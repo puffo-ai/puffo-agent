@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# Distributed as `puffo-agent` (hyphen) and the Python module path is
+# `puffo_agent` (underscore — Python doesn't allow hyphens in module
+# names). The deliberate rename frees `site-packages/puffoagent/` for
+# the older standalone `puffoagent` package at
+# github.com/puffo-ai/puffoagent so both can pip-install into the
+# *same* env without colliding. CLI binary stays `puffo-agent`; home
+# dir stays `~/.puffo-agent/`.
+name = "puffo-agent"
+version = "0.7.2"
+description = "Run AI bots on Puffo.ai — local daemon that supervises many bot accounts and handles their LLM loops."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Puffo.ai" },
+]
+keywords = ["puffo", "ai", "agent", "chatbot", "anthropic", "openai"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "aiosqlite>=0.20",
+    "anthropic>=0.25",
+    "cryptography>=43.0",
+    "mcp>=1.0",
+    "pyhpke>=0.6",
+    "openai>=1.30",
+    "psutil>=5.9",
+    "pyyaml>=6.0",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+# pip install puffo-agent[sdk]  — needed for agents with runtime.kind=sdk
+sdk = ["claude-agent-sdk>=0.1.61"]
+# cli-local / cli-docker adapters don't need extra Python deps; they
+# shell out to the `claude` binary (cli-local) or Docker (cli-docker).
+# pip install --editable ".[dev]"  — needed to run the test suite.
+# pytest-asyncio is required: several test modules (test_message_store,
+# test_ws_client, test_http_client) declare async test functions via
+# `@pytest.mark.asyncio`. Without it, those tests silently skip and
+# anything using async fixtures errors out.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[project.urls]
+Homepage      = "https://github.com/puffo-ai/puffo-agent"
+Source        = "https://github.com/puffo-ai/puffo-agent"
+Issues        = "https://github.com/puffo-ai/puffo-agent/issues"
+
+[project.scripts]
+puffo-agent = "puffo_agent.portal.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

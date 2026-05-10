@@ -1,0 +1,58 @@
+# Example ~/.puffo-agent/daemon.yml
+#
+# This is the daemon-wide config. Each agent has its own
+# ~/.puffo-agent/agents/<agent-id>/agent.yml that covers the
+# puffo-core identity (server_url / slug / device_id / space_id),
+# runtime kind, triggers, etc. — don't duplicate those here.
+#
+# Most users don't need this file at all. The daemon starts with
+# built-in defaults; per-agent keys travel inside each agent's own
+# agent.yml. Use the keys below only if you want one provider key
+# shared across multiple agents — set them by running
+# `puffo-agent config`, which prompts and writes this file for you.
+
+# Which provider the chat-local runtime uses by default. Agents can
+# still override this in their own agent.yml via runtime.provider.
+default_provider: "anthropic"  # "anthropic" | "openai" | "google"
+
+anthropic:
+  api_key: ""                    # https://console.anthropic.com/
+  model:   "claude-sonnet-4-6"   # empty = provider default
+
+openai:
+  api_key: ""                    # https://platform.openai.com/
+  model:   "gpt-4o"
+
+google:
+  api_key: ""                    # required for cli-docker + harness=gemini-cli
+  model:   "gemini-2.5-pro"
+
+# Optional: absolute path to a directory of shared Claude Code
+# skills (*.md files or skill dirs) synced into every cli-local /
+# cli-docker agent on worker start. Leave empty to skip.
+skills_dir: ""
+
+# Reconciler tick intervals. Lower = more responsive to agent.yml
+# edits but more filesystem polling; defaults are fine for ~10s of
+# agents.
+reconcile_interval_seconds: 2.0
+runtime_heartbeat_seconds:  5.0
+
+# cli-docker resource caps applied to every agent container at
+# `docker run` time. Defaults are ON: 1.5 GiB hard ceiling / 500 MiB
+# soft floor, verified against the 0.7.1 ENOMEM-on-read incident
+# on a 6 GiB Docker Desktop VM with 7 active agents. Bounding each
+# container gives the kernel a clear blast radius — when one agent
+# exceeds its cap, OOM kills land inside *that* container only,
+# and the worker's _ensure_running respawn path picks up where it
+# left off, sparing the rest.
+#
+# Sizing rule of thumb: with N agents on a VM of M MiB, plus ~1 GiB
+# kernel/cache headroom and ~1 GiB for any non-agent containers
+# (postgres etc.), each agent gets (M - 2048) / N MiB. Subtract a
+# bit more for cold-boot peaks. Per-agent overrides live in
+# agent.yml under `runtime.docker_memory_limit` / `docker_memory_reservation`
+# — set there if a single heavy agent needs more headroom. Set
+# either field below to an empty string ("") to opt out entirely.
+docker_memory_limit:        "1.5g"  # --memory hard ceiling
+docker_memory_reservation:  "500m"  # --memory-reservation soft floor

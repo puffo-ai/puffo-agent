@@ -1,0 +1,74 @@
+{
+  "ed25519": {
+    "secret_key": "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+    "public_key": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "signatures": [
+      {
+        "message": "dGVzdCBtZXNzYWdlIGZvciBzaWduaW5n",
+        "message_utf8": "test message for signing",
+        "signature": "HZWNvchkeNJrLH-fiuskQ64WIknTZH3cgEq2fhYOzdV4jdRRANtGgFqaZep8FtNLqLefE6ehKC0N4MeMdLSoAQ"
+      },
+      {
+        "message": "d3MtY29ubmVjdAphbGljZS0wMDAxCnNrX3Rlc3QKbm9uY2UxMjMKMTcwMDAwMDAwMDAwMA",
+        "message_utf8": "ws-connect\nalice-0001\nsk_test\nnonce123\n1700000000000",
+        "signature": "kovvWSX-5V3k8dhqA6Vw2G4leE3KiDtZn4TmwHTv7198YE71QXlCiN_-vpYEcO_gKzRXJDUwba9bZ9xT0bC9Cg"
+      }
+    ]
+  },
+  "chacha20poly1305": {
+    "key": "gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp8",
+    "nonce": "BwAAAEBBQkNERUZH",
+    "aad": "YWxpY2UtMDAwMQpjaF9hYmMKY2hhbm5lbA",
+    "aad_utf8": "alice-0001\nch_abc\nchannel",
+    "plaintext": "eyJjb250ZW50IjoiaGVsbG8gd29ybGQiLCJzZW5kZXJfc2x1ZyI6ImFsaWNlLTAwMDEifQ",
+    "plaintext_utf8": "{\"content\":\"hello world\",\"sender_slug\":\"alice-0001\"}",
+    "ciphertext": "5FmKMm-JJdRhwLXZXuRmwq7g_1B7bQr88aij4jvmZtcR7adNy6xkCdm222yf9mLYRTWQE0Eikoxam9ucUuHatCNmKe4"
+  },
+  "hpke": {
+    "recipient_secret_key": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA",
+    "recipient_public_key": "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9_AsrhtHHw",
+    "info": "cHVmZm8tbXNnLXYx",
+    "info_utf8": "puffo-msg-v1",
+    "aad": "ZW52X3Rlc3QtZW52ZWxvcGUtaWQKZGV2X3Rlc3QtZGV2aWNl",
+    "aad_utf8": "env_test-envelope-id\ndev_test-device",
+    "plaintext": "qrvM3e7_ABEiM0RVZneImaq7zN3u_wARIjNEVWZ3iJk",
+    "enc": "rhoIENLWOGbRmJTT5mrOYg-z5PHoay2k43aqlYvm2Ao",
+    "ciphertext": "nUPRqVYpGnwu3gyblDJxErIDy7HnH_Cwu_xwThw3YlRjQwuyqQwPT5EkrVp5h5_k"
+  },
+  "base64url": {
+    "cases": [
+      {
+        "raw": "",
+        "encoded": ""
+      },
+      {
+        "raw": "f",
+        "encoded": "Zg"
+      },
+      {
+        "raw": "fo",
+        "encoded": "Zm8"
+      },
+      {
+        "raw": "foo",
+        "encoded": "Zm9v"
+      },
+      {
+        "raw": "foob",
+        "encoded": "Zm9vYg"
+      },
+      {
+        "raw": "fooba",
+        "encoded": "Zm9vYmE"
+      },
+      {
+        "raw": "foobar",
+        "encoded": "Zm9vYmFy"
+      },
+      {
+        "raw_hex": "fffefd",
+        "encoded": "__79"
+      }
+    ]
+  }
+}

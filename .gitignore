@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.tox/
+.coverage
+.pytest_cache/
+
+# Local config (holds PAT + LLM keys, never commit)
+config.yml
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+.claude/
+
+# Scratch / debugging artifacts dropped during local troubleshooting
+# (paste-in log captures, quick exports, etc.). Never tracked.
+tmp/
+
+# Runtime state the daemon writes under ~/.puffo-agent, not in-tree,
+# but keep these patterns defensive in case someone launches from
+# inside the repo dir.
+agents/*/agent.yml
+agents/*/runtime.json
+agents/*/cli_session.json
+agents/*/memory/
+agents/*/workspace/
+daemon.yml
+daemon.pid
