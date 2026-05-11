@@ -695,8 +695,26 @@ class PuffoCoreMessageClient:
                 # the next pop tries again. Back off 15-45s
                 # randomised to avoid a thundering herd across a
                 # fleet hit by the same outage.
+                #
+                # Mid-dispatch arrivals: a new message on this thread
+                # that landed while the failed dispatch was awaiting
+                # would have hit the reopen branch of
+                # ``_admit_thread_message`` (in_queue was False) and
+                # set ``entry.messages = [new]``. We must preserve
+                # those — dedupe-prepend ``batch`` instead of
+                # overwriting, so the retry includes both the failed
+                # messages AND any in-flight arrivals.
                 self._queue_seq += 1
-                entry.messages = batch
+                existing_ids = {
+                    m.get("envelope_id")
+                    for m in entry.messages
+                    if m.get("envelope_id")
+                }
+                carry = [
+                    m for m in batch
+                    if m.get("envelope_id") not in existing_ids
+                ]
+                entry.messages = carry + entry.messages
                 entry.in_queue = True
                 entry.current_seq = self._queue_seq
                 await self._queue.put(

@@ -38,6 +38,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   batch had no envelope-level dedup. Now `_admit_thread_message`
   drops the append when the incoming `envelope_id` is already in the
   pending batch.
+- `AgentAPIError` retry path was clobbering mid-dispatch arrivals.
+  When the dispatch failed AND a new message had landed on the same
+  thread during the failed dispatch (admitted through the reopen
+  branch of `_admit_thread_message`), the handler set
+  `entry.messages = batch` and silently dropped the new message.
+  The retry now dedupe-prepends the failed batch to whatever is
+  already in `entry.messages` so the next attempt carries both.
 - cli-local adapter silently dropped MCP servers passed via
   `--mcp-config`. claude-code gates MCP registration on the per-
   project trust dialog stored in `~/.claude.json`, and the dialog has

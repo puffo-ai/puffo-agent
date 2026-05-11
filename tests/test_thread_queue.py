@@ -538,6 +538,147 @@ async def test_consume_jitters_before_dispatch():
 
 
 @pytest.mark.asyncio
+async def test_arrival_during_dispatch_lands_in_next_batch():
+    """While the consumer is awaiting ``on_message_batch`` for batch
+    A, a new message arrives on the same thread. The new message
+    must end up in a second dispatch (batch B), not silently dropped.
+    Reproduces the bug where mid-dispatch arrivals get lost.
+    """
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_1", sent_at=100),
+        channel_meta=_channel_meta(),
+    )
+
+    batches: list[list[str]] = []
+    in_first_dispatch = asyncio.Event()
+    resume_first = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def callback(root_id, batch, channel_meta):
+        batches.append([m["envelope_id"] for m in batch])
+        if len(batches) == 1:
+            in_first_dispatch.set()
+            await resume_first.wait()
+        elif len(batches) == 2:
+            second_done.set()
+
+    # Neutralise the 0-1.5s pre-dispatch jitter without touching
+    # asyncio.sleep itself (the consumer still needs real yields).
+    import puffo_agent.agent.puffo_core_client as mod
+    original_uniform = mod.random.uniform
+
+    def fake_uniform(a, b):
+        return 0.0 if (a, b) == (0.0, 1.5) else original_uniform(a, b)
+
+    mod.random.uniform = fake_uniform  # type: ignore[assignment]
+    try:
+        task = asyncio.create_task(client._consume_queue(callback))
+        try:
+            await asyncio.wait_for(in_first_dispatch.wait(), timeout=2.0)
+            # Admit msg2 mid-dispatch.
+            await client._admit_thread_message(
+                root_id="env_root",
+                priority=PRIORITY_HUMAN,
+                msg_dict=_msg("env_2", sent_at=200),
+                channel_meta=_channel_meta(),
+            )
+            resume_first.set()
+            await asyncio.wait_for(second_done.wait(), timeout=2.0)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        mod.random.uniform = original_uniform  # type: ignore[assignment]
+
+    assert batches == [["env_1"], ["env_2"]], batches
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_api_error_preserves_mid_dispatch_arrivals():
+    """When the agent dispatch raises AgentAPIError AND a new message
+    arrived on the same thread during that failed dispatch, the new
+    message must NOT be lost. The retry batch should include both the
+    original (failed) messages AND the mid-dispatch arrival.
+    """
+    from puffo_agent.agent.core import AgentAPIError
+
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_1", sent_at=100),
+        channel_meta=_channel_meta(),
+    )
+
+    batches: list[list[str]] = []
+    in_first_dispatch = asyncio.Event()
+    resume_first = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def callback(root_id, batch, channel_meta):
+        batches.append([m["envelope_id"] for m in batch])
+        if len(batches) == 1:
+            in_first_dispatch.set()
+            await resume_first.wait()
+            raise AgentAPIError("provider 429")
+        elif len(batches) == 2:
+            second_done.set()
+
+    # Neutralise jitter (0-1.5s) and the API-error backoff (15-45s)
+    # so the test doesn't burn real wall-clock time.
+    import puffo_agent.agent.puffo_core_client as mod
+    original_uniform = mod.random.uniform
+
+    def fake_uniform(a, b):
+        if (a, b) == (0.0, 1.5):
+            return 0.0
+        if (a, b) == (15.0, 45.0):
+            return 0.0
+        return original_uniform(a, b)
+
+    mod.random.uniform = fake_uniform  # type: ignore[assignment]
+    try:
+        task = asyncio.create_task(client._consume_queue(callback))
+        try:
+            await asyncio.wait_for(in_first_dispatch.wait(), timeout=2.0)
+            # Mid-dispatch arrival: must survive the failed dispatch.
+            await client._admit_thread_message(
+                root_id="env_root",
+                priority=PRIORITY_HUMAN,
+                msg_dict=_msg("env_2", sent_at=200),
+                channel_meta=_channel_meta(),
+            )
+            resume_first.set()
+            await asyncio.wait_for(second_done.wait(), timeout=2.0)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        mod.random.uniform = original_uniform  # type: ignore[assignment]
+
+    # The retry should include both env_1 (the failed batch) and
+    # env_2 (the mid-dispatch arrival). Without the fix, env_2 was
+    # clobbered by ``entry.messages = batch`` and dropped silently.
+    assert batches[0] == ["env_1"]
+    assert batches[1] == ["env_1", "env_2"]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_api_error_requeues_same_batch_preserves_cursor():
     """``AgentAPIError`` re-enqueues the same batch without advancing
     the durable cursor. The next pop must see the same messages."""
