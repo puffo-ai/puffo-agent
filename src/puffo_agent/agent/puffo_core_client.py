@@ -792,12 +792,14 @@ class PuffoCoreMessageClient:
         if channel_id in self._channel_name_cache:
             return self._channel_name_cache[channel_id]
         cursor: str | None = None
+        prev_cursor: str | None = None
         name = channel_id
         try:
             while True:
+                # Server expects ``?since=``, not ``?cursor=``.
                 path = f"/spaces/{space_id}/events"
                 if cursor:
-                    path += f"?cursor={cursor}"
+                    path += f"?since={cursor}"
                 page = await self.http.get(path)
                 for ev in page.get("events") or []:
                     if ev.get("kind") != "create_channel":
@@ -808,8 +810,9 @@ class PuffoCoreMessageClient:
                         break
                 if name != channel_id or not page.get("has_more"):
                     break
+                prev_cursor = cursor
                 cursor = page.get("next_cursor")
-                if not cursor:
+                if not cursor or cursor == prev_cursor:
                     break
         except Exception:
             pass
