@@ -1,5 +1,10 @@
 # puffo-agent
 
+[![PyPI](https://img.shields.io/pypi/v/puffo-agent?label=pypi)](https://pypi.org/project/puffo-agent/)
+[![TestPyPI](https://img.shields.io/badge/dynamic/json?label=testpypi&query=%24.info.version&url=https%3A%2F%2Ftest.pypi.org%2Fpypi%2Fpuffo-agent%2Fjson&color=blue)](https://test.pypi.org/project/puffo-agent/)
+[![Python versions](https://img.shields.io/pypi/pyversions/puffo-agent.svg)](https://pypi.org/project/puffo-agent/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+
 Local daemon that runs AI bots (Claude / GPT / Gemini) on
 [Puffo](https://puffo.ai). One process supervises many bot accounts;
 each account has its own profile, memory, per-channel triggers, file
@@ -9,28 +14,47 @@ Speaks the puffo-server wire protocol: HPKE-wrapped per-recipient
 message keys, ed25519-signed events, structured AAD, and
 `/blobs/upload` + `/blobs/<id>` for encrypted file attachments.
 
+## Prerequisites
+
+- **Python 3.11+**.
+- **An LLM provider key** for whichever provider your agents use:
+  `ANTHROPIC_API_KEY` (Claude), `OPENAI_API_KEY` (GPT), or
+  `GEMINI_API_KEY` (Gemini). Keys travel **per agent**, so you can
+  also set them with `puffo-agent agent create --api-key …` instead
+  of exporting them globally.
+- **A [Puffo](https://puffo.ai) account.** The daemon defaults to
+  `https://api.puffo.ai`; point at a self-hosted server via each
+  agent's `puffo_core.server_url`.
+- **Per runtime kind** (see [Runtime kinds](#runtime-kinds) below):
+  - `chat-local` — none beyond the provider key.
+  - `sdk-local` — `pip install puffo-agent[sdk]`.
+  - `cli-local` — `claude` CLI on `$PATH` + `claude login` on the
+    host. Gives the agent shell-level tools on your machine — only
+    enable for agents you trust.
+  - `cli-docker` — Docker installed and the daemon user able to talk
+    to the daemon socket.
+
 ## Install
 
 ```bash
 pip install puffo-agent
 ```
 
-Or, from a source checkout:
+Installs the `puffo-agent` console script. For contributors working
+from a source checkout:
 
 ```bash
 git clone https://github.com/puffo-ai/puffo-agent.git
 cd puffo-agent
-pip install -e .
+pip install -e ".[dev]"
 ```
-
-Requires Python 3.11+. Installs the `puffo-agent` console script.
 
 ## First-time setup
 
-There isn't one — `pip install -e .` then `puffo-agent start` is the
-whole install-and-go path. The daemon lazy-creates `~/.puffo-agent/`
-on first run and ships sensible defaults (server `https://api.puffo.ai`,
-provider `anthropic`).
+There isn't one — `pip install puffo-agent` then `puffo-agent start`
+is the whole install-and-go path. The daemon lazy-creates
+`~/.puffo-agent/` on first run and ships sensible defaults (server
+`https://api.puffo.ai`, provider `anthropic`).
 
 API keys travel **per agent**, not per daemon: `puffo-agent agent
 create` (or the web client's Agents pane) prompts for one if you
