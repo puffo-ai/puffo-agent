@@ -507,6 +507,12 @@ class PuffoCoreMessageClient:
             # skip — the agent has seen this.
             last_processed = await self.store.get_last_processed_sent_at(root_id)
             if payload.sent_at <= last_processed:
+                logger.info(
+                    "handle_envelope: cursor-rejected duplicate envelope=%s "
+                    "(sent_at=%d <= last_processed=%d, root=%s)",
+                    payload.envelope_id, payload.sent_at,
+                    last_processed, root_id,
+                )
                 return
 
             msg_dict = {
@@ -616,6 +622,10 @@ class PuffoCoreMessageClient:
         # gets dispatched as the next batch — agent sees the same
         # envelope across two turns. See ``_ThreadEntry`` docstring.
         if entry is not None and incoming_id and incoming_id in entry.dispatching_ids:
+            logger.info(
+                "_admit_thread_message: dispatching_ids-rejected duplicate "
+                "envelope=%s root=%s", incoming_id, root_id,
+            )
             return
 
         if entry is None or not entry.in_queue:
@@ -648,6 +658,11 @@ class PuffoCoreMessageClient:
         if incoming_id and any(
             m.get("envelope_id") == incoming_id for m in entry.messages
         ):
+            logger.info(
+                "_admit_thread_message: in-batch-rejected duplicate "
+                "envelope=%s root=%s (pending batch=%d)",
+                incoming_id, root_id, len(entry.messages),
+            )
             return
 
         entry.messages.append(msg_dict)

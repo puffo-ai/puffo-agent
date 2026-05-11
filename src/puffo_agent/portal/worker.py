@@ -518,6 +518,16 @@ class Worker:
             """
             if not batch:
                 return
+            # Diagnostic: log every dispatched batch so we can trace
+            # cross-batch duplicates (same envelope_id surfacing in
+            # consecutive turns). If the SAME envelope_id appears
+            # across two log lines for one agent within a few
+            # seconds, the cursor or dispatching_ids check missed it.
+            batch_ids = [m.get("envelope_id", "") for m in batch]
+            logger.info(
+                "agent %s: on_message_batch root=%s size=%d envelopes=%s",
+                agent_id, root_id, len(batch), batch_ids,
+            )
             # Status telemetry is now per-thread-batch. The first
             # message in arrival order gets the /processing/start
             # call (yellow dot lands there) — that's what the human
