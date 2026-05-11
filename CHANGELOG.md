@@ -6,6 +6,34 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-05-11
+
+### Changed
+
+- Message processing is now thread-batched instead of per-message.
+  Each root message id (`envelope_id` of the thread root) is a single
+  slot in the priority queue; new messages on the same thread coalesce
+  into the existing slot, a higher-priority arrival bumps the slot but
+  preserves the batch cursor, and the consumer drains the full batch
+  in one `on_message_batch` dispatch. The agent reads the whole thread
+  and decides on its own who to reply to — no trigger-message concept.
+- Cross-restart dedup: a new `thread_processing_state(root_id PK,
+  last_processed_sent_at)` table records the last `sent_at` drained
+  per thread. On startup the runtime skips anything at or below that
+  cursor so a crash mid-batch doesn't replay the whole thread.
+
+### Fixed
+
+- cli-local adapter silently dropped MCP servers passed via
+  `--mcp-config`. claude-code gates MCP registration on the per-
+  project trust dialog stored in `~/.claude.json`, and the dialog has
+  no TUI surface under `--input-format stream-json`, so it never
+  resolved. Switched the `bypassPermissions` permission-mode to emit
+  `--dangerously-skip-permissions` (which also bypasses the trust
+  dialog) instead of `--permission-mode bypassPermissions` (which
+  only bypasses per-tool prompts). cli-docker already used the right
+  flag; this aligns cli-local.
+
 ## [0.7.2] — 2026-05-10
 
 First public PyPI release.
@@ -26,5 +54,6 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.3
 [0.7.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.2
