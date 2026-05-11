@@ -62,6 +62,19 @@ class PuffoAgent:
         # Conversation log shared across all channels.
         self.log: list[dict] = []
 
+        # Envelopes already appended to ``self.log`` (and hence the
+        # adapter's claude-code session). On AgentAPIError the consumer
+        # re-enqueues the failed batch and ``handle_message_batch``
+        # runs again — without this set, the same envelope would be
+        # ``_append_user``ed a second time, doubling its appearance in
+        # the agent's transcript. The agent then sees what looks like
+        # a dup wire delivery (it isn't — it's a retry of a single
+        # delivery whose previous turn failed with rate-limiting). Set
+        # lives for the lifetime of this PuffoAgent (one per worker
+        # lifecycle) so cross-restart redeliveries that hit the
+        # cursor check upstream don't even reach here.
+        self._appended_envelope_ids: set[str] = set()
+
     # ── Message handling ──────────────────────────────────────────────────────
 
     async def handle_message(
@@ -126,7 +139,23 @@ class PuffoAgent:
         """
         if not batch:
             return None
+        appended_this_call = 0
         for msg in batch:
+            env_id = msg.get("envelope_id", "")
+            # Skip envelopes already in the session log. This is the
+            # AgentAPIError retry path: the previous attempt at this
+            # batch failed (rate-limited or otherwise), the consumer
+            # re-enqueued, and we're here again. The envelope is
+            # already in claude-code's transcript — appending it a
+            # second time would surface as a "duplicate user input"
+            # in the agent's own conversation view.
+            if env_id and env_id in self._appended_envelope_ids:
+                self.logger.info(
+                    "handle_message_batch: skipping re-append of "
+                    "already-seen envelope=%s (likely AgentAPIError retry)",
+                    env_id,
+                )
+                continue
             self._append_user(
                 channel_meta.get("channel_name", ""),
                 msg.get("sender_slug", ""),
@@ -137,12 +166,15 @@ class PuffoAgent:
                 attachments=msg.get("attachments") or [],
                 sender_is_bot=msg.get("sender_is_bot", False),
                 mentions=msg.get("mentions") or [],
-                post_id=msg.get("envelope_id", ""),
+                post_id=env_id,
                 create_at=msg.get("sent_at", 0),
                 followups=None,
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
             )
+            if env_id:
+                self._appended_envelope_ids.add(env_id)
+            appended_this_call += 1
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
         # agent itself decides who to reply to.
@@ -210,6 +242,24 @@ class PuffoAgent:
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
                 "contained 'API Error'; suppressing post + flagging for retry"
             )
+            # Forget the adapter's resumable claude-code session
+            # before the retry. Without this, the consumer's
+            # AgentAPIError handler re-dispatches the batch, the
+            # cli adapter ``--resume``s the same session, and
+            # claude-code appends the same user input again — the
+            # agent then sees the message twice (or N times for N
+            # retries) inside its own conversation transcript even
+            # though the wire only delivered once. Forgetting the
+            # session means the retry starts fresh: lost prior
+            # conversation history is the tradeoff for not faking
+            # a duplicate delivery to the LLM.
+            try:
+                await self.adapter.invalidate_session()
+            except Exception:
+                self.logger.exception(
+                    "adapter.invalidate_session() failed; retry may "
+                    "still duplicate the user input in the transcript"
+                )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error'"
             )

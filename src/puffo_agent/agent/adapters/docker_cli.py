@@ -599,6 +599,10 @@ class DockerCLIAdapter(Adapter):
             await self._session.aclose()
             self._session = None
 
+    async def invalidate_session(self) -> None:
+        if self._session is not None:
+            await self._session.invalidate()
+
     def _credentials_expires_in_seconds(self) -> int | None:
         # Every cli-docker agent's container reads the host's
         # credentials file via bind-mount, so the host copy is the

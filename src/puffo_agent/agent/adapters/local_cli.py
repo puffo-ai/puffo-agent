@@ -175,6 +175,10 @@ class LocalCLIAdapter(Adapter):
             await self._session.aclose()
             self._session = None
 
+    async def invalidate_session(self) -> None:
+        if self._session is not None:
+            await self._session.invalidate()
+
     def _credentials_expires_in_seconds(self) -> int | None:
         # All cli-local agents share the HOST's .credentials.json
         # (symlink where permitted, periodic copy elsewhere). Parse

@@ -263,6 +263,19 @@ class ClaudeSession:
         async with self._lock:
             await self._kill_proc()
 
+    async def invalidate(self) -> None:
+        """Clear the resumable session id and kill the running
+        subprocess so the next ``run_turn`` spawns a fresh claude-
+        code with no ``--resume`` and an empty transcript. Used by
+        the adapter when the previous turn failed with
+        ``API Error`` — the AgentAPIError retry path would otherwise
+        ``--resume`` the same session and the duplicate user input
+        would surface in the agent's transcript on every retry.
+        """
+        async with self._lock:
+            self._clear_session_id()
+            await self._kill_proc()
+
     # ── Session id persistence ────────────────────────────────────────────────
 
     def _load_session_id(self) -> str:

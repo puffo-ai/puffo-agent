@@ -94,6 +94,28 @@ class Adapter(ABC):
         """
         return None
 
+    async def invalidate_session(self) -> None:
+        """Discard the underlying runtime's resumable session so the
+        next turn starts from scratch.
+
+        Called by ``core.py`` right before re-raising
+        ``AgentAPIError`` (e.g. claude-code's
+        ``API Error: Server is temporarily limiting requests``). The
+        AgentAPIError retry path in the consumer re-dispatches the
+        same batch, and the cli adapters by default ``--resume`` the
+        same claude-code session — so the agent's transcript would
+        show ``user: msg_X / assistant: "API Error" / user: msg_X /
+        ...`` accumulating one duplicate per retry. Clearing the
+        session means each retry starts a fresh claude-code session
+        with just the current input. The cost is losing prior
+        conversation history; the agent's memory + MCP
+        ``get_channel_history`` can rebuild context if needed.
+
+        Default no-op for adapters that don't maintain a resumable
+        session (SDK / chat-only).
+        """
+        return None
+
     async def refresh_ping(self) -> None:
         """Force an OAuth round-trip so Anthropic's rotating refresh
         token gets exchanged before the access token dies. Guarded by

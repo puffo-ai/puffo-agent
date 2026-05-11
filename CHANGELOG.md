@@ -61,6 +61,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `on_message_batch`, logging a warning if anything is dropped. The
   agent must never see the same envelope twice in one turn, even if
   some upstream race we haven't characterised slips through.
+- `AgentAPIError` retry was duplicating the user input in the
+  agent's claude-code transcript on every retry. When claude-code
+  returns `API Error: Server is temporarily limiting requests`, the
+  consumer re-enqueues the batch and `handle_message_batch` runs
+  again — and the cli adapter `--resume`s the same claude-code
+  session, so the same user message got appended to the transcript
+  once per retry. A receiver who saw `×4` was hitting the rate
+  limit four times before succeeding, with each attempt being a
+  legitimate retry of one real wire delivery. Adds
+  `Adapter.invalidate_session()` (implemented in cli-local /
+  cli-docker via a new `ClaudeSession.invalidate`) and calls it in
+  `_run_turn_and_route` right before re-raising `AgentAPIError`.
+  Each retry now starts a fresh claude-code session with no
+  `--resume`, so the agent's transcript shows the input exactly
+  once. Tracks `_appended_envelope_ids` on the `PuffoAgent` so the
+  retry's `handle_message_batch` doesn't re-`_append_user` the
+  same envelope into `self.log` either.
 - cli-docker now auto-recreates a reused container when its
   `/opt/puffoagent-pkg` bind mount no longer resolves to the host
   path that contains `puffo_agent` (typical cause: the operator
