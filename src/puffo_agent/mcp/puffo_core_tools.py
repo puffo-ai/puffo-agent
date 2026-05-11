@@ -267,12 +267,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 break
             prev_cursor = cursor
             cursor = data.get("next_cursor")
-            if cursor is None:
-                break
-            # Defensive: cursor must strictly advance whenever
-            # ``has_more`` is set. A repeated value means the server
-            # isn't making progress; bail instead of spinning.
-            if cursor == prev_cursor:
+            if cursor is None or cursor == prev_cursor:
                 break
         if not channels:
             return "(no channels in this space)"
