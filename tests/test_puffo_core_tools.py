@@ -297,6 +297,75 @@ async def test_list_channels():
 
 
 @pytest.mark.asyncio
+async def test_list_channels_paginates_via_since():
+    """``list_channels`` walks ``/spaces/<sp>/events`` page-by-page
+    using ``?since=<next_cursor>``. Guards against a regression of
+    the ``?cursor=`` bug — the server's axum extractor silently
+    ignored the wrong-named key, so paginated calls re-fetched the
+    first page forever and the tool never returned."""
+    cfg, http, _ = _setup()
+    # Page 1: one channel + cursor pointing at page 2.
+    http.responses["/spaces/sp_test/events"] = {
+        "events": [
+            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
+        ],
+        "has_more": True,
+        "next_cursor": "cursor_page2",
+    }
+    # Page 2: second channel + end of stream. Registered against the
+    # exact ``?since=`` URL so a regression to ``?cursor=`` would miss
+    # this entry and fall back to page 1 (loop forever).
+    http.responses["/spaces/sp_test/events?since=cursor_page2"] = {
+        "events": [
+            {"kind": "create_channel", "payload": {"channel_id": "ch_2", "name": "Random"}},
+        ],
+        "has_more": False,
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels")
+
+    assert "General" in result
+    assert "ch_1" in result
+    assert "Random" in result
+    assert "ch_2" in result
+
+    events_calls = [c for c in http.calls if c[1].startswith("/spaces/sp_test/events")]
+    # Exactly two requests: page 1 (no query) + page 2 (?since=).
+    assert len(events_calls) == 2, events_calls
+    assert events_calls[0][1] == "/spaces/sp_test/events"
+    assert "?since=cursor_page2" in events_calls[1][1]
+
+
+@pytest.mark.asyncio
+async def test_list_channels_bails_on_stuck_cursor():
+    """If the server ever regresses and returns the same cursor it
+    was just sent, the tool must stop instead of spinning. Mirrors
+    the strict-advance guard in ``fetchChannelsFromEvents``
+    (web) and ``_resolve_channel_name`` (this package)."""
+    cfg, http, _ = _setup()
+    # Both the initial and the ``?since=stuck`` request hand back
+    # the same ``next_cursor`` — a real regression would loop, the
+    # guarded loop bails after the second fetch.
+    page = {
+        "events": [
+            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
+        ],
+        "has_more": True,
+        "next_cursor": "stuck",
+    }
+    http.responses["/spaces/sp_test/events"] = page
+    http.responses["/spaces/sp_test/events?since=stuck"] = page
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels")
+
+    assert "General" in result
+    events_calls = [c for c in http.calls if c[1].startswith("/spaces/sp_test/events")]
+    # Two calls: initial, then one with ``?since=stuck`` whose
+    # ``next_cursor`` is also ``stuck`` — the guard breaks the loop.
+    assert len(events_calls) == 2, events_calls
+
+
+@pytest.mark.asyncio
 async def test_list_channel_members():
     """Channel members come from
     ``/spaces/<sp>/channels/<ch>/members`` keyed by space_id."""

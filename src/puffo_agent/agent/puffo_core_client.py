@@ -792,12 +792,21 @@ class PuffoCoreMessageClient:
         if channel_id in self._channel_name_cache:
             return self._channel_name_cache[channel_id]
         cursor: str | None = None
+        prev_cursor: str | None = None
         name = channel_id
         try:
             while True:
+                # Server's query parameter is ``since`` (see
+                # ``SpaceEventsParams`` in puffo-server
+                # membership.rs). Earlier copies of this client used
+                # ``cursor=``, which axum's Query extractor silently
+                # ignored — every paginated request came back with
+                # the first page, ``has_more: true``, and the same
+                # cursor, looping forever (the web client had the
+                # same bug; see commit 5b031cc in puffo-core-han-group).
                 path = f"/spaces/{space_id}/events"
                 if cursor:
-                    path += f"?cursor={cursor}"
+                    path += f"?since={cursor}"
                 page = await self.http.get(path)
                 for ev in page.get("events") or []:
                     if ev.get("kind") != "create_channel":
@@ -808,8 +817,14 @@ class PuffoCoreMessageClient:
                         break
                 if name != channel_id or not page.get("has_more"):
                     break
+                prev_cursor = cursor
                 cursor = page.get("next_cursor")
                 if not cursor:
+                    break
+                # Defensive: a server-side regression that ignores
+                # ``since`` would echo the same cursor back and wedge
+                # this loop. Bail rather than spin.
+                if cursor == prev_cursor:
                     break
         except Exception:
             pass

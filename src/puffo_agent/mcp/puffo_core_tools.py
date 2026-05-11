@@ -245,6 +245,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         # cursor is ``<issued_at>:<signer_slug>:<event_id>``. Colons
         # are legal in query strings but encode anyway for safety.
         cursor: Optional[str] = None
+        prev_cursor: Optional[str] = None
         channels: list[tuple[str, str]] = []
         while True:
             if cursor is not None:
@@ -264,8 +265,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                         channels.append((cid, name))
             if not data.get("has_more"):
                 break
+            prev_cursor = cursor
             cursor = data.get("next_cursor")
             if cursor is None:
+                break
+            # Defensive: cursor must strictly advance whenever
+            # ``has_more`` is set. A repeated value means the server
+            # isn't making progress; bail instead of spinning.
+            if cursor == prev_cursor:
                 break
         if not channels:
             return "(no channels in this space)"
