@@ -603,6 +603,83 @@ async def test_arrival_during_dispatch_lands_in_next_batch():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_envelope_during_dispatch_is_skipped():
+    """A duplicate of an envelope that the consumer just claimed for
+    dispatch must not produce a second batch. The bug: the consumer
+    sets ``entry.messages = []`` and ``in_queue = False`` before
+    dispatching; a duplicate WS delivery during that window slips
+    past the handle_envelope cursor check (cursor hasn't advanced
+    yet) and hits ``_admit_thread_message``'s reopen branch, which
+    creates a fresh batch the consumer dispatches next — so the
+    agent sees the same envelope across two turns.
+    """
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_x", sent_at=100),
+        channel_meta=_channel_meta(),
+    )
+
+    batches: list[list[str]] = []
+    in_first_dispatch = asyncio.Event()
+    resume_first = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def callback(root_id, batch, channel_meta):
+        batches.append([m["envelope_id"] for m in batch])
+        if len(batches) == 1:
+            in_first_dispatch.set()
+            await resume_first.wait()
+        else:
+            second_done.set()
+
+    import puffo_agent.agent.puffo_core_client as mod
+    original_uniform = mod.random.uniform
+
+    def fake_uniform(a, b):
+        return 0.0 if (a, b) == (0.0, 1.5) else original_uniform(a, b)
+
+    mod.random.uniform = fake_uniform  # type: ignore[assignment]
+    try:
+        task = asyncio.create_task(client._consume_queue(callback))
+        try:
+            await asyncio.wait_for(in_first_dispatch.wait(), timeout=2.0)
+            # Duplicate of env_x arrives mid-dispatch (same envelope_id,
+            # same sent_at — exactly what server pending-message
+            # redelivery + live WS can produce).
+            await client._admit_thread_message(
+                root_id="env_root",
+                priority=PRIORITY_HUMAN,
+                msg_dict=_msg("env_x", sent_at=100),
+                channel_meta=_channel_meta(),
+            )
+            resume_first.set()
+            # If a duplicate-driven second dispatch is going to fire,
+            # it'll fire within a few hundred ms. Generous budget so
+            # sqlite IO doesn't race the assertion.
+            try:
+                await asyncio.wait_for(second_done.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        mod.random.uniform = original_uniform  # type: ignore[assignment]
+
+    # Exactly one dispatch — the duplicate must be skipped at admit
+    # time. Without the dispatching_ids fix this would be 2.
+    assert batches == [["env_x"]], batches
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_api_error_preserves_mid_dispatch_arrivals():
     """When the agent dispatch raises AgentAPIError AND a new message
     arrived on the same thread during that failed dispatch, the new

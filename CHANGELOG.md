@@ -45,6 +45,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   batch had no envelope-level dedup. Now `_admit_thread_message`
   drops the append when the incoming `envelope_id` is already in the
   pending batch.
+- A duplicate WS delivery that landed during a successful dispatch
+  was being added to a fresh batch and re-fed to the agent on the
+  next turn — observed as the same `envelope_id` appearing twice
+  across consecutive claude-code turns (with a system-reminder
+  injected between them). The handle_envelope cursor check couldn't
+  catch it because `mark_thread_processed` runs *after* the dispatch
+  finishes, and the in-batch dedup couldn't catch it because the
+  consumer empties `entry.messages` to claim the batch. Adds a per-
+  thread `dispatching_ids` set populated at claim time and consulted
+  at the top of `_admit_thread_message`; cleared after the cursor
+  advances on successful dispatch.
 - `AgentAPIError` retry path was clobbering mid-dispatch arrivals.
   When the dispatch failed AND a new message had landed on the same
   thread during the failed dispatch (admitted through the reopen

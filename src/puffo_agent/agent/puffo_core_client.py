@@ -64,12 +64,24 @@ class _ThreadEntry:
     - ``channel_meta`` is captured on the first enqueue and reused
       on dispatch; the thread/channel/space context is invariant
       for a given root.
+    - ``dispatching_ids`` is the set of envelope_ids currently being
+      sent to the agent (the batch the consumer just claimed but
+      hasn't finished). A duplicate WS delivery that lands during
+      that window can't be caught by the handle_envelope cursor
+      (cursor advances only after dispatch succeeds) or by the
+      in-memory dedup (the consumer just emptied ``messages`` to
+      claim the batch), so the reopen branch of
+      ``_admit_thread_message`` would otherwise put the duplicate
+      into a fresh batch — causing the agent to see the same post
+      across two turns. This set is checked at admit time and
+      cleared on successful cursor advance.
     """
     current_priority: int
     current_seq: int
     messages: list[dict] = field(default_factory=list)
     in_queue: bool = True
     channel_meta: dict = field(default_factory=dict)
+    dispatching_ids: set[str] = field(default_factory=set)
 
 
 async def _fetch_blob_with_retry(
@@ -595,6 +607,17 @@ class PuffoCoreMessageClient:
         doesn't re-check the durable cursor.
         """
         entry = self._thread_state.get(root_id)
+        incoming_id = msg_dict.get("envelope_id", "")
+
+        # Cross-batch dedup: skip a duplicate of an envelope the
+        # consumer just claimed and is sending to the agent right
+        # now. Without this, the reopen branch below would create a
+        # fresh ``entry.messages = [dup]`` slot and the duplicate
+        # gets dispatched as the next batch — agent sees the same
+        # envelope across two turns. See ``_ThreadEntry`` docstring.
+        if entry is not None and incoming_id and incoming_id in entry.dispatching_ids:
+            return
+
         if entry is None or not entry.in_queue:
             self._queue_seq += 1
             if entry is None:
@@ -622,7 +645,6 @@ class PuffoCoreMessageClient:
         # INSERT OR IGNORE in MessageStore.store already covers the
         # durable table, but the in-memory batch is independent and
         # would otherwise feed the agent the same post N times.
-        incoming_id = msg_dict.get("envelope_id", "")
         if incoming_id and any(
             m.get("envelope_id") == incoming_id for m in entry.messages
         ):
@@ -667,11 +689,18 @@ class PuffoCoreMessageClient:
             # Claim the batch atomically — mark the slot closed
             # before dispatch so concurrent arrivals open a fresh
             # entry instead of stacking into a batch the agent is
-            # already chewing through.
+            # already chewing through. Record the batch's
+            # envelope_ids in ``dispatching_ids`` so that a duplicate
+            # arriving mid-dispatch can be rejected at admit time
+            # (the durable cursor hasn't advanced yet, so it can't
+            # catch it).
             batch = entry.messages
             channel_meta = entry.channel_meta
             entry.messages = []
             entry.in_queue = False
+            entry.dispatching_ids = {
+                m.get("envelope_id") for m in batch if m.get("envelope_id")
+            }
 
             # Pre-dispatch jitter. When several agents on the same
             # host get activated by the same message (e.g. a channel
@@ -760,6 +789,11 @@ class PuffoCoreMessageClient:
                         "may re-process this thread after a restart",
                         root_id, tail_sent_at,
                     )
+            # Cursor now covers the dispatched batch — duplicates of
+            # any of its envelopes will be caught by the handle_envelope
+            # cursor check from this point on, so the in-memory
+            # dispatching_ids set has done its job and can be released.
+            entry.dispatching_ids = set()
 
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the
