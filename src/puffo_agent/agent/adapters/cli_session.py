@@ -182,6 +182,14 @@ class ClaudeSession:
         self._session_id: str = self._load_session_id()
         self._lock = asyncio.Lock()
         self._stderr_drain_task: asyncio.Task | None = None
+        # True iff the most recent ``_spawn`` used ``--resume``. False
+        # after a fresh spawn (no session id) or when ``_ResumeFailed``
+        # forced a fresh fallback. ``run_retry_turn`` reads this to
+        # decide whether the cheap "session errored, please resume"
+        # kick is enough, or whether the caller's full-payload
+        # fallback needs to be sent because claude-code has no
+        # transcript to resume.
+        self._last_spawn_resumed: bool = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -245,6 +253,46 @@ class ClaudeSession:
                 )
             return TurnResult(reply="", metadata=md)
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        system_prompt: str,
+    ) -> TurnResult:
+        """Retry the most recently failed turn.
+
+        If claude-code's session was resumed successfully (the
+        previous user input is still in its transcript), send just
+        ``kick_text`` — a small control message like "session
+        errored on rate limiting, please resume processing". The
+        agent reads the transcript and retries its previous response
+        without seeing a duplicate of the original input.
+
+        If ``--resume`` failed (the session id is no longer valid),
+        ``_ensure_running`` has already cleared the session id and
+        spawned a fresh claude-code with no transcript. The kick
+        would be meaningless on its own, so we send
+        ``fallback_user_message`` instead — the full original payload
+        that the caller would have sent for a normal turn.
+
+        Auth-error retry inside ``run_turn`` would normally re-send
+        the user message on each attempt; for the API-error path the
+        consumer drives retries from outside (with its own backoff),
+        so this method is a single-shot.
+        """
+        async with self._lock:
+            await self._ensure_running(system_prompt)
+            if self._last_spawn_resumed:
+                user_message = kick_text
+            else:
+                logger.warning(
+                    "agent %s: --resume not in effect for retry; "
+                    "falling back to the original payload",
+                    self.agent_id,
+                )
+                user_message = fallback_user_message
+            return await self._one_turn(user_message)
+
     async def warm(self, system_prompt: str) -> None:
         """Spawn the claude subprocess without running a turn so the
         first real message doesn't pay process + init latency.
@@ -261,19 +309,6 @@ class ClaudeSession:
 
     async def aclose(self) -> None:
         async with self._lock:
-            await self._kill_proc()
-
-    async def invalidate(self) -> None:
-        """Clear the resumable session id and kill the running
-        subprocess so the next ``run_turn`` spawns a fresh claude-
-        code with no ``--resume`` and an empty transcript. Used by
-        the adapter when the previous turn failed with
-        ``API Error`` — the AgentAPIError retry path would otherwise
-        ``--resume`` the same session and the duplicate user input
-        would surface in the agent's transcript on every retry.
-        """
-        async with self._lock:
-            self._clear_session_id()
             await self._kill_proc()
 
     # ── Session id persistence ────────────────────────────────────────────────
@@ -314,8 +349,15 @@ class ClaudeSession:
             )
             self._proc = None
 
+        had_session_id = bool(self._session_id)
         try:
             await self._spawn(system_prompt)
+            # _spawn either uses --resume (when _session_id was set
+            # going in) or starts a fresh session and learns the new
+            # session id on system/init. ``_last_spawn_resumed``
+            # captures the former path so ``run_retry_turn`` can
+            # decide whether the kick alone is sufficient.
+            self._last_spawn_resumed = had_session_id
             return
         except _ResumeFailed as exc:
             logger.warning(
@@ -324,6 +366,7 @@ class ClaudeSession:
             )
             self._clear_session_id()
             await self._spawn(system_prompt)
+            self._last_spawn_resumed = False
 
     async def _spawn(self, system_prompt: str) -> None:
         # --verbose is required with --output-format stream-json +

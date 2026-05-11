@@ -320,12 +320,21 @@ class PuffoCoreMessageClient:
     async def listen(
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
+        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """``on_message`` is the thread-batch callback. Despite the
         legacy parameter name kept for caller compatibility, it's
         invoked as ``on_message(root_id, batch, channel_meta)`` —
         the consumer collapses every arrival on the same thread
         into a single dispatch (see ``_consume_queue``).
+
+        ``on_api_error_retry`` is the kick-retry callback invoked
+        after the consumer catches an ``AgentAPIError``. Same
+        signature, but the implementation is expected to nudge
+        claude-code via ``--resume`` rather than re-sending the
+        ``batch`` payload (so the agent's transcript doesn't pick up
+        a duplicate of the original user input on every retry). When
+        omitted, the consumer abandons the batch on first failure.
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -557,7 +566,9 @@ class PuffoCoreMessageClient:
         # Reset on every (re)connect — the auto-accept path is
         # idempotent against server-side state.
         self._processed_invite_ids = set()
-        consumer_task = asyncio.ensure_future(self._consume_queue(on_message))
+        consumer_task = asyncio.ensure_future(
+            self._consume_queue(on_message, on_api_error_retry),
+        )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
 
         self._ws = PuffoCoreWsClient(
@@ -672,9 +683,114 @@ class PuffoCoreMessageClient:
             entry.current_seq = self._queue_seq
             await self._queue.put((priority, entry.current_seq, root_id))
 
+    # Upper bound on consecutive AgentAPIError retries for a single
+    # batch before we give up. claude-code's rate limit usually lifts
+    # well inside 3 × (15-45s) of backoff; staying any longer is
+    # bad for everything else queued behind this thread.
+    MAX_API_ERROR_RETRIES = 3
+
+    async def _do_api_error_retries(
+        self,
+        *,
+        root_id: str,
+        entry: "_ThreadEntry",
+        batch: list[dict],
+        channel_meta: dict,
+        on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        last_envelope: str,
+    ) -> None:
+        """Loop the API-Error kick-retry path until the agent
+        succeeds, the retry cap is hit, or a non-retry exception
+        bubbles up. The original ``batch`` doesn't go back into
+        ``entry.messages`` — the kick path tells claude-code (via
+        --resume) to re-attempt its previous turn; if --resume is
+        gone, the adapter falls back to the payload internally.
+
+        Mid-dispatch arrivals: any new messages that landed on the
+        same thread during the failed dispatch were admitted via
+        ``_admit_thread_message``'s reopen branch and are now in
+        ``entry.messages`` with a fresh queue tuple. We don't touch
+        them; the consumer picks them up after this retry loop
+        exits.
+
+        Cursor is NOT advanced on the failed batch — if a later
+        message succeeds on this thread it'll mark a higher
+        ``sent_at`` past the failed one, effectively leaving the
+        failed envelope readable via ``get_channel_history`` for the
+        agent if it wants to backfill.
+        """
+        # Reset the in-flight set for this slot. The failed batch is
+        # no longer "currently dispatching"; future duplicates of
+        # those envelopes need to be caught by the cursor (advanced
+        # by the kick's successful dispatch) or by in-batch dedup.
+        entry.dispatching_ids = set()
+
+        if on_api_error_retry is None:
+            logger.warning(
+                "agent reply contained 'API Error' for thread %s "
+                "(last envelope %s); no retry callback wired, "
+                "abandoning batch",
+                root_id, last_envelope,
+            )
+            return
+
+        for attempt in range(1, self.MAX_API_ERROR_RETRIES + 1):
+            delay = random.uniform(15.0, 45.0)
+            logger.warning(
+                "agent reply contained 'API Error' for thread %s "
+                "(last envelope %s); kick-retry %d/%d in %.1fs",
+                root_id, last_envelope, attempt,
+                self.MAX_API_ERROR_RETRIES, delay,
+            )
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            try:
+                await on_api_error_retry(root_id, batch, channel_meta)
+                # Success path: no exception. The agent processed
+                # the retry. Advance cursor past the failed batch
+                # so we don't re-trigger on redelivery.
+                if batch:
+                    tail_sent_at = batch[-1].get("sent_at", 0)
+                    try:
+                        await self.store.mark_thread_processed(
+                            root_id, tail_sent_at,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "mark_thread_processed(%s, %d) failed "
+                            "after kick-retry; agent may re-process "
+                            "after restart",
+                            root_id, tail_sent_at,
+                        )
+                logger.info(
+                    "agent thread %s recovered after kick-retry %d/%d",
+                    root_id, attempt, self.MAX_API_ERROR_RETRIES,
+                )
+                return
+            except AgentAPIError:
+                # Still rate-limited; loop with another backoff.
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "kick-retry %d/%d for thread %s raised; abandoning",
+                    attempt, self.MAX_API_ERROR_RETRIES, root_id,
+                )
+                return
+        logger.warning(
+            "agent thread %s exhausted %d kick-retries (last envelope %s); "
+            "abandoning the batch — agent will see these messages via "
+            "get_channel_history on the next dispatch",
+            root_id, self.MAX_API_ERROR_RETRIES, last_envelope,
+        )
+
     async def _consume_queue(
         self,
         on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
+        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """Drain the priority queue serially. One turn at a time so
         the underlying session keeps a coherent conversation history;
@@ -760,49 +876,30 @@ class PuffoCoreMessageClient:
             try:
                 await on_message_batch(root_id, batch, channel_meta)
             except AgentAPIError:
-                # Adapter surfaced "API Error". Reopen the slot
-                # with the SAME batch (cursor untouched) and push a
-                # fresh queue tuple with the original priority so
-                # the next pop tries again. Back off 15-45s
-                # randomised to avoid a thundering herd across a
-                # fleet hit by the same outage.
+                # Adapter surfaced "API Error" — most commonly
+                # claude-code's transient rate-limit error. The
+                # original user input is already in claude-code's
+                # ``--resume``-backed transcript from the failed
+                # dispatch; the retry just needs to nudge the agent
+                # to try again, NOT re-send the payload (which would
+                # accumulate visible duplicates in the agent's
+                # transcript on every retry).
                 #
-                # Mid-dispatch arrivals: a new message on this thread
-                # that landed while the failed dispatch was awaiting
-                # would have hit the reopen branch of
-                # ``_admit_thread_message`` (in_queue was False) and
-                # set ``entry.messages = [new]``. We must preserve
-                # those — dedupe-prepend ``batch`` instead of
-                # overwriting, so the retry includes both the failed
-                # messages AND any in-flight arrivals.
-                self._queue_seq += 1
-                existing_ids = {
-                    m.get("envelope_id")
-                    for m in entry.messages
-                    if m.get("envelope_id")
-                }
-                carry = [
-                    m for m in batch
-                    if m.get("envelope_id") not in existing_ids
-                ]
-                entry.messages = carry + entry.messages
-                entry.in_queue = True
-                entry.current_seq = self._queue_seq
-                await self._queue.put(
-                    (entry.current_priority, entry.current_seq, root_id),
-                )
-                delay = random.uniform(15.0, 45.0)
+                # The retry path uses a small kick message ("session
+                # errored on rate limiting, please resume processing")
+                # via ``on_api_error_retry``; if ``--resume`` is no
+                # longer valid the adapter falls back to the original
+                # payload on its own so the agent has something to
+                # work from.
                 last_envelope = batch[-1].get("envelope_id", "") if batch else ""
-                logger.warning(
-                    "agent reply contained 'API Error' for thread %s "
-                    "(last envelope %s); re-queued and pausing %.1fs "
-                    "before next message",
-                    root_id, last_envelope, delay,
+                await self._do_api_error_retries(
+                    root_id=root_id,
+                    entry=entry,
+                    batch=batch,
+                    channel_meta=channel_meta,
+                    on_api_error_retry=on_api_error_retry,
+                    last_envelope=last_envelope,
                 )
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
-                    raise
                 continue
             except asyncio.CancelledError:
                 raise

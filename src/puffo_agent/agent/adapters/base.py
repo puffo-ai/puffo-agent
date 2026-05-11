@@ -94,27 +94,30 @@ class Adapter(ABC):
         """
         return None
 
-    async def invalidate_session(self) -> None:
-        """Discard the underlying runtime's resumable session so the
-        next turn starts from scratch.
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        """Retry the most recent turn after an ``AgentAPIError``.
 
-        Called by ``core.py`` right before re-raising
-        ``AgentAPIError`` (e.g. claude-code's
-        ``API Error: Server is temporarily limiting requests``). The
-        AgentAPIError retry path in the consumer re-dispatches the
-        same batch, and the cli adapters by default ``--resume`` the
-        same claude-code session — so the agent's transcript would
-        show ``user: msg_X / assistant: "API Error" / user: msg_X /
-        ...`` accumulating one duplicate per retry. Clearing the
-        session means each retry starts a fresh claude-code session
-        with just the current input. The cost is losing prior
-        conversation history; the agent's memory + MCP
-        ``get_channel_history`` can rebuild context if needed.
-
-        Default no-op for adapters that don't maintain a resumable
-        session (SDK / chat-only).
+        Default: stateless adapters (SDK, chat-only) have no
+        resumable session, so the kick is meaningless on its own;
+        send the full ``fallback_user_message`` as a normal turn.
+        cli adapters override this to send the cheap kick on
+        ``--resume`` success and fall back to the full payload only
+        when ``--resume`` failed.
         """
-        return None
+        ctx_fallback = TurnContext(
+            system_prompt=ctx.system_prompt,
+            messages=[{"role": "user", "content": fallback_user_message}],
+            workspace_dir=ctx.workspace_dir,
+            claude_dir=ctx.claude_dir,
+            memory_dir=ctx.memory_dir,
+            on_progress=ctx.on_progress,
+        )
+        return await self.run_turn(ctx_fallback)
 
     async def refresh_ping(self) -> None:
         """Force an OAuth round-trip so Anthropic's rotating refresh

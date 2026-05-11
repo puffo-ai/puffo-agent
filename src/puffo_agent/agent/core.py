@@ -62,19 +62,6 @@ class PuffoAgent:
         # Conversation log shared across all channels.
         self.log: list[dict] = []
 
-        # Envelopes already appended to ``self.log`` (and hence the
-        # adapter's claude-code session). On AgentAPIError the consumer
-        # re-enqueues the failed batch and ``handle_message_batch``
-        # runs again — without this set, the same envelope would be
-        # ``_append_user``ed a second time, doubling its appearance in
-        # the agent's transcript. The agent then sees what looks like
-        # a dup wire delivery (it isn't — it's a retry of a single
-        # delivery whose previous turn failed with rate-limiting). Set
-        # lives for the lifetime of this PuffoAgent (one per worker
-        # lifecycle) so cross-restart redeliveries that hit the
-        # cursor check upstream don't even reach here.
-        self._appended_envelope_ids: set[str] = set()
-
     # ── Message handling ──────────────────────────────────────────────────────
 
     async def handle_message(
@@ -139,23 +126,7 @@ class PuffoAgent:
         """
         if not batch:
             return None
-        appended_this_call = 0
         for msg in batch:
-            env_id = msg.get("envelope_id", "")
-            # Skip envelopes already in the session log. This is the
-            # AgentAPIError retry path: the previous attempt at this
-            # batch failed (rate-limited or otherwise), the consumer
-            # re-enqueued, and we're here again. The envelope is
-            # already in claude-code's transcript — appending it a
-            # second time would surface as a "duplicate user input"
-            # in the agent's own conversation view.
-            if env_id and env_id in self._appended_envelope_ids:
-                self.logger.info(
-                    "handle_message_batch: skipping re-append of "
-                    "already-seen envelope=%s (likely AgentAPIError retry)",
-                    env_id,
-                )
-                continue
             self._append_user(
                 channel_meta.get("channel_name", ""),
                 msg.get("sender_slug", ""),
@@ -166,15 +137,12 @@ class PuffoAgent:
                 attachments=msg.get("attachments") or [],
                 sender_is_bot=msg.get("sender_is_bot", False),
                 mentions=msg.get("mentions") or [],
-                post_id=env_id,
+                post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
                 followups=None,
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
             )
-            if env_id:
-                self._appended_envelope_ids.add(env_id)
-            appended_this_call += 1
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
         # agent itself decides who to reply to.
@@ -184,6 +152,93 @@ class PuffoAgent:
             sender=last_msg.get("sender_slug", ""),
             on_progress=on_progress,
         )
+
+    async def handle_api_error_retry(
+        self,
+        root_id: str,
+        channel_meta: dict,
+        fallback_batch: list[dict],
+        on_progress=None,
+    ) -> str | None:
+        """Retry the most recently failed turn.
+
+        Doesn't touch ``self.log`` — the original user input is
+        already in there from the first attempt. The adapter sends
+        a small kick ("session errored on rate limiting, please
+        resume processing") when ``--resume`` is still live, or
+        falls back to the original ``fallback_batch`` payload when
+        the resumable session has been lost.
+
+        Reply routing is the same as ``_run_turn_and_route`` (the
+        ``AgentAPIError`` raise still happens here on consecutive
+        failures, so the consumer keeps incrementing its retry
+        counter).
+        """
+        kick_text = (
+            "[system] session errored on rate limiting, "
+            "please resume processing."
+        )
+        # Fallback is the same payload ``_append_user`` would have
+        # produced. For multi-message batches we only have the
+        # adapter API for a single user_message, so concatenate.
+        fallback_chunks: list[str] = []
+        for msg in fallback_batch:
+            fallback_chunks.append(self._format_user_block(
+                channel_name=channel_meta.get("channel_name", ""),
+                sender=msg.get("sender_slug", ""),
+                sender_email=msg.get("sender_email", ""),
+                text=msg.get("text", ""),
+                channel_id=channel_meta.get("channel_id", ""),
+                root_id=root_id,
+                attachments=msg.get("attachments") or [],
+                sender_is_bot=msg.get("sender_is_bot", False),
+                mentions=msg.get("mentions") or [],
+                post_id=msg.get("envelope_id", ""),
+                create_at=msg.get("sent_at", 0),
+                space_id=channel_meta.get("space_id", ""),
+                space_name=channel_meta.get("space_name", ""),
+            ))
+        fallback_text = "\n\n".join(fallback_chunks)
+
+        ctx = TurnContext(
+            system_prompt=self.system_prompt,
+            messages=list(self.log),
+            workspace_dir=self.workspace_dir,
+            claude_dir=self.claude_dir,
+            memory_dir=self.memory_dir,
+            on_progress=on_progress,
+        )
+        result = await self.adapter.run_retry_turn(
+            kick_text, fallback_text, ctx,
+        )
+
+        # Route reply the same way as a normal turn so the consumer
+        # picks up AgentAPIError again on consecutive rate-limit
+        # failures.
+        send_message_called = bool(result.metadata.get("send_message_targets"))
+        text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
+        if send_message_called:
+            if result.reply:
+                self._append_assistant(
+                    channel_meta.get("channel_name", ""), result.reply,
+                )
+            return None
+        joined = "\n".join(text_parts) if text_parts else (result.reply or "")
+        if "[SILENT]" in joined:
+            return None
+        if "API Error" in joined:
+            self.logger.warning(
+                "[api-error-retry] adapter still rate-limited; "
+                "raising for consumer-side backoff"
+            )
+            raise AgentAPIError(
+                "agent adapter output contained 'API Error' on retry"
+            )
+        if not text_parts and not result.reply:
+            return None
+        fallback = _format_assistant_fallback(text_parts, result.reply)
+        self._append_assistant(channel_meta.get("channel_name", ""), fallback)
+        return fallback
 
     async def _run_turn_and_route(
         self,
@@ -240,26 +295,8 @@ class PuffoAgent:
         if "API Error" in joined:
             self.logger.warning(
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
-                "contained 'API Error'; suppressing post + flagging for retry"
+                "contained 'API Error'; suppressing post, abandoning batch"
             )
-            # Forget the adapter's resumable claude-code session
-            # before the retry. Without this, the consumer's
-            # AgentAPIError handler re-dispatches the batch, the
-            # cli adapter ``--resume``s the same session, and
-            # claude-code appends the same user input again — the
-            # agent then sees the message twice (or N times for N
-            # retries) inside its own conversation transcript even
-            # though the wire only delivered once. Forgetting the
-            # session means the retry starts fresh: lost prior
-            # conversation history is the tradeoff for not faking
-            # a duplicate delivery to the LLM.
-            try:
-                await self.adapter.invalidate_session()
-            except Exception:
-                self.logger.exception(
-                    "adapter.invalidate_session() failed; retry may "
-                    "still duplicate the user input in the transcript"
-                )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error'"
             )
@@ -295,6 +332,43 @@ class PuffoAgent:
         space_id: str = "",
         space_name: str = "",
     ):
+        content = self._format_user_block(
+            channel_name=channel_name,
+            sender=sender,
+            sender_email=sender_email,
+            text=text,
+            attachments=attachments,
+            channel_id=channel_id,
+            root_id=root_id,
+            sender_is_bot=sender_is_bot,
+            mentions=mentions,
+            post_id=post_id,
+            create_at=create_at,
+            followups=followups,
+            space_id=space_id,
+            space_name=space_name,
+        )
+        self.log.append({"role": "user", "content": content})
+        self._truncate_log()
+
+    def _format_user_block(
+        self,
+        *,
+        channel_name: str,
+        sender: str,
+        sender_email: str,
+        text: str,
+        attachments: list[str] | None,
+        channel_id: str = "",
+        root_id: str = "",
+        sender_is_bot: bool = False,
+        mentions: list[dict] | None = None,
+        post_id: str = "",
+        create_at: int = 0,
+        followups: list[dict] | None = None,
+        space_id: str = "",
+        space_name: str = "",
+    ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
         # "[#channel] @user:" style prefixes back into replies. Format
@@ -351,8 +425,7 @@ class PuffoAgent:
                 lines.append(
                     f"  - [{ts} post:{fid}] @{fsender}: {ftext}"
                 )
-        self.log.append({"role": "user", "content": "\n".join(lines)})
-        self._truncate_log()
+        return "\n".join(lines)
 
     def _append_assistant(self, channel_name: str, reply: str):
         self.log.append({"role": "assistant", "content": reply})

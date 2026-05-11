@@ -69,15 +69,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   session, so the same user message got appended to the transcript
   once per retry. A receiver who saw `×4` was hitting the rate
   limit four times before succeeding, with each attempt being a
-  legitimate retry of one real wire delivery. Adds
-  `Adapter.invalidate_session()` (implemented in cli-local /
-  cli-docker via a new `ClaudeSession.invalidate`) and calls it in
-  `_run_turn_and_route` right before re-raising `AgentAPIError`.
-  Each retry now starts a fresh claude-code session with no
-  `--resume`, so the agent's transcript shows the input exactly
-  once. Tracks `_appended_envelope_ids` on the `PuffoAgent` so the
-  retry's `handle_message_batch` doesn't re-`_append_user` the
-  same envelope into `self.log` either.
+  legitimate retry of one real wire delivery. New behaviour:
+  preserve `--resume`, send a kick-only "session errored on rate
+  limiting, please resume processing" instead of re-appending the
+  batch. The cli adapter falls back to the full payload only when
+  `_ResumeFailed` was caught and a fresh claude-code session was
+  spawned (so the transcript has no original input to resume from).
+  Plumbed via a new `Adapter.run_retry_turn(kick_text,
+  fallback_user_message, ctx)` and a parallel
+  `_consume_queue(on_api_error_retry=...)` callback. Capped at 3
+  retries per batch; on exhaustion the cursor stays put so the
+  failed envelopes remain readable via `get_channel_history` on
+  the agent's next normal turn.
 - cli-docker now auto-recreates a reused container when its
   `/opt/puffoagent-pkg` bind mount no longer resolves to the host
   path that contains `puffo_agent` (typical cause: the operator

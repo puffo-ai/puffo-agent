@@ -650,6 +650,34 @@ class Worker:
                 # reply lands in the thread the agent was reading.
                 await client.post_message(channel_id, reply, root_id=root_id)
 
+        async def on_api_error_retry(
+            root_id: str,
+            batch: list[dict],
+            channel_meta: dict,
+        ):
+            """Kick-retry path after an ``AgentAPIError``. Calls the
+            agent's retry method, which sends a small "session
+            errored on rate limiting, please resume processing"
+            kick to claude-code over ``--resume`` instead of
+            re-appending the original batch. If ``--resume`` is no
+            longer valid, the adapter falls back to the full
+            ``batch`` payload on its own.
+
+            Raises ``AgentAPIError`` again if the kick also surfaces
+            the rate limit, so the consumer's outer retry loop can
+            apply another backoff or give up after the cap.
+            """
+            channel_id = channel_meta.get("channel_id", "")
+            reply = await puffo.handle_api_error_retry(
+                root_id=root_id,
+                channel_meta=channel_meta,
+                fallback_batch=batch,
+            )
+            self.runtime.msg_count += 1
+            self.runtime.last_event_at = int(time.time())
+            if reply:
+                await client.post_message(channel_id, reply, root_id=root_id)
+
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
             while not self._stop.is_set():
@@ -723,7 +751,10 @@ class Worker:
         try:
             while not self._stop.is_set():
                 try:
-                    await client.listen(on_message=on_message_batch)
+                    await client.listen(
+                        on_message=on_message_batch,
+                        on_api_error_retry=on_api_error_retry,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:

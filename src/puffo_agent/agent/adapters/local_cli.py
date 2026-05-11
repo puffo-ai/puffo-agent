@@ -152,6 +152,18 @@ class LocalCLIAdapter(Adapter):
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        self._verify()
+        session = self._ensure_session()
+        return await session.run_retry_turn(
+            kick_text, fallback_user_message, ctx.system_prompt,
+        )
+
     async def warm(self, system_prompt: str) -> None:
         """Spawn the claude subprocess eagerly when this agent has a
         persisted session; fresh agents wait for their first message
@@ -174,10 +186,6 @@ class LocalCLIAdapter(Adapter):
         if self._session is not None:
             await self._session.aclose()
             self._session = None
-
-    async def invalidate_session(self) -> None:
-        if self._session is not None:
-            await self._session.invalidate()
 
     def _credentials_expires_in_seconds(self) -> int | None:
         # All cli-local agents share the HOST's .credentials.json

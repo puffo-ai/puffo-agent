@@ -741,11 +741,16 @@ async def test_duplicate_envelope_during_dispatch_is_skipped():
 
 
 @pytest.mark.asyncio
-async def test_api_error_preserves_mid_dispatch_arrivals():
-    """When the agent dispatch raises AgentAPIError AND a new message
-    arrived on the same thread during that failed dispatch, the new
-    message must NOT be lost. The retry batch should include both the
-    original (failed) messages AND the mid-dispatch arrival.
+async def test_api_error_calls_kick_retry_not_re_enqueue():
+    """``AgentAPIError`` from the main dispatch should trigger the
+    ``on_api_error_retry`` callback (the kick path) instead of
+    re-dispatching the original batch. The original user input is
+    already in claude-code's ``--resume`` transcript; re-sending
+    would duplicate it.
+
+    The kick callback receives the same ``(root_id, batch,
+    channel_meta)`` as a fallback in case ``--resume`` itself fails;
+    on success the cursor advances past the failed batch.
     """
     from puffo_agent.agent.core import AgentAPIError
 
@@ -759,46 +764,33 @@ async def test_api_error_preserves_mid_dispatch_arrivals():
         channel_meta=_channel_meta(),
     )
 
-    batches: list[list[str]] = []
-    in_first_dispatch = asyncio.Event()
-    resume_first = asyncio.Event()
-    second_done = asyncio.Event()
+    dispatched: list[list[str]] = []
+    retry_batches: list[list[str]] = []
+    retry_done = asyncio.Event()
 
-    async def callback(root_id, batch, channel_meta):
-        batches.append([m["envelope_id"] for m in batch])
-        if len(batches) == 1:
-            in_first_dispatch.set()
-            await resume_first.wait()
-            raise AgentAPIError("provider 429")
-        elif len(batches) == 2:
-            second_done.set()
+    async def on_message_batch(root_id, batch, channel_meta):
+        dispatched.append([m["envelope_id"] for m in batch])
+        raise AgentAPIError("provider 429")
 
-    # Neutralise jitter (0-1.5s) and the API-error backoff (15-45s)
-    # so the test doesn't burn real wall-clock time.
+    async def on_retry(root_id, batch, channel_meta):
+        retry_batches.append([m["envelope_id"] for m in batch])
+        retry_done.set()
+        # First kick succeeds (no AgentAPIError).
+
+    # Patch jitter + API-error backoff to zero so the test runs fast.
     import puffo_agent.agent.puffo_core_client as mod
     original_uniform = mod.random.uniform
 
     def fake_uniform(a, b):
-        if (a, b) == (0.0, 1.5):
-            return 0.0
-        if (a, b) == (15.0, 45.0):
-            return 0.0
-        return original_uniform(a, b)
+        return 0.0 if (a, b) in ((0.0, 1.5), (15.0, 45.0)) else original_uniform(a, b)
 
     mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
-        task = asyncio.create_task(client._consume_queue(callback))
+        task = asyncio.create_task(
+            client._consume_queue(on_message_batch, on_retry),
+        )
         try:
-            await asyncio.wait_for(in_first_dispatch.wait(), timeout=2.0)
-            # Mid-dispatch arrival: must survive the failed dispatch.
-            await client._admit_thread_message(
-                root_id="env_root",
-                priority=PRIORITY_HUMAN,
-                msg_dict=_msg("env_2", sent_at=200),
-                channel_meta=_channel_meta(),
-            )
-            resume_first.set()
-            await asyncio.wait_for(second_done.wait(), timeout=2.0)
+            await asyncio.wait_for(retry_done.wait(), timeout=2.0)
         finally:
             task.cancel()
             try:
@@ -808,19 +800,26 @@ async def test_api_error_preserves_mid_dispatch_arrivals():
     finally:
         mod.random.uniform = original_uniform  # type: ignore[assignment]
 
-    # The retry should include both env_1 (the failed batch) and
-    # env_2 (the mid-dispatch arrival). Without the fix, env_2 was
-    # clobbered by ``entry.messages = batch`` and dropped silently.
-    assert batches[0] == ["env_1"]
-    assert batches[1] == ["env_1", "env_2"]
+    # One main dispatch + one kick retry. The kick gets the
+    # original batch as fallback (so the adapter has something to
+    # send if --resume failed), but the consumer never re-enqueued
+    # the batch through the main on_message_batch path.
+    assert dispatched == [["env_1"]]
+    assert retry_batches == [["env_1"]]
+    # Cursor advanced after successful kick so a redelivered env_1
+    # via /messages/pending after a restart won't re-trigger.
+    assert await store.get_last_processed_sent_at("env_root") == 100
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_api_error_requeues_same_batch_preserves_cursor():
-    """``AgentAPIError`` re-enqueues the same batch without advancing
-    the durable cursor. The next pop must see the same messages."""
+async def test_api_error_kick_retries_capped():
+    """If the kick itself keeps raising AgentAPIError, the consumer
+    gives up after ``MAX_API_ERROR_RETRIES`` attempts. The failed
+    batch is abandoned (cursor stays at 0) so the agent can pick
+    those envelopes up via tools the next time it runs."""
     from puffo_agent.agent.core import AgentAPIError
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
     store = await _make_store()
     client = _make_client_for_queue(store)
@@ -831,61 +830,50 @@ async def test_api_error_requeues_same_batch_preserves_cursor():
         msg_dict=_msg("env_1", sent_at=100),
         channel_meta=_channel_meta(),
     )
-    await client._admit_thread_message(
-        root_id="env_root",
-        priority=PRIORITY_HUMAN,
-        msg_dict=_msg("env_2", sent_at=200),
-        channel_meta=_channel_meta(),
-    )
 
-    call_count = 0
-    seen_batches: list[list[dict]] = []
+    main_calls = 0
+    retry_calls = 0
 
-    async def callback(root_id, batch, channel_meta):
-        nonlocal call_count
-        seen_batches.append(list(batch))
-        call_count += 1
-        if call_count == 1:
-            raise AgentAPIError("provider 429")
-        # second call: success, stop consumer
-        raise asyncio.CancelledError()
+    async def on_message_batch(root_id, batch, channel_meta):
+        nonlocal main_calls
+        main_calls += 1
+        raise AgentAPIError("provider 429")
 
-    # Patch the sleep so we don't wait 15-45s in tests.
+    async def on_retry(root_id, batch, channel_meta):
+        nonlocal retry_calls
+        retry_calls += 1
+        raise AgentAPIError("still rate limited")
+
     import puffo_agent.agent.puffo_core_client as mod
-    original_sleep = mod.asyncio.sleep
-    sleeps: list[float] = []
+    original_uniform = mod.random.uniform
 
-    async def fake_sleep(seconds):
-        sleeps.append(seconds)
-        return None
+    def fake_uniform(a, b):
+        return 0.0 if (a, b) in ((0.0, 1.5), (15.0, 45.0)) else original_uniform(a, b)
 
-    mod.asyncio.sleep = fake_sleep  # type: ignore[assignment]
+    mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
-        task = asyncio.create_task(client._consume_queue(callback))
+        task = asyncio.create_task(
+            client._consume_queue(on_message_batch, on_retry),
+        )
         try:
-            await asyncio.wait_for(task, timeout=2.0)
-        except asyncio.CancelledError:
-            pass
-        except asyncio.TimeoutError:
+            # Loop should exit after the main dispatch + cap retries,
+            # then block on queue.get for the next thread. Cancel
+            # after a short window.
+            await asyncio.sleep(0.2)
+        finally:
             task.cancel()
             try:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
     finally:
-        mod.asyncio.sleep = original_sleep  # type: ignore[assignment]
+        mod.random.uniform = original_uniform  # type: ignore[assignment]
 
-    assert call_count == 2
-    # Both invocations saw the same batch (cursor preserved).
-    assert [m["envelope_id"] for m in seen_batches[0]] == ["env_1", "env_2"]
-    assert [m["envelope_id"] for m in seen_batches[1]] == ["env_1", "env_2"]
-    # We slept for the back-off between the two attempts.
-    assert any(s > 0 for s in sleeps)
-    # Cursor was NOT advanced for the failing turn but IS advanced
-    # for the successful one (the second call was cancelled before
-    # mark_thread_processed ran, so cursor stays at 0). Acceptable —
-    # the second attempt's failure-mode (CancelledError) is an
-    # artificial stop signal in this test, not a real success path.
+    assert main_calls == 1
+    assert retry_calls == PuffoCoreMessageClient.MAX_API_ERROR_RETRIES
+    # Cursor NOT advanced — the failed batch wasn't successfully
+    # processed by the agent.
+    assert await store.get_last_processed_sent_at("env_root") == 0
     await store.close()
 
 

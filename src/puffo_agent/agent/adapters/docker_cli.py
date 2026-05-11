@@ -209,6 +209,31 @@ class DockerCLIAdapter(Adapter):
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        # claude-code only — hermes / gemini-cli always run one-shot
+        # without --resume, so a retry is just a normal turn against
+        # the fallback payload.
+        if self.harness.name() != "claude-code":
+            ctx_fallback = TurnContext(
+                system_prompt=ctx.system_prompt,
+                messages=[{"role": "user", "content": fallback_user_message}],
+                workspace_dir=ctx.workspace_dir,
+                claude_dir=ctx.claude_dir,
+                memory_dir=ctx.memory_dir,
+                on_progress=ctx.on_progress,
+            )
+            return await self.run_turn(ctx_fallback)
+        await self._ensure_started()
+        session = self._ensure_session()
+        return await session.run_retry_turn(
+            kick_text, fallback_user_message, ctx.system_prompt,
+        )
+
     async def _run_turn_hermes(self, user_message: str, system_prompt: str) -> TurnResult:
         """One-shot hermes turn via ``hermes chat --provider anthropic
         --quiet [--continue] -q <prompt>``.
@@ -598,10 +623,6 @@ class DockerCLIAdapter(Adapter):
         if self._session is not None:
             await self._session.aclose()
             self._session = None
-
-    async def invalidate_session(self) -> None:
-        if self._session is not None:
-            await self._session.invalidate()
 
     def _credentials_expires_in_seconds(self) -> int | None:
         # Every cli-docker agent's container reads the host's
