@@ -21,6 +21,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   last_processed_sent_at)` table records the last `sent_at` drained
   per thread. On startup the runtime skips anything at or below that
   cursor so a crash mid-batch doesn't replay the whole thread.
+- Pre-dispatch jitter (0.0–1.5s) before each batch is sent to the
+  agent. When multiple agents on the same host get activated by one
+  broadcast message, unblocked dispatch sends them all into the
+  claude-code API simultaneously and trips its rate limit; the
+  random sleep desynchronises them. Each agent picks its own delay
+  independently — no host-wide coordination needed.
 
 ### Fixed
 

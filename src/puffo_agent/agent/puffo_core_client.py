@@ -673,6 +673,19 @@ class PuffoCoreMessageClient:
             entry.messages = []
             entry.in_queue = False
 
+            # Pre-dispatch jitter. When several agents on the same
+            # host get activated by the same message (e.g. a channel
+            # broadcast), unblocked dispatch sends them all into the
+            # claude-code API at once and trips its rate limit. A
+            # 0.0–1.5s random sleep here desynchronises them; each
+            # agent picks independently. Messages that arrive during
+            # the sleep land in the next batch because in_queue is
+            # already False.
+            try:
+                await asyncio.sleep(random.uniform(0.0, 1.5))
+            except asyncio.CancelledError:
+                raise
+
             try:
                 await on_message_batch(root_id, batch, channel_meta)
             except AgentAPIError:

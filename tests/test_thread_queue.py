@@ -485,6 +485,59 @@ async def test_arrival_after_processing_does_not_replay():
 
 
 @pytest.mark.asyncio
+async def test_consume_jitters_before_dispatch():
+    """Pre-dispatch sleep of 0.0–1.5s desynchronises agents on the
+    same host that get activated by one broadcast message. Verifies
+    ``asyncio.sleep`` is awaited with a value in that range BEFORE
+    the on_message_batch callback fires."""
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_1", sent_at=100),
+        channel_meta=_channel_meta(),
+    )
+
+    import puffo_agent.agent.puffo_core_client as mod
+    original_sleep = mod.asyncio.sleep
+    sleeps_before_callback: list[float] = []
+    done = asyncio.Event()
+
+    async def fake_sleep(seconds):
+        if not done.is_set():
+            sleeps_before_callback.append(seconds)
+        return None
+
+    async def callback(root_id, batch, channel_meta):
+        done.set()
+
+    mod.asyncio.sleep = fake_sleep  # type: ignore[assignment]
+    try:
+        task = asyncio.create_task(client._consume_queue(callback))
+        try:
+            # Wait on the Event directly so we don't issue any sleep
+            # calls that would pollute the recording.
+            await asyncio.wait_for(done.wait(), timeout=2.0)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        mod.asyncio.sleep = original_sleep  # type: ignore[assignment]
+
+    assert done.is_set(), "callback never fired"
+    # Exactly one pre-dispatch sleep, and it sits in the jitter band.
+    assert len(sleeps_before_callback) == 1
+    delay = sleeps_before_callback[0]
+    assert 0.0 <= delay <= 1.5
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_api_error_requeues_same_batch_preserves_cursor():
     """``AgentAPIError`` re-enqueues the same batch without advancing
     the durable cursor. The next pop must see the same messages."""
