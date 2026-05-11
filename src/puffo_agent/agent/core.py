@@ -96,7 +96,73 @@ class PuffoAgent:
             space_id=space_id,
             space_name=space_name,
         )
+        return await self._run_turn_and_route(
+            channel_name=channel_name,
+            sender=sender,
+            on_progress=on_progress,
+        )
 
+    async def handle_message_batch(
+        self,
+        root_id: str,
+        batch: list[dict],
+        channel_meta: dict,
+        on_progress=None,
+    ) -> str | None:
+        """One adapter turn over a whole thread batch.
+
+        Each entry in ``batch`` is the same decoded-message dict the
+        listen handler used to enqueue (envelope_id, sender_slug,
+        text, attachments, mentions, sent_at, sender_is_bot,
+        is_dm…). The thread/channel context is constant across the
+        batch and rides on ``channel_meta`` (channel_id,
+        channel_name, space_id, space_name).
+
+        The agent sees every message in order as separate ``user``
+        turns in the shell log so the LLM can reason about who said
+        what and decide on its own how many replies to issue. The
+        ``followups`` field on the old single-message path is gone —
+        every message is a real user turn now.
+        """
+        if not batch:
+            return None
+        for msg in batch:
+            self._append_user(
+                channel_meta.get("channel_name", ""),
+                msg.get("sender_slug", ""),
+                msg.get("sender_email", ""),
+                msg.get("text", ""),
+                channel_id=channel_meta.get("channel_id", ""),
+                root_id=root_id,
+                attachments=msg.get("attachments") or [],
+                sender_is_bot=msg.get("sender_is_bot", False),
+                mentions=msg.get("mentions") or [],
+                post_id=msg.get("envelope_id", ""),
+                create_at=msg.get("sent_at", 0),
+                followups=None,
+                space_id=channel_meta.get("space_id", ""),
+                space_name=channel_meta.get("space_name", ""),
+            )
+        # Route logging uses the LAST sender in the batch as the
+        # display "trigger" for log lines — purely cosmetic, the
+        # agent itself decides who to reply to.
+        last_msg = batch[-1]
+        return await self._run_turn_and_route(
+            channel_name=channel_meta.get("channel_name", ""),
+            sender=last_msg.get("sender_slug", ""),
+            on_progress=on_progress,
+        )
+
+    async def _run_turn_and_route(
+        self,
+        channel_name: str,
+        sender: str,
+        on_progress=None,
+    ) -> str | None:
+        """Shared tail for ``handle_message`` and ``handle_message_batch``.
+        Runs one adapter turn against the current ``self.log`` and
+        routes the reply per the rules below.
+        """
         ctx = TurnContext(
             system_prompt=self.system_prompt,
             messages=list(self.log),

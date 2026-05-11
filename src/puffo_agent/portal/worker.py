@@ -497,16 +497,31 @@ class Worker:
         # channel + root to reply to.
         current_turn_path = Path(workspace_path) / ".puffo-agent" / "current_turn.json"
 
-        async def on_message(
-            channel_id, channel_name, sender, sender_email, text,
-            root_id, direct, attachments, sender_is_bot, mentions,
-            post_id, create_at, followups,
-            *, space_id="", space_name="",
+        async def on_message_batch(
+            root_id: str,
+            batch: list[dict],
+            channel_meta: dict,
         ):
-            # Honour reload before the turn so the first message after
+            """One agent turn per thread batch. The puffo-core client
+            collapses every arrival on the same ``root_id`` into a
+            single list and hands it here in arrival order. The agent
+            sees every message in one turn and decides whom (and how
+            many times) to reply on its own.
+
+            Server-side processing-run telemetry is keyed on the
+            triggering post id; we use the LAST envelope in the batch
+            as that anchor since it's the most recent thing the agent
+            is reasoning about. The reply, if any, posts back to
+            ``root_id`` as a thread reply (or to the channel root for
+            a top-level batch).
+            """
+            if not batch:
+                return
+            triggering_post_id = batch[-1].get("envelope_id", "")
+            channel_id = channel_meta.get("channel_id", "")
+
+            # Honour reload before the turn so the first batch after
             # a flag-drop picks up fresh CLAUDE.md / profile / memory.
-            # Flag-drops happen mid-turn; the next turn is the earliest
-            # safe point to reload.
             if reload_flag_path.exists():
                 await _reload_from_disk(
                     agent_id=agent_id,
@@ -536,7 +551,7 @@ class Worker:
                     json.dumps({
                         "channel_id": channel_id,
                         "root_id": root_id,
-                        "triggering_post_id": post_id,
+                        "triggering_post_id": triggering_post_id,
                     }),
                     encoding="utf-8",
                 )
@@ -548,40 +563,40 @@ class Worker:
             # Server-side processing-run + status transitions.
             # Reporter swallows network errors so a flaky status push
             # never blocks the actual reply.
-            run_id = await reporter.begin_turn(post_id) if post_id else None
+            run_id = (
+                await reporter.begin_turn(triggering_post_id)
+                if triggering_post_id
+                else None
+            )
             turn_succeeded = True
             turn_error: str | None = None
             try:
-                reply = await puffo.handle_message(
-                    channel_id, channel_name, sender, sender_email, text, direct,
-                    attachments=attachments,
-                    sender_is_bot=sender_is_bot,
-                    mentions=mentions,
-                    post_id=post_id,
+                reply = await puffo.handle_message_batch(
                     root_id=root_id,
-                    create_at=create_at,
-                    followups=followups,
-                    space_id=space_id,
-                    space_name=space_name,
+                    batch=batch,
+                    channel_meta=channel_meta,
                 )
             except AgentAPIError as exc:
                 # Adapter surfaced an "API Error" string. Mark turn
                 # errored and re-raise; the consumer loop re-enqueues
-                # the message and backs off.
+                # the batch with cursor preserved and backs off.
                 logger.warning("agent %s: api-error retry: %s", agent_id, exc)
                 reply = None
                 turn_succeeded = False
                 turn_error = "API Error"
                 raise
             except Exception as exc:
-                logger.error("agent %s: handle_message error: %s", agent_id, exc, exc_info=True)
+                logger.error(
+                    "agent %s: handle_message_batch error: %s",
+                    agent_id, exc, exc_info=True,
+                )
                 reply = None
                 turn_succeeded = False
                 turn_error = f"{type(exc).__name__}: {exc}"
             finally:
-                if run_id is not None and post_id:
+                if run_id is not None and triggering_post_id:
                     await reporter.end_turn(
-                        post_id,
+                        triggering_post_id,
                         run_id,
                         succeeded=turn_succeeded,
                         error_text=turn_error,
@@ -593,9 +608,14 @@ class Worker:
                     current_turn_path.unlink()
                 except OSError:
                     pass
+            # One batch = one "message" for the runtime counter; the
+            # display still reads as "N messages processed."
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
             if reply:
+                # Fallback reply when the agent skipped both
+                # send_message and [SILENT]. Post to root so the
+                # reply lands in the thread the agent was reading.
                 await client.post_message(channel_id, reply, root_id=root_id)
 
         async def heartbeat():
@@ -669,7 +689,7 @@ class Worker:
         try:
             while not self._stop.is_set():
                 try:
-                    await client.listen(on_message=on_message)
+                    await client.listen(on_message=on_message_batch)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:

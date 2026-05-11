@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
@@ -34,6 +35,41 @@ PRIORITY_MENTIONED_BOT = 2
 PRIORITY_HUMAN = 3
 PRIORITY_BOT = 4
 PRIORITY_SYSTEM = 5
+
+
+@dataclass
+class _ThreadEntry:
+    """Per-thread queue state.
+
+    The PriorityQueue itself stores ``(priority, seq, root_id)``
+    tuples so the heap can order by priority and break ties on
+    monotonic seq (dicts aren't orderable). The real per-thread
+    state lives here, keyed by ``root_id``:
+
+    - ``messages`` holds every decoded message dict for this
+      thread that has been enqueued but not yet dispatched. The
+      consumer drains the whole list in a single ``on_message_batch``
+      call, so messages that arrived between the first enqueue and
+      the eventual pop all reach the agent as one turn.
+    - ``current_priority`` / ``current_seq`` are the priority and
+      seq currently active in the queue. When a new arrival on the
+      same root bumps priority, we DON'T remove the stale heap
+      entry (``asyncio.PriorityQueue`` doesn't support that); we
+      push a fresh tuple and let the consumer drop the old one when
+      it pops and notices ``seq`` no longer matches the entry's
+      ``current_seq``.
+    - ``in_queue`` flips False between successful dispatch and the
+      next arrival on this root, so a later message reopens the
+      entry cleanly instead of stacking into a stale batch.
+    - ``channel_meta`` is captured on the first enqueue and reused
+      on dispatch; the thread/channel/space context is invariant
+      for a given root.
+    """
+    current_priority: int
+    current_seq: int
+    messages: list[dict] = field(default_factory=list)
+    in_queue: bool = True
+    channel_meta: dict = field(default_factory=dict)
 
 
 async def _fetch_blob_with_retry(
@@ -273,6 +309,12 @@ class PuffoCoreMessageClient:
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
     ) -> None:
+        """``on_message`` is the thread-batch callback. Despite the
+        legacy parameter name kept for caller compatibility, it's
+        invoked as ``on_message(root_id, batch, channel_meta)`` —
+        the consumer collapses every arrival on the same thread
+        into a single dispatch (see ``_consume_queue``).
+        """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
             decode_secret(identity.kem_secret_key)
@@ -433,14 +475,29 @@ class PuffoCoreMessageClient:
             else:
                 channel_name = channel_id
 
-            # Monotonic ``seq`` tiebreaker keeps PriorityQueue from
-            # comparing the args dict on ties (dicts aren't orderable
-            # so a same-priority pair would TypeError).
             direct = is_dm or is_mention
             sender_is_bot = False  # puffo-core has no is_bot flag yet
             priority = _compute_priority(direct, sender_is_bot)
-            self._queue_seq += 1
-            await self._queue.put((priority, self._queue_seq, {
+
+            # Thread-batched queue: every message coalesces under
+            # its ``root_id`` (the envelope's ``thread_root_id``, or
+            # the message itself when it's a top-level post). The
+            # PriorityQueue holds one slot per root; new arrivals on
+            # the same thread either join the existing batch
+            # (priority same or lower) or bump the slot to the new
+            # higher priority. The agent processes one whole thread
+            # at a time in ``on_message_batch``.
+            root_id = payload.thread_root_id or payload.envelope_id
+
+            # Cross-restart dedup: after a daemon restart the server
+            # redelivers anything in /messages/pending. If we already
+            # dispatched a batch that covers ``payload.sent_at``,
+            # skip — the agent has seen this.
+            last_processed = await self.store.get_last_processed_sent_at(root_id)
+            if payload.sent_at <= last_processed:
+                return
+
+            msg_dict = {
                 "channel_id": channel_id,
                 "channel_name": channel_name,
                 "space_id": space_id,
@@ -455,13 +512,30 @@ class PuffoCoreMessageClient:
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
-            }))
+            }
+            channel_meta = {
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "space_id": space_id,
+                "space_name": space_name,
+                "is_dm": is_dm,
+            }
+
+            await self._admit_thread_message(
+                root_id=root_id,
+                priority=priority,
+                msg_dict=msg_dict,
+                channel_meta=channel_meta,
+            )
 
         # Per-listen() queue. A reconnect drops any envelopes not yet
         # drained; the server redelivers via /messages/pending on the
-        # next subscribe.
+        # next subscribe, and the sqlite ``thread_processing_state``
+        # cursor keeps the agent from re-running on threads it already
+        # handled before the restart.
         self._queue = asyncio.PriorityQueue()
         self._queue_seq = 0
+        self._thread_state: dict[str, _ThreadEntry] = {}
         # Reset on every (re)connect — the auto-accept path is
         # idempotent against server-side state.
         self._processed_invite_ids = set()
@@ -488,55 +562,160 @@ class PuffoCoreMessageClient:
                 except (asyncio.CancelledError, Exception):
                     pass
 
+    async def _admit_thread_message(
+        self,
+        *,
+        root_id: str,
+        priority: int,
+        msg_dict: dict,
+        channel_meta: dict,
+    ) -> None:
+        """Add (or coalesce) a message into the thread-batched queue.
+
+        Cases (all keyed on ``root_id``):
+
+        - **New root** (no entry yet): build a fresh ``_ThreadEntry``
+          with this message as the only element and push a heap tuple.
+        - **Reopen** (entry exists but ``in_queue`` is False — a
+          previous batch was already dispatched): reset the entry with
+          this message as the new cursor and push a fresh heap tuple.
+        - **In-queue, same-or-lower priority** (priority numeric value
+          unchanged or larger): append to the existing batch. The
+          cursor (``messages[0]``) stays pinned; the heap tuple
+          doesn't move.
+        - **In-queue, higher priority** (smaller numeric value): append
+          to the batch AND push a new heap tuple with the upgraded
+          priority and a fresh seq. The old tuple is left in the heap
+          and gets skipped on pop via the ``current_seq`` mismatch
+          check in ``_consume_queue``.
+
+        Caller must have already filtered out messages whose
+        ``sent_at`` is at or below
+        ``store.get_last_processed_sent_at(root_id)``; this method
+        doesn't re-check the durable cursor.
+        """
+        entry = self._thread_state.get(root_id)
+        if entry is None or not entry.in_queue:
+            self._queue_seq += 1
+            if entry is None:
+                entry = _ThreadEntry(
+                    current_priority=priority,
+                    current_seq=self._queue_seq,
+                    messages=[msg_dict],
+                    in_queue=True,
+                    channel_meta=channel_meta,
+                )
+                self._thread_state[root_id] = entry
+            else:
+                entry.current_priority = priority
+                entry.current_seq = self._queue_seq
+                entry.messages = [msg_dict]
+                entry.in_queue = True
+                entry.channel_meta = channel_meta
+            await self._queue.put((priority, entry.current_seq, root_id))
+            return
+
+        entry.messages.append(msg_dict)
+        if priority < entry.current_priority:
+            self._queue_seq += 1
+            entry.current_priority = priority
+            entry.current_seq = self._queue_seq
+            await self._queue.put((priority, entry.current_seq, root_id))
+
     async def _consume_queue(
         self,
-        on_message: Callable[..., Coroutine[Any, Any, Any]],
+        on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
     ) -> None:
         """Drain the priority queue serially. One turn at a time so
         the underlying session keeps a coherent conversation history;
         concurrent turns would interleave context.
+
+        Each pop yields a ``root_id``. We look up the per-thread
+        entry, drop the message batch out (claim it), and dispatch
+        the whole list as one agent invocation. While the agent is
+        running, new arrivals on the same thread create a fresh
+        entry that will be picked up on the next pop — the agent
+        won't re-see messages it already processed.
         """
         while True:
             try:
-                item = await self._queue.get()
+                _priority, popped_seq, root_id = await self._queue.get()
             except asyncio.CancelledError:
                 return
-            _priority, _seq, args = item
+
+            entry = self._thread_state.get(root_id)
+            if entry is None or not entry.in_queue or entry.current_seq != popped_seq:
+                # Stale heap entry: a higher-priority arrival
+                # already pushed a fresh tuple for this root, or
+                # the slot has been closed since we popped. Drop
+                # and continue.
+                continue
+
+            # Claim the batch atomically — mark the slot closed
+            # before dispatch so concurrent arrivals open a fresh
+            # entry instead of stacking into a batch the agent is
+            # already chewing through.
+            batch = entry.messages
+            channel_meta = entry.channel_meta
+            entry.messages = []
+            entry.in_queue = False
+
             try:
-                await on_message(
-                    args["channel_id"], args["channel_name"],
-                    args["sender_slug"], args["sender_email"],
-                    args["text"], args["root_id"], args["is_dm"],
-                    args["attachments"], args["sender_is_bot"],
-                    args["mentions"],
-                    args["envelope_id"], args["sent_at"], [],
-                    space_id=args.get("space_id", ""),
-                    space_name=args.get("space_name", ""),
-                )
+                await on_message_batch(root_id, batch, channel_meta)
             except AgentAPIError:
-                # Adapter surfaced "API Error". Re-enqueue the same
-                # tuple so the message keeps its priority band slot
-                # (later arrivals have strictly larger ``seq``), then
-                # back off 15-45s randomised to avoid a thundering
-                # herd across a fleet hit by the same outage.
-                await self._queue.put(item)
+                # Adapter surfaced "API Error". Reopen the slot
+                # with the SAME batch (cursor untouched) and push a
+                # fresh queue tuple with the original priority so
+                # the next pop tries again. Back off 15-45s
+                # randomised to avoid a thundering herd across a
+                # fleet hit by the same outage.
+                self._queue_seq += 1
+                entry.messages = batch
+                entry.in_queue = True
+                entry.current_seq = self._queue_seq
+                await self._queue.put(
+                    (entry.current_priority, entry.current_seq, root_id),
+                )
                 delay = random.uniform(15.0, 45.0)
+                last_envelope = batch[-1].get("envelope_id", "") if batch else ""
                 logger.warning(
-                    "agent reply contained 'API Error' for envelope %s; "
-                    "re-queued and pausing %.1fs before next message",
-                    args.get("envelope_id"), delay,
+                    "agent reply contained 'API Error' for thread %s "
+                    "(last envelope %s); re-queued and pausing %.1fs "
+                    "before next message",
+                    root_id, last_envelope, delay,
                 )
                 try:
                     await asyncio.sleep(delay)
                 except asyncio.CancelledError:
                     raise
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
-                    "on_message handler failed for envelope %s",
-                    args.get("envelope_id"),
+                    "on_message_batch handler failed for thread %s (%d messages)",
+                    root_id, len(batch),
                 )
+                # Treat poison-message style failures as terminal for
+                # the batch — don't loop forever. The sqlite cursor
+                # stays untouched so a restart can retry, but we mark
+                # the slot done in-memory so live arrivals keep
+                # flowing for other threads.
+                continue
+
+            # Success: persist the cursor so a restart-then-redeliver
+            # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
+            # the high-water mark we just covered.
+            if batch:
+                tail_sent_at = batch[-1].get("sent_at", 0)
+                try:
+                    await self.store.mark_thread_processed(root_id, tail_sent_at)
+                except Exception:
+                    logger.exception(
+                        "mark_thread_processed(%s, %d) failed; agent "
+                        "may re-process this thread after a restart",
+                        root_id, tail_sent_at,
+                    )
 
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the

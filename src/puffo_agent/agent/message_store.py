@@ -31,6 +31,20 @@ CREATE INDEX IF NOT EXISTS idx_messages_dm
     ON messages (sender_slug, sent_at) WHERE envelope_kind = 'dm';
 CREATE INDEX IF NOT EXISTS idx_messages_received
     ON messages (received_at);
+CREATE INDEX IF NOT EXISTS idx_messages_thread_root
+    ON messages (thread_root_id, sent_at) WHERE thread_root_id IS NOT NULL;
+
+-- Per-thread cursor used by the thread-batched priority queue. After
+-- ``on_message_batch`` finishes successfully, the consumer advances
+-- this to the ``sent_at`` of the last message in the dispatched
+-- batch. The listen handler then drops any inbound message whose
+-- ``sent_at`` is <= the stored cursor, so server-side pending-message
+-- redeliveries after a daemon restart don't re-trigger the agent on
+-- already-processed threads.
+CREATE TABLE IF NOT EXISTS thread_processing_state (
+    root_id TEXT PRIMARY KEY,
+    last_processed_sent_at INTEGER NOT NULL
+);
 """
 
 
@@ -220,6 +234,68 @@ class MessageStore:
         if row is None:
             return None
         return self._row_to_msg(row)
+
+    async def get_thread_batch(
+        self,
+        root_id: str,
+        since_sent_at: int,
+    ) -> list[StoredMessage]:
+        """Root message + every reply in its thread with
+        ``sent_at > since_sent_at``, ordered ascending. The root row
+        itself has ``thread_root_id IS NULL`` and matches via the
+        ``envelope_id = root_id`` arm of the OR.
+        """
+        if not root_id:
+            return []
+        db = await self._ensure_db()
+        async with db.execute(
+            """SELECT * FROM messages
+               WHERE (envelope_id = ? OR thread_root_id = ?)
+                 AND sent_at > ?
+               ORDER BY sent_at ASC, envelope_id ASC""",
+            (root_id, root_id, since_sent_at),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
+    async def get_last_processed_sent_at(self, root_id: str) -> int:
+        """``sent_at`` of the last message in the most recently
+        dispatched batch for this thread, or ``0`` if the agent has
+        never processed it. Used at enqueue time to drop redelivered
+        messages whose work has already been done.
+        """
+        if not root_id:
+            return 0
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT last_processed_sent_at FROM thread_processing_state "
+            "WHERE root_id = ?",
+            (root_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def mark_thread_processed(
+        self, root_id: str, sent_at: int,
+    ) -> None:
+        """Upsert the per-thread cursor. ``MAX(existing, new)`` so
+        out-of-order writes (extremely unlikely but cheap to guard)
+        never regress the cursor.
+        """
+        if not root_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO thread_processing_state (root_id, last_processed_sent_at)
+               VALUES (?, ?)
+               ON CONFLICT(root_id) DO UPDATE SET
+                 last_processed_sent_at = MAX(
+                   thread_processing_state.last_processed_sent_at,
+                   excluded.last_processed_sent_at
+                 )""",
+            (root_id, sent_at),
+        )
+        await db.commit()
 
     async def cleanup(self, retention_days: int = 90) -> int:
         db = await self._ensure_db()
