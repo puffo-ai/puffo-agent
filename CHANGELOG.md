@@ -56,6 +56,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   thread `dispatching_ids` set populated at claim time and consulted
   at the top of `_admit_thread_message`; cleared after the cursor
   advances on successful dispatch.
+- Belt-and-suspenders: the consumer now dedupes `batch` by
+  `envelope_id` one final time immediately before invoking
+  `on_message_batch`, logging a warning if anything is dropped. The
+  agent must never see the same envelope twice in one turn, even if
+  some upstream race we haven't characterised slips through.
 - `AgentAPIError` retry path was clobbering mid-dispatch arrivals.
   When the dispatch failed AND a new message had landed on the same
   thread during the failed dispatch (admitted through the reopen

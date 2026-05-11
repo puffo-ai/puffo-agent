@@ -702,6 +702,33 @@ class PuffoCoreMessageClient:
                 m.get("envelope_id") for m in batch if m.get("envelope_id")
             }
 
+            # Safety net: paranoid in-batch dedup right before
+            # dispatch. ``_admit_thread_message``'s in-queue dedup
+            # plus ``dispatching_ids`` should already guarantee
+            # ``batch`` is duplicate-free, but if some upstream race
+            # we haven't characterised slips a duplicate envelope_id
+            # past both, we must NOT hand the same envelope to the
+            # agent twice in one turn. The warning log lets us spot
+            # the offending path if it ever fires.
+            seen_ids: set[str] = set()
+            deduped: list[dict] = []
+            dropped: list[str] = []
+            for m in batch:
+                mid = m.get("envelope_id", "")
+                if mid and mid in seen_ids:
+                    dropped.append(mid)
+                    continue
+                if mid:
+                    seen_ids.add(mid)
+                deduped.append(m)
+            if dropped:
+                logger.warning(
+                    "consumer dropped %d in-batch duplicate envelope_id(s) "
+                    "for thread %s before dispatch: %s",
+                    len(dropped), root_id, dropped,
+                )
+                batch = deduped
+
             # Pre-dispatch jitter. When several agents on the same
             # host get activated by the same message (e.g. a channel
             # broadcast), unblocked dispatch sends them all into the

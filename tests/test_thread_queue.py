@@ -603,6 +603,67 @@ async def test_arrival_during_dispatch_lands_in_next_batch():
 
 
 @pytest.mark.asyncio
+async def test_consumer_dedupes_batch_before_dispatch_as_safety_net():
+    """Even if some upstream path somehow leaves duplicate
+    envelope_ids in ``entry.messages``, the agent must never see the
+    same envelope twice in one ``on_message_batch`` dispatch (the
+    user's strict requirement #1). The consumer's pre-dispatch
+    safety-net dedup guarantees that. To verify, we bypass admit and
+    inject the duplicate directly into the in-memory state.
+    """
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    # Build entry state by hand — same shape admit would produce,
+    # but with an extra duplicate of env_x sneaked into messages.
+    entry = _ThreadEntry(
+        current_priority=PRIORITY_HUMAN,
+        current_seq=1,
+        messages=[
+            _msg("env_x", sent_at=100),
+            _msg("env_x", sent_at=100),  # duplicate
+            _msg("env_y", sent_at=200),
+        ],
+        in_queue=True,
+        channel_meta=_channel_meta(),
+    )
+    client._thread_state["env_root"] = entry
+    client._queue_seq = 1
+    await client._queue.put((PRIORITY_HUMAN, 1, "env_root"))
+
+    batches: list[list[str]] = []
+
+    async def callback(root_id, batch, channel_meta):
+        batches.append([m["envelope_id"] for m in batch])
+        raise asyncio.CancelledError()
+
+    import puffo_agent.agent.puffo_core_client as mod
+    original_uniform = mod.random.uniform
+
+    def fake_uniform(a, b):
+        return 0.0 if (a, b) == (0.0, 1.5) else original_uniform(a, b)
+
+    mod.random.uniform = fake_uniform  # type: ignore[assignment]
+    try:
+        task = asyncio.create_task(client._consume_queue(callback))
+        try:
+            await asyncio.wait_for(task, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        mod.random.uniform = original_uniform  # type: ignore[assignment]
+
+    # The batch dispatched to the agent must have each envelope_id
+    # exactly once, in arrival order.
+    assert batches == [["env_x", "env_y"]], batches
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_envelope_during_dispatch_is_skipped():
     """A duplicate of an envelope that the consumer just claimed for
     dispatch must not produce a second batch. The bug: the consumer
