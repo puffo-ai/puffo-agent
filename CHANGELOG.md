@@ -61,6 +61,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `on_message_batch`, logging a warning if anything is dropped. The
   agent must never see the same envelope twice in one turn, even if
   some upstream race we haven't characterised slips through.
+- cli-docker now auto-recreates a reused container when its
+  `/opt/puffoagent-pkg` bind mount no longer resolves to the host
+  path that contains `puffo_agent` (typical cause: the operator
+  reinstalled puffo-agent from a different path, e.g. moved off
+  `puffo-core-han-group/agent` to the standalone repo). Without
+  this, `python3 -m puffo_agent.mcp.puffo_core_server` inside the
+  container would fail with `ModuleNotFoundError`, claude-code's
+  MCP subprocess wouldn't initialise, and every puffo MCP tool
+  surfaced as "No such tool available". Detected by `docker exec
+  test -f /opt/puffoagent-pkg/puffo_agent/__init__.py`.
 - `AgentAPIError` retry path was clobbering mid-dispatch arrivals.
   When the dispatch failed AND a new message had landed on the same
   thread during the failed dispatch (admitted through the reopen
