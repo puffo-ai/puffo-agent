@@ -220,3 +220,75 @@ async def test_heartbeat_interval_clamped_to_minimum():
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=0.5)
     assert rep._interval == 10.0
+
+
+# ─── end_turn_batch ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_end_turn_batch_posts_all_runs_in_one_call():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep._current_status = "busy"
+    rep._current_message_id = "msg_a"
+
+    await rep.end_turn_batch([
+        {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
+        {"run_id": "run_b", "message_id": "msg_b", "succeeded": True},
+        {"run_id": "run_c", "message_id": "msg_c", "succeeded": True},
+    ])
+
+    assert len(http.calls) == 1
+    path, body = http.calls[0]
+    assert path == "/messages/processing/end:batch"
+    assert body == {"runs": [
+        {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
+        {"run_id": "run_b", "message_id": "msg_b", "succeeded": True},
+        {"run_id": "run_c", "message_id": "msg_c", "succeeded": True},
+    ]}
+    assert rep._current_status == "idle"
+    assert rep._current_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_end_turn_batch_failure_flips_status_to_error():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.end_turn_batch([
+        {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
+        {"run_id": "run_b", "message_id": "msg_b", "succeeded": False,
+         "error_text": "claude rate limit"},
+    ])
+
+    _path, body = http.calls[0]
+    # error_text only emitted on the failing run, capped at 1024 chars.
+    assert body["runs"][0] == {
+        "run_id": "run_a", "message_id": "msg_a", "succeeded": True,
+    }
+    assert body["runs"][1] == {
+        "run_id": "run_b", "message_id": "msg_b", "succeeded": False,
+        "error_text": "claude rate limit",
+    }
+    assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_end_turn_batch_empty_is_no_op():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.end_turn_batch([])
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_end_turn_batch_swallows_http_error():
+    http = FakeHttp()
+    http.side_effect = HttpError(500, "boom")
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    # No raise — telemetry must not break the agent loop.
+    await rep.end_turn_batch([
+        {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
+    ])
+    assert len(http.calls) == 1

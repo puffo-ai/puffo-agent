@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from ..agent.adapters import Adapter
@@ -517,7 +518,13 @@ class Worker:
             """
             if not batch:
                 return
-            triggering_post_id = batch[-1].get("envelope_id", "")
+            # Status telemetry is now per-thread-batch. The first
+            # message in arrival order gets the /processing/start
+            # call (yellow dot lands there) — that's what the human
+            # who triggered the agent will see go yellow first. The
+            # rest of the batch flips straight from white to green
+            # via /processing/end:batch at the end of the turn.
+            first_post_id = batch[0].get("envelope_id", "")
             channel_id = channel_meta.get("channel_id", "")
 
             # Honour reload before the turn so the first batch after
@@ -551,7 +558,7 @@ class Worker:
                     json.dumps({
                         "channel_id": channel_id,
                         "root_id": root_id,
-                        "triggering_post_id": triggering_post_id,
+                        "triggering_post_id": first_post_id,
                     }),
                     encoding="utf-8",
                 )
@@ -564,8 +571,8 @@ class Worker:
             # Reporter swallows network errors so a flaky status push
             # never blocks the actual reply.
             run_id = (
-                await reporter.begin_turn(triggering_post_id)
-                if triggering_post_id
+                await reporter.begin_turn(first_post_id)
+                if first_post_id
                 else None
             )
             turn_succeeded = True
@@ -594,13 +601,28 @@ class Worker:
                 turn_succeeded = False
                 turn_error = f"{type(exc).__name__}: {exc}"
             finally:
-                if run_id is not None and triggering_post_id:
-                    await reporter.end_turn(
-                        triggering_post_id,
-                        run_id,
-                        succeeded=turn_succeeded,
-                        error_text=turn_error,
-                    )
+                if run_id is not None and first_post_id:
+                    # Build the batch payload: first row reuses the
+                    # /start run_id (server UPDATEs its row); the
+                    # rest get fresh run_ids and are UPSERTed by the
+                    # server with started_at = ended_at = now.
+                    runs: list[dict] = [{
+                        "run_id": run_id,
+                        "message_id": first_post_id,
+                        "succeeded": turn_succeeded,
+                        "error_text": turn_error,
+                    }]
+                    for msg in batch[1:]:
+                        mid = msg.get("envelope_id", "")
+                        if not mid:
+                            continue
+                        runs.append({
+                            "run_id": f"run_{uuid.uuid4().hex}",
+                            "message_id": mid,
+                            "succeeded": turn_succeeded,
+                            "error_text": turn_error,
+                        })
+                    await reporter.end_turn_batch(runs)
                 # Clear turn context so post-turn background work
                 # doesn't inherit a stale channel/root. Hook
                 # fails-open when the file is absent.
@@ -674,6 +696,8 @@ class Worker:
                 async def begin_turn(self, _mid):
                     return None
                 async def end_turn(self, *_a, **_kw):
+                    return None
+                async def end_turn_batch(self, *_a, **_kw):
                     return None
                 async def report_error(self, _t):
                     return None

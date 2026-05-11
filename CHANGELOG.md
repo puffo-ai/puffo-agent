@@ -27,6 +27,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   claude-code API simultaneously and trips its rate limit; the
   random sleep desynchronises them. Each agent picks its own delay
   independently — no host-wide coordination needed.
+- Status telemetry follows the thread-batch lifecycle. The first
+  message in a batch still gets a single `/processing/start`
+  (yellow dot lands there), but the per-message `/end` fan-out is
+  replaced by a single `/messages/processing/end:batch` call that
+  flips every message in the batch to green at once. Requires the
+  puffo-server endpoint added in puffo-server#46 (deployed
+  2026-05-11).
 
 ### Fixed
 
