@@ -1,0 +1,61 @@
+# Production PyPI publish. Fires when a GitHub Release is published.
+# Tag the release `vX.Y.Z` to match the version in pyproject.toml;
+# the build picks up the version from pyproject, not the tag, so the
+# tag is just a label for humans. Uses Trusted Publishing — no
+# secrets stored, OIDC exchange only.
+#
+# One-time setup on pypi.org:
+#
+#   1. Sign in at pypi.org.
+#   2. Account settings → Publishing → "Add a new pending publisher".
+#   3. PyPI project name: puffo-agent
+#      Owner:               puffo-ai
+#      Repository name:     puffo-agent
+#      Workflow filename:   publish-pypi.yml
+#      Environment name:    pypi
+#   4. Save. After the first successful run the publisher converts
+#      from "pending" to a real one.
+#
+# Strongly recommended: in repo Settings → Environments → pypi, add a
+# "Required reviewers" rule so the upload step waits on a manual
+# approval before publishing. Once a version is on PyPI it can never
+# be re-uploaded — the approval gate is the last cheap chance to
+# catch a bad build.
+
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/puffo-agent
+    permissions:
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Smoke-install the wheel
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/puffo-agent --help > /dev/null
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
