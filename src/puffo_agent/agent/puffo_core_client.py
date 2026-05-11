@@ -615,6 +615,19 @@ class PuffoCoreMessageClient:
             await self._queue.put((priority, entry.current_seq, root_id))
             return
 
+        # Dedup by envelope_id within the live batch. The same wire
+        # envelope can land here twice when the server's pending-
+        # message redelivery overlaps with live WS delivery (e.g.
+        # after a daemon restart or brief WS reconnect). sqlite-side
+        # INSERT OR IGNORE in MessageStore.store already covers the
+        # durable table, but the in-memory batch is independent and
+        # would otherwise feed the agent the same post N times.
+        incoming_id = msg_dict.get("envelope_id", "")
+        if incoming_id and any(
+            m.get("envelope_id") == incoming_id for m in entry.messages
+        ):
+            return
+
         entry.messages.append(msg_dict)
         if priority < entry.current_priority:
             self._queue_seq += 1

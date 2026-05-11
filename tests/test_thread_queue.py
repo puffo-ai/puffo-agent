@@ -257,6 +257,53 @@ async def test_admit_second_same_priority_coalesces_no_new_heap_tuple():
 
 
 @pytest.mark.asyncio
+async def test_admit_dedups_same_envelope_id_within_batch():
+    """Server-side pending-message redelivery (or a WS reconnect) can
+    push the same wire envelope at us twice while the previous batch
+    is still in-flight. The in-memory batch must NOT stack duplicates
+    — the agent should see each envelope_id at most once per dispatch.
+    """
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_1"),
+        channel_meta=_channel_meta(),
+    )
+    # Second arrival is a true new envelope on the same thread.
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_2"),
+        channel_meta=_channel_meta(),
+    )
+    qsize_before = client._queue.qsize()
+    # Now the wire redelivers env_2 twice more — same envelope_id,
+    # same content. These must be dropped.
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_2"),
+        channel_meta=_channel_meta(),
+    )
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=_msg("env_2"),
+        channel_meta=_channel_meta(),
+    )
+
+    entry = client._thread_state["env_root"]
+    assert [m["envelope_id"] for m in entry.messages] == ["env_1", "env_2"]
+    # No spurious heap tuples either — dedup short-circuits before
+    # the priority-bump branch.
+    assert client._queue.qsize() == qsize_before
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_admit_lower_priority_arrival_does_not_replace_slot():
     """Higher priority = lower numeric value. A LATER arrival with a
     LOWER priority (larger numeric) joins the batch but doesn't push

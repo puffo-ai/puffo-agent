@@ -24,6 +24,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Thread-batched dispatch could feed the agent the same envelope
+  multiple times in one batch when the server's pending-message
+  redelivery overlapped with live WS delivery (most easily reproduced
+  after a daemon restart). `MessageStore.store` already used
+  `INSERT OR IGNORE`, but the in-memory `_ThreadEntry.messages`
+  batch had no envelope-level dedup. Now `_admit_thread_message`
+  drops the append when the incoming `envelope_id` is already in the
+  pending batch.
 - cli-local adapter silently dropped MCP servers passed via
   `--mcp-config`. claude-code gates MCP registration on the per-
   project trust dialog stored in `~/.claude.json`, and the dialog has
