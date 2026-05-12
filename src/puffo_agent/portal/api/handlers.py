@@ -700,17 +700,11 @@ async def _upload_avatar_via_agent_keystore(
 
 
 async def _sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
-    """PATCH /identities/self signed by the agent's keystore."""
-    from ...crypto.http_client import PuffoCoreHttpClient
-    from ...crypto.keystore import KeyStore
-
-    pc = cfg.puffo_core
-    ks = KeyStore.for_agent(cfg.id)
-    http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
-    try:
-        await http.patch("/identities/self", patch)
-    finally:
-        await http.close()
+    """PATCH /identities/self signed by the agent's keystore.
+    Thin wrapper around ``portal.profile_sync.sync_agent_profile`` so
+    the bridge and CLI share the same wire shape."""
+    from ..profile_sync import sync_agent_profile
+    await sync_agent_profile(cfg, patch)
 
 
 async def get_runtime_state(request: web.Request) -> web.Response:
