@@ -1318,16 +1318,16 @@ class PuffoCoreMessageClient:
         # events`` may not be committed yet. The endpoint returns 200
         # + an empty (non-JSON) body for "you're not a member of this
         # space" rather than 403, so ``http.get`` hands us a raw
-        # ``str`` instead of a dict. Retry on a generous schedule
-        # (~70s cumulative); past that give up silently — missing
-        # the intro is preferable to spinning forever.
+        # ``str`` instead of a dict. Always sleep before the first
+        # attempt — even a fast server can't commit that quickly —
+        # then back off across ~70s total; past that give up
+        # silently rather than spinning forever.
         retry_delays = (0.5, 1.0, 3.0, 6.0, 12.0, 24.0, 24.0)
-        cursor: str | None = None
-        prev_cursor: str | None = None
         found_cid = ""
-        for attempt_idx in range(len(retry_delays) + 1):
-            cursor = None
-            prev_cursor = None
+        for attempt_idx, delay in enumerate(retry_delays):
+            await asyncio.sleep(delay)
+            cursor: str | None = None
+            prev_cursor: str | None = None
             replay_ok = True
             while True:
                 path = f"/spaces/{space_id}/events"
@@ -1340,7 +1340,7 @@ class PuffoCoreMessageClient:
                         "(attempt %d/%d, body=%r) — retrying",
                         space_id,
                         attempt_idx + 1,
-                        len(retry_delays) + 1,
+                        len(retry_delays),
                         page,
                     )
                     replay_ok = False
@@ -1363,12 +1363,10 @@ class PuffoCoreMessageClient:
                     break
             if replay_ok:
                 return found_cid
-            if attempt_idx < len(retry_delays):
-                await asyncio.sleep(retry_delays[attempt_idx])
         logger.warning(
             "gave up looking up General channel for space=%s after %d "
             "attempts — intro nudge will be skipped",
-            space_id, len(retry_delays) + 1,
+            space_id, len(retry_delays),
         )
         return ""
 
