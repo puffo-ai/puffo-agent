@@ -1295,74 +1295,47 @@ class PuffoCoreMessageClient:
 
     async def _find_public_general_channel(self, space_id: str) -> str:
         """Return the ``channel_id`` of the space's auto-created public
-        General channel (CreateChannel event with ``is_public=true``),
-        or ``""`` if none exists. Used after accepting a space invite
-        to pick the one channel the agent now has auto-fanned-out
-        membership in.
+        General channel (the first ``is_public=true`` row from
+        ``GET /spaces/<id>/channels``), or ``""`` if none.
 
-        Replays ``/spaces/<id>/events`` because puffo-server has no
-        dedicated channels-list endpoint — same pattern as the
-        ``list_channels`` MCP tool. Returns the FIRST public channel
-        encountered so a hypothetical future second public channel
-        doesn't double-fire.
+        Used after accepting a space invite to pick the one channel
+        the agent now has auto-fanned-out membership in. Side effect:
+        every channel returned by the server is folded into
+        ``self._channel_name_cache`` so the immediately-following
+        ``_resolve_channel_name`` inside the intro nudge becomes a
+        cache hit instead of a separate events replay.
 
-        Side effect: while walking, every ``create_channel`` event we
-        pass is folded into ``self._channel_name_cache`` so the
-        immediately-following ``_resolve_channel_name`` inside the
-        intro nudge becomes a cache hit instead of a duplicate
-        events replay."""
+        Accept POST → channels GET is a tight race: the server has
+        the accept event applied, but the ``channel_memberships``
+        rows that gate this endpoint may not be committed yet (the
+        endpoint returns 200 + the SPA index when the caller isn't
+        yet a member, which the http client decodes as a raw
+        ``str``). Sleep-first retry on a generous schedule;
+        past ~70s give up silently rather than spinning forever."""
         if not space_id:
             return ""
-        # Accept POST → events GET is a tight race: the server has the
-        # accept, but the membership row that gates ``/spaces/<id>/
-        # events`` may not be committed yet. The endpoint returns 200
-        # + an empty (non-JSON) body for "you're not a member of this
-        # space" rather than 403, so ``http.get`` hands us a raw
-        # ``str`` instead of a dict. Always sleep before the first
-        # attempt — even a fast server can't commit that quickly —
-        # then back off across ~70s total; past that give up
-        # silently rather than spinning forever.
         retry_delays = (0.5, 1.0, 3.0, 6.0, 12.0, 24.0, 24.0)
-        found_cid = ""
         for attempt_idx, delay in enumerate(retry_delays):
             await asyncio.sleep(delay)
-            cursor: str | None = None
-            prev_cursor: str | None = None
-            replay_ok = True
-            while True:
-                path = f"/spaces/{space_id}/events"
-                if cursor:
-                    path += f"?since={cursor}"
-                page = await self.http.get(path)
-                if not isinstance(page, dict):
-                    logger.info(
-                        "events endpoint not ready for space=%s "
-                        "(attempt %d/%d, body=%r) — retrying",
-                        space_id,
-                        attempt_idx + 1,
-                        len(retry_delays),
-                        page,
-                    )
-                    replay_ok = False
-                    break
-                for ev in page.get("events") or []:
-                    if ev.get("kind") != "create_channel":
-                        continue
-                    payload = ev.get("payload") or {}
-                    cid = payload.get("channel_id") or ""
-                    name = (payload.get("name") or "").strip()
-                    if cid and cid not in self._channel_name_cache:
-                        self._channel_name_cache[cid] = name or cid
-                    if not found_cid and payload.get("is_public") and cid:
-                        found_cid = cid
-                if found_cid or not page.get("has_more"):
-                    break
-                prev_cursor = cursor
-                cursor = page.get("next_cursor")
-                if not cursor or cursor == prev_cursor:
-                    break
-            if replay_ok:
-                return found_cid
+            data = await self.http.get(f"/spaces/{space_id}/channels")
+            if not isinstance(data, dict):
+                logger.info(
+                    "channels endpoint not ready for space=%s "
+                    "(attempt %d/%d) — retrying",
+                    space_id,
+                    attempt_idx + 1,
+                    len(retry_delays),
+                )
+                continue
+            found_cid = ""
+            for entry in data.get("channels") or []:
+                cid = entry.get("channel_id") or ""
+                name = (entry.get("name") or "").strip()
+                if cid and cid not in self._channel_name_cache:
+                    self._channel_name_cache[cid] = name or cid
+                if not found_cid and entry.get("is_public") and cid:
+                    found_cid = cid
+            return found_cid
         logger.warning(
             "gave up looking up General channel for space=%s after %d "
             "attempts — intro nudge will be skipped",

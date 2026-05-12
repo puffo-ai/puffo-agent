@@ -7,9 +7,10 @@ thread queue so it posts a short intro using its normal
 via the ``channel_intro_prompted`` sqlite table so a daemon restart or
 a server-side invite redelivery can't fire a second intro.
 
-These tests exercise ``_enqueue_channel_intro_nudge`` and the
-``MessageStore`` helpers directly. The wiring inside ``_accept_invite``
-is a thin try/except wrapper on top — covered by manual smoke tests.
+These tests exercise ``_enqueue_channel_intro_nudge``,
+``_find_public_general_channel`` and the ``MessageStore`` helpers
+directly. The wiring inside ``_accept_invite`` is a thin try/except
+wrapper on top — covered by manual smoke tests.
 """
 
 from __future__ import annotations
@@ -46,9 +47,9 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._queue = asyncio.PriorityQueue()
     client._queue_seq = 0
     client._thread_state = {}
-    # ``_find_public_general_channel`` warms this cache as it walks
-    # so the immediately-following ``_resolve_channel_name`` inside
-    # the intro nudge becomes a cache hit.
+    # ``_find_public_general_channel`` warms this cache from the
+    # /channels response so the immediately-following
+    # ``_resolve_channel_name`` inside the intro nudge becomes a hit.
     client._channel_name_cache = {}
 
     async def _stub_space_name(space_id: str) -> str:
@@ -60,6 +61,16 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._resolve_space_name = _stub_space_name  # type: ignore[assignment]
     client._resolve_channel_name = _stub_channel_name  # type: ignore[assignment]
     return client
+
+
+def _instant_sleep_monkeypatch(monkeypatch) -> None:
+    """Skip the real backoff sleep so the suite stays fast."""
+    import puffo_agent.agent.puffo_core_client as _client_mod
+
+    async def _instant_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(_client_mod.asyncio, "sleep", _instant_sleep)
 
 
 # ─── MessageStore helpers ─────────────────────────────────────────
@@ -115,8 +126,6 @@ async def test_intro_nudge_admits_one_system_priority_envelope():
     assert len(entry.messages) == 1
     msg = entry.messages[0]
 
-    # Shape sanity: channel ids resolved, prompt prefixed correctly,
-    # not a DM, no attachments.
     assert msg["channel_id"] == "ch_1"
     assert msg["channel_name"] == "general"
     assert msg["space_id"] == "sp_1"
@@ -130,7 +139,6 @@ async def test_intro_nudge_admits_one_system_priority_envelope():
     assert "general" in msg["text"]
     assert "send_message" in msg["text"]
 
-    # Dedup row landed.
     assert await store.has_channel_intro_been_prompted("ch_1") is True
     await store.close()
 
@@ -150,7 +158,7 @@ async def test_intro_nudge_skipped_when_already_prompted():
     await client._enqueue_channel_intro_nudge(
         space_id="sp_1", channel_id="ch_1",
     )
-    assert client._queue.qsize() == 1  # still just the first one
+    assert client._queue.qsize() == 1
     assert len(client._thread_state) == 1
     await store.close()
 
@@ -175,40 +183,39 @@ async def test_intro_nudge_distinct_channels_each_get_one():
     await store.close()
 
 
+# ─── _find_public_general_channel (against /spaces/<id>/channels) ─
+
+
+def _channels_response(*entries: dict) -> dict:
+    """Wrap channel rows in the shape ``GET /spaces/<id>/channels``
+    returns (matches ``server::space_config::ListChannelsResponse``)."""
+    return {"channels": list(entries)}
+
+
 @pytest.mark.asyncio
-async def test_find_public_general_channel_picks_is_public_true():
-    """``_find_public_general_channel`` walks the space's events,
-    returns the first ``create_channel`` event with ``is_public=true``.
-    Public-flag check is the canonical signal — server emits a
-    synthetic CreateChannel with ``is_public=true`` for every new
-    space's General; user-created channels default false."""
+async def test_find_public_general_channel_picks_is_public_true(monkeypatch):
+    """Returns the first row with ``is_public=true``. Server already
+    filters the list by membership, so anything we see is reachable —
+    we just need to pick General."""
+    _instant_sleep_monkeypatch(monkeypatch)
     store = await _make_store()
     client = _make_client(store)
 
     class _StubHttp:
         async def get(self, path: str) -> dict:
-            assert path.startswith("/spaces/sp_1/events")
-            return {
-                "events": [
-                    {
-                        "kind": "create_channel",
-                        "payload": {
-                            "channel_id": "ch_private",
-                            "name": "Random",
-                            "is_public": False,
-                        },
-                    },
-                    {
-                        "kind": "create_channel",
-                        "payload": {
-                            "channel_id": "ch_general",
-                            "name": "General",
-                            "is_public": True,
-                        },
-                    },
-                ],
-                "has_more": False,
-            }
+            assert path == "/spaces/sp_1/channels"
+            return _channels_response(
+                {
+                    "channel_id": "ch_private",
+                    "name": "Random",
+                    "is_public": False,
+                },
+                {
+                    "channel_id": "ch_general",
+                    "name": "General",
+                    "is_public": True,
+                },
+            )
 
     client.http = _StubHttp()
     cid = await client._find_public_general_channel("sp_1")
@@ -217,41 +224,31 @@ async def test_find_public_general_channel_picks_is_public_true():
 
 
 @pytest.mark.asyncio
-async def test_find_public_general_channel_warms_channel_name_cache():
-    """The walk we already pay for to find General doubles as a cache
-    warmup for every ``create_channel`` it passes — so the
-    ``_resolve_channel_name`` inside the intro nudge doesn't have to
-    replay the same events page seconds later."""
+async def test_find_public_general_channel_warms_channel_name_cache(monkeypatch):
+    """The /channels response we already pay for doubles as a cache
+    warmup so the ``_resolve_channel_name`` inside the intro nudge
+    doesn't have to round-trip again seconds later."""
+    _instant_sleep_monkeypatch(monkeypatch)
     store = await _make_store()
     client = _make_client(store)
 
     class _StubHttp:
         async def get(self, _path: str) -> dict:
-            return {
-                "events": [
-                    {
-                        "kind": "create_channel",
-                        "payload": {
-                            "channel_id": "ch_random",
-                            "name": "Random",
-                            "is_public": False,
-                        },
-                    },
-                    {
-                        "kind": "create_channel",
-                        "payload": {
-                            "channel_id": "ch_general",
-                            "name": "General",
-                            "is_public": True,
-                        },
-                    },
-                ],
-                "has_more": False,
-            }
+            return _channels_response(
+                {
+                    "channel_id": "ch_random",
+                    "name": "Random",
+                    "is_public": False,
+                },
+                {
+                    "channel_id": "ch_general",
+                    "name": "General",
+                    "is_public": True,
+                },
+            )
 
     client.http = _StubHttp()
     await client._find_public_general_channel("sp_1")
-    # Both channels — public AND private — landed in the cache.
     assert client._channel_name_cache == {
         "ch_random": "Random",
         "ch_general": "General",
@@ -260,20 +257,35 @@ async def test_find_public_general_channel_warms_channel_name_cache():
 
 
 @pytest.mark.asyncio
-async def test_find_public_general_channel_retries_when_events_endpoint_returns_string(monkeypatch):
-    """Accept POST → events GET is a tight race: server may return 200
-    + empty body (decoded as a raw ``str`` by the http client) while
-    the membership row is still committing. One short retry covers
-    that — the third call returns a real dict and the General lookup
-    succeeds."""
-    # Skip the real backoff sleep so the test stays fast.
-    import puffo_agent.agent.puffo_core_client as _client_mod
+async def test_find_public_general_channel_returns_empty_when_none(monkeypatch):
+    """No public channel in the response → empty string. Caller
+    treats this as 'skip the intro' (no obvious landing channel)."""
+    _instant_sleep_monkeypatch(monkeypatch)
+    store = await _make_store()
+    client = _make_client(store)
 
-    async def _instant_sleep(_s: float) -> None:
-        return None
+    class _StubHttp:
+        async def get(self, _path: str) -> dict:
+            return _channels_response({
+                "channel_id": "ch_private",
+                "name": "Random",
+                "is_public": False,
+            })
 
-    monkeypatch.setattr(_client_mod.asyncio, "sleep", _instant_sleep)
+    client.http = _StubHttp()
+    cid = await client._find_public_general_channel("sp_1")
+    assert cid == ""
+    await store.close()
 
+
+@pytest.mark.asyncio
+async def test_find_public_general_channel_retries_when_endpoint_returns_string(monkeypatch):
+    """Accept POST → channels GET is a tight race: the server has the
+    accept event applied but the ``channel_memberships`` row that
+    gates the endpoint may not be committed yet. In that window the
+    endpoint returns the SPA fallback (decoded as ``str``); we sleep
+    and retry. Third call wins → General resolved."""
+    _instant_sleep_monkeypatch(monkeypatch)
     store = await _make_store()
     client = _make_client(store)
 
@@ -284,19 +296,11 @@ async def test_find_public_general_channel_retries_when_events_endpoint_returns_
             calls.append(1)
             if len(calls) < 3:
                 return ""  # not-a-member-yet stand-in
-            return {
-                "events": [
-                    {
-                        "kind": "create_channel",
-                        "payload": {
-                            "channel_id": "ch_general",
-                            "name": "General",
-                            "is_public": True,
-                        },
-                    },
-                ],
-                "has_more": False,
-            }
+            return _channels_response({
+                "channel_id": "ch_general",
+                "name": "General",
+                "is_public": True,
+            })
 
     client.http = _FlakyHttp()
     cid = await client._find_public_general_channel("sp_1")
@@ -307,15 +311,9 @@ async def test_find_public_general_channel_retries_when_events_endpoint_returns_
 
 @pytest.mark.asyncio
 async def test_find_public_general_channel_gives_up_after_all_retries(monkeypatch):
-    """Endpoint stays unhappy across all attempts → return ``""``,
-    no exception raised. The accept itself isn't blocked."""
-    import puffo_agent.agent.puffo_core_client as _client_mod
-
-    async def _instant_sleep(_s: float) -> None:
-        return None
-
-    monkeypatch.setattr(_client_mod.asyncio, "sleep", _instant_sleep)
-
+    """Endpoint stays unhappy across all attempts → return ``""``, no
+    exception raised. The accept itself isn't blocked."""
+    _instant_sleep_monkeypatch(monkeypatch)
     store = await _make_store()
     client = _make_client(store)
 
@@ -324,35 +322,6 @@ async def test_find_public_general_channel_gives_up_after_all_retries(monkeypatc
             return ""
 
     client.http = _AlwaysString()
-    cid = await client._find_public_general_channel("sp_1")
-    assert cid == ""
-    await store.close()
-
-
-@pytest.mark.asyncio
-async def test_find_public_general_channel_returns_empty_when_none():
-    """No public channel in the space → empty string. Caller treats
-    this as 'skip the intro' (no obvious landing channel)."""
-    store = await _make_store()
-    client = _make_client(store)
-
-    class _StubHttp:
-        async def get(self, _path: str) -> dict:
-            return {
-                "events": [
-                    {
-                        "kind": "create_channel",
-                        "payload": {
-                            "channel_id": "ch_private",
-                            "name": "Random",
-                            "is_public": False,
-                        },
-                    },
-                ],
-                "has_more": False,
-            }
-
-    client.http = _StubHttp()
     cid = await client._find_public_general_channel("sp_1")
     assert cid == ""
     await store.close()
@@ -383,5 +352,5 @@ async def test_intro_nudge_survives_simulated_restart():
     await client_2._enqueue_channel_intro_nudge(
         space_id="sp_1", channel_id="ch_1",
     )
-    assert client_2._queue.qsize() == 0  # gate held across restart
+    assert client_2._queue.qsize() == 0
     await store_2.close()
