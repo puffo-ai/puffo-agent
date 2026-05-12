@@ -142,6 +142,7 @@ class PuffoAgent:
                 followups=None,
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
+                sender_display_name=msg.get("sender_display_name", ""),
             )
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
@@ -197,6 +198,7 @@ class PuffoAgent:
                 create_at=msg.get("sent_at", 0),
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
+                sender_display_name=msg.get("sender_display_name", ""),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
 
@@ -331,6 +333,7 @@ class PuffoAgent:
         followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
+        sender_display_name: str = "",
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -347,6 +350,7 @@ class PuffoAgent:
             followups=followups,
             space_id=space_id,
             space_name=space_name,
+            sender_display_name=sender_display_name,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -368,6 +372,7 @@ class PuffoAgent:
         followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
+        sender_display_name: str = "",
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
@@ -391,9 +396,16 @@ class PuffoAgent:
         ts_iso = _ms_to_iso(create_at)
         if ts_iso:
             lines.append(f"- timestamp: {ts_iso}")
-        lines.append(
-            f"- sender: {sender}" + (f" ({sender_email})" if sender_email else "")
-        )
+        # ``sender`` is the human-readable name the LLM should use
+        # when addressing this person in prose; ``sender_slug`` is
+        # the structural identifier (always required for @-mentions
+        # and send_message routing). When the server has no
+        # display_name on file, ``sender`` falls back to the slug so
+        # the field is always populated — no parsing branch in the
+        # agent prompt.
+        display = sender_display_name or sender
+        lines.append(f"- sender: {display}")
+        lines.append(f"- sender_slug: {sender}")
         lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
         if mentions:
             lines.append("- mentions:")

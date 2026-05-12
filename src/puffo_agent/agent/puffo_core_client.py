@@ -524,12 +524,20 @@ class PuffoCoreMessageClient:
                 )
                 return
 
+            # Per-session display-name cache turns this into ~1 HTTP
+            # call per distinct sender per session; same helper the
+            # invite-DM flow already uses. Empty string on miss.
+            sender_display_name = await self._fetch_display_name(
+                payload.sender_slug,
+            )
+
             msg_dict = {
                 "channel_id": channel_id,
                 "channel_name": channel_name,
                 "space_id": space_id,
                 "space_name": space_name,
                 "sender_slug": payload.sender_slug,
+                "sender_display_name": sender_display_name,
                 "sender_email": "",
                 "text": clean_text,
                 "root_id": payload.thread_root_id or "",
@@ -1257,6 +1265,175 @@ class PuffoCoreMessageClient:
         await self.http.post(
             "/spaces/events",
             {"space_id": space_id, "events": [signed]},
+        )
+
+        # Accepting an invite triggers a one-shot self-introduction
+        # nudge: we enqueue a synthetic ``[puffo-agent system message]``
+        # so the agent posts a short intro using its existing
+        # ``send_message`` MCP tool. Channel invites intro into the
+        # invited channel; space invites intro into the space's public
+        # ``General`` channel (the only channel an accepting member is
+        # auto-fanned-out into per puffo-server's space-invite redeem
+        # logic — any other channel needs its own invite_to_channel).
+        intro_channel_id = ""
+        if kind == "invite_to_channel" and channel_id:
+            intro_channel_id = channel_id
+        elif kind == "invite_to_space":
+            try:
+                intro_channel_id = await self._find_public_general_channel(
+                    space_id,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to look up General channel for intro nudge "
+                    "(space=%s)", space_id,
+                )
+        if intro_channel_id:
+            try:
+                await self._enqueue_channel_intro_nudge(
+                    space_id=space_id,
+                    channel_id=intro_channel_id,
+                )
+            except Exception:
+                # Intro is best-effort; never block the accept.
+                logger.exception(
+                    "failed to enqueue channel intro nudge "
+                    "(space=%s channel=%s)", space_id, intro_channel_id,
+                )
+
+    async def _find_public_general_channel(self, space_id: str) -> str:
+        """Return the ``channel_id`` of the space's auto-created public
+        General channel (the first ``is_public=true`` row from
+        ``GET /spaces/<id>/channels``), or ``""`` if none.
+
+        Used after accepting a space invite to pick the one channel
+        the agent now has auto-fanned-out membership in. Side effect:
+        every channel returned by the server is folded into
+        ``self._channel_name_cache`` so the immediately-following
+        ``_resolve_channel_name`` inside the intro nudge becomes a
+        cache hit instead of a separate events replay.
+
+        Accept POST → channels GET is a tight race: the server has
+        the accept event applied, but the ``channel_memberships``
+        rows that gate this endpoint may not be committed yet (the
+        endpoint returns 200 + the SPA index when the caller isn't
+        yet a member, which the http client decodes as a raw
+        ``str``). Sleep-first retry on a generous schedule;
+        past ~70s give up silently rather than spinning forever."""
+        if not space_id:
+            return ""
+        retry_delays = (0.5, 1.0, 3.0, 6.0, 12.0, 24.0, 24.0)
+        for attempt_idx, delay in enumerate(retry_delays):
+            await asyncio.sleep(delay)
+            data = await self.http.get(f"/spaces/{space_id}/channels")
+            if not isinstance(data, dict):
+                logger.info(
+                    "channels endpoint not ready for space=%s "
+                    "(attempt %d/%d) — retrying",
+                    space_id,
+                    attempt_idx + 1,
+                    len(retry_delays),
+                )
+                continue
+            found_cid = ""
+            for entry in data.get("channels") or []:
+                cid = entry.get("channel_id") or ""
+                name = (entry.get("name") or "").strip()
+                if cid and cid not in self._channel_name_cache:
+                    self._channel_name_cache[cid] = name or cid
+                # Persist the channel→space mapping so the MCP
+                # subprocess's send_message can resolve this channel
+                # BEFORE the first inbound message lands. Without
+                # this, lookup_channel_space falls through to the
+                # /messages table (empty) and then to agent.yml's
+                # space_id, which is the WRONG space when the agent
+                # has just joined a different one.
+                if cid:
+                    await self.store.mark_channel_space(cid, space_id)
+                if not found_cid and entry.get("is_public") and cid:
+                    found_cid = cid
+            return found_cid
+        logger.warning(
+            "gave up looking up General channel for space=%s after %d "
+            "attempts — intro nudge will be skipped",
+            space_id, len(retry_delays),
+        )
+        return ""
+
+    async def _enqueue_channel_intro_nudge(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+    ) -> None:
+        """Inject a synthetic system-message envelope into the thread
+        queue asking the agent to post a brief self-introduction in
+        ``channel_id``. Idempotent against the
+        ``channel_intro_prompted`` sqlite table so a redelivered
+        accept can't fire a second intro."""
+        if await self.store.has_channel_intro_been_prompted(channel_id):
+            return
+
+        space_name = (
+            await self._resolve_space_name(space_id) if space_id else ""
+        )
+        channel_name = await self._resolve_channel_name(space_id, channel_id)
+
+        now_ms = int(__import__("time").time() * 1000)
+        envelope_id = f"intro-prompt-{channel_id}-{now_ms}"
+        # The prefix is documented in the agent's CLAUDE.md primer as
+        # a recognised control-message marker (see 0.7.3 notes); the
+        # agent treats it as a directive rather than user chatter.
+        prompt_text = (
+            "[puffo-agent system message] You've just been added to "
+            f"channel #{channel_name} (channel_id: {channel_id}) in "
+            f"space {space_name or space_id}. Post a brief "
+            "self-introduction (2-3 sentences, in English by default) "
+            f"using mcp__puffo__send_message with channel=\"{channel_id}\" "
+            "so existing members know who you are and how you can help. "
+            "Don't include a thread root_id — this should be a new "
+            "top-level post in the channel."
+        )
+
+        msg_dict = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "sender_slug": "system",
+            "sender_display_name": "",
+            "sender_email": "",
+            "text": prompt_text,
+            "root_id": "",
+            "is_dm": False,
+            "attachments": [],
+            "sender_is_bot": False,
+            "mentions": [],
+            "envelope_id": envelope_id,
+            "sent_at": now_ms,
+        }
+        channel_meta = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "is_dm": False,
+        }
+
+        # Mark prompted BEFORE admitting so a crash between admit and
+        # commit can't leave us re-prompting on restart. Worst case
+        # the agent doesn't get the nudge — preferable to spamming.
+        await self.store.mark_channel_intro_prompted(channel_id)
+
+        await self._admit_thread_message(
+            root_id=envelope_id,
+            priority=PRIORITY_SYSTEM,
+            msg_dict=msg_dict,
+            channel_meta=channel_meta,
+        )
+        logger.info(
+            "enqueued channel-intro nudge for channel=%s (space=%s)",
+            channel_id, space_id,
         )
 
     async def _maybe_handle_invite_reply(

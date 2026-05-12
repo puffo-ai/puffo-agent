@@ -6,6 +6,49 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Auto self-introduction after accepting an invite. When the agent
+  accepts an ``invite_to_channel`` (auto-accepted from an operator-
+  matched signer, or accepted via the operator's ``y`` DM reply),
+  the daemon enqueues a synthetic ``[puffo-agent system message]``
+  envelope on the invited channel asking the agent to post a short
+  intro (default English, 2-3 sentences) via its normal
+  ``mcp__puffo__send_message`` path. For ``invite_to_space``, the
+  daemon resolves the space's auto-General channel via ``GET
+  /spaces/<id>/channels`` (the row with ``is_public=true``) and
+  fires the same nudge there — General is the one channel the agent
+  gets auto-fanned-out membership on when accepting a space invite,
+  so it's the only channel it can immediately post into. Existing
+  ``profile.md`` personality shapes the wording.
+
+  Wiring:
+  * New sqlite table ``channel_intro_prompted(channel_id PK,
+    prompted_at)`` on the per-agent ``messages.db`` gates the nudge
+    so a daemon restart or server-side invite redelivery can't fire
+    a second intro on the same channel.
+  * New sqlite table ``channel_space_map(channel_id PK, space_id,
+    learned_at)`` records the channel→space mapping discovered
+    out-of-band by the General lookup. ``lookup_channel_space``
+    (used by the MCP ``send_message`` tool) checks this map first,
+    then falls back to the historical ``messages``-table inference.
+    Without this, the agent's first send into the freshly-joined
+    channel would 404 the data-service lookup (no prior messages on
+    that channel) and fall back to ``agent.yml``'s configured
+    ``space_id`` — the WRONG space when the agent has just joined
+    a different one.
+  * General lookup retries on a sleep-first schedule
+    (0.5 / 1 / 3 / 6 / 12 / 24 / 24 seconds, ~70s total) because
+    the server has a tight race between the ``accept_space_invite``
+    POST returning and the ``channel_memberships`` row that gates
+    ``GET /spaces/<id>/channels`` being committed. Past ~70s the
+    daemon gives up silently — missing the intro is preferable to
+    spinning forever.
+  * ``_channel_name_cache`` is warmed from the same ``/channels``
+    response so the ``_resolve_channel_name`` call inside the
+    nudge becomes a cache hit instead of a duplicate HTTP round-
+    trip.
+
 ## [0.7.4] — 2026-05-12
 
 ### Fixed

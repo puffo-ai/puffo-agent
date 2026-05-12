@@ -45,6 +45,31 @@ CREATE TABLE IF NOT EXISTS thread_processing_state (
     root_id TEXT PRIMARY KEY,
     last_processed_sent_at INTEGER NOT NULL
 );
+
+-- One row per channel the agent has been auto-prompted to introduce
+-- itself in. Gate set in ``_accept_invite`` so a daemon restart (or a
+-- server-side invite redelivery) can't trigger a second intro.
+CREATE TABLE IF NOT EXISTS channel_intro_prompted (
+    channel_id TEXT PRIMARY KEY,
+    prompted_at INTEGER NOT NULL
+);
+
+-- Out-of-band channel→space mappings discovered without an inbound
+-- message. The /messages table inference is enough for channels the
+-- agent has received traffic from, but the intro-nudge path needs
+-- the mapping BEFORE the first real message — agent calls
+-- send_message against the freshly-joined channel, MCP asks
+-- lookup_channel_space, and without this table the daemon-side
+-- query returns 404 → MCP falls back to agent.yml's home space,
+-- which is the wrong space when the agent is now multi-space.
+-- Populated by ``_find_public_general_channel`` (and any future
+-- channel-discovery hook). ``lookup_channel_space`` checks this
+-- table first before the /messages fallback.
+CREATE TABLE IF NOT EXISTS channel_space_map (
+    channel_id TEXT PRIMARY KEY,
+    space_id TEXT NOT NULL,
+    learned_at INTEGER NOT NULL
+);
 """
 
 
@@ -186,14 +211,34 @@ class MessageStore:
             return await cursor.fetchone() is not None
 
     async def lookup_channel_space(self, channel_id: str) -> str | None:
-        """Return the ``space_id`` last seen for ``channel_id``, or
-        ``None`` when no message from that channel has been stored.
-        Used by the MCP subprocess (which can't read the daemon's
-        in-memory ``_channel_space`` map) as a cross-space fallback.
+        """Return the ``space_id`` known for ``channel_id``, or
+        ``None`` when neither the explicit map nor any prior message
+        gives one. Used by the MCP subprocess (which can't read the
+        daemon's in-memory ``_channel_space`` map) as a cross-space
+        fallback.
+
+        Two-source lookup, in order:
+
+        1. ``channel_space_map`` — explicit mappings recorded by
+           out-of-band discovery (``_find_public_general_channel`` and
+           friends). Lets send_message resolve a channel BEFORE the
+           first inbound message lands on it — the case the intro
+           nudge needs.
+        2. ``messages`` — last ``space_id`` seen on an envelope in
+           that channel. Steady-state fallback that doesn't need
+           explicit bookkeeping; works automatically once any message
+           arrives.
         """
         if not channel_id:
             return None
         db = await self._ensure_db()
+        async with db.execute(
+            "SELECT space_id FROM channel_space_map WHERE channel_id = ?",
+            (channel_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None and row[0]:
+            return row[0]
         async with db.execute(
             "SELECT space_id FROM messages WHERE channel_id = ? "
             "AND space_id IS NOT NULL AND space_id != '' "
@@ -204,6 +249,24 @@ class MessageStore:
         if row is None:
             return None
         return row[0] if row[0] else None
+
+    async def mark_channel_space(self, channel_id: str, space_id: str) -> None:
+        """Record an explicit channel→space mapping. Called by
+        out-of-band channel-discovery paths (``_find_public_general_channel``)
+        so ``lookup_channel_space`` can resolve the channel before
+        the first inbound message lands."""
+        if not channel_id or not space_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO channel_space_map (channel_id, space_id, learned_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(channel_id) DO UPDATE SET
+                 space_id = excluded.space_id,
+                 learned_at = excluded.learned_at""",
+            (channel_id, space_id, _now_ms()),
+        )
+        await db.commit()
 
     async def get_channel_history(
         self,
@@ -467,6 +530,34 @@ class MessageStore:
                    excluded.last_processed_sent_at
                  )""",
             (root_id, sent_at),
+        )
+        await db.commit()
+
+    async def has_channel_intro_been_prompted(self, channel_id: str) -> bool:
+        """True iff the agent already had a self-introduction prompted
+        for ``channel_id``. Used by ``_accept_invite`` to gate the
+        synthetic system-message enqueue so a restart-time replay of
+        the same pending invite doesn't fire a second intro."""
+        if not channel_id:
+            return False
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT 1 FROM channel_intro_prompted WHERE channel_id = ?",
+            (channel_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def mark_channel_intro_prompted(self, channel_id: str) -> None:
+        """Record that an intro nudge has been enqueued for
+        ``channel_id``. Idempotent."""
+        if not channel_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO channel_intro_prompted (channel_id, prompted_at)
+               VALUES (?, ?)
+               ON CONFLICT(channel_id) DO NOTHING""",
+            (channel_id, _now_ms()),
         )
         await db.commit()
 
