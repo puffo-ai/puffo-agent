@@ -34,6 +34,13 @@ class StoredMessageDict:
     reply_to_id: Optional[str]
 
 
+# Re-exported from ``message_store`` so both the network-backed
+# DataClient and the in-process MessageStore (used as a duck-type
+# drop-in in tests) raise the same type — the MCP tool layer can
+# ``except DataNotFound`` regardless of which one it has.
+from ..agent.message_store import DataNotFound  # noqa: E402  (intentional placement)
+
+
 @dataclass
 class ChannelRootDict:
     """Per-thread head + reply count returned by
@@ -170,7 +177,7 @@ class DataClient:
                 f"{self.base_url}{path}", params=params,
             ) as resp:
                 if resp.status == 404:
-                    return []
+                    raise DataNotFound(f"channel not found: {channel_id}")
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.warning(
@@ -218,7 +225,7 @@ class DataClient:
                 f"{self.base_url}{path}", params=params,
             ) as resp:
                 if resp.status == 404:
-                    return []
+                    raise DataNotFound(f"thread root not found: {root_id}")
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.warning(

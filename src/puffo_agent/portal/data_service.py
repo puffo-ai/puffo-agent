@@ -169,6 +169,14 @@ async def list_channel_roots(request: web.Request) -> web.Response:
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
+        # Distinguish "channel never seen" (true 404) from "channel
+        # seen but window after filters is empty" (200 + []). The
+        # latter is a routine case for ``since=<last_id>`` polling
+        # and must NOT look the same to the MCP tool.
+        if not await store.channel_exists(channel_id):
+            return web.json_response(
+                {"error": "channel not found"}, status=404,
+            )
         roots = await store.get_channel_roots(
             channel_id,
             limit=limit,
@@ -213,6 +221,14 @@ async def list_thread_messages(request: web.Request) -> web.Response:
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
+        # Mirrors ``list_channel_roots``: 404 when the agent has
+        # never recorded anything for ``root_id`` (the root message
+        # itself isn't in the store), 200 + [] when the root is
+        # known but the requested window is empty.
+        if not await store.has_message(root_id):
+            return web.json_response(
+                {"error": "thread root not found"}, status=404,
+            )
         msgs = await store.get_thread_messages(
             root_id,
             limit=limit,

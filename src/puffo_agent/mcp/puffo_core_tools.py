@@ -27,7 +27,7 @@ from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
 from ..crypto.primitives import Ed25519KeyPair
-from .data_client import DataClient
+from .data_client import DataClient, DataNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -239,13 +239,16 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             )
         channel_id = channel_ref
 
-        roots = await cfg.data_client.get_channel_roots(
-            channel_id,
-            limit=limit,
-            since_envelope_id=since or None,
-            before_ts=int(before) if before else None,
-            after_ts=int(after) if after else None,
-        )
+        try:
+            roots = await cfg.data_client.get_channel_roots(
+                channel_id,
+                limit=limit,
+                since_envelope_id=since or None,
+                before_ts=int(before) if before else None,
+                after_ts=int(after) if after else None,
+            )
+        except DataNotFound:
+            return f"(no such channel: {channel_id})"
         if not roots:
             return "(no root posts in the requested window)"
         lines = []
@@ -288,15 +291,18 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         if not root_id.strip():
             raise RuntimeError("root_id required")
         limit = max(1, min(int(limit), 200))
-        msgs = await cfg.data_client.get_thread_messages(
-            root_id.strip(),
-            limit=limit,
-            since_envelope_id=since or None,
-            before_ts=int(before) if before else None,
-            after_ts=int(after) if after else None,
-        )
+        try:
+            msgs = await cfg.data_client.get_thread_messages(
+                root_id.strip(),
+                limit=limit,
+                since_envelope_id=since or None,
+                before_ts=int(before) if before else None,
+                after_ts=int(after) if after else None,
+            )
+        except DataNotFound:
+            return f"(no such thread: {root_id.strip()})"
         if not msgs:
-            return "(no messages in this thread)"
+            return "(no messages in this thread for the requested window)"
         lines = []
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)

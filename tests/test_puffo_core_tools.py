@@ -265,12 +265,71 @@ async def test_get_channel_history_from_local():
 
 
 @pytest.mark.asyncio
-async def test_get_channel_history_empty():
+async def test_get_channel_history_unknown_channel():
+    """Channel never seen → 'no such channel: …'. Distinct from
+    the empty-window message so the agent doesn't conflate a
+    bad channel id with a quiet one."""
     cfg, _, ms = _setup()
     await ms.open()
     mcp = _build_tools(cfg)
     result = await _call(mcp, "get_channel_history", {"channel": "ch_nonexistent"})
+    assert "no such channel" in result
+    assert "ch_nonexistent" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_history_empty_window():
+    """Channel exists but the ``since`` filter pushes past every
+    root → 'no root posts in the requested window'."""
+    cfg, _, ms = _setup()
+    await ms.open()
+    base = _now_ms()
+    await ms.store({
+        "envelope_id": "env_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_seen",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "Hello", "sent_at": base,
+    })
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp, "get_channel_history",
+        {"channel": "ch_seen", "since": "env_root"},
+    )
     assert "no root posts" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_get_thread_history_unknown_root():
+    cfg, _, ms = _setup()
+    await ms.open()
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "get_thread_history", {"root_id": "msg_nonexistent"})
+    assert "no such thread" in result
+    assert "msg_nonexistent" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_get_thread_history_empty_window():
+    cfg, _, ms = _setup()
+    await ms.open()
+    base = _now_ms()
+    await ms.store({
+        "envelope_id": "env_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_t",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "Root", "sent_at": base,
+    })
+    mcp = _build_tools(cfg)
+    # ``since=env_root`` filters out the root itself; thread has no
+    # replies → empty window.
+    result = await _call(
+        mcp, "get_thread_history",
+        {"root_id": "env_root", "since": "env_root"},
+    )
+    assert "no messages in this thread" in result
     await ms.close()
 
 

@@ -52,6 +52,14 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+class DataNotFound(Exception):
+    """Raised by reads that need to distinguish "this channel /
+    thread has never been seen" from "seen, but the requested
+    window is empty after filters". The MCP tool layer surfaces a
+    different user-facing message for each.
+    """
+
+
 @dataclass
 class StoredMessage:
     envelope_id: str
@@ -153,6 +161,22 @@ class MessageStore:
             ),
         )
         await db.commit()
+
+    async def channel_exists(self, channel_id: str) -> bool:
+        """True iff the store has ever recorded a message in
+        ``channel_id``. Used by the data service to return 404 when
+        the caller asks for history on a channel the agent has never
+        seen — distinguishes "unknown channel" from "known channel,
+        empty window after filters" (200 + empty list).
+        """
+        if not channel_id:
+            return False
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT 1 FROM messages WHERE channel_id = ? LIMIT 1",
+            (channel_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     async def has_message(self, envelope_id: str) -> bool:
         db = await self._ensure_db()
@@ -310,8 +334,13 @@ class MessageStore:
         - ``before_ts`` (ms-epoch) — exclusive upper bound on
           ``sent_at``.
 
-        Returned newest-first up to ``limit``.
+        Returned newest-first up to ``limit``. Raises
+        ``DataNotFound`` if the channel has never had any message
+        stored — so the MCP layer can distinguish "unknown channel"
+        from "known but empty window".
         """
+        if not await self.channel_exists(channel_id):
+            raise DataNotFound(f"channel not found: {channel_id}")
         db = await self._ensure_db()
         lower_bounds: list[int] = []
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
@@ -366,10 +395,14 @@ class MessageStore:
         ``get_channel_roots``. Newest-first selection, then
         reversed to oldest-first in the returned list — matches
         ``get_channel_history``'s shape so the MCP tool can format
-        either the same way.
+        either the same way. Raises ``DataNotFound`` when no
+        message with that envelope_id has been stored — same
+        rationale as ``get_channel_roots``.
         """
         if not root_id:
-            return []
+            raise DataNotFound("thread root not found: (empty)")
+        if not await self.has_message(root_id):
+            raise DataNotFound(f"thread root not found: {root_id}")
         db = await self._ensure_db()
         lower_bounds: list[int] = []
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
