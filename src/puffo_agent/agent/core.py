@@ -142,6 +142,7 @@ class PuffoAgent:
                 followups=None,
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
+                sender_display_name=msg.get("sender_display_name", ""),
             )
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
@@ -197,6 +198,7 @@ class PuffoAgent:
                 create_at=msg.get("sent_at", 0),
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
+                sender_display_name=msg.get("sender_display_name", ""),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
 
@@ -331,6 +333,7 @@ class PuffoAgent:
         followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
+        sender_display_name: str = "",
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -347,6 +350,7 @@ class PuffoAgent:
             followups=followups,
             space_id=space_id,
             space_name=space_name,
+            sender_display_name=sender_display_name,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -368,6 +372,7 @@ class PuffoAgent:
         followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
+        sender_display_name: str = "",
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
@@ -391,9 +396,16 @@ class PuffoAgent:
         ts_iso = _ms_to_iso(create_at)
         if ts_iso:
             lines.append(f"- timestamp: {ts_iso}")
-        lines.append(
-            f"- sender: {sender}" + (f" ({sender_email})" if sender_email else "")
+        # Render display_name in parens when present so the LLM has a
+        # human-readable handle to address peers with; the slug stays
+        # as the structural identifier for @-mention and send_message
+        # routing. Falls back to bare ``- sender: <slug>`` when the
+        # server didn't return a display_name.
+        suffix = (
+            f" ({sender_display_name})" if sender_display_name
+            else (f" <{sender_email}>" if sender_email else "")
         )
+        lines.append(f"- sender: {sender}{suffix}")
         lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
         if mentions:
             lines.append("- mentions:")

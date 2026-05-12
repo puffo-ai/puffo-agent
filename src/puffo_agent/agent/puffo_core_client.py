@@ -524,12 +524,20 @@ class PuffoCoreMessageClient:
                 )
                 return
 
+            # Per-session display-name cache turns this into ~1 HTTP
+            # call per distinct sender per session; same helper the
+            # invite-DM flow already uses. Empty string on miss.
+            sender_display_name = await self._fetch_display_name(
+                payload.sender_slug,
+            )
+
             msg_dict = {
                 "channel_id": channel_id,
                 "channel_name": channel_name,
                 "space_id": space_id,
                 "space_name": space_name,
                 "sender_slug": payload.sender_slug,
+                "sender_display_name": sender_display_name,
                 "sender_email": "",
                 "text": clean_text,
                 "root_id": payload.thread_root_id or "",
@@ -1393,6 +1401,7 @@ class PuffoCoreMessageClient:
             "space_id": space_id,
             "space_name": space_name,
             "sender_slug": "system",
+            "sender_display_name": "",
             "sender_email": "",
             "text": prompt_text,
             "root_id": "",
