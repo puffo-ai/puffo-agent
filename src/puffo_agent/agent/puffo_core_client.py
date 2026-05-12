@@ -1259,6 +1259,101 @@ class PuffoCoreMessageClient:
             {"space_id": space_id, "events": [signed]},
         )
 
+        # Channel invites trigger a one-shot self-introduction nudge:
+        # we enqueue a synthetic ``[puffo-agent system message]`` so the
+        # agent posts a short intro in the channel using its existing
+        # ``send_message`` MCP tool. Space-only invites are skipped
+        # (the agent isn't actually in any specific channel yet) and
+        # so are channels we've already prompted (server-side invite
+        # redelivery / daemon restart guard via sqlite).
+        if kind == "invite_to_channel" and channel_id:
+            try:
+                await self._enqueue_channel_intro_nudge(
+                    space_id=space_id,
+                    channel_id=channel_id,
+                )
+            except Exception:
+                # Intro is best-effort; never block the accept.
+                logger.exception(
+                    "failed to enqueue channel intro nudge "
+                    "(space=%s channel=%s)", space_id, channel_id,
+                )
+
+    async def _enqueue_channel_intro_nudge(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+    ) -> None:
+        """Inject a synthetic system-message envelope into the thread
+        queue asking the agent to post a brief self-introduction in
+        ``channel_id``. Idempotent against the
+        ``channel_intro_prompted`` sqlite table so a redelivered
+        accept can't fire a second intro."""
+        if await self.store.has_channel_intro_been_prompted(channel_id):
+            return
+
+        space_name = (
+            await self._resolve_space_name(space_id) if space_id else ""
+        )
+        channel_name = await self._resolve_channel_name(space_id, channel_id)
+
+        now_ms = int(__import__("time").time() * 1000)
+        envelope_id = f"intro-prompt-{channel_id}-{now_ms}"
+        # The prefix is documented in the agent's CLAUDE.md primer as
+        # a recognised control-message marker (see 0.7.3 notes); the
+        # agent treats it as a directive rather than user chatter.
+        prompt_text = (
+            "[puffo-agent system message] You've just been added to "
+            f"channel #{channel_name} (channel_id: {channel_id}) in "
+            f"space {space_name or space_id}. Post a brief "
+            "self-introduction (2-3 sentences, in English by default) "
+            f"using mcp__puffo__send_message with channel=\"{channel_id}\" "
+            "so existing members know who you are and how you can help. "
+            "Don't include a thread root_id — this should be a new "
+            "top-level post in the channel."
+        )
+
+        msg_dict = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "sender_slug": "system",
+            "sender_email": "",
+            "text": prompt_text,
+            "root_id": "",
+            "is_dm": False,
+            "attachments": [],
+            "sender_is_bot": False,
+            "mentions": [],
+            "envelope_id": envelope_id,
+            "sent_at": now_ms,
+        }
+        channel_meta = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "is_dm": False,
+        }
+
+        # Mark prompted BEFORE admitting so a crash between admit and
+        # commit can't leave us re-prompting on restart. Worst case
+        # the agent doesn't get the nudge — preferable to spamming.
+        await self.store.mark_channel_intro_prompted(channel_id)
+
+        await self._admit_thread_message(
+            root_id=envelope_id,
+            priority=PRIORITY_SYSTEM,
+            msg_dict=msg_dict,
+            channel_meta=channel_meta,
+        )
+        logger.info(
+            "enqueued channel-intro nudge for channel=%s (space=%s)",
+            channel_id, space_id,
+        )
+
     async def _maybe_handle_invite_reply(
         self, *, thread_root_id: str, text: str,
     ) -> bool:

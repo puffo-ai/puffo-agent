@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS thread_processing_state (
     root_id TEXT PRIMARY KEY,
     last_processed_sent_at INTEGER NOT NULL
 );
+
+-- One row per channel the agent has been auto-prompted to introduce
+-- itself in. Gate set in ``_accept_invite`` so a daemon restart (or a
+-- server-side invite redelivery) can't trigger a second intro.
+CREATE TABLE IF NOT EXISTS channel_intro_prompted (
+    channel_id TEXT PRIMARY KEY,
+    prompted_at INTEGER NOT NULL
+);
 """
 
 
@@ -467,6 +475,34 @@ class MessageStore:
                    excluded.last_processed_sent_at
                  )""",
             (root_id, sent_at),
+        )
+        await db.commit()
+
+    async def has_channel_intro_been_prompted(self, channel_id: str) -> bool:
+        """True iff the agent already had a self-introduction prompted
+        for ``channel_id``. Used by ``_accept_invite`` to gate the
+        synthetic system-message enqueue so a restart-time replay of
+        the same pending invite doesn't fire a second intro."""
+        if not channel_id:
+            return False
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT 1 FROM channel_intro_prompted WHERE channel_id = ?",
+            (channel_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def mark_channel_intro_prompted(self, channel_id: str) -> None:
+        """Record that an intro nudge has been enqueued for
+        ``channel_id``. Idempotent."""
+        if not channel_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO channel_intro_prompted (channel_id, prompted_at)
+               VALUES (?, ?)
+               ON CONFLICT(channel_id) DO NOTHING""",
+            (channel_id, _now_ms()),
         )
         await db.commit()
 
