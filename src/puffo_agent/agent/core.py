@@ -396,16 +396,16 @@ class PuffoAgent:
         ts_iso = _ms_to_iso(create_at)
         if ts_iso:
             lines.append(f"- timestamp: {ts_iso}")
-        # Render display_name in parens when present so the LLM has a
-        # human-readable handle to address peers with; the slug stays
-        # as the structural identifier for @-mention and send_message
-        # routing. Falls back to bare ``- sender: <slug>`` when the
-        # server didn't return a display_name.
-        suffix = (
-            f" ({sender_display_name})" if sender_display_name
-            else (f" <{sender_email}>" if sender_email else "")
-        )
-        lines.append(f"- sender: {sender}{suffix}")
+        # ``sender`` is the human-readable name the LLM should use
+        # when addressing this person in prose; ``sender_slug`` is
+        # the structural identifier (always required for @-mentions
+        # and send_message routing). When the server has no
+        # display_name on file, ``sender`` falls back to the slug so
+        # the field is always populated — no parsing branch in the
+        # agent prompt.
+        display = sender_display_name or sender
+        lines.append(f"- sender: {display}")
+        lines.append(f"- sender_slug: {sender}")
         lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
         if mentions:
             lines.append("- mentions:")
