@@ -1318,15 +1318,14 @@ class PuffoCoreMessageClient:
         # events`` may not be committed yet. The endpoint returns 200
         # + an empty (non-JSON) body for "you're not a member of this
         # space" rather than 403, so ``http.get`` hands us a raw
-        # ``str`` instead of a dict. One short retry covers the race;
-        # past that we give up silently — missing the intro nudge is
-        # preferable to logging an error storm.
-        attempts = 3
-        delay = 0.25
+        # ``str`` instead of a dict. Retry on a generous schedule
+        # (~70s cumulative); past that give up silently — missing
+        # the intro is preferable to spinning forever.
+        retry_delays = (0.5, 1.0, 3.0, 6.0, 12.0, 24.0, 24.0)
         cursor: str | None = None
         prev_cursor: str | None = None
         found_cid = ""
-        for attempt in range(attempts):
+        for attempt_idx in range(len(retry_delays) + 1):
             cursor = None
             prev_cursor = None
             replay_ok = True
@@ -1339,7 +1338,10 @@ class PuffoCoreMessageClient:
                     logger.info(
                         "events endpoint not ready for space=%s "
                         "(attempt %d/%d, body=%r) — retrying",
-                        space_id, attempt + 1, attempts, page,
+                        space_id,
+                        attempt_idx + 1,
+                        len(retry_delays) + 1,
+                        page,
                     )
                     replay_ok = False
                     break
@@ -1361,13 +1363,12 @@ class PuffoCoreMessageClient:
                     break
             if replay_ok:
                 return found_cid
-            if attempt < attempts - 1:
-                await asyncio.sleep(delay)
-                delay *= 2
+            if attempt_idx < len(retry_delays):
+                await asyncio.sleep(retry_delays[attempt_idx])
         logger.warning(
             "gave up looking up General channel for space=%s after %d "
             "attempts — intro nudge will be skipped",
-            space_id, attempts,
+            space_id, len(retry_delays) + 1,
         )
         return ""
 
