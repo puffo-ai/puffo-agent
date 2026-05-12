@@ -1313,31 +1313,63 @@ class PuffoCoreMessageClient:
         events replay."""
         if not space_id:
             return ""
+        # Accept POST → events GET is a tight race: the server has the
+        # accept, but the membership row that gates ``/spaces/<id>/
+        # events`` may not be committed yet. The endpoint returns 200
+        # + an empty (non-JSON) body for "you're not a member of this
+        # space" rather than 403, so ``http.get`` hands us a raw
+        # ``str`` instead of a dict. One short retry covers the race;
+        # past that we give up silently — missing the intro nudge is
+        # preferable to logging an error storm.
+        attempts = 3
+        delay = 0.25
         cursor: str | None = None
         prev_cursor: str | None = None
         found_cid = ""
-        while True:
-            path = f"/spaces/{space_id}/events"
-            if cursor:
-                path += f"?since={cursor}"
-            page = await self.http.get(path)
-            for ev in page.get("events") or []:
-                if ev.get("kind") != "create_channel":
-                    continue
-                payload = ev.get("payload") or {}
-                cid = payload.get("channel_id") or ""
-                name = (payload.get("name") or "").strip()
-                if cid and cid not in self._channel_name_cache:
-                    self._channel_name_cache[cid] = name or cid
-                if not found_cid and payload.get("is_public") and cid:
-                    found_cid = cid
-            if found_cid or not page.get("has_more"):
-                break
-            prev_cursor = cursor
-            cursor = page.get("next_cursor")
-            if not cursor or cursor == prev_cursor:
-                break
-        return found_cid
+        for attempt in range(attempts):
+            cursor = None
+            prev_cursor = None
+            replay_ok = True
+            while True:
+                path = f"/spaces/{space_id}/events"
+                if cursor:
+                    path += f"?since={cursor}"
+                page = await self.http.get(path)
+                if not isinstance(page, dict):
+                    logger.info(
+                        "events endpoint not ready for space=%s "
+                        "(attempt %d/%d, body=%r) — retrying",
+                        space_id, attempt + 1, attempts, page,
+                    )
+                    replay_ok = False
+                    break
+                for ev in page.get("events") or []:
+                    if ev.get("kind") != "create_channel":
+                        continue
+                    payload = ev.get("payload") or {}
+                    cid = payload.get("channel_id") or ""
+                    name = (payload.get("name") or "").strip()
+                    if cid and cid not in self._channel_name_cache:
+                        self._channel_name_cache[cid] = name or cid
+                    if not found_cid and payload.get("is_public") and cid:
+                        found_cid = cid
+                if found_cid or not page.get("has_more"):
+                    break
+                prev_cursor = cursor
+                cursor = page.get("next_cursor")
+                if not cursor or cursor == prev_cursor:
+                    break
+            if replay_ok:
+                return found_cid
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+                delay *= 2
+        logger.warning(
+            "gave up looking up General channel for space=%s after %d "
+            "attempts — intro nudge will be skipped",
+            space_id, attempts,
+        )
+        return ""
 
     async def _enqueue_channel_intro_nudge(
         self,

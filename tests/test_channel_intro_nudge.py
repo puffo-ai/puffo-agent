@@ -260,6 +260,76 @@ async def test_find_public_general_channel_warms_channel_name_cache():
 
 
 @pytest.mark.asyncio
+async def test_find_public_general_channel_retries_when_events_endpoint_returns_string(monkeypatch):
+    """Accept POST → events GET is a tight race: server may return 200
+    + empty body (decoded as a raw ``str`` by the http client) while
+    the membership row is still committing. One short retry covers
+    that — the third call returns a real dict and the General lookup
+    succeeds."""
+    # Skip the real backoff sleep so the test stays fast.
+    import puffo_agent.agent.puffo_core_client as _client_mod
+
+    async def _instant_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(_client_mod.asyncio, "sleep", _instant_sleep)
+
+    store = await _make_store()
+    client = _make_client(store)
+
+    calls: list[int] = []
+
+    class _FlakyHttp:
+        async def get(self, _path: str):
+            calls.append(1)
+            if len(calls) < 3:
+                return ""  # not-a-member-yet stand-in
+            return {
+                "events": [
+                    {
+                        "kind": "create_channel",
+                        "payload": {
+                            "channel_id": "ch_general",
+                            "name": "General",
+                            "is_public": True,
+                        },
+                    },
+                ],
+                "has_more": False,
+            }
+
+    client.http = _FlakyHttp()
+    cid = await client._find_public_general_channel("sp_1")
+    assert cid == "ch_general"
+    assert len(calls) == 3
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_public_general_channel_gives_up_after_all_retries(monkeypatch):
+    """Endpoint stays unhappy across all attempts → return ``""``,
+    no exception raised. The accept itself isn't blocked."""
+    import puffo_agent.agent.puffo_core_client as _client_mod
+
+    async def _instant_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(_client_mod.asyncio, "sleep", _instant_sleep)
+
+    store = await _make_store()
+    client = _make_client(store)
+
+    class _AlwaysString:
+        async def get(self, _path: str):
+            return ""
+
+    client.http = _AlwaysString()
+    cid = await client._find_public_general_channel("sp_1")
+    assert cid == ""
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_find_public_general_channel_returns_empty_when_none():
     """No public channel in the space → empty string. Caller treats
     this as 'skip the intro' (no obvious landing channel)."""
