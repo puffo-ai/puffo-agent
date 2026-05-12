@@ -281,15 +281,22 @@ def _profile_summary(cfg: AgentConfig) -> str:
     """Return the full body of the agent's ``# Soul`` section from
     profile.md (or any description-like heading: ``description`` /
     ``about`` / ``summary``). Picks up everything between the
-    matching heading and the next heading or EOF, with surrounding
-    blank lines trimmed. Empty string when no such section exists
-    or the profile is unreadable.
+    matching heading and the next heading **of the same or higher
+    level** (or EOF). Sub-headings inside the section (``## Tone``,
+    ``## What you don't do`` etc.) stay part of the body so the
+    operator's structured markdown round-trips faithfully.
+
+    Surrounding blank lines are trimmed; internal blank lines are
+    preserved.
+
+    Empty string when no such section exists or the profile is
+    unreadable.
 
     The asymmetric "read first line, write full body" the helper had
-    before broke the new agent-card Soul-expand UI — the operator
-    typed multiple paragraphs into the Soul textarea, the write path
-    wrote them all to profile.md, then the next read returned only
-    the first line so the expanded card looked truncated."""
+    before broke the new agent-card Soul-expand UI; the H2-stops-
+    collection bug then truncated multi-section souls (the operator's
+    helper template uses ``## How you act`` / ``## Tone`` / etc.)
+    even after the multi-line fix landed."""
     try:
         text = cfg.resolve_profile_path().read_text(encoding="utf-8")
     except Exception:
@@ -298,20 +305,39 @@ def _profile_summary(cfg: AgentConfig) -> str:
     description_heading = {"soul", "description", "about", "summary"}
     body_lines: list[str] = []
     in_description = False
+    section_level = 0  # ``#`` → 1, ``##`` → 2, etc.
 
     for raw in text.splitlines():
-        stripped = raw.strip()
+        stripped = raw.lstrip()
+        # Recognise a heading: one or more leading ``#`` followed by
+        # whitespace then text. ``#hashtag`` (no space) isn't a
+        # heading in CommonMark; ignore it.
+        is_heading = False
+        level = 0
+        heading_text = ""
         if stripped.startswith("#"):
-            heading = stripped.lstrip("#").strip().lower()
+            # Count consecutive '#'s.
+            i = 0
+            while i < len(stripped) and stripped[i] == "#":
+                i += 1
+            if i < len(stripped) and stripped[i] in " \t":
+                level = i
+                heading_text = stripped[i:].strip().lower()
+                is_heading = True
+
+        if is_heading:
             if in_description:
-                # Already inside the Soul section — a new heading
-                # closes it. Stop collecting; ignore any later
-                # description-like section so the body stays
-                # deterministic.
-                break
-            if heading in description_heading:
+                if level <= section_level:
+                    # Same-or-higher-level heading closes the section.
+                    break
+                # Deeper heading — part of the soul body.
+                body_lines.append(raw)
+                continue
+            if heading_text in description_heading:
                 in_description = True
+                section_level = level
             continue
+
         if in_description:
             body_lines.append(raw)
 

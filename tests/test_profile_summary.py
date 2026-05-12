@@ -49,9 +49,13 @@ def _agent_with_profile(home: str, profile_text: str, agent_id: str = "smoke") -
 
 
 def test_returns_full_soul_body_multi_paragraph(monkeypatch):
-    """Multi-paragraph Soul section: every line between ``# Soul``
-    and the next heading (or EOF) is returned with internal blank
-    lines preserved."""
+    """Multi-paragraph Soul with sub-sections: every line between
+    ``# Soul`` and the next same-or-higher-level heading (here EOF)
+    is returned, including ``## ...`` sub-headings, with internal
+    blank lines preserved. Operators rely on sub-headings — the
+    helper template in ~/Downloads/markdowns/helper-agent.md uses
+    ``## How you act`` / ``## Tone`` / ``## What you don't do`` —
+    so a multi-level capture is the round-trip-faithful behaviour."""
     with tempfile.TemporaryDirectory() as home:
         monkeypatch.setenv("PUFFO_AGENT_HOME", home)
         body = (
@@ -63,22 +67,48 @@ def test_returns_full_soul_body_multi_paragraph(monkeypatch):
             "Wrapped onto a second line.\n\n"
             "Second paragraph.\n\n"
             "## Subsection\n\n"
-            "Still part of the soul because the subsection sits inside it.\n"
+            "Sub-section content stays in the body.\n\n"
+            "## Another subsection\n\n"
+            "Also part of soul.\n"
         )
         cfg = _agent_with_profile(home, body)
         out = _profile_summary(cfg)
+        # First-line + subsequent paragraphs.
         assert "First paragraph of soul." in out
         assert "Wrapped onto a second line." in out
         assert "Second paragraph." in out
-        # Sub-section heading INSIDE the soul block stops collection,
-        # matching the rule "any later heading closes the section".
-        # This avoids accidentally swallowing trailing notes the
-        # operator stashed below the soul.
-        assert "## Subsection" not in out
-        assert "Still part of the soul" not in out
+        # Sub-headings (## ...) are deeper than the # Soul section
+        # heading and stay part of the body so the operator's
+        # markdown structure round-trips.
+        assert "## Subsection" in out
+        assert "Sub-section content stays in the body." in out
+        assert "## Another subsection" in out
+        assert "Also part of soul." in out
         # Leading + trailing whitespace trimmed.
         assert not out.startswith("\n")
         assert not out.endswith("\n")
+
+
+def test_stops_on_same_level_heading_after_soul(monkeypatch):
+    """A later H1 (same level as ``# Soul``) closes the section.
+    Trailing top-level notes after Soul shouldn't leak in."""
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        body = (
+            "# Soul\n\n"
+            "The actual soul.\n\n"
+            "## A subsection\n\n"
+            "Still soul.\n\n"
+            "# Notes\n\n"
+            "Operator's private notes — not soul.\n"
+        )
+        cfg = _agent_with_profile(home, body)
+        out = _profile_summary(cfg)
+        assert "The actual soul." in out
+        assert "## A subsection" in out
+        assert "Still soul." in out
+        assert "# Notes" not in out
+        assert "Operator's private notes" not in out
 
 
 def test_returns_empty_when_no_soul_section(monkeypatch):
