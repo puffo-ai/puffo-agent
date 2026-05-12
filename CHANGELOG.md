@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-05-12
+
 ### Added
 
 - Auto self-introduction after accepting an invite. When the agent
@@ -48,6 +50,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
     response so the ``_resolve_channel_name`` call inside the
     nudge becomes a cache hit instead of a duplicate HTTP round-
     trip.
+
+- Every message fed to the agent now carries the sender's
+  ``display_name`` alongside the slug, rendered as two distinct
+  fields in the user block:
+
+  ```
+  - sender: Alice Wong
+  - sender_slug: alice-0001
+  - sender_type: human
+  ```
+
+  ``sender`` is the human-readable handle the LLM uses to address
+  peers in prose; ``sender_slug`` stays the structural identifier
+  for @-mentions and ``send_message`` routing. When the server has
+  no display_name on file, ``sender`` echoes the slug so the field
+  is always populated. Resolution piggy-backs on the existing
+  per-session display-name cache (one ``/identities/profiles?slugs=``
+  call per distinct sender per session; subsequent messages from
+  the same sender are free).
+
+### Changed
+
+- ``- sender: <slug> <email>`` rendering removed from the user
+  block; ``sender_email`` was hardcoded to ``""`` everywhere it
+  was populated and just cluttered the prompt.
 
 ## [0.7.4] — 2026-05-12
 
@@ -219,6 +246,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.7.5...HEAD
+[0.7.5]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.5
+[0.7.4]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.4
 [0.7.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.3
 [0.7.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.2
