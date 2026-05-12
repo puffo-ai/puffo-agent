@@ -8,20 +8,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Auto self-introduction after accepting a channel invite. When the
-  agent accepts an ``invite_to_channel`` (whether auto-accepted from
-  the operator or accepted via the operator's ``y`` DM reply), the
+- Auto self-introduction after accepting an invite. When the agent
+  accepts an ``invite_to_channel`` (whether auto-accepted from the
+  operator or accepted via the operator's ``y`` DM reply), the
   daemon enqueues a synthetic ``[puffo-agent system message]``
-  envelope on the new channel asking the agent to post a short intro
-  (default English, 2-3 sentences) using its normal
-  ``mcp__puffo__send_message`` path. Existing personality from
+  envelope on the invited channel asking the agent to post a short
+  intro (default English, 2-3 sentences) via its normal
+  ``mcp__puffo__send_message`` path. For ``invite_to_space``, the
+  daemon locates the space's auto-General channel (the
+  ``create_channel`` event with ``is_public=true``) and fires the
+  same nudge there — the agent gets auto-fanned-out membership on
+  General when accepting a space invite, so that's the one channel
+  it can immediately post into. Existing personality from
   ``profile.md`` shapes the wording. A new sqlite table
   ``channel_intro_prompted(channel_id PK, prompted_at)`` (per-agent
   ``messages.db``) gates the nudge so a daemon restart or a
-  server-side invite redelivery can't fire a second intro. Space-only
-  invites and public channels the agent gains via space-membership
-  fan-out are intentionally not nudged — the trigger is specifically
-  the channel-level invite accept.
+  server-side invite redelivery can't fire a second intro.
 
 ## [0.7.4] — 2026-05-12
 

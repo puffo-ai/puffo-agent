@@ -172,6 +172,76 @@ async def test_intro_nudge_distinct_channels_each_get_one():
 
 
 @pytest.mark.asyncio
+async def test_find_public_general_channel_picks_is_public_true():
+    """``_find_public_general_channel`` walks the space's events,
+    returns the first ``create_channel`` event with ``is_public=true``.
+    Public-flag check is the canonical signal — server emits a
+    synthetic CreateChannel with ``is_public=true`` for every new
+    space's General; user-created channels default false."""
+    store = await _make_store()
+    client = _make_client(store)
+
+    class _StubHttp:
+        async def get(self, path: str) -> dict:
+            assert path.startswith("/spaces/sp_1/events")
+            return {
+                "events": [
+                    {
+                        "kind": "create_channel",
+                        "payload": {
+                            "channel_id": "ch_private",
+                            "name": "Random",
+                            "is_public": False,
+                        },
+                    },
+                    {
+                        "kind": "create_channel",
+                        "payload": {
+                            "channel_id": "ch_general",
+                            "name": "General",
+                            "is_public": True,
+                        },
+                    },
+                ],
+                "has_more": False,
+            }
+
+    client.http = _StubHttp()
+    cid = await client._find_public_general_channel("sp_1")
+    assert cid == "ch_general"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_public_general_channel_returns_empty_when_none():
+    """No public channel in the space → empty string. Caller treats
+    this as 'skip the intro' (no obvious landing channel)."""
+    store = await _make_store()
+    client = _make_client(store)
+
+    class _StubHttp:
+        async def get(self, _path: str) -> dict:
+            return {
+                "events": [
+                    {
+                        "kind": "create_channel",
+                        "payload": {
+                            "channel_id": "ch_private",
+                            "name": "Random",
+                            "is_public": False,
+                        },
+                    },
+                ],
+                "has_more": False,
+            }
+
+    client.http = _StubHttp()
+    cid = await client._find_public_general_channel("sp_1")
+    assert cid == ""
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_intro_nudge_survives_simulated_restart():
     """Dedup is persistent: a fresh client built on the same db path
     must still treat the channel as already-prompted."""

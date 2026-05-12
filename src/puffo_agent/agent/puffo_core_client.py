@@ -1259,25 +1259,77 @@ class PuffoCoreMessageClient:
             {"space_id": space_id, "events": [signed]},
         )
 
-        # Channel invites trigger a one-shot self-introduction nudge:
-        # we enqueue a synthetic ``[puffo-agent system message]`` so the
-        # agent posts a short intro in the channel using its existing
-        # ``send_message`` MCP tool. Space-only invites are skipped
-        # (the agent isn't actually in any specific channel yet) and
-        # so are channels we've already prompted (server-side invite
-        # redelivery / daemon restart guard via sqlite).
+        # Accepting an invite triggers a one-shot self-introduction
+        # nudge: we enqueue a synthetic ``[puffo-agent system message]``
+        # so the agent posts a short intro using its existing
+        # ``send_message`` MCP tool. Channel invites intro into the
+        # invited channel; space invites intro into the space's public
+        # ``General`` channel (the only channel an accepting member is
+        # auto-fanned-out into per puffo-server's space-invite redeem
+        # logic — any other channel needs its own invite_to_channel).
+        intro_channel_id = ""
         if kind == "invite_to_channel" and channel_id:
+            intro_channel_id = channel_id
+        elif kind == "invite_to_space":
+            try:
+                intro_channel_id = await self._find_public_general_channel(
+                    space_id,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to look up General channel for intro nudge "
+                    "(space=%s)", space_id,
+                )
+        if intro_channel_id:
             try:
                 await self._enqueue_channel_intro_nudge(
                     space_id=space_id,
-                    channel_id=channel_id,
+                    channel_id=intro_channel_id,
                 )
             except Exception:
                 # Intro is best-effort; never block the accept.
                 logger.exception(
                     "failed to enqueue channel intro nudge "
-                    "(space=%s channel=%s)", space_id, channel_id,
+                    "(space=%s channel=%s)", space_id, intro_channel_id,
                 )
+
+    async def _find_public_general_channel(self, space_id: str) -> str:
+        """Return the ``channel_id`` of the space's auto-created public
+        General channel (CreateChannel event with ``is_public=true``),
+        or ``""`` if none exists. Used after accepting a space invite
+        to pick the one channel the agent now has auto-fanned-out
+        membership in.
+
+        Replays ``/spaces/<id>/events`` because puffo-server has no
+        dedicated channels-list endpoint — same pattern as the
+        ``list_channels`` MCP tool. Returns the FIRST public channel
+        encountered so a hypothetical future second public channel
+        doesn't double-fire."""
+        if not space_id:
+            return ""
+        cursor: str | None = None
+        prev_cursor: str | None = None
+        while True:
+            path = f"/spaces/{space_id}/events"
+            if cursor:
+                path += f"?since={cursor}"
+            page = await self.http.get(path)
+            for ev in page.get("events") or []:
+                if ev.get("kind") != "create_channel":
+                    continue
+                payload = ev.get("payload") or {}
+                if not payload.get("is_public"):
+                    continue
+                cid = payload.get("channel_id") or ""
+                if cid:
+                    return cid
+            if not page.get("has_more"):
+                break
+            prev_cursor = cursor
+            cursor = page.get("next_cursor")
+            if not cursor or cursor == prev_cursor:
+                break
+        return ""
 
     async def _enqueue_channel_intro_nudge(
         self,
