@@ -8,6 +8,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.7.3] — 2026-05-11
 
+### Added
+
+- New MCP tool `mcp__puffo__get_thread_history(root_id, limit,
+  since, before, after)` — root post + every reply in one thread,
+  oldest-first. Companion to the restructured
+  `get_channel_history`; agents drill into a thread only when
+  `get_channel_history` shows a non-zero reply count worth reading.
+- `[puffo-agent system message]` prefix on control messages the
+  runtime injects into the agent's claude-code transcript (today
+  used for the rate-limit retry kick; the prefix is documented in
+  CLAUDE.md so the agent recognises future control messages
+  without another prompt update).
+
 ### Changed
 
 - Message processing is now thread-batched instead of per-message.
@@ -34,6 +47,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   flips every message in the batch to green at once. Requires the
   puffo-server endpoint added in puffo-server#46 (deployed
   2026-05-11).
+- `mcp__puffo__get_channel_history` now returns **root posts only**
+  with a per-thread `(N replies)` annotation instead of inlining
+  every reply. One busy thread no longer eats the whole channel's
+  view. Same call also accepts `since=<envelope_id>` / `before=<ms>`
+  / `after=<ms>` filters for incremental polling.
+- Both `get_channel_history` and `get_thread_history` distinguish
+  "unknown channel/thread" (HTTP 404 → "(no such channel: …)" /
+  "(no such thread: …)") from "known but window-empty after
+  filters" (HTTP 200 + `[]` → "(no … in the requested window)").
+  Agents can tell a typoed id from a quiet polling window.
 
 ### Fixed
 
