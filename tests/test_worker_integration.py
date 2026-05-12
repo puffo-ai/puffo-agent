@@ -144,6 +144,39 @@ def test_puffo_core_mcp_env_optional_fields():
     assert "PUFFO_AGENT_ID" not in env
 
 
+def test_puffo_core_mcp_env_pins_python_user_base():
+    """cli-local rewrites HOME on the claude subprocess, which
+    would move Python's user-site to an empty per-agent path and
+    hide ``mcp`` from the MCP subprocess. ``PYTHONUSERBASE`` pins
+    user-site to the daemon's real base regardless of HOME."""
+    import site
+    env = puffo_core_mcp_env(
+        slug="bot-0001",
+        device_id="dev_1",
+        server_url="http://localhost:3000",
+        keystore_dir="/tmp/keys",
+        workspace="/workspace",
+        runtime_kind="cli-local",
+    )
+    assert env["PYTHONUSERBASE"] == site.getuserbase()
+
+
+def test_puffo_core_mcp_env_skips_python_user_base_for_docker():
+    """The container has its own Python install with baked-in deps,
+    so the host's user-base path is meaningless inside it. We
+    deliberately don't forward ``PYTHONUSERBASE`` into the docker
+    env block to keep the contract semantically clean."""
+    env = puffo_core_mcp_env(
+        slug="bot-0001",
+        device_id="dev_1",
+        server_url="http://localhost:3000",
+        keystore_dir="/tmp/keys",
+        workspace="/workspace",
+        runtime_kind="cli-docker",
+    )
+    assert "PYTHONUSERBASE" not in env
+
+
 def test_puffo_core_stdio_sdk_config():
     cfg = puffo_core_stdio_sdk_config(
         python="/usr/bin/python3",
