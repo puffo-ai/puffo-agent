@@ -175,8 +175,8 @@ class PuffoAgent:
         counter).
         """
         kick_text = (
-            "[system] session errored on rate limiting, "
-            "please resume processing."
+            "[puffo-agent system message] session errored on rate "
+            "limiting, please resume processing."
         )
         # Fallback is the same payload ``_append_user`` would have
         # produced. For multi-message batches we only have the
