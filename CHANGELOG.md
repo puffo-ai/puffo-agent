@@ -6,6 +6,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-05-12
+
+### Fixed
+
+- cli-local: MCP server was crashing on agent startup with
+  `ModuleNotFoundError: No module named 'mcp'` on macOS / Linux
+  installs where `mcp` lives in real-user user-site (e.g. installed
+  via `pip install --user` or as a transitive dep of `pip install
+  -e .`). The adapter rewrites `HOME` (and `USERPROFILE`) on the
+  claude subprocess so each agent has its own `~/.claude`; the MCP
+  subprocess claude spawns inherited that HOME, and Python computed
+  user-site relative to it (`<per-agent-home>/Library/Python/...`),
+  landing on an empty per-agent directory. Result: every
+  `mcp__puffo__*` tool went missing and the agent fell back to
+  plain-text replies. Now `puffo_core_mcp_env` injects
+  `PYTHONUSERBASE` pointing at the daemon's real user base
+  (captured via `site.getuserbase()` at module load time, before
+  any HOME mutation), which the spawned MCP subprocess uses to
+  resolve user-site independent of HOME — `.pth` files processed,
+  editable installs honoured. cli-docker is excluded (container
+  has its own Python tree with deps baked in, so a host path would
+  be meaningless inside it); Windows is unaffected in practice
+  because Windows user-site reads `APPDATA`, not `HOME`, but the
+  `PYTHONUSERBASE` injection is harmless there.
+
 ## [0.7.3] — 2026-05-11
 
 ### Added

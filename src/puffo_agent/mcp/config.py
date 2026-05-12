@@ -13,6 +13,7 @@ that form.
 from __future__ import annotations
 
 import json
+import site
 import sys
 from pathlib import Path
 
@@ -86,6 +87,43 @@ def default_python_executable() -> str:
     return sys.executable or "python3"
 
 
+# cli-local adapter overrides ``HOME`` (and ``USERPROFILE``) on the
+# claude subprocess so each agent has its own ``~/.claude``. The
+# MCP server claude spawns inherits that HOME, which makes Python's
+# user-site path resolve to ``<per-agent-home>/Library/Python/...``
+# (macOS) / ``<per-agent-home>/AppData/...`` (Windows) — a directory
+# that doesn't exist on disk. Result: ``import mcp`` (installed in
+# the real user's user-site) raises ModuleNotFoundError, the MCP
+# server exits, and the agent loses every ``mcp__puffo__*`` tool.
+#
+# ``PYTHONUSERBASE`` overrides where Python computes user-site from,
+# independent of HOME. By snapshotting ``site.getuserbase()`` while
+# we're in the daemon process (real HOME) and forwarding it via the
+# MCP env, the spawned subprocess locates the same user-site the
+# daemon does — ``.pth`` files included, so editable installs of
+# ``puffo_agent`` keep working too.
+_REAL_USER_BASE = site.getuserbase()
+
+
+def _python_user_base_env(runtime_kind: str) -> dict[str, str]:
+    """Env additions that pin ``PYTHONUSERBASE`` so subprocesses with
+    a per-agent HOME still resolve user-site to the daemon's real
+    base. Returns an empty dict if ``site.getuserbase()`` produced
+    nothing usable (defensive — shouldn't happen on supported
+    platforms, but failing silent beats taking the MCP down).
+
+    ``cli-docker`` is excluded: the MCP runs inside a container with
+    its own Python install and baked-in deps, so the host's user-base
+    path is meaningless there (a non-existent dir Python would just
+    skip). Forwarding a host-relative path into the container env is
+    semantically wrong even if harmless, so we keep the env clean."""
+    if runtime_kind == "cli-docker":
+        return {}
+    if not _REAL_USER_BASE:
+        return {}
+    return {"PYTHONUSERBASE": _REAL_USER_BASE}
+
+
 # ── puffo-core config builders ────────────────────────────────────
 
 
@@ -117,6 +155,12 @@ def puffo_core_mcp_env(
         "PUFFO_CORE_KEYSTORE_DIR": keystore_dir,
         "PUFFO_WORKSPACE": workspace,
         "PUFFO_DATA_SERVICE_URL": data_service_url,
+        # See ``_python_user_base_env`` — pins user-site to the
+        # daemon's real base so the per-agent HOME override the
+        # cli-local adapter applies doesn't hide ``mcp`` from the
+        # spawned MCP subprocess. Skipped for cli-docker where the
+        # container has its own Python tree.
+        **_python_user_base_env(runtime_kind),
     }
     if agent_id:
         env["PUFFO_AGENT_ID"] = agent_id
