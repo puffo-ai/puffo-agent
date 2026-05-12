@@ -46,6 +46,10 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._queue = asyncio.PriorityQueue()
     client._queue_seq = 0
     client._thread_state = {}
+    # ``_find_public_general_channel`` warms this cache as it walks
+    # so the immediately-following ``_resolve_channel_name`` inside
+    # the intro nudge becomes a cache hit.
+    client._channel_name_cache = {}
 
     async def _stub_space_name(space_id: str) -> str:
         return "Team" if space_id == "sp_1" else space_id
@@ -209,6 +213,49 @@ async def test_find_public_general_channel_picks_is_public_true():
     client.http = _StubHttp()
     cid = await client._find_public_general_channel("sp_1")
     assert cid == "ch_general"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_public_general_channel_warms_channel_name_cache():
+    """The walk we already pay for to find General doubles as a cache
+    warmup for every ``create_channel`` it passes — so the
+    ``_resolve_channel_name`` inside the intro nudge doesn't have to
+    replay the same events page seconds later."""
+    store = await _make_store()
+    client = _make_client(store)
+
+    class _StubHttp:
+        async def get(self, _path: str) -> dict:
+            return {
+                "events": [
+                    {
+                        "kind": "create_channel",
+                        "payload": {
+                            "channel_id": "ch_random",
+                            "name": "Random",
+                            "is_public": False,
+                        },
+                    },
+                    {
+                        "kind": "create_channel",
+                        "payload": {
+                            "channel_id": "ch_general",
+                            "name": "General",
+                            "is_public": True,
+                        },
+                    },
+                ],
+                "has_more": False,
+            }
+
+    client.http = _StubHttp()
+    await client._find_public_general_channel("sp_1")
+    # Both channels — public AND private — landed in the cache.
+    assert client._channel_name_cache == {
+        "ch_random": "Random",
+        "ch_general": "General",
+    }
     await store.close()
 
 

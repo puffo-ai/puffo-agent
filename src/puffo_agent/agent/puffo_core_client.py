@@ -1304,11 +1304,18 @@ class PuffoCoreMessageClient:
         dedicated channels-list endpoint — same pattern as the
         ``list_channels`` MCP tool. Returns the FIRST public channel
         encountered so a hypothetical future second public channel
-        doesn't double-fire."""
+        doesn't double-fire.
+
+        Side effect: while walking, every ``create_channel`` event we
+        pass is folded into ``self._channel_name_cache`` so the
+        immediately-following ``_resolve_channel_name`` inside the
+        intro nudge becomes a cache hit instead of a duplicate
+        events replay."""
         if not space_id:
             return ""
         cursor: str | None = None
         prev_cursor: str | None = None
+        found_cid = ""
         while True:
             path = f"/spaces/{space_id}/events"
             if cursor:
@@ -1318,18 +1325,19 @@ class PuffoCoreMessageClient:
                 if ev.get("kind") != "create_channel":
                     continue
                 payload = ev.get("payload") or {}
-                if not payload.get("is_public"):
-                    continue
                 cid = payload.get("channel_id") or ""
-                if cid:
-                    return cid
-            if not page.get("has_more"):
+                name = (payload.get("name") or "").strip()
+                if cid and cid not in self._channel_name_cache:
+                    self._channel_name_cache[cid] = name or cid
+                if not found_cid and payload.get("is_public") and cid:
+                    found_cid = cid
+            if found_cid or not page.get("has_more"):
                 break
             prev_cursor = cursor
             cursor = page.get("next_cursor")
             if not cursor or cursor == prev_cursor:
                 break
-        return ""
+        return found_cid
 
     async def _enqueue_channel_intro_nudge(
         self,
