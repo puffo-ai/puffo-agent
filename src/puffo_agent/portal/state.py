@@ -731,6 +731,15 @@ class AgentConfig:
     display_name: str = ""
     # Cached chat avatar URL; server is source of truth.
     avatar_url: str = ""
+    # ``role`` is the long-form (<=140 chars) "what does this agent do"
+    # string; ``role_short`` is the chip label rendered by clients in
+    # member lists. Mirror of the server-side identity profile fields
+    # added in puffo-server's identity_role migration. On every edit
+    # the daemon syncs both up to ``PATCH /identities/self``; the
+    # server derives ``role_short`` from ``role`` when the client
+    # omits it.
+    role: str = ""
+    role_short: str = ""
     puffo_core: PuffoCoreConfig = field(default_factory=PuffoCoreConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     profile: str = "profile.md"       # path relative to agent dir, or absolute
@@ -774,6 +783,8 @@ class AgentConfig:
             state=raw.get("state", "running"),
             display_name=raw.get("display_name", ""),
             avatar_url=raw.get("avatar_url", ""),
+            role=raw.get("role", ""),
+            role_short=raw.get("role_short", ""),
             puffo_core=PuffoCoreConfig(
                 server_url=pc.get("server_url") or DEFAULT_PUFFO_SERVER_URL,
                 slug=pc.get("slug", ""),
@@ -812,6 +823,8 @@ class AgentConfig:
             "state": self.state,
             "display_name": self.display_name,
             "avatar_url": self.avatar_url,
+            "role": self.role,
+            "role_short": self.role_short,
             "created_at": self.created_at,
             "puffo_core": asdict(self.puffo_core),
             "runtime": asdict(self.runtime),

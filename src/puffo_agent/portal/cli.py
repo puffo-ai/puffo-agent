@@ -388,6 +388,24 @@ def _resolve_api_key_for_create(
     return val
 
 
+def _derive_role_short_cli(role: str) -> str:
+    """Local mirror of ``profiles::derive_role_short`` (server) +
+    ``_derive_role_short`` (bridge). Keeps the chip label in
+    agent.yml consistent with what the server stores when the
+    daemon syncs on first connect. See server-side validators for
+    the canonical contract."""
+    if ":" not in role:
+        return ""
+    head, tail = role.split(":", 1)
+    candidate = head.strip()
+    rest = tail.strip()
+    if not candidate or not rest or len(candidate) > 32:
+        return ""
+    if any(ch.isspace() for ch in candidate):
+        return ""
+    return candidate
+
+
 def cmd_agent_create(args: argparse.Namespace) -> int:
     agent_id = args.id
     if not is_valid_agent_id(agent_id):
@@ -406,12 +424,31 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         runtime_kind=runtime_kind,
     )
 
+    role = (args.role or "").strip()
+    role_short_raw = getattr(args, "role_short", None)
+    role_short_raw = role_short_raw.strip() if role_short_raw else ""
+    if role_short_raw and not role:
+        print(
+            "error: --role-short cannot be set without --role",
+            file=sys.stderr,
+        )
+        return 2
+    if role and len(role) > 140:
+        print("error: --role must be at most 140 characters", file=sys.stderr)
+        return 2
+    if role_short_raw and len(role_short_raw) > 32:
+        print("error: --role-short must be at most 32 characters", file=sys.stderr)
+        return 2
+    role_short = role_short_raw or (_derive_role_short_cli(role) if role else "")
+
     target.mkdir(parents=True)
 
     cfg = AgentConfig(
         id=agent_id,
         state="running",
         display_name=args.display_name or agent_id,
+        role=role,
+        role_short=role_short,
         runtime=RuntimeConfig(
             kind=runtime_kind,
             provider=args.provider or "",
@@ -1013,6 +1050,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create.add_argument("--id", required=True)
     create.add_argument("--display-name", help="Friendly name for the agent")
+    create.add_argument(
+        "--role",
+        help=(
+            "Short 'what does this agent do' string (<=140 chars). "
+            "Recommended shape '<short>: <description>'; the server "
+            "derives a chip label from the prefix (so "
+            "'coder: main puffo-core coder' surfaces 'coder' in "
+            "member lists)."
+        ),
+    )
+    create.add_argument(
+        "--role-short",
+        help=(
+            "Optional explicit override for the chip label "
+            "(<=32 chars). When omitted and --role is set, the "
+            "server derives it. Cannot be passed without --role."
+        ),
+    )
     create.add_argument("--profile", help="Path to a profile.md to copy (default: built-in template)")
     create.add_argument(
         "--runtime",
