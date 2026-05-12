@@ -440,21 +440,33 @@ async def update_runtime(request: web.Request) -> web.Response:
     })
 
 
+MAX_ROLE_LEN = 140
+MAX_ROLE_SHORT_LEN = 32
+
+
 async def update_profile(request: web.Request) -> web.Response:
-    """Patch the agent's display_name + avatar_url. Owner-only.
+    """Patch the agent's display_name + avatar_url + role. Owner-only.
 
     Body (all fields optional)::
 
         {
           "display_name": "Helper Bot",
           "avatar_bytes_b64": "<base64 of a PNG/JPG/GIF>",
-          "avatar_content_type": "image/png"
+          "avatar_content_type": "image/png",
+          "role": "coder: main puffo-core coder",
+          "role_short": "coder"
         }
 
     Updates ``agent.yml`` locally and best-effort syncs to puffo-server
     via ``/blobs/upload`` + ``PATCH /identities/self``. On sync
     failure the local agent.yml still gets written so the operator
     can retry without losing what they typed.
+
+    ``role_short`` is normally derived server-side from ``role`` (the
+    recommended ``<short>: <description>`` shape). Sending it
+    explicitly overrides the derive. ``role_short`` without ``role``
+    is a 400 — the server enforces the same rule but it's cheaper to
+    catch it before the round-trip.
     """
     import base64
 
@@ -479,6 +491,19 @@ async def update_profile(request: web.Request) -> web.Response:
     cfg = AgentConfig.load(agent_id)
     new_display_name = payload.get("display_name")
     avatar_b64 = payload.get("avatar_bytes_b64")
+    new_role = payload.get("role")
+    new_role_short = payload.get("role_short")
+
+    # Mirror the server-side INVALID_ROLE_SHORT 400 — keeps clients
+    # from sending an inconsistent patch that the server would reject.
+    if new_role is None and new_role_short is not None:
+        return _bad("role_short cannot be set without role")
+    if isinstance(new_role, str) and len(new_role) > MAX_ROLE_LEN:
+        return _bad(f"role must be at most {MAX_ROLE_LEN} characters")
+    if isinstance(new_role_short, str) and len(new_role_short) > MAX_ROLE_SHORT_LEN:
+        return _bad(
+            f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters",
+        )
 
     avatar_bytes: bytes | None = None
     if avatar_b64 is not None:
@@ -512,6 +537,10 @@ async def update_profile(request: web.Request) -> web.Response:
         # Direct override (e.g. clearing). Synced to server too.
         new_avatar_url = payload["avatar_url"].strip()
         profile_patch["avatar_url"] = new_avatar_url
+    if isinstance(new_role, str):
+        profile_patch["role"] = new_role
+    if isinstance(new_role_short, str):
+        profile_patch["role_short"] = new_role_short
 
     # Best-effort server sync; failure logs but doesn't fail the
     # request since agent.yml is still updated locally.
@@ -536,20 +565,55 @@ async def update_profile(request: web.Request) -> web.Response:
         cfg.display_name = new_display_name.strip() or cfg.display_name
     if new_avatar_url is not None:
         cfg.avatar_url = new_avatar_url
+    if isinstance(new_role, str):
+        cfg.role = new_role
+        # If the caller didn't override role_short, mirror the
+        # server-side derive locally so agent.yml stays consistent
+        # with what the server stores. The server is still
+        # authoritative — this is a best-effort local cache.
+        if not isinstance(new_role_short, str):
+            cfg.role_short = _derive_role_short(new_role)
+    if isinstance(new_role_short, str):
+        cfg.role_short = new_role_short
     cfg.save()
     logger.info(
-        "bridge: updated profile for agent=%s display_name=%r avatar=%s",
-        agent_id, cfg.display_name, "(set)" if cfg.avatar_url else "(empty)",
+        "bridge: updated profile for agent=%s display_name=%r avatar=%s role_short=%r",
+        agent_id, cfg.display_name,
+        "(set)" if cfg.avatar_url else "(empty)",
+        cfg.role_short,
     )
     body: dict[str, Any] = {
         "agent_id": agent_id,
         "display_name": cfg.display_name,
         "avatar_url": cfg.avatar_url,
+        "role": cfg.role,
+        "role_short": cfg.role_short,
         "profile_summary": _profile_summary(cfg),
     }
     if sync_warning:
         body["warning"] = sync_warning
     return web.json_response(body)
+
+
+def _derive_role_short(role: str) -> str:
+    """Local mirror of puffo-server's ``derive_role_short``: pull a
+    short chip label out of a ``<short>: <description>``-shaped role
+    string. Returns ``""`` for any shape the server would also
+    reject (no colon, empty prefix, whitespace in prefix, empty
+    suffix, prefix > ``MAX_ROLE_SHORT_LEN``). Kept in sync with
+    ``profiles::derive_role_short`` in puffo-server."""
+    if ":" not in role:
+        return ""
+    colon_pos = role.index(":")
+    candidate = role[:colon_pos].strip()
+    rest = role[colon_pos + 1:].strip()
+    if not candidate or not rest:
+        return ""
+    if len(candidate) > MAX_ROLE_SHORT_LEN:
+        return ""
+    if any(ch.isspace() for ch in candidate):
+        return ""
+    return candidate
 
 
 def _update_profile_summary(cfg: AgentConfig, new_summary: str) -> None:
@@ -636,17 +700,11 @@ async def _upload_avatar_via_agent_keystore(
 
 
 async def _sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
-    """PATCH /identities/self signed by the agent's keystore."""
-    from ...crypto.http_client import PuffoCoreHttpClient
-    from ...crypto.keystore import KeyStore
-
-    pc = cfg.puffo_core
-    ks = KeyStore.for_agent(cfg.id)
-    http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
-    try:
-        await http.patch("/identities/self", patch)
-    finally:
-        await http.close()
+    """PATCH /identities/self signed by the agent's keystore.
+    Thin wrapper around ``portal.profile_sync.sync_agent_profile`` so
+    the bridge and CLI share the same wire shape."""
+    from ..profile_sync import sync_agent_profile
+    await sync_agent_profile(cfg, patch)
 
 
 async def get_runtime_state(request: web.Request) -> web.Response:
@@ -1041,6 +1099,25 @@ async def create_agent(request: web.Request) -> web.Response:
     # Defaults match the CLI's `agent create` behaviour.
     display_name = (payload.get("display_name") or agent_id).strip() or agent_id
     avatar_url = (payload.get("avatar_url") or "").strip()
+    role = (payload.get("role") or "").strip()
+    role_short_raw = payload.get("role_short")
+    if role_short_raw is not None and not isinstance(role_short_raw, str):
+        return _create_reject("role_short must be a string")
+    if role and len(role) > MAX_ROLE_LEN:
+        return _create_reject(
+            f"role must be at most {MAX_ROLE_LEN} characters",
+        )
+    if isinstance(role_short_raw, str) and len(role_short_raw) > MAX_ROLE_SHORT_LEN:
+        return _create_reject(
+            f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters",
+        )
+    if not role and role_short_raw:
+        return _create_reject("role_short cannot be set without role")
+    role_short = (
+        role_short_raw.strip() if isinstance(role_short_raw, str)
+        else _derive_role_short(role) if role
+        else ""
+    )
     profile_text = payload.get("profile")
     if not isinstance(profile_text, str) or not profile_text.strip():
         return _create_reject("profile (markdown body) is required")
@@ -1071,6 +1148,8 @@ async def create_agent(request: web.Request) -> web.Response:
             state="running",
             display_name=display_name,
             avatar_url=avatar_url,
+            role=role,
+            role_short=role_short,
             puffo_core=PuffoCoreConfig(
                 server_url=server_url,
                 slug=pc_slug,
@@ -1101,6 +1180,27 @@ async def create_agent(request: web.Request) -> web.Response:
         "bridge: created agent slug=%s device_id=%s by operator=%s",
         agent_id, pc_device_id, request["paired_slug"],
     )
+
+    # Best-effort: push role to the agent's server-side identity
+    # profile. display_name + avatar_url already flow through the
+    # pending_agents → identities materialisation in puffo-server
+    # signup, so they're set at registration time; ``role`` was
+    # added later (migration 019_identity_role) and doesn't have a
+    # matching signup pathway yet, so the bridge has to sync it
+    # post-create. Failure here is non-fatal — the operator can
+    # retry via ``PATCH /v1/agents/{id}/profile`` later.
+    if role:
+        try:
+            patch: dict[str, Any] = {"role": role}
+            if role_short:
+                patch["role_short"] = role_short
+            await _sync_agent_profile(AgentConfig.load(agent_id), patch)
+        except Exception as exc:
+            logger.warning(
+                "bridge: post-create role sync failed for agent=%s: %s",
+                agent_id, exc,
+            )
+
     return web.json_response({
         "agent_id": agent_id,
         "agent_dir": str(target),

@@ -388,6 +388,24 @@ def _resolve_api_key_for_create(
     return val
 
 
+def _derive_role_short_cli(role: str) -> str:
+    """Local mirror of ``profiles::derive_role_short`` (server) +
+    ``_derive_role_short`` (bridge). Keeps the chip label in
+    agent.yml consistent with what the server stores when the
+    daemon syncs on first connect. See server-side validators for
+    the canonical contract."""
+    if ":" not in role:
+        return ""
+    head, tail = role.split(":", 1)
+    candidate = head.strip()
+    rest = tail.strip()
+    if not candidate or not rest or len(candidate) > 32:
+        return ""
+    if any(ch.isspace() for ch in candidate):
+        return ""
+    return candidate
+
+
 def cmd_agent_create(args: argparse.Namespace) -> int:
     agent_id = args.id
     if not is_valid_agent_id(agent_id):
@@ -406,12 +424,31 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         runtime_kind=runtime_kind,
     )
 
+    role = (args.role or "").strip()
+    role_short_raw = getattr(args, "role_short", None)
+    role_short_raw = role_short_raw.strip() if role_short_raw else ""
+    if role_short_raw and not role:
+        print(
+            "error: --role-short cannot be set without --role",
+            file=sys.stderr,
+        )
+        return 2
+    if role and len(role) > 140:
+        print("error: --role must be at most 140 characters", file=sys.stderr)
+        return 2
+    if role_short_raw and len(role_short_raw) > 32:
+        print("error: --role-short must be at most 32 characters", file=sys.stderr)
+        return 2
+    role_short = role_short_raw or (_derive_role_short_cli(role) if role else "")
+
     target.mkdir(parents=True)
 
     cfg = AgentConfig(
         id=agent_id,
         state="running",
         display_name=args.display_name or agent_id,
+        role=role,
+        role_short=role_short,
         runtime=RuntimeConfig(
             kind=runtime_kind,
             provider=args.provider or "",
@@ -727,6 +764,104 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_profile(args: argparse.Namespace) -> int:
+    """Show or update the identity-profile fields (display_name, role,
+    role_short) and best-effort sync them to puffo-server signed by
+    the agent's own keystore.
+
+    Mirrors the bridge ``PATCH /v1/agents/{id}/profile`` endpoint
+    one-for-one — same validation, same wire shape, same server
+    update — so anything the operator can do from the local-bridge
+    UI is reachable from the CLI too. No flags ⇒ show current
+    values. With flags ⇒ update agent.yml, then sync to server."""
+    import asyncio
+
+    from .profile_sync import sync_agent_profile
+
+    agent_id = args.id
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return 2
+    cfg = AgentConfig.load(agent_id)
+
+    role_arg = getattr(args, "role", None)
+    role_short_arg = getattr(args, "role_short", None)
+    display_name_arg = getattr(args, "display_name", None)
+
+    no_edits = all(
+        x is None for x in (display_name_arg, role_arg, role_short_arg)
+    )
+    if no_edits:
+        print(f"id:            {cfg.id}")
+        print(f"slug:          {cfg.puffo_core.slug}")
+        print(f"display_name:  {cfg.display_name!r}")
+        print(f"avatar_url:    {cfg.avatar_url!r}")
+        print(f"role:          {cfg.role!r}")
+        print(f"role_short:    {cfg.role_short!r}")
+        print(f"server_url:    {cfg.puffo_core.server_url}")
+        return 0
+
+    # Validation mirrors handlers.update_profile so the CLI fails
+    # locally before bothering the server.
+    if role_short_arg is not None and role_arg is None and not cfg.role:
+        print(
+            "error: --role-short cannot be set without --role "
+            "(no existing role on file)",
+            file=sys.stderr,
+        )
+        return 2
+    if role_arg is not None and len(role_arg) > 140:
+        print("error: --role must be at most 140 characters", file=sys.stderr)
+        return 2
+    if role_short_arg is not None and len(role_short_arg) > 32:
+        print("error: --role-short must be at most 32 characters", file=sys.stderr)
+        return 2
+
+    # Build the wire patch + apply locally in lock-step. agent.yml
+    # writes happen first so a server-side hiccup doesn't lose what
+    # the operator typed; the sync warning surfaces after.
+    patch: dict[str, Any] = {}
+    if isinstance(display_name_arg, str):
+        new_name = display_name_arg.strip() or cfg.display_name
+        cfg.display_name = new_name
+        patch["display_name"] = new_name
+    if isinstance(role_arg, str):
+        cfg.role = role_arg
+        patch["role"] = role_arg
+        # Mirror the server-side derive locally so agent.yml stays
+        # in sync with what the server stores unless the caller
+        # explicitly overrides ``role_short`` below.
+        if not isinstance(role_short_arg, str):
+            cfg.role_short = _derive_role_short_cli(role_arg)
+    if isinstance(role_short_arg, str):
+        cfg.role_short = role_short_arg
+        patch["role_short"] = role_short_arg
+
+    cfg.save()
+
+    try:
+        asyncio.run(sync_agent_profile(cfg, patch))
+    except Exception as exc:
+        print(f"warning: server sync failed: {exc}", file=sys.stderr)
+        print(
+            "agent.yml is updated locally. Rerun this command after "
+            "fixing connectivity to retry the push.",
+            file=sys.stderr,
+        )
+        return 0
+
+    print(f"agent {agent_id!r} profile updated + synced:")
+    if "display_name" in patch:
+        print(f"  display_name: {cfg.display_name!r}")
+    if "role" in patch:
+        print(f"  role:         {cfg.role!r}")
+    if "role_short" in patch:
+        print(f"  role_short:   {cfg.role_short!r}  (explicit)")
+    elif "role" in patch:
+        print(f"  role_short:   {cfg.role_short!r}  (server-derived)")
+    return 0
+
+
 def cmd_agent_runtime(args: argparse.Namespace) -> int:
     """Show or update the runtime: block in agent.yml. Fields are
     optional; invoking with no flags just prints the current block."""
@@ -1013,6 +1148,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     create.add_argument("--id", required=True)
     create.add_argument("--display-name", help="Friendly name for the agent")
+    create.add_argument(
+        "--role",
+        help=(
+            "Short 'what does this agent do' string (<=140 chars). "
+            "Recommended shape '<short>: <description>'; the server "
+            "derives a chip label from the prefix (so "
+            "'coder: main puffo-core coder' surfaces 'coder' in "
+            "member lists)."
+        ),
+    )
+    create.add_argument(
+        "--role-short",
+        help=(
+            "Optional explicit override for the chip label "
+            "(<=32 chars). When omitted and --role is set, the "
+            "server derives it. Cannot be passed without --role."
+        ),
+    )
     create.add_argument("--profile", help="Path to a profile.md to copy (default: built-in template)")
     create.add_argument(
         "--runtime",
@@ -1124,6 +1277,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     runtime.set_defaults(func=cmd_agent_runtime)
+
+    profile = agent_sub.add_parser(
+        "profile",
+        help=(
+            "Show or edit identity-profile fields (display_name, role, "
+            "role_short). No flags ⇒ show. With flags ⇒ update "
+            "agent.yml AND sync to puffo-server, signed by the agent's "
+            "own keystore. Mirrors the local-bridge PATCH endpoint."
+        ),
+    )
+    profile.add_argument("id")
+    profile.add_argument(
+        "--display-name",
+        help="New friendly name for the agent (≤60 chars per server validation)",
+    )
+    profile.add_argument(
+        "--role",
+        help=(
+            "Long-form 'what does this agent do' string (≤140 chars). "
+            "Recommended shape '<short>: <description>' — the server "
+            "auto-derives the chip label from the prefix."
+        ),
+    )
+    profile.add_argument(
+        "--role-short",
+        help=(
+            "Explicit chip-label override (≤32 chars). When omitted, "
+            "the server derives this from --role. Cannot be passed "
+            "alone unless agent.yml already has a role."
+        ),
+    )
+    profile.set_defaults(func=cmd_agent_profile)
 
     archive = agent_sub.add_parser("archive", help="Stop and archive an agent to ~/.puffo-agent/archived/")
     archive.add_argument("id")

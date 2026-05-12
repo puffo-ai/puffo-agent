@@ -6,6 +6,41 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- ``role`` + ``role_short`` fields on ``AgentConfig`` and the local
+  bridge profile-edit path. Mirrors the
+  [puffo-server identity_role migration](https://github.com/puffo-ai/puffo-server/pull/50)
+  that surfaces the same fields on the server identity profile.
+  ``role`` is the long form (≤140 chars, recommended shape
+  ``<short>: <description>``); ``role_short`` is the chip label
+  clients render in member lists (≤32 chars). Both default to empty
+  string; existing agent.yml files load with empty values and don't
+  need a fresh write.
+
+  Plumbed across:
+  * ``AgentConfig`` load/save preserves the two fields.
+  * ``PATCH /v1/agents/{id}/profile`` accepts ``role`` + ``role_short``,
+    validates lengths, rejects ``role_short`` without ``role``
+    (mirrors the server-side 400), updates agent.yml, and best-effort
+    syncs to ``PATCH /identities/self`` via the existing
+    ``_sync_agent_profile`` helper. Sync failures log but don't
+    block the local write.
+  * ``POST /v1/agents`` (bridge create) accepts the same two fields
+    and fires a best-effort post-create sync so a freshly-provisioned
+    agent's server-side identity profile carries its role from the
+    start.
+  * ``puffo-agent agent create`` CLI gained ``--role`` /
+    ``--role-short`` flags. Length and "short without role"
+    validation matches the bridge.
+
+  ``role_short`` defaults to the server-side derive on save:
+  ``"coder: main puffo-core coder"`` → ``"coder"``. A local mirror
+  of that derive in the bridge handler + CLI keeps agent.yml
+  consistent with what the server stores without an extra GET. The
+  agent guides include a unit test pinning both mirrors against the
+  server contract.
+
 ## [0.7.5] — 2026-05-12
 
 ### Added
