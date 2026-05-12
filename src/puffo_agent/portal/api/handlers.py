@@ -278,33 +278,52 @@ async def list_agents(request: web.Request) -> web.Response:
 
 
 def _profile_summary(cfg: AgentConfig) -> str:
-    """Best-effort 1-line summary for list rows. Prefers the first
-    non-heading line under a description-like section; falls back to
-    the first non-heading line anywhere; returns empty string if the
-    profile is unreadable."""
+    """Return the full body of the agent's ``# Soul`` section from
+    profile.md (or any description-like heading: ``description`` /
+    ``about`` / ``summary``). Picks up everything between the
+    matching heading and the next heading or EOF, with surrounding
+    blank lines trimmed. Empty string when no such section exists
+    or the profile is unreadable.
+
+    The asymmetric "read first line, write full body" the helper had
+    before broke the new agent-card Soul-expand UI — the operator
+    typed multiple paragraphs into the Soul textarea, the write path
+    wrote them all to profile.md, then the next read returned only
+    the first line so the expanded card looked truncated."""
     try:
         text = cfg.resolve_profile_path().read_text(encoding="utf-8")
     except Exception:
         return ""
 
-    lines = [line.strip() for line in text.splitlines()]
     description_heading = {"soul", "description", "about", "summary"}
+    body_lines: list[str] = []
     in_description = False
-    fallback = ""
 
-    for line in lines:
-        if not line:
-            continue
-        if line.startswith("#"):
-            heading = line.lstrip("#").strip().lower()
-            in_description = heading in description_heading
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip().lower()
+            if in_description:
+                # Already inside the Soul section — a new heading
+                # closes it. Stop collecting; ignore any later
+                # description-like section so the body stays
+                # deterministic.
+                break
+            if heading in description_heading:
+                in_description = True
             continue
         if in_description:
-            return line
-        if not fallback:
-            fallback = line
+            body_lines.append(raw)
 
-    return fallback
+    # Trim leading + trailing blank lines so the returned body
+    # doesn't carry the layout whitespace operators leave around
+    # the markdown.
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+
+    return "\n".join(body_lines)
 
 
 async def get_agent(request: web.Request) -> web.Response:
