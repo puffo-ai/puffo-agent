@@ -209,6 +209,31 @@ class DockerCLIAdapter(Adapter):
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        # claude-code only — hermes / gemini-cli always run one-shot
+        # without --resume, so a retry is just a normal turn against
+        # the fallback payload.
+        if self.harness.name() != "claude-code":
+            ctx_fallback = TurnContext(
+                system_prompt=ctx.system_prompt,
+                messages=[{"role": "user", "content": fallback_user_message}],
+                workspace_dir=ctx.workspace_dir,
+                claude_dir=ctx.claude_dir,
+                memory_dir=ctx.memory_dir,
+                on_progress=ctx.on_progress,
+            )
+            return await self.run_turn(ctx_fallback)
+        await self._ensure_started()
+        session = self._ensure_session()
+        return await session.run_retry_turn(
+            kick_text, fallback_user_message, ctx.system_prompt,
+        )
+
     async def _run_turn_hermes(self, user_message: str, system_prompt: str) -> TurnResult:
         """One-shot hermes turn via ``hermes chat --provider anthropic
         --quiet [--continue] -q <prompt>``.
@@ -761,6 +786,32 @@ class DockerCLIAdapter(Adapter):
         )
         return []
 
+    async def _puffo_pkg_mount_is_current(self) -> bool:
+        """``True`` iff the existing container's
+        ``/opt/puffoagent-pkg`` bind mount still resolves to a
+        directory containing the ``puffo_agent`` package.
+
+        Implemented as a ``docker exec test -f`` rather than
+        comparing ``docker inspect``'s Mount.Source against
+        ``_puffo_agent_pkg_dir()`` because Docker Desktop on Windows
+        rewrites the source path (``/run/desktop/mnt/host/c/...``)
+        and a literal string compare wouldn't survive that. The
+        in-container probe is authoritative: if claude-code's MCP
+        subprocess can ``import puffo_agent`` from the bind mount,
+        ``__init__.py`` must be visible — and if it isn't, the
+        subprocess will crash and every puffo MCP tool will surface
+        as "No such tool available".
+        """
+        rc, _, _ = await _run_cmd(
+            [
+                "docker", "exec", self.container_name,
+                "test", "-f",
+                "/opt/puffoagent-pkg/puffo_agent/__init__.py",
+            ],
+            check=False,
+        )
+        return rc == 0
+
     async def _container_state(self) -> str:
         """Docker-reported container State.Status (``running``,
         ``exited``, ``paused``, ``created``, ``dead``), or ``""``
@@ -878,6 +929,7 @@ class DockerCLIAdapter(Adapter):
             # next turn instead of paying container boot + image
             # pull every restart.
             state = await self._container_state()
+            existed = state != ""
             if state == "running":
                 logger.info(
                     "agent %s: reusing running container %r",
@@ -897,6 +949,37 @@ class DockerCLIAdapter(Adapter):
                 await _run_cmd(["docker", "unpause", self.container_name])
             else:
                 # state == "" — no container with this name.
+                await self._ensure_image()
+                await self._start_container()
+
+            # Validate the puffo_agent bind mount on REUSED
+            # containers. The /opt/puffoagent-pkg bind mount source
+            # is baked in at ``docker run`` time and immutable until
+            # the container is recreated. If the operator pip-
+            # reinstalled puffo-agent from a different host path
+            # (e.g. uninstalled the editable install from
+            # puffo-core-han-group/agent and re-installed from
+            # puffo-ai/puffo-agent), the container is still bound to
+            # the old — now non-existent — path. ``python3 -m
+            # puffo_agent.mcp.puffo_core_server`` inside the
+            # container then fails with ModuleNotFoundError, and
+            # claude-code reports every puffo MCP tool as
+            # "No such tool available". Detect that case here and
+            # recreate.
+            if existed and not await self._puffo_pkg_mount_is_current():
+                logger.warning(
+                    "agent %s: container %r has a stale "
+                    "/opt/puffoagent-pkg bind mount (the host path it "
+                    "was created with no longer contains puffo_agent). "
+                    "Recreating so claude-code's MCP subprocess can "
+                    "import the package again — typical cause is a "
+                    "pip reinstall from a different path.",
+                    self.agent_id, self.container_name,
+                )
+                await _run_cmd(
+                    ["docker", "rm", "-f", self.container_name],
+                    check=False,
+                )
                 await self._ensure_image()
                 await self._start_container()
             self._started = True

@@ -130,6 +130,125 @@ async def list_recent_messages(request: web.Request) -> web.Response:
     })
 
 
+def _parse_int_param(value: str | None, name: str) -> tuple[int | None, web.Response | None]:
+    """Return (parsed, error_response). ``None, None`` if missing."""
+    if value is None or value == "":
+        return None, None
+    try:
+        return int(value), None
+    except ValueError:
+        return None, web.json_response(
+            {"error": f"{name} must be an integer"}, status=400,
+        )
+
+
+async def list_channel_roots(request: web.Request) -> web.Response:
+    """Root posts in a channel with reply counts. Replaces the
+    flat ``messages/recent`` view for agents that want to see what
+    conversations exist without dragging every reply into context.
+    Query params: ``channel`` (required), ``limit``, ``since`` (an
+    envelope_id), ``before`` (ms-epoch), ``after`` (ms-epoch)."""
+    agent_id = request.match_info["agent_id"]
+    channel_id = request.query.get("channel", "")
+    if not channel_id:
+        return web.json_response(
+            {"error": "channel query param required"}, status=400,
+        )
+    limit, err = _parse_int_param(request.query.get("limit", "20"), "limit")
+    if err is not None:
+        return err
+    before_ts, err = _parse_int_param(request.query.get("before"), "before")
+    if err is not None:
+        return err
+    after_ts, err = _parse_int_param(request.query.get("after"), "after")
+    if err is not None:
+        return err
+    since = request.query.get("since") or None
+    limit = max(1, min(limit or 20, 200))
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"error": "agent db not found"}, status=404)
+    try:
+        # Distinguish "channel never seen" (true 404) from "channel
+        # seen but window after filters is empty" (200 + []). The
+        # latter is a routine case for ``since=<last_id>`` polling
+        # and must NOT look the same to the MCP tool.
+        if not await store.channel_exists(channel_id):
+            return web.json_response(
+                {"error": "channel not found"}, status=404,
+            )
+        roots = await store.get_channel_roots(
+            channel_id,
+            limit=limit,
+            since_envelope_id=since,
+            before_ts=before_ts,
+            after_ts=after_ts,
+        )
+    except Exception as exc:
+        logger.exception(
+            "data-service: get_channel_roots failed (agent=%s ch=%s)",
+            agent_id, channel_id,
+        )
+        return web.json_response(
+            {"error": f"roots fetch failed: {exc}"}, status=500,
+        )
+    return web.json_response({
+        "roots": [
+            {"message": _msg_to_dict(r.message), "reply_count": r.reply_count}
+            for r in roots
+        ],
+    })
+
+
+async def list_thread_messages(request: web.Request) -> web.Response:
+    """Messages in a thread (the root + every reply), filtered by
+    optional ``since`` (envelope_id), ``before`` / ``after`` (ms-
+    epoch). Returned oldest-first up to ``limit``."""
+    agent_id = request.match_info["agent_id"]
+    root_id = request.match_info["root_id"]
+    limit, err = _parse_int_param(request.query.get("limit", "50"), "limit")
+    if err is not None:
+        return err
+    before_ts, err = _parse_int_param(request.query.get("before"), "before")
+    if err is not None:
+        return err
+    after_ts, err = _parse_int_param(request.query.get("after"), "after")
+    if err is not None:
+        return err
+    since = request.query.get("since") or None
+    limit = max(1, min(limit or 50, 200))
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"error": "agent db not found"}, status=404)
+    try:
+        # Mirrors ``list_channel_roots``: 404 when the agent has
+        # never recorded anything for ``root_id`` (the root message
+        # itself isn't in the store), 200 + [] when the root is
+        # known but the requested window is empty.
+        if not await store.has_message(root_id):
+            return web.json_response(
+                {"error": "thread root not found"}, status=404,
+            )
+        msgs = await store.get_thread_messages(
+            root_id,
+            limit=limit,
+            since_envelope_id=since,
+            before_ts=before_ts,
+            after_ts=after_ts,
+        )
+    except Exception as exc:
+        logger.exception(
+            "data-service: get_thread_messages failed (agent=%s root=%s)",
+            agent_id, root_id,
+        )
+        return web.json_response(
+            {"error": f"thread fetch failed: {exc}"}, status=500,
+        )
+    return web.json_response({
+        "messages": [_msg_to_dict(m) for m in msgs],
+    })
+
+
 async def get_message_by_envelope(request: web.Request) -> web.Response:
     """GET a single message by envelope_id. 404 if not stored."""
     agent_id = request.match_info["agent_id"]
@@ -182,6 +301,14 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     app.router.add_get(
         "/v1/data/{agent_id}/messages/recent",
         list_recent_messages,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/channels/roots",
+        list_channel_roots,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/threads/{root_id}",
+        list_thread_messages,
     )
     app.router.add_get(
         "/v1/data/{agent_id}/messages/{envelope_id}",

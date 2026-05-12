@@ -93,6 +93,47 @@ class StatusReporter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("end_turn message=%s errored (%s)", message_id, exc)
 
+    async def end_turn_batch(self, runs: list[dict]) -> None:
+        """Mark every message in a thread batch as processed in one
+        round trip.
+
+        ``runs`` is the list of ``{run_id, message_id, succeeded,
+        error_text?}`` dicts the server's ``/messages/processing/
+        end:batch`` endpoint accepts. The first message in the batch
+        has a ``run_id`` from a prior ``begin_turn`` call (so it gets
+        a yellow dot); the rest are UPSERTed by the server with
+        ``started_at = ended_at = now`` and skip straight to green.
+        """
+        if not runs:
+            return
+        payload_runs: list[dict[str, Any]] = []
+        for r in runs:
+            entry: dict[str, Any] = {
+                "run_id": r["run_id"],
+                "message_id": r["message_id"],
+                "succeeded": bool(r["succeeded"]),
+            }
+            err = r.get("error_text")
+            if err is not None:
+                entry["error_text"] = err[:1024]
+            payload_runs.append(entry)
+        try:
+            await self._http.post(
+                "/messages/processing/end:batch", {"runs": payload_runs},
+            )
+            # Server flips agent_status atomically — mirror locally.
+            any_failed = any(not r["succeeded"] for r in runs)
+            self._current_status = "error" if any_failed else "idle"
+            self._current_message_id = None
+        except HttpError as exc:
+            logger.warning(
+                "end_turn_batch (%d runs) failed (%s)", len(runs), exc,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "end_turn_batch (%d runs) errored (%s)", len(runs), exc,
+            )
+
     async def report_error(self, error_text: str) -> None:
         """Catch-all for unrecoverable failures; cleared by the
         next successful heartbeat.

@@ -96,7 +96,160 @@ class PuffoAgent:
             space_id=space_id,
             space_name=space_name,
         )
+        return await self._run_turn_and_route(
+            channel_name=channel_name,
+            sender=sender,
+            on_progress=on_progress,
+        )
 
+    async def handle_message_batch(
+        self,
+        root_id: str,
+        batch: list[dict],
+        channel_meta: dict,
+        on_progress=None,
+    ) -> str | None:
+        """One adapter turn over a whole thread batch.
+
+        Each entry in ``batch`` is the same decoded-message dict the
+        listen handler used to enqueue (envelope_id, sender_slug,
+        text, attachments, mentions, sent_at, sender_is_bot,
+        is_dm…). The thread/channel context is constant across the
+        batch and rides on ``channel_meta`` (channel_id,
+        channel_name, space_id, space_name).
+
+        The agent sees every message in order as separate ``user``
+        turns in the shell log so the LLM can reason about who said
+        what and decide on its own how many replies to issue. The
+        ``followups`` field on the old single-message path is gone —
+        every message is a real user turn now.
+        """
+        if not batch:
+            return None
+        for msg in batch:
+            self._append_user(
+                channel_meta.get("channel_name", ""),
+                msg.get("sender_slug", ""),
+                msg.get("sender_email", ""),
+                msg.get("text", ""),
+                channel_id=channel_meta.get("channel_id", ""),
+                root_id=root_id,
+                attachments=msg.get("attachments") or [],
+                sender_is_bot=msg.get("sender_is_bot", False),
+                mentions=msg.get("mentions") or [],
+                post_id=msg.get("envelope_id", ""),
+                create_at=msg.get("sent_at", 0),
+                followups=None,
+                space_id=channel_meta.get("space_id", ""),
+                space_name=channel_meta.get("space_name", ""),
+            )
+        # Route logging uses the LAST sender in the batch as the
+        # display "trigger" for log lines — purely cosmetic, the
+        # agent itself decides who to reply to.
+        last_msg = batch[-1]
+        return await self._run_turn_and_route(
+            channel_name=channel_meta.get("channel_name", ""),
+            sender=last_msg.get("sender_slug", ""),
+            on_progress=on_progress,
+        )
+
+    async def handle_api_error_retry(
+        self,
+        root_id: str,
+        channel_meta: dict,
+        fallback_batch: list[dict],
+        on_progress=None,
+    ) -> str | None:
+        """Retry the most recently failed turn.
+
+        Doesn't touch ``self.log`` — the original user input is
+        already in there from the first attempt. The adapter sends
+        a small kick ("session errored on rate limiting, please
+        resume processing") when ``--resume`` is still live, or
+        falls back to the original ``fallback_batch`` payload when
+        the resumable session has been lost.
+
+        Reply routing is the same as ``_run_turn_and_route`` (the
+        ``AgentAPIError`` raise still happens here on consecutive
+        failures, so the consumer keeps incrementing its retry
+        counter).
+        """
+        kick_text = (
+            "[puffo-agent system message] session errored on rate "
+            "limiting, please resume processing."
+        )
+        # Fallback is the same payload ``_append_user`` would have
+        # produced. For multi-message batches we only have the
+        # adapter API for a single user_message, so concatenate.
+        fallback_chunks: list[str] = []
+        for msg in fallback_batch:
+            fallback_chunks.append(self._format_user_block(
+                channel_name=channel_meta.get("channel_name", ""),
+                sender=msg.get("sender_slug", ""),
+                sender_email=msg.get("sender_email", ""),
+                text=msg.get("text", ""),
+                channel_id=channel_meta.get("channel_id", ""),
+                root_id=root_id,
+                attachments=msg.get("attachments") or [],
+                sender_is_bot=msg.get("sender_is_bot", False),
+                mentions=msg.get("mentions") or [],
+                post_id=msg.get("envelope_id", ""),
+                create_at=msg.get("sent_at", 0),
+                space_id=channel_meta.get("space_id", ""),
+                space_name=channel_meta.get("space_name", ""),
+            ))
+        fallback_text = "\n\n".join(fallback_chunks)
+
+        ctx = TurnContext(
+            system_prompt=self.system_prompt,
+            messages=list(self.log),
+            workspace_dir=self.workspace_dir,
+            claude_dir=self.claude_dir,
+            memory_dir=self.memory_dir,
+            on_progress=on_progress,
+        )
+        result = await self.adapter.run_retry_turn(
+            kick_text, fallback_text, ctx,
+        )
+
+        # Route reply the same way as a normal turn so the consumer
+        # picks up AgentAPIError again on consecutive rate-limit
+        # failures.
+        send_message_called = bool(result.metadata.get("send_message_targets"))
+        text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
+        if send_message_called:
+            if result.reply:
+                self._append_assistant(
+                    channel_meta.get("channel_name", ""), result.reply,
+                )
+            return None
+        joined = "\n".join(text_parts) if text_parts else (result.reply or "")
+        if "[SILENT]" in joined:
+            return None
+        if "API Error" in joined:
+            self.logger.warning(
+                "[api-error-retry] adapter still rate-limited; "
+                "raising for consumer-side backoff"
+            )
+            raise AgentAPIError(
+                "agent adapter output contained 'API Error' on retry"
+            )
+        if not text_parts and not result.reply:
+            return None
+        fallback = _format_assistant_fallback(text_parts, result.reply)
+        self._append_assistant(channel_meta.get("channel_name", ""), fallback)
+        return fallback
+
+    async def _run_turn_and_route(
+        self,
+        channel_name: str,
+        sender: str,
+        on_progress=None,
+    ) -> str | None:
+        """Shared tail for ``handle_message`` and ``handle_message_batch``.
+        Runs one adapter turn against the current ``self.log`` and
+        routes the reply per the rules below.
+        """
         ctx = TurnContext(
             system_prompt=self.system_prompt,
             messages=list(self.log),
@@ -142,7 +295,7 @@ class PuffoAgent:
         if "API Error" in joined:
             self.logger.warning(
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
-                "contained 'API Error'; suppressing post + flagging for retry"
+                "contained 'API Error'; suppressing post, abandoning batch"
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error'"
@@ -179,6 +332,43 @@ class PuffoAgent:
         space_id: str = "",
         space_name: str = "",
     ):
+        content = self._format_user_block(
+            channel_name=channel_name,
+            sender=sender,
+            sender_email=sender_email,
+            text=text,
+            attachments=attachments,
+            channel_id=channel_id,
+            root_id=root_id,
+            sender_is_bot=sender_is_bot,
+            mentions=mentions,
+            post_id=post_id,
+            create_at=create_at,
+            followups=followups,
+            space_id=space_id,
+            space_name=space_name,
+        )
+        self.log.append({"role": "user", "content": content})
+        self._truncate_log()
+
+    def _format_user_block(
+        self,
+        *,
+        channel_name: str,
+        sender: str,
+        sender_email: str,
+        text: str,
+        attachments: list[str] | None,
+        channel_id: str = "",
+        root_id: str = "",
+        sender_is_bot: bool = False,
+        mentions: list[dict] | None = None,
+        post_id: str = "",
+        create_at: int = 0,
+        followups: list[dict] | None = None,
+        space_id: str = "",
+        space_name: str = "",
+    ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
         # "[#channel] @user:" style prefixes back into replies. Format
@@ -235,8 +425,7 @@ class PuffoAgent:
                 lines.append(
                     f"  - [{ts} post:{fid}] @{fsender}: {ftext}"
                 )
-        self.log.append({"role": "user", "content": "\n".join(lines)})
-        self._truncate_log()
+        return "\n".join(lines)
 
     def _append_assistant(self, channel_name: str, reply: str):
         self.log.append({"role": "assistant", "content": reply})

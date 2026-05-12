@@ -110,20 +110,28 @@ class TestBuildCommand:
         cmd = adapter._build_command(extra_args=[])
         assert "--model" not in cmd
 
-    def test_bypass_permissions_passes_through(self):
+    def test_bypass_permissions_uses_dangerously_skip_permissions(self):
+        # bypassPermissions is the only path today; it MUST emit
+        # --dangerously-skip-permissions (and not --permission-mode)
+        # so claude-code in stream-json mode bypasses the per-project
+        # trust dialog. Otherwise MCP servers supplied via
+        # --mcp-config get silently dropped on the first run.
         adapter = _make_adapter(permission_mode="bypassPermissions")
         cmd = adapter._build_command(extra_args=[])
-        i = cmd.index("--permission-mode")
-        assert cmd[i + 1] == "bypassPermissions"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--permission-mode" not in cmd
 
-    def test_never_passes_dangerously_skip_permissions(self):
-        # Regression guard: this flag is deprecated in favour of
-        # --permission-mode. If it returns, permission decisions
-        # silent-bypass and the MCP proxy never fires.
+    def test_non_bypass_modes_pass_dangerously_skip_permissions_off(self):
+        # The other modes route per-tool decisions through the
+        # PreToolUse hook; they MUST NOT use --dangerously-skip-
+        # permissions or the hook never fires.
         for mode in VALID_PERMISSION_MODES:
+            if mode == "bypassPermissions":
+                continue
             adapter = _make_adapter(permission_mode=mode)
             cmd = adapter._build_command(extra_args=["--foo", "bar"])
             assert "--dangerously-skip-permissions" not in cmd
+            assert "--permission-mode" in cmd
 
     def test_unknown_mode_sanitised_at_construction(self, caplog):
         with caplog.at_level(logging.WARNING):

@@ -27,7 +27,7 @@ from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
 from ..crypto.primitives import Ed25519KeyPair
-from .data_client import DataClient
+from .data_client import DataClient, DataNotFound
 
 logger = logging.getLogger(__name__)
 
@@ -204,13 +204,32 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return f"posted {envelope.get('envelope_id', '?')} to {channel}"
 
     @mcp.tool()
-    async def get_channel_history(channel: str, limit: int = 20) -> str:
-        """Fetch the last N messages in a channel from local storage.
+    async def get_channel_history(
+        channel: str,
+        limit: int = 20,
+        since: str = "",
+        before: int = 0,
+        after: int = 0,
+    ) -> str:
+        """List recent **root posts** in a channel from local storage,
+        with the reply count for each thread.
 
-        Each line shows timestamp, sender, and text. Read from the
-        local store — no server round-trip. Pass a raw channel id
-        (``ch_<uuid>``).
-        """
+        Replies are NOT inlined — call ``get_thread_history`` if you
+        want to drill into a specific thread. This keeps a single
+        ``get_channel_history`` call from dragging hundreds of replies
+        into your context just because one thread is active.
+
+        Filters (optional, can be combined):
+        - ``since`` — an envelope_id (``msg_<uuid>``). Results have
+          ``sent_at >`` that envelope's ``sent_at``. Use this when
+          you remember the latest root you already saw.
+        - ``after`` — ms-epoch timestamp; exclusive lower bound.
+        - ``before`` — ms-epoch timestamp; exclusive upper bound.
+
+        Output lines: ``<ts>  @<sender>: <text>  (N replies)`` where
+        ``N`` is the current reply count (omitted for 0). Oldest-
+        first inside the returned window. Channel id is a raw
+        ``ch_<uuid>`` (no ``#name`` shortcut)."""
         limit = max(1, min(int(limit), 200))
         channel_ref = channel.strip()
         if channel_ref.startswith("#"):
@@ -220,16 +239,78 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             )
         channel_id = channel_ref
 
-        msgs = await cfg.data_client.get_channel_history(channel_id, limit)
+        try:
+            roots = await cfg.data_client.get_channel_roots(
+                channel_id,
+                limit=limit,
+                since_envelope_id=since or None,
+                before_ts=int(before) if before else None,
+                after_ts=int(after) if after else None,
+            )
+        except DataNotFound:
+            return f"(no such channel: {channel_id})"
+        if not roots:
+            return "(no root posts in the requested window)"
+        lines = []
+        for entry in roots:
+            m = entry.message
+            ts = _ts_to_iso(m.sent_at)
+            text = str(m.content).replace("\n", " ") if m.content else ""
+            suffix = (
+                f"  ({entry.reply_count} repl{'y' if entry.reply_count == 1 else 'ies'})"
+                if entry.reply_count > 0 else ""
+            )
+            lines.append(
+                f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
+            )
+        return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_thread_history(
+        root_id: str,
+        limit: int = 50,
+        since: str = "",
+        before: int = 0,
+        after: int = 0,
+    ) -> str:
+        """List messages in one thread (the root post + every reply
+        that points at it) from local storage.
+
+        Used after ``get_channel_history`` shows a thread you want
+        to read into. Same filter semantics as
+        ``get_channel_history``: ``since`` is an envelope_id whose
+        ``sent_at`` becomes the exclusive lower bound; ``after`` /
+        ``before`` are ms-epoch bounds. All filters optional.
+
+        ``root_id`` is the thread root envelope_id (``msg_<uuid>``).
+        For a top-level post that has no replies, this returns just
+        that post.
+
+        Output lines: ``<ts>  post:<envelope_id>  @<sender>: <text>``,
+        oldest-first."""
+        if not root_id.strip():
+            raise RuntimeError("root_id required")
+        limit = max(1, min(int(limit), 200))
+        try:
+            msgs = await cfg.data_client.get_thread_messages(
+                root_id.strip(),
+                limit=limit,
+                since_envelope_id=since or None,
+                before_ts=int(before) if before else None,
+                after_ts=int(after) if after else None,
+            )
+        except DataNotFound:
+            return f"(no such thread: {root_id.strip()})"
         if not msgs:
-            return "(no messages in local history)"
-        rows = []
+            return "(no messages in this thread for the requested window)"
+        lines = []
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)
             text = str(m.content).replace("\n", " ") if m.content else ""
-            thread = f" [thread:{m.thread_root_id[:10]}...]" if m.thread_root_id else ""
-            rows.append(f"{ts}  @{m.sender_slug}: {text}{thread}")
-        return "\n".join(rows)
+            lines.append(
+                f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
+            )
+        return "\n".join(lines)
 
     @mcp.tool()
     async def list_channels() -> str:

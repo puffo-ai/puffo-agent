@@ -94,6 +94,31 @@ class Adapter(ABC):
         """
         return None
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        """Retry the most recent turn after an ``AgentAPIError``.
+
+        Default: stateless adapters (SDK, chat-only) have no
+        resumable session, so the kick is meaningless on its own;
+        send the full ``fallback_user_message`` as a normal turn.
+        cli adapters override this to send the cheap kick on
+        ``--resume`` success and fall back to the full payload only
+        when ``--resume`` failed.
+        """
+        ctx_fallback = TurnContext(
+            system_prompt=ctx.system_prompt,
+            messages=[{"role": "user", "content": fallback_user_message}],
+            workspace_dir=ctx.workspace_dir,
+            claude_dir=ctx.claude_dir,
+            memory_dir=ctx.memory_dir,
+            on_progress=ctx.on_progress,
+        )
+        return await self.run_turn(ctx_fallback)
+
     async def refresh_ping(self) -> None:
         """Force an OAuth round-trip so Anthropic's rotating refresh
         token gets exchanged before the access token dies. Guarded by

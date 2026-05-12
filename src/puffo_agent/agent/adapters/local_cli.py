@@ -152,6 +152,18 @@ class LocalCLIAdapter(Adapter):
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        self._verify()
+        session = self._ensure_session()
+        return await session.run_retry_turn(
+            kick_text, fallback_user_message, ctx.system_prompt,
+        )
+
     async def warm(self, system_prompt: str) -> None:
         """Spawn the claude subprocess eagerly when this agent has a
         persisted session; fresh agents wait for their first message
@@ -399,11 +411,28 @@ class LocalCLIAdapter(Adapter):
         # host by ClaudeSession._spawn; the kwarg here is just for
         # symmetry with the docker adapter.
         del env_overrides
-        # ``--permission-mode`` (not ``--dangerously-skip-permissions``)
-        # lets the user control which tool categories auto-approve;
-        # the rest flow through the MCP permission-prompt callback,
-        # which fails closed on timeout.
-        cmd = ["claude", "--permission-mode", self.permission_mode]
+        cmd = ["claude"]
+        # ``--dangerously-skip-permissions`` bypasses BOTH the per-tool
+        # approval prompt AND the per-project trust dialog. Claude
+        # code's stream-json mode has no UI surface to accept the
+        # trust dialog, so anything short of this flag leaves the
+        # cwd un-trusted, which silently drops MCP servers supplied
+        # via ``--mcp-config`` — exactly the "agent can't see the
+        # puffo MCP" symptom on cli-local. ``--permission-mode
+        # bypassPermissions`` (the previous flag here) only handles
+        # the per-tool prompt path, not the trust dialog, so the MCP
+        # was getting dropped before its tools could even register.
+        # When the bypass mode is anything other than
+        # ``bypassPermissions`` (e.g. the future ``default`` /
+        # ``acceptEdits`` modes that route through the PreToolUse
+        # hook), fall back to ``--permission-mode <mode>`` so the
+        # hook controls each tool category — those modes implicitly
+        # require an operator-supervised setup where the trust
+        # dialog has already been accepted in a real claude session.
+        if self.permission_mode == "bypassPermissions":
+            cmd.append("--dangerously-skip-permissions")
+        else:
+            cmd.extend(["--permission-mode", self.permission_mode])
         if self.model:
             cmd.extend(["--model", self.model])
         cmd.extend(extra_args)

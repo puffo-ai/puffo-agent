@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
@@ -34,6 +35,53 @@ PRIORITY_MENTIONED_BOT = 2
 PRIORITY_HUMAN = 3
 PRIORITY_BOT = 4
 PRIORITY_SYSTEM = 5
+
+
+@dataclass
+class _ThreadEntry:
+    """Per-thread queue state.
+
+    The PriorityQueue itself stores ``(priority, seq, root_id)``
+    tuples so the heap can order by priority and break ties on
+    monotonic seq (dicts aren't orderable). The real per-thread
+    state lives here, keyed by ``root_id``:
+
+    - ``messages`` holds every decoded message dict for this
+      thread that has been enqueued but not yet dispatched. The
+      consumer drains the whole list in a single ``on_message_batch``
+      call, so messages that arrived between the first enqueue and
+      the eventual pop all reach the agent as one turn.
+    - ``current_priority`` / ``current_seq`` are the priority and
+      seq currently active in the queue. When a new arrival on the
+      same root bumps priority, we DON'T remove the stale heap
+      entry (``asyncio.PriorityQueue`` doesn't support that); we
+      push a fresh tuple and let the consumer drop the old one when
+      it pops and notices ``seq`` no longer matches the entry's
+      ``current_seq``.
+    - ``in_queue`` flips False between successful dispatch and the
+      next arrival on this root, so a later message reopens the
+      entry cleanly instead of stacking into a stale batch.
+    - ``channel_meta`` is captured on the first enqueue and reused
+      on dispatch; the thread/channel/space context is invariant
+      for a given root.
+    - ``dispatching_ids`` is the set of envelope_ids currently being
+      sent to the agent (the batch the consumer just claimed but
+      hasn't finished). A duplicate WS delivery that lands during
+      that window can't be caught by the handle_envelope cursor
+      (cursor advances only after dispatch succeeds) or by the
+      in-memory dedup (the consumer just emptied ``messages`` to
+      claim the batch), so the reopen branch of
+      ``_admit_thread_message`` would otherwise put the duplicate
+      into a fresh batch — causing the agent to see the same post
+      across two turns. This set is checked at admit time and
+      cleared on successful cursor advance.
+    """
+    current_priority: int
+    current_seq: int
+    messages: list[dict] = field(default_factory=list)
+    in_queue: bool = True
+    channel_meta: dict = field(default_factory=dict)
+    dispatching_ids: set[str] = field(default_factory=set)
 
 
 async def _fetch_blob_with_retry(
@@ -272,7 +320,22 @@ class PuffoCoreMessageClient:
     async def listen(
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
+        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
+        """``on_message`` is the thread-batch callback. Despite the
+        legacy parameter name kept for caller compatibility, it's
+        invoked as ``on_message(root_id, batch, channel_meta)`` —
+        the consumer collapses every arrival on the same thread
+        into a single dispatch (see ``_consume_queue``).
+
+        ``on_api_error_retry`` is the kick-retry callback invoked
+        after the consumer catches an ``AgentAPIError``. Same
+        signature, but the implementation is expected to nudge
+        claude-code via ``--resume`` rather than re-sending the
+        ``batch`` payload (so the agent's transcript doesn't pick up
+        a duplicate of the original user input on every retry). When
+        omitted, the consumer abandons the batch on first failure.
+        """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
             decode_secret(identity.kem_secret_key)
@@ -433,14 +496,35 @@ class PuffoCoreMessageClient:
             else:
                 channel_name = channel_id
 
-            # Monotonic ``seq`` tiebreaker keeps PriorityQueue from
-            # comparing the args dict on ties (dicts aren't orderable
-            # so a same-priority pair would TypeError).
             direct = is_dm or is_mention
             sender_is_bot = False  # puffo-core has no is_bot flag yet
             priority = _compute_priority(direct, sender_is_bot)
-            self._queue_seq += 1
-            await self._queue.put((priority, self._queue_seq, {
+
+            # Thread-batched queue: every message coalesces under
+            # its ``root_id`` (the envelope's ``thread_root_id``, or
+            # the message itself when it's a top-level post). The
+            # PriorityQueue holds one slot per root; new arrivals on
+            # the same thread either join the existing batch
+            # (priority same or lower) or bump the slot to the new
+            # higher priority. The agent processes one whole thread
+            # at a time in ``on_message_batch``.
+            root_id = payload.thread_root_id or payload.envelope_id
+
+            # Cross-restart dedup: after a daemon restart the server
+            # redelivers anything in /messages/pending. If we already
+            # dispatched a batch that covers ``payload.sent_at``,
+            # skip — the agent has seen this.
+            last_processed = await self.store.get_last_processed_sent_at(root_id)
+            if payload.sent_at <= last_processed:
+                logger.info(
+                    "handle_envelope: cursor-rejected duplicate envelope=%s "
+                    "(sent_at=%d <= last_processed=%d, root=%s)",
+                    payload.envelope_id, payload.sent_at,
+                    last_processed, root_id,
+                )
+                return
+
+            msg_dict = {
                 "channel_id": channel_id,
                 "channel_name": channel_name,
                 "space_id": space_id,
@@ -455,17 +539,36 @@ class PuffoCoreMessageClient:
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
-            }))
+            }
+            channel_meta = {
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "space_id": space_id,
+                "space_name": space_name,
+                "is_dm": is_dm,
+            }
+
+            await self._admit_thread_message(
+                root_id=root_id,
+                priority=priority,
+                msg_dict=msg_dict,
+                channel_meta=channel_meta,
+            )
 
         # Per-listen() queue. A reconnect drops any envelopes not yet
         # drained; the server redelivers via /messages/pending on the
-        # next subscribe.
+        # next subscribe, and the sqlite ``thread_processing_state``
+        # cursor keeps the agent from re-running on threads it already
+        # handled before the restart.
         self._queue = asyncio.PriorityQueue()
         self._queue_seq = 0
+        self._thread_state: dict[str, _ThreadEntry] = {}
         # Reset on every (re)connect — the auto-accept path is
         # idempotent against server-side state.
         self._processed_invite_ids = set()
-        consumer_task = asyncio.ensure_future(self._consume_queue(on_message))
+        consumer_task = asyncio.ensure_future(
+            self._consume_queue(on_message, on_api_error_retry),
+        )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
 
         self._ws = PuffoCoreWsClient(
@@ -488,55 +591,348 @@ class PuffoCoreMessageClient:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-    async def _consume_queue(
+    async def _admit_thread_message(
         self,
-        on_message: Callable[..., Coroutine[Any, Any, Any]],
+        *,
+        root_id: str,
+        priority: int,
+        msg_dict: dict,
+        channel_meta: dict,
     ) -> None:
-        """Drain the priority queue serially. One turn at a time so
-        the underlying session keeps a coherent conversation history;
-        concurrent turns would interleave context.
+        """Add (or coalesce) a message into the thread-batched queue.
+
+        Cases (all keyed on ``root_id``):
+
+        - **New root** (no entry yet): build a fresh ``_ThreadEntry``
+          with this message as the only element and push a heap tuple.
+        - **Reopen** (entry exists but ``in_queue`` is False — a
+          previous batch was already dispatched): reset the entry with
+          this message as the new cursor and push a fresh heap tuple.
+        - **In-queue, same-or-lower priority** (priority numeric value
+          unchanged or larger): append to the existing batch. The
+          cursor (``messages[0]``) stays pinned; the heap tuple
+          doesn't move.
+        - **In-queue, higher priority** (smaller numeric value): append
+          to the batch AND push a new heap tuple with the upgraded
+          priority and a fresh seq. The old tuple is left in the heap
+          and gets skipped on pop via the ``current_seq`` mismatch
+          check in ``_consume_queue``.
+
+        Caller must have already filtered out messages whose
+        ``sent_at`` is at or below
+        ``store.get_last_processed_sent_at(root_id)``; this method
+        doesn't re-check the durable cursor.
         """
-        while True:
+        entry = self._thread_state.get(root_id)
+        incoming_id = msg_dict.get("envelope_id", "")
+
+        # Cross-batch dedup: skip a duplicate of an envelope the
+        # consumer just claimed and is sending to the agent right
+        # now. Without this, the reopen branch below would create a
+        # fresh ``entry.messages = [dup]`` slot and the duplicate
+        # gets dispatched as the next batch — agent sees the same
+        # envelope across two turns. See ``_ThreadEntry`` docstring.
+        if entry is not None and incoming_id and incoming_id in entry.dispatching_ids:
+            logger.info(
+                "_admit_thread_message: dispatching_ids-rejected duplicate "
+                "envelope=%s root=%s", incoming_id, root_id,
+            )
+            return
+
+        if entry is None or not entry.in_queue:
+            self._queue_seq += 1
+            if entry is None:
+                entry = _ThreadEntry(
+                    current_priority=priority,
+                    current_seq=self._queue_seq,
+                    messages=[msg_dict],
+                    in_queue=True,
+                    channel_meta=channel_meta,
+                )
+                self._thread_state[root_id] = entry
+            else:
+                entry.current_priority = priority
+                entry.current_seq = self._queue_seq
+                entry.messages = [msg_dict]
+                entry.in_queue = True
+                entry.channel_meta = channel_meta
+            await self._queue.put((priority, entry.current_seq, root_id))
+            return
+
+        # Dedup by envelope_id within the live batch. The same wire
+        # envelope can land here twice when the server's pending-
+        # message redelivery overlaps with live WS delivery (e.g.
+        # after a daemon restart or brief WS reconnect). sqlite-side
+        # INSERT OR IGNORE in MessageStore.store already covers the
+        # durable table, but the in-memory batch is independent and
+        # would otherwise feed the agent the same post N times.
+        if incoming_id and any(
+            m.get("envelope_id") == incoming_id for m in entry.messages
+        ):
+            logger.info(
+                "_admit_thread_message: in-batch-rejected duplicate "
+                "envelope=%s root=%s (pending batch=%d)",
+                incoming_id, root_id, len(entry.messages),
+            )
+            return
+
+        entry.messages.append(msg_dict)
+        if priority < entry.current_priority:
+            self._queue_seq += 1
+            entry.current_priority = priority
+            entry.current_seq = self._queue_seq
+            await self._queue.put((priority, entry.current_seq, root_id))
+
+    # Upper bound on consecutive AgentAPIError retries for a single
+    # batch before we give up. claude-code's rate limit usually lifts
+    # well inside 3 × (15-45s) of backoff; staying any longer is
+    # bad for everything else queued behind this thread.
+    MAX_API_ERROR_RETRIES = 3
+
+    async def _do_api_error_retries(
+        self,
+        *,
+        root_id: str,
+        entry: "_ThreadEntry",
+        batch: list[dict],
+        channel_meta: dict,
+        on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        last_envelope: str,
+    ) -> None:
+        """Loop the API-Error kick-retry path until the agent
+        succeeds, the retry cap is hit, or a non-retry exception
+        bubbles up. The original ``batch`` doesn't go back into
+        ``entry.messages`` — the kick path tells claude-code (via
+        --resume) to re-attempt its previous turn; if --resume is
+        gone, the adapter falls back to the payload internally.
+
+        Mid-dispatch arrivals: any new messages that landed on the
+        same thread during the failed dispatch were admitted via
+        ``_admit_thread_message``'s reopen branch and are now in
+        ``entry.messages`` with a fresh queue tuple. We don't touch
+        them; the consumer picks them up after this retry loop
+        exits.
+
+        Cursor is NOT advanced on the failed batch — if a later
+        message succeeds on this thread it'll mark a higher
+        ``sent_at`` past the failed one, effectively leaving the
+        failed envelope readable via ``get_channel_history`` for the
+        agent if it wants to backfill.
+        """
+        # Reset the in-flight set for this slot. The failed batch is
+        # no longer "currently dispatching"; future duplicates of
+        # those envelopes need to be caught by the cursor (advanced
+        # by the kick's successful dispatch) or by in-batch dedup.
+        entry.dispatching_ids = set()
+
+        if on_api_error_retry is None:
+            logger.warning(
+                "agent reply contained 'API Error' for thread %s "
+                "(last envelope %s); no retry callback wired, "
+                "abandoning batch",
+                root_id, last_envelope,
+            )
+            return
+
+        for attempt in range(1, self.MAX_API_ERROR_RETRIES + 1):
+            delay = random.uniform(15.0, 45.0)
+            logger.warning(
+                "agent reply contained 'API Error' for thread %s "
+                "(last envelope %s); kick-retry %d/%d in %.1fs",
+                root_id, last_envelope, attempt,
+                self.MAX_API_ERROR_RETRIES, delay,
+            )
             try:
-                item = await self._queue.get()
+                await asyncio.sleep(delay)
             except asyncio.CancelledError:
-                return
-            _priority, _seq, args = item
+                raise
             try:
-                await on_message(
-                    args["channel_id"], args["channel_name"],
-                    args["sender_slug"], args["sender_email"],
-                    args["text"], args["root_id"], args["is_dm"],
-                    args["attachments"], args["sender_is_bot"],
-                    args["mentions"],
-                    args["envelope_id"], args["sent_at"], [],
-                    space_id=args.get("space_id", ""),
-                    space_name=args.get("space_name", ""),
+                await on_api_error_retry(root_id, batch, channel_meta)
+                # Success path: no exception. The agent processed
+                # the retry. Advance cursor past the failed batch
+                # so we don't re-trigger on redelivery.
+                if batch:
+                    tail_sent_at = batch[-1].get("sent_at", 0)
+                    try:
+                        await self.store.mark_thread_processed(
+                            root_id, tail_sent_at,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "mark_thread_processed(%s, %d) failed "
+                            "after kick-retry; agent may re-process "
+                            "after restart",
+                            root_id, tail_sent_at,
+                        )
+                logger.info(
+                    "agent thread %s recovered after kick-retry %d/%d",
+                    root_id, attempt, self.MAX_API_ERROR_RETRIES,
                 )
+                return
             except AgentAPIError:
-                # Adapter surfaced "API Error". Re-enqueue the same
-                # tuple so the message keeps its priority band slot
-                # (later arrivals have strictly larger ``seq``), then
-                # back off 15-45s randomised to avoid a thundering
-                # herd across a fleet hit by the same outage.
-                await self._queue.put(item)
-                delay = random.uniform(15.0, 45.0)
-                logger.warning(
-                    "agent reply contained 'API Error' for envelope %s; "
-                    "re-queued and pausing %.1fs before next message",
-                    args.get("envelope_id"), delay,
-                )
-                try:
-                    await asyncio.sleep(delay)
-                except asyncio.CancelledError:
-                    raise
+                # Still rate-limited; loop with another backoff.
+                continue
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception(
-                    "on_message handler failed for envelope %s",
-                    args.get("envelope_id"),
+                    "kick-retry %d/%d for thread %s raised; abandoning",
+                    attempt, self.MAX_API_ERROR_RETRIES, root_id,
                 )
+                return
+        logger.warning(
+            "agent thread %s exhausted %d kick-retries (last envelope %s); "
+            "abandoning the batch — agent will see these messages via "
+            "get_channel_history on the next dispatch",
+            root_id, self.MAX_API_ERROR_RETRIES, last_envelope,
+        )
+
+    async def _consume_queue(
+        self,
+        on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
+        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+    ) -> None:
+        """Drain the priority queue serially. One turn at a time so
+        the underlying session keeps a coherent conversation history;
+        concurrent turns would interleave context.
+
+        Each pop yields a ``root_id``. We look up the per-thread
+        entry, drop the message batch out (claim it), and dispatch
+        the whole list as one agent invocation. While the agent is
+        running, new arrivals on the same thread create a fresh
+        entry that will be picked up on the next pop — the agent
+        won't re-see messages it already processed.
+        """
+        while True:
+            try:
+                _priority, popped_seq, root_id = await self._queue.get()
+            except asyncio.CancelledError:
+                return
+
+            entry = self._thread_state.get(root_id)
+            if entry is None or not entry.in_queue or entry.current_seq != popped_seq:
+                # Stale heap entry: a higher-priority arrival
+                # already pushed a fresh tuple for this root, or
+                # the slot has been closed since we popped. Drop
+                # and continue.
+                continue
+
+            # Claim the batch atomically — mark the slot closed
+            # before dispatch so concurrent arrivals open a fresh
+            # entry instead of stacking into a batch the agent is
+            # already chewing through. Record the batch's
+            # envelope_ids in ``dispatching_ids`` so that a duplicate
+            # arriving mid-dispatch can be rejected at admit time
+            # (the durable cursor hasn't advanced yet, so it can't
+            # catch it).
+            batch = entry.messages
+            channel_meta = entry.channel_meta
+            entry.messages = []
+            entry.in_queue = False
+            entry.dispatching_ids = {
+                m.get("envelope_id") for m in batch if m.get("envelope_id")
+            }
+
+            # Safety net: paranoid in-batch dedup right before
+            # dispatch. ``_admit_thread_message``'s in-queue dedup
+            # plus ``dispatching_ids`` should already guarantee
+            # ``batch`` is duplicate-free, but if some upstream race
+            # we haven't characterised slips a duplicate envelope_id
+            # past both, we must NOT hand the same envelope to the
+            # agent twice in one turn. The warning log lets us spot
+            # the offending path if it ever fires.
+            seen_ids: set[str] = set()
+            deduped: list[dict] = []
+            dropped: list[str] = []
+            for m in batch:
+                mid = m.get("envelope_id", "")
+                if mid and mid in seen_ids:
+                    dropped.append(mid)
+                    continue
+                if mid:
+                    seen_ids.add(mid)
+                deduped.append(m)
+            if dropped:
+                logger.warning(
+                    "consumer dropped %d in-batch duplicate envelope_id(s) "
+                    "for thread %s before dispatch: %s",
+                    len(dropped), root_id, dropped,
+                )
+                batch = deduped
+
+            # Pre-dispatch jitter. When several agents on the same
+            # host get activated by the same message (e.g. a channel
+            # broadcast), unblocked dispatch sends them all into the
+            # claude-code API at once and trips its rate limit. A
+            # 0.0–1.5s random sleep here desynchronises them; each
+            # agent picks independently. Messages that arrive during
+            # the sleep land in the next batch because in_queue is
+            # already False.
+            try:
+                await asyncio.sleep(random.uniform(0.0, 1.5))
+            except asyncio.CancelledError:
+                raise
+
+            try:
+                await on_message_batch(root_id, batch, channel_meta)
+            except AgentAPIError:
+                # Adapter surfaced "API Error" — most commonly
+                # claude-code's transient rate-limit error. The
+                # original user input is already in claude-code's
+                # ``--resume``-backed transcript from the failed
+                # dispatch; the retry just needs to nudge the agent
+                # to try again, NOT re-send the payload (which would
+                # accumulate visible duplicates in the agent's
+                # transcript on every retry).
+                #
+                # The retry path uses a small kick message ("session
+                # errored on rate limiting, please resume processing")
+                # via ``on_api_error_retry``; if ``--resume`` is no
+                # longer valid the adapter falls back to the original
+                # payload on its own so the agent has something to
+                # work from.
+                last_envelope = batch[-1].get("envelope_id", "") if batch else ""
+                await self._do_api_error_retries(
+                    root_id=root_id,
+                    entry=entry,
+                    batch=batch,
+                    channel_meta=channel_meta,
+                    on_api_error_retry=on_api_error_retry,
+                    last_envelope=last_envelope,
+                )
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "on_message_batch handler failed for thread %s (%d messages)",
+                    root_id, len(batch),
+                )
+                # Treat poison-message style failures as terminal for
+                # the batch — don't loop forever. The sqlite cursor
+                # stays untouched so a restart can retry, but we mark
+                # the slot done in-memory so live arrivals keep
+                # flowing for other threads.
+                continue
+
+            # Success: persist the cursor so a restart-then-redeliver
+            # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
+            # the high-water mark we just covered.
+            if batch:
+                tail_sent_at = batch[-1].get("sent_at", 0)
+                try:
+                    await self.store.mark_thread_processed(root_id, tail_sent_at)
+                except Exception:
+                    logger.exception(
+                        "mark_thread_processed(%s, %d) failed; agent "
+                        "may re-process this thread after a restart",
+                        root_id, tail_sent_at,
+                    )
+            # Cursor now covers the dispatched batch — duplicates of
+            # any of its envelopes will be caught by the handle_envelope
+            # cursor check from this point on, so the in-memory
+            # dispatching_ids set has done its job and can be released.
+            entry.dispatching_ids = set()
 
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the

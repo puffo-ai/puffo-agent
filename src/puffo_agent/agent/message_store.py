@@ -31,11 +31,33 @@ CREATE INDEX IF NOT EXISTS idx_messages_dm
     ON messages (sender_slug, sent_at) WHERE envelope_kind = 'dm';
 CREATE INDEX IF NOT EXISTS idx_messages_received
     ON messages (received_at);
+CREATE INDEX IF NOT EXISTS idx_messages_thread_root
+    ON messages (thread_root_id, sent_at) WHERE thread_root_id IS NOT NULL;
+
+-- Per-thread cursor used by the thread-batched priority queue. After
+-- ``on_message_batch`` finishes successfully, the consumer advances
+-- this to the ``sent_at`` of the last message in the dispatched
+-- batch. The listen handler then drops any inbound message whose
+-- ``sent_at`` is <= the stored cursor, so server-side pending-message
+-- redeliveries after a daemon restart don't re-trigger the agent on
+-- already-processed threads.
+CREATE TABLE IF NOT EXISTS thread_processing_state (
+    root_id TEXT PRIMARY KEY,
+    last_processed_sent_at INTEGER NOT NULL
+);
 """
 
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+class DataNotFound(Exception):
+    """Raised by reads that need to distinguish "this channel /
+    thread has never been seen" from "seen, but the requested
+    window is empty after filters". The MCP tool layer surfaces a
+    different user-facing message for each.
+    """
 
 
 @dataclass
@@ -52,6 +74,18 @@ class StoredMessage:
     received_at: int
     thread_root_id: Optional[str] = None
     reply_to_id: Optional[str] = None
+
+
+@dataclass
+class ChannelRoot:
+    """One root post in a channel plus how many replies it accrued.
+    Used by ``get_channel_roots`` to surface thread heads without
+    blasting every reply into the agent's context window — the agent
+    sees N=reply_count and calls ``get_thread_messages`` only on
+    threads it actually wants to read into.
+    """
+    message: StoredMessage
+    reply_count: int
 
 
 class MessageStore:
@@ -127,6 +161,22 @@ class MessageStore:
             ),
         )
         await db.commit()
+
+    async def channel_exists(self, channel_id: str) -> bool:
+        """True iff the store has ever recorded a message in
+        ``channel_id``. Used by the data service to return 404 when
+        the caller asks for history on a channel the agent has never
+        seen — distinguishes "unknown channel" from "known channel,
+        empty window after filters" (200 + empty list).
+        """
+        if not channel_id:
+            return False
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT 1 FROM messages WHERE channel_id = ? LIMIT 1",
+            (channel_id,),
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
     async def has_message(self, envelope_id: str) -> bool:
         db = await self._ensure_db()
@@ -220,6 +270,205 @@ class MessageStore:
         if row is None:
             return None
         return self._row_to_msg(row)
+
+    async def get_thread_batch(
+        self,
+        root_id: str,
+        since_sent_at: int,
+    ) -> list[StoredMessage]:
+        """Root message + every reply in its thread with
+        ``sent_at > since_sent_at``, ordered ascending. The root row
+        itself has ``thread_root_id IS NULL`` and matches via the
+        ``envelope_id = root_id`` arm of the OR.
+        """
+        if not root_id:
+            return []
+        db = await self._ensure_db()
+        async with db.execute(
+            """SELECT * FROM messages
+               WHERE (envelope_id = ? OR thread_root_id = ?)
+                 AND sent_at > ?
+               ORDER BY sent_at ASC, envelope_id ASC""",
+            (root_id, root_id, since_sent_at),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
+    async def _resolve_since_sent_at(self, since_envelope_id: str | None) -> int | None:
+        """Look up the ``sent_at`` of a reference envelope. Used by
+        ``get_channel_roots`` / ``get_thread_messages`` to translate
+        a ``since=<envelope_id>`` filter into an exclusive sent_at
+        lower bound. Returns ``None`` when the envelope isn't in the
+        store (caller treats that as "no since filter")."""
+        if not since_envelope_id:
+            return None
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT sent_at FROM messages WHERE envelope_id = ?",
+            (since_envelope_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else None
+
+    async def get_channel_roots(
+        self,
+        channel_id: str,
+        limit: int = 20,
+        since_envelope_id: str | None = None,
+        before_ts: int | None = None,
+        after_ts: int | None = None,
+    ) -> list[ChannelRoot]:
+        """Recent root posts in ``channel_id`` (``thread_root_id``
+        IS NULL) with the count of replies that point at each.
+
+        Replies in any thread are excluded from the result — the
+        agent gets one bullet per conversation head and can drill
+        into the threads it actually cares about via
+        ``get_thread_messages``. Filtering options:
+
+        - ``since_envelope_id`` — return roots whose ``sent_at`` is
+          strictly greater than that envelope's. Convenient when
+          the agent already knows the latest root it processed.
+        - ``after_ts`` (ms-epoch) — exclusive lower bound on
+          ``sent_at``. Combined with ``since`` we take the larger.
+        - ``before_ts`` (ms-epoch) — exclusive upper bound on
+          ``sent_at``.
+
+        Returned newest-first up to ``limit``. Raises
+        ``DataNotFound`` if the channel has never had any message
+        stored — so the MCP layer can distinguish "unknown channel"
+        from "known but empty window".
+        """
+        if not await self.channel_exists(channel_id):
+            raise DataNotFound(f"channel not found: {channel_id}")
+        db = await self._ensure_db()
+        lower_bounds: list[int] = []
+        since_resolved = await self._resolve_since_sent_at(since_envelope_id)
+        if since_resolved is not None:
+            lower_bounds.append(since_resolved)
+        if after_ts is not None:
+            lower_bounds.append(int(after_ts))
+        effective_after = max(lower_bounds) if lower_bounds else None
+
+        # ``reply_count`` is a correlated subquery on the same
+        # ``messages`` table; the WAL writer is the only producer, so
+        # the count is point-in-time consistent.
+        clauses = ["m.channel_id = ?", "m.thread_root_id IS NULL"]
+        params: list = [channel_id]
+        if effective_after is not None:
+            clauses.append("m.sent_at > ?")
+            params.append(effective_after)
+        if before_ts is not None:
+            clauses.append("m.sent_at < ?")
+            params.append(int(before_ts))
+        where = " AND ".join(clauses)
+        sql = (
+            "SELECT m.*, "
+            "(SELECT COUNT(*) FROM messages r "
+            " WHERE r.thread_root_id = m.envelope_id) AS reply_count "
+            f"FROM messages m WHERE {where} "
+            "ORDER BY m.sent_at DESC, m.envelope_id DESC LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 200)))
+
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        # Reverse so callers see oldest-first inside the window.
+        return [
+            ChannelRoot(
+                message=self._row_to_msg(r),
+                reply_count=int(r["reply_count"]),
+            )
+            for r in reversed(rows)
+        ]
+
+    async def get_thread_messages(
+        self,
+        root_id: str,
+        limit: int = 50,
+        since_envelope_id: str | None = None,
+        before_ts: int | None = None,
+        after_ts: int | None = None,
+    ) -> list[StoredMessage]:
+        """Messages belonging to a thread (the root itself plus
+        every reply pointing at it), filtered the same way as
+        ``get_channel_roots``. Newest-first selection, then
+        reversed to oldest-first in the returned list — matches
+        ``get_channel_history``'s shape so the MCP tool can format
+        either the same way. Raises ``DataNotFound`` when no
+        message with that envelope_id has been stored — same
+        rationale as ``get_channel_roots``.
+        """
+        if not root_id:
+            raise DataNotFound("thread root not found: (empty)")
+        if not await self.has_message(root_id):
+            raise DataNotFound(f"thread root not found: {root_id}")
+        db = await self._ensure_db()
+        lower_bounds: list[int] = []
+        since_resolved = await self._resolve_since_sent_at(since_envelope_id)
+        if since_resolved is not None:
+            lower_bounds.append(since_resolved)
+        if after_ts is not None:
+            lower_bounds.append(int(after_ts))
+        effective_after = max(lower_bounds) if lower_bounds else None
+
+        clauses = ["(envelope_id = ? OR thread_root_id = ?)"]
+        params: list = [root_id, root_id]
+        if effective_after is not None:
+            clauses.append("sent_at > ?")
+            params.append(effective_after)
+        if before_ts is not None:
+            clauses.append("sent_at < ?")
+            params.append(int(before_ts))
+        where = " AND ".join(clauses)
+        sql = (
+            f"SELECT * FROM messages WHERE {where} "
+            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 200)))
+
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in reversed(rows)]
+
+    async def get_last_processed_sent_at(self, root_id: str) -> int:
+        """``sent_at`` of the last message in the most recently
+        dispatched batch for this thread, or ``0`` if the agent has
+        never processed it. Used at enqueue time to drop redelivered
+        messages whose work has already been done.
+        """
+        if not root_id:
+            return 0
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT last_processed_sent_at FROM thread_processing_state "
+            "WHERE root_id = ?",
+            (root_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def mark_thread_processed(
+        self, root_id: str, sent_at: int,
+    ) -> None:
+        """Upsert the per-thread cursor. ``MAX(existing, new)`` so
+        out-of-order writes (extremely unlikely but cheap to guard)
+        never regress the cursor.
+        """
+        if not root_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO thread_processing_state (root_id, last_processed_sent_at)
+               VALUES (?, ?)
+               ON CONFLICT(root_id) DO UPDATE SET
+                 last_processed_sent_at = MAX(
+                   thread_processing_state.last_processed_sent_at,
+                   excluded.last_processed_sent_at
+                 )""",
+            (root_id, sent_at),
+        )
+        await db.commit()
 
     async def cleanup(self, retention_days: int = 90) -> int:
         db = await self._ensure_db()
