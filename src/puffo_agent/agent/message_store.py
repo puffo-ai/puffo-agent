@@ -68,6 +68,18 @@ class StoredMessage:
     reply_to_id: Optional[str] = None
 
 
+@dataclass
+class ChannelRoot:
+    """One root post in a channel plus how many replies it accrued.
+    Used by ``get_channel_roots`` to surface thread heads without
+    blasting every reply into the agent's context window — the agent
+    sees N=reply_count and calls ``get_thread_messages`` only on
+    threads it actually wants to read into.
+    """
+    message: StoredMessage
+    reply_count: int
+
+
 class MessageStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -257,6 +269,134 @@ class MessageStore:
         ) as cursor:
             rows = await cursor.fetchall()
         return [self._row_to_msg(r) for r in rows]
+
+    async def _resolve_since_sent_at(self, since_envelope_id: str | None) -> int | None:
+        """Look up the ``sent_at`` of a reference envelope. Used by
+        ``get_channel_roots`` / ``get_thread_messages`` to translate
+        a ``since=<envelope_id>`` filter into an exclusive sent_at
+        lower bound. Returns ``None`` when the envelope isn't in the
+        store (caller treats that as "no since filter")."""
+        if not since_envelope_id:
+            return None
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT sent_at FROM messages WHERE envelope_id = ?",
+            (since_envelope_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else None
+
+    async def get_channel_roots(
+        self,
+        channel_id: str,
+        limit: int = 20,
+        since_envelope_id: str | None = None,
+        before_ts: int | None = None,
+        after_ts: int | None = None,
+    ) -> list[ChannelRoot]:
+        """Recent root posts in ``channel_id`` (``thread_root_id``
+        IS NULL) with the count of replies that point at each.
+
+        Replies in any thread are excluded from the result — the
+        agent gets one bullet per conversation head and can drill
+        into the threads it actually cares about via
+        ``get_thread_messages``. Filtering options:
+
+        - ``since_envelope_id`` — return roots whose ``sent_at`` is
+          strictly greater than that envelope's. Convenient when
+          the agent already knows the latest root it processed.
+        - ``after_ts`` (ms-epoch) — exclusive lower bound on
+          ``sent_at``. Combined with ``since`` we take the larger.
+        - ``before_ts`` (ms-epoch) — exclusive upper bound on
+          ``sent_at``.
+
+        Returned newest-first up to ``limit``.
+        """
+        db = await self._ensure_db()
+        lower_bounds: list[int] = []
+        since_resolved = await self._resolve_since_sent_at(since_envelope_id)
+        if since_resolved is not None:
+            lower_bounds.append(since_resolved)
+        if after_ts is not None:
+            lower_bounds.append(int(after_ts))
+        effective_after = max(lower_bounds) if lower_bounds else None
+
+        # ``reply_count`` is a correlated subquery on the same
+        # ``messages`` table; the WAL writer is the only producer, so
+        # the count is point-in-time consistent.
+        clauses = ["m.channel_id = ?", "m.thread_root_id IS NULL"]
+        params: list = [channel_id]
+        if effective_after is not None:
+            clauses.append("m.sent_at > ?")
+            params.append(effective_after)
+        if before_ts is not None:
+            clauses.append("m.sent_at < ?")
+            params.append(int(before_ts))
+        where = " AND ".join(clauses)
+        sql = (
+            "SELECT m.*, "
+            "(SELECT COUNT(*) FROM messages r "
+            " WHERE r.thread_root_id = m.envelope_id) AS reply_count "
+            f"FROM messages m WHERE {where} "
+            "ORDER BY m.sent_at DESC, m.envelope_id DESC LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 200)))
+
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        # Reverse so callers see oldest-first inside the window.
+        return [
+            ChannelRoot(
+                message=self._row_to_msg(r),
+                reply_count=int(r["reply_count"]),
+            )
+            for r in reversed(rows)
+        ]
+
+    async def get_thread_messages(
+        self,
+        root_id: str,
+        limit: int = 50,
+        since_envelope_id: str | None = None,
+        before_ts: int | None = None,
+        after_ts: int | None = None,
+    ) -> list[StoredMessage]:
+        """Messages belonging to a thread (the root itself plus
+        every reply pointing at it), filtered the same way as
+        ``get_channel_roots``. Newest-first selection, then
+        reversed to oldest-first in the returned list — matches
+        ``get_channel_history``'s shape so the MCP tool can format
+        either the same way.
+        """
+        if not root_id:
+            return []
+        db = await self._ensure_db()
+        lower_bounds: list[int] = []
+        since_resolved = await self._resolve_since_sent_at(since_envelope_id)
+        if since_resolved is not None:
+            lower_bounds.append(since_resolved)
+        if after_ts is not None:
+            lower_bounds.append(int(after_ts))
+        effective_after = max(lower_bounds) if lower_bounds else None
+
+        clauses = ["(envelope_id = ? OR thread_root_id = ?)"]
+        params: list = [root_id, root_id]
+        if effective_after is not None:
+            clauses.append("sent_at > ?")
+            params.append(effective_after)
+        if before_ts is not None:
+            clauses.append("sent_at < ?")
+            params.append(int(before_ts))
+        where = " AND ".join(clauses)
+        sql = (
+            f"SELECT * FROM messages WHERE {where} "
+            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        )
+        params.append(max(1, min(int(limit), 200)))
+
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in reversed(rows)]
 
     async def get_last_processed_sent_at(self, root_id: str) -> int:
         """``sent_at`` of the last message in the most recently

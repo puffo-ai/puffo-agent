@@ -34,6 +34,17 @@ class StoredMessageDict:
     reply_to_id: Optional[str]
 
 
+@dataclass
+class ChannelRootDict:
+    """Per-thread head + reply count returned by
+    ``get_channel_roots``. ``message`` is the root post itself
+    (``thread_root_id`` is None); ``reply_count`` is how many
+    replies currently point at its ``envelope_id``.
+    """
+    message: "StoredMessageDict"
+    reply_count: int
+
+
 def _msg_from_dict(d: dict[str, Any]) -> StoredMessageDict:
     return StoredMessageDict(
         envelope_id=d.get("envelope_id", ""),
@@ -124,6 +135,102 @@ class DataClient:
                 return [_msg_from_dict(m) for m in msgs]
         except aiohttp.ClientError as exc:
             logger.warning("data-service: get_channel_history transport: %s", exc)
+            return []
+
+    async def get_channel_roots(
+        self,
+        channel_id: str,
+        limit: int = 20,
+        since_envelope_id: str | None = None,
+        before_ts: int | None = None,
+        after_ts: int | None = None,
+    ) -> list[ChannelRootDict]:
+        """Root posts in ``channel_id`` with reply counts. Filters:
+        ``since_envelope_id`` (results have ``sent_at >`` that
+        envelope's ``sent_at``), ``before_ts`` / ``after_ts``
+        (ms-epoch bounds).
+        """
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/channels/roots"
+        )
+        params: dict[str, str] = {
+            "channel": channel_id,
+            "limit": str(limit),
+        }
+        if since_envelope_id:
+            params["since"] = since_envelope_id
+        if before_ts is not None:
+            params["before"] = str(before_ts)
+        if after_ts is not None:
+            params["after"] = str(after_ts)
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}{path}", params=params,
+            ) as resp:
+                if resp.status == 404:
+                    return []
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "data-service: get_channel_roots %s -> %d %s",
+                        path, resp.status, body,
+                    )
+                    return []
+                data = await resp.json()
+                roots = data.get("roots") or []
+                return [
+                    ChannelRootDict(
+                        message=_msg_from_dict(r.get("message") or {}),
+                        reply_count=int(r.get("reply_count") or 0),
+                    )
+                    for r in roots
+                ]
+        except aiohttp.ClientError as exc:
+            logger.warning("data-service: get_channel_roots transport: %s", exc)
+            return []
+
+    async def get_thread_messages(
+        self,
+        root_id: str,
+        limit: int = 50,
+        since_envelope_id: str | None = None,
+        before_ts: int | None = None,
+        after_ts: int | None = None,
+    ) -> list[StoredMessageDict]:
+        """Root + every reply in the thread anchored at ``root_id``.
+        Same filters as ``get_channel_roots``."""
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/threads/{urllib.parse.quote(root_id, safe='')}"
+        )
+        params: dict[str, str] = {"limit": str(limit)}
+        if since_envelope_id:
+            params["since"] = since_envelope_id
+        if before_ts is not None:
+            params["before"] = str(before_ts)
+        if after_ts is not None:
+            params["after"] = str(after_ts)
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}{path}", params=params,
+            ) as resp:
+                if resp.status == 404:
+                    return []
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "data-service: get_thread_messages %s -> %d %s",
+                        path, resp.status, body,
+                    )
+                    return []
+                data = await resp.json()
+                msgs = data.get("messages") or []
+                return [_msg_from_dict(m) for m in msgs]
+        except aiohttp.ClientError as exc:
+            logger.warning("data-service: get_thread_messages transport: %s", exc)
             return []
 
     async def get_message_by_envelope(

@@ -270,7 +270,7 @@ async def test_get_channel_history_empty():
     await ms.open()
     mcp = _build_tools(cfg)
     result = await _call(mcp, "get_channel_history", {"channel": "ch_nonexistent"})
-    assert "no messages" in result
+    assert "no root posts" in result
     await ms.close()
 
 
