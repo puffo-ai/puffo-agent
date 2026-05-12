@@ -1333,6 +1333,15 @@ class PuffoCoreMessageClient:
                 name = (entry.get("name") or "").strip()
                 if cid and cid not in self._channel_name_cache:
                     self._channel_name_cache[cid] = name or cid
+                # Persist the channel→space mapping so the MCP
+                # subprocess's send_message can resolve this channel
+                # BEFORE the first inbound message lands. Without
+                # this, lookup_channel_space falls through to the
+                # /messages table (empty) and then to agent.yml's
+                # space_id, which is the WRONG space when the agent
+                # has just joined a different one.
+                if cid:
+                    await self.store.mark_channel_space(cid, space_id)
                 if not found_cid and entry.get("is_public") and cid:
                     found_cid = cid
             return found_cid

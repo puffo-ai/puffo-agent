@@ -224,6 +224,88 @@ async def test_find_public_general_channel_picks_is_public_true(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_find_public_general_channel_persists_channel_space_map(monkeypatch):
+    """Every channel returned by /channels lands in the
+    ``channel_space_map`` table so ``lookup_channel_space`` can
+    resolve it BEFORE the first inbound message — the MCP
+    ``send_message`` tool depends on this for the intro nudge."""
+    _instant_sleep_monkeypatch(monkeypatch)
+    store = await _make_store()
+    client = _make_client(store)
+
+    class _StubHttp:
+        async def get(self, _path: str) -> dict:
+            return _channels_response(
+                {
+                    "channel_id": "ch_random",
+                    "name": "Random",
+                    "is_public": False,
+                },
+                {
+                    "channel_id": "ch_general",
+                    "name": "General",
+                    "is_public": True,
+                },
+            )
+
+    client.http = _StubHttp()
+    await client._find_public_general_channel("sp_1")
+
+    # Both channels are now resolvable by lookup_channel_space —
+    # private ones too, since the agent might still want to send
+    # there later.
+    assert await store.lookup_channel_space("ch_random") == "sp_1"
+    assert await store.lookup_channel_space("ch_general") == "sp_1"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_channel_space_prefers_map_over_messages_inference():
+    """Explicit map wins over the /messages-table fallback. Same
+    channel could in principle show up under two space_ids if the
+    server emits conflicting envelopes; the explicit map is
+    authoritative."""
+    store = await _make_store()
+
+    await store.mark_channel_space("ch_1", "sp_authoritative")
+    # Plant a "wrong" message-level signal too.
+    await store.store({
+        "envelope_id": "env_1",
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": "ch_1",
+        "space_id": "sp_stale",
+        "content_type": "text/plain",
+        "content": "hi",
+        "sent_at": 1,
+    })
+
+    assert await store.lookup_channel_space("ch_1") == "sp_authoritative"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_lookup_channel_space_falls_back_to_messages_when_no_map_row():
+    """When ``channel_space_map`` has no entry, the historical
+    /messages-table inference still works — keeps steady-state
+    behaviour for channels we learned about via inbound traffic."""
+    store = await _make_store()
+    await store.store({
+        "envelope_id": "env_1",
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": "ch_inferred",
+        "space_id": "sp_via_msg",
+        "content_type": "text/plain",
+        "content": "hi",
+        "sent_at": 1,
+    })
+
+    assert await store.lookup_channel_space("ch_inferred") == "sp_via_msg"
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_find_public_general_channel_warms_channel_name_cache(monkeypatch):
     """The /channels response we already pay for doubles as a cache
     warmup so the ``_resolve_channel_name`` inside the intro nudge
