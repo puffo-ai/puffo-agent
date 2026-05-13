@@ -8,8 +8,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **cli-local: host Claude Code plugins now propagate to per-agent
-  virtual ``$HOME``.** Operator-reported: plugins installed via
+- **Host Claude Code plugins now propagate to cli-local + cli-docker
+  agents.** Operator-reported: plugins installed via
   ``claude /plugin install <name>@<marketplace>`` (e.g.
   ``imessage@claude-plugins-official``,
   ``chrome-devtools-mcp@claude-plugins-official``) were silently
@@ -53,14 +53,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
   Tests in ``test_host_sync.py``: 11 new (5 plugin tree + 6
   enabledPlugins) covering symlink / copy-fallback / idempotent
-  re-call / no-host-dir noop / agent-side preservation. Full
-  suite: 486 passed, 7 skipped.
+  re-call / no-host-dir noop / agent-side preservation.
 
-  cli-docker isn't covered by this fix — host plugin code (npx,
-  npm-resolved binaries, etc.) generally doesn't exist inside the
-  container and would error on first use. Scoped to a follow-up
-  once the cli-docker MCP-server unreachable-warning pattern is
-  extended to plugins.
+  cli-docker takes a different shape because the container's
+  ``/home/agent/.claude`` is already an outer bind-mount: nested a
+  second read-only bind-mount surfacing ``host_home/.claude/plugins``
+  at ``/home/agent/.claude/plugins:ro`` (so the marketplace + cache
+  + installed_plugins.json reach the in-container Claude without a
+  copy), and called the same ``sync_host_enabled_plugins`` helper
+  in ``_ensure_started`` so settings.json (already bind-mounted)
+  carries the enabledPlugins array. The cli-docker image bakes
+  node 22 + npm + python + uv, so most ``npx``/``uvx`` plugin
+  commands resolve naturally; native-binary plugins (those that
+  shell out to a host-only path) will still fail at use-time. 5
+  new tests in ``test_docker_host_plugins.py`` covering the bind-
+  mount injection, the missing-host-dir noop, the ``:ro`` flag,
+  argv ordering (before image positional), and the enabledPlugins
+  propagation path.
+
+  Full suite: 491 passed, 7 skipped.
 
 ## [0.7.6] — 2026-05-12
 
