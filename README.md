@@ -137,13 +137,103 @@ Each agent's state lives entirely on disk:
 ├── pairing.json                 # current web operator pairing
 └── agents/<agent-id>/
     ├── agent.yml                # puffo_core identity, runtime, triggers
-    ├── profile.md               # system prompt
+    ├── profile.md               # system prompt + Soul (long-form persona)
     ├── memory/                  # rolling notes the agent writes itself
     ├── keys/                    # per-agent puffo-core keystore
     ├── messages.db              # encrypted message store (sqlite)
     ├── runtime.json             # heartbeat / status (daemon-managed)
     └── workspace/.puffo/inbox/  # decrypted incoming attachments
 ```
+
+## Agent identity: display name, avatar, role, soul
+
+Every agent carries five operator-editable identity fields. The web
+client's **Create Agent** modal and the right-rail **profile panel**
+expose all five with a single pencil button; the CLI mirrors them as
+flags on `agent create` / `agent edit`. They land in two places on
+disk — short strings in `agent.yml`, the long-form persona in
+`profile.md`:
+
+- **`display_name`** — the human-readable label shown next to the
+  avatar in member lists and message bubbles. Falls back to the
+  `agent-id` when unset.
+- **`avatar_url`** — uploaded blob URL (the web client handles the
+  upload + verify pipeline; the bridge's `PATCH /v1/agents/{id}`
+  accepts raw bytes via `avatar_bytes_b64` and writes the resolved
+  URL back to `agent.yml`).
+- **`role`** — free-text "what does this agent do" string (≤140
+  chars). Recommended shape `<short>: <description>`, e.g.
+  `"coder: main puffo-core coder"`. Stored as a single line in
+  `agent.yml`. The server side mirrors this on `identities.role`.
+- **`role_short`** — chip label shown next to display_name in member
+  lists (≤32 chars). Auto-derived from `role` if you only set the
+  long form (server does the same derive on save).
+- **`soul`** — long-form persona / character / instructions, written
+  as a top-level `# Soul` section inside `profile.md`. This is what
+  the LLM reads in its system prompt every turn, so it's the place
+  to put "how this agent thinks, what it cares about, what tone to
+  use". Supports full markdown (sub-headings, lists, code blocks);
+  the web client renders it back with `react-markdown`. Older
+  `# Description` / `# About` / `# Summary` headings still work as
+  aliases for backwards compatibility.
+
+### Editing `profile.md` directly
+
+The on-disk file is the source of truth. The web client's edit form
+and `puffo-agent agent edit` ultimately write to it via the bridge,
+but you can also open it in your editor:
+
+```bash
+puffo-agent agent edit <agent-id>          # opens profile.md in $EDITOR
+$EDITOR ~/.puffo-agent/agents/<agent-id>/profile.md
+```
+
+A minimal `profile.md` looks like:
+
+```markdown
+# Agent Profile
+
+## Conversation Format
+…framework primer the daemon stamps in for every agent…
+
+## Identity
+You are a helpful assistant.
+
+# Soul
+
+You're a senior backend engineer with strong opinions about API
+ergonomics. Prefer plain Go to clever abstractions. When asked for a
+code review, list concrete fixes in priority order; skip the
+encouragement paragraph at the top.
+
+## How you act
+- Concise. One short paragraph plus bullets is the target shape.
+- Cite file paths with `path:line` so the reader can jump.
+```
+
+The first three `##` headings are the framework primer (do not delete).
+The `# Soul` top-level heading marks the start of the persona body —
+the bridge reads everything between it and the next top-level heading
+(or EOF) when surfacing `profile_summary` to the web client. Sub-
+headings (`## How you act`, `## Tone`, etc.) stay inside the soul and
+travel along.
+
+A few constraints worth knowing:
+
+- The `# Soul` body is **read every prompt**, so keep it tight. ~200
+  lines is a reasonable upper bound; longer and you'll pay token cost
+  on every turn for content the LLM rarely references.
+- The daemon picks up edits on its next reconcile tick (~2 s) for new
+  conversations. Existing in-flight worker processes finish their
+  current turn against the old profile, then reload on restart — use
+  `puffo-agent agent runtime <agent-id> --kind …` (or restart from the
+  web) to force a worker respawn if you need the change to land
+  mid-conversation.
+- The server-side `identities.role` / `role_short` fields are kept in
+  sync best-effort. A `PATCH /v1/agents/{id}/profile` write to the
+  bridge fans out to `PATCH /identities/self` automatically; if that
+  sync fails (e.g. server unreachable) the local change still lands
+  and the next successful sync will catch up.
 
 ## Runtime kinds
 
