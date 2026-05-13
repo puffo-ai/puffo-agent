@@ -8,6 +8,46 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Agents can now see their own sent messages in
+  ``get_channel_history`` / ``get_thread_history``.** Operator-
+  reported: `get_thread_history(<root>)` returned only messages
+  from other senders; the agent's own replies were absent even
+  though other agents in the same thread saw them fine.
+
+  Root cause: two parallel send paths existed, and only one wrote
+  locally. The daemon-internal ``PuffoCoreMessageClient.post_
+  message`` (used by the fallback-reply path in worker.py) mirrored
+  the outbound payload to ``messages.db`` after the server POST,
+  but the MCP tool ``mcp__puffo__send_message`` (the path agents
+  actually use) didn't. Both relied on the daemon's WS handler to
+  not persist, because ``handle_envelope`` dropped envelopes whose
+  ``sender_slug == self.slug`` at the door — to "avoid retrigger
+  loops".
+
+  The right shape (long-term) is "server-echoed-over-WS is the
+  canonical proof a message was delivered, so the WS handler is
+  the canonical write path for inbound + outbound alike":
+
+  * ``handle_envelope`` no longer drops self-envelopes. The server
+    fans out every recipient device in ``envelope.recipients``,
+    which always includes the agent's own device (the MCP
+    ``send_message`` tool puts self in the recipient list for both
+    DMs and channels), so a successful send → WS echo → daemon
+    persists through the same path every other message uses.
+  * After the ``store.store(...)`` call, self-envelopes return
+    early — they're persisted but never queued for the LLM
+    (re-feeding the agent its own words would trip a turn-by-turn
+    echo loop).
+  * The redundant mirror-write in ``post_message`` was removed.
+    Both send paths now converge on the WS-echo persistence,
+    which is the single source of truth.
+
+  Follow-up: a future change can extract ``handle_envelope`` to a
+  testable method and add a unit test for the self-echo persist
+  + dispatch-skip semantics. The cursor-check tests in
+  ``test_thread_queue.py`` are unaffected. Full suite still 496 /
+  503 (no new tests, no regressions).
+
 - **Intro-nudge synthetic envelope is now persisted to ``messages.db``,
   and the status reporter no longer 404s on local-only envelopes.**
   Operator-reported: after joining a channel the agent received the
