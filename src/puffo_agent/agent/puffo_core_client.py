@@ -198,6 +198,85 @@ def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
     return PRIORITY_BOT
 
 
+# Hard cap on the preview length embedded in the redaction
+# placeholder. Big enough to convey the message's flavour to the
+# agent (so it knows whether to bother fetching segments) but
+# small enough that pasting a 100kB log doesn't itself blow the
+# prompt budget through the preview alone.
+_LONG_MESSAGE_PREVIEW_CHARS = 240
+
+
+def _maybe_redact_long_text(
+    text: str,
+    *,
+    envelope_id: str,
+    sender_slug: str,
+    sender_display_name: str,
+    max_inline_chars: int,
+    segment_chars: int,
+    agent_slug: str,
+) -> str:
+    """Substitute oversize message bodies with a placeholder that
+    points the agent at ``get_post_segment``. Anything ≤
+    ``max_inline_chars`` is returned untouched.
+
+    The placeholder lives in the *prompt-facing* view of the message
+    only — the original ``text`` is still persisted into
+    ``messages.db`` via ``store.store()`` upstream of this call, so
+    the segment tool can paginate the full body back to the agent
+    on demand.
+
+    A daemon log is emitted whenever redaction fires so an operator
+    debugging "my agent didn't see my paste" can grep for the
+    envelope_id without tailing turn output.
+    """
+    if not text:
+        return text
+    total = len(text)
+    if total <= max_inline_chars:
+        return text
+
+    # Segment count is ceil(total / segment_chars), at least 1.
+    seg_count = (total + segment_chars - 1) // segment_chars
+
+    # Preview: the first ~240 chars of the (already-mention-rewritten)
+    # text, with line breaks normalised to spaces so the placeholder
+    # stays one tidy block. Truncated with an ellipsis so the agent
+    # doesn't mistake the cut for the end of the message.
+    raw_preview = text[:_LONG_MESSAGE_PREVIEW_CHARS].replace("\n", " ").strip()
+    if total > _LONG_MESSAGE_PREVIEW_CHARS:
+        raw_preview = raw_preview + "…"
+
+    sender_label = (
+        f"@{sender_display_name} ({sender_slug})"
+        if sender_display_name
+        else f"@{sender_slug}"
+    )
+    placeholder = (
+        "[puffo-agent system message] inbound message was too long "
+        "to embed inline and has been redacted from this prompt for "
+        "context-budget reasons.\n"
+        f"  envelope_id: {envelope_id}\n"
+        f"  total_chars: {total}\n"
+        f"  segments: {seg_count} (0-indexed, up to {segment_chars} chars each)\n"
+        f"  sender: {sender_label}\n"
+        f"  preview: {raw_preview}\n"
+        "Retrieve the full body one chunk at a time with "
+        "mcp__puffo__get_post_segment("
+        f"envelope_id=\"{envelope_id}\", segment=N) where N runs "
+        f"0..{seg_count - 1}. Fetch only the segments you actually "
+        "need — the placeholder above already tells you what kind "
+        "of content it is."
+    )
+
+    logger.info(
+        "agent %s: inlined message %s truncated (%d → %d chars, %d segments) "
+        "for prompt budget",
+        agent_slug, envelope_id, total, max_inline_chars, seg_count,
+    )
+    return placeholder
+
+
 class DeviceKeyCache:
     """Caches sender signing public keys.
 
@@ -261,6 +340,8 @@ class PuffoCoreMessageClient:
         message_store: MessageStore,
         operator_slug: str = "",
         workspace: str = "",
+        max_inline_chars: int = 4000,
+        segment_chars: int = 2000,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -271,6 +352,15 @@ class PuffoCoreMessageClient:
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
         self.workspace = workspace
+        # Long-message redaction thresholds. When an inbound message's
+        # ``text`` field exceeds ``max_inline_chars`` the LLM sees a
+        # placeholder pointing at ``get_post_segment`` instead of the
+        # raw body. ``segment_chars`` is the page size that tool
+        # returns. Both come from ``DaemonConfig`` so the operator can
+        # tune per host; we keep generous defaults that survive a
+        # 200k-context model with a verbose system prompt.
+        self._max_inline_chars = max(1, int(max_inline_chars))
+        self._segment_chars = max(1, int(segment_chars))
         self.keystore = keystore
         self.http = http_client
         self.store = message_store
@@ -548,6 +638,24 @@ class PuffoCoreMessageClient:
                 payload.sender_slug,
             )
 
+            # Long-message redaction. Operators paste big chunks of
+            # code or transcripts that, combined with the agent's
+            # system prompt + thread history, can blow past the LLM
+            # context window — historically observable as the agent
+            # getting stuck in a "Prompt is too long" retry loop the
+            # restart path didn't recover from. The full envelope
+            # stays in messages.db; only the in-prompt view collapses
+            # to a placeholder pointing at ``get_post_segment``.
+            llm_text = _maybe_redact_long_text(
+                clean_text,
+                envelope_id=payload.envelope_id,
+                sender_slug=payload.sender_slug,
+                sender_display_name=sender_display_name,
+                max_inline_chars=self._max_inline_chars,
+                segment_chars=self._segment_chars,
+                agent_slug=self.slug,
+            )
+
             msg_dict = {
                 "channel_id": channel_id,
                 "channel_name": channel_name,
@@ -556,7 +664,7 @@ class PuffoCoreMessageClient:
                 "sender_slug": payload.sender_slug,
                 "sender_display_name": sender_display_name,
                 "sender_email": "",
-                "text": clean_text,
+                "text": llm_text,
                 "root_id": payload.thread_root_id or "",
                 "is_dm": is_dm,
                 "attachments": attachment_paths,

@@ -269,7 +269,13 @@ def test_list_mcp_servers_tags_scope(tmp_path):
 
     entries = _list_mcp_servers(workspace, home)
 
-    assert entries == [("system", "sys-mcp"), ("agent", "agent-mcp")]
+    # 3-tuple shape: (scope, name, source). System + agent entries
+    # leave ``source`` blank; only plugin entries fill it in (see
+    # the plugin-scope tests below).
+    assert entries == [
+        ("system", "sys-mcp", ""),
+        ("agent", "agent-mcp", ""),
+    ]
 
 
 def test_list_mcp_servers_empty_when_nothing_registered(tmp_path):
@@ -287,7 +293,148 @@ def test_list_mcp_servers_tolerates_malformed_system_config(tmp_path):
 
     entries = _list_mcp_servers(workspace, home)
 
-    assert entries == [("agent", "agent-mcp")]
+    assert entries == [("agent", "agent-mcp", "")]
+
+
+# ── plugin-scope listing ────────────────────────────────────────
+
+
+def _seed_plugin_mcp(home, plugin: str, version: str, servers: dict) -> None:
+    """Drop a ``<home>/.claude/plugins/cache/<plugin>/<version>/.mcp.json``
+    matching the shape claude-code's plugin loader writes."""
+    plugin_dir = home / ".claude" / "plugins" / "cache" / plugin / version
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / ".mcp.json").write_text(
+        json.dumps({"mcpServers": servers}),
+        encoding="utf-8",
+    )
+
+
+def test_list_mcp_servers_includes_plugin_scope(tmp_path):
+    """Plugin-routed MCP servers live under
+    ``~/.claude/plugins/cache/<plugin>/<version>/.mcp.json`` — a
+    distinct scope from the system + agent paths. They must show
+    up tagged ``plugin`` so the agent can call them and the
+    operator can tell which plugin owns each entry. The agent-
+    reported case that motivated this: imessage + chrome-devtools-
+    mcp returning empty from ``list_mcp_servers`` despite being
+    installed via ``claude /plugin install``."""
+    workspace = tmp_path / "ws"
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    _seed_plugin_mcp(home, "imessage", "0.1.0", {
+        "imessage": {"command": "bun", "args": ["run"]},
+    })
+    _seed_plugin_mcp(home, "chrome-devtools-mcp", "0.22.0", {
+        "chrome-devtools": {"command": "npx", "args": ["chrome-devtools-mcp@latest"]},
+    })
+
+    entries = _list_mcp_servers(workspace, home)
+
+    # Sorted alphabetically by plugin name, then by server name
+    # within a plugin. ``source`` carries the ``<plugin>/<version>``
+    # label so the operator can match server back to plugin.
+    assert entries == [
+        ("plugin", "chrome-devtools", "chrome-devtools-mcp/0.22.0"),
+        ("plugin", "imessage", "imessage/0.1.0"),
+    ]
+
+
+def test_list_mcp_servers_combines_all_three_scopes(tmp_path):
+    """System / agent / plugin entries coexist; the listing emits
+    them in scope order (system, agent, plugin) so the agent can
+    eyeball "did my install land?" from the bottom up."""
+    workspace = tmp_path / "ws"
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"sys-mcp": {"command": "npx"}}}),
+        encoding="utf-8",
+    )
+    _install_mcp_server(workspace, "agent-mcp", "uvx")
+    _seed_plugin_mcp(home, "imessage", "0.1.0", {
+        "imessage": {"command": "bun"},
+    })
+
+    entries = _list_mcp_servers(workspace, home)
+
+    assert entries == [
+        ("system", "sys-mcp", ""),
+        ("agent", "agent-mcp", ""),
+        ("plugin", "imessage", "imessage/0.1.0"),
+    ]
+
+
+def test_list_mcp_servers_skips_malformed_plugin_mcp_json(tmp_path):
+    """One plugin with garbled JSON must not nuke the whole listing
+    — the agent should still see every other plugin's servers.
+    Defensive because plugin authors aren't operating under our
+    quality bar and a half-written download / git pull could land
+    a partial file."""
+    workspace = tmp_path / "ws"
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    bad = home / ".claude" / "plugins" / "cache" / "bad-plugin" / "9.9.9"
+    bad.mkdir(parents=True)
+    (bad / ".mcp.json").write_text("{not json", encoding="utf-8")
+    _seed_plugin_mcp(home, "good-plugin", "0.1.0", {
+        "good-srv": {"command": "npx"},
+    })
+
+    entries = _list_mcp_servers(workspace, home)
+
+    assert entries == [
+        ("plugin", "good-srv", "good-plugin/0.1.0"),
+    ]
+
+
+def test_list_mcp_servers_skips_plugin_dirs_without_mcp_json(tmp_path):
+    """A plugin can be installed without registering any MCP server
+    (skills-only / hooks-only plugins are a real category). The
+    plugin tree exists but has no ``.mcp.json`` — listing must
+    treat the directory as empty for MCP purposes rather than
+    crashing on the missing file."""
+    workspace = tmp_path / "ws"
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    skills_only = home / ".claude" / "plugins" / "cache" / "skills-pkg" / "0.1.0"
+    skills_only.mkdir(parents=True)
+    # No .mcp.json in this dir — only SKILL.md, hooks, etc. would
+    # normally live here.
+    (skills_only / "README.md").write_text("docs", encoding="utf-8")
+    _seed_plugin_mcp(home, "real-mcp", "0.1.0", {
+        "srv": {"command": "npx"},
+    })
+
+    entries = _list_mcp_servers(workspace, home)
+
+    assert entries == [
+        ("plugin", "srv", "real-mcp/0.1.0"),
+    ]
+
+
+def test_list_mcp_servers_handles_multiple_versions(tmp_path):
+    """A plugin can have several versions cached side-by-side after
+    an upgrade dance; each version that ships a ``.mcp.json`` gets
+    its own row so the agent + operator can see exactly which
+    version's MCP server is actually live (or, in a half-upgraded
+    state, that both are)."""
+    workspace = tmp_path / "ws"
+    home = tmp_path / "home"
+    home.mkdir(parents=True)
+    _seed_plugin_mcp(home, "imessage", "0.1.0", {
+        "imessage": {"command": "bun"},
+    })
+    _seed_plugin_mcp(home, "imessage", "0.2.0", {
+        "imessage": {"command": "bun"},
+    })
+
+    entries = _list_mcp_servers(workspace, home)
+
+    assert entries == [
+        ("plugin", "imessage", "imessage/0.1.0"),
+        ("plugin", "imessage", "imessage/0.2.0"),
+    ]
 
 
 # ── refresh.flag ─────────────────────────────────────────────────────────────

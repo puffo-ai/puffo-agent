@@ -440,6 +440,78 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
+    async def get_post_segment(
+        envelope_id: str,
+        segment: int,
+        segment_size: int = 2000,
+    ) -> str:
+        """Page a long message body back in chunks.
+
+        When the daemon redacts an oversize inbound message it
+        replaces the in-prompt body with a ``[puffo-agent system
+        message]`` placeholder citing this tool's name plus the
+        envelope_id and total segment count. Call this tool with
+        ``segment=N`` (zero-indexed) and the same ``segment_size``
+        the placeholder reported to retrieve chunk ``N`` of the
+        full body. Only fetch the segments you actually need —
+        the placeholder preview usually tells you whether the
+        content is worth paging through.
+
+        Returns: ``segment <i>/<total> (chars <start>..<end> of <total>):
+        \n<chunk body>``. Out-of-range segment numbers return
+        ``segment out of range`` so the agent knows it overshot.
+
+        Special cases:
+          * unknown envelope_id → "message <id> not found in local storage"
+          * empty content       → "message <id> has no text body"
+
+        ``segment_size`` defaults to 2000 to match the daemon's
+        default redaction page size; pass the value the placeholder
+        cited if the operator has overridden it on their host.
+        """
+        envelope_id = (envelope_id or "").strip()
+        if not envelope_id:
+            raise RuntimeError("envelope_id is required")
+        if segment < 0:
+            raise RuntimeError("segment must be >= 0")
+        if segment_size <= 0:
+            raise RuntimeError("segment_size must be > 0")
+
+        msg = await cfg.data_client.get_message_by_envelope(envelope_id)
+        if msg is None:
+            return f"message {envelope_id} not found in local storage"
+
+        # ``content`` carries either a bare string (plain message)
+        # or the ``puffo/message+attachments/v1`` dict shape; pull
+        # the text out of the latter so segmenting works on the
+        # human-readable portion in both cases.
+        content = msg.content
+        if isinstance(content, dict):
+            text = str(content.get("text") or "")
+        else:
+            text = str(content) if content else ""
+
+        if not text:
+            return f"message {envelope_id} has no text body"
+
+        total = len(text)
+        # ceil(total / segment_size); at least 1 when total > 0.
+        seg_count = (total + segment_size - 1) // segment_size
+        if segment >= seg_count:
+            return (
+                f"segment {segment} out of range (envelope_id={envelope_id} "
+                f"has {seg_count} segment(s) at segment_size={segment_size}, "
+                "indexed 0..{0})".format(seg_count - 1)
+            )
+        start = segment * segment_size
+        end = min(start + segment_size, total)
+        chunk = text[start:end]
+        return (
+            f"segment {segment}/{seg_count - 1} "
+            f"(chars {start}..{end - 1} of {total}):\n{chunk}"
+        )
+
+    @mcp.tool()
     async def upload_file(
         paths: list[str],
         channel: str,

@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 # *same* env without colliding. CLI binary stays `puffo-agent`; home
 # dir stays `~/.puffo-agent/`.
 name = "puffo-agent"
-version = "0.7.8"
+version = "0.7.9"
 description = "Run AI bots on Puffo.ai — local daemon that supervises many bot accounts and handles their LLM loops."
 readme = "README.md"
 license = { file = "LICENSE" }

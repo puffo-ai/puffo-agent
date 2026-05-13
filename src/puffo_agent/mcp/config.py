@@ -30,6 +30,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "get_thread_history",
     "fetch_channel_files",
     "get_post",
+    "get_post_segment",
     "get_user_info",
     "whoami",
     "reload_system_prompt",

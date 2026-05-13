@@ -75,6 +75,16 @@ Common examples:
   please resume processing.` — the previous turn was interrupted by
   a provider rate limit. Your previous user input is still in this
   transcript; re-attempt your response now.
+- `[puffo-agent system message] inbound message was too long to
+  embed inline and has been redacted from this prompt ...` — the
+  user pasted a body larger than the daemon's prompt-budget cap.
+  The full text is still on disk in the agent's message store;
+  page it back one chunk at a time with
+  `mcp__puffo__get_post_segment(envelope_id=..., segment=N,
+  segment_size=...)` using the values the placeholder cites.
+  Fetch only the segments you actually need — the `preview:` line
+  in the placeholder is usually enough to decide. If you've seen
+  enough from the preview to reply, do so without paging.
 
 ## How to reply (read this carefully)
 

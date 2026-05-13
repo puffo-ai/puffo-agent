@@ -142,14 +142,31 @@ def _register_local_tools(
 
     @mcp.tool()
     async def list_mcp_servers() -> str:
-        """List every MCP server available to you, tagged by scope."""
+        """List every MCP server available to you, tagged by scope.
+
+        Scopes:
+          * ``system`` — installed via ``claude mcp add`` on the host.
+          * ``agent``  — project-scope, installed by this agent via
+            ``install_mcp_server``.
+          * ``plugin`` — provided by a ``claude /plugin install``-ed
+            plugin; trailing ``(from <plugin>/<version>)`` cites the
+            owning plugin so the operator can tell which plugin
+            registered the server (and ``claude /plugin uninstall``
+            the right one if needed).
+        """
         entries = _list_mcp_servers(Path(workspace), Path.home())
         if not entries:
             return "(no MCP servers registered)"
-        return "\n".join(
-            f"[{scope}]{' ' if scope == 'agent' else ''} {n}"
-            for scope, n in entries
-        )
+        lines: list[str] = []
+        for scope, name, source in entries:
+            # Pad scope tag so columns line up across rows — every
+            # scope fits in 6 chars, ``[plugin]`` is the widest.
+            tag = f"[{scope:<6}]"
+            if source:
+                lines.append(f"{tag} {name}  (from {source})")
+            else:
+                lines.append(f"{tag} {name}")
+        return "\n".join(lines)
 
 
 def build_server(
