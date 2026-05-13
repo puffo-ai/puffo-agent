@@ -6,6 +6,52 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.9] — 2026-05-13
+
+### Added
+
+- **Inbound long-message redaction + ``get_post_segment`` MCP
+  tool.** Operators occasionally paste large code blocks into a DM
+  or channel; combined with the agent's system prompt + history
+  the result can blow past the provider's context window. Before
+  this release that surfaced as an "API Error: Prompt is too
+  long" string from claude-code, which the rate-limit retry loop
+  bounced through ``--resume`` three times and then abandoned —
+  but with the cursor stuck at the failed batch, any new message
+  in the same thread re-triggered the same failure. From the
+  operator's perspective the agent was wedged and ``restart``
+  didn't help (the claude-code session still held the oversize
+  transcript); ``pause`` was the only way out.
+
+  Fix: in ``puffo_core_client.handle_envelope``, any message
+  whose text exceeds ``DaemonConfig.max_inline_message_chars``
+  (default 4000) gets replaced — *for the LLM view only* — with a
+  ``[puffo-agent system message]`` placeholder citing the
+  envelope_id, total length, segment count, sender, and a short
+  preview. The full envelope is still persisted to
+  ``messages.db`` unmodified. The new
+  ``mcp__puffo__get_post_segment(envelope_id, segment,
+  segment_size)`` tool pages the body back ``segment_chars``
+  bytes at a time (default 2000) so the agent can fetch only
+  what it needs.
+
+  Logged when triggered:
+  ```
+  agent <id>: inlined message <env_id> truncated
+  (47832 → 4000 chars, 24 segments) for prompt budget
+  ```
+
+  New tunables in ``daemon.yml``:
+  ```yaml
+  max_inline_message_chars: 4000   # redact above this
+  segment_chars: 2000              # page size for get_post_segment
+  ```
+
+  Existing oversize content already in a claude-code session
+  isn't unstuck by this release — clear the agent's
+  ``.claude-session.json`` (under ``~/.puffo-agent/agents/<id>/``)
+  once to force a fresh transcript on next start.
+
 ## [0.7.8] — 2026-05-13
 
 ### Added

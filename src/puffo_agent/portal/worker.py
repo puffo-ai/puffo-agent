@@ -283,8 +283,17 @@ def _ensure_agent_identity_imported(agent_id: str, slug: str) -> None:
         )
 
 
-def _build_puffo_core_client(agent_cfg: AgentConfig, agent_id: str):
-    """Construct a PuffoCoreMessageClient from the agent's config."""
+def _build_puffo_core_client(
+    agent_cfg: AgentConfig,
+    agent_id: str,
+    daemon_cfg: "DaemonConfig | None" = None,
+):
+    """Construct a PuffoCoreMessageClient from the agent's config.
+    ``daemon_cfg`` carries the host-wide tunables (currently the
+    long-message redaction thresholds); accepts ``None`` so legacy
+    test seeds that didn't have a daemon config keep working with
+    the dataclass defaults.
+    """
     from ..agent.message_store import MessageStore
     from ..agent.puffo_core_client import PuffoCoreMessageClient
     from ..crypto.http_client import PuffoCoreHttpClient
@@ -297,6 +306,13 @@ def _build_puffo_core_client(agent_cfg: AgentConfig, agent_id: str):
     http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
+    max_inline = (
+        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else 4000
+    )
+    segment_chars = (
+        daemon_cfg.segment_chars if daemon_cfg is not None else 2000
+    )
+
     return PuffoCoreMessageClient(
         slug=pc.slug,
         device_id=pc.device_id,
@@ -306,6 +322,8 @@ def _build_puffo_core_client(agent_cfg: AgentConfig, agent_id: str):
         http_client=http,
         message_store=ms,
         workspace=str(agent_cfg.resolve_workspace_dir()),
+        max_inline_chars=max_inline,
+        segment_chars=segment_chars,
     )
 
 
@@ -468,7 +486,9 @@ class Worker:
                     "is incomplete. Required fields: server_url, slug, "
                     "device_id, space_id."
                 )
-            client = _build_puffo_core_client(self.agent_cfg, agent_id)
+            client = _build_puffo_core_client(
+                self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
+            )
             self._client = client
         except Exception as e:
             logger.error("agent %s: failed to initialise: %s", agent_id, e, exc_info=True)
