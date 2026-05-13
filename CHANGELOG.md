@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- ``puffo-agent agent autoaccept <id> --space <space_id> --owner on|off``
+  — toggles the agent's per-space ``auto_accept_owner_invite``
+  flag via signed PATCH to puffo-server's new
+  ``/spaces/{id}/members/me/settings`` endpoint. When ON, the
+  agent silently joins any channel its space owner invites it to;
+  when OFF, the invite goes through the normal DM-operator
+  confirmation path. Member-invite flag is deliberately not
+  exposed — the server returns 403 for agents on that field. CLI
+  uses the agent's own keystore (same auth model as the
+  ``profile`` subcommand: operator controls the local keystore,
+  so a CLI invocation IS an operator decision).
+
 ## [0.7.7] — 2026-05-13
 
 ### Fixed
