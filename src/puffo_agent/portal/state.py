@@ -413,6 +413,129 @@ def sync_host_mcp_servers(
     return len(host_servers), unreachable
 
 
+def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
+    """Mirror host ``~/.claude/plugins/`` into per-agent
+    ``.claude/plugins/`` so the agent's spawned Claude session can
+    resolve plugin names listed in ``settings.json#enabledPlugins``.
+
+    Without this, ``settings.json`` carries enabledPlugins via
+    ``seed_claude_home`` but Claude can't find the plugin code under
+    ``<agent_home>/.claude/plugins/`` and silently drops every plugin
+    — including any MCP servers they would register. cli-local
+    repro: operator runs ``claude /plugin install
+    chrome-devtools-mcp@claude-plugins-official``, then spawns an
+    agent → the agent sees ``(no MCP servers registered)`` for the
+    plugin-provided MCPs.
+
+    Prefers symlink (free read-through; new host plugin installs /
+    marketplace pulls show up automatically on next worker start
+    without re-copy). Falls back to ``copytree`` on Windows-without-
+    Developer-Mode. The plugin tree can be GB-scale (each marketplace
+    is a git clone with history); on copy fallback we don't refresh
+    an existing copy — operators can ``rm -rf <agent>/.claude/plugins``
+    to force a fresh re-sync.
+
+    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
+    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-dir"``.
+    """
+    import shutil
+    host_plugins = host_home / ".claude" / "plugins"
+    agent_plugins = agent_home / ".claude" / "plugins"
+    if not host_plugins.is_dir():
+        return "no-host-dir"
+    agent_plugins.parent.mkdir(parents=True, exist_ok=True)
+
+    # Fast path: existing symlink already points at host_plugins.
+    if agent_plugins.is_symlink():
+        try:
+            current = os.readlink(agent_plugins)
+            if Path(current) == host_plugins or current == str(host_plugins):
+                return "symlink (already)"
+        except OSError:
+            pass
+
+    # Fast path: copy-mode dir already in place. We deliberately
+    # don't recopy — see the docstring for the GB-scale rationale.
+    if agent_plugins.is_dir() and not agent_plugins.is_symlink():
+        return "copy (fresh)"
+
+    # Tear down whatever's there (stale symlink, regular file) before
+    # creating a fresh one. Unlink can fail on Windows races; the
+    # next call retries naturally.
+    try:
+        if agent_plugins.is_symlink() or agent_plugins.exists():
+            agent_plugins.unlink()
+    except OSError:
+        pass
+
+    try:
+        os.symlink(host_plugins, agent_plugins, target_is_directory=True)
+        return "symlink"
+    except (OSError, NotImplementedError):
+        pass
+
+    try:
+        shutil.copytree(host_plugins, agent_plugins)
+        return "copy"
+    except OSError:
+        return "no-host-dir"
+
+
+def sync_host_enabled_plugins(host_home: Path, agent_home: Path) -> int:
+    """Mirror host ``~/.claude/settings.json#enabledPlugins`` into the
+    per-agent ``settings.json``. ``enabledPlugins`` is the complete
+    enumeration of which ``<plugin>@<marketplace>`` names the operator
+    has flipped on; host wins and overwrites the agent's value.
+
+    ``seed_claude_home`` already copies ``settings.json`` once on
+    first start, but it's idempotent — when the operator enables a
+    new plugin later, the agent's copy stays stale. This helper
+    rewrites just ``enabledPlugins`` on every worker start while
+    leaving other settings keys (theme, model preferences, etc.)
+    untouched. The actual plugin code is wired up by the sibling
+    ``sync_host_plugins``.
+
+    Returns the count of enabledPlugins entries propagated. Returns
+    0 when host has no settings.json, no enabledPlugins key, or the
+    value isn't a dict/list.
+    """
+    host_settings = host_home / ".claude" / "settings.json"
+    if not host_settings.is_file():
+        return 0
+    try:
+        host_data = json.loads(host_settings.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError):
+        return 0
+    enabled = host_data.get("enabledPlugins")
+    # Claude Code has used both shapes historically — dict
+    # (``{name: true}``) on newer versions, list (``[name, ...]``)
+    # on older. Pass either through unchanged so we don't reshape
+    # something Claude is about to read.
+    if not isinstance(enabled, (list, dict)) or not enabled:
+        return 0
+
+    agent_settings = agent_home / ".claude" / "settings.json"
+    agent_data: dict[str, Any] = {}
+    if agent_settings.exists():
+        try:
+            raw = agent_settings.read_text(encoding="utf-8")
+            if raw.strip():
+                agent_data = json.loads(raw)
+        except (OSError, ValueError):
+            agent_data = {}
+
+    agent_data["enabledPlugins"] = enabled
+
+    try:
+        agent_settings.parent.mkdir(parents=True, exist_ok=True)
+        tmp = agent_settings.with_suffix(agent_settings.suffix + ".tmp")
+        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
+        os.replace(tmp, agent_settings)
+    except OSError:
+        return 0
+    return len(enabled)
+
+
 def sync_host_gemini_mcp_servers(
     host_home: Path, project_dir: Path, *, extra_servers: dict | None = None,
 ) -> tuple[int, list[tuple[str, str]]]:

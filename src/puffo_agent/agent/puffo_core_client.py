@@ -350,9 +350,16 @@ class PuffoCoreMessageClient:
         )
 
         async def handle_envelope(envelope: dict) -> None:
-            if envelope.get("sender_slug") == self.slug:
-                return
-
+            # Self-envelopes are NOT dropped at the door anymore (Han
+            # 2026-05-13). The server fans out every recipient device
+            # in ``envelope.recipients``, which always includes the
+            # agent's own device (the MCP send_message tool puts it
+            # in the recipient list for both DMs and channels), so
+            # the WS echo IS the canonical "this message was actually
+            # delivered" signal. We persist it through the same path
+            # every other message goes through; the dispatch-to-
+            # worker step below short-circuits on ``sender_slug ==
+            # self.slug`` to prevent a retrigger loop.
             sender_slug = envelope.get("sender_slug", "")
             try:
                 sender_pks = await self._key_cache.get_signing_keys(sender_slug)
@@ -411,6 +418,16 @@ class PuffoCoreMessageClient:
                 "thread_root_id": payload.thread_root_id,
                 "reply_to_id": payload.reply_to_id,
             })
+
+            # Self-echo lands here too now (see ``handle_envelope``'s
+            # opening comment). Persist it — so ``get_channel_history``
+            # / ``get_thread_history`` show the agent's own posts —
+            # then stop before any of the LLM-facing pipeline below
+            # runs. The agent already produced this message; queueing
+            # it again would feed the agent its own words and trip a
+            # turn-by-turn echo loop.
+            if payload.sender_slug == self.slug:
+                return
 
             # Daemon-side intercept: ``y``/``n`` in the thread of an
             # outstanding invite-DM accepts/rejects the invite without
@@ -1425,6 +1442,41 @@ class PuffoCoreMessageClient:
         # the agent doesn't get the nudge — preferable to spamming.
         await self.store.mark_channel_intro_prompted(channel_id)
 
+        # Persist the synthetic envelope to ``messages.db`` so the
+        # agent can resolve it through its normal data-service paths
+        # (``mcp__puffo__get_channel_history`` /
+        # ``get_message_by_envelope``). Without this, the envelope
+        # only existed in the in-memory thread queue — the agent
+        # would see it in the turn prompt, but a follow-up
+        # ``get_channel_history`` would return an inconsistent view
+        # (intro is missing) and ``send_message(root_id=<intro id>)``
+        # would surface as a broken thread reference. Side benefit:
+        # ``lookup_channel_space`` learns the channel→space mapping
+        # off this envelope automatically.
+        store_payload = {
+            "envelope_id": envelope_id,
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": channel_id,
+            "space_id": space_id,
+            "content_type": "text/plain",
+            "content": prompt_text,
+            "sent_at": now_ms,
+            "thread_root_id": envelope_id,
+            "reply_to_id": None,
+        }
+        try:
+            await self.store.store(store_payload)
+        except Exception as exc:  # noqa: BLE001
+            # Persistence is best-effort — the in-memory queue still
+            # delivers the prompt even if sqlite fails (disk full,
+            # permission, etc.). Log loud so the operator can spot
+            # the inconsistency between prompt + history.
+            logger.warning(
+                "intro-nudge: failed to persist envelope=%s to messages.db: %s",
+                envelope_id, exc,
+            )
+
         await self._admit_thread_message(
             root_id=envelope_id,
             priority=PRIORITY_SYSTEM,
@@ -1870,32 +1922,13 @@ class PuffoCoreMessageClient:
             logger.exception("post_message: POST /messages failed")
             raise
 
-        # Persist the outbound message locally so the agent's own
-        # replies appear in ``get_channel_history``. The WS echo path
-        # can't do this (it drops ``sender_slug == self.slug``
-        # envelopes to avoid retrigger loops, and the wire payload is
-        # encrypted) so we mirror the inbound write here with the
-        # plaintext we already have.
-        try:
-            await self.store.store({
-                "envelope_id": envelope["envelope_id"],
-                "envelope_kind": envelope_kind,
-                "sender_slug": self.slug,
-                "channel_id": send_channel_id,
-                "space_id": send_space_id,
-                "recipient_slug": recipient_slug,
-                "content_type": "text/plain",
-                "content": text,
-                "sent_at": envelope.get("sent_at"),
-                "thread_root_id": root_id if root_id else None,
-            })
-        except Exception:
-            # Local-write failure must not fail the send — the
-            # recipient already has the message.
-            logger.exception(
-                "post_message: failed to persist outbound envelope %s",
-                envelope.get("envelope_id"),
-            )
+        # No mirror-write here anymore. The WS echo path now persists
+        # self-envelopes through the same handler every other message
+        # uses (Han 2026-05-13). Keeping a parallel mirror would double-
+        # insert (``INSERT OR IGNORE`` makes it idempotent, but the
+        # two write paths diverging is exactly the bug class we just
+        # fixed for the MCP ``send_message`` tool — better to have one
+        # canonical path).
 
     async def send_typing(self, channel_id: str, parent_id: str) -> None:
         pass

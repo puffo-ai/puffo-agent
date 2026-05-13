@@ -6,6 +6,148 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.7] — 2026-05-13
+
+### Fixed
+
+- **Agents can now see their own sent messages in
+  ``get_channel_history`` / ``get_thread_history``.** Operator-
+  reported: `get_thread_history(<root>)` returned only messages
+  from other senders; the agent's own replies were absent even
+  though other agents in the same thread saw them fine.
+
+  Root cause: two parallel send paths existed, and only one wrote
+  locally. The daemon-internal ``PuffoCoreMessageClient.post_
+  message`` (used by the fallback-reply path in worker.py) mirrored
+  the outbound payload to ``messages.db`` after the server POST,
+  but the MCP tool ``mcp__puffo__send_message`` (the path agents
+  actually use) didn't. Both relied on the daemon's WS handler to
+  not persist, because ``handle_envelope`` dropped envelopes whose
+  ``sender_slug == self.slug`` at the door — to "avoid retrigger
+  loops".
+
+  The right shape (long-term) is "server-echoed-over-WS is the
+  canonical proof a message was delivered, so the WS handler is
+  the canonical write path for inbound + outbound alike":
+
+  * ``handle_envelope`` no longer drops self-envelopes. The server
+    fans out every recipient device in ``envelope.recipients``,
+    which always includes the agent's own device (the MCP
+    ``send_message`` tool puts self in the recipient list for both
+    DMs and channels), so a successful send → WS echo → daemon
+    persists through the same path every other message uses.
+  * After the ``store.store(...)`` call, self-envelopes return
+    early — they're persisted but never queued for the LLM
+    (re-feeding the agent its own words would trip a turn-by-turn
+    echo loop).
+  * The redundant mirror-write in ``post_message`` was removed.
+    Both send paths now converge on the WS-echo persistence,
+    which is the single source of truth.
+
+  Follow-up: a future change can extract ``handle_envelope`` to a
+  testable method and add a unit test for the self-echo persist
+  + dispatch-skip semantics. The cursor-check tests in
+  ``test_thread_queue.py`` are unaffected. Full suite still 496 /
+  503 (no new tests, no regressions).
+
+- **Intro-nudge synthetic envelope is now persisted to ``messages.db``,
+  and the status reporter no longer 404s on local-only envelopes.**
+  Operator-reported: after joining a channel the agent received the
+  ``[puffo-agent system message] You've just been added to …`` prompt
+  and posted an intro, but the daemon log carried a noisy
+  ``begin_turn message=intro-prompt-… failed (HTTP 404: NOT_FOUND)``
+  per nudge, and the agent's own ``mcp__puffo__get_channel_history``
+  call right after would return an inconsistent view (the intro it
+  just saw wasn't there).
+
+  Two changes:
+  * The synthetic envelope is written to ``messages.db`` via the
+    existing ``MessageStore.store`` path before being enqueued, so
+    ``get_channel_history`` / ``get_message_by_envelope`` /
+    ``lookup_channel_space`` all resolve it naturally. Side benefit:
+    ``send_message(root_id=<intro id>)`` is now a real thread root
+    locally; agents can post a reply-shape intro without producing
+    a broken reference.
+  * ``StatusReporter.begin_turn`` / ``end_turn`` /
+    ``end_turn_batch`` recognise local-only envelope prefixes
+    (currently ``intro-prompt-``) and skip the server POST. The
+    run is still tracked in-memory via the returned ``run_id`` so
+    the worker's batched ``end_turn_batch`` path keeps working;
+    server-side rows simply never get created for envelopes the
+    server never knew about. Quiets the per-nudge WARN noise
+    structurally rather than via primer compliance.
+
+  5 new tests: 1 in ``test_channel_intro_nudge.py``
+  (``test_intro_nudge_persists_envelope_to_messages_db``) + 4 in
+  ``test_status_reporter.py`` (``begin_turn`` skip, ``end_turn``
+  skip, batch filters mixed local/real runs, all-local batch
+  short-circuits). Full suite: 496 passed, 7 skipped.
+
+- **Host Claude Code plugins now propagate to cli-local + cli-docker
+  agents.** Operator-reported: plugins installed via
+  ``claude /plugin install <name>@<marketplace>`` (e.g.
+  ``imessage@claude-plugins-official``,
+  ``chrome-devtools-mcp@claude-plugins-official``) were silently
+  invisible to cli-local agents — ``mcp__puffo__list_mcp_servers``
+  returned ``(no MCP servers registered)`` for the plugin-provided
+  MCPs, and the per-agent ``.claude/plugins/`` directory didn't
+  exist at all.
+
+  Root cause was a missing sync step. ``seed_claude_home`` had been
+  one-shot copying ``.claude/settings.json`` + ``.claude.json``, but
+  nothing was bringing across:
+  * ``~/.claude/plugins/`` — the marketplace clones + plugin cache
+    + ``installed_plugins.json`` + ``known_marketplaces.json`` that
+    contain the actual plugin code.
+  * ``~/.claude/settings.json#enabledPlugins`` — the array that
+    tells Claude which plugin names to load. ``seed_claude_home``
+    copied this once on first start but never refreshed, so
+    plugins enabled later on the host stayed invisible to the
+    agent. (Plugin-provided MCP servers register through the plugin
+    pipeline, not through the user-level ``mcpServers`` map that
+    ``sync_host_mcp_servers`` already merges, so the existing MCP
+    sync didn't cover this case.)
+
+  Two new helpers in ``portal/state.py``, both wired into
+  ``local_cli.LocalCLIAdapter._verify()`` after the existing host
+  syncs:
+  * ``sync_host_plugins(host_home, agent_home)`` — symlinks
+    ``host_home/.claude/plugins/`` to
+    ``agent_home/.claude/plugins/``. The tree is GB-scale (each
+    marketplace is a git clone with history); symlink keeps the
+    agent live with host installs without recopy cost. Falls back
+    to ``copytree`` on Windows-without-Developer-Mode (operators
+    can ``rm -rf <agent>/.claude/plugins`` to force a refresh in
+    that branch). Returns the mode string for logging.
+  * ``sync_host_enabled_plugins(host_home, agent_home)`` — rewrites
+    just the ``enabledPlugins`` key in per-agent ``settings.json``
+    from the host's. Atomic tmp+rename. Leaves other settings
+    keys (theme, model, etc.) untouched. Accepts both the dict
+    (``{name: true}``) and list (``[name, ...]``) shapes Claude
+    Code has used historically.
+
+  Tests in ``test_host_sync.py``: 11 new (5 plugin tree + 6
+  enabledPlugins) covering symlink / copy-fallback / idempotent
+  re-call / no-host-dir noop / agent-side preservation.
+
+  cli-docker takes a different shape because the container's
+  ``/home/agent/.claude`` is already an outer bind-mount: nested a
+  second read-only bind-mount surfacing ``host_home/.claude/plugins``
+  at ``/home/agent/.claude/plugins:ro`` (so the marketplace + cache
+  + installed_plugins.json reach the in-container Claude without a
+  copy), and called the same ``sync_host_enabled_plugins`` helper
+  in ``_ensure_started`` so settings.json (already bind-mounted)
+  carries the enabledPlugins array. The cli-docker image bakes
+  node 22 + npm + python + uv, so most ``npx``/``uvx`` plugin
+  commands resolve naturally; native-binary plugins (those that
+  shell out to a host-only path) will still fail at use-time. 5
+  new tests in ``test_docker_host_plugins.py`` covering the bind-
+  mount injection, the missing-host-dir noop, the ``:ro`` flag,
+  argv ordering (before image positional), and the enabledPlugins
+  propagation path.
+
+  Full suite: 491 passed, 7 skipped.
+
 ## [0.7.6] — 2026-05-12
 
 ### Added

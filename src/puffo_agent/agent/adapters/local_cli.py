@@ -29,7 +29,9 @@ from ...mcp.config import (
 from ...portal.state import (
     link_host_credentials,
     seed_claude_home,
+    sync_host_enabled_plugins,
     sync_host_mcp_servers,
+    sync_host_plugins,
     sync_host_skills,
 )
 from .base import Adapter, TurnContext, TurnResult, looks_like_auth_failure
@@ -507,6 +509,22 @@ class LocalCLIAdapter(Adapter):
             logger.info(
                 "agent %s: merged %d host MCP server registration(s) "
                 "into per-agent .claude.json", self.agent_id, merged_mcp,
+            )
+        # Plugins layer — pairs the actual plugin code tree with the
+        # ``enabledPlugins`` array Claude reads from settings.json.
+        # Without both, plugin-provided MCP servers (imessage,
+        # chrome-devtools-mcp, etc.) silently never register.
+        plugins_mode = sync_host_plugins(host_home, self.agent_home_dir)
+        if plugins_mode not in ("no-host-dir",):
+            logger.info(
+                "agent %s: shared host ~/.claude/plugins/ (%s)",
+                self.agent_id, plugins_mode,
+            )
+        enabled_count = sync_host_enabled_plugins(host_home, self.agent_home_dir)
+        if enabled_count:
+            logger.info(
+                "agent %s: propagated %d enabledPlugins entry/entries "
+                "from host settings.json", self.agent_id, enabled_count,
             )
         agent_claude = self.agent_home_dir / ".claude"
         if not (agent_claude / ".credentials.json").exists():

@@ -42,6 +42,7 @@ from ...mcp.config import (
 )
 from ...portal.state import (
     seed_claude_home,
+    sync_host_enabled_plugins,
     sync_host_gemini_mcp_servers,
     sync_host_gemini_skills,
     sync_host_mcp_servers,
@@ -876,6 +877,24 @@ class DockerCLIAdapter(Adapter):
                     "otherwise this MCP will fail on first use.",
                     self.agent_id, name, cmd,
                 )
+            # Plugins: the actual plugin tree is bind-mounted read-
+            # only into the container by ``_start_container``
+            # (see the ``-v {host_plugins}:/home/agent/.claude/plugins:ro``
+            # line). Here we just propagate the ``enabledPlugins``
+            # array from host settings.json so the container's Claude
+            # knows which plugin names to load. The image bakes in
+            # node/npm/python so most ``npx`` / ``uvx`` plugin
+            # commands resolve naturally; native-binary plugins (e.g.
+            # one that shells out to a host-only path) will still
+            # fail and that surfaces as a runtime error.
+            enabled_count = sync_host_enabled_plugins(
+                host_home, self.agent_home_dir,
+            )
+            if enabled_count:
+                logger.info(
+                    "agent %s: propagated %d enabledPlugins entry/entries "
+                    "from host settings.json", self.agent_id, enabled_count,
+                )
 
             # Gemini host sync — always runs (cheap when there's no
             # ~/.gemini/) so harness swap doesn't require a rebuild.
@@ -1076,6 +1095,23 @@ class DockerCLIAdapter(Adapter):
             "-v", f"{self.agent_home_dir}:/home/agent/.puffo-agent-state",
             "--init",  # reap zombies from claude's child processes
         ]
+        # Host Claude Code plugins ride in via a read-only nested
+        # bind-mount on top of the .claude dir. Plugin code (the
+        # marketplace clones, cache, installed_plugins.json) lives in
+        # ``~/.claude/plugins/`` and can be GB-scale; an extra mount
+        # is cheaper than copying every worker start, and the agent
+        # picks up host installs live. The image bakes in node/npm/
+        # python+uv so most plugin commands (``npx``/``uvx``)
+        # resolve. Sibling ``sync_host_enabled_plugins`` propagates
+        # the ``enabledPlugins`` array via the per-agent
+        # ``.claude/settings.json`` that lives under the existing
+        # ``claude_home_src`` mount. Skipped when the host has no
+        # plugins dir.
+        host_plugins = Path.home() / ".claude" / "plugins"
+        if host_plugins.is_dir():
+            cmd.extend([
+                "-v", f"{host_plugins}:/home/agent/.claude/plugins:ro",
+            ])
         # ``--memory`` is a hard cgroup ceiling; ``--memory-reservation``
         # is a soft floor. Either may be empty (operator opt-out).
         if self.memory_limit:

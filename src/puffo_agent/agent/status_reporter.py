@@ -20,6 +20,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
 
 
+# envelope_id prefixes the daemon mints for purely-local synthetic
+# messages (no server-side row exists). Status-reporter calls keyed
+# on these IDs would 404 against ``/messages/<id>/processing/{start,
+# end}`` — server reasonably reports "no such message" — and the
+# resulting WARN line per intro nudge was operator-visible noise.
+# Skip the HTTP round-trip entirely for these envelopes; the run is
+# still tracked in-memory by the worker via the returned ``run_id``.
+_LOCAL_ONLY_ENVELOPE_PREFIXES = ("intro-prompt-",)
+
+
+def _is_local_only_envelope(message_id: str) -> bool:
+    return message_id.startswith(_LOCAL_ONLY_ENVELOPE_PREFIXES)
+
+
 class StatusReporter:
     """Owns the heartbeat loop and turn lifecycle hooks.
 
@@ -58,6 +72,14 @@ class StatusReporter:
     async def begin_turn(self, message_id: str) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = f"run_{uuid.uuid4().hex}"
+        if _is_local_only_envelope(message_id):
+            # Daemon-minted synthetic envelope (e.g. intro-prompt).
+            # The server has no row for it; skip the POST so we
+            # don't log a 404 WARN per nudge. Run is still tracked
+            # in-memory via the returned run_id.
+            self._current_status = "busy"
+            self._current_message_id = message_id
+            return run_id
         try:
             await self._http.post(
                 f"/messages/{message_id}/processing/start",
@@ -79,6 +101,13 @@ class StatusReporter:
         succeeded: bool,
         error_text: str | None = None,
     ) -> None:
+        if _is_local_only_envelope(message_id):
+            # Symmetric to ``begin_turn`` — local-only envelopes have
+            # no server-side row to mark ended. Update local status
+            # only.
+            self._current_status = "idle" if succeeded else "error"
+            self._current_message_id = None
+            return
         body: dict[str, Any] = {"run_id": run_id, "succeeded": succeeded}
         if error_text is not None:
             body["error_text"] = error_text[:1024]  # server MAX_TEXT_LEN
@@ -108,15 +137,27 @@ class StatusReporter:
             return
         payload_runs: list[dict[str, Any]] = []
         for r in runs:
+            mid = r.get("message_id", "")
+            if _is_local_only_envelope(mid):
+                # Drop local-only synthetic envelopes — see
+                # ``begin_turn`` rationale. Their run lifecycle is
+                # in-memory only.
+                continue
             entry: dict[str, Any] = {
                 "run_id": r["run_id"],
-                "message_id": r["message_id"],
+                "message_id": mid,
                 "succeeded": bool(r["succeeded"]),
             }
             err = r.get("error_text")
             if err is not None:
                 entry["error_text"] = err[:1024]
             payload_runs.append(entry)
+        # If every run was local-only, there's nothing to POST.
+        if not payload_runs:
+            any_failed = any(not r["succeeded"] for r in runs)
+            self._current_status = "error" if any_failed else "idle"
+            self._current_message_id = None
+            return
         try:
             await self._http.post(
                 "/messages/processing/end:batch", {"runs": payload_runs},
