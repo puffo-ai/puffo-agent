@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.8] — 2026-05-13
+
 ### Added
 
 - ``puffo-agent agent autoaccept <id> --space <space_id> --owner on|off``
