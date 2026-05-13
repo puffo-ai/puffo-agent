@@ -6,6 +6,62 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **cli-local: host Claude Code plugins now propagate to per-agent
+  virtual ``$HOME``.** Operator-reported: plugins installed via
+  ``claude /plugin install <name>@<marketplace>`` (e.g.
+  ``imessage@claude-plugins-official``,
+  ``chrome-devtools-mcp@claude-plugins-official``) were silently
+  invisible to cli-local agents — ``mcp__puffo__list_mcp_servers``
+  returned ``(no MCP servers registered)`` for the plugin-provided
+  MCPs, and the per-agent ``.claude/plugins/`` directory didn't
+  exist at all.
+
+  Root cause was a missing sync step. ``seed_claude_home`` had been
+  one-shot copying ``.claude/settings.json`` + ``.claude.json``, but
+  nothing was bringing across:
+  * ``~/.claude/plugins/`` — the marketplace clones + plugin cache
+    + ``installed_plugins.json`` + ``known_marketplaces.json`` that
+    contain the actual plugin code.
+  * ``~/.claude/settings.json#enabledPlugins`` — the array that
+    tells Claude which plugin names to load. ``seed_claude_home``
+    copied this once on first start but never refreshed, so
+    plugins enabled later on the host stayed invisible to the
+    agent. (Plugin-provided MCP servers register through the plugin
+    pipeline, not through the user-level ``mcpServers`` map that
+    ``sync_host_mcp_servers`` already merges, so the existing MCP
+    sync didn't cover this case.)
+
+  Two new helpers in ``portal/state.py``, both wired into
+  ``local_cli.LocalCLIAdapter._verify()`` after the existing host
+  syncs:
+  * ``sync_host_plugins(host_home, agent_home)`` — symlinks
+    ``host_home/.claude/plugins/`` to
+    ``agent_home/.claude/plugins/``. The tree is GB-scale (each
+    marketplace is a git clone with history); symlink keeps the
+    agent live with host installs without recopy cost. Falls back
+    to ``copytree`` on Windows-without-Developer-Mode (operators
+    can ``rm -rf <agent>/.claude/plugins`` to force a refresh in
+    that branch). Returns the mode string for logging.
+  * ``sync_host_enabled_plugins(host_home, agent_home)`` — rewrites
+    just the ``enabledPlugins`` key in per-agent ``settings.json``
+    from the host's. Atomic tmp+rename. Leaves other settings
+    keys (theme, model, etc.) untouched. Accepts both the dict
+    (``{name: true}``) and list (``[name, ...]``) shapes Claude
+    Code has used historically.
+
+  Tests in ``test_host_sync.py``: 11 new (5 plugin tree + 6
+  enabledPlugins) covering symlink / copy-fallback / idempotent
+  re-call / no-host-dir noop / agent-side preservation. Full
+  suite: 486 passed, 7 skipped.
+
+  cli-docker isn't covered by this fix — host plugin code (npx,
+  npm-resolved binaries, etc.) generally doesn't exist inside the
+  container and would error on first use. Scoped to a follow-up
+  once the cli-docker MCP-server unreachable-warning pattern is
+  extended to plugins.
+
 ## [0.7.6] — 2026-05-12
 
 ### Added

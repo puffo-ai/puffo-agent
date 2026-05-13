@@ -19,15 +19,44 @@ from __future__ import annotations
 
 import json
 
+import os
+from pathlib import Path
+
+import pytest
+
 from puffo_agent.portal.state import (
     AGENT_INSTALLED_MARKER,
     HOST_SYNCED_MARKER,
     _looks_host_local_command,
+    sync_host_enabled_plugins,
     sync_host_gemini_mcp_servers,
     sync_host_gemini_skills,
     sync_host_mcp_servers,
+    sync_host_plugins,
     sync_host_skills,
 )
+
+
+def _symlinks_available(tmp_path: Path) -> bool:
+    """Probe: can this process create a symlink in ``tmp_path``?
+    Mirrors the helper in ``test_host_credentials.py`` so the
+    plugin-sync tests can skip the symlink path on Windows-without-
+    Developer-Mode without dragging in a shared import.
+    """
+    probe = tmp_path / "_probe_symlink"
+    target = tmp_path / "_probe_target"
+    target.write_text("x", encoding="utf-8")
+    try:
+        os.symlink(target, probe)
+        probe.unlink()
+        target.unlink()
+        return True
+    except (OSError, NotImplementedError):
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return False
 
 
 # ── Skills ───────────────────────────────────────────────────────────────────
@@ -293,6 +322,231 @@ def test_sync_host_mcp_handles_empty_agent_file(tmp_path):
     assert merged == 1
     data = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
     assert "fs" in data["mcpServers"]
+
+
+# ── Plugins ──────────────────────────────────────────────────────────────────
+
+
+def _populate_host_plugins(host: Path) -> Path:
+    """Build a minimal host plugins/ tree that exercises every branch
+    the agent's spawned Claude session will read. Returns the plugins
+    dir path."""
+    plugins = host / ".claude" / "plugins"
+    (plugins / "marketplaces" / "claude-plugins-official" / ".git").mkdir(parents=True)
+    (plugins / "marketplaces" / "claude-plugins-official" / "imessage" / "manifest.json").parent.mkdir(parents=True, exist_ok=True)
+    (plugins / "marketplaces" / "claude-plugins-official" / "imessage" / "manifest.json").write_text(
+        '{"name": "imessage"}', encoding="utf-8",
+    )
+    (plugins / "cache" / "build-001").mkdir(parents=True)
+    (plugins / "cache" / "build-001" / "compiled.bin").write_bytes(b"\x00\x01\x02")
+    (plugins / "installed_plugins.json").write_text(
+        '{"plugins": ["imessage@claude-plugins-official"]}', encoding="utf-8",
+    )
+    (plugins / "known_marketplaces.json").write_text(
+        '{"marketplaces": ["claude-plugins-official"]}', encoding="utf-8",
+    )
+    return plugins
+
+
+def test_sync_host_plugins_symlinks_when_supported(tmp_path):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
+    host = tmp_path / "host"
+    _populate_host_plugins(host)
+    agent = tmp_path / "agent"
+
+    mode = sync_host_plugins(host, agent)
+
+    assert mode == "symlink"
+    plugins = agent / ".claude" / "plugins"
+    assert plugins.is_symlink()
+    # Resolving through the symlink lands at the host file — the
+    # whole point: a fresh host plugin install shows up immediately.
+    assert (plugins / "installed_plugins.json").read_text() == (
+        '{"plugins": ["imessage@claude-plugins-official"]}'
+    )
+    assert (
+        plugins / "marketplaces" / "claude-plugins-official" / "imessage" / "manifest.json"
+    ).read_text() == '{"name": "imessage"}'
+
+
+def test_sync_host_plugins_idempotent_when_symlink_exists(tmp_path):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
+    host = tmp_path / "host"
+    _populate_host_plugins(host)
+    agent = tmp_path / "agent"
+
+    assert sync_host_plugins(host, agent) == "symlink"
+    # Second call recognises the existing symlink without re-creating.
+    assert sync_host_plugins(host, agent) == "symlink (already)"
+
+
+def test_sync_host_plugins_no_host_dir_returns_no_host_dir(tmp_path):
+    host = tmp_path / "host"  # no .claude/plugins/
+    agent = tmp_path / "agent"
+
+    mode = sync_host_plugins(host, agent)
+
+    assert mode == "no-host-dir"
+    assert not (agent / ".claude" / "plugins").exists()
+
+
+def test_sync_host_plugins_copy_fallback_when_symlink_blocked(
+    tmp_path, monkeypatch,
+):
+    """Force the symlink branch to raise so the copytree fallback
+    runs. Mirrors the Windows-without-Developer-Mode reality."""
+    host = tmp_path / "host"
+    _populate_host_plugins(host)
+    agent = tmp_path / "agent"
+    from puffo_agent.portal import state as state_mod
+
+    def _no_symlink(*_args, **_kwargs):
+        raise OSError("symlink blocked")
+    monkeypatch.setattr(state_mod.os, "symlink", _no_symlink)
+
+    mode = sync_host_plugins(host, agent)
+
+    assert mode == "copy"
+    plugins = agent / ".claude" / "plugins"
+    assert plugins.is_dir() and not plugins.is_symlink()
+    # Copy preserves the marketplace + cache + the two json siblings.
+    assert (plugins / "installed_plugins.json").exists()
+    assert (plugins / "known_marketplaces.json").exists()
+    assert (
+        plugins / "marketplaces" / "claude-plugins-official" / "imessage" / "manifest.json"
+    ).read_text() == '{"name": "imessage"}'
+
+
+def test_sync_host_plugins_copy_fresh_skips_recopy(tmp_path, monkeypatch):
+    """An already-copied tree stays as-is — re-copying a GB-scale
+    plugin tree on every worker tick would be the wrong default."""
+    host = tmp_path / "host"
+    _populate_host_plugins(host)
+    agent = tmp_path / "agent"
+    from puffo_agent.portal import state as state_mod
+    monkeypatch.setattr(state_mod.os, "symlink", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("nope")))
+
+    assert sync_host_plugins(host, agent) == "copy"
+    # Modify host after the initial copy.
+    (host / ".claude" / "plugins" / "new-marker").write_text("v2", encoding="utf-8")
+
+    # Second call sees an existing dir and doesn't recopy.
+    assert sync_host_plugins(host, agent) == "copy (fresh)"
+    assert not (agent / ".claude" / "plugins" / "new-marker").exists()
+
+
+# ── enabledPlugins propagation ───────────────────────────────────────────────
+
+
+def test_sync_host_enabled_plugins_propagates_dict_shape(tmp_path):
+    """Newer Claude Code stores enabledPlugins as
+    ``{name: bool}``. Pass through unchanged."""
+    host = tmp_path / "host"
+    _write_json(host / ".claude" / "settings.json", {
+        "enabledPlugins": {
+            "imessage@claude-plugins-official": True,
+            "chrome-devtools-mcp@claude-plugins-official": True,
+        },
+        "theme": "dark",  # unrelated key, must survive
+    })
+    agent = tmp_path / "agent"
+
+    n = sync_host_enabled_plugins(host, agent)
+
+    assert n == 2
+    data = json.loads((agent / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data["enabledPlugins"] == {
+        "imessage@claude-plugins-official": True,
+        "chrome-devtools-mcp@claude-plugins-official": True,
+    }
+
+
+def test_sync_host_enabled_plugins_propagates_list_shape(tmp_path):
+    """Older Claude Code uses ``[name, ...]``. Same passthrough."""
+    host = tmp_path / "host"
+    _write_json(host / ".claude" / "settings.json", {
+        "enabledPlugins": [
+            "imessage@claude-plugins-official",
+            "chrome-devtools-mcp@claude-plugins-official",
+        ],
+    })
+    agent = tmp_path / "agent"
+
+    n = sync_host_enabled_plugins(host, agent)
+
+    assert n == 2
+    data = json.loads((agent / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data["enabledPlugins"] == [
+        "imessage@claude-plugins-official",
+        "chrome-devtools-mcp@claude-plugins-official",
+    ]
+
+
+def test_sync_host_enabled_plugins_preserves_other_agent_keys(tmp_path):
+    host = tmp_path / "host"
+    _write_json(host / ".claude" / "settings.json", {
+        "enabledPlugins": {"foo@market": True},
+    })
+    agent = tmp_path / "agent"
+    _write_json(agent / ".claude" / "settings.json", {
+        "theme": "light",                  # agent-only preference
+        "model": "claude-opus-4-7",        # agent-only preference
+        "enabledPlugins": {"stale@old": True},  # to be overwritten
+    })
+
+    n = sync_host_enabled_plugins(host, agent)
+
+    assert n == 1
+    data = json.loads((agent / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data["theme"] == "light"
+    assert data["model"] == "claude-opus-4-7"
+    # Stale agent entry replaced by host.
+    assert data["enabledPlugins"] == {"foo@market": True}
+
+
+def test_sync_host_enabled_plugins_creates_agent_settings_if_missing(tmp_path):
+    """First-time agent has no settings.json yet (seed_claude_home
+    hasn't run, or the operator-installed plugins haven't propagated).
+    The helper still writes a minimal file."""
+    host = tmp_path / "host"
+    _write_json(host / ".claude" / "settings.json", {
+        "enabledPlugins": {"foo@market": True},
+    })
+    agent = tmp_path / "agent"  # no settings.json
+
+    n = sync_host_enabled_plugins(host, agent)
+
+    assert n == 1
+    data = json.loads((agent / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    assert data == {"enabledPlugins": {"foo@market": True}}
+
+
+def test_sync_host_enabled_plugins_noop_when_host_missing(tmp_path):
+    host = tmp_path / "host"  # no settings.json
+    agent = tmp_path / "agent"
+
+    n = sync_host_enabled_plugins(host, agent)
+
+    assert n == 0
+    assert not (agent / ".claude" / "settings.json").exists()
+
+
+def test_sync_host_enabled_plugins_noop_when_host_field_absent(tmp_path):
+    """Host settings.json exists but has no enabledPlugins — leave
+    the agent file alone (no spurious write that bumps mtime)."""
+    host = tmp_path / "host"
+    _write_json(host / ".claude" / "settings.json", {"theme": "dark"})
+    agent = tmp_path / "agent"
+    _write_json(agent / ".claude" / "settings.json", {"model": "claude-opus-4-7"})
+
+    n = sync_host_enabled_plugins(host, agent)
+
+    assert n == 0
+    data = json.loads((agent / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    # Untouched.
+    assert data == {"model": "claude-opus-4-7"}
 
 
 # ── Unreachable-command heuristic ────────────────────────────────────────────
