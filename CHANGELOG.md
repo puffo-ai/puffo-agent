@@ -6,7 +6,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.6] — 2026-05-12
+
 ### Added
+
+- Bridge endpoints for the web client's 5-button agent action row:
+  ``POST /v1/agents/{id}/pause``, ``POST /v1/agents/{id}/resume``,
+  ``POST /v1/agents/{id}/archive``. The pause / resume pair flips
+  ``agent.yml``'s ``state`` field; the reconciler picks the change
+  up on its next tick and stops or starts the worker. Archive
+  pauses first (so the worker exits cleanly + releases sqlite-WAL
+  file handles), then drops an ``archive.flag`` sentinel; the
+  reconciler then moves the agent dir into
+  ``~/.puffo-agent/archived/<id>-ws-<timestamp>``. All three are
+  idempotent and ownership-gated — only the agent's operator can
+  call them; non-owners get 403, missing IDs get 404.
+
+  Tests in ``tests/test_pause_resume_archive.py``: state-flip
+  parity, idempotent-already-{paused,running} note, 403 on
+  non-owner, 404 on unknown id, archive writes the flag even when
+  the agent was already paused, archive non-owner doesn't drop a
+  stray flag.
 
 - ``role`` + ``role_short`` fields on ``AgentConfig`` and the local
   bridge profile-edit path. Mirrors the
@@ -40,6 +60,24 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   consistent with what the server stores without an extra GET. The
   agent guides include a unit test pinning both mirrors against the
   server contract.
+
+### Fixed
+
+- ``_profile_summary`` returns the full ``# Soul`` section body
+  instead of just the first non-blank line. The web client's
+  AgentsPane card has a "▸ Soul" expand toggle that revealed only
+  one sentence of what the operator typed; the helper now walks
+  from the matching heading (``# Soul`` / ``# Description`` /
+  ``# About`` / ``# Summary``) to the next top-level heading or
+  EOF, preserves sub-headings inside the body, and trims leading
+  + trailing blank lines. Round-trip with ``_update_profile_summary``
+  (which already wrote the full body) is now lossless.
+
+- README and the new "Agent identity" section now document the
+  five operator-editable fields (display_name, avatar_url, role,
+  role_short, soul) and how they map onto ``agent.yml`` +
+  ``profile.md``. The ``# Soul`` body is what the LLM reads every
+  prompt; sub-headings inside it travel along.
 
 ## [0.7.5] — 2026-05-12
 

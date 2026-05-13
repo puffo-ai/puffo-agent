@@ -28,6 +28,7 @@ from ..state import (
     agent_claude_user_dir,
     agent_dir,
     agent_yml_path,
+    archive_flag_path,
     delete_flag_path,
     discover_agents,
     is_valid_agent_id,
@@ -278,33 +279,78 @@ async def list_agents(request: web.Request) -> web.Response:
 
 
 def _profile_summary(cfg: AgentConfig) -> str:
-    """Best-effort 1-line summary for list rows. Prefers the first
-    non-heading line under a description-like section; falls back to
-    the first non-heading line anywhere; returns empty string if the
-    profile is unreadable."""
+    """Return the full body of the agent's ``# Soul`` section from
+    profile.md (or any description-like heading: ``description`` /
+    ``about`` / ``summary``). Picks up everything between the
+    matching heading and the next heading **of the same or higher
+    level** (or EOF). Sub-headings inside the section (``## Tone``,
+    ``## What you don't do`` etc.) stay part of the body so the
+    operator's structured markdown round-trips faithfully.
+
+    Surrounding blank lines are trimmed; internal blank lines are
+    preserved.
+
+    Empty string when no such section exists or the profile is
+    unreadable.
+
+    The asymmetric "read first line, write full body" the helper had
+    before broke the new agent-card Soul-expand UI; the H2-stops-
+    collection bug then truncated multi-section souls (the operator's
+    helper template uses ``## How you act`` / ``## Tone`` / etc.)
+    even after the multi-line fix landed."""
     try:
         text = cfg.resolve_profile_path().read_text(encoding="utf-8")
     except Exception:
         return ""
 
-    lines = [line.strip() for line in text.splitlines()]
     description_heading = {"soul", "description", "about", "summary"}
+    body_lines: list[str] = []
     in_description = False
-    fallback = ""
+    section_level = 0  # ``#`` → 1, ``##`` → 2, etc.
 
-    for line in lines:
-        if not line:
+    for raw in text.splitlines():
+        stripped = raw.lstrip()
+        # Recognise a heading: one or more leading ``#`` followed by
+        # whitespace then text. ``#hashtag`` (no space) isn't a
+        # heading in CommonMark; ignore it.
+        is_heading = False
+        level = 0
+        heading_text = ""
+        if stripped.startswith("#"):
+            # Count consecutive '#'s.
+            i = 0
+            while i < len(stripped) and stripped[i] == "#":
+                i += 1
+            if i < len(stripped) and stripped[i] in " \t":
+                level = i
+                heading_text = stripped[i:].strip().lower()
+                is_heading = True
+
+        if is_heading:
+            if in_description:
+                if level <= section_level:
+                    # Same-or-higher-level heading closes the section.
+                    break
+                # Deeper heading — part of the soul body.
+                body_lines.append(raw)
+                continue
+            if heading_text in description_heading:
+                in_description = True
+                section_level = level
             continue
-        if line.startswith("#"):
-            heading = line.lstrip("#").strip().lower()
-            in_description = heading in description_heading
-            continue
+
         if in_description:
-            return line
-        if not fallback:
-            fallback = line
+            body_lines.append(raw)
 
-    return fallback
+    # Trim leading + trailing blank lines so the returned body
+    # doesn't carry the layout whitespace operators leave around
+    # the markdown.
+    while body_lines and not body_lines[0].strip():
+        body_lines.pop(0)
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+
+    return "\n".join(body_lines)
 
 
 async def get_agent(request: web.Request) -> web.Response:
@@ -798,6 +844,119 @@ async def delete_agent(request: web.Request) -> web.Response:
         "agent_id": agent_id,
         "ok": True,
         "note": "daemon will stop the worker + remove the agent dir on the next reconcile tick (~2s)",
+    })
+
+
+# ────────────────────────────────────────────────────────────────────
+# /v1/agents/{id}/pause (POST) and /v1/agents/{id}/resume (POST) —
+# flip ``agent.yml``'s ``state`` field; the daemon reconciler picks
+# up the change on the next tick and stops / starts the worker.
+# Same flow the CLI's ``puffo-agent agent pause`` / ``resume`` use
+# via ``_set_agent_state`` in ``portal.cli``.
+# ────────────────────────────────────────────────────────────────────
+
+
+async def _flip_agent_state(
+    request: web.Request, *, target_state: str, action_label: str,
+) -> web.Response:
+    agent_id = request.match_info["id"]
+    if not is_valid_agent_id(agent_id):
+        return _bad("invalid agent id")
+    if not agent_yml_path(agent_id).exists():
+        return _not_found("agent not found")
+    paired_root = request["paired_root_pubkey"]
+    if not is_owner(agent_id, paired_root):
+        return web.json_response(
+            {"error": f"only the agent's operator can {action_label} it"},
+            status=403,
+        )
+    cfg = AgentConfig.load(agent_id)
+    if cfg.state == target_state:
+        # Idempotent: silently succeed when already in the target
+        # state. The CLI prints "already {state}"; the bridge just
+        # returns 200 with the resolved state so the web client can
+        # refresh agent list without special-casing.
+        return web.json_response({
+            "agent_id": agent_id,
+            "state": cfg.state,
+            "ok": True,
+            "note": f"already {target_state}",
+        })
+    cfg.state = target_state
+    cfg.save()
+    logger.info(
+        "bridge: %s requested for agent=%s (state -> %s)",
+        action_label, agent_id, target_state,
+    )
+    return web.json_response({
+        "agent_id": agent_id,
+        "state": cfg.state,
+        "ok": True,
+        "note": (
+            "daemon will apply the state change on the next reconcile "
+            "tick (~2s)"
+        ),
+    })
+
+
+async def pause_agent(request: web.Request) -> web.Response:
+    return await _flip_agent_state(
+        request, target_state="paused", action_label="pause",
+    )
+
+
+async def resume_agent(request: web.Request) -> web.Response:
+    return await _flip_agent_state(
+        request, target_state="running", action_label="resume",
+    )
+
+
+# ────────────────────────────────────────────────────────────────────
+# /v1/agents/{id}/archive (POST) — pauses the worker + drops an
+# ``archive.flag`` sentinel; the reconciler stops the worker and
+# moves the agent dir to ``~/.puffo-agent/archived/<id>-<ts>``.
+# Soft-destructive: the dir is preserved on disk and can be brought
+# back by hand. Distinct from DELETE which removes the dir entirely.
+# ────────────────────────────────────────────────────────────────────
+
+
+async def archive_agent(request: web.Request) -> web.Response:
+    agent_id = request.match_info["id"]
+    if not is_valid_agent_id(agent_id):
+        return _bad("invalid agent id")
+    if not agent_dir(agent_id).exists():
+        return _not_found("agent not found")
+    paired_root = request["paired_root_pubkey"]
+    if not is_owner(agent_id, paired_root):
+        return web.json_response(
+            {"error": "only the agent's operator can archive it"},
+            status=403,
+        )
+    # Flip to paused FIRST so the worker exits cleanly before the
+    # reconciler tries to move the dir. CLI's ``cmd_agent_archive``
+    # does the same dance — pause, wait for the worker to release
+    # file handles (sqlite WAL is the slow one), then move.
+    cfg = AgentConfig.load(agent_id)
+    if cfg.state != "paused":
+        cfg.state = "paused"
+        cfg.save()
+    flag = archive_flag_path(agent_id)
+    try:
+        flag.parent.mkdir(parents=True, exist_ok=True)
+        flag.write_text("requested", encoding="utf-8")
+    except OSError as exc:
+        return web.json_response(
+            {"error": f"could not write archive flag: {exc}"},
+            status=500,
+        )
+    logger.info("bridge: archive requested for agent=%s", agent_id)
+    return web.json_response({
+        "agent_id": agent_id,
+        "ok": True,
+        "note": (
+            "daemon will pause the worker + move the agent dir to "
+            "~/.puffo-agent/archived/ on the next reconcile tick (~2s)"
+        ),
     })
 
 
