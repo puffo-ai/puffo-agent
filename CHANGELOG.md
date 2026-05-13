@@ -8,6 +8,39 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Intro-nudge synthetic envelope is now persisted to ``messages.db``,
+  and the status reporter no longer 404s on local-only envelopes.**
+  Operator-reported: after joining a channel the agent received the
+  ``[puffo-agent system message] You've just been added to …`` prompt
+  and posted an intro, but the daemon log carried a noisy
+  ``begin_turn message=intro-prompt-… failed (HTTP 404: NOT_FOUND)``
+  per nudge, and the agent's own ``mcp__puffo__get_channel_history``
+  call right after would return an inconsistent view (the intro it
+  just saw wasn't there).
+
+  Two changes:
+  * The synthetic envelope is written to ``messages.db`` via the
+    existing ``MessageStore.store`` path before being enqueued, so
+    ``get_channel_history`` / ``get_message_by_envelope`` /
+    ``lookup_channel_space`` all resolve it naturally. Side benefit:
+    ``send_message(root_id=<intro id>)`` is now a real thread root
+    locally; agents can post a reply-shape intro without producing
+    a broken reference.
+  * ``StatusReporter.begin_turn`` / ``end_turn`` /
+    ``end_turn_batch`` recognise local-only envelope prefixes
+    (currently ``intro-prompt-``) and skip the server POST. The
+    run is still tracked in-memory via the returned ``run_id`` so
+    the worker's batched ``end_turn_batch`` path keeps working;
+    server-side rows simply never get created for envelopes the
+    server never knew about. Quiets the per-nudge WARN noise
+    structurally rather than via primer compliance.
+
+  5 new tests: 1 in ``test_channel_intro_nudge.py``
+  (``test_intro_nudge_persists_envelope_to_messages_db``) + 4 in
+  ``test_status_reporter.py`` (``begin_turn`` skip, ``end_turn``
+  skip, batch filters mixed local/real runs, all-local batch
+  short-circuits). Full suite: 496 passed, 7 skipped.
+
 - **Host Claude Code plugins now propagate to cli-local + cli-docker
   agents.** Operator-reported: plugins installed via
   ``claude /plugin install <name>@<marketplace>`` (e.g.

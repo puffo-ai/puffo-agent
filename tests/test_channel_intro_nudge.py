@@ -144,6 +144,48 @@ async def test_intro_nudge_admits_one_system_priority_envelope():
 
 
 @pytest.mark.asyncio
+async def test_intro_nudge_persists_envelope_to_messages_db():
+    """The synthetic envelope must be queryable via the data-service
+    paths the agent uses at runtime — ``get_channel_history`` /
+    ``get_message_by_envelope`` / ``lookup_channel_space`` — so the
+    agent's view of the channel is consistent with what it just
+    received in its turn prompt. Without persistence the agent
+    would see the intro in the user-block but a follow-up
+    ``get_channel_history`` would return an empty list (or a list
+    that omits the intro), and ``send_message(root_id=<intro id>)``
+    would surface as a broken thread reference."""
+    store = await _make_store()
+    client = _make_client(store)
+
+    await client._enqueue_channel_intro_nudge(
+        space_id="sp_1", channel_id="ch_1",
+    )
+
+    # The envelope is queryable by its id.
+    _, _, root_id = await client._queue.get()
+    envelope = await store.get_message_by_envelope(root_id)
+    assert envelope is not None
+    assert envelope.channel_id == "ch_1"
+    assert envelope.space_id == "sp_1"
+    assert envelope.sender_slug == "system"
+    assert envelope.thread_root_id == root_id
+    assert "[puffo-agent system message]" in envelope.content
+
+    # And it shows up in the channel-history view that the
+    # agent's MCP tooling pulls from.
+    history = await store.get_channel_history(channel_id="ch_1", limit=10)
+    assert len(history) == 1
+    assert history[0].envelope_id == root_id
+
+    # Bonus: ``lookup_channel_space`` learns the mapping off the
+    # persisted envelope so ``send_message`` resolves the right
+    # space without an extra round-trip.
+    assert await store.lookup_channel_space("ch_1") == "sp_1"
+
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_intro_nudge_skipped_when_already_prompted():
     store = await _make_store()
     client = _make_client(store)

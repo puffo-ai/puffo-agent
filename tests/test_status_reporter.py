@@ -292,3 +292,74 @@ async def test_end_turn_batch_swallows_http_error():
         {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
     ])
     assert len(http.calls) == 1
+
+
+# ── Local-only envelope skip path ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_skips_http_for_local_only_envelope():
+    """Daemon-minted synthetic envelopes (intro-prompt-...) have no
+    server-side row. Posting to ``/messages/<id>/processing/start``
+    used to 404 and log a WARN per nudge — kill that noise."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    run_id = await rep.begin_turn("intro-prompt-ch_xxx-1778641626040")
+
+    assert run_id.startswith("run_")
+    assert http.calls == []  # No round-trip.
+    # Local-only run still flips state to busy so the heartbeat
+    # carries the in-progress envelope id.
+    assert rep._current_status == "busy"
+    assert rep._current_message_id == "intro-prompt-ch_xxx-1778641626040"
+
+
+@pytest.mark.asyncio
+async def test_end_turn_skips_http_for_local_only_envelope():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep._current_status = "busy"
+    rep._current_message_id = "intro-prompt-ch_a-1"
+
+    await rep.end_turn("intro-prompt-ch_a-1", "run_x", succeeded=True)
+
+    assert http.calls == []
+    assert rep._current_status == "idle"
+    assert rep._current_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_end_turn_batch_filters_local_only_runs():
+    """A thread batch can contain a synthetic intro envelope mixed
+    with real follow-up messages. ``end_turn_batch`` must keep the
+    real ones in the wire payload and drop the local-only entries
+    so the server doesn't see a phantom message id."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.end_turn_batch([
+        {"run_id": "run_intro", "message_id": "intro-prompt-ch_1-1", "succeeded": True},
+        {"run_id": "run_real",  "message_id": "env_real", "succeeded": True},
+    ])
+
+    assert len(http.calls) == 1
+    _, body = http.calls[0]
+    msg_ids = [r["message_id"] for r in body["runs"]]
+    assert msg_ids == ["env_real"]
+
+
+@pytest.mark.asyncio
+async def test_end_turn_batch_all_local_only_skips_http():
+    """All-synthetic batches don't hit the wire — there's nothing
+    for the server to upsert."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.end_turn_batch([
+        {"run_id": "run_a", "message_id": "intro-prompt-ch_a-1", "succeeded": True},
+        {"run_id": "run_b", "message_id": "intro-prompt-ch_b-1", "succeeded": True},
+    ])
+
+    assert http.calls == []
+    assert rep._current_status == "idle"

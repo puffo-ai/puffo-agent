@@ -1425,6 +1425,41 @@ class PuffoCoreMessageClient:
         # the agent doesn't get the nudge — preferable to spamming.
         await self.store.mark_channel_intro_prompted(channel_id)
 
+        # Persist the synthetic envelope to ``messages.db`` so the
+        # agent can resolve it through its normal data-service paths
+        # (``mcp__puffo__get_channel_history`` /
+        # ``get_message_by_envelope``). Without this, the envelope
+        # only existed in the in-memory thread queue — the agent
+        # would see it in the turn prompt, but a follow-up
+        # ``get_channel_history`` would return an inconsistent view
+        # (intro is missing) and ``send_message(root_id=<intro id>)``
+        # would surface as a broken thread reference. Side benefit:
+        # ``lookup_channel_space`` learns the channel→space mapping
+        # off this envelope automatically.
+        store_payload = {
+            "envelope_id": envelope_id,
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": channel_id,
+            "space_id": space_id,
+            "content_type": "text/plain",
+            "content": prompt_text,
+            "sent_at": now_ms,
+            "thread_root_id": envelope_id,
+            "reply_to_id": None,
+        }
+        try:
+            await self.store.store(store_payload)
+        except Exception as exc:  # noqa: BLE001
+            # Persistence is best-effort — the in-memory queue still
+            # delivers the prompt even if sqlite fails (disk full,
+            # permission, etc.). Log loud so the operator can spot
+            # the inconsistency between prompt + history.
+            logger.warning(
+                "intro-nudge: failed to persist envelope=%s to messages.db: %s",
+                envelope_id, exc,
+            )
+
         await self._admit_thread_message(
             root_id=envelope_id,
             priority=PRIORITY_SYSTEM,
