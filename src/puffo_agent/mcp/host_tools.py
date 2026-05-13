@@ -77,6 +77,71 @@ def _system_claude_json_path(home: Path) -> Path:
     return home / ".claude.json"
 
 
+def _plugin_cache_root(home: Path) -> Path:
+    """Where Claude Code's plugin loader keeps the *active* snapshot
+    of installed plugins. Each entry is
+    ``<plugin_name>/<version>/.mcp.json`` (plus other plugin files);
+    only the ``.mcp.json`` matters for MCP enumeration.
+
+    A separate ``plugins/marketplaces/<marketplace>/...`` tree holds
+    plugin source / catalog data — that one is informational, NOT
+    what claude-code actually loads at runtime. We list cache only:
+    the goal of ``list_mcp_servers`` is to tell the agent what it
+    can call right now, not what's available on the host.
+    """
+    return home / ".claude" / "plugins" / "cache"
+
+
+def _plugin_mcp_entries(home: Path) -> list[tuple[str, str]]:
+    """Walk ``~/.claude/plugins/cache/<plugin>/<version>/.mcp.json``
+    and return ``[(plugin_label, mcp_server_name), ...]`` where
+    ``plugin_label`` is ``<plugin>/<version>``.
+
+    Per the agent feedback that prompted this code: chrome-devtools-
+    mcp and imessage are installed via ``claude /plugin install``,
+    land in the cache tree above, and register their MCP servers
+    through claude-code's plugin pipeline — bypassing the user-
+    scope ``~/.claude.json#mcpServers`` map that the system-scope
+    branch above reads. Without walking the plugin tree those
+    server names never show up in ``list_mcp_servers`` output even
+    though the agent can call them.
+
+    Tolerates a missing cache dir (return []), missing per-version
+    ``.mcp.json`` (skip), malformed JSON in a single plugin file
+    (skip that plugin, keep listing the rest). A bad plugin must
+    NOT take the whole listing down.
+    """
+    root = _plugin_cache_root(home)
+    if not root.is_dir():
+        return []
+    out: list[tuple[str, str]] = []
+    # Sort for stable output: <plugin>, then <version>. Listing
+    # order matters because the formatter prints in-order; the
+    # agent reads top-down looking for what it needs.
+    for plugin_dir in sorted(root.iterdir()):
+        if not plugin_dir.is_dir():
+            continue
+        for version_dir in sorted(plugin_dir.iterdir()):
+            if not version_dir.is_dir():
+                continue
+            mcp_path = version_dir / ".mcp.json"
+            if not mcp_path.is_file():
+                continue
+            try:
+                data = _read_json_or_empty(mcp_path)
+            except RuntimeError:
+                # Bad JSON in this plugin — log nothing (host_tools
+                # is stdlib-only by contract), just skip.
+                continue
+            servers = data.get("mcpServers")
+            if not isinstance(servers, dict):
+                continue
+            label = f"{plugin_dir.name}/{version_dir.name}"
+            for name in sorted(servers.keys()):
+                out.append((label, name))
+    return out
+
+
 def _read_json_or_empty(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -219,20 +284,45 @@ def _uninstall_mcp_server(workspace: Path, name: str) -> Path:
     return path
 
 
-def _list_mcp_servers(workspace: Path, home: Path) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
+def _list_mcp_servers(
+    workspace: Path, home: Path,
+) -> list[tuple[str, str, str]]:
+    """Return ``[(scope, name, source), ...]`` for every MCP server
+    the agent's runtime can reach.
+
+    Three scopes:
+      * ``"system"`` — user-installed via ``claude mcp add``, lives
+        in ``<home>/.claude.json#mcpServers``. ``source`` is ``""``.
+      * ``"agent"``  — project-scope, installed by the agent via
+        ``install_mcp_server``, lives in
+        ``<workspace>/.mcp.json#mcpServers``. ``source`` is ``""``.
+      * ``"plugin"`` — provided by a ``claude /plugin install``-ed
+        plugin under ``<home>/.claude/plugins/cache/<plugin>/
+        <version>/.mcp.json``. ``source`` is the
+        ``"<plugin>/<version>"`` label so the operator can tell
+        which plugin owns it.
+
+    Pre-existing 0.7.8 callers expected a 2-tuple — every callsite
+    in this repo was updated in lockstep when this scope was
+    added; downstream code that destructures should switch to
+    3-tuple. Malformed configs in any scope are tolerated (skip
+    that file, keep listing the rest).
+    """
+    out: list[tuple[str, str, str]] = []
     try:
         sys_data = _read_json_or_empty(_system_claude_json_path(home))
     except RuntimeError:
         sys_data = {}
     for n in sorted((sys_data.get("mcpServers") or {}).keys()):
-        out.append(("system", n))
+        out.append(("system", n, ""))
     try:
         agent_data = _read_json_or_empty(_workspace_mcp_path(workspace))
     except RuntimeError:
         agent_data = {}
     for n in sorted((agent_data.get("mcpServers") or {}).keys()):
-        out.append(("agent", n))
+        out.append(("agent", n, ""))
+    for source, name in _plugin_mcp_entries(home):
+        out.append(("plugin", name, source))
     return out
 
 

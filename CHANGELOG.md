@@ -8,6 +8,30 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.7.9] — 2026-05-13
 
+### Fixed
+
+- **``mcp__puffo__list_mcp_servers`` now enumerates plugin-routed
+  MCP servers too.** Operator + agent feedback: plugins installed
+  via ``claude /plugin install`` (e.g. ``imessage``,
+  ``chrome-devtools-mcp``) register their MCP servers under
+  ``~/.claude/plugins/cache/<plugin>/<version>/.mcp.json`` — a
+  third scope distinct from system (``~/.claude.json``) and agent
+  (``<workspace>/.mcp.json``). The listing tool only walked the
+  first two, so plugin-provided servers were invisible to the
+  agent even though it could call them.
+
+  Fix walks the plugin cache too and tags each entry ``plugin``
+  with a ``(from <plugin>/<version>)`` source label so the
+  operator can map server-back-to-plugin at a glance. Defensive
+  on the file system: missing cache dir, missing per-version
+  ``.mcp.json``, malformed JSON in one plugin's file, and
+  multiple cached versions all handled without taking the whole
+  listing down.
+
+  5 new tests in ``test_agent_install.py``; the 2 pre-existing
+  list tests updated to the new 3-tuple shape
+  ``(scope, name, source)``.
+
 ### Added
 
 - **Inbound long-message redaction + ``get_post_segment`` MCP
