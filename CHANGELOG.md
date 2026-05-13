@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.7] — 2026-05-13
+
 ### Fixed
 
 - **Agents can now see their own sent messages in
