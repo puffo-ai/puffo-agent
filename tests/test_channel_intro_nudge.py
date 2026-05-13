@@ -478,3 +478,167 @@ async def test_intro_nudge_survives_simulated_restart():
     )
     assert client_2._queue.qsize() == 0
     await store_2.close()
+
+
+# ─── _handle_event: server-side auto-accept synthetic event ───────
+#
+# When the server short-circuits an InviteToChannel (because the
+# agent's ``auto_accept_owner_invite`` flag is on AND the inviter
+# is the space owner), it emits a synthetic AcceptChannelInvite
+# event signed-as-the-invitee with the original signed invite
+# nested under ``payload.original_invite``. The agent's
+# ``_accept_invite`` path — which normally fires the self-intro
+# nudge — never runs in this case, so ``_handle_event`` has to
+# trigger the nudge directly off the WS push. These tests pin
+# that branch.
+
+
+def _synthetic_accept_event(
+    *, agent_slug: str, space_id: str, channel_id: str,
+    invite_event_id: str = "ev_invite_1",
+    inviter_slug: str = "alice-0001",
+) -> dict:
+    """Wire-shape mirror of the synthetic event the server emits
+    from ``build_auto_accept_synthetic_event`` (puffo-server
+    ``spaces.rs``). The agent only reads a handful of fields here
+    (``kind``, ``signer_slug``, ``payload.space_id`` /
+    ``channel_id`` / ``original_invite``); the rest of the payload
+    is included so the fixture stays a faithful copy of the wire."""
+    return {
+        "type": "signed_event",
+        "version": 1,
+        "event_id": "ev_auto_accept_1",
+        "kind": "accept_channel_invite",
+        "signer_slug": agent_slug,
+        "signer_device_id": "",
+        "signer_subkey_id": "",
+        "signature": "server-auto:default-general-channel",
+        "payload": {
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "invitation_event_id": invite_event_id,
+            "accepted_at": 1_700_000_000_000,
+            "nonce": "test-nonce",
+            "channel_name": "secret-room",
+            # Real inviter signature would live here on the wire;
+            # the agent treats the presence of this object as the
+            # "this is a server auto-accept" marker.
+            "original_invite": {
+                "type": "signed_event",
+                "version": 1,
+                "event_id": invite_event_id,
+                "kind": "invite_to_channel",
+                "signer_slug": inviter_slug,
+                "signer_device_id": "dev_alice",
+                "signer_subkey_id": "sk_alice",
+                "signature": "real-signature-bytes-b64",
+                "payload": {
+                    "space_id": space_id,
+                    "channel_id": channel_id,
+                    "invitee_slug": agent_slug,
+                    "issued_at": 1_700_000_000_000,
+                    "nonce": "invite-nonce",
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_handle_event_fires_intro_on_synthetic_auto_accept():
+    """The happy path: server-emitted accept_channel_invite event
+    addressed to this agent → intro nudge lands on the queue."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._queue.qsize() == 1
+    assert await store.has_channel_intro_been_prompted("ch_1") is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_ignores_accept_for_other_slug():
+    """A space owner accepting a different invitee's invite gets
+    fanned out to us too; we must not react."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="someone-else", space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._queue.qsize() == 0
+    assert await store.has_channel_intro_been_prompted("ch_1") is False
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_ignores_operator_signed_accept():
+    """A real signed accept the agent itself (or its operator) posted
+    bounces back over WS. Without ``original_invite`` it must NOT
+    fire a nudge — ``_accept_invite`` already did, and double-firing
+    would be visible as two intros in the channel."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="ch_1",
+    )
+    # Strip the marker the synthetic event carries.
+    del event["payload"]["original_invite"]
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._queue.qsize() == 0
+    assert await store.has_channel_intro_been_prompted("ch_1") is False
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_synthetic_accept_is_idempotent():
+    """Server WS catch-up after a reconnect can redeliver the same
+    synthetic accept event. The per-channel dedup gate must hold —
+    only one intro lands in the queue across redeliveries."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._queue.qsize() == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_synthetic_accept_missing_ids_is_safe():
+    """A malformed payload (missing space_id or channel_id) must
+    not crash the WS handler — it should just no-op."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="", channel_id="ch_1",
+    )
+    await client._handle_event(scope="", event=event)
+    assert client._queue.qsize() == 0
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+    assert client._queue.qsize() == 0
+
+    await store.close()

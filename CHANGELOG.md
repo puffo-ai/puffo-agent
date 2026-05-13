@@ -20,6 +20,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ``profile`` subcommand: operator controls the local keystore,
   so a CLI invocation IS an operator decision).
 
+### Changed
+
+- **Self-introduction nudge now fires on server-side auto-accept
+  too.** Previously the synthetic ``AcceptChannelInvite`` event the
+  server emits when it short-circuits an InviteToChannel
+  (``auto_accept_owner_invite=TRUE`` + inviter is the space owner)
+  was silently ignored by the daemon's WS handler, so the agent
+  never posted its 2-3-sentence intro in the auto-joined channel.
+  The handler now recognises the synthetic variant via the
+  ``payload.original_invite`` marker and routes through the same
+  ``_enqueue_channel_intro_nudge`` path that the operator-signed
+  accept already uses. Idempotent: redelivered events hit the
+  existing per-channel dedup gate. 5 new unit tests pin the
+  branch + negative cases (other-slug fan-out, operator-signed
+  echo, malformed payload).
+
 ## [0.7.7] — 2026-05-13
 
 ### Fixed
