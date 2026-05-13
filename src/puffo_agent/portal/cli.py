@@ -764,6 +764,61 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_autoaccept(args: argparse.Namespace) -> int:
+    """Flip the agent's per-space ``auto_accept_owner_invite`` flag
+    via the server's PATCH endpoint. Signed by the agent's own subkey
+    (mirrors the ``profile`` CLI's auth model — the operator
+    controls the local keystore, so a CLI invocation IS an operator
+    decision).
+
+    The member-invite flag is intentionally not exposed: the server
+    rejects PATCH-with-member-flag from agent identities (403), so
+    surfacing it as a CLI flag would just produce a confusing
+    server error. If/when the policy changes, add ``--member``
+    here in lockstep with relaxing the server-side gate.
+    """
+    import asyncio
+
+    agent_id = args.id
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return 2
+    cfg = AgentConfig.load(agent_id)
+    space_id = args.space
+    owner_on = args.owner == "on"
+
+    async def patch_settings() -> dict:
+        from ..crypto.http_client import PuffoCoreHttpClient
+        from ..crypto.keystore import KeyStore
+
+        pc = cfg.puffo_core
+        ks = KeyStore.for_agent(cfg.id)
+        http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
+        try:
+            return await http.patch(
+                f"/spaces/{space_id}/members/me/settings",
+                {"auto_accept_owner_invite": owner_on},
+            )
+        finally:
+            await http.close()
+
+    try:
+        resp = asyncio.run(patch_settings())
+    except Exception as exc:
+        print(f"error: server PATCH failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"agent {agent_id!r} in space {space_id}: "
+        f"auto_accept_owner_invite = {resp.get('auto_accept_owner_invite')!r}"
+    )
+    print(
+        f"  auto_accept_member_invite (unchanged, locked for agents): "
+        f"{resp.get('auto_accept_member_invite')!r}"
+    )
+    return 0
+
+
 def cmd_agent_profile(args: argparse.Namespace) -> int:
     """Show or update the identity-profile fields (display_name, role,
     role_short) and best-effort sync them to puffo-server signed by
@@ -1309,6 +1364,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     profile.set_defaults(func=cmd_agent_profile)
+
+    autoaccept = agent_sub.add_parser(
+        "autoaccept",
+        help=(
+            "Toggle this agent's auto-accept-channel-invite preference "
+            "in a given space. With --owner on, the agent silently "
+            "joins any channel its space-owner invites it to; with off, "
+            "the agent goes through the normal DM-operator confirmation "
+            "path. The member-invite flag is locked off for agents in "
+            "this build (server returns 403)."
+        ),
+    )
+    autoaccept.add_argument("id")
+    autoaccept.add_argument("--space", required=True, help="space_id (sp_<uuid>) to scope the toggle to")
+    autoaccept.add_argument(
+        "--owner",
+        choices=["on", "off"],
+        required=True,
+        help="Auto-accept channel invites from the space owner",
+    )
+    autoaccept.set_defaults(func=cmd_agent_autoaccept)
 
     archive = agent_sub.add_parser("archive", help="Stop and archive an agent to ~/.puffo-agent/archived/")
     archive.add_argument("id")

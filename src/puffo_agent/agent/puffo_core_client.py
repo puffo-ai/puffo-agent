@@ -985,14 +985,49 @@ class PuffoCoreMessageClient:
         prevents the next periodic poll from double-acting.
         """
         kind = event.get("kind")
-        if kind not in ("invite_to_space", "invite_to_channel"):
+        payload = event.get("payload") or {}
+
+        if kind in ("invite_to_space", "invite_to_channel"):
+            if payload.get("invitee_slug") != self.slug:
+                return  # Server fans the event to space members too.
+            await self._poll_pending_invites()
             return
 
-        payload = event.get("payload") or {}
-        if payload.get("invitee_slug") != self.slug:
-            return  # Server fans the event to space members too.
-
-        await self._poll_pending_invites()
+        # Server-side auto-accept synthetic event. When the server
+        # short-circuits an InviteToChannel because this agent's
+        # ``auto_accept_owner_invite`` flag is on AND the inviter is
+        # the space owner, it emits an ``accept_channel_invite``
+        # signed-as-the-invitee with the original signed invite
+        # nested under ``payload.original_invite``. There's no
+        # pending_invites row to poll and ``_accept_invite`` never
+        # runs, so the self-intro nudge that path normally fires
+        # would otherwise be silently dropped on auto-accept.
+        # Mirror just the nudge here.
+        if kind == "accept_channel_invite":
+            if event.get("signer_slug") != self.slug:
+                return  # Someone else's accept — not our business.
+            # Distinguish the server-emitted synthetic from a
+            # real signed accept that's bouncing back over WS.
+            # ``original_invite`` is the canonical marker — the
+            # operator-signed path never embeds the source invite.
+            if not isinstance(payload.get("original_invite"), dict):
+                return
+            space_id = payload.get("space_id") or ""
+            channel_id = payload.get("channel_id") or ""
+            if not space_id or not channel_id:
+                return
+            try:
+                await self._enqueue_channel_intro_nudge(
+                    space_id=space_id,
+                    channel_id=channel_id,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to enqueue intro nudge for server-auto-"
+                    "accepted channel (space=%s channel=%s)",
+                    space_id, channel_id,
+                )
+            return
 
     async def _poll_pending_invites(self) -> None:
         """Pull pending invites the agent hasn't acted on. Space

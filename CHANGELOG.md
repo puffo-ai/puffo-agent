@@ -6,6 +6,38 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.8] — 2026-05-13
+
+### Added
+
+- ``puffo-agent agent autoaccept <id> --space <space_id> --owner on|off``
+  — toggles the agent's per-space ``auto_accept_owner_invite``
+  flag via signed PATCH to puffo-server's new
+  ``/spaces/{id}/members/me/settings`` endpoint. When ON, the
+  agent silently joins any channel its space owner invites it to;
+  when OFF, the invite goes through the normal DM-operator
+  confirmation path. Member-invite flag is deliberately not
+  exposed — the server returns 403 for agents on that field. CLI
+  uses the agent's own keystore (same auth model as the
+  ``profile`` subcommand: operator controls the local keystore,
+  so a CLI invocation IS an operator decision).
+
+### Changed
+
+- **Self-introduction nudge now fires on server-side auto-accept
+  too.** Previously the synthetic ``AcceptChannelInvite`` event the
+  server emits when it short-circuits an InviteToChannel
+  (``auto_accept_owner_invite=TRUE`` + inviter is the space owner)
+  was silently ignored by the daemon's WS handler, so the agent
+  never posted its 2-3-sentence intro in the auto-joined channel.
+  The handler now recognises the synthetic variant via the
+  ``payload.original_invite`` marker and routes through the same
+  ``_enqueue_channel_intro_nudge`` path that the operator-signed
+  accept already uses. Idempotent: redelivered events hit the
+  existing per-channel dedup gate. 5 new unit tests pin the
+  branch + negative cases (other-slug fan-out, operator-signed
+  echo, malformed payload).
+
 ## [0.7.7] — 2026-05-13
 
 ### Fixed
