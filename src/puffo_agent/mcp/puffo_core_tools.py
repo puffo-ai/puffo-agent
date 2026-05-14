@@ -46,8 +46,9 @@ class PuffoCoreToolsConfig:
     http_client: PuffoCoreHttpClient
     data_client: DataClient
     space_id: Optional[str] = None
-    # Workspace root used by ``upload_file`` to safety-resolve LLM-
-    # supplied relative paths (no ``..`` escape, no absolutes).
+    # Workspace root used by ``send_message_with_attachments`` to
+    # safety-resolve LLM-supplied relative paths (no ``..`` escape,
+    # no absolutes).
     workspace: Optional[str] = None
 
 
@@ -113,13 +114,23 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    async def send_message(channel: str, text: str, root_id: str = "") -> str:
+    async def send_message(
+        channel: str,
+        text: str,
+        is_visible_to_human: bool,
+        root_id: str = "",
+    ) -> str:
         """Post a message to a Puffo.ai channel or DM a user.
 
         channel: '@<slug>' for a DM (e.g. '@alice-1234'), or a raw
             channel id (e.g. 'ch_<uuid>'). Use ``list_channels`` to
             discover ids — '#name' shortcuts are not supported.
         text: message body. Markdown preserved verbatim.
+        is_visible_to_human: REQUIRED — decide whether a human should
+            see this message inline. ``true`` for anything a person
+            needs to read; ``false`` for agent-to-agent coordination
+            chatter, which human clients fold away. There is no
+            default — judge every message.
         root_id: optional — reply inside a thread; pass the
             envelope_id of the message you're replying to.
         """
@@ -190,6 +201,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
             sender_subkey_id=sess.subkey_id,
+            is_visible_to_human=is_visible_to_human,
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
@@ -512,21 +524,27 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
 
     @mcp.tool()
-    async def upload_file(
+    async def send_message_with_attachments(
         paths: list[str],
         channel: str,
+        is_visible_to_human: bool,
         caption: str = "",
         root_id: str = "",
     ) -> str:
-        """Upload one or more workspace files to a channel or DM.
+        """Send a message carrying one or more workspace files to a
+        channel or DM.
 
         All files ride in a single envelope — recipients see one
-        bubble with N attachments.
+        message bubble with N attachments.
 
         paths: workspace-relative file paths. ``..`` and absolute
             paths are rejected.
         channel: same syntax as ``send_message`` (``@<slug>`` or a
             raw channel id).
+        is_visible_to_human: REQUIRED — same semantics as
+            ``send_message``: ``true`` when a person should see this,
+            ``false`` for agent-to-agent chatter that human clients
+            fold away. No default — judge every send.
         caption: optional text alongside the files.
         root_id: optional thread reply, same semantics as
             ``send_message``'s ``root_id``.
@@ -536,13 +554,18 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
         if not cfg.workspace:
             raise RuntimeError(
-                "upload_file: agent has no configured workspace dir"
+                "send_message_with_attachments: agent has no configured "
+                "workspace dir"
             )
         if not paths or not isinstance(paths, list):
-            raise RuntimeError("upload_file: paths is required (non-empty list)")
+            raise RuntimeError(
+                "send_message_with_attachments: paths is required "
+                "(non-empty list)"
+            )
         if len(paths) > 10:
             raise RuntimeError(
-                f"upload_file: too many files ({len(paths)} > 10 cap)"
+                f"send_message_with_attachments: too many files "
+                f"({len(paths)} > 10 cap)"
             )
         workspace_dir = Path(cfg.workspace).resolve()
 
@@ -552,21 +575,27 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         for raw in paths:
             rel = (raw or "").strip()
             if not rel:
-                raise RuntimeError("upload_file: paths contains empty entry")
+                raise RuntimeError(
+                    "send_message_with_attachments: paths contains empty entry"
+                )
             rel_path = Path(rel)
             if rel_path.is_absolute():
                 raise RuntimeError(
-                    f"upload_file: absolute paths not allowed ({rel!r})"
+                    f"send_message_with_attachments: absolute paths not "
+                    f"allowed ({rel!r})"
                 )
             try:
                 target = (workspace_dir / rel_path).resolve()
                 target.relative_to(workspace_dir)
             except (OSError, ValueError):
                 raise RuntimeError(
-                    f"upload_file: {rel!r} escapes the workspace"
+                    f"send_message_with_attachments: {rel!r} escapes the "
+                    f"workspace"
                 )
             if not target.is_file():
-                raise RuntimeError(f"upload_file: {rel!r} is not a file")
+                raise RuntimeError(
+                    f"send_message_with_attachments: {rel!r} is not a file"
+                )
             targets.append(target)
 
         # Encrypt + upload each file. ``blob_id`` is patched in
@@ -577,7 +606,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             plaintext = target.read_bytes()
             if len(plaintext) > 8 * 1024 * 1024:
                 raise RuntimeError(
-                    f"upload_file: {target.name!r} is {len(plaintext)} bytes "
+                    f"send_message_with_attachments: {target.name!r} is {len(plaintext)} bytes "
                     "(server caps at 8 MiB)"
                 )
             mime_type, _ = mimetypes.guess_type(target.name)
@@ -594,7 +623,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             blob_id = upload.get("blob_id") if isinstance(upload, dict) else None
             if not blob_id:
                 raise RuntimeError(
-                    f"upload_file: server returned no blob_id for "
+                    f"send_message_with_attachments: server returned no blob_id for "
                     f"{target.name!r} ({upload!r})"
                 )
             meta.blob_id = blob_id
@@ -627,7 +656,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             )
             if not send_space_id:
                 raise RuntimeError(
-                    f"upload_file: channel {channel_id} not seen before "
+                    f"send_message_with_attachments: channel {channel_id} not seen before "
                     "and the agent has no configured space_id"
                 )
             members_resp = await cfg.http_client.get(
@@ -640,12 +669,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ]
             if not recipient_slugs:
                 raise RuntimeError(
-                    f"upload_file: channel {channel_id} has no resolvable members"
+                    f"send_message_with_attachments: channel {channel_id} has no resolvable members"
                 )
 
         devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
         if not devices:
-            raise RuntimeError("upload_file: no recipient devices found")
+            raise RuntimeError("send_message_with_attachments: no recipient devices found")
 
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
@@ -659,6 +688,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
             sender_subkey_id=sess.subkey_id,
+            is_visible_to_human=is_visible_to_human,
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,

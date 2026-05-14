@@ -34,6 +34,7 @@ class EncryptInput:
     envelope_kind: str  # "channel" or "dm"
     sender_slug: str
     sender_subkey_id: str
+    is_visible_to_human: bool
     space_id: Optional[str] = None
     channel_id: Optional[str] = None
     recipient_slug: Optional[str] = None
@@ -65,6 +66,7 @@ class MessagePayload:
     message_nonce: str
     content_type: str
     content: Any
+    is_visible_to_human: bool
     space_id: Optional[str] = None
     channel_id: Optional[str] = None
     recipient_slug: Optional[str] = None
@@ -94,6 +96,7 @@ class MessagePayload:
             "reply_to_id": self.reply_to_id,
             "content_type": self.content_type,
             "content": self.content,
+            "is_visible_to_human": self.is_visible_to_human,
         }
 
 
@@ -135,6 +138,7 @@ def encrypt_message(
         reply_to_id=inp.reply_to_id,
         content_type=inp.content_type,
         content=inp.content,
+        is_visible_to_human=inp.is_visible_to_human,
     )
 
     payload_dict = payload.to_payload_dict()
@@ -269,4 +273,5 @@ def decrypt_message(
         reply_to_id=payload_dict.get("reply_to_id"),
         content_type=payload_dict["content_type"],
         content=payload_dict["content"],
+        is_visible_to_human=payload_dict.get("is_visible_to_human", True),
     )

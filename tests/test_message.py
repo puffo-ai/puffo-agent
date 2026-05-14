@@ -22,11 +22,14 @@ def _make_recipient() -> tuple[RecipientDevice, KemKeyPair]:
     ), kp
 
 
-def _channel_input(recipients: list[RecipientDevice]) -> EncryptInput:
+def _channel_input(
+    recipients: list[RecipientDevice], is_visible_to_human: bool = True
+) -> EncryptInput:
     return EncryptInput(
         envelope_kind="channel",
         sender_slug="alice-0001",
         sender_subkey_id="sk_alice",
+        is_visible_to_human=is_visible_to_human,
         space_id="sp_1",
         channel_id="ch_1",
         content_type="text/plain",
@@ -35,11 +38,14 @@ def _channel_input(recipients: list[RecipientDevice]) -> EncryptInput:
     )
 
 
-def _dm_input(recipients: list[RecipientDevice]) -> EncryptInput:
+def _dm_input(
+    recipients: list[RecipientDevice], is_visible_to_human: bool = True
+) -> EncryptInput:
     return EncryptInput(
         envelope_kind="dm",
         sender_slug="alice-0001",
         sender_subkey_id="sk_alice",
+        is_visible_to_human=is_visible_to_human,
         recipient_slug="bob-0001",
         content_type="text/plain",
         content="Secret message",
@@ -279,3 +285,89 @@ class TestDecryptMessage:
 
         assert payload.thread_root_id is None
         assert payload.reply_to_id is None
+
+    def test_is_visible_to_human_true_roundtrip(self):
+        signing_key = Ed25519KeyPair.generate()
+        dev, kp = _make_recipient()
+        env = encrypt_message(
+            _channel_input([dev], is_visible_to_human=True), signing_key
+        )
+
+        payload = decrypt_message(env, dev.device_id, kp, signing_key.public_key_bytes())
+
+        assert payload.is_visible_to_human is True
+
+    def test_is_visible_to_human_false_roundtrip(self):
+        signing_key = Ed25519KeyPair.generate()
+        dev, kp = _make_recipient()
+        env = encrypt_message(
+            _channel_input([dev], is_visible_to_human=False), signing_key
+        )
+
+        payload = decrypt_message(env, dev.device_id, kp, signing_key.public_key_bytes())
+
+        assert payload.is_visible_to_human is False
+
+    def test_is_visible_to_human_defaults_true_when_absent(self):
+        # Old senders predate the field; decrypt must default it to
+        # True rather than KeyError.
+        signing_key = Ed25519KeyPair.generate()
+        dev, kp = _make_recipient()
+        inp = _channel_input([dev], is_visible_to_human=False)
+        env = encrypt_message(inp, signing_key)
+
+        # Re-seal a payload with the field stripped, re-signed so the
+        # signature check still passes.
+        from puffo_agent.crypto.canonical import canonicalize_for_signing
+        from puffo_agent.crypto.primitives import (
+            aead_decrypt,
+            aead_encrypt,
+            generate_aead_nonce,
+            hpke_open,
+        )
+        from puffo_agent.crypto.primitives import MESSAGE_HPKE_INFO
+        from puffo_agent.crypto.v2_aad import compute_outer_aad, compute_wrap_aad
+
+        entry = env["recipients"][0]
+        envelope_id = env["envelope_id"]
+        wrap_aad = compute_wrap_aad(envelope_id, dev.device_id)
+        content_key = hpke_open(
+            kp,
+            base64url_decode(entry["hpke_enc"]),
+            MESSAGE_HPKE_INFO,
+            wrap_aad,
+            base64url_decode(entry["wrapped_content_key"]),
+        )
+        outer_aad = compute_outer_aad(
+            envelope_id=envelope_id,
+            envelope_kind=env["envelope_kind"],
+            sender_slug=env["sender_slug"],
+            sent_at_ms=env["sent_at"],
+            space_id=env.get("space_id"),
+            channel_id=env.get("channel_id"),
+            recipient_slug=env.get("recipient_slug"),
+        )
+        plaintext = aead_decrypt(
+            content_key,
+            base64url_decode(env["content_nonce"]),
+            base64url_decode(env["content_ciphertext"]),
+            outer_aad,
+        )
+        signed = json.loads(plaintext)
+        signed["payload"].pop("is_visible_to_human")
+        canonical = canonicalize_for_signing(signed["payload"])
+        signed["signature"] = base64url_encode(signing_key.sign(canonical))
+
+        new_nonce = generate_aead_nonce()
+        new_ct = aead_encrypt(
+            content_key,
+            new_nonce,
+            json.dumps(signed, separators=(",", ":")).encode(),
+            outer_aad,
+        )
+        env["content_nonce"] = base64url_encode(new_nonce)
+        env["content_ciphertext"] = base64url_encode(new_ct)
+
+        payload = decrypt_message(env, dev.device_id, kp, signing_key.public_key_bytes())
+
+        assert payload.is_visible_to_human is True

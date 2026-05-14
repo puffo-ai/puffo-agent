@@ -143,6 +143,7 @@ class PuffoAgent:
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
+                is_visible_to_human=msg.get("is_visible_to_human", True),
             )
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
@@ -334,6 +335,7 @@ class PuffoAgent:
         space_id: str = "",
         space_name: str = "",
         sender_display_name: str = "",
+        is_visible_to_human: bool = True,
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -351,6 +353,7 @@ class PuffoAgent:
             space_id=space_id,
             space_name=space_name,
             sender_display_name=sender_display_name,
+            is_visible_to_human=is_visible_to_human,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -373,6 +376,7 @@ class PuffoAgent:
         space_id: str = "",
         space_name: str = "",
         sender_display_name: str = "",
+        is_visible_to_human: bool = True,
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
@@ -407,6 +411,9 @@ class PuffoAgent:
         lines.append(f"- sender: {display}")
         lines.append(f"- sender_slug: {sender}")
         lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
+        lines.append(
+            f"- is_visible_to_human: {'true' if is_visible_to_human else 'false'}"
+        )
         if mentions:
             lines.append("- mentions:")
             for m in mentions:

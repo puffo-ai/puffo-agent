@@ -717,6 +717,7 @@ class PuffoCoreMessageClient:
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
+                "is_visible_to_human": payload.is_visible_to_human,
             }
             channel_meta = {
                 "channel_id": channel_id,
@@ -1965,6 +1966,8 @@ class PuffoCoreMessageClient:
             envelope_kind="dm",
             sender_slug=self.slug,
             sender_subkey_id=sess.subkey_id,
+            # Operator-facing notices (invite approvals) — always visible.
+            is_visible_to_human=True,
             recipient_slug=recipient_slug,
             thread_root_id=root_id if root_id else None,
             content_type="text/plain",
@@ -2092,6 +2095,10 @@ class PuffoCoreMessageClient:
             envelope_kind=envelope_kind,
             sender_slug=self.slug,
             sender_subkey_id=sess.subkey_id,
+            # Fallback path (agent skipped send_message + [SILENT]) —
+            # folded by default; the primer steers agents to
+            # send_message, where they set visibility consciously.
+            is_visible_to_human=False,
             space_id=send_space_id,
             channel_id=send_channel_id,
             recipient_slug=recipient_slug,
