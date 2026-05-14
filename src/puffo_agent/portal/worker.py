@@ -668,7 +668,7 @@ class Worker:
                 # Fallback reply when the agent skipped both
                 # send_message and [SILENT]. Post to root so the
                 # reply lands in the thread the agent was reading.
-                await client.post_message(channel_id, reply, root_id=root_id)
+                await client.send_fallback_message(channel_id, reply, root_id=root_id)
 
         async def on_api_error_retry(
             root_id: str,
@@ -696,7 +696,7 @@ class Worker:
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
             if reply:
-                await client.post_message(channel_id, reply, root_id=root_id)
+                await client.send_fallback_message(channel_id, reply, root_id=root_id)
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)

@@ -155,7 +155,11 @@ async def test_send_message_channel():
         "has_more": False,
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "send_message", {"channel": "ch_abc", "text": "hello world"})
+    result = await _call(
+        mcp,
+        "send_message",
+        {"channel": "ch_abc", "text": "hello world", "is_visible_to_human": True},
+    )
     assert "posted" in result
     assert "ch_abc" in result
 
@@ -210,7 +214,11 @@ async def test_send_message_dm():
         "has_more": False,
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "send_message", {"channel": "@alice-0001", "text": "hey"})
+    result = await _call(
+        mcp,
+        "send_message",
+        {"channel": "@alice-0001", "text": "hey", "is_visible_to_human": True},
+    )
     assert "posted" in result
 
     post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
@@ -232,7 +240,11 @@ async def test_send_message_rejects_named_channel():
     cfg, _, _ = _setup()
     mcp = _build_tools(cfg)
     with pytest.raises(Exception) as excinfo:
-        await _call(mcp, "send_message", {"channel": "#general", "text": "hi"})
+        await _call(
+            mcp,
+            "send_message",
+            {"channel": "#general", "text": "hi", "is_visible_to_human": True},
+        )
     assert "isn't supported" in str(excinfo.value) or "not supported" in str(excinfo.value)
 
 
@@ -494,16 +506,18 @@ async def test_get_post_not_found():
 
 
 @pytest.mark.asyncio
-async def test_upload_file_requires_workspace():
-    """Without ``cfg.workspace``, upload_file refuses rather than
-    silently dropping into a "no agent dir" hole. Real upload path
-    is exercised end-to-end against a live daemon."""
+async def test_send_message_with_attachments_requires_workspace():
+    """Without ``cfg.workspace``, send_message_with_attachments refuses
+    rather than silently dropping into a "no agent dir" hole. Real
+    upload path is exercised end-to-end against a live daemon."""
     cfg, _, _ = _setup()
     # Fixture leaves cfg.workspace as None.
     mcp = _build_tools(cfg)
     with pytest.raises(Exception) as exc_info:
         await _call(
-            mcp, "upload_file", {"paths": ["test.txt"], "channel": "ch_1"},
+            mcp,
+            "send_message_with_attachments",
+            {"paths": ["test.txt"], "channel": "ch_1", "is_visible_to_human": True},
         )
     assert "workspace" in str(exc_info.value).lower()
 
@@ -524,6 +538,6 @@ async def test_all_9_tools_registered():
     expected = {
         "whoami", "send_message", "get_channel_history",
         "list_channels", "list_channel_members", "get_user_info",
-        "get_post", "upload_file", "fetch_channel_files",
+        "get_post", "send_message_with_attachments", "fetch_channel_files",
     }
     assert expected.issubset(tool_names)

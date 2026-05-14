@@ -274,8 +274,8 @@ async def test_message_store_wal_mode():
 
 
 @pytest.mark.asyncio
-async def test_puffo_core_client_post_message_encrypts():
-    """Smoke test: post_message resolves channel members and their
+async def test_puffo_core_client_send_fallback_message_encrypts():
+    """Smoke test: send_fallback_message resolves channel members and their
     device certs, encrypts the reply, and posts the bare envelope.
 
     Mocked endpoints reflect the real puffo-core wire shape:
@@ -340,7 +340,7 @@ async def test_puffo_core_client_post_message_encrypts():
         http_client=http,
         message_store=ms,
     )
-    await client.post_message("ch_abc", "hello world", root_id="")
+    await client.send_fallback_message("ch_abc", "hello world", root_id="")
 
     # Channel resolution: members endpoint -> /certs/sync.
     assert any(
