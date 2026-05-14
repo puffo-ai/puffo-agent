@@ -94,6 +94,28 @@ async def _fetch_device_keys(
     return devices
 
 
+def _coerce_root_visibility(
+    is_visible_to_human: bool, root_id: str,
+) -> tuple[bool, str]:
+    """Root-level (non-threaded) messages can't fold in the human UI —
+    only threaded replies do. When an agent marks a root-level message
+    ``is_visible_to_human=false`` we coerce it back to visible (so the
+    message still goes out) and return a note to splice into the tool
+    response. The agent learns from the tool result on the spot,
+    rather than depending on the primer being current.
+
+    Returns ``(effective_visibility, note)`` — ``note`` is empty
+    unless a coercion happened.
+    """
+    if is_visible_to_human is False and not root_id.strip():
+        return True, (
+            "\nnote: is_visible_to_human=false ignored — root-level "
+            "messages can't fold; sent as visible. Use false only on "
+            "threaded replies (pass root_id)."
+        )
+    return is_visible_to_human, ""
+
+
 def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
@@ -130,7 +152,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             see this message inline. ``true`` for anything a person
             needs to read; ``false`` for agent-to-agent coordination
             chatter, which human clients fold away. There is no
-            default — judge every message.
+            default — judge every message. NOTE: ``false`` only takes
+            effect on threaded replies (when ``root_id`` is set) —
+            root-level messages can't fold, so ``false`` on one is
+            ignored and the message is sent visible.
         root_id: optional — reply inside a thread; pass the
             envelope_id of the message you're replying to.
         """
@@ -197,11 +222,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             decode_secret(sess.subkey_secret_key)
         )
 
+        effective_visible, fold_note = _coerce_root_visibility(
+            is_visible_to_human, root_id,
+        )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
             sender_subkey_id=sess.subkey_id,
-            is_visible_to_human=is_visible_to_human,
+            is_visible_to_human=effective_visible,
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
@@ -213,7 +241,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         envelope = encrypt_message(inp, signing_key)
         # Server expects the envelope at the top level, not wrapped.
         await cfg.http_client.post("/messages", envelope)
-        return f"posted {envelope.get('envelope_id', '?')} to {channel}"
+        return (
+            f"posted {envelope.get('envelope_id', '?')} to {channel}"
+            f"{fold_note}"
+        )
 
     @mcp.tool()
     async def get_channel_history(
@@ -544,7 +575,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         is_visible_to_human: REQUIRED — same semantics as
             ``send_message``: ``true`` when a person should see this,
             ``false`` for agent-to-agent chatter that human clients
-            fold away. No default — judge every send.
+            fold away. No default — judge every send. NOTE: ``false``
+            only takes effect on threaded replies (when ``root_id`` is
+            set); on a root-level message it's ignored and the
+            message is sent visible.
         caption: optional text alongside the files.
         root_id: optional thread reply, same semantics as
             ``send_message``'s ``root_id``.
@@ -684,11 +718,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             "text": caption,
             "attachments": [m.to_dict() for m in attachment_metas],
         }
+        effective_visible, fold_note = _coerce_root_visibility(
+            is_visible_to_human, root_id,
+        )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
             sender_subkey_id=sess.subkey_id,
-            is_visible_to_human=is_visible_to_human,
+            is_visible_to_human=effective_visible,
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
@@ -705,6 +742,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} bytes "
             f"total) to {channel}{thread_note} "
             f"(envelope_id {envelope.get('envelope_id', '?')})"
+            f"{fold_note}"
         )
 
     @mcp.tool()

@@ -14,6 +14,7 @@ from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encod
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
+    _coerce_root_visibility,
     register_core_tools,
 )
 
@@ -186,6 +187,94 @@ async def test_send_message_channel():
     assert r["device_id"] == "dev_recipient_1"
     assert "hpke_enc" in r
     assert "wrapped_content_key" in r
+
+
+def test_coerce_root_visibility():
+    # Root-level false → coerced to visible + a note for the agent.
+    visible, note = _coerce_root_visibility(False, "")
+    assert visible is True
+    assert "ignored" in note and "root-level" in note
+    # Threaded false (root_id set) → left alone, no note.
+    visible, note = _coerce_root_visibility(False, "msg_root")
+    assert visible is False
+    assert note == ""
+    # true is never touched, root-level or threaded.
+    assert _coerce_root_visibility(True, "") == (True, "")
+    assert _coerce_root_visibility(True, "msg_root") == (True, "")
+    # Whitespace-only root_id counts as root-level.
+    visible, note = _coerce_root_visibility(False, "   ")
+    assert visible is True and note != ""
+
+
+@pytest.mark.asyncio
+async def test_send_message_root_level_false_coerced():
+    """A root-level send with is_visible_to_human=false still posts —
+    the flag is coerced to visible and the tool response carries a
+    note so the agent learns on the spot."""
+    cfg, http, _ = _setup()
+    recipient_kem = KemKeyPair.generate()
+    http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
+        "members": [{"slug": "alice-0001", "role": "owner"}],
+    }
+    http.responses["/certs/sync?slugs=alice-0001"] = {
+        "entries": [{
+            "seq": 1,
+            "kind": "device_cert",
+            "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_recipient_1",
+                "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp,
+        "send_message",
+        {"channel": "ch_abc", "text": "agent chatter", "is_visible_to_human": False},
+    )
+    # Message still went out (warning, not error).
+    assert "posted" in result
+    assert len([1 for m, _, _ in http.calls if m == "POST"]) == 1
+    # ...and the agent is told the flag was ignored.
+    assert "is_visible_to_human=false ignored" in result
+
+
+@pytest.mark.asyncio
+async def test_send_message_threaded_false_not_coerced():
+    """A threaded reply (root_id set) keeps is_visible_to_human=false
+    — no coercion, no note."""
+    cfg, http, _ = _setup()
+    recipient_kem = KemKeyPair.generate()
+    http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
+        "members": [{"slug": "alice-0001", "role": "owner"}],
+    }
+    http.responses["/certs/sync?slugs=alice-0001"] = {
+        "entries": [{
+            "seq": 1,
+            "kind": "device_cert",
+            "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_recipient_1",
+                "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp,
+        "send_message",
+        {
+            "channel": "ch_abc",
+            "text": "agent-to-agent reply",
+            "is_visible_to_human": False,
+            "root_id": "msg_root_abc",
+        },
+    )
+    assert "posted" in result
+    assert "ignored" not in result
 
 
 @pytest.mark.asyncio
