@@ -16,7 +16,10 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.portal.api.handlers import _profile_summary
+from puffo_agent.portal.api.handlers import (
+    _profile_summary,
+    _update_profile_summary,
+)
 from puffo_agent.portal.state import AgentConfig
 
 
@@ -175,3 +178,83 @@ def test_trims_blank_lines_around_body(monkeypatch):
         )
         out = _profile_summary(cfg)
         assert out == "Line 1.\nLine 2."
+
+
+def test_soul_body_may_open_with_its_own_heading(monkeypatch):
+    """A soul body that leads with its own H1 — ``# Soul`` immediately
+    followed by ``# <agent-name>`` — is captured in full. The opening
+    heading is part of the soul, not the end of the section.
+
+    Regression: before the span fix this returned an empty string
+    because the second H1 was read as a sibling heading closing
+    ``# Soul`` instantly. The original templates (and the operator's
+    ~/Downloads/markdowns souls) all open this way."""
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        body = (
+            "# Identity\nd2d2\n\n"
+            "# Soul\n"
+            "# d2d2-butler\n\n"
+            "> Language rule: match the human.\n\n"
+            "## Identity\n\n"
+            "You are the household butler.\n"
+        )
+        cfg = _agent_with_profile(home, body)
+        out = _profile_summary(cfg)
+        assert "# d2d2-butler" in out
+        assert "> Language rule: match the human." in out
+        assert "## Identity" in out
+        assert "You are the household butler." in out
+
+
+def test_update_replaces_body_that_opens_with_a_heading(monkeypatch):
+    """Updating the soul of a profile whose body opens with its own
+    H1 REPLACES the whole body — it must not insert the new text
+    above the old (the append-duplicate bug). A post-update read
+    sees only the new content; the Identity section is untouched."""
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        body = (
+            "# Identity\nd2d2\n\n"
+            "# Soul\n"
+            "# old-title\n\n"
+            "Old soul body.\n"
+        )
+        cfg = _agent_with_profile(home, body)
+        _update_profile_summary(cfg, "# new-title\n\nBrand new soul body.")
+        out = _profile_summary(cfg)
+        assert "# new-title" in out
+        assert "Brand new soul body." in out
+        assert "old-title" not in out
+        assert "Old soul body." not in out
+        text = cfg.resolve_profile_path().read_text(encoding="utf-8")
+        assert text.startswith("# Identity\nd2d2\n")
+
+
+def test_update_preserves_trailing_section(monkeypatch):
+    """A ``# Notes`` section after ``# Soul`` survives an update —
+    only the soul body between the headings is replaced."""
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        body = (
+            "# Soul\n\nOld soul.\n\n"
+            "# Notes\n\nOperator's private notes.\n"
+        )
+        cfg = _agent_with_profile(home, body)
+        _update_profile_summary(cfg, "New soul.")
+        text = cfg.resolve_profile_path().read_text(encoding="utf-8")
+        assert "New soul." in text
+        assert "Old soul." not in text
+        assert "# Notes" in text
+        assert "Operator's private notes." in text
+
+
+def test_update_appends_soul_when_absent(monkeypatch):
+    """A profile with no description-like heading gets a fresh
+    ``# Soul`` section appended."""
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(home, "# Identity\nd2d2\n")
+        _update_profile_summary(cfg, "Freshly added soul.")
+        out = _profile_summary(cfg)
+        assert out == "Freshly added soul."
