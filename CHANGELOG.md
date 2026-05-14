@@ -4,6 +4,38 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] — 2026-05-14
+
+### Fixed
+
+- **A `# Soul` section whose body opens with its own heading is no
+  longer read as empty — or duplicated on update.** Soul templates
+  (and the operator-authored souls) open `# Soul` with a
+  `# <agent-name>` title line. Both the `_profile_summary` reader and
+  the `_update_profile_summary` writer detected the section's end as
+  "the next heading of the same-or-higher level" — and the body's own
+  opening H1 *is* such a heading:
+  - **Read** closed the section instantly and returned `""`, so the
+    web client's agent card showed "Soul not configured" even though
+    `profile.md` carried a full soul.
+  - **Write** skipped "the old body until the next heading", hit that
+    same opening H1, skipped nothing, and inserted the new summary
+    *above* the old body — an append/duplicate instead of a replace.
+    Repeated UI soul edits stacked multiple souls into one file.
+
+  Both paths now share one `_soul_section_span` helper: a
+  same-or-higher heading only closes the section once real prose (a
+  non-blank, non-heading line) has been collected. An *opening*
+  heading is part of the soul; a *trailing* `# Notes` section after
+  real soul prose still closes it and stays out. Follow-up to the
+  0.7.6 multi-line `_profile_summary` change that introduced the
+  walk-to-next-heading logic.
+
+  4 new tests in `test_profile_summary.py` (read with an opening
+  heading, write replaces an opening-heading body without
+  duplication, trailing section preserved on update, append-when-
+  absent). Full suite: 548 passed, 7 skipped.
+
 ## [0.8.1] — 2026-05-14
 
 ### Added
@@ -662,7 +694,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.2...HEAD
+[0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2
 [0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1
 [0.8.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.0
 [0.7.5]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.5
