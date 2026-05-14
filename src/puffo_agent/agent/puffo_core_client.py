@@ -277,6 +277,51 @@ def _maybe_redact_long_text(
     return placeholder
 
 
+# Anthropic's API rejects any conversation containing an image whose
+# longest edge tops 2000px. Claude-code Read-ing such an attachment
+# poisons the session transcript — every later turn then fails
+# wholesale (see ClaudeSession._looks_like_poisoned_session). We
+# can't stop claude-code Read-ing a file, but we CAN keep the file
+# on disk in bounds. 1568px is Anthropic's recommended max — well
+# under the 2000px hard cap.
+_MAX_IMAGE_EDGE_PX = 1568
+
+
+def _downscale_oversized_image(path) -> None:
+    """Resize ``path`` in place if it's an image whose longest edge
+    tops ``_MAX_IMAGE_EDGE_PX``. No-op for non-images, small images,
+    or anything Pillow can't open (claude-code's loader can't open
+    it either, so it can't reach the API as an oversized image).
+    Best-effort — never raises."""
+    try:
+        from PIL import Image
+    except ImportError:
+        logger.warning(
+            "Pillow missing — inbound images aren't dimension-checked; "
+            "an oversized image can dead-lock the claude session "
+            "(pip install pillow)",
+        )
+        return
+    try:
+        with Image.open(path) as img:
+            img.load()
+            w, h = img.size
+            longest = max(w, h)
+            if longest <= _MAX_IMAGE_EDGE_PX:
+                return
+            scale = _MAX_IMAGE_EDGE_PX / longest
+            new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
+            fmt = img.format or "PNG"
+            img.resize(new_size, Image.LANCZOS).save(path, format=fmt)
+        logger.info(
+            "downscaled inbound image %s: %dx%d -> %dx%d "
+            "(claude image dimension cap)",
+            getattr(path, "name", path), w, h, new_size[0], new_size[1],
+        )
+    except Exception as exc:
+        logger.warning("could not dimension-check image %s: %s", path, exc)
+
+
 class DeviceKeyCache:
     """Caches sender signing public keys.
 
@@ -1888,6 +1933,10 @@ class PuffoCoreMessageClient:
                     "attachment save failed (%s): %s", target, exc,
                 )
                 continue
+            # Shrink oversized images before the agent can Read them
+            # into — and poison — its claude session. Off-loop: Pillow
+            # decode/resize is blocking.
+            await asyncio.to_thread(_downscale_oversized_image, target)
             paths.append(str(target))
         return paths
 

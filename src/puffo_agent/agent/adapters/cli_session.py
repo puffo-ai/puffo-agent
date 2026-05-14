@@ -67,11 +67,35 @@ _AUTH_ERROR_MARKERS = (
 AUTH_RETRY_BACKOFFS_SECONDS = (3, 6, 12, 24)
 
 
+# Case-insensitive substrings that mark a claude reply as a POISONED
+# SESSION: the conversation transcript accumulated content the API
+# now rejects wholesale (most commonly an image whose longest edge
+# tops 2000px). ``--resume`` reloads the same poisoned transcript, so
+# every later turn fails identically and the agent dead-locks. The
+# only fix is what the API itself advises — start a fresh session.
+# Kept STRONG-ONLY: these are verbatim API error strings, vanishingly
+# unlikely in normal chatter. The inbound-image downscale
+# (puffo_core_client._downscale_oversized_image) is the prevention
+# half; this is the recovery half for anything that slips through or
+# is already stuck in an existing transcript.
+_POISONED_SESSION_MARKERS = (
+    "exceeds the dimension limit for many-image requests",
+    "start a new session with fewer images",
+)
+
+
 def _looks_like_auth_error(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
     return any(marker in low for marker in _AUTH_ERROR_MARKERS)
+
+
+def _looks_like_poisoned_session(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _POISONED_SESSION_MARKERS)
 
 
 class AuditLog:
@@ -193,6 +217,34 @@ class ClaudeSession:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    async def _one_turn_with_poison_recovery(
+        self, user_message: str, system_prompt: str,
+    ) -> TurnResult:
+        """``_one_turn`` plus a single fresh-session retry when the
+        turn comes back poisoned.
+
+        ``_one_turn`` already cleared the session id + killed the
+        subprocess on detection, so ``_ensure_running`` here spawns a
+        FRESH session with no transcript — the poison was content from
+        an EARLIER turn that the fresh session simply doesn't have.
+        The current message's own image attachments are downscaled at
+        save time, so re-sending it on the clean transcript succeeds;
+        without this retry the triggering message would be silently
+        dropped (it never gets another turn if it's the only inbound
+        message). Retried at most once: if the message itself somehow
+        still poisons the fresh session, return the (empty) poisoned
+        result rather than loop."""
+        result = await self._one_turn(user_message)
+        if not result.metadata.get("poisoned_session"):
+            return result
+        logger.warning(
+            "agent %s: re-running the turn on a fresh session after "
+            "poisoned-transcript recovery so the message isn't dropped",
+            self.agent_id,
+        )
+        await self._ensure_running(system_prompt)
+        return await self._one_turn(user_message)
+
     async def run_turn(self, user_message: str, system_prompt: str) -> TurnResult:
         async with self._lock:
             await self._ensure_running(system_prompt)
@@ -214,7 +266,9 @@ class ClaudeSession:
                     # during the wait. Respawn re-reads the shared
                     # credentials file.
                     await self._ensure_running(system_prompt)
-                result = await self._one_turn(user_message)
+                result = await self._one_turn_with_poison_recovery(
+                    user_message, system_prompt,
+                )
                 if not _looks_like_auth_error(result.reply):
                     return result
                 last_result = result
@@ -291,7 +345,9 @@ class ClaudeSession:
                     self.agent_id,
                 )
                 user_message = fallback_user_message
-            return await self._one_turn(user_message)
+            return await self._one_turn_with_poison_recovery(
+                user_message, system_prompt,
+            )
 
     async def warm(self, system_prompt: str) -> None:
         """Spawn the claude subprocess without running a turn so the
@@ -499,6 +555,28 @@ class ClaudeSession:
             )
         await self._kill_proc()
 
+    async def _handle_poisoned_session(self, reply: str) -> None:
+        """Recovery for a poisoned session transcript (see
+        ``_POISONED_SESSION_MARKERS``). ``--resume`` would reload the
+        same rejected content, so clear the session id AND kill the
+        subprocess: the next turn spawns a FRESH session with no
+        transcript. The dropped turn is re-readable from messages.db,
+        so the agent can rebuild context on its next turn."""
+        logger.error(
+            "agent %s: claude session poisoned (API rejects the whole "
+            "conversation) — clearing session id, respawning fresh. "
+            "reply: %s",
+            self.agent_id, reply[:300],
+        )
+        if self.audit is not None:
+            self.audit.write(
+                "session.poisoned",
+                reply=reply,
+                action="cleared_session_id_and_respawned_fresh",
+            )
+        self._clear_session_id()
+        await self._kill_proc()
+
     async def _kill_proc(self) -> None:
         if self._proc is None:
             return
@@ -651,6 +729,18 @@ class ClaudeSession:
                 break
 
         reply = "".join(reply_parts).strip()
+
+        # Poisoned-session recovery. If the API rejected the whole
+        # conversation (oversized image in the transcript, etc),
+        # ``--resume`` would just reload the same poison — clear the
+        # session id + kill the subprocess so the next turn starts
+        # fresh. Empty reply (mirrors the stream-error contract) so
+        # the shell suppresses the post; the metadata flag lets the
+        # worker surface the reset.
+        if _looks_like_poisoned_session(reply):
+            await self._handle_poisoned_session(reply)
+            return TurnResult(reply="", metadata={"poisoned_session": True})
+
         if not reply:
             logger.warning(
                 "agent %s: claude turn produced no text reply. events seen: %s",
