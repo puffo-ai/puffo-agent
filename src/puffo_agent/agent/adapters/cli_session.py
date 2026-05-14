@@ -67,11 +67,35 @@ _AUTH_ERROR_MARKERS = (
 AUTH_RETRY_BACKOFFS_SECONDS = (3, 6, 12, 24)
 
 
+# Case-insensitive substrings that mark a claude reply as a POISONED
+# SESSION: the conversation transcript accumulated content the API
+# now rejects wholesale (most commonly an image whose longest edge
+# tops 2000px). ``--resume`` reloads the same poisoned transcript, so
+# every later turn fails identically and the agent dead-locks. The
+# only fix is what the API itself advises — start a fresh session.
+# Kept STRONG-ONLY: these are verbatim API error strings, vanishingly
+# unlikely in normal chatter. The inbound-image downscale
+# (puffo_core_client._downscale_oversized_image) is the prevention
+# half; this is the recovery half for anything that slips through or
+# is already stuck in an existing transcript.
+_POISONED_SESSION_MARKERS = (
+    "exceeds the dimension limit for many-image requests",
+    "start a new session with fewer images",
+)
+
+
 def _looks_like_auth_error(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
     return any(marker in low for marker in _AUTH_ERROR_MARKERS)
+
+
+def _looks_like_poisoned_session(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _POISONED_SESSION_MARKERS)
 
 
 class AuditLog:
@@ -499,6 +523,28 @@ class ClaudeSession:
             )
         await self._kill_proc()
 
+    async def _handle_poisoned_session(self, reply: str) -> None:
+        """Recovery for a poisoned session transcript (see
+        ``_POISONED_SESSION_MARKERS``). ``--resume`` would reload the
+        same rejected content, so clear the session id AND kill the
+        subprocess: the next turn spawns a FRESH session with no
+        transcript. The dropped turn is re-readable from messages.db,
+        so the agent can rebuild context on its next turn."""
+        logger.error(
+            "agent %s: claude session poisoned (API rejects the whole "
+            "conversation) — clearing session id, respawning fresh. "
+            "reply: %s",
+            self.agent_id, reply[:300],
+        )
+        if self.audit is not None:
+            self.audit.write(
+                "session.poisoned",
+                reply=reply,
+                action="cleared_session_id_and_respawned_fresh",
+            )
+        self._clear_session_id()
+        await self._kill_proc()
+
     async def _kill_proc(self) -> None:
         if self._proc is None:
             return
@@ -651,6 +697,18 @@ class ClaudeSession:
                 break
 
         reply = "".join(reply_parts).strip()
+
+        # Poisoned-session recovery. If the API rejected the whole
+        # conversation (oversized image in the transcript, etc),
+        # ``--resume`` would just reload the same poison — clear the
+        # session id + kill the subprocess so the next turn starts
+        # fresh. Empty reply (mirrors the stream-error contract) so
+        # the shell suppresses the post; the metadata flag lets the
+        # worker surface the reset.
+        if _looks_like_poisoned_session(reply):
+            await self._handle_poisoned_session(reply)
+            return TurnResult(reply="", metadata={"poisoned_session": True})
+
         if not reply:
             logger.warning(
                 "agent %s: claude turn produced no text reply. events seen: %s",

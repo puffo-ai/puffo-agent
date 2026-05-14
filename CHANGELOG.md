@@ -6,6 +6,35 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **An oversized inbound image can no longer dead-lock an agent.**
+  Anthropic's API rejects any conversation containing an image whose
+  longest edge tops 2000px ("exceeds the dimension limit for
+  many-image requests — start a new session with fewer images").
+  Once claude-code Read such an attachment into its session
+  transcript, EVERY later turn failed wholesale and the agent was
+  permanently stuck — the image analogue of the long-message
+  problem fixed in 0.7.9.
+
+  Two-part fix:
+  - **Prevention** — inbound image attachments are dimension-checked
+    and downscaled in place at save time (longest edge pinned to
+    1568px, Anthropic's recommended max, well under the hard cap),
+    so claude-code only ever loads in-bounds images. Adds a Pillow
+    dependency; non-images, already-small images, and anything
+    Pillow can't open are left untouched.
+  - **Recovery** — if a poison reaches the API anyway (or is already
+    stuck in an existing transcript), the ``claude`` session adapter
+    now recognises the rejection, clears the persisted session id,
+    and kills the subprocess so the next turn spawns a FRESH session
+    instead of ``--resume``-ing onto the same poisoned transcript.
+    The dropped turn stays in ``messages.db`` for the agent to page
+    back in on its next turn.
+
+  Existing stuck agents recover automatically on their next inbound
+  message — no operator action needed.
+
 ## [0.7.9] — 2026-05-13
 
 ### Fixed

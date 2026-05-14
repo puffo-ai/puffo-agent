@@ -38,6 +38,9 @@ dependencies = [
     "anthropic>=0.25",
     "cryptography>=43.0",
     "mcp>=1.0",
+    # Pillow: dimension-check + downscale inbound image attachments so
+    # an oversized image can't poison the agent's claude session.
+    "pillow>=10.0",
     "pyhpke>=0.6",
     "openai>=1.30",
     "psutil>=5.9",

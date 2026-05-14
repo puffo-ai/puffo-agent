@@ -18,6 +18,7 @@ from puffo_agent.agent.adapters.cli_session import (
     STREAM_READER_LIMIT_BYTES,
     AuditLog,
     ClaudeSession,
+    _looks_like_poisoned_session,
 )
 
 
@@ -306,3 +307,111 @@ def test_refresh_oneshot_sets_auth_healthy_on_success(tmp_path):
         asyncio.run(adapter._run_refresh_oneshot())
 
     assert adapter.auth_healthy is True
+
+
+# ── Test 4: poisoned-session recovery ────────────────────────────────────────
+
+
+def test_looks_like_poisoned_session_matches_image_dimension_error():
+    """Verbatim API error strings match; ordinary chat does not."""
+    assert _looks_like_poisoned_session(
+        "API Error: An image in the conversation exceeds the dimension "
+        "limit for many-image requests (2000px). Start a new session "
+        "with fewer images."
+    )
+    # Case-insensitive.
+    assert _looks_like_poisoned_session("START A NEW SESSION WITH FEWER IMAGES")
+    # No false positive on normal replies.
+    assert not _looks_like_poisoned_session("Sure, here's the image you asked about.")
+    assert not _looks_like_poisoned_session("")
+
+
+def test_one_turn_recovers_from_poisoned_session(tmp_path, caplog):
+    """A reply carrying the oversized-image API error must: return an
+    empty reply (so the channel sees nothing), flag
+    ``poisoned_session`` in metadata, CLEAR the persisted session id
+    (so the next spawn is fresh, not ``--resume`` onto the same
+    poisoned transcript), kill the subprocess, and audit the reset.
+    """
+    poison = (
+        "API Error: An image in the conversation exceeds the dimension "
+        "limit for many-image requests (2000px). Start a new session "
+        "with fewer images."
+    )
+    assistant = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": poison}]},
+    }
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-poisoned",
+        "usage": {"input_tokens": 5, "output_tokens": 5},
+    }
+    lines = [
+        (json.dumps(assistant) + "\n").encode("utf-8"),
+        (json.dumps(result) + "\n").encode("utf-8"),
+    ]
+    session = _make_session(tmp_path)
+    # Pretend a prior turn persisted a session id — that's what makes
+    # the next spawn try --resume onto the poisoned transcript.
+    session._save_session_id("sess-poisoned")
+    assert session.session_file.exists()
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=lines)
+        return await session._one_turn("look at this picture")
+
+    with caplog.at_level(logging.ERROR):
+        out = asyncio.run(drive())
+
+    # Empty reply — the raw API error must not post as a bot message.
+    assert out.reply == ""
+    assert out.metadata.get("poisoned_session") is True
+    # Session id cleared on disk AND in memory — next spawn is fresh.
+    assert not session.session_file.exists()
+    assert session._session_id == ""
+    # Subprocess killed so the next turn respawns.
+    assert session._proc is None
+
+    events = _read_audit_events(tmp_path / "audit.log")
+    poisoned = [e for e in events if e.get("event") == "session.poisoned"]
+    assert len(poisoned) == 1
+    assert poisoned[0]["action"] == "cleared_session_id_and_respawned_fresh"
+
+    assert any(
+        "poisoned" in r.message and r.levelno == logging.ERROR
+        for r in caplog.records
+    ), "expected an ERROR log naming the poisoned session"
+
+
+def test_one_turn_normal_reply_keeps_session(tmp_path):
+    """A clean reply leaves the persisted session id intact — the
+    recovery path must not fire on ordinary turns."""
+    assistant = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "all good, here you go"}]},
+    }
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-healthy",
+        "usage": {"input_tokens": 5, "output_tokens": 5},
+    }
+    lines = [
+        (json.dumps(assistant) + "\n").encode("utf-8"),
+        (json.dumps(result) + "\n").encode("utf-8"),
+    ]
+    session = _make_session(tmp_path)
+    session._save_session_id("sess-healthy")
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=lines)
+        return await session._one_turn("hello")
+
+    out = asyncio.run(drive())
+
+    assert out.reply == "all good, here you go"
+    assert out.metadata.get("poisoned_session") is None
+    assert session.session_file.exists()
+    assert session._session_id == "sess-healthy"
