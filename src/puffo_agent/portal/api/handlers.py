@@ -278,69 +278,100 @@ async def list_agents(request: web.Request) -> web.Response:
     return web.json_response({"agents": items})
 
 
+_DESCRIPTION_HEADINGS = {"soul", "description", "about", "summary"}
+
+
+def _atx_heading(raw: str) -> tuple[int, str]:
+    """``(level, lowercased text)`` for an ATX markdown heading, or
+    ``(0, "")`` for any non-heading line. ``#hashtag`` (no space after
+    the ``#``) isn't a heading in CommonMark and reads as level 0."""
+    stripped = raw.lstrip()
+    if not stripped.startswith("#"):
+        return 0, ""
+    i = 0
+    while i < len(stripped) and stripped[i] == "#":
+        i += 1
+    if i < len(stripped) and stripped[i] in " \t":
+        return i, stripped[i:].strip().lower()
+    return 0, ""
+
+
+def _soul_section_span(lines: list[str]) -> tuple[int, int, int] | None:
+    """Locate the description / ``# Soul`` section in a profile.md.
+
+    Returns ``(heading_idx, body_start, body_end)``:
+      - ``heading_idx`` — index of the ``# Soul`` (or ``description`` /
+        ``about`` / ``summary``) heading line,
+      - ``body_start`` — first line after that heading,
+      - ``body_end`` — exclusive index where the section ends: the
+        next heading of the same-or-higher level that appears *after*
+        the soul body has real (non-blank, non-heading) content, or
+        EOF.
+
+    ``None`` when there is no description-like heading.
+
+    The "after real content" gate is the fix for the opening-heading
+    footgun: a soul body legitimately opens with its own heading
+    (``# Soul`` immediately followed by ``# <agent-name>``), and that
+    heading must not be mistaken for the *end* of the section. A
+    same-or-higher heading only closes the section once actual prose
+    has been collected — matching the operator's intent: a trailing
+    ``# Notes`` section is theirs, an opening ``# Name`` line is the
+    soul's. Single source of truth for both the read path
+    (``_profile_summary``) and the write path
+    (``_update_profile_summary``)."""
+    heading_idx = -1
+    section_level = 0
+    for idx, raw in enumerate(lines):
+        level, text = _atx_heading(raw)
+        if level and text in _DESCRIPTION_HEADINGS:
+            heading_idx = idx
+            section_level = level
+            break
+    if heading_idx == -1:
+        return None
+
+    body_start = heading_idx + 1
+    body_end = len(lines)
+    has_text = False
+    for idx in range(body_start, len(lines)):
+        raw = lines[idx]
+        level, _ = _atx_heading(raw)
+        if level:
+            if level <= section_level and has_text:
+                body_end = idx
+                break
+            # Deeper heading, or a heading before any prose — part of
+            # the soul body either way.
+            continue
+        if raw.strip():
+            has_text = True
+    return heading_idx, body_start, body_end
+
+
 def _profile_summary(cfg: AgentConfig) -> str:
     """Return the full body of the agent's ``# Soul`` section from
     profile.md (or any description-like heading: ``description`` /
-    ``about`` / ``summary``). Picks up everything between the
-    matching heading and the next heading **of the same or higher
-    level** (or EOF). Sub-headings inside the section (``## Tone``,
-    ``## What you don't do`` etc.) stay part of the body so the
-    operator's structured markdown round-trips faithfully.
+    ``about`` / ``summary``) — see ``_soul_section_span`` for exactly
+    where the section starts and ends. Sub-headings inside the
+    section (``## Tone`` etc.), and an opening heading the soul body
+    leads with, stay part of the body so the operator's structured
+    markdown round-trips faithfully.
 
     Surrounding blank lines are trimmed; internal blank lines are
-    preserved.
-
-    Empty string when no such section exists or the profile is
-    unreadable.
-
-    The asymmetric "read first line, write full body" the helper had
-    before broke the new agent-card Soul-expand UI; the H2-stops-
-    collection bug then truncated multi-section souls (the operator's
-    helper template uses ``## How you act`` / ``## Tone`` / etc.)
-    even after the multi-line fix landed."""
+    preserved. Empty string when no such section exists or the
+    profile is unreadable."""
     try:
         text = cfg.resolve_profile_path().read_text(encoding="utf-8")
     except Exception:
         return ""
 
-    description_heading = {"soul", "description", "about", "summary"}
-    body_lines: list[str] = []
-    in_description = False
-    section_level = 0  # ``#`` → 1, ``##`` → 2, etc.
-
-    for raw in text.splitlines():
-        stripped = raw.lstrip()
-        # Recognise a heading: one or more leading ``#`` followed by
-        # whitespace then text. ``#hashtag`` (no space) isn't a
-        # heading in CommonMark; ignore it.
-        is_heading = False
-        level = 0
-        heading_text = ""
-        if stripped.startswith("#"):
-            # Count consecutive '#'s.
-            i = 0
-            while i < len(stripped) and stripped[i] == "#":
-                i += 1
-            if i < len(stripped) and stripped[i] in " \t":
-                level = i
-                heading_text = stripped[i:].strip().lower()
-                is_heading = True
-
-        if is_heading:
-            if in_description:
-                if level <= section_level:
-                    # Same-or-higher-level heading closes the section.
-                    break
-                # Deeper heading — part of the soul body.
-                body_lines.append(raw)
-                continue
-            if heading_text in description_heading:
-                in_description = True
-                section_level = level
-            continue
-
-        if in_description:
-            body_lines.append(raw)
+    lines = text.splitlines()
+    span = _soul_section_span(lines)
+    if span is None:
+        return ""
+    _, body_start, body_end = span
+    body_lines = lines[body_start:body_end]
 
     # Trim leading + trailing blank lines so the returned body
     # doesn't carry the layout whitespace operators leave around
@@ -664,40 +695,31 @@ def _derive_role_short(role: str) -> str:
 
 def _update_profile_summary(cfg: AgentConfig, new_summary: str) -> None:
     """Rewrite the description section of profile.md with
-    ``new_summary``. Replaces the body of the first matching heading
-    (soul / description / about / summary); appends a new ``# Soul``
-    section when no such heading exists.
+    ``new_summary``. Replaces the whole body of the ``# Soul`` (or
+    description / about / summary) section — its bounds come from
+    ``_soul_section_span``, the same logic the read path uses, so an
+    update round-trips faithfully and never appends a duplicate.
+    Appends a fresh ``# Soul`` section when no such heading exists.
     """
     try:
         path = cfg.resolve_profile_path()
         text = path.read_text(encoding="utf-8")
         lines = text.splitlines(keepends=True)
 
-        description_heading = {"soul", "description", "about", "summary"}
-        new_lines: list[str] = []
-        i = 0
-        found = False
-
-        while i < len(lines):
-            raw = lines[i]
-            stripped = raw.strip()
-            if stripped.startswith("#"):
-                heading = stripped.lstrip("#").strip().lower()
-                if heading in description_heading:
-                    new_lines.append(raw)  # keep the heading line
-                    i += 1
-                    # Skip existing body lines until the next heading or EOF
-                    while i < len(lines) and not lines[i].strip().startswith("#"):
-                        i += 1
-                    # Insert updated summary (single line)
-                    new_lines.append(new_summary + "\n")
-                    found = True
-                    continue
-            new_lines.append(raw)
-            i += 1
-
-        if not found:
-            # No matching heading — append a new Soul section
+        # Span is computed on newline-stripped copies so the indices
+        # line up 1:1 with ``lines`` (splitlines(keepends=True) yields
+        # the same element count, just with the line endings kept).
+        span = _soul_section_span([raw.rstrip("\r\n") for raw in lines])
+        if span is not None:
+            _, body_start, body_end = span
+            new_lines = (
+                lines[:body_start]
+                + ["\n", new_summary + "\n"]
+                + lines[body_end:]
+            )
+        else:
+            # No matching heading — append a fresh Soul section.
+            new_lines = list(lines)
             if new_lines and not new_lines[-1].endswith("\n"):
                 new_lines.append("\n")
             new_lines.extend(["\n# Soul\n", new_summary + "\n"])
