@@ -20,15 +20,8 @@ from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
 from ..agent.shared_content import (
-
-    assemble_claude_md,
-    ensure_shared_primer,
     looks_like_managed_claude_md,
-    read_memory_snapshot,
-    read_shared_primer,
-    sync_shared_skills,
-    write_claude_md,
-    write_gemini_md,
+    rebuild_agent_claude_md,
 )
 from .state import (
     AgentConfig,
@@ -434,24 +427,13 @@ class Worker:
             # chat-local / sdk-local don't auto-discover, so the same
             # string is passed as PuffoAgent's system_prompt.
             shared_path = docker_shared_dir()
-            ensure_shared_primer(shared_path)
-            sync_shared_skills(shared_path, Path(workspace_path))
-            primer = read_shared_primer(shared_path)
-            try:
-                profile_text = Path(profile_path).read_text(encoding="utf-8")
-            except OSError:
-                profile_text = ""
-            claude_md = assemble_claude_md(
-                shared_primer=primer,
-                profile=profile_text,
-                memory_snapshot=read_memory_snapshot(Path(memory_path)),
-            )
-            write_claude_md(agent_claude_user_dir(agent_id), claude_md)
-
-            # Mirror the same content to user-level GEMINI.md so a
-            # harness swap doesn't need another sync cycle.
-            write_gemini_md(
-                agent_home_dir(agent_id) / ".gemini", claude_md,
+            claude_md = rebuild_agent_claude_md(
+                shared_dir=shared_path,
+                profile_path=Path(profile_path),
+                memory_dir=Path(memory_path),
+                workspace_dir=Path(workspace_path),
+                claude_user_dir=agent_claude_user_dir(agent_id),
+                gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
             )
 
             # One-time migration: remove an older project-level
@@ -825,19 +807,14 @@ async def _reload_from_disk(
     any cached subprocess. Failures are logged but don't drop the
     turn — a stale prompt beats a dropped message."""
     try:
-        ensure_shared_primer(shared_path)
-        sync_shared_skills(shared_path, Path(workspace_path))
-        primer = read_shared_primer(shared_path)
-        try:
-            profile_text = Path(profile_path).read_text(encoding="utf-8")
-        except OSError:
-            profile_text = ""
-        new_md = assemble_claude_md(
-            shared_primer=primer,
-            profile=profile_text,
-            memory_snapshot=read_memory_snapshot(Path(memory_path)),
+        new_md = rebuild_agent_claude_md(
+            shared_dir=shared_path,
+            profile_path=Path(profile_path),
+            memory_dir=Path(memory_path),
+            workspace_dir=Path(workspace_path),
+            claude_user_dir=agent_claude_user_dir(agent_id),
+            gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
         )
-        write_claude_md(agent_claude_user_dir(agent_id), new_md)
         puffo.system_prompt = new_md
         await adapter.reload(new_md)
         logger.info("agent %s: reloaded system prompt from disk", agent_id)

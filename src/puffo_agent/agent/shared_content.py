@@ -9,6 +9,7 @@ combines primer + profile + memory snapshot into the per-agent prompt.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from pathlib import Path
 
 
@@ -722,23 +723,72 @@ DEFAULT_SKILLS: dict[str, str] = {
 }
 
 
+def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
+    """The shared-primer files the daemon owns, paired with the
+    content baked into this install. Single source of truth for both
+    ``ensure_shared_primer`` (seed-if-missing) and
+    ``reseed_shared_primer`` (force back to this version).
+    """
+    yield shared_dir / "CLAUDE.md", DEFAULT_SHARED_CLAUDE_MD
+    yield shared_dir / "README.md", DEFAULT_SHARED_README
+    for name, body in DEFAULT_SKILLS.items():
+        yield shared_dir / "skills" / name, body
+
+
 def ensure_shared_primer(shared_dir: Path) -> None:
     """Create ``shared_dir`` and seed defaults. Idempotent — never
-    overwrites existing files so operator edits survive.
+    overwrites existing files so operator edits survive. Use
+    ``reseed_shared_primer`` to force the files back to this install's
+    version (e.g. after a ``puffo-agent`` upgrade).
     """
     shared_dir.mkdir(parents=True, exist_ok=True)
-    primer = shared_dir / "CLAUDE.md"
-    if not primer.exists():
-        primer.write_text(DEFAULT_SHARED_CLAUDE_MD, encoding="utf-8")
-    readme = shared_dir / "README.md"
-    if not readme.exists():
-        readme.write_text(DEFAULT_SHARED_README, encoding="utf-8")
-    skills_dir = shared_dir / "skills"
-    skills_dir.mkdir(exist_ok=True)
-    for name, body in DEFAULT_SKILLS.items():
-        path = skills_dir / name
+    (shared_dir / "skills").mkdir(exist_ok=True)
+    for path, body in _managed_primer_files(shared_dir):
         if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(body, encoding="utf-8")
+
+
+def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
+    """Force the managed shared-primer files (CLAUDE.md, README.md,
+    skills/*) back to the versions baked into this install. Unlike
+    ``ensure_shared_primer`` this DOES overwrite — but only files
+    whose content differs, and it saves a ``.bak`` of anything it
+    replaces so operator edits are recoverable.
+
+    Returns ``[(relative_path, action)]`` sorted by path, where action
+    is ``"created"``, ``"updated (backed up)"``, or ``"unchanged"``.
+    """
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    (shared_dir / "skills").mkdir(exist_ok=True)
+    results: list[tuple[str, str]] = []
+    for path, body in _managed_primer_files(shared_dir):
+        rel = path.relative_to(shared_dir).as_posix()
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            results.append((rel, "created"))
+            continue
+        try:
+            current = path.read_text(encoding="utf-8")
+        except OSError:
+            current = None
+        if current == body:
+            results.append((rel, "unchanged"))
+            continue
+        # Content differs (operator edit, or a stale pre-upgrade
+        # version) — keep a recoverable copy, then overwrite.
+        if current is not None:
+            try:
+                path.with_suffix(path.suffix + ".bak").write_text(
+                    current, encoding="utf-8",
+                )
+            except OSError:
+                pass
+        path.write_text(body, encoding="utf-8")
+        results.append((rel, "updated (backed up)"))
+    results.sort()
+    return results
 
 
 def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
@@ -837,6 +887,42 @@ def write_gemini_md(gemini_dir: Path, content: str) -> Path:
     path = gemini_dir / "GEMINI.md"
     path.write_text(content, encoding="utf-8")
     return path
+
+
+def rebuild_agent_claude_md(
+    *,
+    shared_dir: Path,
+    profile_path: Path,
+    memory_dir: Path,
+    workspace_dir: Path,
+    claude_user_dir: Path,
+    gemini_user_dir: Path,
+) -> str:
+    """Assemble + write one agent's managed CLAUDE.md / GEMINI.md.
+
+    Seeds the shared primer if missing, mirrors shared skills into the
+    workspace, reads the agent's ``profile.md`` + memory snapshot, then
+    writes the combined prompt to the agent's USER-level ``.claude/`` /
+    ``.gemini/`` dirs. Returns the assembled CLAUDE.md string.
+
+    Shared by the worker's startup path and the ``agent reset-primer``
+    CLI command so the assembly sequence lives in exactly one place.
+    """
+    ensure_shared_primer(shared_dir)
+    sync_shared_skills(shared_dir, workspace_dir)
+    primer = read_shared_primer(shared_dir)
+    try:
+        profile_text = profile_path.read_text(encoding="utf-8")
+    except OSError:
+        profile_text = ""
+    claude_md = assemble_claude_md(
+        shared_primer=primer,
+        profile=profile_text,
+        memory_snapshot=read_memory_snapshot(memory_dir),
+    )
+    write_claude_md(claude_user_dir, claude_md)
+    write_gemini_md(gemini_user_dir, claude_md)
+    return claude_md
 
 
 # First line of the default shared primer. Used to identify
