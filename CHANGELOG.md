@@ -4,6 +4,25 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`PuffoCoreHttpClient` no longer hands callers a raw string body
+  as if it were a parsed JSON response.** When a 2xx response carried
+  a non-empty, non-JSON body — a proxy / CDN error page, a gateway
+  interstitial, a plain-text error — `_do_request`'s `json.loads`
+  fallback returned the raw string, and every caller of
+  `get()` / `post()` (`mcp__puffo__send_message` channel resolution,
+  `list_channels`, …) then did `.get()` on it and crashed three
+  layers up with the opaque `'str' object has no attribute 'get'`.
+  Reported via FB-76: `send_message` to a channel id and
+  `list_channels` failing identically — the shared `http_client`
+  layer, not an endpoint-specific bug. `_request` now raises
+  `HttpError` with the actual body when a 2xx response isn't JSON, so
+  the failure is diagnosable at the source. Empty 2xx bodies (204 No
+  Content etc.) are unaffected. 2 new tests in `test_http_client.py`.
+
 ## [0.8.2] — 2026-05-14
 
 ### Fixed
