@@ -28,6 +28,7 @@ from .state import (
     RuntimeConfig,
     RuntimeState,
     TriggerRules,
+    agent_claude_user_dir,
     agent_dir,
     agent_home_dir,
     agent_yml_path,
@@ -38,6 +39,7 @@ from .state import (
     daemon_yml_path,
     daemon_pid_path,
     discover_agents,
+    docker_shared_dir,
     home_dir,
     is_daemon_alive,
     is_valid_agent_id,
@@ -1125,6 +1127,65 @@ def cmd_agent_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
+    """Re-seed the shared platform primer to this install's version,
+    then rebuild the listed agents' managed CLAUDE.md from it.
+
+    The shared primer is a single file shared by every agent, so the
+    re-seed is global — the agent id list only scopes which agents'
+    CLAUDE.md gets rebuilt. Running workers keep their already-loaded
+    prompt; the rebuilt file takes effect on their next restart.
+    """
+    from ..agent.shared_content import (
+        rebuild_agent_claude_md,
+        reseed_shared_primer,
+    )
+
+    shared_dir = docker_shared_dir()
+    actions = reseed_shared_primer(shared_dir)
+    print(f"shared primer ({shared_dir}):")
+    for rel, action in actions:
+        print(f"  {rel}: {action}")
+
+    rc = 0
+    rebuilt: list[str] = []
+    for agent_id in args.ids:
+        if not agent_yml_path(agent_id).exists():
+            print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+            rc = 2
+            continue
+        try:
+            cfg = AgentConfig.load(agent_id)
+        except Exception as exc:
+            print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
+        rebuild_agent_claude_md(
+            shared_dir=shared_dir,
+            profile_path=cfg.resolve_profile_path(),
+            memory_dir=cfg.resolve_memory_dir(),
+            workspace_dir=cfg.resolve_workspace_dir(),
+            claude_user_dir=agent_claude_user_dir(agent_id),
+            gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+        )
+        rebuilt.append(agent_id)
+        print(f"rebuilt CLAUDE.md for {agent_id!r}")
+
+    if rebuilt:
+        if is_daemon_alive():
+            print(
+                "note: a running worker keeps its already-loaded prompt — "
+                "the rebuilt CLAUDE.md takes effect when the agent's worker "
+                "next restarts (or it calls reload_system_prompt)."
+            )
+        else:
+            print(
+                "note: agents will pick up the rebuilt CLAUDE.md on the "
+                "next `puffo-agent start`."
+            )
+    return rc
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1409,6 +1470,21 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("id")
     export.add_argument("dest", help="Destination .zip file")
     export.set_defaults(func=cmd_agent_export)
+
+    reset_primer = agent_sub.add_parser(
+        "reset-primer",
+        help=(
+            "Re-seed the shared platform primer to this install's version "
+            "and rebuild the listed agents' CLAUDE.md from it"
+        ),
+    )
+    reset_primer.add_argument(
+        "ids",
+        nargs="+",
+        metavar="agent_id",
+        help="agent id(s) whose CLAUDE.md to rebuild",
+    )
+    reset_primer.set_defaults(func=cmd_agent_reset_primer)
 
     # Bridge / local HTTP API admin.
     pairing = sub.add_parser(
