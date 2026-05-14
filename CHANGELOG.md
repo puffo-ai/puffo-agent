@@ -4,6 +4,39 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-05-14
+
+### Added
+
+- **`puffo-agent agent reset-primer <id> ...`** — re-seed the shared
+  platform primer to the installed version. The shared primer
+  (`~/.puffo-agent/docker/shared/CLAUDE.md` + `skills/`) is
+  seed-once: `ensure_shared_primer` never overwrites it, so a
+  `puffo-agent` upgrade never reached existing installs — primer
+  updates only landed on brand-new machines. The new command
+  force-rewrites the managed shared files to this install's version
+  (unchanged files skipped, edited ones backed up to `<file>.bak`
+  first), then rebuilds each listed agent's managed `CLAUDE.md` /
+  `GEMINI.md` from the fresh primer. The re-seed is global — the
+  agent id list only scopes which agents get rebuilt. Running
+  workers keep their loaded prompt; the rebuild takes effect on the
+  worker's next restart.
+
+### Fixed
+
+- **`is_visible_to_human=false` on a root-level message is no longer
+  a silent no-op.** Root-level (non-threaded) messages can't fold in
+  the human UI — only threaded replies do — so an agent passing
+  `false` on a root-level `send_message` /
+  `send_message_with_attachments` was producing a message that
+  rendered visible anyway but was inconsistently excluded from
+  unread counts. The tools now coerce the flag back to visible (the
+  message still goes out — a warning, not an error) and splice a
+  note into the tool response so the agent learns at the point of
+  the mistake rather than depending on a possibly-stale primer. The
+  primer and tool docstrings now state that `false` only takes
+  effect on threaded replies.
+
 ## [0.8.0] — 2026-05-14
 
 ### Added
@@ -629,7 +662,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1
 [0.8.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.0
 [0.7.5]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.5
 [0.7.4]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.4
