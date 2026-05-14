@@ -217,6 +217,34 @@ class ClaudeSession:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    async def _one_turn_with_poison_recovery(
+        self, user_message: str, system_prompt: str,
+    ) -> TurnResult:
+        """``_one_turn`` plus a single fresh-session retry when the
+        turn comes back poisoned.
+
+        ``_one_turn`` already cleared the session id + killed the
+        subprocess on detection, so ``_ensure_running`` here spawns a
+        FRESH session with no transcript — the poison was content from
+        an EARLIER turn that the fresh session simply doesn't have.
+        The current message's own image attachments are downscaled at
+        save time, so re-sending it on the clean transcript succeeds;
+        without this retry the triggering message would be silently
+        dropped (it never gets another turn if it's the only inbound
+        message). Retried at most once: if the message itself somehow
+        still poisons the fresh session, return the (empty) poisoned
+        result rather than loop."""
+        result = await self._one_turn(user_message)
+        if not result.metadata.get("poisoned_session"):
+            return result
+        logger.warning(
+            "agent %s: re-running the turn on a fresh session after "
+            "poisoned-transcript recovery so the message isn't dropped",
+            self.agent_id,
+        )
+        await self._ensure_running(system_prompt)
+        return await self._one_turn(user_message)
+
     async def run_turn(self, user_message: str, system_prompt: str) -> TurnResult:
         async with self._lock:
             await self._ensure_running(system_prompt)
@@ -238,7 +266,9 @@ class ClaudeSession:
                     # during the wait. Respawn re-reads the shared
                     # credentials file.
                     await self._ensure_running(system_prompt)
-                result = await self._one_turn(user_message)
+                result = await self._one_turn_with_poison_recovery(
+                    user_message, system_prompt,
+                )
                 if not _looks_like_auth_error(result.reply):
                     return result
                 last_result = result
@@ -315,7 +345,9 @@ class ClaudeSession:
                     self.agent_id,
                 )
                 user_message = fallback_user_message
-            return await self._one_turn(user_message)
+            return await self._one_turn_with_poison_recovery(
+                user_message, system_prompt,
+            )
 
     async def warm(self, system_prompt: str) -> None:
         """Spawn the claude subprocess without running a turn so the

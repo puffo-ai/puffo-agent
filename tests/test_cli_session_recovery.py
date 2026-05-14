@@ -385,6 +385,80 @@ def test_one_turn_recovers_from_poisoned_session(tmp_path, caplog):
     ), "expected an ERROR log naming the poisoned session"
 
 
+def test_poison_recovery_reruns_the_turn_on_a_fresh_session(tmp_path):
+    """The triggering message must NOT be dropped. After ``_one_turn``
+    detects the poison + clears the session, ``_one_turn_with_poison_
+    recovery`` re-ensures running (a fresh spawn) and re-sends the
+    SAME message — which succeeds on the clean transcript. Without
+    this rerun the message is lost forever when it's the only inbound
+    one (no later turn ever pages it back in)."""
+    poison_lines = [
+        (
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": (
+                        "An image in the conversation exceeds the "
+                        "dimension limit for many-image requests (2000px)."
+                    ),
+                }]},
+            }) + "\n"
+        ).encode("utf-8"),
+        (
+            json.dumps({
+                "type": "result", "subtype": "success",
+                "session_id": "sess-poison",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }) + "\n"
+        ).encode("utf-8"),
+    ]
+    clean_lines = [
+        (
+            json.dumps({
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "text", "text": "processed your message fine"}
+                ]},
+            }) + "\n"
+        ).encode("utf-8"),
+        (
+            json.dumps({
+                "type": "result", "subtype": "success",
+                "session_id": "sess-fresh",
+                "usage": {"input_tokens": 2, "output_tokens": 3},
+            }) + "\n"
+        ).encode("utf-8"),
+    ]
+    session = _make_session(tmp_path)
+    session._save_session_id("sess-poison")
+
+    async def drive():
+        # Turn 1: the poisoned proc.
+        session._proc = _FakeProc(stdout_lines=poison_lines)
+        # _ensure_running is what would respawn — patch it to inject
+        # the fresh (clean) proc, modelling a no-session-id spawn.
+        clean_proc = _FakeProc(stdout_lines=clean_lines)
+
+        async def fake_ensure(_system_prompt):
+            session._proc = clean_proc
+
+        with patch.object(session, "_ensure_running", side_effect=fake_ensure):
+            return await session._one_turn_with_poison_recovery(
+                "look at this picture", "sysprompt",
+            )
+
+    out = asyncio.run(drive())
+
+    # The rerun succeeded — the message produced a real reply, not an
+    # empty drop.
+    assert out.reply == "processed your message fine"
+    assert out.metadata.get("poisoned_session") is None
+    assert out.input_tokens == 2
+    # Poisoned id cleared by turn 1; the fresh turn learned a new one.
+    assert session._session_id == "sess-fresh"
+
+
 def test_one_turn_normal_reply_keeps_session(tmp_path):
     """A clean reply leaves the persisted session id intact — the
     recovery path must not fire on ordinary turns."""

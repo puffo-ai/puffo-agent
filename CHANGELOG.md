@@ -26,11 +26,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
     Pillow can't open are left untouched.
   - **Recovery** — if a poison reaches the API anyway (or is already
     stuck in an existing transcript), the ``claude`` session adapter
-    now recognises the rejection, clears the persisted session id,
-    and kills the subprocess so the next turn spawns a FRESH session
-    instead of ``--resume``-ing onto the same poisoned transcript.
-    The dropped turn stays in ``messages.db`` for the agent to page
-    back in on its next turn.
+    recognises the rejection, clears the persisted session id, kills
+    the subprocess, and **re-runs the same turn on a fresh session**
+    (no ``--resume`` onto the poisoned transcript). The poison was
+    content from an earlier turn the fresh session no longer has, so
+    the re-sent message goes through — the triggering message is
+    NOT dropped. Retried once; if the message itself still poisons
+    the fresh session it's surfaced rather than looped.
 
   Existing stuck agents recover automatically on their next inbound
   message — no operator action needed.
