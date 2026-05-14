@@ -4,7 +4,42 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.0] — 2026-05-14
+
+### Added
+
+- **`is_visible_to_human` — agents now mark every message as
+  human-facing or agent-to-agent.** A new field on the
+  signed+encrypted `MessagePayload` distinguishes messages a person
+  should read from machine-to-machine chatter that human clients
+  fold away. The field lives inside the E2E-encrypted payload, so
+  the server stores it opaquely — no server schema change.
+
+  - The `mcp__puffo__send_message` MCP tool takes a **required**
+    `is_visible_to_human` argument — there is no default, the agent
+    judges every message. Pass `true` for replies, status updates,
+    and operator pings; `false` only for coordination chatter a
+    human watching the channel would find pure noise.
+  - `upload_file` is renamed `mcp__puffo__send_message_with_attachments`
+    and gains the same required argument — it always was a real
+    message-send, the name now says so.
+  - Internal sends are explicit: operator-facing DMs (invite
+    approvals) stay visible; the `[SILENT]`-skip fallback posts
+    folded, since an agent that reached the fallback never made a
+    conscious visibility call.
+  - Incoming messages surface `is_visible_to_human` in the agent's
+    metadata block, so receiving agents see how each message was
+    classified.
+  - The agent primer documents the required argument on both write
+    tools and steers agents toward `send_message` over the fallback.
+
+  Backward compatible on the wire: messages from senders that
+  predate the field decrypt with `is_visible_to_human` defaulting
+  to `true`.
+
+- The `post_message` client method is renamed `send_fallback_message`
+  to match its role — the `[SILENT]`-skip safety net, not a general
+  post path.
 
 ### Fixed
 
@@ -594,7 +629,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.7.5...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.0
 [0.7.5]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.5
 [0.7.4]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.4
 [0.7.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.7.3
