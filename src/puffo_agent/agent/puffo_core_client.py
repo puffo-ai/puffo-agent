@@ -411,7 +411,7 @@ class PuffoCoreMessageClient:
         self.store = message_store
         self._key_cache = DeviceKeyCache(http_client)
         self._ws: Optional[PuffoCoreWsClient] = None
-        # Most recent DM sender. ``post_message(channel_id="")`` means
+        # Most recent DM sender. ``send_fallback_message(channel_id="")`` means
         # "reply to whoever just DMed me". Single-slot is fine since
         # the worker handles one envelope at a time; concurrent DM
         # handlers would need a per-turn lookup keyed by envelope_id.
@@ -600,7 +600,7 @@ class PuffoCoreMessageClient:
             else:
                 raw_text = str(payload.content) if payload.content else ""
 
-            # Stash the sender so `post_message("")` can route replies.
+            # Stash the sender so `send_fallback_message("")` can route replies.
             # Always overwrite — first-write would pin replies to a
             # stale peer when a different person DMs us.
             if is_dm:
@@ -1945,7 +1945,7 @@ class PuffoCoreMessageClient:
         self, recipient_slug: str, text: str, root_id: str,
     ) -> dict | None:
         """Send a DM to a specific slug (rather than to
-        ``_last_dm_sender`` like ``post_message`` does). Returns the
+        ``_last_dm_sender`` like ``send_fallback_message`` does). Returns the
         encrypted envelope on success (caller can read its
         envelope_id), or ``None`` when the recipient has no
         resolvable devices.
@@ -2025,7 +2025,7 @@ class PuffoCoreMessageClient:
                 break
         return devices
 
-    async def post_message(
+    async def send_fallback_message(
         self, channel_id: str, text: str, root_id: str = "",
     ) -> None:
         """Post a reply. Empty ``channel_id`` ⇒ DM back to
@@ -2069,7 +2069,7 @@ class PuffoCoreMessageClient:
             recipient = self._last_dm_sender
             if not recipient:
                 logger.warning(
-                    "post_message called with empty channel_id but no DM "
+                    "send_fallback_message called with empty channel_id but no DM "
                     "context — dropping reply",
                 )
                 return
@@ -2087,7 +2087,7 @@ class PuffoCoreMessageClient:
             return
 
         logger.info(
-            "post_message: kind=%s target=%s devices=%d",
+            "send_fallback_message: kind=%s target=%s devices=%d",
             envelope_kind, recipient_slug or channel_id, len(devices),
         )
 
@@ -2113,12 +2113,12 @@ class PuffoCoreMessageClient:
         try:
             resp = await self.http.post("/messages", envelope)
             logger.info(
-                "post_message sent: envelope_id=%s queued=%s",
+                "send_fallback_message sent: envelope_id=%s queued=%s",
                 envelope.get("envelope_id"),
                 (resp or {}).get("devices_queued"),
             )
         except Exception:
-            logger.exception("post_message: POST /messages failed")
+            logger.exception("send_fallback_message: POST /messages failed")
             raise
 
         # No mirror-write here anymore. The WS echo path now persists
