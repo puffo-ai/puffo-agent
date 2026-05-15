@@ -4,6 +4,49 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`send_message` no longer silently sends to the wrong space when a
+  channel id isn't in the local cache.** The previous resolver fell
+  back to `cfg.space_id` (the agent's home space) whenever
+  `lookup_channel_space` had no record of the channel — but the
+  channel may actually live in a *different* accessible space, in
+  which case the next call (`/spaces/<home>/channels/<ch>/members`)
+  targeted the wrong space. The relay's response in that case wasn't
+  the documented 403/400; it was a 2xx with a non-JSON body, which
+  the caller then `.get()`-ed and crashed three layers up with the
+  opaque `'str' object has no attribute 'get'` (FB-76 root cause).
+
+  Two-stage resolver now:
+  1. local cache (`data_client.lookup_channel_space` — unchanged);
+  2. on miss, walk `GET /spaces` + `GET /spaces/<sp>/channels` to
+     find a definitive match across the agent's accessible spaces.
+
+  When both miss, raise a clear unresolved-channel error rather than
+  guessing. The previous `or cfg.space_id` fallback is removed
+  entirely. 2 new tests in `test_puffo_core_tools.py` (discovery
+  succeeds in another space; full miss → clear error). The
+  `PuffoCoreHttpClient` fail-loud fix below remains as the
+  safety-net for any other caller that hits the same non-JSON-2xx
+  shape from the relay.
+
+- **`PuffoCoreHttpClient` no longer hands callers a raw string body
+  as if it were a parsed JSON response.** When a 2xx response carried
+  a non-empty, non-JSON body — a proxy / CDN error page, a gateway
+  interstitial, a plain-text error — `_do_request`'s `json.loads`
+  fallback returned the raw string, and every caller of
+  `get()` / `post()` (`mcp__puffo__send_message` channel resolution,
+  `list_channels`, …) then did `.get()` on it and crashed three
+  layers up with the opaque `'str' object has no attribute 'get'`.
+  Reported via FB-76: `send_message` to a channel id and
+  `list_channels` failing identically — the shared `http_client`
+  layer, not an endpoint-specific bug. `_request` now raises
+  `HttpError` with the actual body when a 2xx response isn't JSON, so
+  the failure is diagnosable at the source. Empty 2xx bodies (204 No
+  Content etc.) are unaffected. 2 new tests in `test_http_client.py`.
+
 ## [0.8.2] — 2026-05-14
 
 ### Fixed

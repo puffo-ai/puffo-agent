@@ -150,6 +150,8 @@ class TestHttpClientErrors(AioHTTPTestCase):
         app = web.Application()
         app.router.add_route("GET", "/not-found", self._handle_404)
         app.router.add_route("GET", "/server-error", self._handle_500)
+        app.router.add_route("GET", "/html-ok", self._handle_html_ok)
+        app.router.add_route("GET", "/empty-ok", self._handle_empty_ok)
         return app
 
     async def _handle_404(self, request):
@@ -157,6 +159,20 @@ class TestHttpClientErrors(AioHTTPTestCase):
 
     async def _handle_500(self, request):
         return web.json_response({"error": "internal"}, status=500)
+
+    async def _handle_html_ok(self, request):
+        # A 2xx with a non-JSON body — the shape a proxy / CDN error
+        # page or gateway interstitial takes when it slips past the
+        # status check.
+        return web.Response(
+            text="<!doctype html><html><body>gateway error</body></html>",
+            status=200,
+            content_type="text/html",
+        )
+
+    async def _handle_empty_ok(self, request):
+        # A legitimately empty 2xx (204 No Content) — must NOT raise.
+        return web.Response(status=204)
 
     @unittest_run_loop
     async def test_404_raises_http_error(self):
@@ -179,6 +195,34 @@ class TestHttpClientErrors(AioHTTPTestCase):
             assert False, "should have raised"
         except HttpError as e:
             assert e.status == 500
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_non_json_2xx_raises_http_error(self):
+        # A 2xx whose body isn't JSON must fail loud here — not three
+        # layers up as `'str' object has no attribute 'get'`.
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.get("/html-ok")
+            assert False, "should have raised"
+        except HttpError as e:
+            assert e.status == 200
+            assert "non-JSON body" in e.body
+            assert "gateway error" in e.body
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_empty_2xx_does_not_raise(self):
+        # An empty 2xx body (204 No Content etc.) is legitimate —
+        # callers that ignore the result must keep working.
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            result = await client.get("/empty-ok")
+            assert not result, f"expected falsy empty result, got {result!r}"
         finally:
             await client.close()
 

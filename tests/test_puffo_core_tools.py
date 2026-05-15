@@ -136,10 +136,14 @@ async def test_whoami():
 
 @pytest.mark.asyncio
 async def test_send_message_channel():
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
     # Channel reply: members from /spaces/<sp>/channels/<ch>/members,
     # device certs from /certs/sync.
+    # Pre-cache the channel→space mapping the way an inbound message
+    # would: send_message now resolves space via the local cache, then
+    # via /spaces walking, and refuses to fall back to cfg.space_id.
+    await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [{"slug": "alice-0001", "role": "owner"}],
     }
@@ -211,8 +215,12 @@ async def test_send_message_root_level_false_coerced():
     """A root-level send with is_visible_to_human=false still posts —
     the flag is coerced to visible and the tool response carries a
     note so the agent learns on the spot."""
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
+    # Pre-cache the channel→space mapping the way an inbound message
+    # would: send_message now resolves space via the local cache, then
+    # via /spaces walking, and refuses to fall back to cfg.space_id.
+    await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [{"slug": "alice-0001", "role": "owner"}],
     }
@@ -245,8 +253,12 @@ async def test_send_message_root_level_false_coerced():
 async def test_send_message_threaded_false_not_coerced():
     """A threaded reply (root_id set) keeps is_visible_to_human=false
     — no coercion, no note."""
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
+    # Pre-cache the channel→space mapping the way an inbound message
+    # would: send_message now resolves space via the local cache, then
+    # via /spaces walking, and refuses to fall back to cfg.space_id.
+    await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [{"slug": "alice-0001", "role": "owner"}],
     }
@@ -278,8 +290,104 @@ async def test_send_message_threaded_false_not_coerced():
 
 
 @pytest.mark.asyncio
-async def test_send_message_dm():
+async def test_send_message_discovers_channel_in_other_space():
+    """When the channel id isn't in the local cache (no inbound seen
+    yet), send_message walks ``/spaces`` + ``/spaces/<sp>/channels``
+    for a definitive match — and aims the members call at the
+    *discovered* space, not at ``cfg.space_id``. Fixes FB-76: the
+    previous silent fallback to ``cfg.space_id`` produced wrong-space
+    members requests that surfaced as ``'str' object has no attribute
+    'get'`` three layers up."""
     cfg, http, _ = _setup()
+    recipient_kem = KemKeyPair.generate()
+    # cfg.space_id is "sp_test"; the channel actually lives in a
+    # DIFFERENT space the agent has access to.
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_test", "name": "Home"},
+            {"space_id": "sp_other", "name": "Other Team"},
+        ],
+    }
+    http.responses["/spaces/sp_test/channels"] = {
+        "channels": [{"channel_id": "ch_home", "name": "general"}],
+    }
+    http.responses["/spaces/sp_other/channels"] = {
+        "channels": [{"channel_id": "ch_elsewhere", "name": "general"}],
+    }
+    http.responses["/spaces/sp_other/channels/ch_elsewhere/members"] = {
+        "members": [{"slug": "alice-0001", "role": "member"}],
+    }
+    http.responses["/certs/sync?slugs=alice-0001"] = {
+        "entries": [{
+            "seq": 1, "kind": "device_cert", "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_recipient_1",
+                "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp, "send_message",
+        {
+            "channel": "ch_elsewhere",
+            "text": "hello other space",
+            "is_visible_to_human": True,
+        },
+    )
+    assert "posted" in result, f"expected success, got: {result}"
+    # Critical: the members call must target sp_other (correct), NOT
+    # sp_test (the previous wrong-space fallback) — that's the
+    # regression we're guarding against.
+    members_paths = [
+        path for method, path, _ in http.calls
+        if method == "GET" and "ch_elsewhere/members" in path
+    ]
+    assert any("/spaces/sp_other/" in p for p in members_paths), (
+        f"members call must target sp_other, got: {members_paths}"
+    )
+    assert not any("/spaces/sp_test/" in p for p in members_paths), (
+        f"must NOT hit sp_test (wrong-space fallback regression): {members_paths}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_message_fails_loud_when_channel_not_in_any_space():
+    """When neither the local cache nor any accessible space contains
+    the channel, send_message raises a clear unresolved-channel error
+    instead of silently sending to the wrong space — FB-76 fix."""
+    cfg, http, _ = _setup()
+    http.responses["/spaces"] = {
+        "spaces": [{"space_id": "sp_test", "name": "Home"}],
+    }
+    http.responses["/spaces/sp_test/channels"] = {
+        "channels": [{"channel_id": "ch_known", "name": "general"}],
+    }
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp, "send_message",
+            {
+                "channel": "ch_nowhere",
+                "text": "should not send",
+                "is_visible_to_human": True,
+            },
+        )
+    assert "can't resolve which space" in str(excinfo.value), (
+        f"expected an unresolved-channel error, got: {excinfo.value}"
+    )
+    # And critically: no wrong-space members call was issued.
+    assert not any(
+        "ch_nowhere/members" in path
+        for method, path, _ in http.calls
+        if method == "GET"
+    ), "must not issue a members call when space resolution fails"
+
+
+@pytest.mark.asyncio
+async def test_send_message_dm():
+    cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
     sender_kem = KemKeyPair.generate()
     # DM fans to recipient + sender's own devices via /certs/sync.
@@ -438,7 +546,7 @@ async def test_get_thread_history_empty_window():
 async def test_list_channels():
     """Channels come from ``/spaces/<sp>/events`` replay — there's no
     standalone channels endpoint on puffo-server."""
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     http.responses["/spaces/sp_test/events"] = {
         "events": [
             {"kind": "create_space", "payload": {"space_id": "sp_test", "name": "Test"}},
@@ -463,7 +571,7 @@ async def test_list_channels_paginates_via_since():
     the ``?cursor=`` bug — the server's axum extractor silently
     ignored the wrong-named key, so paginated calls re-fetched the
     first page forever and the tool never returned."""
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     # Page 1: one channel + cursor pointing at page 2.
     http.responses["/spaces/sp_test/events"] = {
         "events": [
@@ -502,7 +610,7 @@ async def test_list_channels_bails_on_stuck_cursor():
     was just sent, the tool must stop instead of spinning. Mirrors
     the strict-advance guard in ``fetchChannelsFromEvents``
     (web) and ``_resolve_channel_name`` (this package)."""
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     # Both the initial and the ``?since=stuck`` request hand back
     # the same ``next_cursor`` — a real regression would loop, the
     # guarded loop bails after the second fetch.
@@ -529,7 +637,11 @@ async def test_list_channels_bails_on_stuck_cursor():
 async def test_list_channel_members():
     """Channel members come from
     ``/spaces/<sp>/channels/<ch>/members`` keyed by space_id."""
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
+    # Pre-cache the channel→space mapping the way an inbound message
+    # would: send_message now resolves space via the local cache, then
+    # via /spaces walking, and refuses to fall back to cfg.space_id.
+    await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [
             {"slug": "alice-0001", "role": "owner"},
@@ -549,7 +661,7 @@ async def test_list_channel_members():
 async def test_get_user_info():
     """Profile lookups go through ``/identities/profiles?slugs=<slug>``.
     """
-    cfg, http, _ = _setup()
+    cfg, http, ms = _setup()
     http.responses["/identities/profiles?slugs=alice-0001"] = {
         "profiles": [{
             "slug": "alice-0001",

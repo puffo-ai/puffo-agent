@@ -97,6 +97,20 @@ class PuffoCoreHttpClient:
             status, data = await self._do_request(method, path, body)
         if status >= 400:
             raise HttpError(status, json.dumps(data) if isinstance(data, dict) else str(data))
+        # Fail loud on a 2xx whose body wasn't JSON. ``_do_request``
+        # falls back to the raw string when ``json.loads`` fails;
+        # every caller of get()/post()/etc. expects a dict/list, so a
+        # *non-empty* non-JSON 2xx body — an HTML error page, a
+        # proxy/CDN interstitial, a plain-text gateway error — is a
+        # broken response. Surfacing it here turns the otherwise
+        # cryptic downstream ``'str' object has no attribute 'get'``
+        # into a diagnosable HttpError carrying the actual body.
+        # Empty bodies (204 No Content etc.) stay untouched.
+        if isinstance(data, str) and data.strip():
+            raise HttpError(
+                status,
+                f"non-JSON body on {status} response: {data[:500]}",
+            )
         return status, data
 
     async def _do_request(

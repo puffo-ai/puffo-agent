@@ -32,6 +32,67 @@ from .data_client import DataClient, DataNotFound
 logger = logging.getLogger(__name__)
 
 
+async def _discover_channel_space(http_client: Any, channel_id: str) -> Optional[str]:
+    """Walk the agent's accessible spaces to find which one contains
+    ``channel_id``. Used as the second-stage resolver when the local
+    cache (``data_client.lookup_channel_space``) has no record of the
+    channel — typically because the agent was just added to it and
+    hasn't received an inbound message there yet.
+
+    Bounded by ``GET /spaces`` — only spaces the agent has access to
+    are scanned, so a hit also proves access. Returns ``None`` when
+    no accessible space contains the channel, or when ``/spaces`` is
+    unreachable; the caller (``send_message``) fails loud at that
+    point rather than guessing.
+
+    Replaces an earlier silent fallback to ``cfg.space_id`` (the
+    agent's home space) that produced wrong-space members requests
+    when an unseen channel actually lived in a *different* accessible
+    space — the FB-76 root cause.
+    """
+    try:
+        spaces_resp = await http_client.get("/spaces")
+    except Exception as exc:
+        logger.warning(
+            "discover_channel_space %s: GET /spaces failed: %s",
+            channel_id, exc,
+        )
+        return None
+    spaces = (
+        spaces_resp.get("spaces", [])
+        if isinstance(spaces_resp, dict)
+        else []
+    )
+    for space in spaces:
+        if not isinstance(space, dict):
+            continue
+        sp_id = space.get("space_id") or space.get("id")
+        if not sp_id:
+            continue
+        try:
+            channels_resp = await http_client.get(
+                f"/spaces/{urllib.parse.quote(sp_id, safe='')}/channels"
+            )
+        except Exception as exc:
+            logger.warning(
+                "discover_channel_space %s: GET /spaces/%s/channels failed: %s",
+                channel_id, sp_id, exc,
+            )
+            continue
+        channels = (
+            channels_resp.get("channels", [])
+            if isinstance(channels_resp, dict)
+            else []
+        )
+        for ch in channels:
+            if not isinstance(ch, dict):
+                continue
+            cid = ch.get("channel_id") or ch.get("id")
+            if cid == channel_id:
+                return sp_id
+    return None
+
+
 def _ts_to_iso(ms: int) -> str:
     if not ms:
         return ""
@@ -183,21 +244,38 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             channel_id = channel_ref
             envelope_kind = "channel"
             recipient_slug = None
-            # Look up the space this channel lives in. Inbound
-            # envelopes are tagged with ``space_id`` in the local
-            # message store, so any prior message on this channel
-            # gives us the mapping. Falls back to the agent's home
-            # space when we've never seen the channel — server
-            # returns 403/400 for channels we have no rights on.
-            send_space_id: str | None = (
-                await cfg.data_client.lookup_channel_space(channel_id)
-                or cfg.space_id
+            # Resolve which space this channel lives in. Two-stage:
+            # (1) local cache — inbound envelopes tag ``space_id`` in
+            # the message store, so any prior message in this channel
+            # gives the mapping for free. (2) On miss (channel never
+            # seen — typical right after the agent gets added) walk
+            # ``GET /spaces`` + ``GET /spaces/<sp>/channels`` for a
+            # definitive match across the agent's accessible spaces.
+            #
+            # Previously the cache miss fell back to ``cfg.space_id``
+            # (the agent's home space). When the channel actually
+            # lived in a *different* accessible space, the next call
+            # (``/spaces/<home>/channels/<ch>/members``) targeted the
+            # wrong space. The response in that case wasn't the
+            # expected 403/400 — it was a 2xx with a non-JSON body
+            # (proxy / gateway interstitial), which surfaced three
+            # layers up as ``'str' object has no attribute 'get'``.
+            # FB-76's root cause. We now fail loud when both stages
+            # miss rather than guessing.
+            send_space_id: Optional[str] = await cfg.data_client.lookup_channel_space(
+                channel_id,
             )
             if not send_space_id:
+                send_space_id = await _discover_channel_space(
+                    cfg.http_client, channel_id,
+                )
+            if not send_space_id:
                 raise RuntimeError(
-                    f"channel {channel_id} not seen before and the agent "
-                    "has no configured `puffo_core.space_id` — can't "
-                    "resolve which space to send into."
+                    f"can't resolve which space channel {channel_id} belongs "
+                    f"to: the agent has no local record of it, and it doesn't "
+                    f"appear in any space the agent currently has access to. "
+                    f"The agent may need to be invited to that space first, "
+                    f"or the channel id may be wrong."
                 )
             members_resp = await cfg.http_client.get(
                 f"/spaces/{send_space_id}/channels/{channel_id}/members"
