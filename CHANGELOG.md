@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.3] — 2026-05-15
 
 ### Fixed
 
@@ -737,7 +737,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.3...HEAD
+[0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3
 [0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2
 [0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1
 [0.8.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.0
