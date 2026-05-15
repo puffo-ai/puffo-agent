@@ -241,13 +241,93 @@ def probe_keychain_write() -> ProbeReport:
     return rpt
 
 
+def _run_sandboxed_claude_oneshot(
+    sandbox: Path, blob: str, shim_path: Path,
+) -> tuple[int, str, str, Optional[str]]:
+    """Stage ``blob`` into ``sandbox/.claude/.credentials.json``, run a
+    one-turn ``claude --print``, and return
+    ``(returncode, stdout_tail, stderr_tail, refreshed_blob_or_none)``.
+
+    The sandbox dir must already exist. On timeout / claude missing,
+    returncode is -1 and stderr describes the failure mode.
+    """
+    sandbox_claude_dir = sandbox / ".claude"
+    sandbox_claude_dir.mkdir(parents=True, exist_ok=True)
+    sandbox_creds = sandbox_claude_dir / ".credentials.json"
+    sandbox_creds.write_text(blob, encoding="utf-8")
+
+    env = {
+        **os.environ,
+        "HOME": str(sandbox),
+        "USERPROFILE": str(sandbox),
+        "CLAUDE_CONFIG_DIR": str(sandbox_claude_dir),
+        "PATH": f"{shim_path}{os.pathsep}{os.environ.get('PATH', '')}",
+    }
+
+    try:
+        proc = subprocess.run(
+            [
+                "claude", "--dangerously-skip-permissions",
+                "--print", "--max-turns", "1",
+                "--output-format", "stream-json", "--verbose",
+                "ok",
+            ],
+            env=env, cwd=str(sandbox),
+            capture_output=True, text=True, timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return (-1, "", "timeout after 90s", None)
+    except FileNotFoundError:
+        return (-1, "", "claude binary missing", None)
+
+    try:
+        refreshed = sandbox_creds.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        refreshed = None
+
+    return (
+        proc.returncode,
+        (proc.stdout or "")[-300:],
+        (proc.stderr or "")[-500:],
+        refreshed,
+    )
+
+
+def _access_token(blob: str) -> str:
+    try:
+        return (
+            (json.loads(blob).get("claudeAiOauth") or {}).get("accessToken")
+        ) or ""
+    except json.JSONDecodeError:
+        return ""
+
+
+def _force_expiry(blob: str, seconds_in_past: int = 60) -> Optional[str]:
+    """Return a copy of ``blob`` with ``expiresAt`` mutated to
+    ``now - seconds_in_past`` (milliseconds). ``None`` if the blob is
+    unparseable or doesn't have the expected shape."""
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data.get("claudeAiOauth"), dict):
+        return None
+    data["claudeAiOauth"]["expiresAt"] = int(
+        (time.time() - seconds_in_past) * 1000,
+    )
+    return json.dumps(data)
+
+
 def probe_refresh_flush() -> ProbeReport:
     """Step 3: does a sandboxed ``claude --print`` actually flush a
     refreshed token to its ``.credentials.json``?
 
-    This validates the core mechanism of ``refresh_via_oneshot``. If
-    Claude has changed its flush behaviour in some new version, this
-    probe will catch it.
+    This is the **passive** variant — it stages the current blob and
+    just observes whether claude rotates the token naturally. When the
+    token is still well within its 8h TTL, claude won't rotate
+    (correctly), and we report NEEDS_ATTENTION with a note to rerun
+    with ``puffo-agent test refresh-flush-forced`` for definitive
+    confirmation.
     """
     rpt = ProbeReport(title="puffo-agent test refresh-flush")
     if not is_macos():
@@ -273,58 +353,26 @@ def probe_refresh_flush() -> ProbeReport:
 
     home = home_dir()
     shim_path = install_path_shim(home)
+    old_token = _access_token(read_result.blob)
 
     with tempfile.TemporaryDirectory(prefix="puffo-agent-test-refresh-") as sandbox:
-        sandbox_path = Path(sandbox)
-        sandbox_claude_dir = sandbox_path / ".claude"
-        sandbox_claude_dir.mkdir(parents=True, exist_ok=True)
-        sandbox_creds = sandbox_claude_dir / ".credentials.json"
-        sandbox_creds.write_text(read_result.blob, encoding="utf-8")
-        pre_mtime = sandbox_creds.stat().st_mtime
-        pre_size = sandbox_creds.stat().st_size
-
-        env = {
-            **os.environ,
-            "HOME": str(sandbox_path),
-            "USERPROFILE": str(sandbox_path),
-            "CLAUDE_CONFIG_DIR": str(sandbox_claude_dir),
-            "PATH": f"{shim_path}{os.pathsep}{os.environ.get('PATH', '')}",
-        }
-
         started = time.time()
-        try:
-            proc = subprocess.run(
-                [
-                    "claude", "--dangerously-skip-permissions",
-                    "--print", "--max-turns", "1",
-                    "--output-format", "stream-json", "--verbose",
-                    "ok",
-                ],
-                env=env, cwd=str(sandbox_path),
-                capture_output=True, text=True, timeout=90,
-            )
-        except subprocess.TimeoutExpired:
-            rpt.add("claude-oneshot", VERDICT_FAIL, "timeout after 90s")
-            return rpt
+        code, _, stderr_tail, refreshed = _run_sandboxed_claude_oneshot(
+            Path(sandbox), read_result.blob, shim_path,
+        )
         elapsed_ms = int((time.time() - started) * 1000)
 
-        if proc.returncode != 0:
+        if code != 0:
             rpt.add(
                 "claude-oneshot",
                 VERDICT_FAIL,
-                f"exit={proc.returncode}, elapsed_ms={elapsed_ms}\n"
-                f"stderr (last 500): {(proc.stderr or '')[-500:]}",
+                f"exit={code}, elapsed_ms={elapsed_ms}\n"
+                f"stderr (last 500): {stderr_tail}",
             )
             return rpt
-        rpt.add(
-            "claude-oneshot",
-            VERDICT_OK,
-            f"exit=0, elapsed_ms={elapsed_ms}",
-        )
+        rpt.add("claude-oneshot", VERDICT_OK, f"exit=0, elapsed_ms={elapsed_ms}")
 
-        try:
-            refreshed = sandbox_creds.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        if refreshed is None:
             rpt.add(
                 "credentials-file",
                 VERDICT_FAIL,
@@ -332,41 +380,13 @@ def probe_refresh_flush() -> ProbeReport:
             )
             return rpt
 
-        post_mtime = sandbox_creds.stat().st_mtime
-        post_size = sandbox_creds.stat().st_size
-
-        try:
-            new_token = (
-                (json.loads(refreshed).get("claudeAiOauth") or {}).get("accessToken")
-            ) or ""
-        except json.JSONDecodeError:
-            rpt.add(
-                "credentials-file",
-                VERDICT_FAIL,
-                "sandbox .credentials.json wrote but is no longer valid JSON",
-            )
-            return rpt
-
-        try:
-            old_token = (
-                (json.loads(read_result.blob).get("claudeAiOauth") or {}).get(
-                    "accessToken"
-                )
-            ) or ""
-        except json.JSONDecodeError:
-            old_token = ""
-
+        new_token = _access_token(refreshed)
         rotated = bool(new_token) and old_token != new_token
         rpt.add(
             "credentials-file",
             VERDICT_OK if rotated else VERDICT_NEEDS_ATTENTION,
-            "mtime delta: {:+.2f}s\nsize delta: {:+d} bytes\ntoken rotated: {}\n"
-            "old: {}\nnew: {}".format(
-                post_mtime - pre_mtime,
-                post_size - pre_size,
-                rotated,
-                _redact_token(old_token),
-                _redact_token(new_token),
+            "token rotated: {}\nold: {}\nnew: {}".format(
+                rotated, _redact_token(old_token), _redact_token(new_token),
             ),
         )
 
@@ -374,10 +394,171 @@ def probe_refresh_flush() -> ProbeReport:
         rpt.summary = "Refresh flush works — sandbox flush mechanism confirmed."
     else:
         rpt.summary = (
-            "Sandbox claude exited OK but the token wasn't rotated. "
-            "Likely just means the current token is still valid; rerun "
-            "again after token expiry to confirm refresh-on-expiry."
+            "Sandbox claude exited OK but the token wasn't rotated — "
+            "current token is still valid, so claude correctly skipped "
+            "the OAuth round-trip. To definitively confirm refresh-"
+            "on-expiry, run `puffo-agent test refresh-flush-forced` "
+            "(which mutates expiresAt to force the refresh path)."
         )
+    return rpt
+
+
+def probe_refresh_flush_forced() -> ProbeReport:
+    """Step 3b (opt-in): force the refresh code path by mutating the
+    cached blob's ``expiresAt`` to a past timestamp.
+
+    **Has real side effects:** Anthropic rotates the refresh_token on
+    every successful refresh, so the user's pre-probe refresh_token is
+    invalidated as soon as claude succeeds. We write the freshly-issued
+    blob back to the Keychain so the user's main CLI / VS Code
+    extension stays authenticated. If that writeback fails, the user
+    is left in a degraded state where their main CLI will need a re-
+    login (the new tokens still live in our run-dir cache, but main
+    CLI doesn't know about them).
+
+    Designed for occasional manual verification, NOT for every
+    deploy. The natural ``refresh-flush`` is the everyday probe.
+    """
+    rpt = ProbeReport(title="puffo-agent test refresh-flush-forced")
+    if not is_macos():
+        rpt.add("platform-check", VERDICT_SKIPPED, "not Darwin — probe skipped")
+        return rpt
+    if shutil.which("claude") is None:
+        rpt.add(
+            "prerequisite-claude",
+            VERDICT_FAIL,
+            "`claude` not on PATH — install Claude Code first.",
+        )
+        return rpt
+
+    read_result = read_keychain_blob()
+    if not read_result.ok:
+        rpt.add(
+            "prerequisite-keychain",
+            VERDICT_FAIL,
+            f"keychain read failed: {read_result.error}",
+        )
+        return rpt
+    rpt.add(
+        "prerequisite-keychain",
+        VERDICT_OK,
+        "original blob captured (will write back at the end to keep "
+        "main CLI alive)",
+    )
+
+    mutated = _force_expiry(read_result.blob, seconds_in_past=60)
+    if mutated is None:
+        rpt.add(
+            "force-expiry",
+            VERDICT_FAIL,
+            "could not mutate blob — unexpected shape; aborting "
+            "before doing anything destructive",
+        )
+        return rpt
+    rpt.add(
+        "force-expiry",
+        VERDICT_OK,
+        "set claudeAiOauth.expiresAt = now - 60s in sandbox copy "
+        "(Keychain entry untouched until writeback step)",
+    )
+
+    home = home_dir()
+    shim_path = install_path_shim(home)
+    old_token = _access_token(read_result.blob)
+
+    with tempfile.TemporaryDirectory(
+        prefix="puffo-agent-test-refresh-forced-",
+    ) as sandbox:
+        started = time.time()
+        code, _, stderr_tail, refreshed = _run_sandboxed_claude_oneshot(
+            Path(sandbox), mutated, shim_path,
+        )
+        elapsed_ms = int((time.time() - started) * 1000)
+
+        if code != 0:
+            rpt.add(
+                "claude-oneshot",
+                VERDICT_FAIL,
+                f"exit={code}, elapsed_ms={elapsed_ms}\n"
+                f"stderr (last 500): {stderr_tail}",
+            )
+            rpt.summary = (
+                "Forced refresh failed before completing. Anthropic "
+                "side-effect did not happen — Keychain untouched."
+            )
+            return rpt
+        rpt.add("claude-oneshot", VERDICT_OK, f"exit=0, elapsed_ms={elapsed_ms}")
+
+        if refreshed is None:
+            rpt.add(
+                "credentials-file",
+                VERDICT_FAIL,
+                "sandbox .credentials.json was DELETED — flush failed",
+            )
+            return rpt
+
+        new_token = _access_token(refreshed)
+        rotated = bool(new_token) and old_token != new_token
+        rpt.add(
+            "credentials-file",
+            VERDICT_OK if rotated else VERDICT_FAIL,
+            "token rotated: {}\nold: {}\nnew: {}\n{}".format(
+                rotated,
+                _redact_token(old_token),
+                _redact_token(new_token),
+                (
+                    "claude saw the past expiresAt and refreshed."
+                    if rotated else
+                    "claude did NOT rotate despite forced expiry — "
+                    "the refresh code path is broken or behind a flag "
+                    "we don't set."
+                ),
+            ),
+        )
+
+        if not rotated:
+            rpt.summary = (
+                "Forced expiry did not trigger refresh. Investigate "
+                "before promoting — `refresh_via_oneshot` will silently "
+                "no-op in production."
+            )
+            return rpt
+
+        # Critical: writeback the freshly-rotated blob to Keychain so
+        # the user's main CLI doesn't get stranded with an invalid
+        # refresh_token. Anthropic invalidated the original
+        # refresh_token the moment they issued the new one.
+        wb_ok, wb_reason = writeback_to_keychain(refreshed)
+        if wb_ok:
+            rpt.add(
+                "keychain-writeback",
+                VERDICT_OK,
+                "freshly-rotated tokens written back to Keychain; "
+                "main CLI / VS Code extension will see them on next "
+                "use",
+            )
+            rpt.summary = (
+                "Forced refresh succeeded end-to-end: claude rotated "
+                "the token AND we synced the new value back to "
+                "Keychain. `refresh_via_oneshot` will work as "
+                "designed in production."
+            )
+        else:
+            rpt.add(
+                "keychain-writeback",
+                VERDICT_NEEDS_ATTENTION,
+                f"writeback failed: {wb_reason}\n"
+                "Main CLI's view of the credentials is now STALE. "
+                "Run `puffo-agent test keychain-write` to diagnose; "
+                "user may need to re-login via `claude` in a terminal "
+                "to recover.",
+            )
+            rpt.summary = (
+                "Forced refresh worked but writeback to Keychain "
+                "failed. Main CLI is now in a degraded state and may "
+                "need a manual re-login."
+            )
+
     return rpt
 
 
@@ -589,6 +770,21 @@ def cmd_test_refresh_flush(args: argparse.Namespace) -> int:
     return _print_report(probe_refresh_flush())
 
 
+def cmd_test_refresh_flush_forced(args: argparse.Namespace) -> int:
+    if not getattr(args, "yes", False):
+        print(
+            "This probe rotates your real OAuth refresh_token by "
+            "mutating expiresAt and forcing Claude to refresh. Anthropic "
+            "invalidates the prior refresh_token on success; we write "
+            "the new value back to your Keychain to keep your main CLI "
+            "alive, but writeback can fail.\n\n"
+            "Re-run with `--yes` to acknowledge.",
+            file=sys.stderr,
+        )
+        return 2
+    return _print_report(probe_refresh_flush_forced())
+
+
 def cmd_test_keychain_survives_token_env(
     args: argparse.Namespace,
 ) -> int:
@@ -629,8 +825,23 @@ def register_test_subcommands(sub) -> None:
     test_sub.add_parser(
         "refresh-flush",
         help="Run a sandboxed `claude --print` and check that the "
-        "OAuth token is rotated on the way out.",
+        "OAuth token is rotated on the way out (passive; expects "
+        "current token to still be valid).",
     ).set_defaults(func=cmd_test_refresh_flush)
+
+    forced = test_sub.add_parser(
+        "refresh-flush-forced",
+        help="Force the refresh code path by mutating the cached "
+        "blob's expiresAt to a past timestamp. HAS SIDE EFFECTS: "
+        "rotates the user's real refresh_token; requires --yes.",
+    )
+    forced.add_argument(
+        "--yes",
+        action="store_true",
+        help="Acknowledge that this probe will rotate your real "
+        "OAuth refresh_token.",
+    )
+    forced.set_defaults(func=cmd_test_refresh_flush_forced)
 
     test_sub.add_parser(
         "keychain-survives-token-env",

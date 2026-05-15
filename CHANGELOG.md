@@ -37,13 +37,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
     per-agent `.credentials.json` as a file-storage fallback. The
     per-agent `_run_refresh_oneshot` is a no-op on macOS (daemon
     handles refresh); Linux is unchanged.
-  - `puffo-agent test ...` diagnostic command tree (5 subcommands):
+  - `puffo-agent test ...` diagnostic command tree (6 subcommands):
     `keychain-read`, `keychain-write`, `refresh-flush`,
-    `keychain-survives-token-env`, `full-probe`. Each prints a
-    markdown report classifying every step as
-    `OK`/`FAIL`/`NEEDS_ATTENTION`/`SKIPPED`. Tokens are redacted to
-    `len=N sha256_prefix=X`; raw secrets never appear in stdout.
-    `full-probe` also saves to `~/.puffo-agent/probe-report.md`.
+    `refresh-flush-forced`, `keychain-survives-token-env`,
+    `full-probe`. Each prints a markdown report classifying every
+    step as `OK`/`FAIL`/`NEEDS_ATTENTION`/`SKIPPED`. Tokens are
+    redacted to `len=N sha256_prefix=X`; raw secrets never appear in
+    stdout. `full-probe` saves to `~/.puffo-agent/probe-report.md`.
+    `refresh-flush-forced` mutates `expiresAt` to a past timestamp
+    so claude is forced into the OAuth refresh code path; gated
+    behind `--yes` because it actually rotates the user's
+    refresh_token, with a writeback step to keep the user's main
+    CLI in sync.
 
   Linux / Windows: every code path gates on
   `platform.system() == "Darwin"`. The legacy HOME-overlay +

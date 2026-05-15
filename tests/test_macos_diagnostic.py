@@ -169,3 +169,58 @@ def test_keychain_write_roundtrip_success(monkeypatch):
     )
     rpt = diag.probe_keychain_write()
     assert rpt.overall() == diag.VERDICT_OK
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forced-expiry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_force_expiry_mutates_expires_at():
+    import time
+    out = diag._force_expiry(_BLOB, seconds_in_past=120)
+    assert out is not None
+    parsed = json.loads(out)
+    expires_ms = parsed["claudeAiOauth"]["expiresAt"]
+    # expiresAt should now be in the past (within the last few seconds).
+    assert expires_ms < int(time.time() * 1000)
+    # accessToken and refreshToken should be preserved verbatim — we only
+    # touched expiresAt.
+    assert parsed["claudeAiOauth"]["accessToken"] == "sk-ant-AAAA"
+    assert parsed["claudeAiOauth"]["refreshToken"] == "rt-BBBB"
+
+
+def test_force_expiry_rejects_malformed_blob():
+    assert diag._force_expiry("not json") is None
+
+
+def test_force_expiry_rejects_missing_oauth_dict():
+    assert diag._force_expiry(json.dumps({"unrelated": 1})) is None
+
+
+def test_access_token_extraction():
+    assert diag._access_token(_BLOB) == "sk-ant-AAAA"
+    assert diag._access_token("not json") == ""
+    assert diag._access_token(json.dumps({})) == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh-flush-forced subcommand
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_refresh_flush_forced_skipped_off_macos(monkeypatch):
+    monkeypatch.setattr(cm, "is_macos", lambda: False)
+    monkeypatch.setattr(diag, "is_macos", lambda: False)
+    rpt = diag.probe_refresh_flush_forced()
+    assert rpt.overall() == diag.VERDICT_SKIPPED
+
+
+def test_refresh_flush_forced_requires_yes_flag(monkeypatch, capsys):
+    """The forced subcommand has destructive side effects; without
+    --yes it must refuse and exit non-zero."""
+    import argparse
+    ns = argparse.Namespace(yes=False)
+    code = diag.cmd_test_refresh_flush_forced(ns)
+    assert code == 2
+    captured = capsys.readouterr()
+    assert "rotates" in captured.err.lower()
+    assert "--yes" in captured.err
