@@ -4,6 +4,58 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0a1] — 2026-05-15
+
+> **Pre-release published to TestPyPI only — not for general install.**
+> Install with `pip install --index-url https://test.pypi.org/simple/
+> --extra-index-url https://pypi.org/simple/ puffo-agent==0.9.0a1`.
+
+### Added
+
+- **macOS-only: transparent Claude Code credential management.** The
+  daemon now owns the OAuth credential and refreshes it independently
+  of the per-agent worker spawns. Goal: eliminate the Keychain ACL
+  popup spam that macOS users see when puffo-agent runs Claude Code
+  with a per-agent `$HOME` overlay, without forcing the operator to
+  pre-generate a long-lived setup-token.
+
+  Components:
+  - `puffo_agent.macos.credential_manager` — daemon companion that
+    bootstraps the cache from the Keychain on first start (one-time
+    ACL prompt, "Always Allow"), then runs a 6-hour refresh loop in a
+    sandboxed `$HOME` that flushes refreshed tokens back to the cache
+    and writes them back to the Keychain (best-effort).
+  - PATH shim — small shell wrapper that intercepts
+    `security delete-generic-password "Claude Code-credentials"`
+    (Claude Code GitHub issue #37512) and no-ops it, leaving every
+    other `security` call untouched. Prepended to `$PATH` for every
+    spawned claude process and for the refresh oneshot.
+  - `local_cli` adapter now injects, on macOS:
+    `CLAUDE_CONFIG_DIR=<per-agent>/.claude`,
+    `CLAUDE_CODE_OAUTH_TOKEN=<from cache>`, and
+    `PATH=<shim>:$PATH`. The cache blob is also copied to the
+    per-agent `.credentials.json` as a file-storage fallback. The
+    per-agent `_run_refresh_oneshot` is a no-op on macOS (daemon
+    handles refresh); Linux is unchanged.
+  - `puffo-agent test ...` diagnostic command tree (5 subcommands):
+    `keychain-read`, `keychain-write`, `refresh-flush`,
+    `keychain-survives-token-env`, `full-probe`. Each prints a
+    markdown report classifying every step as
+    `OK`/`FAIL`/`NEEDS_ATTENTION`/`SKIPPED`. Tokens are redacted to
+    `len=N sha256_prefix=X`; raw secrets never appear in stdout.
+    `full-probe` also saves to `~/.puffo-agent/probe-report.md`.
+
+  Linux / Windows: every code path gates on
+  `platform.system() == "Darwin"`. The legacy HOME-overlay +
+  `link_host_credentials` path is preserved verbatim there.
+
+  This is an alpha to TestPyPI for macOS user verification of:
+  (1) ACL prompt is one-time, (2) `claude --print` in a sandbox `$HOME`
+  still flushes refreshed tokens, (3) issue #37512 is either fixed
+  upstream or correctly suppressed by the shim. Promote to
+  `0.9.0` after a colleague returns a clean `puffo-agent test
+  full-probe` report.
+
 ## [0.8.3] — 2026-05-15
 
 ### Fixed
@@ -737,7 +789,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.9.0a1...HEAD
+[0.9.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.9.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3
 [0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2
 [0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1

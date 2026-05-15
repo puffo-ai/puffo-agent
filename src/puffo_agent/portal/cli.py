@@ -1511,6 +1511,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print bind address, allowed origins, and pairing status",
     ).set_defaults(func=cmd_api_status)
 
+    # macOS Keychain integration probes (no-op on Linux/Windows).
+    from .diagnostic import register_test_subcommands
+    register_test_subcommands(sub)
+
     return parser
 
 

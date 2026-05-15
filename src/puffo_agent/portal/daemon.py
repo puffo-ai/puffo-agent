@@ -16,6 +16,7 @@ import shutil
 import signal
 import time
 
+from ..macos import CredentialManager, is_macos
 from .api import start_api_server, stop_api_server
 from .data_service import start_data_service, stop_data_service
 from .state import (
@@ -49,6 +50,10 @@ class Daemon:
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
+        # macOS-only: owns Keychain bootstrap + 6h refresh loop.
+        # No-op on Linux/Windows (the .start() / .stop() / .bootstrap()
+        # calls all gate on platform internally).
+        self.credentials = CredentialManager(home_dir())
 
     async def run(self) -> None:
         logger.info("puffo-agent portal starting; home=%s", home_dir())
@@ -56,6 +61,21 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+
+        # macOS Keychain bootstrap. First call after a fresh install may
+        # trigger a one-time "Always Allow" ACL prompt; after that,
+        # everything is silent. Non-fatal on failure — the daemon falls
+        # back to the legacy HOME-overlay path.
+        if is_macos():
+            ok, reason = await self.credentials.bootstrap()
+            if ok:
+                logger.info("claude credential bootstrap: %s", reason)
+                self.credentials.start()
+            else:
+                logger.warning(
+                    "claude credential bootstrap failed: %s — falling back "
+                    "to legacy HOME-overlay path", reason,
+                )
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
@@ -84,6 +104,7 @@ class Daemon:
                     pass
         finally:
             await self._stop_all_workers()
+            await self.credentials.stop()
             await stop_api_server(api_runner)
             await stop_data_service(data_runner)
             clear_daemon_pid()

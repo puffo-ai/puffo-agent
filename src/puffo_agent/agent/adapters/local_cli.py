@@ -22,11 +22,13 @@ import shutil
 import time
 from pathlib import Path
 
+from ...macos import CredentialCache, install_path_shim, is_macos
 from ...mcp.config import (
     default_python_executable,
     write_cli_mcp_config,
 )
 from ...portal.state import (
+    home_dir,
     link_host_credentials,
     seed_claude_home,
     sync_host_enabled_plugins,
@@ -190,11 +192,17 @@ class LocalCLIAdapter(Adapter):
             self._session = None
 
     def _credentials_expires_in_seconds(self) -> int | None:
-        # All cli-local agents share the HOST's .credentials.json
-        # (symlink where permitted, periodic copy elsewhere). Parse
-        # ``expiresAt`` directly — mtime only advances on rewrite,
-        # not while the token is still valid. The link call here
-        # doubles as the periodic re-sync for copy-mode agents.
+        # On macOS, the daemon-owned cache is authoritative; the
+        # daemon's CredentialManager refreshes it every 6h so per-agent
+        # refresh_ping should almost always see a fresh token and
+        # short-circuit. Linux/Windows keep the legacy host-file path
+        # — Claude there still uses .credentials.json natively.
+        if is_macos():
+            cache = CredentialCache.at(home_dir())
+            exp = cache.expires_at_seconds()
+            if exp is None:
+                return None
+            return int(exp - time.time())
         link_host_credentials(Path.home(), self.agent_home_dir)
         host_credentials = Path.home() / ".claude" / ".credentials.json"
         try:
@@ -208,7 +216,14 @@ class LocalCLIAdapter(Adapter):
         """Spawn ``claude --print ...`` with the per-agent HOME env.
         Same rationale as DockerCLIAdapter: only a process exit
         flushes the refreshed token to disk.
+
+        On macOS, the daemon's CredentialManager owns refresh; this
+        per-agent path is short-circuited so we don't duplicate the
+        work and don't spawn HOME-overlay refresh oneshots that hit
+        the original Keychain ACL popup.
         """
+        if is_macos():
+            return
         self._verify()
         env = {
             **os.environ,
@@ -302,6 +317,7 @@ class LocalCLIAdapter(Adapter):
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
+            **self._macos_credential_env(),
         }
         self._session = ClaudeSession(
             agent_id=self.agent_id,
@@ -316,6 +332,47 @@ class LocalCLIAdapter(Adapter):
             extra_args=extra,
         )
         return self._session
+
+    def _macos_credential_env(self) -> dict[str, str]:
+        """macOS-only env hardening: bypass Keychain reads via
+        ``CLAUDE_CODE_OAUTH_TOKEN``, isolate per-agent settings via
+        ``CLAUDE_CONFIG_DIR``, prepend the security-shim to ``PATH`` to
+        block the issue #37512 Keychain-deletion bug.
+
+        Returns ``{}`` on non-macOS and when the daemon-owned cache is
+        empty (a stale install before bootstrap, or non-macOS dev) —
+        the caller falls back to the legacy HOME-overlay path.
+        """
+        if not is_macos():
+            return {}
+        cache = CredentialCache.at(home_dir())
+        token = cache.access_token()
+        if not token:
+            return {}
+        shim_dir_path = install_path_shim(home_dir())
+        agent_claude = self.agent_home_dir / ".claude"
+        # Copy the cache to the per-agent .credentials.json as a
+        # belt-and-braces fallback — Claude Code's storage backend
+        # combiner can sometimes prefer file over env-var. Atomic
+        # write inside _credentials_expires_in_seconds / spawn paths
+        # respects this.
+        try:
+            agent_creds = agent_claude / ".credentials.json"
+            agent_claude.mkdir(parents=True, exist_ok=True)
+            blob = cache.read()
+            if blob:
+                agent_creds.write_text(blob, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't stage credentials from cache: %s",
+                self.agent_id, exc,
+            )
+        existing_path = os.environ.get("PATH", "")
+        return {
+            "CLAUDE_CONFIG_DIR": str(agent_claude),
+            "CLAUDE_CODE_OAUTH_TOKEN": token,
+            "PATH": f"{shim_dir_path}{os.pathsep}{existing_path}",
+        }
 
     def _permission_hook_env(self) -> dict[str, str]:
         """Env vars the PreToolUse hook script reads. Claude inherits
