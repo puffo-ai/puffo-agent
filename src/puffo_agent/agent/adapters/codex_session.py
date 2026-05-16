@@ -85,6 +85,16 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # that ACKs the request but never streams.
 TURN_TIMEOUT_SECONDS = 600.0
 
+# StreamReader buffer size for the codex subprocess's stdout. The
+# asyncio default is 64 KiB; single notifications from codex
+# (mcpServer/startupStatus/updated carrying the full tool catalog,
+# thread/started carrying a session snapshot, etc.) routinely exceed
+# that, which raises ``LimitOverrunError`` from ``readline()`` and
+# wedges the reader loop. 16 MiB matches ClaudeSession's choice —
+# bounds per-agent memory while comfortably covering every event size
+# seen in practice.
+STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state machine
@@ -352,6 +362,12 @@ class CodexSession:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
                 env=self.env,
+                # Override asyncio's default 64 KiB StreamReader buffer
+                # — codex emits very chunky single-line JSON
+                # notifications (full tool catalogs on
+                # mcpServer/startupStatus/updated, session snapshots
+                # on thread/started, etc.) that overrun it.
+                limit=STREAM_READER_LIMIT_BYTES,
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
