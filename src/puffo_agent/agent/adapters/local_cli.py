@@ -400,8 +400,13 @@ class LocalCLIAdapter(Adapter):
                 self.agent_id, auth_mode,
             )
         # Subprocess argv — ``codex app-server`` is the documented entry
-        # point for embedding codex as a long-running agent.
-        argv = ["codex", "app-server"]
+        # point for embedding codex as a long-running agent. Resolve
+        # the binary via shutil.which so npm-installed shims like
+        # ``codex.cmd`` (Windows) work: asyncio.create_subprocess_exec
+        # goes through CreateProcess and does NOT honour PATHEXT, so
+        # the bare name ``codex`` fails to find ``codex.cmd``.
+        codex_bin = shutil.which("codex") or "codex"
+        argv = [codex_bin, "app-server"]
 
         self._codex_session = CodexSession(
             agent_id=self.agent_id,
