@@ -712,11 +712,21 @@ class CodexSession:
             if not turn.completed.done():
                 turn.completed.set_result(None)
             return
-        if m.startswith("turn/failed") and turn is not None:
+        # codex emits both ``turn/failed`` AND a top-level ``error``
+        # notification, depending on whether the error happens
+        # client-side validation or upstream from the model. Treat
+        # both as turn-fatal so the turn future resolves with a clear
+        # error message instead of timing out into "no reply".
+        if (m == "error" or m.startswith("turn/failed")) and turn is not None:
             err = (params or {}).get("error") or params or "(no detail)"
+            # Codex's ``error`` notification wraps the upstream error
+            # JSON-as-string under params.error.message. Unwrap so the
+            # operator sees the actual reason ("model not supported"
+            # etc.) rather than a JSON-soup blob.
+            err_text = _readable_error(err)
             if not turn.completed.done():
                 turn.completed.set_exception(
-                    RuntimeError(f"codex turn failed: {err}"),
+                    RuntimeError(f"codex turn failed: {err_text}"),
                 )
             return
 
@@ -806,6 +816,34 @@ class CodexSession:
             raise RuntimeError(f"codex turn failed: {err}")
         # ``running`` / unknown — let notifications take over.
         return False
+
+
+def _readable_error(err: Any) -> str:
+    """Codex's notification ``error`` field can be: a plain string, a
+    dict with ``message`` (sometimes JSON-encoded itself), or a nested
+    error envelope. Walk the structure to surface the most-readable
+    text — operators want "model not supported" not a JSON blob.
+    """
+    if isinstance(err, str):
+        # Maybe a JSON-encoded error string.
+        try:
+            inner = json.loads(err)
+        except (ValueError, TypeError):
+            return err
+        return _readable_error(inner)
+    if isinstance(err, dict):
+        # Common patterns.
+        for key in ("message", "msg", "detail"):
+            v = err.get(key)
+            if isinstance(v, str) and v:
+                return _readable_error(v)
+        # Nested error envelope.
+        for key in ("error",):
+            v = err.get(key)
+            if v is not None:
+                return _readable_error(v)
+        return json.dumps(err)[:500]
+    return repr(err)[:500]
 
 
 def _extract_thread_id(result: Any) -> str:
