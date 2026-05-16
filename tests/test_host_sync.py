@@ -28,6 +28,7 @@ from puffo_agent.portal.state import (
     AGENT_INSTALLED_MARKER,
     HOST_SYNCED_MARKER,
     _looks_host_local_command,
+    sync_host_claude_ai_state,
     sync_host_enabled_plugins,
     sync_host_gemini_mcp_servers,
     sync_host_gemini_skills,
@@ -832,3 +833,104 @@ def test_sync_host_gemini_mcp_servers_flags_host_local_commands(tmp_path):
     n, unreachable = sync_host_gemini_mcp_servers(host, agent)
     assert n == 2
     assert [name for name, _ in unreachable] == ["local"]
+
+
+# ── sync_host_claude_ai_state (remote connector inheritance) ─────────────────
+
+
+def test_sync_host_claude_ai_state_seeds_empty_agent(tmp_path):
+    """Operator connected Gmail / Drive on the host side; a freshly-
+    spawned agent must inherit the connector state. Without this the
+    agent's Claude Code subprocess sees an empty ``claudeAi*`` block
+    and ``ToolSearch`` can't find Gmail."""
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "claudeAiMcpEverConnected": [
+            "claude.ai Gmail",
+            "claude.ai Google Drive",
+        ],
+        "claudeAiAccount": {"email": "alice@example.com"},
+        "mcpServers": {"local": {"command": "npx"}},
+        "unrelated": {"keep": "me"},
+    })
+
+    n = sync_host_claude_ai_state(host, agent)
+
+    assert n == 2  # 2 claudeAi* keys copied (NOT mcpServers, NOT unrelated)
+    data = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
+    assert data["claudeAiMcpEverConnected"] == [
+        "claude.ai Gmail",
+        "claude.ai Google Drive",
+    ]
+    assert data["claudeAiAccount"] == {"email": "alice@example.com"}
+    # mcpServers + unrelated are NOT this sync's job — they should
+    # NOT have been copied here.
+    assert "mcpServers" not in data
+    assert "unrelated" not in data
+
+
+def test_sync_host_claude_ai_state_preserves_agent_state(tmp_path):
+    """Agent's existing transcript / project / mcpServers state must
+    survive a connector re-sync — only ``claudeAi*`` keys get
+    overwritten."""
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "claudeAiMcpEverConnected": ["claude.ai Gmail"],
+    })
+    _write_json(agent / ".claude.json", {
+        "mcpServers": {"puffo": {"command": "python"}},
+        "projects": {"/some/path": {"history": ["..."]}},
+        "claudeAiMcpEverConnected": ["claude.ai Notion"],  # stale
+    })
+
+    n = sync_host_claude_ai_state(host, agent)
+
+    assert n == 1
+    data = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
+    # Host wins on claudeAi* keys.
+    assert data["claudeAiMcpEverConnected"] == ["claude.ai Gmail"]
+    # Other state is untouched.
+    assert data["mcpServers"]["puffo"]["command"] == "python"
+    assert data["projects"]["/some/path"]["history"] == ["..."]
+
+
+def test_sync_host_claude_ai_state_skips_oauth(tmp_path):
+    """``claudeAiOauth`` is the auth blob — handled by
+    ``link_host_credentials`` + the Keychain bridge, NOT here.
+    Including it would race those paths."""
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "claudeAiOauth": {"accessToken": "sk-redacted"},
+        "claudeAiMcpEverConnected": ["claude.ai Gmail"],
+    })
+
+    n = sync_host_claude_ai_state(host, agent)
+
+    assert n == 1
+    data = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
+    assert data["claudeAiMcpEverConnected"] == ["claude.ai Gmail"]
+    # OAuth blob deliberately not copied.
+    assert "claudeAiOauth" not in data
+
+
+def test_sync_host_claude_ai_state_no_host_file(tmp_path):
+    """No host file → noop, no agent file created."""
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    n = sync_host_claude_ai_state(host, agent)
+    assert n == 0
+    assert not (agent / ".claude.json").exists()
+
+
+def test_sync_host_claude_ai_state_no_claude_ai_keys(tmp_path):
+    """Host has a .claude.json but no claudeAi* keys → noop."""
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "mcpServers": {"local": {"command": "npx"}},
+    })
+    n = sync_host_claude_ai_state(host, agent)
+    assert n == 0

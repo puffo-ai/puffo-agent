@@ -413,6 +413,71 @@ def sync_host_mcp_servers(
     return len(host_servers), unreachable
 
 
+def sync_host_claude_ai_state(host_home: Path, agent_home: Path) -> int:
+    """Mirror Claude.ai connector / account state from host
+    ``~/.claude.json`` into the per-agent ``.claude.json`` so the
+    agent's Claude Code subprocess inherits the operator's remote
+    connectors (Gmail, Google Drive, Google Calendar, Notion, etc.).
+
+    The connector state lives under a family of ``claudeAi*`` keys
+    (``claudeAiMcpEverConnected``, ``claudeAiOauth`` not included —
+    that's the auth path, handled separately, etc.). ``seed_claude_home``
+    used to copy ``.claude.json`` exactly once at agent creation,
+    so a connector added on the host AFTER the agent existed never
+    propagated. ``sync_host_mcp_servers`` (which runs every spawn)
+    only touches the local ``mcpServers`` field — remote Claude.ai
+    connectors aren't in that field.
+
+    Merge strategy: every host key beginning with ``claudeAi`` wins;
+    every other agent-side key is preserved (transcript history,
+    project state, MCP servers we already synced separately). Returns
+    the number of keys copied. Safe to call on every worker spawn.
+    """
+    host_path = host_home / ".claude.json"
+    if not host_path.exists():
+        return 0
+    try:
+        host_data = json.loads(host_path.read_text(encoding="utf-8") or "{}")
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(host_data, dict):
+        return 0
+
+    # Auth lives in ``claudeAiOauth`` — already handled by
+    # link_host_credentials + Keychain bridge. Skip it here to avoid
+    # racing those paths.
+    SKIP_KEYS = frozenset({"claudeAiOauth"})
+    claude_ai_keys = {
+        k: v for k, v in host_data.items()
+        if k.startswith("claudeAi") and k not in SKIP_KEYS
+    }
+    if not claude_ai_keys:
+        return 0
+
+    agent_path = agent_home / ".claude.json"
+    agent_data: dict[str, Any] = {}
+    if agent_path.exists():
+        try:
+            raw = agent_path.read_text(encoding="utf-8")
+            if raw.strip():
+                agent_data = json.loads(raw)
+                if not isinstance(agent_data, dict):
+                    agent_data = {}
+        except (OSError, ValueError):
+            agent_data = {}
+
+    agent_data.update(claude_ai_keys)
+
+    try:
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = agent_path.with_suffix(agent_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
+        os.replace(tmp, agent_path)
+    except OSError:
+        return 0
+    return len(claude_ai_keys)
+
+
 def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
     """Mirror host ``~/.claude/plugins/`` into per-agent
     ``.claude/plugins/`` so the agent's spawned Claude session can

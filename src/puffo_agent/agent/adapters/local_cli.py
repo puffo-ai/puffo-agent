@@ -22,26 +22,26 @@ import shutil
 import time
 from pathlib import Path
 
+from ...macos import CredentialCache, install_path_shim, is_macos
 from ...mcp.config import (
     default_python_executable,
     write_cli_mcp_config,
 )
 from ...portal.state import (
+    home_dir,
     link_host_credentials,
     seed_claude_home,
+    sync_host_claude_ai_state,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
     sync_host_plugins,
     sync_host_skills,
 )
-from .base import Adapter, TurnContext, TurnResult, looks_like_auth_failure
+from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 
 logger = logging.getLogger(__name__)
 
-
-# See docker_cli for rationale.
-REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
 # How long the permission proxy hook waits for an owner reply before
 # denying. Exposed to the hook via PUFFO_PERMISSION_TIMEOUT.
@@ -190,96 +190,29 @@ class LocalCLIAdapter(Adapter):
             self._session = None
 
     def _credentials_expires_in_seconds(self) -> int | None:
-        # All cli-local agents share the HOST's .credentials.json
-        # (symlink where permitted, periodic copy elsewhere). Parse
-        # ``expiresAt`` directly — mtime only advances on rewrite,
-        # not while the token is still valid. The link call here
-        # doubles as the periodic re-sync for copy-mode agents.
+        # Daemon's CredentialManager owns refresh on every platform now
+        # (see ``puffo_agent.macos.credential_manager``). Per-agent
+        # ``refresh_ping`` is therefore a no-op — return None to short-
+        # circuit ``base.Adapter.refresh_ping``. This eliminates the
+        # rotating-refresh-token race that caused "refresh ran but
+        # expiry didn't advance" reports under multi-agent load, and
+        # prevents the FD-exhaustion-via-stale-subprocesses fallout.
+        #
+        # Just keep the per-agent symlink/copy fresh so each agent's
+        # ``.credentials.json`` (or its symlink target) reflects what
+        # the daemon's refresh wrote.
         link_host_credentials(Path.home(), self.agent_home_dir)
-        host_credentials = Path.home() / ".claude" / ".credentials.json"
-        try:
-            data = json.loads(host_credentials.read_text(encoding="utf-8"))
-            expires_ms = int(data["claudeAiOauth"]["expiresAt"])
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-        return int(expires_ms / 1000 - time.time())
+        return None
 
     async def _run_refresh_oneshot(self) -> None:
-        """Spawn ``claude --print ...`` with the per-agent HOME env.
-        Same rationale as DockerCLIAdapter: only a process exit
-        flushes the refreshed token to disk.
+        """Per-agent refresh is owned by the daemon now (see
+        ``puffo_agent.macos.credential_manager``). This method stays
+        as a hook the base class can call, but it's a no-op on every
+        platform — historical per-agent OAuth races and the
+        ``[Errno 24] Too many open files`` FD leak from the old path
+        are both gone.
         """
-        self._verify()
-        env = {
-            **os.environ,
-            "HOME": str(self.agent_home_dir),
-            "USERPROFILE": str(self.agent_home_dir),
-        }
-        # --dangerously-skip-permissions is required: in --print mode
-        # claude can't surface permission prompts, so without bypass
-        # it exits before the API call and no refresh happens.
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-        ]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        cmd.append("ok")
-        started_at = time.time()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=self.workspace_dir,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=REFRESH_ONESHOT_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "agent %s: refresh one-shot timed out after %ds",
-                self.agent_id, REFRESH_ONESHOT_TIMEOUT_SECONDS,
-            )
-            return
-        except FileNotFoundError:
-            logger.warning(
-                "agent %s: refresh one-shot: claude binary missing",
-                self.agent_id,
-            )
-            return
-        elapsed = time.time() - started_at
-        out_text = stdout.decode("utf-8", errors="replace")
-        err_text = stderr.decode("utf-8", errors="replace")
-        # Doubles as an inference smoke test (auth status can
-        # report OK while every API call returns 401). The worker
-        # reads auth_healthy to suppress noisy replies while the
-        # operator re-auths.
-        if looks_like_auth_failure(out_text, err_text):
-            logger.error(
-                "agent %s: refresh one-shot hit an auth failure "
-                "(rc=%d in %.1fs). operator re-auth likely required. "
-                "stdout: %s | stderr: %s",
-                self.agent_id, proc.returncode, elapsed,
-                out_text.strip()[-400:], err_text.strip()[-400:],
-            )
-            self.auth_healthy = False
-        elif proc.returncode != 0:
-            logger.warning(
-                "agent %s: refresh one-shot rc=%d in %.1fs | "
-                "stdout: %s | stderr: %s",
-                self.agent_id, proc.returncode, elapsed,
-                out_text.strip()[-400:], err_text.strip()[-400:],
-            )
-        else:
-            logger.debug(
-                "agent %s: refresh one-shot rc=0 in %.1fs",
-                self.agent_id, elapsed,
-            )
-            self.auth_healthy = True
+        return
 
     async def aclose(self) -> None:
         if self._session is not None:
@@ -302,6 +235,7 @@ class LocalCLIAdapter(Adapter):
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
+            **self._macos_credential_env(),
         }
         self._session = ClaudeSession(
             agent_id=self.agent_id,
@@ -316,6 +250,47 @@ class LocalCLIAdapter(Adapter):
             extra_args=extra,
         )
         return self._session
+
+    def _macos_credential_env(self) -> dict[str, str]:
+        """macOS-only env hardening: bypass Keychain reads via
+        ``CLAUDE_CODE_OAUTH_TOKEN``, isolate per-agent settings via
+        ``CLAUDE_CONFIG_DIR``, prepend the security-shim to ``PATH`` to
+        block the issue #37512 Keychain-deletion bug.
+
+        Returns ``{}`` on non-macOS and when the daemon-owned cache is
+        empty (a stale install before bootstrap, or non-macOS dev) —
+        the caller falls back to the legacy HOME-overlay path.
+        """
+        if not is_macos():
+            return {}
+        cache = CredentialCache.at(home_dir())
+        token = cache.access_token()
+        if not token:
+            return {}
+        shim_dir_path = install_path_shim(home_dir())
+        agent_claude = self.agent_home_dir / ".claude"
+        # Copy the cache to the per-agent .credentials.json as a
+        # belt-and-braces fallback — Claude Code's storage backend
+        # combiner can sometimes prefer file over env-var. Atomic
+        # write inside _credentials_expires_in_seconds / spawn paths
+        # respects this.
+        try:
+            agent_creds = agent_claude / ".credentials.json"
+            agent_claude.mkdir(parents=True, exist_ok=True)
+            blob = cache.read()
+            if blob:
+                agent_creds.write_text(blob, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't stage credentials from cache: %s",
+                self.agent_id, exc,
+            )
+        existing_path = os.environ.get("PATH", "")
+        return {
+            "CLAUDE_CONFIG_DIR": str(agent_claude),
+            "CLAUDE_CODE_OAUTH_TOKEN": token,
+            "PATH": f"{shim_dir_path}{os.pathsep}{existing_path}",
+        }
 
     def _permission_hook_env(self) -> dict[str, str]:
         """Env vars the PreToolUse hook script reads. Claude inherits
@@ -509,6 +484,21 @@ class LocalCLIAdapter(Adapter):
             logger.info(
                 "agent %s: merged %d host MCP server registration(s) "
                 "into per-agent .claude.json", self.agent_id, merged_mcp,
+            )
+        # Claude.ai remote connector state — Gmail / Drive / Calendar /
+        # Notion / PDF Viewer. These live under ``claudeAi*`` keys
+        # in the host's ``~/.claude.json`` and are NOT covered by
+        # ``mcpServers`` (those are local stdio MCPs only). Without
+        # this every connector the operator connected on the host
+        # silently disappears in the agent's Claude Code subprocess.
+        synced_claude_ai = sync_host_claude_ai_state(
+            host_home, self.agent_home_dir,
+        )
+        if synced_claude_ai:
+            logger.info(
+                "agent %s: synced %d Claude.ai state key(s) "
+                "(remote connectors etc.) from host .claude.json",
+                self.agent_id, synced_claude_ai,
             )
         # Plugins layer — pairs the actual plugin code tree with the
         # ``enabledPlugins`` array Claude reads from settings.json.

@@ -16,6 +16,7 @@ import shutil
 import signal
 import time
 
+from ..macos import CredentialManager, is_macos
 from .api import start_api_server, stop_api_server
 from .data_service import start_data_service, stop_data_service
 from .state import (
@@ -49,6 +50,15 @@ class Daemon:
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
+        # Daemon-level Claude Code OAuth credential refresh. Runs on
+        # every platform — macOS additionally bridges through the
+        # Keychain. On Linux/Windows this is the single owner of
+        # ``claude --print`` refresh calls; per-agent refresh_ping is
+        # short-circuited to None, killing the rotating-token race
+        # that caused "refresh ran but expiry didn't advance" + the
+        # FD-exhaustion-via-stuck-subprocesses fallout under
+        # multi-agent load.
+        self.credentials = CredentialManager(home_dir())
 
     async def run(self) -> None:
         logger.info("puffo-agent portal starting; home=%s", home_dir())
@@ -56,6 +66,21 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+
+        # Bootstrap + start daemon-level credential refresh. On macOS
+        # this also bridges the Keychain → cache (first run may trigger
+        # a one-time "Always Allow" ACL prompt). On Linux/Windows it's
+        # a no-op bootstrap + start the refresh loop directly.
+        ok, reason = await self.credentials.bootstrap()
+        if ok:
+            logger.info("claude credential bootstrap: %s", reason)
+            self.credentials.start()
+        else:
+            logger.warning(
+                "claude credential bootstrap failed: %s — daemon-level "
+                "refresh disabled; per-agent fallback applies",
+                reason,
+            )
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
@@ -84,6 +109,7 @@ class Daemon:
                     pass
         finally:
             await self._stop_all_workers()
+            await self.credentials.stop()
             await stop_api_server(api_runner)
             await stop_data_service(data_runner)
             clear_daemon_pid()
