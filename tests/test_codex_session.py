@@ -90,14 +90,20 @@ def _argv_for(fake: Path) -> list[str]:
 SINGLE_TURN_SCRIPT = '''\
 absorb_initialize()
 
-# 1. Handle thread/start, return threadId
+# 1. Handle thread/start, return nested {thread: {id}} (real codex
+#    shape per codex-rs/app-server). Verify the params don't carry
+#    legacy ``instructions`` (codex doesn't accept that field).
 msg = r()
 assert msg["method"] == "thread/start"
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "conv_42"}})
+assert "instructions" not in msg["params"]
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_42", "createdAt": "2026-05-15T00:00:00Z"}}})
 
-# 2. Receive turn/start
+# 2. Receive turn/start with structured ``input`` array
 msg = r()
 assert msg["method"] == "turn/start"
+assert msg["params"]["threadId"] == "conv_42"
+assert msg["params"]["input"] == [{"type": "text", "text": "hi there"}]
 turn_id = msg["id"]
 
 # 3. Stream two agentMessage deltas
@@ -162,7 +168,8 @@ absorb_initialize()
 msg = r()
 assert msg["method"] == "thread/resume", f"expected thread/resume, got {msg['method']}"
 assert msg["params"]["threadId"] == "conv_42"
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "conv_42"}})
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_42"}}})
 
 msg = r()
 assert msg["method"] == "turn/start"
@@ -210,7 +217,7 @@ absorb_initialize()
 
 # thread/start
 msg = r()
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "c1"}})
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
 
 # turn/start
 msg = r()
@@ -267,7 +274,7 @@ FAIL_SCRIPT = '''\
 absorb_initialize()
 
 msg = r()
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "c1"}})
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
 
 msg = r()
 turn_id = msg["id"]
@@ -314,24 +321,30 @@ def test_turn_failed_raises(tmp_path):
 RELOAD_SCRIPT = '''\
 absorb_initialize()
 
+# thread/start no longer carries instructions — codex reads AGENTS.md
+# directly. The reload path mutates current_instructions but that
+# field is now used only for future ``personality`` overrides; tests
+# verify the call shape doesn't regress to passing instructions in
+# thread/start or turn/start.
 msg = r()
 assert msg["method"] == "thread/start"
-assert msg["params"]["instructions"] == "v1"
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "c1"}})
+assert "instructions" not in msg["params"]
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
 
-# First turn — should carry instructions v1
+# First turn
 msg = r()
 assert msg["method"] == "turn/start"
-assert msg["params"]["instructions"] == "v1"
+assert "instructions" not in msg["params"]
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
    "params": {"item": {"type": "agent_message", "text": "turn1"}}})
 w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
 w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
 
-# Second turn — instructions hot-swapped to v2 via reload()
+# Second turn after reload() — same call shape; reload mutated
+# current_instructions but turn/start no longer carries it.
 msg = r()
 assert msg["method"] == "turn/start"
-assert msg["params"]["instructions"] == "v2", f"got: {msg['params']['instructions']!r}"
+assert "instructions" not in msg["params"]
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
    "params": {"item": {"type": "agent_message", "text": "turn2"}}})
 w({"jsonrpc": "2.0", "id": msg["id"], "result": None})

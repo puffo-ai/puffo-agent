@@ -415,6 +415,7 @@ class LocalCLIAdapter(Adapter):
             cwd=self.workspace_dir,
             env=env,
             permission_mode=self.permission_mode,
+            model=self.model,
         )
         return self._codex_session
 

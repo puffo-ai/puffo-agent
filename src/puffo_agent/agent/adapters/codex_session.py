@@ -144,6 +144,7 @@ class CodexSession:
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         permission_mode: str = "bypassPermissions",
+        model: str = "",
     ):
         self.agent_id = agent_id
         self.session_file = session_file
@@ -154,6 +155,9 @@ class CodexSession:
         # The plan's v1 stance — other modes are deferred until the
         # permission-proxy DM flow is ready for codex too.
         self.permission_mode = permission_mode
+        # Codex's thread/start takes ``model`` as a required-ish
+        # parameter; empty string means "let codex pick its default".
+        self.model = model
 
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -189,41 +193,55 @@ class CodexSession:
             self._active_turn = turn
 
         try:
-            await self._send_raw_request(
+            # turn/start params per codex-rs/app-server protocol:
+            # ``threadId``, ``input`` (array of structured items —
+            # NOT a bare string), plus optional config overrides we
+            # leave out for v1.
+            turn_response = await self._send_raw_request(
                 turn.request_id,
                 METHOD_SEND_USER_TURN,
                 {
                     "threadId": self._conversation_id,
-                    "userInput": user_message,
-                    # Best-effort per-turn instructions override —
-                    # silently ignored by App Server versions that
-                    # don't accept it (Phase 0 #1 verify).
-                    "instructions": self.current_instructions,
+                    "input": [
+                        {"type": "text", "text": user_message},
+                    ],
                 },
             )
-            try:
-                await asyncio.wait_for(
-                    turn.completed, timeout=TURN_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "agent %s: codex turn timed out after %ds",
-                    self.agent_id, TURN_TIMEOUT_SECONDS,
-                )
-                # Best-effort interrupt so the server stops streaming
-                # output we'll never read.
+            # Some App Server versions complete the turn synchronously
+            # and put the final items in the response payload; others
+            # stream item/* + turn/completed notifications and return
+            # only ``{turn: {id, status: "running"}}``. Handle both.
+            sync_resolved = self._absorb_sync_turn_response(turn, turn_response)
+            if sync_resolved:
+                # No need to wait — server already gave us everything.
+                pass
+            else:
                 try:
-                    await self._send_raw_request(
-                        self._reserve_id(),
-                        METHOD_INTERRUPT_TURN,
-                        {"threadId": self._conversation_id},
+                    await asyncio.wait_for(
+                        turn.completed, timeout=TURN_TIMEOUT_SECONDS,
                     )
-                except Exception:
-                    pass
-                return TurnResult(
-                    reply="",
-                    metadata={"codex_turn_timeout": True},
-                )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "agent %s: codex turn timed out after %ds",
+                        self.agent_id, TURN_TIMEOUT_SECONDS,
+                    )
+                    # Best-effort interrupt so the server stops streaming
+                    # output we'll never read.
+                    try:
+                        await self._send_raw_request(
+                            self._reserve_id(),
+                            METHOD_INTERRUPT_TURN,
+                            {
+                                "threadId": self._conversation_id,
+                                "turnId": turn_response.get("turn", {}).get("id") if isinstance(turn_response, dict) else None,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return TurnResult(
+                        reply="",
+                        metadata={"codex_turn_timeout": True},
+                    )
         finally:
             self._active_turn = None
 
@@ -394,16 +412,27 @@ class CodexSession:
                 )
                 self._conversation_id = ""
 
+        # thread/start params per codex-rs/app-server protocol:
+        # ``model``, ``cwd``, ``approvalPolicy``, ``sandbox`` /
+        # ``permissions``. NOT ``instructions`` — codex reads the
+        # system prompt from ``$CODEX_HOME/AGENTS.md`` which we wrote
+        # at adapter init.
+        new_conv_params: dict[str, Any] = {
+            "cwd": self.cwd or os.getcwd(),
+            # ``bypassPermissions`` ⇒ never-prompt; codex's exact value
+            # name is ``never``. Maps onto our existing permission_mode
+            # field so the two halves stay in sync.
+            "approvalPolicy": (
+                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
+            ),
+        }
+        if self.model:
+            new_conv_params["model"] = self.model
+
         result = await self._send_raw_request(
             self._reserve_id(),
             METHOD_NEW_CONVERSATION,
-            {
-                "instructions": self.current_instructions,
-                # Working directory is set on subprocess spawn already,
-                # but pass it through too for App Servers that ignore
-                # cwd and want it in the payload.
-                "cwd": self.cwd or os.getcwd(),
-            },
+            new_conv_params,
         )
         cid = _extract_thread_id(result)
         if not cid:
@@ -707,6 +736,50 @@ class CodexSession:
             turn.output_tokens = int(usage.get("output_tokens") or 0)
         except (TypeError, ValueError):
             pass
+
+    def _absorb_sync_turn_response(
+        self, turn: _PendingTurn, response: Any,
+    ) -> bool:
+        """Pull the agent reply out of a synchronous ``turn/start``
+        response shape (``{turn: {id, status, items, error}}``).
+
+        Returns True when the response already carries a completed
+        turn — caller skips waiting on ``turn.completed``. Returns
+        False when the response indicates the turn is still running
+        (so notifications will drive completion).
+        """
+        if not isinstance(response, dict):
+            return False
+        turn_obj = response.get("turn")
+        if not isinstance(turn_obj, dict):
+            return False
+        status = (turn_obj.get("status") or "").lower()
+        # Completed-by-server response: extract final items.
+        if status in ("completed", "done", "finished", "success"):
+            items = turn_obj.get("items") or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                kind = (item.get("type") or "").lower()
+                if kind in ("agent_message", "agentmessage", "assistant_message"):
+                    text = item.get("text") or item.get("content") or ""
+                    if isinstance(text, str) and text:
+                        turn.reply_chunks.append(text)
+                elif kind in ("tool_call", "toolcall", "tool_use", "tooluse"):
+                    turn.tool_calls += 1
+            usage = turn_obj.get("usage") or {}
+            try:
+                turn.input_tokens = int(usage.get("input_tokens") or 0)
+                turn.output_tokens = int(usage.get("output_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+            return True
+        # Failed-by-server response: surface the error.
+        if status in ("failed", "error"):
+            err = turn_obj.get("error") or "(no detail)"
+            raise RuntimeError(f"codex turn failed: {err}")
+        # ``running`` / unknown — let notifications take over.
+        return False
 
 
 def _extract_thread_id(result: Any) -> str:
