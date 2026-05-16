@@ -144,6 +144,122 @@ while True:
 '''
 
 
+def test_mcp_send_message_recorded_in_metadata(tmp_path):
+    """When the agent invokes ``mcp__puffo__send_message`` (or its
+    attachments sibling) and the call completes, the resulting
+    TurnResult.metadata must carry a non-empty
+    ``send_message_targets`` list. core.py reads that field to decide
+    "agent already posted; skip the shell fallback" — without this
+    detection the codex path silently triggers the
+    is_visible_to_human=false fallback for every reply.
+    """
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+absorb_mcp_status_list()
+
+msg = r()  # turn/start
+turn_id = msg["id"]
+
+# Emit a completed mcpToolCall matching the real codex notification
+# shape from the live debug log (server="puffo", tool="send_message",
+# status="completed", arguments includes channel + root_id).
+w({"jsonrpc": "2.0", "method": "item/completed",
+   "params": {"item": {
+       "type": "mcpToolCall",
+       "id": "call_abc",
+       "server": "puffo",
+       "tool": "send_message",
+       "status": "completed",
+       "arguments": {
+           "channel": "ch_test_123",
+           "root_id": "msg_root_456",
+           "text": "hi",
+           "is_visible_to_human": True,
+       },
+   }}})
+
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        result = await cs.run_turn("hi", "system prompt")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    targets = result.metadata.get("send_message_targets") or []
+    assert len(targets) == 1, targets
+    assert targets[0]["channel"] == "ch_test_123"
+    assert targets[0]["root_id"] == "msg_root_456"
+
+
+def test_mcp_send_message_failed_status_does_not_record(tmp_path):
+    """A failed/declined MCP tool call must NOT populate
+    send_message_targets — otherwise the worker would skip its
+    fallback and the agent's reply would silently disappear."""
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+absorb_mcp_status_list()
+
+msg = r()
+turn_id = msg["id"]
+
+w({"jsonrpc": "2.0", "method": "item/completed",
+   "params": {"item": {
+       "type": "mcpToolCall",
+       "server": "puffo", "tool": "send_message",
+       "status": "failed",
+       "arguments": {"channel": "ch_x", "root_id": "msg_x"},
+   }}})
+w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m",
+              "delta": "I tried but failed"}})
+
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        result = await cs.run_turn("hi", "system prompt")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    targets = result.metadata.get("send_message_targets") or []
+    assert targets == [], targets
+
+
 def test_single_turn_roundtrip(tmp_path):
     fake = _write_fake(tmp_path, SINGLE_TURN_SCRIPT)
     session_file = tmp_path / "codex_session.json"

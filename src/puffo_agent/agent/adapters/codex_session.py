@@ -85,6 +85,18 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # that ACKs the request but never streams.
 TURN_TIMEOUT_SECONDS = 600.0
 
+# Tool names of the puffo MCP server's "this counts as posting a
+# reply" family. When the agent invokes one of these and it completes
+# successfully, the worker treats the turn as "agent already replied"
+# (skipping the [SILENT]-fallback shell auto-post). Names match
+# ``mcp.config.PUFFO_CORE_TOOL_NAMES`` — kept inline as a frozenset to
+# avoid an import-cycle with the MCP package.
+_PUFFO_SEND_MESSAGE_TOOLS = frozenset({
+    "send_message",
+    "send_message_with_attachments",
+})
+
+
 # StreamReader buffer size for the codex subprocess's stdout. The
 # asyncio default is 64 KiB; single notifications from codex
 # (mcpServer/startupStatus/updated carrying the full tool catalog,
@@ -118,6 +130,11 @@ class _PendingTurn:
     reply_chunks: list[str] = field(default_factory=list)
     # ``tool_use`` events counted for TurnResult.tool_calls metric.
     tool_calls: int = 0
+    # When the agent invoked a puffo MCP send-message tool, the worker
+    # reads this list off TurnResult.metadata to decide "agent already
+    # posted; don't run the [SILENT]-fallback path". Each entry mirrors
+    # the claude-code adapter's shape: ``{channel, root_id}``.
+    send_message_targets: list[dict] = field(default_factory=list)
     # Usage stats lifted from the final ``turn/completed`` envelope.
     input_tokens: int = 0
     output_tokens: int = 0
@@ -273,10 +290,15 @@ class CodexSession:
         reply = "".join(turn.reply_chunks).strip()
         logger.info(
             "agent %s: codex turn complete (reply_len=%d, tool_calls=%d, "
-            "in=%d out=%d)",
+            "send_msg_calls=%d, in=%d out=%d)",
             self.agent_id, len(reply), turn.tool_calls,
+            len(turn.send_message_targets),
             turn.input_tokens, turn.output_tokens,
         )
+        # core.py's reply-routing check: a non-empty
+        # ``send_message_targets`` list means "agent already posted via
+        # MCP, skip the shell fallback." Mirrors the claude-code adapter
+        # shape so the routing logic is harness-agnostic.
         return TurnResult(
             reply=reply,
             input_tokens=turn.input_tokens,
@@ -285,6 +307,7 @@ class CodexSession:
             metadata={
                 "harness": "codex",
                 "conversation_id": self._conversation_id,
+                "send_message_targets": turn.send_message_targets,
             },
         )
 
@@ -847,6 +870,29 @@ class CodexSession:
                         turn.reply_chunks = [text]
             elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
                 turn.tool_calls += 1
+            elif kind == "mcptoolcall":
+                # Real codex shape per debug logs: ``item/completed``
+                # with ``item.type == "mcpToolCall"``, ``item.server``
+                # == server name, ``item.tool`` == tool name,
+                # ``item.status`` ∈ {"completed", "failed", ...},
+                # ``item.arguments`` == the tool's JSON input.
+                turn.tool_calls += 1
+                status = (item.get("status") or "").lower()
+                server = item.get("server") or ""
+                tool = item.get("tool") or ""
+                args = item.get("arguments") or {}
+                if (
+                    server == "puffo"
+                    and tool in _PUFFO_SEND_MESSAGE_TOOLS
+                    and status == "completed"
+                ):
+                    # Shape mirrors the claude-code adapter so core.py's
+                    # ``send_message_called`` check is identical
+                    # regardless of harness.
+                    turn.send_message_targets.append({
+                        "channel": str(args.get("channel", "")),
+                        "root_id": str(args.get("root_id", "")),
+                    })
             return
 
     def _absorb_turn_usage(self, turn: _PendingTurn, params: dict) -> None:
