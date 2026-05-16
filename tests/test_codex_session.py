@@ -239,14 +239,30 @@ absorb_mcp_status_list()
 msg = r()
 turn_id = msg["id"]
 
-# Server-initiated request: ask for exec approval. Wait synchronously
-# for the response before completing the turn.
-w({"jsonrpc": "2.0", "id": 9001, "method": "execCommandApproval",
-   "params": {"command": "rm -rf /"}})
+# Server-initiated request: codex's new MCP elicitation contract
+# (mcpServer/elicitation/request). Reply shape per app-server README:
+#   accept  → {"action": "accept",  "content": {}}
+#   decline → {"action": "decline", "content": null}
+w({"jsonrpc": "2.0", "id": 9001, "method": "mcpServer/elicitation/request",
+   "params": {
+       "threadId": "c1",
+       "serverName": "puffo",
+       "meta": {"codex_approval_kind": "mcp_tool_call"},
+   }})
 
 reply = r()
 assert reply["id"] == 9001
-assert reply["result"]["decision"] == "approved"
+assert reply["result"]["action"] == "accept", reply
+assert reply["result"]["content"] == {}, reply
+
+# Also send a legacy-shape approval to make sure the old path still
+# works (older codex versions / docker exec approval flow).
+w({"jsonrpc": "2.0", "id": 9002, "method": "execCommandApproval",
+   "params": {"command": "rm -rf /"}})
+
+reply = r()
+assert reply["id"] == 9002
+assert reply["result"]["decision"] == "approved", reply
 
 # Now complete the turn
 w({"jsonrpc": "2.0", "id": turn_id, "result": None})

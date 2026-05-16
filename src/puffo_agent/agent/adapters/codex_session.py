@@ -673,18 +673,46 @@ class CodexSession:
         self, request_id: Any, method: str, params: dict,
     ) -> None:
         """The App Server occasionally asks us things — most commonly
-        approval for risky tool calls. ``bypassPermissions`` auto-
-        approves; other modes will route through the puffo permission
-        proxy DM flow (deferred for v1)."""
-        # Approval methods we know about. The exact method names are
-        # pre-1.0; we match by suffix so a near-rename doesn't break
-        # us silently.
+        approval for risky tool calls (``mcpServer/elicitation/request``)
+        or command / patch approval (older shapes).
+
+        ``bypassPermissions`` auto-approves all of these; other modes
+        will route through the puffo permission proxy DM flow (deferred
+        for v1).
+        """
         m = method.lower()
-        approval_like = (
+
+        # 1. App Server MCP elicitation (codex 0.x) — the canonical
+        # mechanism for "agent wants to use an MCP tool, ask user".
+        # Response contract per codex-rs/app-server README:
+        #
+        #   accept:  {"action": "accept",  "content": {}}
+        #   decline: {"action": "decline", "content": null}
+        #   cancel:  {"action": "cancel",  "content": null}
+        #
+        # ``content`` must match the request's ``requestedSchema``;
+        # for plain approvals (``codex_approval_kind == "mcp_tool_call"``)
+        # there's no schema, so ``{}`` is the right value.
+        if "elicitation" in m:
+            if self.permission_mode == "bypassPermissions":
+                await self._reply_to_server_request(
+                    request_id,
+                    {"action": "accept", "content": {}},
+                )
+            else:
+                await self._reply_to_server_request(
+                    request_id,
+                    {"action": "decline", "content": None},
+                )
+            return
+
+        # 2. Legacy command / patch approval (older codex versions).
+        # Different shape: ``{decision: "approved"|"denied"}``.
+        legacy_approval = (
             "approval" in m or "approve" in m
             or "applypatch" in m or "execcommand" in m
         )
-        if approval_like:
+        if legacy_approval:
             decision = (
                 "approved" if self.permission_mode == "bypassPermissions"
                 else "denied"
