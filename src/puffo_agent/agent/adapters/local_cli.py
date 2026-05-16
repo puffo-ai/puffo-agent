@@ -25,8 +25,11 @@ from pathlib import Path
 from ...mcp.config import (
     default_python_executable,
     write_cli_mcp_config,
+    write_codex_mcp_config,
 )
 from ...portal.state import (
+    agent_codex_user_dir,
+    link_host_codex_auth,
     link_host_credentials,
     seed_claude_home,
     sync_host_enabled_plugins,
@@ -36,6 +39,7 @@ from ...portal.state import (
 )
 from .base import Adapter, TurnContext, TurnResult, looks_like_auth_failure
 from .cli_session import AuditLog, ClaudeSession
+from .codex_session import CodexSession
 
 logger = logging.getLogger(__name__)
 
@@ -131,11 +135,10 @@ class LocalCLIAdapter(Adapter):
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
-        # cli-local doesn't yet support hermes / gemini-cli.
-        # Replicating the containerised setup on the operator's own
-        # host (where ``~/.hermes/`` / ``~/.gemini/`` may contain
-        # personal sessions) needs its own design pass. Reject loudly
-        # at construction.
+        # cli-local supports claude-code (default) and codex (alpha).
+        # hermes / gemini-cli remain cli-docker-only — replicating
+        # their containerised setup on the operator's own host needs
+        # its own design pass.
         if harness.name() in ("hermes", "gemini-cli"):
             raise RuntimeError(
                 f"agent {agent_id!r}: runtime.harness={harness.name()!r} is "
@@ -145,12 +148,23 @@ class LocalCLIAdapter(Adapter):
             )
         self.harness = harness
         self.puffo_core_mcp_env: dict[str, str] | None = None
+        # Caller injects the OpenAI key (from agent.yml or env) into
+        # this field; codex reads it as ``OPENAI_API_KEY`` env. Unused
+        # for the claude-code path.
+        self.openai_api_key: str = ""
         self._verified = False
+        # claude-code path uses ClaudeSession (long-lived stream-json);
+        # codex path uses CodexSession (long-lived JSON-RPC). Only one
+        # is non-None at a time — selected by ``harness.name()``.
         self._session: ClaudeSession | None = None
+        self._codex_session: CodexSession | None = None
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         self._verify()
         user_message = ctx.messages[-1]["content"] if ctx.messages else ""
+        if self.harness.name() == "codex":
+            session = self._ensure_codex_session()
+            return await session.run_turn(user_message, ctx.system_prompt)
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
@@ -161,17 +175,36 @@ class LocalCLIAdapter(Adapter):
         ctx: TurnContext,
     ) -> TurnResult:
         self._verify()
+        if self.harness.name() == "codex":
+            # codex has no equivalent of claude-code's cheap "resume
+            # kick" — the App Server doesn't expose a resume-with-
+            # tickle handle in v1. Re-send the full payload, same as
+            # a fresh turn would.
+            session = self._ensure_codex_session()
+            return await session.run_turn(
+                fallback_user_message, ctx.system_prompt,
+            )
         session = self._ensure_session()
         return await session.run_retry_turn(
             kick_text, fallback_user_message, ctx.system_prompt,
         )
 
     async def warm(self, system_prompt: str) -> None:
-        """Spawn the claude subprocess eagerly when this agent has a
+        """Spawn the runtime subprocess eagerly when this agent has a
         persisted session; fresh agents wait for their first message
         to avoid paying for permanently-idle bots.
         """
         self._verify()
+        if self.harness.name() == "codex":
+            session = self._ensure_codex_session()
+            if not session.has_persisted_session():
+                logger.info(
+                    "agent %s: no persisted codex conversation; deferring "
+                    "spawn until first message", self.agent_id,
+                )
+                return
+            await session.warm(system_prompt)
+            return
         session = self._ensure_session()
         if not session.has_persisted_session():
             logger.info(
@@ -182,14 +215,25 @@ class LocalCLIAdapter(Adapter):
         await session.warm(system_prompt)
 
     async def reload(self, new_system_prompt: str) -> None:
-        """Close the long-lived claude subprocess so the next turn
-        spawns one that re-reads CLAUDE.md.
+        """Drop cached runtime state so the next turn re-reads the
+        on-disk instructions (CLAUDE.md for claude-code, AGENTS.md for
+        codex). For claude-code we close the long-lived subprocess;
+        for codex we update the in-memory ``current_instructions``
+        which the next ``sendUserTurn`` carries through (and the
+        rewritten AGENTS.md catches new conversations on resume).
         """
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if self._codex_session is not None:
+            await self._codex_session.reload(new_system_prompt)
 
     def _credentials_expires_in_seconds(self) -> int | None:
+        # Codex auth is a static OPENAI_API_KEY env var — no expiry,
+        # no rotation, so we always report "fresh" by returning None
+        # (the base refresh_ping short-circuits on None).
+        if self.harness.name() == "codex":
+            return None
         # All cli-local agents share the HOST's .credentials.json
         # (symlink where permitted, periodic copy elsewhere). Parse
         # ``expiresAt`` directly — mtime only advances on rewrite,
@@ -208,7 +252,11 @@ class LocalCLIAdapter(Adapter):
         """Spawn ``claude --print ...`` with the per-agent HOME env.
         Same rationale as DockerCLIAdapter: only a process exit
         flushes the refreshed token to disk.
+
+        codex: OPENAI_API_KEY is static, so refresh is a no-op.
         """
+        if self.harness.name() == "codex":
+            return
         self._verify()
         env = {
             **os.environ,
@@ -285,6 +333,91 @@ class LocalCLIAdapter(Adapter):
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if self._codex_session is not None:
+            await self._codex_session.aclose()
+            self._codex_session = None
+
+    def _ensure_codex_session(self) -> CodexSession:
+        if self._codex_session is not None:
+            return self._codex_session
+
+        codex_home = agent_codex_user_dir(self.agent_id)
+        codex_home.mkdir(parents=True, exist_ok=True)
+        # AGENTS.md investment goes here so codex picks it up on
+        # ``newConversation``; the file body itself is written by
+        # ``profile_sync.rebuild_agent_codex_md`` (worker startup +
+        # reload_system_prompt). Writing the dir is just to make sure
+        # codex has a HOME to read from.
+        agents_md = codex_home / "AGENTS.md"
+        if not agents_md.exists():
+            agents_md.write_text("", encoding="utf-8")
+
+        # Per-server env injection for the puffo_core MCP server runs
+        # through ``write_codex_mcp_config`` (TOML, not JSON).
+        if self.puffo_core_mcp_env:
+            write_codex_mcp_config(
+                codex_home / "config.toml",
+                command=default_python_executable(),
+                args=["-m", "puffo_agent.mcp.puffo_core_server"],
+                env=self.puffo_core_mcp_env,
+            )
+        else:
+            logger.warning(
+                "agent %s: codex MCP tools unavailable — puffo_core is "
+                "not configured. populate `puffo_core:` in agent.yml to "
+                "enable send_message / list_channels / etc.",
+                self.agent_id,
+            )
+
+        env = {
+            **os.environ,
+            # Per-agent isolation for codex sessions/config/instructions.
+            # Plan §2.D — Phase 0 #8 verifies the App Server actually
+            # honours this.
+            "CODEX_HOME": str(codex_home),
+        }
+        if self.openai_api_key:
+            env["OPENAI_API_KEY"] = self.openai_api_key
+        else:
+            # OAuth fallback: share the operator's ``~/.codex/auth.json``
+            # into this agent's $CODEX_HOME so codex picks up the
+            # ``codex login`` session. Symlink-preferred (refresh rotations
+            # propagate instantly across agents); copy fallback on
+            # Windows non-dev-mode. Fail loud with a clear message if
+            # neither auth path exists — there's no way the agent can
+            # talk to OpenAI without one or the other.
+            auth_mode = link_host_codex_auth(Path.home(), codex_home)
+            if auth_mode == "no-host-file":
+                raise RuntimeError(
+                    f"agent {self.agent_id!r}: codex needs auth — either "
+                    "set runtime.api_key in agent.yml / openai.api_key in "
+                    "daemon.yml / export OPENAI_API_KEY, OR run "
+                    "`codex login` in your own shell so ~/.codex/auth.json "
+                    "exists."
+                )
+            logger.info(
+                "agent %s: shared host codex auth (%s)",
+                self.agent_id, auth_mode,
+            )
+        # Subprocess argv — ``codex app-server`` is the documented entry
+        # point for embedding codex as a long-running agent. Resolve
+        # the binary via shutil.which so npm-installed shims like
+        # ``codex.cmd`` (Windows) work: asyncio.create_subprocess_exec
+        # goes through CreateProcess and does NOT honour PATHEXT, so
+        # the bare name ``codex`` fails to find ``codex.cmd``.
+        codex_bin = shutil.which("codex") or "codex"
+        argv = [codex_bin, "app-server"]
+
+        self._codex_session = CodexSession(
+            agent_id=self.agent_id,
+            session_file=codex_home / "codex_session.json",
+            argv=argv,
+            cwd=self.workspace_dir,
+            env=env,
+            permission_mode=self.permission_mode,
+            model=self.model,
+        )
+        return self._codex_session
 
     def _ensure_session(self) -> ClaudeSession:
         if self._session is not None:
@@ -465,6 +598,13 @@ class LocalCLIAdapter(Adapter):
 
     def _verify(self) -> None:
         if self._verified:
+            return
+        if self.harness.name() == "codex":
+            # codex has its own binary check (see CodexSession._spawn).
+            # We deliberately skip the claude-seed / link-credentials
+            # bookkeeping below — none of it applies to codex, and
+            # touching ~/.claude/* for a codex agent would be confusing.
+            self._verified = True
             return
         if shutil.which("claude") is None:
             raise RuntimeError(

@@ -78,6 +78,14 @@ def agent_claude_user_dir(agent_id: str) -> Path:
     return agent_home_dir(agent_id) / ".claude"
 
 
+def agent_codex_user_dir(agent_id: str) -> Path:
+    """The agent's ``.codex/`` dir — used as ``CODEX_HOME`` so
+    sessions, config.toml, and AGENTS.md are isolated per agent and
+    don't collide with the operator's own ``~/.codex/``.
+    """
+    return agent_home_dir(agent_id) / ".codex"
+
+
 def shared_fs_dir() -> Path:
     """Shared dir for cross-agent cooperation. Bind-mounted to
     ``/workspace/.shared`` for cli-docker; referenced by absolute path
@@ -244,6 +252,61 @@ def _file_is_up_to_date(dst: Path, src: Path) -> bool:
     except OSError:
         return False
     return ds.st_mtime == ss.st_mtime and ds.st_size == ss.st_size
+
+
+def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
+    """Share the operator's ``~/.codex/auth.json`` with the agent's
+    per-agent ``$CODEX_HOME`` so codex finds OAuth credentials there.
+
+    Mirrors ``link_host_credentials``'s symlink-preferred, copy-fallback
+    layout (Windows without Developer Mode rejects ``os.symlink``).
+    The same OAuth refresh-rotation story applies: a symlink lets every
+    agent see token rotations the moment codex (any process — main CLI
+    or another agent) writes back; a copy gets re-synced on the next
+    link call.
+
+    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
+    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-file"``.
+    """
+    import shutil
+    host_auth = host_home / ".codex" / "auth.json"
+    agent_auth = agent_codex_home / "auth.json"
+    if not host_auth.exists():
+        return "no-host-file"
+    agent_auth.parent.mkdir(parents=True, exist_ok=True)
+
+    if agent_auth.is_symlink():
+        try:
+            current = os.readlink(agent_auth)
+            if Path(current) == host_auth or current == str(host_auth):
+                return "symlink (already)"
+        except OSError:
+            pass
+
+    if (
+        agent_auth.exists()
+        and not agent_auth.is_symlink()
+        and _file_is_up_to_date(agent_auth, host_auth)
+    ):
+        return "copy (fresh)"
+
+    try:
+        if agent_auth.is_symlink() or agent_auth.exists():
+            agent_auth.unlink()
+    except OSError:
+        pass
+
+    try:
+        os.symlink(host_auth, agent_auth)
+        return "symlink"
+    except (OSError, NotImplementedError):
+        pass
+
+    try:
+        shutil.copy2(host_auth, agent_auth)
+        return "copy"
+    except OSError:
+        return "no-host-file"
 
 
 # Provenance markers dropped in skill dirs. Claude Code only loads

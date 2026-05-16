@@ -22,6 +22,7 @@ from ..agent.status_reporter import StatusReporter
 from ..agent.shared_content import (
     looks_like_managed_claude_md,
     rebuild_agent_claude_md,
+    rebuild_agent_codex_md,
 )
 from .state import (
     AgentConfig,
@@ -30,12 +31,46 @@ from .state import (
     RuntimeConfig,
     RuntimeState,
     agent_claude_user_dir,
+    agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
     cli_session_json_path,
     docker_shared_dir,
     shared_fs_dir,
 )
+
+
+def _rebuild_managed_system_prompt(
+    *,
+    harness_name: str,
+    agent_id: str,
+    shared_path: Path,
+    profile_path: str,
+    memory_path: str,
+    workspace_path: str,
+) -> str:
+    """Dispatch wrapper: write the right system-prompt file(s) for the
+    agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; every
+    other harness goes through the legacy claude-code path (which also
+    writes GEMINI.md for the gemini-cli harness sharing the same body).
+    Returns the assembled prompt body either way.
+    """
+    if harness_name == "codex":
+        return rebuild_agent_codex_md(
+            shared_dir=shared_path,
+            profile_path=Path(profile_path),
+            memory_dir=Path(memory_path),
+            workspace_dir=Path(workspace_path),
+            codex_user_dir=agent_codex_user_dir(agent_id),
+        )
+    return rebuild_agent_claude_md(
+        shared_dir=shared_path,
+        profile_path=Path(profile_path),
+        memory_dir=Path(memory_path),
+        workspace_dir=Path(workspace_path),
+        claude_user_dir=agent_claude_user_dir(agent_id),
+        gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -164,9 +199,16 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
         # is unset, so cli-local works without supervised approvals.
         operator = ""
         from ..agent.harness import build_harness
+        harness = build_harness(agent_cfg.runtime.harness)
+        # Codex needs a model + OPENAI_API_KEY; for everything else the
+        # daemon's anthropic model is the right default.
+        if harness.name() == "codex":
+            model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
+        else:
+            model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or ""
         adapter = LocalCLIAdapter(
             agent_id=agent_cfg.id,
-            model=agent_cfg.runtime.model or daemon_cfg.anthropic.model or "",
+            model=model,
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             claude_dir=str(agent_cfg.resolve_claude_dir()),
             session_file=str(cli_session_json_path(agent_cfg.id)),
@@ -174,8 +216,22 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             agent_home_dir=str(agent_home_dir(agent_cfg.id)),
             owner_username=operator,
             permission_mode=agent_cfg.runtime.permission_mode,
-            harness=build_harness(agent_cfg.runtime.harness),
+            harness=harness,
         )
+        if harness.name() == "codex":
+            # Two auth paths supported:
+            #   1. Static OPENAI_API_KEY (cleanest — per-agent isolation,
+            #      no OAuth rotation race).
+            #   2. ChatGPT-account OAuth via `codex login` (operator runs
+            #      it once; the adapter symlinks ~/.codex/auth.json into
+            #      each agent's $CODEX_HOME).
+            # We pass the key down when set; absence means "use the
+            # OAuth file at ~/.codex/auth.json". The adapter raises a
+            # clear error if neither path is usable when the agent
+            # actually tries to spawn.
+            adapter.openai_api_key = (
+                agent_cfg.runtime.api_key or daemon_cfg.openai.api_key or ""
+            )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core
@@ -427,13 +483,13 @@ class Worker:
             # chat-local / sdk-local don't auto-discover, so the same
             # string is passed as PuffoAgent's system_prompt.
             shared_path = docker_shared_dir()
-            claude_md = rebuild_agent_claude_md(
-                shared_dir=shared_path,
-                profile_path=Path(profile_path),
-                memory_dir=Path(memory_path),
-                workspace_dir=Path(workspace_path),
-                claude_user_dir=agent_claude_user_dir(agent_id),
-                gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+            claude_md = _rebuild_managed_system_prompt(
+                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                agent_id=agent_id,
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
             )
 
             # One-time migration: remove an older project-level
@@ -544,6 +600,7 @@ class Worker:
             if reload_flag_path.exists():
                 await _reload_from_disk(
                     agent_id=agent_id,
+                    harness_name=(self.agent_cfg.runtime.harness or "").strip(),
                     shared_path=shared_path,
                     profile_path=profile_path,
                     memory_path=memory_path,
@@ -795,6 +852,7 @@ class Worker:
 async def _reload_from_disk(
     *,
     agent_id: str,
+    harness_name: str = "",
     shared_path: Path,
     profile_path: str,
     memory_path: str,
@@ -803,17 +861,22 @@ async def _reload_from_disk(
     adapter,
     flag_path: Path,
 ) -> None:
-    """Rebuild managed CLAUDE.md from disk and ask the adapter to drop
-    any cached subprocess. Failures are logged but don't drop the
-    turn — a stale prompt beats a dropped message."""
+    """Rebuild managed system-prompt file(s) from disk and ask the
+    adapter to drop any cached subprocess. Failures are logged but
+    don't drop the turn — a stale prompt beats a dropped message.
+
+    Dispatches on ``harness_name``: codex writes ``$CODEX_HOME/
+    AGENTS.md``; every other harness goes through the legacy claude-
+    code path.
+    """
     try:
-        new_md = rebuild_agent_claude_md(
-            shared_dir=shared_path,
-            profile_path=Path(profile_path),
-            memory_dir=Path(memory_path),
-            workspace_dir=Path(workspace_path),
-            claude_user_dir=agent_claude_user_dir(agent_id),
-            gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+        new_md = _rebuild_managed_system_prompt(
+            harness_name=harness_name,
+            agent_id=agent_id,
+            shared_path=shared_path,
+            profile_path=profile_path,
+            memory_path=memory_path,
+            workspace_path=workspace_path,
         )
         puffo.system_prompt = new_md
         await adapter.reload(new_md)

@@ -4,6 +4,175 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0a2] — 2026-05-15
+
+> **Pre-release published to TestPyPI only — not for general install.**
+
+### Fixed (codex cli-local alpha)
+
+End-to-end debugging session against a real `codex app-server`
+binary pinned a sequence of wrong assumptions in `0.10.0a1`. Every
+fix below was driven by either a live error trace from the codex
+process or a direct re-read of `codex-rs/app-server-protocol/src/
+protocol/v2.rs` + `codex-rs/app-server/README.md`.
+
+- **Windows codex binary resolution.** `asyncio.create_subprocess_exec`
+  goes through `CreateProcess`, which doesn't honour `PATHEXT` —
+  npm-installed `codex.cmd` was unreachable as bare `"codex"`.
+  Resolve via `shutil.which` before spawning so the full
+  `C:\Program Files\nodejs\codex.cmd` path is used.
+
+- **Wire method names** (the codex App Server's helpful error
+  response listed every method it knows, which made this exact):
+  `newConversation` → `thread/start`,
+  `resumeConversation` → `thread/resume`,
+  `sendUserTurn` → `turn/start`,
+  `interruptTurn` → `turn/interrupt`.
+  Plus an explicit `initialize` handshake on spawn (best-effort —
+  some App Server versions skip it).
+
+- **`thread/start` param shape.** Wire schema is **camelCase**
+  (`approvalPolicy`, NOT `approval_policy` — the Python SDK FAQ
+  was about the Python wrapper, not the JSON). Thread-level sandbox
+  field is bare `sandbox` (single word — not `sandbox_mode`, not
+  `sandboxMode`). Two prior cycles silently dropped our params and
+  fell back to codex defaults until this was pinned. System prompt
+  is NOT a param — codex reads `$CODEX_HOME/AGENTS.md` directly.
+  `instructions` field removed from both `thread/start` and
+  `turn/start`.
+
+- **`approvalPolicy: "never"` means auto-approve** (i.e. never
+  bother the client), not auto-deny. Counter-intuitive name; pinned
+  by live behaviour. Used together with `sandbox:
+  "danger-full-access"` for the puffo trust model (operator vouches
+  for the agent + machine, all tools allowed). cli-local runs as
+  the operator's UID anyway — codex's in-process sandbox would only
+  block legitimate work.
+
+- **`turn/start.input` is a structured array**
+  (`[{type: "text", text: ...}]`), not a bare string. Old shape
+  was rejected with "missing field `input`" before we figured this
+  out.
+
+- **`thread/start` response is nested**: `{thread: {id, ...}}`,
+  not flat `{threadId: ...}`. `_extract_thread_id` walks the
+  envelope defensively so a near-future minor rename doesn't break
+  us silently.
+
+- **5 distinct server-initiated request methods**, 3 distinct
+  response shapes, each handled explicitly (the previous
+  substring-match dispatcher confused them all):
+  - `item/commandExecution/requestApproval`
+    → `{decision: "accept"}` (variant names `accept` /
+    `acceptForSession` / `decline` / `cancel`, NOT `approved`).
+  - `item/fileChange/requestApproval` → same envelope.
+  - `item/permissions/requestApproval` →
+    `{scope: "session", permissions: …}` (mirrors back the
+    requested permissions).
+  - `mcpServer/elicitation/request` →
+    `{action: "accept", content: {}}` (the canonical mechanism
+    when an MCP tool call needs approval).
+  - `item/tool/call` → `{contentItems: [...], success: false}`
+    (dynamic-tool-invocation contract; we don't register any).
+
+- **`item/agentMessage/delta` payload shape.** Text fragment lives
+  at `params.delta` directly, NOT nested under `params.item.text`.
+  Missing this lost most of the streaming reply text — only the
+  final `item/completed` ever landed in the buffer. Fixed handler
+  reads `params.delta`; final completed item is preferred over
+  delta concatenation when they disagree.
+
+- **`mcp__puffo__send_message` detection.** codex emits a
+  `item/completed` notification with `type: "mcpToolCall"`,
+  `server: "puffo"`, `tool: "send_message"`, `status: "completed"`
+  whenever the agent successfully invokes a puffo MCP tool.
+  `CodexSession` now accumulates these into
+  `TurnResult.metadata["send_message_targets"]` — the same field
+  the claude-code adapter populates, so `core.py`'s reply-routing
+  logic is harness-agnostic. Without this, every codex reply
+  triggered the `[SILENT]`-fallback path (folded, not visible).
+
+- **StreamReader buffer raised from 64 KiB to 16 MiB.** Single
+  codex notifications (full MCP tool catalog on
+  `mcpServer/startupStatus/updated`, session snapshot on
+  `thread/started`) routinely exceed 64 KiB; the reader loop died
+  with `LimitOverrunError`, and subsequent turns timed out
+  reading from a dead pipe.
+
+- **Codex OAuth fallback** via shared `~/.codex/auth.json`. When
+  `runtime.api_key` is unset, the adapter symlinks (copy-fallback
+  on Windows non-dev-mode) the operator's `codex login` token
+  into `$CODEX_HOME/auth.json` per agent — same pattern as
+  `link_host_credentials` for claude-code. ChatGPT-account
+  subscribers can run puffo-agent codex agents on their plan
+  quota without separately-paid API tokens.
+
+### Operator note
+
+Existing `~/.puffo-agent/agents/<id>/.codex/codex_session.json`
+files carry conversation IDs whose `approvalPolicy` / `sandbox`
+config was BAKED at thread creation time. `thread/resume` doesn't
+re-apply those params, so 0.10.0a1 agents won't pick up the new
+config without deleting that file. Delete it (or move it aside)
+on upgrade.
+
+## [0.10.0a1] — 2026-05-15
+
+> **Pre-release published to TestPyPI only — not for general install.**
+> Install with `pip install --index-url https://test.pypi.org/simple/
+> --extra-index-url https://pypi.org/simple/ puffo-agent==0.10.0a1`.
+
+### Added
+
+- **Codex harness on `cli-local` (alpha).** New `runtime.harness: codex`
+  option for OpenAI's `codex` CLI, running as a long-lived
+  `codex app-server` JSON-RPC subprocess. Sibling to claude-code on the
+  cli-local path; claude-code is untouched, codex is opt-in.
+
+  Components:
+  - `agent/harness/codex.py` (`CodexHarness`) + `runtime_matrix`
+    entries (`HARNESS_CODEX` + `HARNESS_PROVIDERS[codex] = {openai}`).
+    Default harness for openai remains `hermes` — codex must be opted
+    into per agent.
+  - `agent/adapters/codex_session.py` (`CodexSession`) — JSON-RPC
+    over stdio: `newConversation` / `sendUserTurn` request/response,
+    `item/*` notification stream accumulated into the reply,
+    `turn/completed` resolves the turn, server-initiated approval
+    requests auto-decided under `bypassPermissions`. Conversation id
+    persisted to `<CODEX_HOME>/codex_session.json` so daemon restarts
+    `resumeConversation` instead of reopening from scratch.
+  - `LocalCLIAdapter` dispatches by `harness.name()`: codex agents
+    route through `CodexSession`, everything else stays on
+    `ClaudeSession`. `refresh_ping` / `_run_refresh_oneshot` short-
+    circuit for codex (static `OPENAI_API_KEY`, no OAuth rotation).
+  - Per-agent `CODEX_HOME` (`~/.puffo-agent/agents/<id>/.codex/`).
+    Two auth paths supported: explicit `runtime.api_key` → injected
+    as `OPENAI_API_KEY` env (cleanest, no rotation), OR ChatGPT-
+    account OAuth via `codex login` (operator runs it once, the
+    adapter symlinks `~/.codex/auth.json` into each agent's
+    `$CODEX_HOME`; copy fallback on Windows non-dev-mode). Fail-loud
+    error at spawn when neither path is usable. AGENTS.md lives at
+    `$CODEX_HOME/AGENTS.md`; reload hot-swaps the in-memory
+    `current_instructions` field carried by each `sendUserTurn` call.
+  - `mcp/config.py` gains `write_codex_mcp_config` — a TOML emitter
+    for codex's `[mcp_servers.puffo]` schema with per-server `env`
+    table for the existing `puffo_core_mcp_env` payload.
+
+  Out of scope for v1 (will follow): per-turn item-event streaming to
+  StatusReporter; codex-shaped health probe; cli-docker codex.
+
+  Self-update for codex agents in v1 is limited to
+  `reload_system_prompt` (re-writes AGENTS.md). `install_skill` /
+  `refresh` / `install_mcp_server` / `uninstall_*` remain
+  claude-code-only — the existing `_require_claude_code` MCP gates
+  surface a clear error.
+
+  This release ships to TestPyPI only. The codex App Server JSON-RPC
+  contract is still pre-1.0 upstream; we treat 0.10.0a1 as the
+  verification vehicle. Promote to PyPI 0.10.0 once a colleague has
+  walked an agent through a real end-to-end turn against the actual
+  `codex app-server` binary.
+
 ## [0.8.3] — 2026-05-15
 
 ### Fixed
@@ -737,7 +906,9 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.10.0a2...HEAD
+[0.10.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a2
+[0.10.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3
 [0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2
 [0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1
