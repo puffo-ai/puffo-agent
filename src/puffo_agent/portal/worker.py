@@ -219,16 +219,19 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             harness=harness,
         )
         if harness.name() == "codex":
-            openai_key = (
-                agent_cfg.runtime.api_key or daemon_cfg.openai.api_key
+            # Two auth paths supported:
+            #   1. Static OPENAI_API_KEY (cleanest — per-agent isolation,
+            #      no OAuth rotation race).
+            #   2. ChatGPT-account OAuth via `codex login` (operator runs
+            #      it once; the adapter symlinks ~/.codex/auth.json into
+            #      each agent's $CODEX_HOME).
+            # We pass the key down when set; absence means "use the
+            # OAuth file at ~/.codex/auth.json". The adapter raises a
+            # clear error if neither path is usable when the agent
+            # actually tries to spawn.
+            adapter.openai_api_key = (
+                agent_cfg.runtime.api_key or daemon_cfg.openai.api_key or ""
             )
-            if not openai_key:
-                raise RuntimeError(
-                    f"agent {agent_cfg.id!r}: runtime.harness=codex needs "
-                    "an OpenAI API key. Set runtime.api_key in agent.yml, "
-                    "openai.api_key in daemon.yml, or export OPENAI_API_KEY."
-                )
-            adapter.openai_api_key = openai_key
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core

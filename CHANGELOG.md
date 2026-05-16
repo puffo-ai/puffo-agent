@@ -33,8 +33,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
     route through `CodexSession`, everything else stays on
     `ClaudeSession`. `refresh_ping` / `_run_refresh_oneshot` short-
     circuit for codex (static `OPENAI_API_KEY`, no OAuth rotation).
-  - Per-agent `CODEX_HOME` (`~/.puffo-agent/agents/<id>/.codex/`) +
-    `OPENAI_API_KEY` env injection. AGENTS.md lives at
+  - Per-agent `CODEX_HOME` (`~/.puffo-agent/agents/<id>/.codex/`).
+    Two auth paths supported: explicit `runtime.api_key` → injected
+    as `OPENAI_API_KEY` env (cleanest, no rotation), OR ChatGPT-
+    account OAuth via `codex login` (operator runs it once, the
+    adapter symlinks `~/.codex/auth.json` into each agent's
+    `$CODEX_HOME`; copy fallback on Windows non-dev-mode). Fail-loud
+    error at spawn when neither path is usable. AGENTS.md lives at
     `$CODEX_HOME/AGENTS.md`; reload hot-swaps the in-memory
     `current_instructions` field carried by each `sendUserTurn` call.
   - `mcp/config.py` gains `write_codex_mcp_config` — a TOML emitter

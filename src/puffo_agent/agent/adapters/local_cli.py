@@ -29,6 +29,7 @@ from ...mcp.config import (
 )
 from ...portal.state import (
     agent_codex_user_dir,
+    link_host_codex_auth,
     link_host_credentials,
     seed_claude_home,
     sync_host_enabled_plugins,
@@ -377,6 +378,27 @@ class LocalCLIAdapter(Adapter):
         }
         if self.openai_api_key:
             env["OPENAI_API_KEY"] = self.openai_api_key
+        else:
+            # OAuth fallback: share the operator's ``~/.codex/auth.json``
+            # into this agent's $CODEX_HOME so codex picks up the
+            # ``codex login`` session. Symlink-preferred (refresh rotations
+            # propagate instantly across agents); copy fallback on
+            # Windows non-dev-mode. Fail loud with a clear message if
+            # neither auth path exists — there's no way the agent can
+            # talk to OpenAI without one or the other.
+            auth_mode = link_host_codex_auth(Path.home(), codex_home)
+            if auth_mode == "no-host-file":
+                raise RuntimeError(
+                    f"agent {self.agent_id!r}: codex needs auth — either "
+                    "set runtime.api_key in agent.yml / openai.api_key in "
+                    "daemon.yml / export OPENAI_API_KEY, OR run "
+                    "`codex login` in your own shell so ~/.codex/auth.json "
+                    "exists."
+                )
+            logger.info(
+                "agent %s: shared host codex auth (%s)",
+                self.agent_id, auth_mode,
+            )
         # Subprocess argv — ``codex app-server`` is the documented entry
         # point for embedding codex as a long-running agent.
         argv = ["codex", "app-server"]
