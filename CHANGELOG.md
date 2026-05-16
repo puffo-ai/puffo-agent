@@ -88,6 +88,37 @@ old path will recover after a daemon restart (the leaked FDs are
 process-bound — they go away when the daemon exits). No data
 migration needed.
 
+### Fixed (Claude.ai remote connectors)
+
+User report: an agent on 0.9.0a1 couldn't see the Gmail connector
+the operator had connected on the host (`ToolSearch` came back
+empty). Affected every Claude.ai remote connector — Gmail, Google
+Drive, Google Calendar, Notion, PDF Viewer.
+
+Root cause: ``seed_claude_home`` copies host ``~/.claude.json`` to
+the per-agent dir **once at agent creation, then never again**. The
+Claude.ai connector state lives under ``claudeAi*`` keys (e.g.
+``claudeAiMcpEverConnected``) and is NOT covered by
+``sync_host_mcp_servers`` (that one only touches the ``mcpServers``
+field, which is local stdio MCPs). So a connector the operator
+added or re-connected after the agent existed never propagated.
+
+Fix: new ``sync_host_claude_ai_state(host_home, agent_home)`` —
+merges every host ``claudeAi*`` key into the per-agent
+``.claude.json`` on every worker spawn. Auth (``claudeAiOauth``)
+is deliberately skipped, since ``link_host_credentials`` + the
+Keychain bridge own that path. ``LocalCLIAdapter._verify`` calls
+this alongside the existing skill / MCP / plugin syncs.
+
+Operator note: an agent that's currently mid-session won't see a
+connector that was connected DURING the session — restart the
+agent (``puffo-agent agent pause/resume`` or daemon restart) so
+the next ``_verify`` re-runs the sync.
+
+5 new tests in ``test_host_sync.py`` cover: empty-agent seed,
+preservation of agent-side mcpServers/projects state, ``claudeAiOauth``
+exclusion, missing-host-file noop, host-has-no-connectors noop.
+
 ## [0.9.0a1] — 2026-05-15
 
 > **Pre-release published to TestPyPI only — not for general install.**

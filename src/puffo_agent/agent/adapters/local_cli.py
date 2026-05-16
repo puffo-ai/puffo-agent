@@ -31,6 +31,7 @@ from ...portal.state import (
     home_dir,
     link_host_credentials,
     seed_claude_home,
+    sync_host_claude_ai_state,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
     sync_host_plugins,
@@ -483,6 +484,21 @@ class LocalCLIAdapter(Adapter):
             logger.info(
                 "agent %s: merged %d host MCP server registration(s) "
                 "into per-agent .claude.json", self.agent_id, merged_mcp,
+            )
+        # Claude.ai remote connector state — Gmail / Drive / Calendar /
+        # Notion / PDF Viewer. These live under ``claudeAi*`` keys
+        # in the host's ``~/.claude.json`` and are NOT covered by
+        # ``mcpServers`` (those are local stdio MCPs only). Without
+        # this every connector the operator connected on the host
+        # silently disappears in the agent's Claude Code subprocess.
+        synced_claude_ai = sync_host_claude_ai_state(
+            host_home, self.agent_home_dir,
+        )
+        if synced_claude_ai:
+            logger.info(
+                "agent %s: synced %d Claude.ai state key(s) "
+                "(remote connectors etc.) from host .claude.json",
+                self.agent_id, synced_claude_ai,
             )
         # Plugins layer — pairs the actual plugin code tree with the
         # ``enabledPlugins`` array Claude reads from settings.json.
