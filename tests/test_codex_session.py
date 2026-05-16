@@ -58,6 +58,15 @@ FAKE_HEADER = textwrap.dedent('''\
     def r():
         line = sys.stdin.readline()
         return json.loads(line) if line else None
+
+    def absorb_initialize():
+        """Drain the JSON-RPC initialize handshake the session sends
+        before any real method call. Tests don't care about the
+        capability exchange — they assert against the method that
+        follows."""
+        msg = r()
+        assert msg["method"] == "initialize", f"expected initialize, got {msg.get('method')!r}"
+        w({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
 ''')
 
 
@@ -79,14 +88,16 @@ def _argv_for(fake: Path) -> list[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SINGLE_TURN_SCRIPT = '''\
-# 1. Handle newConversation, return conversationId
-msg = r()
-assert msg["method"] == "newConversation"
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"conversationId": "conv_42"}})
+absorb_initialize()
 
-# 2. Receive sendUserTurn
+# 1. Handle thread/start, return threadId
 msg = r()
-assert msg["method"] == "sendUserTurn"
+assert msg["method"] == "thread/start"
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "conv_42"}})
+
+# 2. Receive turn/start
+msg = r()
+assert msg["method"] == "turn/start"
 turn_id = msg["id"]
 
 # 3. Stream two agentMessage deltas
@@ -146,13 +157,15 @@ def test_single_turn_roundtrip(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 RESUME_SCRIPT = '''\
-msg = r()
-assert msg["method"] == "resumeConversation", f"expected resume, got {msg['method']}"
-assert msg["params"]["conversationId"] == "conv_42"
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"conversationId": "conv_42"}})
+absorb_initialize()
 
 msg = r()
-assert msg["method"] == "sendUserTurn"
+assert msg["method"] == "thread/resume", f"expected thread/resume, got {msg['method']}"
+assert msg["params"]["threadId"] == "conv_42"
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "conv_42"}})
+
+msg = r()
+assert msg["method"] == "turn/start"
 turn_id = msg["id"]
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
    "params": {"item": {"type": "agent_message", "text": "resumed"}}})
@@ -193,12 +206,13 @@ def test_resume_existing_conversation(tmp_path):
 
 APPROVAL_SCRIPT = '''\
 import time
+absorb_initialize()
 
-# new conv
+# thread/start
 msg = r()
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"conversationId": "c1"}})
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "c1"}})
 
-# turn
+# turn/start
 msg = r()
 turn_id = msg["id"]
 
@@ -250,8 +264,10 @@ def test_approval_auto_bypass(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 FAIL_SCRIPT = '''\
+absorb_initialize()
+
 msg = r()
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"conversationId": "c1"}})
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "c1"}})
 
 msg = r()
 turn_id = msg["id"]
@@ -296,14 +312,16 @@ def test_turn_failed_raises(tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 RELOAD_SCRIPT = '''\
+absorb_initialize()
+
 msg = r()
-assert msg["method"] == "newConversation"
+assert msg["method"] == "thread/start"
 assert msg["params"]["instructions"] == "v1"
-w({"jsonrpc": "2.0", "id": msg["id"], "result": {"conversationId": "c1"}})
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"threadId": "c1"}})
 
 # First turn — should carry instructions v1
 msg = r()
-assert msg["method"] == "sendUserTurn"
+assert msg["method"] == "turn/start"
 assert msg["params"]["instructions"] == "v1"
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
    "params": {"item": {"type": "agent_message", "text": "turn1"}}})
@@ -312,7 +330,7 @@ w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
 
 # Second turn — instructions hot-swapped to v2 via reload()
 msg = r()
-assert msg["method"] == "sendUserTurn"
+assert msg["method"] == "turn/start"
 assert msg["params"]["instructions"] == "v2", f"got: {msg['params']['instructions']!r}"
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
    "params": {"item": {"type": "agent_message", "text": "turn2"}}})

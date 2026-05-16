@@ -62,16 +62,16 @@ _NOTIFICATION_PREFIXES = (
     "turn/", "turn.",
 )
 
-# Methods we issue to the App Server. If the upstream protocol uses
-# different names, change here in one place. ``newConversation`` /
-# ``sendUserTurn`` are the names reported in the codex-rs/app-server
-# README; ``approveExecCommand`` / ``approvePatch`` are the response
-# methods for server-initiated approval (we send them back on the same
-# stream, keyed off the inbound request id).
-METHOD_NEW_CONVERSATION = "newConversation"
-METHOD_SEND_USER_TURN = "sendUserTurn"
-METHOD_RESUME_CONVERSATION = "resumeConversation"
-METHOD_INTERRUPT_TURN = "interruptTurn"
+# Methods we issue to the App Server. These names are pinned from the
+# live server's error response (it helpfully enumerates every method
+# it knows about when handed an unknown one) — codex 0.x rejects
+# camelCase ``sendUserTurn``/``newConversation`` and ships the
+# slash-namespaced ``thread/*`` and ``turn/*`` families instead.
+METHOD_INITIALIZE = "initialize"
+METHOD_NEW_CONVERSATION = "thread/start"
+METHOD_SEND_USER_TURN = "turn/start"
+METHOD_RESUME_CONVERSATION = "thread/resume"
+METHOD_INTERRUPT_TURN = "turn/interrupt"
 
 # How long to wait for the App Server to acknowledge a request before
 # giving up. The first ``newConversation`` after spawn can be slow
@@ -193,7 +193,7 @@ class CodexSession:
                 turn.request_id,
                 METHOD_SEND_USER_TURN,
                 {
-                    "conversationId": self._conversation_id,
+                    "threadId": self._conversation_id,
                     "userInput": user_message,
                     # Best-effort per-turn instructions override —
                     # silently ignored by App Server versions that
@@ -216,7 +216,7 @@ class CodexSession:
                     await self._send_raw_request(
                         self._reserve_id(),
                         METHOD_INTERRUPT_TURN,
-                        {"conversationId": self._conversation_id},
+                        {"threadId": self._conversation_id},
                     )
                 except Exception:
                     pass
@@ -329,23 +329,67 @@ class CodexSession:
             self._stderr_loop(proc.stderr), name=f"codex-stderr-{self.agent_id}",
         )
 
-        # Start or resume the conversation.
+        # Anything below this point that raises must tear the process
+        # back down — otherwise ``_ensure_running`` on the next turn
+        # sees a "live" proc and skips spawn, sending turn requests
+        # against a half-initialised App Server.
+        try:
+            await self._bootstrap_session()
+        except Exception:
+            await self._teardown_locked()
+            raise
+
+    async def _bootstrap_session(self) -> None:
+        """Run the initialize handshake + thread/start (or thread/resume).
+        Separated from ``_spawn`` so the spawn path can wrap it in a
+        try/except that tears down the proc on any failure."""
+        # 1. JSON-RPC initialize handshake. Most JSON-RPC servers
+        # require this before accepting other methods; codex is no
+        # exception. Send a minimal clientInfo + capabilities envelope
+        # and ignore the response — we don't read server capabilities
+        # back yet.
+        try:
+            await self._send_raw_request(
+                self._reserve_id(),
+                METHOD_INITIALIZE,
+                {
+                    "clientInfo": {
+                        "name": "puffo-agent",
+                        "version": "0.10.0a1",
+                    },
+                    "capabilities": {},
+                    # protocolVersion is a polite hint — codex accepts
+                    # most values and pins to its own internal version.
+                    "protocolVersion": "2025-06-18",
+                },
+            )
+        except Exception as exc:
+            # initialize is best-effort: some App Server versions don't
+            # require it. We log + continue so older / newer servers
+            # both work.
+            logger.info(
+                "agent %s: codex initialize returned %s (continuing — "
+                "initialize is sometimes optional)",
+                self.agent_id, exc,
+            )
+
+        # 2. Start or resume the conversation/thread.
         if self._conversation_id:
             try:
                 await self._send_raw_request(
                     self._reserve_id(),
                     METHOD_RESUME_CONVERSATION,
-                    {"conversationId": self._conversation_id},
+                    {"threadId": self._conversation_id},
                 )
                 logger.info(
-                    "agent %s: resumed codex conversation %s",
+                    "agent %s: resumed codex thread %s",
                     self.agent_id, self._conversation_id,
                 )
                 return
             except Exception as exc:
                 logger.warning(
                     "agent %s: resume failed (%s); starting fresh "
-                    "conversation",
+                    "thread",
                     self.agent_id, exc,
                 )
                 self._conversation_id = ""
@@ -361,20 +405,16 @@ class CodexSession:
                 "cwd": self.cwd or os.getcwd(),
             },
         )
-        cid = (
-            (result or {}).get("conversationId")
-            or (result or {}).get("conversation_id")
-            or ""
-        )
+        cid = _extract_thread_id(result)
         if not cid:
             raise RuntimeError(
-                f"agent {self.agent_id}: codex newConversation returned "
-                f"no conversationId: {result!r}"
+                f"agent {self.agent_id}: codex thread/start returned "
+                f"no thread id: {result!r}"
             )
-        self._conversation_id = str(cid)
+        self._conversation_id = cid
         self._save_conversation_id(self._conversation_id)
         logger.info(
-            "agent %s: started codex conversation %s",
+            "agent %s: started codex thread %s",
             self.agent_id, self._conversation_id,
         )
 
@@ -667,6 +707,30 @@ class CodexSession:
             turn.output_tokens = int(usage.get("output_tokens") or 0)
         except (TypeError, ValueError):
             pass
+
+
+def _extract_thread_id(result: Any) -> str:
+    """Pull a thread id out of whatever shape ``thread/start`` returned.
+
+    Codex hasn't published a stable response schema for ``thread/*``,
+    so we try the obvious flat / camelCase / snake_case / nested
+    variations and fall back to empty. Caller surfaces a clear error
+    when this returns empty.
+    """
+    if not isinstance(result, dict):
+        return ""
+    for key in ("threadId", "thread_id", "conversationId", "conversation_id", "id"):
+        v = result.get(key)
+        if isinstance(v, str) and v:
+            return v
+    # Nested {thread: {id: "..."}} / {result: {threadId: "..."}}
+    for parent_key in ("thread", "result"):
+        nested = result.get(parent_key)
+        if isinstance(nested, dict):
+            inner = _extract_thread_id(nested)
+            if inner:
+                return inner
+    return ""
 
 
 __all__ = ["CodexSession"]
