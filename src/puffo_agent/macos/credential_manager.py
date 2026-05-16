@@ -318,22 +318,81 @@ def bootstrap_from_keychain(cache: CredentialCache) -> tuple[bool, Optional[str]
     return (True, "bootstrapped")
 
 
+async def _run_claude_oneshot(
+    env: dict[str, str],
+    cwd: str,
+    *,
+    timeout: float = REFRESH_ONESHOT_TIMEOUT_SECONDS,
+) -> tuple[Optional[int], str]:
+    """Spawn ``claude --print --max-turns 1 "ok"`` and wait. Returns
+    ``(returncode, error_reason)`` — ``returncode`` is None on
+    failure paths (timeout / binary missing / spawn error). Always
+    cleans up the subprocess and pipe FDs even on early-return paths
+    (this is the source of the FD-exhaustion reports under load —
+    asyncio's create_subprocess_exec leaves pipes open until the
+    proc is awaited).
+    """
+    if shutil.which("claude") is None:
+        return (None, "claude_binary_missing")
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--dangerously-skip-permissions",
+                "--print", "--max-turns", "1",
+                "--output-format", "stream-json", "--verbose",
+                "ok",
+                env=env, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            return (None, "claude_binary_missing")
+
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            # CRITICAL — without the kill + drain below the proc
+            # zombies and its stdout/stderr pipes leak. Under load
+            # ([Errno 24] Too many open files) this is the FD leak
+            # the user reported.
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.communicate()
+            except Exception:
+                pass
+            return (None, "refresh_oneshot_timeout")
+        return (proc.returncode, "")
+    finally:
+        # Defensive belt-and-braces: any exception path between spawn
+        # and the timeout/communicate block above leaves proc dangling.
+        # On the success path proc.returncode is already set + pipes
+        # are drained by communicate(), so this branch is a no-op.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except (ProcessLookupError, OSError):
+                pass
+
+
 async def refresh_via_oneshot(
     cache: CredentialCache,
     shim_dir_path: Path,
     *,
     timeout: float = REFRESH_ONESHOT_TIMEOUT_SECONDS,
 ) -> tuple[bool, Optional[str]]:
-    """Run a one-turn ``claude --print`` in a sandbox $HOME seeded
-    from the cache. On exit, Claude has rewritten ``.credentials.json``
-    with a fresh token; copy it back to the cache.
+    """macOS path: run a one-turn ``claude --print`` in a sandbox $HOME
+    seeded from the cache. On exit, Claude has rewritten
+    ``.credentials.json`` with a fresh token; copy it back to the cache.
 
     Returns (ok, reason_when_not_ok).
     """
     if not is_macos():
         return (False, "not_macos")
-    if shutil.which("claude") is None:
-        return (False, "claude_binary_missing")
     blob = cache.read()
     if not blob:
         return (False, "cache_empty")
@@ -360,30 +419,11 @@ async def refresh_via_oneshot(
         # native refresh path to engage (read .credentials.json → if
         # expired refresh against Anthropic → write back). The env-var
         # mode would bypass storage entirely.
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "--dangerously-skip-permissions",
-                "--print", "--max-turns", "1",
-                "--output-format", "stream-json", "--verbose",
-                "ok",
-                env=env, cwd=str(sandbox_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            return (False, "claude_binary_missing")
-
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            return (False, "refresh_oneshot_timeout")
-
-        if proc.returncode != 0:
-            return (False, f"claude_exit_code={proc.returncode}")
+        rc, err = await _run_claude_oneshot(env, str(sandbox_path), timeout=timeout)
+        if rc is None:
+            return (False, err)
+        if rc != 0:
+            return (False, f"claude_exit_code={rc}")
 
         # Read whatever Claude wrote.
         try:
@@ -405,22 +445,62 @@ async def refresh_via_oneshot(
         return (True, "token_refreshed")
 
 
+async def refresh_via_host_oneshot(
+    host_home: Path,
+    *,
+    timeout: float = REFRESH_ONESHOT_TIMEOUT_SECONDS,
+) -> tuple[bool, Optional[str]]:
+    """Linux/Windows path: run ``claude --print`` against the operator's
+    real ``$HOME``. Claude reads / writes ``~/.claude/.credentials.json``
+    natively, so this triggers an in-place token rotation that every
+    agent's symlink picks up on the next read.
+
+    No sandbox, no Keychain — the host file IS the source of truth on
+    these platforms. Daemon-level scheduling means there's exactly ONE
+    refresh in flight at any time, removing the rotating-refresh-token
+    race that was causing "refresh ran but expiry didn't advance"
+    under multi-agent load.
+    """
+    env = {**os.environ, "HOME": str(host_home), "USERPROFILE": str(host_home)}
+    rc, err = await _run_claude_oneshot(env, str(host_home), timeout=timeout)
+    if rc is None:
+        return (False, err)
+    if rc != 0:
+        return (False, f"claude_exit_code={rc}")
+    return (True, "token_refreshed_or_unchanged")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Daemon-level credential manager
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CredentialManager:
-    """Long-running daemon companion. Owns the credential cache, runs
-    the periodic refresh loop, and writes back to Keychain after each
-    successful refresh.
+    """Long-running daemon companion. Single source of truth for
+    Claude Code OAuth refresh — every cli-local agent reads from the
+    file this manager keeps fresh; no per-agent refresh_ping path.
 
     Lifecycle::
 
         cm = CredentialManager(home)
-        await cm.bootstrap()  # may trigger one-time ACL prompt
+        await cm.bootstrap()  # may trigger one-time macOS ACL prompt
         cm.start()
         # ... daemon runs ...
         await cm.stop()
+
+    Why this lives at the daemon level and not on each adapter:
+
+    The previous per-agent path raced rotating refresh tokens whenever
+    N agents hit their refresh window inside the same 30-minute span.
+    First agent's refresh succeeds, server invalidates the prior
+    refresh token, every other in-flight refresh fails with
+    ``invalid_grant`` — but the failure path still rewrote the file
+    with stale content, so ``expiresAt`` would not advance and the
+    next ``refresh_ping`` tick repeated the race. Compounded by a FD
+    leak on the timeout path (proc not killed + pipes not drained),
+    you got "refresh ran but expiry didn't advance" plus
+    ``[Errno 24] Too many open files``. The daemon-level manager
+    here has exactly one refresh in flight, so there's nothing to
+    race; the FD leak is also fixed in ``_run_claude_oneshot``.
     """
 
     def __init__(
@@ -430,26 +510,41 @@ class CredentialManager:
         refresh_interval_seconds: float = REFRESH_INTERVAL_SECONDS,
     ):
         self.home = home
-        self.cache = CredentialCache.at(home)
-        self.shim = shim_dir(home)
+        # macOS-only — Keychain bridge cache. Non-macOS uses the host
+        # file (~/.claude/.credentials.json) directly.
+        self.cache = CredentialCache.at(home) if is_macos() else None
+        self.shim = shim_dir(home) if is_macos() else None
         self.refresh_interval_seconds = refresh_interval_seconds
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Observability — exposed via runtime.json so operators can
+        # see "is credential refresh healthy?" without tailing logs.
         self.last_refresh_at: Optional[float] = None
         self.last_refresh_status: Optional[str] = None
+        # Backoff state: bounded exponential off the normal 6h cadence
+        # when refresh keeps failing. Without this, a permanently-bad
+        # refresh token (revoked / user logged out elsewhere) hammers
+        # the server forever.
+        self.consecutive_failures: int = 0
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
-        """Bootstrap cache + install PATH shim. Idempotent. Safe to
-        call on every daemon start."""
+        """Bootstrap cache + install PATH shim. macOS-only — on
+        Linux/Windows the host's ~/.claude/.credentials.json is
+        already the canonical store. Safe to call on every daemon
+        start.
+        """
         if not is_macos():
-            return (False, "not_macos")
+            return (True, "host_file_authoritative")
         install_path_shim(self.home)
         return bootstrap_from_keychain(self.cache)
 
     def start(self) -> None:
-        """Kick off the background refresh loop. No-op when not on
-        macOS or when already started."""
-        if not is_macos() or self._task is not None:
+        """Kick off the background refresh loop. Runs on all
+        platforms (claude-code OAuth applies regardless of platform);
+        the per-platform refresh strategy is dispatched in
+        ``_refresh_once``. No-op when already started.
+        """
+        if self._task is not None:
             return
         self._task = asyncio.ensure_future(self._loop())
 
@@ -465,11 +560,25 @@ class CredentialManager:
             self._task.cancel()
         self._task = None
 
+    def _next_interval_seconds(self) -> float:
+        """Bounded exponential backoff after consecutive failures.
+        Healthy state stays on the normal 6h schedule; failures
+        retry faster than normal (10min, 20min, 40min, …) but
+        capped at the normal interval so a permanent failure
+        doesn't burn FDs + tokens.
+        """
+        if self.consecutive_failures == 0:
+            return self.refresh_interval_seconds
+        base = 600.0  # 10 minutes
+        delay = base * (2 ** (self.consecutive_failures - 1))
+        return min(delay, self.refresh_interval_seconds)
+
     async def _loop(self) -> None:
-        """Refresh-then-sleep loop. First tick fires immediately so the
-        cache gets a fresh token soon after daemon start (in case the
-        bootstrap blob was several hours old). Subsequent ticks honour
-        ``refresh_interval_seconds``."""
+        """Refresh-then-sleep loop. First tick fires immediately so
+        the on-disk credential gets a fresh token soon after daemon
+        start (the bootstrap blob may be several hours old).
+        Subsequent ticks honour ``_next_interval_seconds()``.
+        """
         # Tiny initial jitter so concurrent daemons (test fixtures)
         # don't all hammer claude simultaneously.
         await asyncio.sleep(2.0)
@@ -480,30 +589,46 @@ class CredentialManager:
                 logger.warning(
                     "credential refresh tick crashed: %s", exc, exc_info=True,
                 )
+                self.consecutive_failures += 1
             try:
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=self.refresh_interval_seconds,
+                    self._stop.wait(), timeout=self._next_interval_seconds(),
                 )
             except asyncio.TimeoutError:
                 pass
 
     async def _refresh_once(self) -> None:
-        ok, reason = await refresh_via_oneshot(self.cache, self.shim)
+        if is_macos():
+            ok, reason = await refresh_via_oneshot(self.cache, self.shim)
+        else:
+            ok, reason = await refresh_via_host_oneshot(Path.home())
         self.last_refresh_at = time.time()
         self.last_refresh_status = (
             f"ok ({reason})" if ok else f"failed ({reason})"
         )
         if ok:
+            self.consecutive_failures = 0
             logger.info("claude credential refresh: %s", reason)
-            blob = self.cache.read()
-            if blob:
-                wb_ok, wb_reason = writeback_to_keychain(blob)
-                if wb_ok:
-                    logger.info("claude credential writeback to keychain: ok")
-                else:
-                    logger.info(
-                        "claude credential writeback to keychain skipped: %s",
-                        wb_reason,
-                    )
+            # macOS only: writeback to Keychain so main CLI / VS Code
+            # extension see the rotated token.
+            if is_macos() and self.cache is not None:
+                blob = self.cache.read()
+                if blob:
+                    wb_ok, wb_reason = writeback_to_keychain(blob)
+                    if wb_ok:
+                        logger.info(
+                            "claude credential writeback to keychain: ok",
+                        )
+                    else:
+                        logger.info(
+                            "claude credential writeback to keychain "
+                            "skipped: %s", wb_reason,
+                        )
         else:
-            logger.warning("claude credential refresh failed: %s", reason)
+            self.consecutive_failures += 1
+            logger.warning(
+                "claude credential refresh failed (attempt #%d): %s — "
+                "next try in %.0fs",
+                self.consecutive_failures, reason,
+                self._next_interval_seconds(),
+            )

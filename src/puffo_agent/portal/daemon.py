@@ -50,9 +50,14 @@ class Daemon:
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
-        # macOS-only: owns Keychain bootstrap + 6h refresh loop.
-        # No-op on Linux/Windows (the .start() / .stop() / .bootstrap()
-        # calls all gate on platform internally).
+        # Daemon-level Claude Code OAuth credential refresh. Runs on
+        # every platform — macOS additionally bridges through the
+        # Keychain. On Linux/Windows this is the single owner of
+        # ``claude --print`` refresh calls; per-agent refresh_ping is
+        # short-circuited to None, killing the rotating-token race
+        # that caused "refresh ran but expiry didn't advance" + the
+        # FD-exhaustion-via-stuck-subprocesses fallout under
+        # multi-agent load.
         self.credentials = CredentialManager(home_dir())
 
     async def run(self) -> None:
@@ -62,20 +67,20 @@ class Daemon:
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
 
-        # macOS Keychain bootstrap. First call after a fresh install may
-        # trigger a one-time "Always Allow" ACL prompt; after that,
-        # everything is silent. Non-fatal on failure — the daemon falls
-        # back to the legacy HOME-overlay path.
-        if is_macos():
-            ok, reason = await self.credentials.bootstrap()
-            if ok:
-                logger.info("claude credential bootstrap: %s", reason)
-                self.credentials.start()
-            else:
-                logger.warning(
-                    "claude credential bootstrap failed: %s — falling back "
-                    "to legacy HOME-overlay path", reason,
-                )
+        # Bootstrap + start daemon-level credential refresh. On macOS
+        # this also bridges the Keychain → cache (first run may trigger
+        # a one-time "Always Allow" ACL prompt). On Linux/Windows it's
+        # a no-op bootstrap + start the refresh loop directly.
+        ok, reason = await self.credentials.bootstrap()
+        if ok:
+            logger.info("claude credential bootstrap: %s", reason)
+            self.credentials.start()
+        else:
+            logger.warning(
+                "claude credential bootstrap failed: %s — daemon-level "
+                "refresh disabled; per-agent fallback applies",
+                reason,
+            )
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.

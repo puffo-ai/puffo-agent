@@ -36,14 +36,11 @@ from ...portal.state import (
     sync_host_plugins,
     sync_host_skills,
 )
-from .base import Adapter, TurnContext, TurnResult, looks_like_auth_failure
+from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 
 logger = logging.getLogger(__name__)
 
-
-# See docker_cli for rationale.
-REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
 # How long the permission proxy hook waits for an owner reply before
 # denying. Exposed to the hook via PUFFO_PERMISSION_TIMEOUT.
@@ -192,109 +189,29 @@ class LocalCLIAdapter(Adapter):
             self._session = None
 
     def _credentials_expires_in_seconds(self) -> int | None:
-        # On macOS, the daemon-owned cache is authoritative; the
-        # daemon's CredentialManager refreshes it every 6h so per-agent
-        # refresh_ping should almost always see a fresh token and
-        # short-circuit. Linux/Windows keep the legacy host-file path
-        # — Claude there still uses .credentials.json natively.
-        if is_macos():
-            cache = CredentialCache.at(home_dir())
-            exp = cache.expires_at_seconds()
-            if exp is None:
-                return None
-            return int(exp - time.time())
+        # Daemon's CredentialManager owns refresh on every platform now
+        # (see ``puffo_agent.macos.credential_manager``). Per-agent
+        # ``refresh_ping`` is therefore a no-op — return None to short-
+        # circuit ``base.Adapter.refresh_ping``. This eliminates the
+        # rotating-refresh-token race that caused "refresh ran but
+        # expiry didn't advance" reports under multi-agent load, and
+        # prevents the FD-exhaustion-via-stale-subprocesses fallout.
+        #
+        # Just keep the per-agent symlink/copy fresh so each agent's
+        # ``.credentials.json`` (or its symlink target) reflects what
+        # the daemon's refresh wrote.
         link_host_credentials(Path.home(), self.agent_home_dir)
-        host_credentials = Path.home() / ".claude" / ".credentials.json"
-        try:
-            data = json.loads(host_credentials.read_text(encoding="utf-8"))
-            expires_ms = int(data["claudeAiOauth"]["expiresAt"])
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-        return int(expires_ms / 1000 - time.time())
+        return None
 
     async def _run_refresh_oneshot(self) -> None:
-        """Spawn ``claude --print ...`` with the per-agent HOME env.
-        Same rationale as DockerCLIAdapter: only a process exit
-        flushes the refreshed token to disk.
-
-        On macOS, the daemon's CredentialManager owns refresh; this
-        per-agent path is short-circuited so we don't duplicate the
-        work and don't spawn HOME-overlay refresh oneshots that hit
-        the original Keychain ACL popup.
+        """Per-agent refresh is owned by the daemon now (see
+        ``puffo_agent.macos.credential_manager``). This method stays
+        as a hook the base class can call, but it's a no-op on every
+        platform — historical per-agent OAuth races and the
+        ``[Errno 24] Too many open files`` FD leak from the old path
+        are both gone.
         """
-        if is_macos():
-            return
-        self._verify()
-        env = {
-            **os.environ,
-            "HOME": str(self.agent_home_dir),
-            "USERPROFILE": str(self.agent_home_dir),
-        }
-        # --dangerously-skip-permissions is required: in --print mode
-        # claude can't surface permission prompts, so without bypass
-        # it exits before the API call and no refresh happens.
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-        ]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        cmd.append("ok")
-        started_at = time.time()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=self.workspace_dir,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=REFRESH_ONESHOT_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "agent %s: refresh one-shot timed out after %ds",
-                self.agent_id, REFRESH_ONESHOT_TIMEOUT_SECONDS,
-            )
-            return
-        except FileNotFoundError:
-            logger.warning(
-                "agent %s: refresh one-shot: claude binary missing",
-                self.agent_id,
-            )
-            return
-        elapsed = time.time() - started_at
-        out_text = stdout.decode("utf-8", errors="replace")
-        err_text = stderr.decode("utf-8", errors="replace")
-        # Doubles as an inference smoke test (auth status can
-        # report OK while every API call returns 401). The worker
-        # reads auth_healthy to suppress noisy replies while the
-        # operator re-auths.
-        if looks_like_auth_failure(out_text, err_text):
-            logger.error(
-                "agent %s: refresh one-shot hit an auth failure "
-                "(rc=%d in %.1fs). operator re-auth likely required. "
-                "stdout: %s | stderr: %s",
-                self.agent_id, proc.returncode, elapsed,
-                out_text.strip()[-400:], err_text.strip()[-400:],
-            )
-            self.auth_healthy = False
-        elif proc.returncode != 0:
-            logger.warning(
-                "agent %s: refresh one-shot rc=%d in %.1fs | "
-                "stdout: %s | stderr: %s",
-                self.agent_id, proc.returncode, elapsed,
-                out_text.strip()[-400:], err_text.strip()[-400:],
-            )
-        else:
-            logger.debug(
-                "agent %s: refresh one-shot rc=0 in %.1fs",
-                self.agent_id, elapsed,
-            )
-            self.auth_healthy = True
+        return
 
     async def aclose(self) -> None:
         if self._session is not None:

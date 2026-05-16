@@ -1,7 +1,11 @@
-"""macOS-specific helpers for transparent Claude Code credential
-management. Everything in this package is no-op on Linux/Windows; call
-sites must still gate on ``platform.system() == "Darwin"`` to avoid
-shipping behaviour they didn't mean to ship.
+"""Daemon-level Claude Code OAuth credential management. Some pieces
+here (Keychain bridge, PATH shim) are macOS-only; ``CredentialManager``
+runs on every platform — refresh strategy dispatched internally.
+
+Path-name historical: this package was bootstrapped as macOS-only.
+The non-macOS daemon-level refresh got bundled in when we generalised
+to fix the "refresh ran but expiry didn't advance" reports on
+Linux/Windows.
 """
 
 from .credential_manager import (
@@ -14,6 +18,7 @@ from .credential_manager import (
     install_path_shim,
     is_macos,
     read_keychain_blob,
+    refresh_via_host_oneshot,
     refresh_via_oneshot,
     shim_dir,
     writeback_to_keychain,
@@ -29,6 +34,7 @@ __all__ = [
     "install_path_shim",
     "is_macos",
     "read_keychain_blob",
+    "refresh_via_host_oneshot",
     "refresh_via_oneshot",
     "shim_dir",
     "writeback_to_keychain",

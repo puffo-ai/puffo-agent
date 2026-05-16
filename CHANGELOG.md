@@ -4,6 +4,90 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0a2] — 2026-05-16
+
+> **Pre-release published to TestPyPI only — not for general install.**
+
+### Fixed
+
+Real-world feedback from a multi-agent Linux deployment surfaced
+three correlated bugs that the macOS-only 0.9.0a1 didn't cover:
+
+  *Symptoms*
+  - `refresh_ping ran but token expiry didn't advance` repeated
+    every 10 minutes per agent.
+  - Credentials expired by hours despite refresh attempts.
+  - `[Errno 24] Too many open files` after a few hours of
+    multi-agent uptime.
+
+  *Root causes*
+  - Linux / Windows kept the legacy per-agent
+    `_run_refresh_oneshot` path (0.9.0a1 only generalised the
+    macOS Keychain bridge). N agents racing on the rotating
+    refresh token meant the first refresh invalidated everyone
+    else's in-flight refresh; the failed paths still rewrote the
+    file with stale content.
+  - The per-agent timeout branch killed the subprocess but never
+    awaited `proc.wait()` / drained the pipes, leaking 3 FDs per
+    timed-out refresh.
+  - No backoff: a permanently-bad refresh token (revoked /
+    operator logged out elsewhere) kept hammering the OAuth
+    endpoint every 10 minutes per agent forever.
+
+### Added
+
+- **`CredentialManager` now runs on every platform.** Removed the
+  `is_macos()` gates from `start()` / `_loop()`. macOS still
+  bridges through the Keychain + cache; Linux / Windows uses the
+  host's `~/.claude/.credentials.json` directly via the new
+  `refresh_via_host_oneshot`. The daemon is the single owner of
+  every `claude --print` refresh call — agents read from the
+  host file (symlink / copy) without any per-agent refresh logic.
+
+- **Per-agent refresh path retired.** `LocalCLIAdapter.
+  _credentials_expires_in_seconds` returns `None` on every
+  platform (short-circuits `base.Adapter.refresh_ping`), and
+  `_run_refresh_oneshot` is a documented no-op. Eliminates the
+  rotating-token race without any per-agent code knowing about
+  it.
+
+- **FD-leak fix in the refresh-oneshot subprocess path.** New
+  shared helper `_run_claude_oneshot` cleans up the
+  `asyncio.subprocess.Process` + drains stdout/stderr pipes on
+  every exit path (success, timeout, exception). The previous
+  timeout branch left the proc alive with pipes open — the FD
+  leak in the user report.
+
+- **Bounded-exponential backoff on consecutive refresh
+  failures.** `CredentialManager.consecutive_failures` resets on
+  every successful refresh; failed refreshes retry at 10min,
+  20min, 40min, … capped at the normal 6h cadence. A
+  permanently-broken refresh credential plateaus at one attempt
+  per 6h instead of one attempt per 10min per agent. Status is
+  exposed via `last_refresh_status` for runtime.json surfacing.
+
+### Tests
+
+15 new tests in `test_macos_credential_manager.py`:
+- backoff math (no failures, single failure, exponential, cap)
+- `refresh_via_host_oneshot` happy path + missing binary +
+  nonzero exit
+- FD-cleanup regression: a hung proc on timeout MUST be killed
+  AND have its pipes drained
+- Cross-platform `start()` semantics
+
+Removed 2 obsolete `test_cli_session_recovery.py` tests that
+exercised the now-retired per-agent `_run_refresh_oneshot` path
+(the auth-healthy concept moves to `CredentialManager` state).
+Full suite: 566 passed, 7 skipped.
+
+### Operator note
+
+Existing Linux / Windows deployments that were burning FDs on the
+old path will recover after a daemon restart (the leaked FDs are
+process-bound — they go away when the daemon exits). No data
+migration needed.
+
 ## [0.9.0a1] — 2026-05-15
 
 > **Pre-release published to TestPyPI only — not for general install.**
@@ -794,7 +878,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.9.0a1...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.9.0a2...HEAD
+[0.9.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.9.0a2
 [0.9.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.9.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3
 [0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2

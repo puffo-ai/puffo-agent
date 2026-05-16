@@ -361,16 +361,175 @@ def test_refresh_via_oneshot_skipped_when_claude_missing(monkeypatch, tmp_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_credential_manager_bootstrap_off_macos(monkeypatch, tmp_path):
+    """On non-macOS the manager still starts (host file is the
+    canonical credential store there), so bootstrap returns OK with a
+    descriptive reason rather than refusing."""
     _disable_macos(monkeypatch)
     m = cm.CredentialManager(tmp_path)
     ok, reason = asyncio.run(m.bootstrap())
-    assert ok is False
-    assert reason == "not_macos"
+    assert ok is True
+    assert reason == "host_file_authoritative"
 
 
-def test_credential_manager_start_is_noop_off_macos(monkeypatch, tmp_path):
+def test_credential_manager_start_runs_loop_on_all_platforms(
+    monkeypatch, tmp_path,
+):
+    """The previous gate that no-op'd ``start()`` off macOS caused
+    the real-world bug — Linux/Windows multi-agent runs got NO
+    daemon-level refresh, and each agent fell back to its own
+    refresh_ping path that raced with everyone else's. ``start()``
+    now creates the loop task on every platform. We mock
+    ``refresh_via_host_oneshot`` so the loop body doesn't try to
+    spawn a real claude binary inside the test process."""
     _disable_macos(monkeypatch)
-    m = cm.CredentialManager(tmp_path)
-    m.start()
-    assert m._task is None
-    asyncio.run(m.stop())  # should not raise
+
+    async def _fake_host_refresh(host_home, *, timeout=90.0):
+        return (True, "fake_ok")
+
+    monkeypatch.setattr(cm, "refresh_via_host_oneshot", _fake_host_refresh)
+
+    async def _drive():
+        m = cm.CredentialManager(tmp_path, refresh_interval_seconds=3600.0)
+        m.start()
+        assert m._task is not None
+        # Give the loop a moment to do its initial jitter sleep + tick.
+        await asyncio.sleep(0.05)
+        await m.stop()
+        assert m._task is None
+
+    asyncio.run(_drive())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backoff state machine
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_next_interval_no_failures_returns_normal(tmp_path):
+    m = cm.CredentialManager(tmp_path, refresh_interval_seconds=6 * 3600)
+    assert m._next_interval_seconds() == 6 * 3600
+
+
+def test_next_interval_one_failure_short(tmp_path):
+    """First failure retries in 10 min — way under the normal 6h
+    cadence so a transient blip doesn't strand agents with stale
+    creds for hours."""
+    m = cm.CredentialManager(tmp_path, refresh_interval_seconds=6 * 3600)
+    m.consecutive_failures = 1
+    assert m._next_interval_seconds() == 600.0
+
+
+def test_next_interval_exponential(tmp_path):
+    m = cm.CredentialManager(tmp_path, refresh_interval_seconds=6 * 3600)
+    m.consecutive_failures = 2
+    assert m._next_interval_seconds() == 1200.0
+    m.consecutive_failures = 3
+    assert m._next_interval_seconds() == 2400.0
+    m.consecutive_failures = 4
+    assert m._next_interval_seconds() == 4800.0
+
+
+def test_next_interval_capped_at_normal_interval(tmp_path):
+    """Permanently-broken refresh shouldn't keep retrying more
+    aggressively forever — past the normal cadence the backoff
+    plateaus at 6h."""
+    m = cm.CredentialManager(tmp_path, refresh_interval_seconds=6 * 3600)
+    m.consecutive_failures = 100
+    assert m._next_interval_seconds() == 6 * 3600
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh_via_host_oneshot (Linux/Windows path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_refresh_via_host_oneshot_success(monkeypatch, tmp_path):
+    """Linux/Windows daemon path — spawn ``claude --print`` against
+    the operator's real HOME, claude writes back to
+    ``~/.claude/.credentials.json`` natively."""
+    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
+    captured = {}
+
+    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
+        captured["env"] = env
+        return _FakeAsyncProc(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    ok, reason = asyncio.run(cm.refresh_via_host_oneshot(tmp_path))
+    assert ok is True
+    # Verify we passed the host home through as HOME — claude needs
+    # this so its native refresh writes to the right file.
+    assert captured["env"]["HOME"] == str(tmp_path)
+
+
+def test_refresh_via_host_oneshot_missing_binary(monkeypatch, tmp_path):
+    monkeypatch.setattr(cm.shutil, "which", lambda b: None)
+    ok, reason = asyncio.run(cm.refresh_via_host_oneshot(tmp_path))
+    assert ok is False
+    assert reason == "claude_binary_missing"
+
+
+def test_refresh_via_host_oneshot_claude_nonzero(monkeypatch, tmp_path):
+    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
+
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeAsyncProc(1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    ok, reason = asyncio.run(cm.refresh_via_host_oneshot(tmp_path))
+    assert ok is False
+    assert "claude_exit_code=1" in reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FD-leak regression — timeout path drains pipes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_timeout_path_kills_proc_and_drains_pipes(monkeypatch, tmp_path):
+    """The previous timeout path returned without awaiting proc.wait()
+    + pipe close, leaking 3 FDs (stdin/stdout/stderr) per timed-out
+    refresh. Under multi-agent load this surfaced as ``[Errno 24]
+    Too many open files``. Verify the new helper kills + drains."""
+    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
+
+    kill_called = {"value": False}
+    drain_calls = {"value": 0}
+
+    class _HangingProc:
+        returncode = None  # alive
+
+        async def communicate(self):
+            # First call (the wait_for'd one) hangs.
+            if drain_calls["value"] == 0:
+                drain_calls["value"] += 1
+                await asyncio.sleep(60)  # >> than test timeout
+                return (b"", b"")
+            # Second call (the post-kill drain) returns immediately.
+            drain_calls["value"] += 1
+            self.returncode = -9
+            return (b"", b"")
+
+        def kill(self):
+            kill_called["value"] = True
+
+        async def wait(self):
+            self.returncode = -9
+
+    async def _fake_spawn(*args, **kwargs):
+        return _HangingProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+
+    # 100ms timeout — well under any plausible real wait.
+    async def _drive():
+        return await cm._run_claude_oneshot(
+            env={}, cwd=str(tmp_path), timeout=0.1,
+        )
+
+    rc, err = asyncio.run(_drive())
+    assert rc is None
+    assert err == "refresh_oneshot_timeout"
+    # The two assertions that prove the FD leak is fixed:
+    assert kill_called["value"], "proc.kill() must run on timeout"
+    assert drain_calls["value"] == 2, (
+        "expected one wait_for'd communicate() + one drain communicate() "
+        "after kill — got %d" % drain_calls["value"]
+    )

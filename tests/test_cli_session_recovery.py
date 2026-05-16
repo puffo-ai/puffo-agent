@@ -219,94 +219,12 @@ def test_one_turn_recovers_on_eof_mid_turn(tmp_path):
     )
 
 
-# ── Test 3: auth 401 smoke test ──────────────────────────────────────────────
-
-
-def test_refresh_oneshot_flags_auth_failure(tmp_path, caplog):
-    """The refresh-ping one-shot doubles as an inference smoke test.
-    A 401 / authentication_error must flip ``auth_healthy`` to False
-    and log at ERROR — ``claude auth status`` reporting logged-in is
-    not sufficient evidence.
-    """
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-
-    adapter = LocalCLIAdapter(
-        agent_id="smoke-agent",
-        model="claude-opus-4-6",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "a" / "cli_session.json"),
-        mcp_config_file=str(tmp_path / "a" / "mcp-config.json"),
-        agent_home_dir=str(tmp_path / "home"),
-        permission_mode="default",
-    )
-    adapter._verified = True  # skip the shutil.which("claude") check
-    # Default from Adapter base; probe hasn't run.
-    assert adapter.auth_healthy is None
-
-    # Fake subprocess returns rc=1 with 401 on stderr.
-    err_bytes = (
-        b'Failed to authenticate. API Error: 401 '
-        b'{"type":"error","error":{"type":"authentication_error",'
-        b'"message":"Invalid authentication credentials"}}\n'
-    )
-
-    class _OneShotProc:
-        returncode = 1
-        async def communicate(self):
-            return b"", err_bytes
-
-    async def fake_exec(*args, **kwargs):
-        return _OneShotProc()
-
-    with patch("asyncio.create_subprocess_exec", fake_exec), \
-         caplog.at_level(logging.ERROR):
-        asyncio.run(adapter._run_refresh_oneshot())
-
-    assert adapter.auth_healthy is False, \
-        "auth_healthy should flip to False on 401"
-    assert any(
-        "auth failure" in r.message and r.levelno == logging.ERROR
-        for r in caplog.records
-    ), "expected an ERROR log naming the auth failure"
-
-
-def test_refresh_oneshot_sets_auth_healthy_on_success(tmp_path):
-    """Happy-path rc=0 flips auth_healthy to True so the operator
-    sees ``health=ok`` once the first probe succeeds after startup.
-    """
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-
-    adapter = LocalCLIAdapter(
-        agent_id="smoke-agent",
-        model="claude-opus-4-6",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "a" / "cli_session.json"),
-        mcp_config_file=str(tmp_path / "a" / "mcp-config.json"),
-        agent_home_dir=str(tmp_path / "home"),
-        permission_mode="default",
-    )
-    adapter._verified = True
-
-    # Minimal stream-json result event; no auth error.
-    ok_stdout = (
-        b'{"type":"result","subtype":"success","session_id":"s1",'
-        b'"usage":{"input_tokens":1,"output_tokens":1}}\n'
-    )
-
-    class _OneShotProc:
-        returncode = 0
-        async def communicate(self):
-            return ok_stdout, b""
-
-    async def fake_exec(*args, **kwargs):
-        return _OneShotProc()
-
-    with patch("asyncio.create_subprocess_exec", fake_exec):
-        asyncio.run(adapter._run_refresh_oneshot())
-
-    assert adapter.auth_healthy is True
+# Test 3 (auth-failure / auth-healthy via per-agent refresh-oneshot) was
+# removed when the per-agent refresh path itself was retired. The same
+# concern — surface auth failure visibly, retry with backoff — now lives
+# in ``CredentialManager`` at the daemon level, covered by
+# ``tests/test_macos_credential_manager.py`` (backoff math + the
+# timeout/FD-cleanup regression).
 
 
 # ── Test 4: poisoned-session recovery ────────────────────────────────────────
