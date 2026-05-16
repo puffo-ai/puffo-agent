@@ -357,13 +357,24 @@ assert reply["id"] == 9001
 assert reply["result"]["action"] == "accept", reply
 assert reply["result"]["content"] == {}, reply
 
-# Also send a legacy-shape approval to make sure the old path still
-# works (older codex versions / docker exec approval flow).
-w({"jsonrpc": "2.0", "id": 9002, "method": "execCommandApproval",
-   "params": {"command": "rm -rf /"}})
+# Also send the codex-canonical command-execution approval method
+# (item/commandExecution/requestApproval). Different response shape
+# from the MCP elicitation above: {decision: "accept" | ...}.
+w({"jsonrpc": "2.0", "id": 9002,
+   "method": "item/commandExecution/requestApproval",
+   "params": {"command": ["rm", "-rf", "/"]}})
 
 reply = r()
 assert reply["id"] == 9002
+assert reply["result"]["decision"] == "accept", reply
+
+# And file-change approval — same {decision: ...} shape as exec.
+w({"jsonrpc": "2.0", "id": 9003,
+   "method": "item/fileChange/requestApproval",
+   "params": {"path": "/some/file"}})
+
+reply = r()
+assert reply["id"] == 9003
 assert reply["result"]["decision"] == "accept", reply
 
 # Now complete the turn

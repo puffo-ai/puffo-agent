@@ -461,33 +461,28 @@ class CodexSession:
                 )
                 self._conversation_id = ""
 
-        # thread/start params per codex-rs/app-server protocol.
-        # System prompt comes from ``$CODEX_HOME/AGENTS.md`` which we
-        # wrote at adapter init, NOT a request param.
+        # thread/start params per codex-rs/app-server-protocol/src/
+        # protocol/v2.rs. The on-wire schema is camelCase (NOT
+        # snake_case — the Python SDK FAQ that suggested otherwise is
+        # describing the Python SDK's wrapper field names, not the
+        # wire JSON). The thread-level sandbox field is bare ``sandbox``
+        # (not ``sandbox_mode``, not ``sandboxMode``) — a single word.
         #
-        # Field names: codex Python SDK migrated from camelCase to
-        # snake_case (per sdk/python/docs/faq.md). The Rust app-server
-        # uses serde default (snake_case). Live test confirmed camelCase
-        # was silently ignored — the agent reported codex defaults
-        # (sandbox=read-only, approval=never) instead of what we passed.
-        # Stick to snake_case.
+        # ``approvalPolicy: "never"`` means **auto-approve everything
+        # without bothering the client**. Confusing name; verified by
+        # live behaviour. Puffo trust model = operator vouches for the
+        # agent + machine, all tools allowed.
         #
-        # ApprovalPolicy "never" means **auto-approve, don't bother the
-        # client** — confusing name, but verified by live behaviour:
-        # MCP tool calls just go through, no elicitation round-trip.
-        # That's exactly what we want for the puffo trust model
-        # (puffo-agent vouches for the operator, all tools allowed).
-        #
-        # SandboxMode "danger-full-access": cli-local runs as the
-        # operator's UID anyway, so a sandbox would only block the
-        # agent from doing useful work. cli-docker (when supported)
-        # will still use this — the container itself is the boundary.
+        # ``sandbox: "danger-full-access"`` removes codex's in-process
+        # sandbox. cli-local runs as the operator's UID anyway —
+        # codex's sandbox is mostly cosmetic here. (cli-docker will
+        # keep this when supported; the container is the boundary.)
         new_conv_params: dict[str, Any] = {
             "cwd": self.cwd or os.getcwd(),
-            "approval_policy": (
+            "approvalPolicy": (
                 "never" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),
-            "sandbox_mode": "danger-full-access",
+            "sandbox": "danger-full-access",
         }
         if self.model:
             new_conv_params["model"] = self.model
@@ -669,61 +664,90 @@ class CodexSession:
     async def _handle_server_request(
         self, request_id: Any, method: str, params: dict,
     ) -> None:
-        """The App Server occasionally asks us things — most commonly
-        approval for risky tool calls (``mcpServer/elicitation/request``)
-        or command / patch approval (older shapes).
+        """codex app-server sends several flavours of server-initiated
+        request mid-turn. Each has a DIFFERENT response shape — schema
+        pinned from ``codex-rs/app-server/README.md`` (canonical):
 
-        ``bypassPermissions`` auto-approves all of these; other modes
-        will route through the puffo permission proxy DM flow (deferred
-        for v1).
+          * ``item/commandExecution/requestApproval``
+            → ``{decision: "accept" | "acceptForSession" | "decline" | "cancel" | <nested>}``
+          * ``item/fileChange/requestApproval``
+            → same ``{decision: ...}`` envelope
+          * ``item/permissions/requestApproval``
+            → ``{permissions: {...}, scope?: "session"}`` (mirror what
+              was requested; omitted entries treated as denied)
+          * ``mcpServer/elicitation/request``
+            → ``{action: "accept" | "decline" | "cancel", content: {} | null}``
+          * ``item/tool/call`` (dynamic tool invocation — server asks
+            CLIENT to execute a tool we registered)
+            → ``{contentItems: [...], success: bool}``
+
+        We auto-grant everything under ``bypassPermissions`` (puffo
+        trust model: operator vouches for the agent + host). Dynamic
+        tool calls have no client-side handler yet, so we reply with
+        ``success: false`` and an error item.
         """
-        m = method.lower()
+        accept = self.permission_mode == "bypassPermissions"
 
-        # 1. App Server MCP elicitation (codex 0.x) — the canonical
-        # mechanism for "agent wants to use an MCP tool, ask user".
-        # Response contract per codex-rs/app-server README:
-        #
-        #   accept:  {"action": "accept",  "content": {}}
-        #   decline: {"action": "decline", "content": null}
-        #   cancel:  {"action": "cancel",  "content": null}
-        #
-        # ``content`` must match the request's ``requestedSchema``;
-        # for plain approvals (``codex_approval_kind == "mcp_tool_call"``)
-        # there's no schema, so ``{}`` is the right value.
-        if "elicitation" in m:
-            if self.permission_mode == "bypassPermissions":
+        if method == "mcpServer/elicitation/request":
+            if accept:
                 await self._reply_to_server_request(
-                    request_id,
-                    {"action": "accept", "content": {}},
+                    request_id, {"action": "accept", "content": {}},
                 )
             else:
                 await self._reply_to_server_request(
-                    request_id,
-                    {"action": "decline", "content": None},
+                    request_id, {"action": "decline", "content": None},
                 )
             return
 
-        # 2. Command execution / patch / write approval (codex
-        # ``CommandExecutionRequestApprovalResponse`` family). codex's
-        # error response told us the legal variants: ``accept`` /
-        # ``acceptForSession`` / ``acceptWithExecpolicyAmendment`` /
-        # ``applyNetworkPolicyAmendment`` / ``decline`` / ``cancel``.
-        # Same ``{decision: ...}`` envelope as the historical
-        # mcp-server shape; only the variant name differs from the old
-        # ``"approved"``. Plain ``accept`` is enough for the puffo
-        # trust model.
-        exec_approval = (
-            "approval" in m or "approve" in m
-            or "applypatch" in m or "execcommand" in m
-            or "commandexecution" in m
-        )
-        if exec_approval:
-            decision = (
-                "accept" if self.permission_mode == "bypassPermissions"
-                else "decline"
-            )
+        if method == "item/commandExecution/requestApproval":
             await self._reply_to_server_request(
-                request_id, {"decision": decision},
+                request_id,
+                {"decision": "accept" if accept else "decline"},
+            )
+            return
+
+        if method == "item/fileChange/requestApproval":
+            await self._reply_to_server_request(
+                request_id,
+                {"decision": "accept" if accept else "decline"},
+            )
+            return
+
+        if method == "item/permissions/requestApproval":
+            # Mirror back whatever permissions were requested. The
+            # README's example showed result.permissions matching the
+            # request's permission shape; we trust the request body
+            # since approvalPolicy is "never" + bypassPermissions.
+            requested = params.get("permissions") if isinstance(params, dict) else None
+            if accept and requested:
+                await self._reply_to_server_request(
+                    request_id,
+                    {"scope": "session", "permissions": requested},
+                )
+            else:
+                await self._reply_to_server_request(
+                    request_id, {"permissions": {}},
+                )
+            return
+
+        if method == "item/tool/call":
+            # codex is invoking a client-registered dynamic tool. We
+            # don't register any (yet). Respond with the contract
+            # shape but mark success=false so codex surfaces the
+            # right error to the model.
+            await self._reply_to_server_request(
+                request_id,
+                {
+                    "contentItems": [{
+                        "type": "errorText",
+                        "text": (
+                            "puffo-agent doesn't register any "
+                            "dynamic tools; this call shape is "
+                            "unexpected."
+                        ),
+                    }],
+                    "success": False,
+                },
             )
             return
 
