@@ -468,6 +468,28 @@ class CodexSession:
             self.agent_id, self._conversation_id,
         )
 
+        # Alpha diagnostic: ask codex which MCP servers it loaded from
+        # $CODEX_HOME/config.toml. If ``puffo`` isn't in the list (or
+        # is in an error state), the send_message tool path is dead
+        # before the agent gets a turn. Best-effort — codex versions
+        # without this method just get a method-not-found we log and
+        # continue.
+        try:
+            mcp_status = await self._send_raw_request(
+                self._reserve_id(),
+                "mcpServerStatus/list",
+                {},
+            )
+            logger.info(
+                "agent %s: codex MCP server status: %s",
+                self.agent_id, json.dumps(mcp_status)[:1500],
+            )
+        except Exception as exc:
+            logger.info(
+                "agent %s: codex mcpServerStatus/list unavailable (%s) — "
+                "skipping MCP diagnostic", self.agent_id, exc,
+            )
+
     async def _teardown_locked(self) -> None:
         for pending in self._pending.values():
             if not pending.future.done():

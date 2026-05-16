@@ -67,6 +67,16 @@ FAKE_HEADER = textwrap.dedent('''\
         msg = r()
         assert msg["method"] == "initialize", f"expected initialize, got {msg.get('method')!r}"
         w({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+
+    def absorb_mcp_status_list():
+        """After thread/start (or thread/resume) the session sends a
+        ``mcpServerStatus/list`` diagnostic. Drain it so tests can
+        focus on the real turn calls."""
+        msg = r()
+        assert msg["method"] == "mcpServerStatus/list", (
+            f"expected mcpServerStatus/list, got {msg.get('method')!r}"
+        )
+        w({"jsonrpc": "2.0", "id": msg["id"], "result": {"servers": []}})
 ''')
 
 
@@ -98,6 +108,8 @@ assert msg["method"] == "thread/start"
 assert "instructions" not in msg["params"]
 w({"jsonrpc": "2.0", "id": msg["id"],
    "result": {"thread": {"id": "conv_42", "createdAt": "2026-05-15T00:00:00Z"}}})
+
+absorb_mcp_status_list()
 
 # 2. Receive turn/start with structured ``input`` array
 msg = r()
@@ -218,6 +230,7 @@ absorb_initialize()
 # thread/start
 msg = r()
 w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+absorb_mcp_status_list()
 
 # turn/start
 msg = r()
@@ -275,6 +288,7 @@ absorb_initialize()
 
 msg = r()
 w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+absorb_mcp_status_list()
 
 msg = r()
 turn_id = msg["id"]
@@ -330,6 +344,7 @@ msg = r()
 assert msg["method"] == "thread/start"
 assert "instructions" not in msg["params"]
 w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+absorb_mcp_status_list()
 
 # First turn
 msg = r()
