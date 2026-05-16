@@ -1137,9 +1137,38 @@ class PuffoCoreMessageClient:
         To avoid bare-ID DMs we use the WS push as a trigger and
         defer to ``_poll_pending_invites``; the processed-id cache
         prevents the next periodic poll from double-acting.
+
+        Side effect: any event carrying a (channel_id, space_id)
+        pair gets recorded via ``store.mark_channel_space``. This
+        keeps the channel→space cache populated even for channels
+        the agent has just been added to but hasn't received a
+        message in yet — MCP tools (``send_message``,
+        ``list_channel_members``) read that cache to construct the
+        space-scoped server URLs and bail loudly on miss rather
+        than walking ``/spaces`` as a fallback (the FB-76 era
+        resolver was removed once events became authoritative).
         """
         kind = event.get("kind")
         payload = event.get("payload") or {}
+
+        # Cache channel→space from any membership event that carries
+        # the pair, before falling through to the kind-specific
+        # handlers. The conditions on which kinds + signers we trust
+        # are deliberately narrow: ``invite_to_channel`` is recorded
+        # only when WE are the invitee (the WS fans invites to every
+        # space member, but other people's invites tell us nothing
+        # about channels we can access); ``accept_channel_invite`` is
+        # recorded only when WE are the signer (the agent's own
+        # accept, or the server-emitted auto-accept synthetic which
+        # signs-as-us); ``create_channel`` is recorded unconditionally
+        # — the server only fans create_channel to space members, so
+        # if we see it we have access to the space.
+        try:
+            await self._maybe_cache_channel_space(kind, event, payload)
+        except Exception:
+            # Never let cache bookkeeping break the rest of event
+            # routing — invite polling / intro nudges must still run.
+            logger.exception("mark_channel_space from %s failed", kind)
 
         if kind in ("invite_to_space", "invite_to_channel"):
             if payload.get("invitee_slug") != self.slug:
@@ -1182,6 +1211,30 @@ class PuffoCoreMessageClient:
                     space_id, channel_id,
                 )
             return
+
+    async def _maybe_cache_channel_space(
+        self, kind: str | None, event: dict, payload: dict,
+    ) -> None:
+        """Record (channel_id, space_id) from events that authoritatively
+        prove the agent can reach the channel. See ``_handle_event``
+        for the rationale per kind."""
+        if not kind:
+            return
+        channel_id = payload.get("channel_id") or ""
+        space_id = payload.get("space_id") or ""
+        if not channel_id or not space_id:
+            return
+        if kind == "invite_to_channel":
+            if payload.get("invitee_slug") != self.slug:
+                return
+        elif kind == "accept_channel_invite":
+            if event.get("signer_slug") != self.slug:
+                return
+        elif kind == "create_channel":
+            pass  # always cache; server only fans to space members
+        else:
+            return
+        await self.store.mark_channel_space(channel_id, space_id)
 
     async def _poll_pending_invites(self) -> None:
         """Pull pending invites the agent hasn't acted on. Space
@@ -1472,6 +1525,22 @@ class PuffoCoreMessageClient:
             "/spaces/events",
             {"space_id": space_id, "events": [signed]},
         )
+
+        # Belt + suspenders: record the channel→space mapping
+        # synchronously here. The server fans the accept event back
+        # over WS and ``_handle_event`` records it too, but that's
+        # async — without this immediate write, the intro nudge's
+        # ``send_message`` call (queued right below) could race the
+        # WS echo and hit a cache miss on a channel the agent has
+        # just provably joined.
+        if kind == "invite_to_channel" and channel_id and space_id:
+            try:
+                await self.store.mark_channel_space(channel_id, space_id)
+            except Exception:
+                logger.exception(
+                    "mark_channel_space after manual accept failed "
+                    "(space=%s channel=%s)", space_id, channel_id,
+                )
 
         # Accepting an invite triggers a one-shot self-introduction
         # nudge: we enqueue a synthetic ``[puffo-agent system message]``
