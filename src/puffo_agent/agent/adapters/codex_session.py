@@ -219,7 +219,7 @@ class CodexSession:
             )
             self._active_turn = turn
 
-        logger.info(
+        logger.debug(
             "agent %s: codex turn/start sending (msg_len=%d, thread=%s)",
             self.agent_id, len(user_message), self._conversation_id,
         )
@@ -237,17 +237,6 @@ class CodexSession:
                         {"type": "text", "text": user_message},
                     ],
                 },
-            )
-            # CRITICAL alpha debug — log the FULL response shape so we
-            # can see what items codex actually returned. Token-redaction
-            # n/a here (no auth tokens in the App Server response).
-            try:
-                _preview = json.dumps(turn_response)[:2000]
-            except Exception:
-                _preview = repr(turn_response)[:2000]
-            logger.info(
-                "agent %s: codex turn/start response: %s",
-                self.agent_id, _preview,
             )
             # Some App Server versions complete the turn synchronously
             # and put the final items in the response payload; others
@@ -288,7 +277,7 @@ class CodexSession:
             self._active_turn = None
 
         reply = "".join(turn.reply_chunks).strip()
-        logger.info(
+        logger.debug(
             "agent %s: codex turn complete (reply_len=%d, tool_calls=%d, "
             "send_msg_calls=%d, in=%d out=%d)",
             self.agent_id, len(reply), turn.tool_calls,
@@ -476,23 +465,29 @@ class CodexSession:
         # System prompt comes from ``$CODEX_HOME/AGENTS.md`` which we
         # wrote at adapter init, NOT a request param.
         #
-        # ApprovalMode enum (codex SDK): "never" | "on-request" |
-        # "on-failure" | "untrusted". "never" means **auto-deny** all
-        # approval-requiring operations — that's wrong for us, it
-        # blocks legitimate tool use (the agent reported it tried to
-        # list MCP tools and "被环境拒了"). Use "on-request" + let
-        # our session's server-initiated approval handler auto-grant.
+        # Field names: codex Python SDK migrated from camelCase to
+        # snake_case (per sdk/python/docs/faq.md). The Rust app-server
+        # uses serde default (snake_case). Live test confirmed camelCase
+        # was silently ignored — the agent reported codex defaults
+        # (sandbox=read-only, approval=never) instead of what we passed.
+        # Stick to snake_case.
         #
-        # SandboxMode enum: "read-only" | "workspace-write" |
-        # "danger-full-access". puffo-agent treats its host as fully
-        # trusted (same posture as cli-docker), so the agent's tools
-        # need write access to do useful work.
+        # ApprovalPolicy "never" means **auto-approve, don't bother the
+        # client** — confusing name, but verified by live behaviour:
+        # MCP tool calls just go through, no elicitation round-trip.
+        # That's exactly what we want for the puffo trust model
+        # (puffo-agent vouches for the operator, all tools allowed).
+        #
+        # SandboxMode "danger-full-access": cli-local runs as the
+        # operator's UID anyway, so a sandbox would only block the
+        # agent from doing useful work. cli-docker (when supported)
+        # will still use this — the container itself is the boundary.
         new_conv_params: dict[str, Any] = {
             "cwd": self.cwd or os.getcwd(),
-            "approvalPolicy": (
-                "on-request" if self.permission_mode == "bypassPermissions" else "untrusted"
+            "approval_policy": (
+                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),
-            "sandboxMode": "workspace-write",
+            "sandbox_mode": "danger-full-access",
         }
         if self.model:
             new_conv_params["model"] = self.model
@@ -515,27 +510,6 @@ class CodexSession:
             self.agent_id, self._conversation_id,
         )
 
-        # Alpha diagnostic: ask codex which MCP servers it loaded from
-        # $CODEX_HOME/config.toml. If ``puffo`` isn't in the list (or
-        # is in an error state), the send_message tool path is dead
-        # before the agent gets a turn. Best-effort — codex versions
-        # without this method just get a method-not-found we log and
-        # continue.
-        try:
-            mcp_status = await self._send_raw_request(
-                self._reserve_id(),
-                "mcpServerStatus/list",
-                {},
-            )
-            logger.info(
-                "agent %s: codex MCP server status: %s",
-                self.agent_id, json.dumps(mcp_status)[:1500],
-            )
-        except Exception as exc:
-            logger.info(
-                "agent %s: codex mcpServerStatus/list unavailable (%s) — "
-                "skipping MCP diagnostic", self.agent_id, exc,
-            )
 
     async def _teardown_locked(self) -> None:
         for pending in self._pending.values():
@@ -788,18 +762,6 @@ class CodexSession:
         # Normalise slash / dot separators.
         m = method.replace(".", "/").lower()
         turn = self._active_turn
-
-        # Alpha — log every notification at INFO so we can see what
-        # the live App Server actually emits. Will turn back down to
-        # DEBUG once protocol assumptions are confirmed.
-        try:
-            _preview = json.dumps(params)[:500]
-        except Exception:
-            _preview = repr(params)[:500]
-        logger.info(
-            "agent %s: codex notif %s: %s",
-            self.agent_id, method, _preview,
-        )
 
         if m.startswith("item/") and turn is not None:
             await self._handle_item_event(m, params, turn)
