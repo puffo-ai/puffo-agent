@@ -192,6 +192,10 @@ class CodexSession:
             )
             self._active_turn = turn
 
+        logger.info(
+            "agent %s: codex turn/start sending (msg_len=%d, thread=%s)",
+            self.agent_id, len(user_message), self._conversation_id,
+        )
         try:
             # turn/start params per codex-rs/app-server protocol:
             # ``threadId``, ``input`` (array of structured items —
@@ -206,6 +210,17 @@ class CodexSession:
                         {"type": "text", "text": user_message},
                     ],
                 },
+            )
+            # CRITICAL alpha debug — log the FULL response shape so we
+            # can see what items codex actually returned. Token-redaction
+            # n/a here (no auth tokens in the App Server response).
+            try:
+                _preview = json.dumps(turn_response)[:2000]
+            except Exception:
+                _preview = repr(turn_response)[:2000]
+            logger.info(
+                "agent %s: codex turn/start response: %s",
+                self.agent_id, _preview,
             )
             # Some App Server versions complete the turn synchronously
             # and put the final items in the response payload; others
@@ -246,6 +261,12 @@ class CodexSession:
             self._active_turn = None
 
         reply = "".join(turn.reply_chunks).strip()
+        logger.info(
+            "agent %s: codex turn complete (reply_len=%d, tool_calls=%d, "
+            "in=%d out=%d)",
+            self.agent_id, len(reply), turn.tool_calls,
+            turn.input_tokens, turn.output_tokens,
+        )
         return TurnResult(
             reply=reply,
             input_tokens=turn.input_tokens,
@@ -671,6 +692,18 @@ class CodexSession:
         m = method.replace(".", "/").lower()
         turn = self._active_turn
 
+        # Alpha — log every notification at INFO so we can see what
+        # the live App Server actually emits. Will turn back down to
+        # DEBUG once protocol assumptions are confirmed.
+        try:
+            _preview = json.dumps(params)[:500]
+        except Exception:
+            _preview = repr(params)[:500]
+        logger.info(
+            "agent %s: codex notif %s: %s",
+            self.agent_id, method, _preview,
+        )
+
         if m.startswith("item/") and turn is not None:
             await self._handle_item_event(m, params, turn)
             return
@@ -686,13 +719,6 @@ class CodexSession:
                     RuntimeError(f"codex turn failed: {err}"),
                 )
             return
-
-        # Quiet by default — pre-1.0 servers emit a lot of debug
-        # notifications we don't care about.
-        logger.debug(
-            "agent %s: codex notification %s: %s",
-            self.agent_id, method, params,
-        )
 
     async def _handle_item_event(
         self, normalised_method: str, params: dict, turn: _PendingTurn,
