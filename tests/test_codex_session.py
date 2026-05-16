@@ -364,7 +364,7 @@ w({"jsonrpc": "2.0", "id": 9002, "method": "execCommandApproval",
 
 reply = r()
 assert reply["id"] == 9002
-assert reply["result"]["decision"] == "approved", reply
+assert reply["result"]["decision"] == "accept", reply
 
 # Now complete the turn
 w({"jsonrpc": "2.0", "id": turn_id, "result": None})

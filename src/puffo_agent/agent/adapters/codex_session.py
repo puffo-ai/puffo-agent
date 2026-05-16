@@ -703,16 +703,24 @@ class CodexSession:
                 )
             return
 
-        # 2. Legacy command / patch approval (older codex versions).
-        # Different shape: ``{decision: "approved"|"denied"}``.
-        legacy_approval = (
+        # 2. Command execution / patch / write approval (codex
+        # ``CommandExecutionRequestApprovalResponse`` family). codex's
+        # error response told us the legal variants: ``accept`` /
+        # ``acceptForSession`` / ``acceptWithExecpolicyAmendment`` /
+        # ``applyNetworkPolicyAmendment`` / ``decline`` / ``cancel``.
+        # Same ``{decision: ...}`` envelope as the historical
+        # mcp-server shape; only the variant name differs from the old
+        # ``"approved"``. Plain ``accept`` is enough for the puffo
+        # trust model.
+        exec_approval = (
             "approval" in m or "approve" in m
             or "applypatch" in m or "execcommand" in m
+            or "commandexecution" in m
         )
-        if legacy_approval:
+        if exec_approval:
             decision = (
-                "approved" if self.permission_mode == "bypassPermissions"
-                else "denied"
+                "accept" if self.permission_mode == "bypassPermissions"
+                else "decline"
             )
             await self._reply_to_server_request(
                 request_id, {"decision": decision},
