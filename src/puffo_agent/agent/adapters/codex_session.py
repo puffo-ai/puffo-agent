@@ -449,19 +449,27 @@ class CodexSession:
                 )
                 self._conversation_id = ""
 
-        # thread/start params per codex-rs/app-server protocol:
-        # ``model``, ``cwd``, ``approvalPolicy``, ``sandbox`` /
-        # ``permissions``. NOT ``instructions`` — codex reads the
-        # system prompt from ``$CODEX_HOME/AGENTS.md`` which we wrote
-        # at adapter init.
+        # thread/start params per codex-rs/app-server protocol.
+        # System prompt comes from ``$CODEX_HOME/AGENTS.md`` which we
+        # wrote at adapter init, NOT a request param.
+        #
+        # ApprovalMode enum (codex SDK): "never" | "on-request" |
+        # "on-failure" | "untrusted". "never" means **auto-deny** all
+        # approval-requiring operations — that's wrong for us, it
+        # blocks legitimate tool use (the agent reported it tried to
+        # list MCP tools and "被环境拒了"). Use "on-request" + let
+        # our session's server-initiated approval handler auto-grant.
+        #
+        # SandboxMode enum: "read-only" | "workspace-write" |
+        # "danger-full-access". puffo-agent treats its host as fully
+        # trusted (same posture as cli-docker), so the agent's tools
+        # need write access to do useful work.
         new_conv_params: dict[str, Any] = {
             "cwd": self.cwd or os.getcwd(),
-            # ``bypassPermissions`` ⇒ never-prompt; codex's exact value
-            # name is ``never``. Maps onto our existing permission_mode
-            # field so the two halves stay in sync.
             "approvalPolicy": (
-                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
+                "on-request" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),
+            "sandboxMode": "workspace-write",
         }
         if self.model:
             new_conv_params["model"] = self.model
@@ -775,30 +783,40 @@ class CodexSession:
         ``agentMessage`` deltas to the reply buffer, count ``tool_use``
         items, and otherwise pass through silently.
 
-        Payload shapes vary across codex versions; this is the only
-        place we touch them, so future changes are localised.
+        codex emits two distinct payload shapes here:
+
+          * Streaming delta (``item/agentMessage/delta``):
+            ``{threadId, turnId, itemId, delta: "<chunk>"}``
+            — text fragment lives at the top level under ``delta``,
+            NOT nested under ``item``. Missing this was why
+            reply_len was tiny in the first live test: we were
+            reading ``params.item.text`` which didn't exist.
+
+          * Completed item (``item/completed``):
+            ``{item: {id, type, text, ...}}`` — type is camelCase
+            ``"agentMessage"``, full text under ``item.text``.
         """
+        # 1. Streaming delta — text at params.delta directly.
+        if "delta" in normalised_method:
+            delta_text = params.get("delta")
+            if isinstance(delta_text, str) and delta_text:
+                turn.reply_chunks.append(delta_text)
+            return
+        # 2. Final item — nested under params.item.
         item = params.get("item") or {}
         kind = (item.get("type") or "").lower()
-        # Streaming delta: ``item/agentMessage/delta``.
-        if "delta" in normalised_method and isinstance(item.get("text"), str):
-            turn.reply_chunks.append(item["text"])
-            return
         if normalised_method.endswith("/started"):
             return
         if normalised_method.endswith("/completed"):
-            # Final shape for a non-streaming server: the whole
-            # message arrives once in ``item/completed``.
             if kind in ("agent_message", "agentmessage"):
                 text = item.get("text") or item.get("content") or ""
                 if isinstance(text, str) and text:
-                    # Replace any partial deltas with the
-                    # authoritative final text — codex sends both in
-                    # some versions.
-                    if turn.reply_chunks and "".join(turn.reply_chunks).strip() == text.strip():
-                        return
-                    if not turn.reply_chunks:
-                        turn.reply_chunks.append(text)
+                    # Prefer the authoritative final text over the
+                    # concatenated deltas when they're inconsistent —
+                    # protects against missed-delta edge cases.
+                    joined = "".join(turn.reply_chunks)
+                    if joined.strip() != text.strip():
+                        turn.reply_chunks = [text]
             elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
                 turn.tool_calls += 1
             return

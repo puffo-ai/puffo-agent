@@ -118,11 +118,14 @@ assert msg["params"]["threadId"] == "conv_42"
 assert msg["params"]["input"] == [{"type": "text", "text": "hi there"}]
 turn_id = msg["id"]
 
-# 3. Stream two agentMessage deltas
+# 3. Stream two agentMessage deltas — codex's real shape puts the
+#    text fragment at params.delta directly (NOT nested under
+#    params.item.text — that was a wrong guess that lost most of the
+#    streaming text in the first live run).
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
-   "params": {"item": {"type": "agent_message", "text": "Hello, "}}})
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "Hello, "}})
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
-   "params": {"item": {"type": "agent_message", "text": "world!"}}})
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "world!"}})
 
 # 4. ACK the request (the App Server doesn't have to ACK before the
 #    turn ends; we ACK here so the session's _send_raw_request future
@@ -187,7 +190,7 @@ msg = r()
 assert msg["method"] == "turn/start"
 turn_id = msg["id"]
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
-   "params": {"item": {"type": "agent_message", "text": "resumed"}}})
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "resumed"}})
 w({"jsonrpc": "2.0", "id": turn_id, "result": None})
 w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
 
@@ -248,7 +251,7 @@ assert reply["result"]["decision"] == "approved"
 # Now complete the turn
 w({"jsonrpc": "2.0", "id": turn_id, "result": None})
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
-   "params": {"item": {"type": "agent_message", "text": "did the thing"}}})
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "did the thing"}})
 w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
 
 while True:
@@ -351,7 +354,7 @@ msg = r()
 assert msg["method"] == "turn/start"
 assert "instructions" not in msg["params"]
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
-   "params": {"item": {"type": "agent_message", "text": "turn1"}}})
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "turn1"}})
 w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
 w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
 
@@ -361,7 +364,7 @@ msg = r()
 assert msg["method"] == "turn/start"
 assert "instructions" not in msg["params"]
 w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
-   "params": {"item": {"type": "agent_message", "text": "turn2"}}})
+   "params": {"threadId": "t", "turnId": "u2", "itemId": "m2", "delta": "turn2"}})
 w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
 w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
 
