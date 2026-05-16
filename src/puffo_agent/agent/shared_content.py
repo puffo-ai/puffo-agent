@@ -889,6 +889,48 @@ def write_gemini_md(gemini_dir: Path, content: str) -> Path:
     return path
 
 
+def write_agents_md(codex_dir: Path, content: str) -> Path:
+    """Write ``content`` to ``<codex_dir>/AGENTS.md``. codex reads
+    ``$CODEX_HOME/AGENTS.md`` on ``newConversation`` as the system-
+    prompt equivalent.
+    """
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    path = codex_dir / "AGENTS.md"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def rebuild_agent_codex_md(
+    *,
+    shared_dir: Path,
+    profile_path: Path,
+    memory_dir: Path,
+    workspace_dir: Path,
+    codex_user_dir: Path,
+) -> str:
+    """Assemble + write one codex agent's AGENTS.md.
+
+    Same content shape as ``rebuild_agent_claude_md`` (shared primer +
+    agent profile + memory snapshot), targeting codex's instruction-
+    file path. codex has no equivalent of Claude Code's ``.skills/``
+    layout, so we skip the skills sync step — the primer carries the
+    same operator-facing platform guidance regardless of harness.
+    """
+    ensure_shared_primer(shared_dir)
+    primer = read_shared_primer(shared_dir)
+    try:
+        profile_text = profile_path.read_text(encoding="utf-8")
+    except OSError:
+        profile_text = ""
+    agents_md = assemble_claude_md(
+        shared_primer=primer,
+        profile=profile_text,
+        memory_snapshot=read_memory_snapshot(memory_dir),
+    )
+    write_agents_md(codex_user_dir, agents_md)
+    return agents_md
+
+
 def rebuild_agent_claude_md(
     *,
     shared_dir: Path,

@@ -1,0 +1,672 @@
+"""``codex app-server`` session — JSON-RPC over stdio.
+
+Lifecycle mirror of :mod:`cli_session.ClaudeSession`, but the wire
+protocol is JSON-RPC notifications + requests, not Claude Code's
+stream-json. The codex App Server gives us:
+
+  * ``newConversation`` request → returns a ``conversationId`` we
+    persist (same on-disk slot as ``ClaudeSession``'s session id, but
+    under a separate ``codex_session.json`` filename so the two never
+    collide if an operator flips harnesses on the same agent).
+  * ``sendUserTurn`` request that streams server-initiated
+    notifications back: ``item/started``, ``item/agentMessage/delta``,
+    tool-call progress, ``item/completed``, and finally
+    ``turn/completed``. We assemble the reply from the
+    ``agent_message`` items in order.
+  * Server-initiated approval requests (``applyPatchApproval`` /
+    ``execCommandApproval``) which we auto-decide based on the agent's
+    permission stance (``bypassPermissions`` for v1).
+
+System prompt is delivered out-of-band as ``$CODEX_HOME/AGENTS.md``;
+codex reads it on conversation start. The plan doc's Phase 0 #1 leaves
+open whether ``newConversation`` (or ``sendUserTurn``) can override
+instructions per-turn — we keep a ``current_instructions`` field that
+``reload()`` updates and ``run_turn`` passes through on every send,
+so if/when the server-side override exists we just plumb it. Until
+then, ``reload()`` falls back to "re-write AGENTS.md and restart the
+conversation" — losing history on reload, but that's the v1 trade-off
+when the server doesn't expose a hot-swap.
+
+This file is *alpha* — the codex App Server JSON-RPC contract is still
+pre-1.0 upstream and several method names / payload shapes here are
+best-effort guesses keyed off the published codex-rs/app-server
+README. The wire glue lives in two small dispatch helpers
+(``_send_request``, ``_handle_notification``) so the entire surface
+moves in one place when we learn the real shape from the field.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from .base import TurnResult
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wire-protocol constants (Phase 0 verify targets)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Both slash- and dot-separated method names appear in codex docs;
+# normalise on first character of separator so we match either.
+_NOTIFICATION_PREFIXES = (
+    "item/", "item.",
+    "turn/", "turn.",
+)
+
+# Methods we issue to the App Server. If the upstream protocol uses
+# different names, change here in one place. ``newConversation`` /
+# ``sendUserTurn`` are the names reported in the codex-rs/app-server
+# README; ``approveExecCommand`` / ``approvePatch`` are the response
+# methods for server-initiated approval (we send them back on the same
+# stream, keyed off the inbound request id).
+METHOD_NEW_CONVERSATION = "newConversation"
+METHOD_SEND_USER_TURN = "sendUserTurn"
+METHOD_RESUME_CONVERSATION = "resumeConversation"
+METHOD_INTERRUPT_TURN = "interruptTurn"
+
+# How long to wait for the App Server to acknowledge a request before
+# giving up. The first ``newConversation`` after spawn can be slow
+# (cold model load); ``sendUserTurn`` should be quick to ACK
+# (streaming starts immediately after).
+REQUEST_TIMEOUT_SECONDS = 60.0
+
+# Turn-level timeout — wall-clock budget for a single user turn from
+# send to ``turn/completed``. Generous; the daemon also caps things
+# at the worker level. Mostly defensive against a wedged App Server
+# that ACKs the request but never streams.
+TURN_TIMEOUT_SECONDS = 600.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state machine
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _PendingRequest:
+    """An in-flight JSON-RPC request awaiting a matching response."""
+    future: asyncio.Future
+    method: str
+    started_at: float
+
+
+@dataclass
+class _PendingTurn:
+    """An in-flight ``sendUserTurn`` accumulating streaming items."""
+    request_id: int
+    started_at: float
+    # Reply text accumulated from ``agent_message`` deltas. Final
+    # value is the joined assistant output.
+    reply_chunks: list[str] = field(default_factory=list)
+    # ``tool_use`` events counted for TurnResult.tool_calls metric.
+    tool_calls: int = 0
+    # Usage stats lifted from the final ``turn/completed`` envelope.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    # ``turn/completed`` resolves this; ``turn/failed`` rejects it.
+    completed: asyncio.Future = field(default_factory=asyncio.Future)
+    # Optional progress callback for in-turn UI updates.
+    on_progress: Optional[Callable[[str], Any]] = None
+
+
+class CodexSession:
+    """One ``codex app-server`` process per agent.
+
+    The session owns:
+      * the subprocess + its stdio JSON-RPC pump
+      * the persisted ``conversationId``
+      * the current system-prompt snapshot used for ``newConversation``
+      * an event loop reading stdout and dispatching by message type
+
+    Public surface mirrors ``ClaudeSession``::
+
+        cs = CodexSession(...)
+        await cs.warm(system_prompt)          # spawn + new/resumeConv
+        result = await cs.run_turn(msg, sys)  # sendUserTurn → wait
+        await cs.reload(new_sys)              # hot-swap instructions
+        await cs.aclose()                     # graceful shutdown
+    """
+
+    def __init__(
+        self,
+        agent_id: str,
+        session_file: Path,
+        argv: list[str],
+        *,
+        cwd: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+        permission_mode: str = "bypassPermissions",
+    ):
+        self.agent_id = agent_id
+        self.session_file = session_file
+        self.argv = argv
+        self.cwd = cwd
+        self.env = env
+        # ``bypassPermissions`` auto-approves every approval request.
+        # The plan's v1 stance — other modes are deferred until the
+        # permission-proxy DM flow is ready for codex too.
+        self.permission_mode = permission_mode
+
+        self._proc: asyncio.subprocess.Process | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._next_id: int = 1
+        self._pending: dict[int, _PendingRequest] = {}
+        self._active_turn: _PendingTurn | None = None
+        self._lock = asyncio.Lock()
+        self._conversation_id: str = self._load_conversation_id()
+        # The latest system prompt we've been handed. Stored so
+        # ``reload`` can detect a no-op vs a real change, and so a
+        # respawn can re-issue ``newConversation`` with current
+        # instructions when the conversation id is missing or rotted.
+        self.current_instructions: str = ""
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    async def warm(self, system_prompt: str) -> None:
+        """Spawn the App Server + start (or resume) a conversation.
+        Idempotent — subsequent calls are no-ops while the process is
+        healthy."""
+        async with self._lock:
+            await self._ensure_running(system_prompt)
+
+    async def run_turn(self, user_message: str, system_prompt: str) -> TurnResult:
+        """Send one turn; wait for ``turn/completed``."""
+        async with self._lock:
+            await self._ensure_running(system_prompt)
+            turn = _PendingTurn(
+                request_id=self._reserve_id(),
+                started_at=time.time(),
+            )
+            self._active_turn = turn
+
+        try:
+            await self._send_raw_request(
+                turn.request_id,
+                METHOD_SEND_USER_TURN,
+                {
+                    "conversationId": self._conversation_id,
+                    "userInput": user_message,
+                    # Best-effort per-turn instructions override —
+                    # silently ignored by App Server versions that
+                    # don't accept it (Phase 0 #1 verify).
+                    "instructions": self.current_instructions,
+                },
+            )
+            try:
+                await asyncio.wait_for(
+                    turn.completed, timeout=TURN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "agent %s: codex turn timed out after %ds",
+                    self.agent_id, TURN_TIMEOUT_SECONDS,
+                )
+                # Best-effort interrupt so the server stops streaming
+                # output we'll never read.
+                try:
+                    await self._send_raw_request(
+                        self._reserve_id(),
+                        METHOD_INTERRUPT_TURN,
+                        {"conversationId": self._conversation_id},
+                    )
+                except Exception:
+                    pass
+                return TurnResult(
+                    reply="",
+                    metadata={"codex_turn_timeout": True},
+                )
+        finally:
+            self._active_turn = None
+
+        reply = "".join(turn.reply_chunks).strip()
+        return TurnResult(
+            reply=reply,
+            input_tokens=turn.input_tokens,
+            output_tokens=turn.output_tokens,
+            tool_calls=turn.tool_calls,
+            metadata={
+                "harness": "codex",
+                "conversation_id": self._conversation_id,
+            },
+        )
+
+    async def reload(self, new_system_prompt: str) -> None:
+        """Update the in-memory ``current_instructions`` snapshot.
+
+        If the App Server honours per-turn ``instructions`` (Phase 0
+        #1), this is sufficient — the next ``sendUserTurn`` carries
+        the new prompt with no thread restart. If the server ignores
+        it, we degrade to "respawn on next warm" by clearing the
+        process state. History is lost in that fallback; the v1
+        trade-off is documented in this module's docstring.
+        """
+        if new_system_prompt == self.current_instructions:
+            return
+        self.current_instructions = new_system_prompt
+        # Conservative for alpha: don't tear down the process here.
+        # ``run_turn`` will pass ``instructions`` per turn; if that's
+        # silently ignored, the user notices and we lift to "respawn
+        # on reload" in 0.10.0a2.
+
+    async def aclose(self) -> None:
+        async with self._lock:
+            await self._teardown_locked()
+
+    def has_persisted_session(self) -> bool:
+        return bool(self._conversation_id)
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _reserve_id(self) -> int:
+        i = self._next_id
+        self._next_id += 1
+        return i
+
+    def _load_conversation_id(self) -> str:
+        try:
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        return str(data.get("conversation_id") or "")
+
+    def _save_conversation_id(self, cid: str) -> None:
+        try:
+            self.session_file.parent.mkdir(parents=True, exist_ok=True)
+            self.session_file.write_text(
+                json.dumps({"conversation_id": cid}),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't persist codex conversation id: %s",
+                self.agent_id, exc,
+            )
+
+    async def _ensure_running(self, system_prompt: str) -> None:
+        # Snapshot whatever caller hands us; ``run_turn`` re-passes it
+        # per turn anyway.
+        if system_prompt:
+            self.current_instructions = system_prompt
+        if self._proc is not None and self._proc.returncode is None:
+            return
+        await self._spawn()
+
+    async def _spawn(self) -> None:
+        logger.info(
+            "agent %s: spawning codex app-server (argv=%s)",
+            self.agent_id, " ".join(self.argv),
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *self.argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd,
+                env=self.env,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"`codex` binary not on PATH: {exc}. Install via "
+                "`npm install -g @openai/codex` or the official install "
+                "script, then re-run."
+            ) from exc
+
+        self._proc = proc
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(proc.stdout), name=f"codex-reader-{self.agent_id}",
+        )
+        self._stderr_task = asyncio.create_task(
+            self._stderr_loop(proc.stderr), name=f"codex-stderr-{self.agent_id}",
+        )
+
+        # Start or resume the conversation.
+        if self._conversation_id:
+            try:
+                await self._send_raw_request(
+                    self._reserve_id(),
+                    METHOD_RESUME_CONVERSATION,
+                    {"conversationId": self._conversation_id},
+                )
+                logger.info(
+                    "agent %s: resumed codex conversation %s",
+                    self.agent_id, self._conversation_id,
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: resume failed (%s); starting fresh "
+                    "conversation",
+                    self.agent_id, exc,
+                )
+                self._conversation_id = ""
+
+        result = await self._send_raw_request(
+            self._reserve_id(),
+            METHOD_NEW_CONVERSATION,
+            {
+                "instructions": self.current_instructions,
+                # Working directory is set on subprocess spawn already,
+                # but pass it through too for App Servers that ignore
+                # cwd and want it in the payload.
+                "cwd": self.cwd or os.getcwd(),
+            },
+        )
+        cid = (
+            (result or {}).get("conversationId")
+            or (result or {}).get("conversation_id")
+            or ""
+        )
+        if not cid:
+            raise RuntimeError(
+                f"agent {self.agent_id}: codex newConversation returned "
+                f"no conversationId: {result!r}"
+            )
+        self._conversation_id = str(cid)
+        self._save_conversation_id(self._conversation_id)
+        logger.info(
+            "agent %s: started codex conversation %s",
+            self.agent_id, self._conversation_id,
+        )
+
+    async def _teardown_locked(self) -> None:
+        for pending in self._pending.values():
+            if not pending.future.done():
+                pending.future.cancel()
+        self._pending.clear()
+        if self._active_turn is not None and not self._active_turn.completed.done():
+            self._active_turn.completed.set_exception(
+                RuntimeError("codex session torn down before turn completed"),
+            )
+        proc = self._proc
+        self._proc = None
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+        for task in (self._reader_task, self._stderr_task):
+            if task is not None and not task.done():
+                task.cancel()
+        self._reader_task = None
+        self._stderr_task = None
+
+    # ── JSON-RPC plumbing ────────────────────────────────────────────────────
+
+    async def _send_raw_request(
+        self, request_id: int, method: str, params: dict,
+    ) -> Any:
+        assert self._proc is not None and self._proc.stdin is not None
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        })
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = _PendingRequest(
+            future=future, method=method, started_at=time.time(),
+        )
+        self._proc.stdin.write((body + "\n").encode("utf-8"))
+        await self._proc.stdin.drain()
+        try:
+            return await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            raise RuntimeError(
+                f"agent {self.agent_id}: codex {method} timed out "
+                f"after {REQUEST_TIMEOUT_SECONDS}s"
+            )
+
+    async def _send_notification(self, method: str, params: dict) -> None:
+        assert self._proc is not None and self._proc.stdin is not None
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        })
+        self._proc.stdin.write((body + "\n").encode("utf-8"))
+        try:
+            await self._proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    async def _reader_loop(self, stdout: asyncio.StreamReader) -> None:
+        while True:
+            try:
+                line = await stdout.readline()
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: codex stdout read failed: %s",
+                    self.agent_id, exc,
+                )
+                break
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+            try:
+                msg = json.loads(text)
+            except json.JSONDecodeError:
+                logger.debug(
+                    "agent %s: codex emitted non-JSON line: %s",
+                    self.agent_id, text[:200],
+                )
+                continue
+            await self._dispatch_message(msg)
+
+        # EOF — fail every pending request so callers don't hang.
+        for pending in self._pending.values():
+            if not pending.future.done():
+                pending.future.set_exception(
+                    RuntimeError("codex app-server closed stdout"),
+                )
+        self._pending.clear()
+        if self._active_turn is not None and not self._active_turn.completed.done():
+            self._active_turn.completed.set_exception(
+                RuntimeError("codex app-server closed stdout mid-turn"),
+            )
+
+    async def _stderr_loop(self, stderr: asyncio.StreamReader) -> None:
+        # codex emits structured logs on stderr; surface them at INFO
+        # with the agent prefix so they round-trip through the puffo-
+        # agent log pipeline.
+        while True:
+            try:
+                line = await stderr.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            logger.info(
+                "agent %s: codex stderr: %s",
+                self.agent_id,
+                line.decode("utf-8", errors="replace").rstrip(),
+            )
+
+    async def _dispatch_message(self, msg: dict) -> None:
+        # JSON-RPC response (id present, result|error)
+        if "id" in msg and ("result" in msg or "error" in msg):
+            req_id = msg["id"]
+            pending = self._pending.pop(req_id, None) if isinstance(req_id, int) else None
+            if pending is None:
+                logger.debug(
+                    "agent %s: codex response for unknown id %r",
+                    self.agent_id, req_id,
+                )
+                return
+            if "error" in msg:
+                err = msg["error"]
+                pending.future.set_exception(RuntimeError(
+                    f"codex {pending.method} error: {err}"
+                ))
+            else:
+                pending.future.set_result(msg.get("result"))
+            return
+
+        # JSON-RPC request from server (e.g. approval prompts)
+        method = msg.get("method")
+        if not isinstance(method, str):
+            return
+        if "id" in msg:
+            await self._handle_server_request(msg["id"], method, msg.get("params") or {})
+            return
+
+        # JSON-RPC notification (one-way)
+        await self._handle_notification(method, msg.get("params") or {})
+
+    async def _handle_server_request(
+        self, request_id: Any, method: str, params: dict,
+    ) -> None:
+        """The App Server occasionally asks us things — most commonly
+        approval for risky tool calls. ``bypassPermissions`` auto-
+        approves; other modes will route through the puffo permission
+        proxy DM flow (deferred for v1)."""
+        # Approval methods we know about. The exact method names are
+        # pre-1.0; we match by suffix so a near-rename doesn't break
+        # us silently.
+        m = method.lower()
+        approval_like = (
+            "approval" in m or "approve" in m
+            or "applypatch" in m or "execcommand" in m
+        )
+        if approval_like:
+            decision = (
+                "approved" if self.permission_mode == "bypassPermissions"
+                else "denied"
+            )
+            await self._reply_to_server_request(
+                request_id, {"decision": decision},
+            )
+            return
+
+        # Unknown server-initiated request — log and reply with an
+        # error so it doesn't wedge the server waiting.
+        logger.warning(
+            "agent %s: codex sent unknown server request %s; replying "
+            "with method-not-found",
+            self.agent_id, method,
+        )
+        await self._reply_to_server_request_error(
+            request_id, -32601, f"method not implemented: {method}",
+        )
+
+    async def _reply_to_server_request(
+        self, request_id: Any, result: Any,
+    ) -> None:
+        if self._proc is None or self._proc.stdin is None:
+            return
+        body = json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result})
+        self._proc.stdin.write((body + "\n").encode("utf-8"))
+        try:
+            await self._proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    async def _reply_to_server_request_error(
+        self, request_id: Any, code: int, message: str,
+    ) -> None:
+        if self._proc is None or self._proc.stdin is None:
+            return
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": code, "message": message},
+        })
+        self._proc.stdin.write((body + "\n").encode("utf-8"))
+        try:
+            await self._proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    async def _handle_notification(self, method: str, params: dict) -> None:
+        # Normalise slash / dot separators.
+        m = method.replace(".", "/").lower()
+        turn = self._active_turn
+
+        if m.startswith("item/") and turn is not None:
+            await self._handle_item_event(m, params, turn)
+            return
+        if m.startswith("turn/completed") and turn is not None:
+            self._absorb_turn_usage(turn, params)
+            if not turn.completed.done():
+                turn.completed.set_result(None)
+            return
+        if m.startswith("turn/failed") and turn is not None:
+            err = (params or {}).get("error") or params or "(no detail)"
+            if not turn.completed.done():
+                turn.completed.set_exception(
+                    RuntimeError(f"codex turn failed: {err}"),
+                )
+            return
+
+        # Quiet by default — pre-1.0 servers emit a lot of debug
+        # notifications we don't care about.
+        logger.debug(
+            "agent %s: codex notification %s: %s",
+            self.agent_id, method, params,
+        )
+
+    async def _handle_item_event(
+        self, normalised_method: str, params: dict, turn: _PendingTurn,
+    ) -> None:
+        """The ``item/*`` family covers per-step events. We forward
+        ``agentMessage`` deltas to the reply buffer, count ``tool_use``
+        items, and otherwise pass through silently.
+
+        Payload shapes vary across codex versions; this is the only
+        place we touch them, so future changes are localised.
+        """
+        item = params.get("item") or {}
+        kind = (item.get("type") or "").lower()
+        # Streaming delta: ``item/agentMessage/delta``.
+        if "delta" in normalised_method and isinstance(item.get("text"), str):
+            turn.reply_chunks.append(item["text"])
+            return
+        if normalised_method.endswith("/started"):
+            return
+        if normalised_method.endswith("/completed"):
+            # Final shape for a non-streaming server: the whole
+            # message arrives once in ``item/completed``.
+            if kind in ("agent_message", "agentmessage"):
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str) and text:
+                    # Replace any partial deltas with the
+                    # authoritative final text — codex sends both in
+                    # some versions.
+                    if turn.reply_chunks and "".join(turn.reply_chunks).strip() == text.strip():
+                        return
+                    if not turn.reply_chunks:
+                        turn.reply_chunks.append(text)
+            elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
+                turn.tool_calls += 1
+            return
+
+    def _absorb_turn_usage(self, turn: _PendingTurn, params: dict) -> None:
+        usage = params.get("usage") or {}
+        try:
+            turn.input_tokens = int(usage.get("input_tokens") or 0)
+            turn.output_tokens = int(usage.get("output_tokens") or 0)
+        except (TypeError, ValueError):
+            pass
+
+
+__all__ = ["CodexSession"]

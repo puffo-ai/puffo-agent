@@ -4,6 +4,58 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0a1] — 2026-05-15
+
+> **Pre-release published to TestPyPI only — not for general install.**
+> Install with `pip install --index-url https://test.pypi.org/simple/
+> --extra-index-url https://pypi.org/simple/ puffo-agent==0.10.0a1`.
+
+### Added
+
+- **Codex harness on `cli-local` (alpha).** New `runtime.harness: codex`
+  option for OpenAI's `codex` CLI, running as a long-lived
+  `codex app-server` JSON-RPC subprocess. Sibling to claude-code on the
+  cli-local path; claude-code is untouched, codex is opt-in.
+
+  Components:
+  - `agent/harness/codex.py` (`CodexHarness`) + `runtime_matrix`
+    entries (`HARNESS_CODEX` + `HARNESS_PROVIDERS[codex] = {openai}`).
+    Default harness for openai remains `hermes` — codex must be opted
+    into per agent.
+  - `agent/adapters/codex_session.py` (`CodexSession`) — JSON-RPC
+    over stdio: `newConversation` / `sendUserTurn` request/response,
+    `item/*` notification stream accumulated into the reply,
+    `turn/completed` resolves the turn, server-initiated approval
+    requests auto-decided under `bypassPermissions`. Conversation id
+    persisted to `<CODEX_HOME>/codex_session.json` so daemon restarts
+    `resumeConversation` instead of reopening from scratch.
+  - `LocalCLIAdapter` dispatches by `harness.name()`: codex agents
+    route through `CodexSession`, everything else stays on
+    `ClaudeSession`. `refresh_ping` / `_run_refresh_oneshot` short-
+    circuit for codex (static `OPENAI_API_KEY`, no OAuth rotation).
+  - Per-agent `CODEX_HOME` (`~/.puffo-agent/agents/<id>/.codex/`) +
+    `OPENAI_API_KEY` env injection. AGENTS.md lives at
+    `$CODEX_HOME/AGENTS.md`; reload hot-swaps the in-memory
+    `current_instructions` field carried by each `sendUserTurn` call.
+  - `mcp/config.py` gains `write_codex_mcp_config` — a TOML emitter
+    for codex's `[mcp_servers.puffo]` schema with per-server `env`
+    table for the existing `puffo_core_mcp_env` payload.
+
+  Out of scope for v1 (will follow): per-turn item-event streaming to
+  StatusReporter; codex-shaped health probe; cli-docker codex.
+
+  Self-update for codex agents in v1 is limited to
+  `reload_system_prompt` (re-writes AGENTS.md). `install_skill` /
+  `refresh` / `install_mcp_server` / `uninstall_*` remain
+  claude-code-only — the existing `_require_claude_code` MCP gates
+  surface a clear error.
+
+  This release ships to TestPyPI only. The codex App Server JSON-RPC
+  contract is still pre-1.0 upstream; we treat 0.10.0a1 as the
+  verification vehicle. Promote to PyPI 0.10.0 once a colleague has
+  walked an agent through a real end-to-end turn against the actual
+  `codex app-server` binary.
+
 ## [0.8.3] — 2026-05-15
 
 ### Fixed
@@ -737,7 +789,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.10.0a1...HEAD
+[0.10.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3
 [0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2
 [0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1

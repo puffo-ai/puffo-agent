@@ -78,6 +78,14 @@ def agent_claude_user_dir(agent_id: str) -> Path:
     return agent_home_dir(agent_id) / ".claude"
 
 
+def agent_codex_user_dir(agent_id: str) -> Path:
+    """The agent's ``.codex/`` dir — used as ``CODEX_HOME`` so
+    sessions, config.toml, and AGENTS.md are isolated per agent and
+    don't collide with the operator's own ``~/.codex/``.
+    """
+    return agent_home_dir(agent_id) / ".codex"
+
+
 def shared_fs_dir() -> Path:
     """Shared dir for cross-agent cooperation. Bind-mounted to
     ``/workspace/.shared`` for cli-docker; referenced by absolute path
