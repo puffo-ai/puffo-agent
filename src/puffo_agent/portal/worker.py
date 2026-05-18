@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -318,6 +319,119 @@ def _build_puffo_core_client(
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
     )
+
+
+# PUF-214: patterns that identify worker-layer error strings the
+# adapter sometimes hands us as ``reply``. These never come from
+# legitimate agent prose:
+# - the "/login" slash command in the Claude CLI's auth-error line,
+# - the bracketed [puffo-agent system message] prefix in the kick
+#   text echoed back (the primer tells agents never to echo it),
+# - the verbatim Anthropic API error names.
+# Patterns are intentionally specific — "rate limit" or "Not logged
+# in" alone don't match, so an agent saying "I'm hitting a rate
+# limit, retrying" passes through.
+_WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"^\s*Not logged in[\s\S]*Please run /login",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*\[puffo-agent system message\]\s+session errored on rate",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bauthentication_error\b", re.IGNORECASE),
+    re.compile(r"\brate[_ -]limit[_ -]error\b", re.IGNORECASE),
+)
+
+
+def _looks_like_auth_error(reply: str) -> bool:
+    """True iff ``reply`` is a Claude CLI auth-error string or the
+    Anthropic API's ``authentication_error`` marker. Used by the
+    kick-retry suppression path to set ``runtime.health="auth_failed"``
+    so the operator's ``puffo-agent status`` view shares the same
+    signal as PUF-207's startup-paused state."""
+    if not reply:
+        return False
+    if re.match(
+        r"^\s*Not logged in[\s\S]*Please run /login",
+        reply,
+        re.IGNORECASE,
+    ):
+        return True
+    if re.search(r"\bauthentication_error\b", reply, re.IGNORECASE):
+        return True
+    return False
+
+
+def _suppress_worker_error_leak(reply: str) -> str | None:
+    """PUF-214: filter that runs against the adapter's ``reply`` text
+    before the worker calls ``send_fallback_message``. Returns
+    ``None`` when the reply matches a worker-error pattern (so the
+    caller suppresses the channel post and surfaces to the operator
+    instead). Returns the original reply unchanged otherwise.
+
+    Pre-fix, the fallback-render path posted whatever the adapter
+    handed back — including Claude CLI's "Not logged in / Please
+    run /login" string and the bracketed kick text echoed back as a
+    fake puffo-agent system frame. Both injected user-visible strings
+    that were never authored by the agent (FB-105 family / Jhope /
+    Sheri / Yasushi case-studies).
+    """
+    if not reply:
+        return reply
+    for pattern in _WORKER_ERROR_LEAK_PATTERNS:
+        if pattern.search(reply):
+            return None
+    return reply
+
+
+def _handle_suppressed_reply(
+    reply: str,
+    runtime: "RuntimeState",
+    agent_id: str,
+    *,
+    scope: str,
+    treat_auth_as_health: bool,
+) -> bool:
+    """PUF-214: shared landing for a suppressed worker-error leak.
+
+    Returns ``True`` when the reply was suppressed and the caller
+    should skip its ``send_fallback_message`` call; ``False`` when
+    the reply is clean and the caller should post it normally.
+
+    On suppression: log the truncated payload, populate
+    ``runtime.error`` with a scope-tagged message so the operator
+    sees signal via ``puffo-agent status`` instead of channel
+    pollution, and (when ``treat_auth_as_health`` is True and the
+    leak looks like an auth error) flip ``runtime.health`` to
+    ``auth_failed`` so this runtime-paused signal matches the
+    startup-paused signal from PUF-207.
+    """
+    safe_reply = _suppress_worker_error_leak(reply)
+    if safe_reply is not None:
+        return False
+    logger.warning(
+        "agent %s: suppressed worker-error leak in %s reply: %s",
+        agent_id, scope, reply[:200],
+    )
+    if treat_auth_as_health and _looks_like_auth_error(reply):
+        runtime.health = "auth_failed"
+    if scope == "api-error-retry":
+        runtime.error = (
+            "Worker emitted an auth/rate-limit error string after an "
+            "API error; suppressed from channel post. Operator should "
+            "check Claude CLI auth and re-run "
+            f"`puffo-agent agent resume {agent_id}` once recovered."
+        )
+    else:
+        runtime.error = (
+            "Worker emitted an auth/rate-limit error string instead of "
+            "a real reply; suppressed from channel post. Check daemon "
+            "logs."
+        )
+    runtime.save(agent_id)
+    return True
 
 
 class Worker:
@@ -646,11 +760,19 @@ class Worker:
             # display still reads as "N messages processed."
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
-            if reply:
+            if reply and not _handle_suppressed_reply(
+                reply,
+                self.runtime,
+                agent_id,
+                scope="fallback",
+                treat_auth_as_health=False,
+            ):
                 # Fallback reply when the agent skipped both
                 # send_message and [SILENT]. Post to root so the
                 # reply lands in the thread the agent was reading.
-                await client.send_fallback_message(channel_id, reply, root_id=root_id)
+                await client.send_fallback_message(
+                    channel_id, reply, root_id=root_id,
+                )
 
         async def on_api_error_retry(
             root_id: str,
@@ -677,8 +799,20 @@ class Worker:
             )
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
-            if reply:
-                await client.send_fallback_message(channel_id, reply, root_id=root_id)
+            if reply and not _handle_suppressed_reply(
+                reply,
+                self.runtime,
+                agent_id,
+                scope="api-error-retry",
+                treat_auth_as_health=True,
+            ):
+                # The kick-retry reply is the hottest leak site — see
+                # PUF-214 / FB-88 / FB-159 case-studies (Claude CLI's
+                # "Not logged in" line lands here when the access
+                # token died mid-session).
+                await client.send_fallback_message(
+                    channel_id, reply, root_id=root_id,
+                )
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
