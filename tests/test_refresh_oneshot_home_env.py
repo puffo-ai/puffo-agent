@@ -13,7 +13,31 @@ import shutil
 import time
 from pathlib import Path
 
+import pytest
+
 from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
+
+
+def _symlinks_available(tmp_path: Path) -> bool:
+    """Probe: can this process create a symlink in ``tmp_path``?
+    Mirrors the helper in ``test_host_credentials.py`` — Windows
+    needs Developer Mode or admin to create symlinks, so the
+    symlink-distribution invariant these tests assert on doesn't
+    apply there."""
+    probe = tmp_path / "_probe_symlink"
+    target = tmp_path / "_probe_target"
+    target.write_text("x", encoding="utf-8")
+    try:
+        os.symlink(target, probe)
+        probe.unlink()
+        target.unlink()
+        return True
+    except (OSError, NotImplementedError):
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return False
 
 
 class _FakeProc:
@@ -85,6 +109,8 @@ def test_refresh_oneshot_write_lands_at_host_path_visible_via_agent_symlink(
     .credentials.json surfaces the new value to puffo-agent's read
     path. Locks in the symlink-distribution contract this fix
     depends on."""
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
     host_home = tmp_path / "operator_home"
     agent_home = tmp_path / "agent_home"
     (host_home / ".claude").mkdir(parents=True)
@@ -110,7 +136,11 @@ def test_refresh_oneshot_write_lands_at_host_path_visible_via_agent_symlink(
         tmp_target.write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "fresh", "expiresAt": fresh_expires_ms},
         }))
-        os.rename(tmp_target, target)
+        # ``os.replace`` not ``os.rename`` — POSIX ``os.rename``
+        # atomically replaces an existing target, but on Windows it
+        # raises ``FileExistsError``. ``os.replace`` is the
+        # cross-platform atomic-replace primitive.
+        os.replace(tmp_target, target)
         return _FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -147,6 +177,8 @@ def test_refresh_oneshot_does_not_create_regular_file_at_agent_path(
     end up with a regular file (which would let
     link_host_credentials's copy-mode clobber the fresh token with
     the stale host content)."""
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
     host_home = tmp_path / "operator_home"
     agent_home = tmp_path / "agent_home"
     (host_home / ".claude").mkdir(parents=True)
@@ -166,7 +198,11 @@ def test_refresh_oneshot_does_not_create_regular_file_at_agent_path(
         tmp_target.write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "post-refresh", "expiresAt": fresh_expires_ms},
         }))
-        os.rename(tmp_target, target)
+        # ``os.replace`` not ``os.rename`` — POSIX ``os.rename``
+        # atomically replaces an existing target, but on Windows it
+        # raises ``FileExistsError``. ``os.replace`` is the
+        # cross-platform atomic-replace primitive.
+        os.replace(tmp_target, target)
         return _FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)

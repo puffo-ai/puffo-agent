@@ -4,6 +4,66 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.6] — 2026-05-18
+
+### Fixed
+
+- **Python-version precheck moved to `puffo_agent/__init__.py` and
+  fires before any submodule of the package is parsed.** Users on
+  Python 3.9 / 3.10 used to see a deep `SyntaxError` / `ImportError`
+  from inside the submodule chain at `cli.py`'s import block — the
+  actual cause (wrong Python version) was buried under the
+  wrong-looking message, and users frequently mis-attributed it as
+  "my Python is broken" (Shiva, FB-149).
+
+  Initial fix (0.8.5-rc, PR #27) added the precheck at the top of
+  `cli.py`. That covered the dominant case but had a subtle
+  weakness: Python parses an entire module before executing any line,
+  so if `cli.py` itself ever used Python 3.11-only syntax (`match` /
+  `case`, PEP 604 unions in expression position, exception groups)
+  the file would fail at parse time **before** the precheck had a
+  chance to run, and the user would be back to "deep SyntaxError"
+  from inside `cli.py`.
+
+  Move it one layer up: `puffo_agent/__init__.py` runs first when
+  Python resolves any `puffo_agent.*` submodule import — including
+  the entry-point's `from puffo_agent.portal.cli import main`. The
+  precheck now fires **before `cli.py` is even parsed**, so a future
+  3.11-only edit to `cli.py` (or any other submodule) can't bypass
+  the guard. `puffo_agent/__init__.py` itself stays deliberately
+  parseable on Python 3.6+ (f-strings only, no PEP 604, no `match`)
+  — documented in the module docstring so the constraint isn't lost.
+
+  `pyproject.toml`'s `requires-python = ">=3.11"` remains the
+  canonical metadata gate; this is the runtime safety net for users
+  on venvs whose interpreter doesn't match the metadata (e.g.
+  installed with `--ignore-requires-python` or older pip).
+
+  Tests in `test_cli_python_version.py` updated to import
+  `_require_python_311` from `puffo_agent` instead of
+  `puffo_agent.portal.cli`. Same 4-case matrix (rejects 3.9.18 /
+  3.10.12, passes 3.11.0 / 3.14.4); each reject branch asserts exit
+  code 1 + version-in-message + presence of at least one of
+  `pyenv` / `brew` / `python.org` upgrade hints. (PUF-206)
+
+- **PUF-217 test fixture: `os.rename` → `os.replace` + symlink-skip
+  guard for Windows.** The PUF-217 test fixture's fake-claude
+  subprocess used `os.rename(tmp_target, target)` to mimic Claude
+  CLI's atomic tmp+rename. On POSIX `os.rename` atomically replaces
+  an existing target, but on Windows it raises `FileExistsError`;
+  the cross-platform atomic-replace primitive is `os.replace`. Two
+  `os.rename` call sites in `test_refresh_oneshot_home_env.py`
+  swapped to `os.replace`. Additionally, the two tests that assert
+  on `agent_creds.is_symlink()` now gate on
+  `_symlinks_available(tmp_path)` and `pytest.skip` when the host
+  can't create symlinks — mirrors the existing pattern in
+  `test_host_credentials.py` (Windows without Developer Mode falls
+  through `link_host_credentials`'s copy-mode branch, so the
+  symlink-distribution invariant these tests assert on doesn't
+  apply there). Linux CI continues to exercise the full assertions;
+  Windows now skips cleanly instead of failing. Full suite:
+  **642 passed / 9 skipped / 0 failed**.
+
 ## [0.8.5] — 2026-05-18
 
 ### Fixed
