@@ -46,6 +46,63 @@ RECONNECT_BACKOFF_SECONDS = 5.0
 # mtime; this is just the upper bound on staleness.
 CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60
 
+# PUF-213: floor on the adaptive refresh-tick interval. When the
+# adapter reports the access token is already inside (or past) the
+# refresh window, we still bound the retry loop to once a minute so
+# a sustained refresh failure doesn't hammer ``_REFRESH_LOCK``.
+CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60
+
+
+def _next_refresh_tick(
+    expires_in_seconds: int | None,
+    *,
+    default_tick: int = CREDENTIAL_REFRESH_TICK_SECONDS,
+    threshold: int | None = None,
+    floor: int = CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS,
+) -> int:
+    """PUF-213: compute the next refresh tick adaptively.
+
+    ``refresh_ping`` only does work when the access token is within
+    ``CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS`` of expiry. The pre-
+    fix worker loop slept a fixed 10 minutes between ticks, so a
+    token whose refresh window fell entirely inside one 10-min sleep
+    could expire without ever being refreshed (FB-88 path #7 / #8).
+
+    This helper scales the next sleep to the token's TTL:
+    - ``None`` (sdk / chat-only adapter without a credentials file)
+      → fall back to ``default_tick`` — there's nothing to refresh,
+      so the loop is effectively a health heartbeat.
+    - TTL far in the future → ``default_tick``.
+    - TTL inside the refresh window → ``floor`` (60s by default).
+      Inside the window every tick triggers an actual refresh, so
+      we don't want to sleep long, but we also don't want to
+      dogpile if the refresh itself is failing.
+    - TTL between window and ``default_tick + threshold`` → wake up
+      ``threshold`` seconds before expiry so the next tick lands
+      inside the refresh window and the proactive refresh fires
+      with margin.
+    - Negative TTL (already expired) → ``floor``; we'll retry the
+      refresh on the next tick, bounded.
+
+    Returns an int number of seconds suitable for
+    ``asyncio.wait_for(stop.wait(), timeout=...)``.
+    """
+    if threshold is None:
+        # Imported lazily so this helper stays unit-testable without
+        # pulling in the adapter package.
+        from ..agent.adapters.base import (
+            CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS as _DEFAULT_THRESHOLD,
+        )
+        threshold = _DEFAULT_THRESHOLD
+    if expires_in_seconds is None:
+        return default_tick
+    target = expires_in_seconds - threshold
+    if target < floor:
+        return floor
+    if target > default_tick:
+        return default_tick
+    return target
+
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     """Construct the adapter for ``runtime.kind``. Raises on unknown
@@ -692,7 +749,14 @@ class Worker:
         async def credential_refresh():
             """Periodically refresh OAuth credentials before they
             expire. The adapter's mtime check skips the work when
-            another consumer just refreshed the shared file."""
+            another consumer just refreshed the shared file.
+
+            PUF-213: the sleep duration is adaptive — when the
+            access token is close to expiry we tick more often, so
+            the refresh window never falls entirely inside one
+            sleep interval. Far from expiry we fall back to the
+            default 10-minute heartbeat.
+            """
             # Skip the first tick to avoid piling onto warm().
             try:
                 await asyncio.wait_for(
@@ -719,10 +783,17 @@ class Worker:
                 elif probed is False:
                     self.runtime.health = "auth_failed"
                 self.runtime.save(agent_id)
+                # Scale next sleep to current TTL so we never miss
+                # the refresh window.
+                try:
+                    expires_in = self._adapter._credentials_expires_in_seconds()
+                except Exception:
+                    expires_in = None
+                next_tick = _next_refresh_tick(expires_in)
                 try:
                     await asyncio.wait_for(
                         self._stop.wait(),
-                        timeout=CREDENTIAL_REFRESH_TICK_SECONDS,
+                        timeout=next_tick,
                     )
                 except asyncio.TimeoutError:
                     pass
