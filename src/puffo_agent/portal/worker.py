@@ -462,6 +462,40 @@ def _handle_suppressed_reply(
     return True, backoff
 
 
+def _check_startup_auth_or_pause(
+    adapter: "Adapter", runtime: "RuntimeState", agent_id: str,
+) -> bool:
+    """PUF-207: gate startup on the result of the most recent OAuth
+    probe. Returns ``True`` when ``_run()`` should continue, ``False``
+    when the agent has been auto-paused with a recoverable error.
+
+    ``adapter.auth_healthy is not False`` → proceed (``None`` =
+    probe is a no-op for sdk / chat-only adapters; ``True`` = probe
+    succeeded). ``False`` → mutate runtime in-place with a recovery
+    prompt and return False so ``_run()`` exits without spawning
+    into a known-broken state.
+    """
+    if adapter.auth_healthy is not False:
+        return True
+    runtime.status = "paused"
+    runtime.health = "auth_failed"
+    runtime.error = (
+        f"Agent {agent_id}: Claude Code OAuth is missing or expired. "
+        "Paused on startup so this agent does not spawn into a "
+        "known-broken state.\n"
+        "To recover:\n"
+        "  1. Open a separate Terminal (not from within an agent's "
+        "own shell), then run `claude` and `/login` to authenticate.\n"
+        f"  2. From the same machine, resume agent {agent_id} with "
+        f"`puffo-agent agent resume {agent_id}`\n"
+        "     (a venv install may need the full path to "
+        "`puffo-agent`)."
+    )
+    runtime.save(agent_id)
+    return False
+
+
+
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
@@ -620,6 +654,26 @@ class Worker:
             self.runtime.error = str(e)
             self.runtime.save(agent_id)
             # Init crashed before warm() — release the startup gate.
+            self._warm_done.set()
+            return
+
+        # PUF-207: probe Claude CLI OAuth before warming. If the probe
+        # comes back explicitly False, pause rather than spawn into a
+        # known-broken state where every first turn would silently
+        # emit "Not logged in" (the FB-159 silent-fail pattern).
+        # Adapters with no credential TTL (sdk, chat-only) leave
+        # ``auth_healthy=None`` and we proceed as today.
+        try:
+            await self._adapter.refresh_ping()
+        except Exception as exc:
+            logger.warning(
+                "agent %s: startup auth probe failed "
+                "(will retry on refresh tick): %s",
+                agent_id, exc,
+            )
+        if not _check_startup_auth_or_pause(
+            self._adapter, self.runtime, agent_id,
+        ):
             self._warm_done.set()
             return
 
