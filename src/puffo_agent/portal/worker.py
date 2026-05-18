@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -321,39 +322,71 @@ def _build_puffo_core_client(
     )
 
 
-# PUF-214: patterns matching worker-layer error strings that
-# never appear in legitimate agent prose. Anchored to specific
-# signatures so prose mentioning rate-limit / login / authentication
-# passes through.
-_WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(
-        r"^\s*Not logged in[\s\S]*Please run /login",
-        re.IGNORECASE,
-    ),
+# PUF-214: auth-class patterns — definitive evidence of OAuth /
+# API-key failure. Shared by the leak filter (suppress the leak)
+# and by health-flip detection (`runtime.health=auth_failed`).
+# Anchored / unambiguous-token patterns only, per the doc-citation
+# audit; high-FP markers like "401" / "unauthorized" / "api_error"
+# stay OUT — they collide with legitimate agent prose.
+_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*Not logged in[\s\S]*Please run /login", re.IGNORECASE),
+    re.compile(r"^\s*OAuth token (?:revoked|has expired)\b", re.IGNORECASE),
+    re.compile(r"^\s*Invalid API key\b", re.IGNORECASE),
+    re.compile(r"\bThis organization has been disabled\b", re.IGNORECASE),
+    re.compile(r"\bauthentication_error\b", re.IGNORECASE),
+)
+
+# Worker-layer leak patterns NOT in the auth-class set. Sources:
+# Claude Code error reference (CLI message-to-recovery table) +
+# Claude API platform docs (canonical <type>_error identifiers).
+_NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Internal kick message echoed back as a reply.
     re.compile(
         r"^\s*\[puffo-agent system message\]\s+session errored on rate",
         re.IGNORECASE,
     ),
-    re.compile(r"\bauthentication_error\b", re.IGNORECASE),
+    # Subscription-plan quotas (the prod miss the reviewer surfaced).
+    re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
+    re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
+    # CLI-emitted server 429 / 5xx.
+    re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
+    re.compile(r"\bAPI Error: Server is temporarily limiting requests\b", re.IGNORECASE),
+    re.compile(r"\bAPI Error: Repeated 529 Overloaded errors\b", re.IGNORECASE),
+    re.compile(r"\bAPI Error: 500\b[\s\S]*Internal server error\b", re.IGNORECASE),
+    # API-canonical <type>_error identifiers, minus high-FP entries
+    # (invalid_request_error / not_found_error / api_error) per audit.
     re.compile(r"\brate[_ -]limit[_ -]error\b", re.IGNORECASE),
+    re.compile(r"\boverloaded_error\b", re.IGNORECASE),
+    re.compile(r"\bbilling_error\b", re.IGNORECASE),
+    re.compile(r"\bpermission_error\b", re.IGNORECASE),
+    re.compile(r"\btimeout_error\b", re.IGNORECASE),
 )
+
+_WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *_AUTH_ERROR_PATTERNS,
+    *_NON_AUTH_LEAK_PATTERNS,
+)
+
+# Backoff range applied after a suppressed leak fires. Random in
+# [15, 60] drops the steady-state leak frequency ~30× without
+# grounding the agent — single-batch leaks self-clear during the
+# sleep; sustained limit conditions get sampled, not hammered.
+_SUPPRESSION_BACKOFF_MIN_SECONDS = 15.0
+_SUPPRESSION_BACKOFF_MAX_SECONDS = 60.0
 
 
 def _looks_like_auth_error(reply: str) -> bool:
-    """True iff ``reply`` is the Claude CLI auth-error line or
-    Anthropic's ``authentication_error`` marker. Used by the
-    kick-retry suppression to flip ``runtime.health=auth_failed``
-    alongside PUF-207's startup-paused signal."""
+    """True iff ``reply`` is one of the definitive auth-class
+    failure strings (Claude CLI re-login prompt, OAuth-token
+    revoked/expired, invalid API key, disabled org, or the
+    ``authentication_error`` API identifier). Drives the
+    ``runtime.health=auth_failed`` flip alongside PUF-207's
+    startup-paused signal."""
     if not reply:
         return False
-    if re.match(
-        r"^\s*Not logged in[\s\S]*Please run /login",
-        reply,
-        re.IGNORECASE,
-    ):
-        return True
-    if re.search(r"\bauthentication_error\b", reply, re.IGNORECASE):
-        return True
+    for pattern in _AUTH_ERROR_PATTERNS:
+        if pattern.search(reply):
+            return True
     return False
 
 
@@ -376,23 +409,31 @@ def _handle_suppressed_reply(
     agent_id: str,
     *,
     scope: str,
-) -> bool:
+) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
-    True when the reply was suppressed and the caller should skip
-    ``send_fallback_message``; False when the reply is clean.
+    ``(suppressed, backoff_seconds)``:
+
+    - Clean prose: ``(False, 0.0)``; caller proceeds normally.
+    - Leak detected: ``(True, uniform(15, 60))``; caller skips
+      ``send_fallback_message`` and ``asyncio.sleep(backoff)`` so
+      the next batch doesn't immediately re-leak in tight loops.
 
     On suppression: log the truncated payload, populate
     ``runtime.error`` with a scope-tagged + leak-class-tagged
-    message, and (if the leak is auth-class) flip
-    ``runtime.health="auth_failed"`` — that signal is definitive
-    regardless of which scope surfaced it."""
+    message, and (if auth-class) flip ``runtime.health="auth_failed"``
+    — that signal is definitive regardless of which scope surfaced
+    it."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
-        return False
+        return False, 0.0
     is_auth = _looks_like_auth_error(reply)
+    backoff = random.uniform(
+        _SUPPRESSION_BACKOFF_MIN_SECONDS,
+        _SUPPRESSION_BACKOFF_MAX_SECONDS,
+    )
     logger.warning(
-        "agent %s: suppressed worker-error leak in %s reply: %s",
-        agent_id, scope, reply[:200],
+        "agent %s: suppressed worker-error leak in %s reply (backoff %.1fs): %s",
+        agent_id, scope, backoff, reply[:200],
     )
     if is_auth:
         runtime.health = "auth_failed"
@@ -406,19 +447,19 @@ def _handle_suppressed_reply(
             )
         else:
             runtime.error = (
-                "Worker emitted a rate-limit error string after an "
-                "API error; suppressed from channel post. Usually "
-                "self-recovers — investigate the daemon log if "
-                "persistent."
+                "Worker emitted a rate-limit / quota / server-error "
+                "string after an API error; suppressed from channel "
+                "post. Usually self-recovers — investigate the daemon "
+                "log if persistent."
             )
     else:
         runtime.error = (
-            "Worker emitted an auth/rate-limit error string instead of "
-            "a real reply; suppressed from channel post. Check daemon "
-            "logs."
+            "Worker emitted an auth / rate-limit / quota error string "
+            "instead of a real reply; suppressed from channel post. "
+            "Check daemon logs."
         )
     runtime.save(agent_id)
-    return True
+    return True, backoff
 
 
 class Worker:
@@ -747,18 +788,21 @@ class Worker:
             # display still reads as "N messages processed."
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
-            if reply and not _handle_suppressed_reply(
-                reply,
-                self.runtime,
-                agent_id,
-                scope="fallback",
-            ):
-                # Fallback reply when the agent skipped both
-                # send_message and [SILENT]. Post to root so the
-                # reply lands in the thread the agent was reading.
-                await client.send_fallback_message(
-                    channel_id, reply, root_id=root_id,
+            if reply:
+                suppressed, backoff = _handle_suppressed_reply(
+                    reply,
+                    self.runtime,
+                    agent_id,
+                    scope="fallback",
                 )
+                if suppressed:
+                    await asyncio.sleep(backoff)
+                else:
+                    # Fallback reply when the agent skipped both
+                    # send_message and [SILENT].
+                    await client.send_fallback_message(
+                        channel_id, reply, root_id=root_id,
+                    )
 
         async def on_api_error_retry(
             root_id: str,
@@ -785,19 +829,22 @@ class Worker:
             )
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
-            if reply and not _handle_suppressed_reply(
-                reply,
-                self.runtime,
-                agent_id,
-                scope="api-error-retry",
-            ):
-                # The kick-retry reply is the hottest leak site — see
-                # PUF-214 / FB-88 / FB-159 case-studies (Claude CLI's
-                # "Not logged in" line lands here when the access
-                # token died mid-session).
-                await client.send_fallback_message(
-                    channel_id, reply, root_id=root_id,
+            if reply:
+                suppressed, backoff = _handle_suppressed_reply(
+                    reply,
+                    self.runtime,
+                    agent_id,
+                    scope="api-error-retry",
                 )
+                if suppressed:
+                    # Hottest leak site (FB-88 / FB-159 case-studies).
+                    # Backoff samples instead of hammering when the
+                    # underlying limit / outage is still active.
+                    await asyncio.sleep(backoff)
+                else:
+                    await client.send_fallback_message(
+                        channel_id, reply, root_id=root_id,
+                    )
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
