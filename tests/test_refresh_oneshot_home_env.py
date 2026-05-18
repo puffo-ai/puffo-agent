@@ -26,7 +26,9 @@ class _FakeProc:
         return self._stdout, self._stderr
 
 
-def _make_adapter(agent_home: Path, workspace: Path) -> LocalCLIAdapter:
+def _make_adapter(
+    agent_home: Path, workspace: Path, monkeypatch,
+) -> LocalCLIAdapter:
     agent_home.mkdir(parents=True, exist_ok=True)
     workspace.mkdir(parents=True, exist_ok=True)
     claude_dir = workspace / ".claude"
@@ -40,9 +42,11 @@ def _make_adapter(agent_home: Path, workspace: Path) -> LocalCLIAdapter:
         mcp_config_file=str(workspace / "mcp.json"),
         agent_home_dir=str(agent_home),
     )
-    # _verify would call shutil.which("claude") and seed the agent
-    # home from the operator's; skip both by flipping the cached flag.
-    adapter._verified = True
+    # _verify would shell out to ``shutil.which("claude")`` and seed
+    # the agent's virtual HOME from the operator's. No-op it here so
+    # the test rides on the public method rather than coupling to the
+    # private ``_verified`` cache flag.
+    monkeypatch.setattr(adapter, "_verify", lambda: None)
     return adapter
 
 
@@ -60,7 +64,7 @@ def test_refresh_oneshot_inherits_operator_home(tmp_path, monkeypatch):
         return _FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-    adapter = _make_adapter(tmp_path / "agent_home", tmp_path / "workspace")
+    adapter = _make_adapter(tmp_path / "agent_home", tmp_path / "workspace", monkeypatch)
     asyncio.run(adapter._run_refresh_oneshot())
 
     env = captured["env"]
@@ -112,7 +116,7 @@ def test_refresh_oneshot_write_lands_at_host_path_visible_via_agent_symlink(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(shutil, "which", lambda *a, **k: "/usr/local/bin/claude")
 
-    adapter = _make_adapter(agent_home, tmp_path / "workspace")
+    adapter = _make_adapter(agent_home, tmp_path / "workspace", monkeypatch)
 
     # First touch: link_host_credentials creates the symlink so the
     # agent has a view onto the host file.
@@ -168,7 +172,7 @@ def test_refresh_oneshot_does_not_create_regular_file_at_agent_path(
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(shutil, "which", lambda *a, **k: "/usr/local/bin/claude")
 
-    adapter = _make_adapter(agent_home, tmp_path / "workspace")
+    adapter = _make_adapter(agent_home, tmp_path / "workspace", monkeypatch)
     # Establish the symlink first.
     adapter._credentials_expires_in_seconds()
     asyncio.run(adapter._run_refresh_oneshot())
