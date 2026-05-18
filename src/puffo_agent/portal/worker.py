@@ -376,31 +376,41 @@ def _handle_suppressed_reply(
     agent_id: str,
     *,
     scope: str,
-    treat_auth_as_health: bool,
 ) -> bool:
     """Shared landing for a suppressed worker-error leak. Returns
     True when the reply was suppressed and the caller should skip
-    ``send_fallback_message``; False when the reply is clean. On
-    suppression: log the truncated payload, populate
-    ``runtime.error`` with a scope-tagged message, and (if
-    ``treat_auth_as_health`` and the leak looks auth-class) flip
-    ``runtime.health="auth_failed"``."""
+    ``send_fallback_message``; False when the reply is clean.
+
+    On suppression: log the truncated payload, populate
+    ``runtime.error`` with a scope-tagged + leak-class-tagged
+    message, and (if the leak is auth-class) flip
+    ``runtime.health="auth_failed"`` — that signal is definitive
+    regardless of which scope surfaced it."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False
+    is_auth = _looks_like_auth_error(reply)
     logger.warning(
         "agent %s: suppressed worker-error leak in %s reply: %s",
         agent_id, scope, reply[:200],
     )
-    if treat_auth_as_health and _looks_like_auth_error(reply):
+    if is_auth:
         runtime.health = "auth_failed"
     if scope == "api-error-retry":
-        runtime.error = (
-            "Worker emitted an auth/rate-limit error string after an "
-            "API error; suppressed from channel post. Operator should "
-            "check Claude CLI auth and re-run "
-            f"`puffo-agent agent resume {agent_id}` once recovered."
-        )
+        if is_auth:
+            runtime.error = (
+                "Worker emitted an auth-error string after an API "
+                "error; suppressed from channel post. Re-run "
+                "`claude /login`, then "
+                f"`puffo-agent agent resume {agent_id}`."
+            )
+        else:
+            runtime.error = (
+                "Worker emitted a rate-limit error string after an "
+                "API error; suppressed from channel post. Usually "
+                "self-recovers — investigate the daemon log if "
+                "persistent."
+            )
     else:
         runtime.error = (
             "Worker emitted an auth/rate-limit error string instead of "
@@ -742,7 +752,6 @@ class Worker:
                 self.runtime,
                 agent_id,
                 scope="fallback",
-                treat_auth_as_health=False,
             ):
                 # Fallback reply when the agent skipped both
                 # send_message and [SILENT]. Post to root so the
@@ -781,7 +790,6 @@ class Worker:
                 self.runtime,
                 agent_id,
                 scope="api-error-retry",
-                treat_auth_as_health=True,
             ):
                 # The kick-retry reply is the hottest leak site — see
                 # PUF-214 / FB-88 / FB-159 case-studies (Claude CLI's

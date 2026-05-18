@@ -153,15 +153,15 @@ def test_handle_suppressed_reply_returns_true_on_leak_fallback_scope(tmp_path, m
         runtime,
         "agent-suppress-fallback",
         scope="fallback",
-        treat_auth_as_health=False,
     )
     assert suppressed is True
     # Operator-facing surface: runtime.error populated, NOT a channel
     # post. The "Check daemon logs" copy is the fallback-scope variant.
     assert "suppressed from channel post" in runtime.error
     assert "Check daemon logs" in runtime.error
-    # treat_auth_as_health=False → health stays unchanged.
-    assert runtime.health == "unknown"
+    # Auth-class leak is definitive evidence regardless of scope —
+    # flips health so puffo-agent status surfaces it.
+    assert runtime.health == "auth_failed"
     # Persisted to disk so ``puffo-agent status`` picks it up.
     reloaded = RuntimeState.load("agent-suppress-fallback")
     assert reloaded is not None
@@ -176,19 +176,18 @@ def test_handle_suppressed_reply_returns_true_on_leak_api_retry_scope(tmp_path, 
         runtime,
         "agent-suppress-retry",
         scope="api-error-retry",
-        treat_auth_as_health=True,
     )
     assert suppressed is True
-    # API-retry scope tells the operator how to recover.
+    # API-retry / auth-class branch: re-login + resume recovery copy.
+    assert "claude /login" in runtime.error
     assert "puffo-agent agent resume agent-suppress-retry" in runtime.error
-    # Auth-class leak flips health for the operator's status view.
     assert runtime.health == "auth_failed"
 
 
-def test_handle_suppressed_reply_rate_limit_does_not_flip_health(tmp_path, monkeypatch):
-    """Rate-limit leak is still suppressed but should NOT mark the
-    agent auth_failed — that mark is reserved for OAuth-class
-    failures the operator recovers via ``claude /login``."""
+def test_handle_suppressed_reply_api_retry_rate_limit_branches_message(tmp_path, monkeypatch):
+    """Rate-limit leak via api-error-retry scope: suppressed, NOT
+    marked auth_failed, AND the recovery copy is rate-limit-flavoured
+    (no misdirecting `claude /login` instruction)."""
     monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
     runtime = RuntimeState(status="running")
     suppressed = _handle_suppressed_reply(
@@ -196,10 +195,14 @@ def test_handle_suppressed_reply_rate_limit_does_not_flip_health(tmp_path, monke
         runtime,
         "agent-rate-limit",
         scope="api-error-retry",
-        treat_auth_as_health=True,
     )
     assert suppressed is True
     assert runtime.health == "unknown"  # NOT auth_failed
+    assert "rate-limit" in runtime.error
+    assert "self-recovers" in runtime.error
+    # Must NOT misdirect the operator to the auth recovery flow.
+    assert "claude /login" not in runtime.error
+    assert "puffo-agent agent resume" not in runtime.error
 
 
 def test_handle_suppressed_reply_returns_false_on_legit_prose(tmp_path, monkeypatch):
@@ -213,7 +216,6 @@ def test_handle_suppressed_reply_returns_false_on_legit_prose(tmp_path, monkeypa
         runtime,
         "agent-clean",
         scope="fallback",
-        treat_auth_as_health=False,
     )
     assert suppressed is False
     # Runtime untouched — no error message, no health flip, no save
@@ -245,7 +247,7 @@ class _RecordingClient:
 
 
 async def _fallback_call_site(
-    client, runtime, agent_id, channel_id, reply, root_id, *, scope, treat_auth_as_health,
+    client, runtime, agent_id, channel_id, reply, root_id, *, scope,
 ):
     """Mirrors the two ``if reply and not _handle_suppressed_reply(...):
     await client.send_fallback_message(...)`` blocks in
@@ -256,7 +258,6 @@ async def _fallback_call_site(
         runtime,
         agent_id,
         scope=scope,
-        treat_auth_as_health=treat_auth_as_health,
     ):
         await client.send_fallback_message(channel_id, reply, root_id=root_id)
 
@@ -273,7 +274,6 @@ def test_call_site_skips_send_on_suppressed_leak(tmp_path, monkeypatch):
         "Not logged in. Please run /login",
         "msg_root",
         scope="api-error-retry",
-        treat_auth_as_health=True,
     ))
     assert client.calls == []  # NEVER called when filter suppresses
     # And the operator-side surface still got populated.
@@ -290,7 +290,6 @@ def test_call_site_calls_send_on_legit_reply(tmp_path, monkeypatch):
         "Got it — pushing that PR shortly.",
         "msg_root",
         scope="fallback",
-        treat_auth_as_health=False,
     ))
     assert client.calls == [
         ("ch_abc", "Got it — pushing that PR shortly.", "msg_root"),
@@ -310,7 +309,6 @@ def test_call_site_skips_send_on_empty_reply(tmp_path, monkeypatch):
     asyncio.run(_fallback_call_site(
         client, runtime, "agent-empty", "ch_abc", "", "msg_root",
         scope="fallback",
-        treat_auth_as_health=False,
     ))
     assert client.calls == []
     assert runtime.error == ""
