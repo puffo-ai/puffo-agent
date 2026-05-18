@@ -465,16 +465,9 @@ def _handle_suppressed_reply(
 def _check_startup_auth_or_pause(
     adapter: "Adapter", runtime: "RuntimeState", agent_id: str,
 ) -> bool:
-    """PUF-207: gate startup on the result of the most recent OAuth
-    probe. Returns ``True`` when ``_run()`` should continue, ``False``
-    when the agent has been auto-paused with a recoverable error.
-
-    ``adapter.auth_healthy is not False`` → proceed (``None`` =
-    probe is a no-op for sdk / chat-only adapters; ``True`` = probe
-    succeeded). ``False`` → mutate runtime in-place with a recovery
-    prompt and return False so ``_run()`` exits without spawning
-    into a known-broken state.
-    """
+    """PUF-207: return True on True/None (proceed); on False,
+    auto-pause the agent with a recoverable runtime.error and
+    return False."""
     if adapter.auth_healthy is not False:
         return True
     runtime.status = "paused"
@@ -657,12 +650,8 @@ class Worker:
             self._warm_done.set()
             return
 
-        # PUF-207: probe Claude CLI OAuth before warming. If the probe
-        # comes back explicitly False, pause rather than spawn into a
-        # known-broken state where every first turn would silently
-        # emit "Not logged in" (the FB-159 silent-fail pattern).
-        # Adapters with no credential TTL (sdk, chat-only) leave
-        # ``auth_healthy=None`` and we proceed as today.
+        # PUF-207: pause on auth_healthy=False so we don't spawn into
+        # a known-broken state (FB-159).
         try:
             await self._adapter.refresh_ping()
         except Exception as exc:

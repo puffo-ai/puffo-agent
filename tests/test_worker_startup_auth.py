@@ -11,9 +11,6 @@ from __future__ import annotations
 
 import os
 import sys
-import tempfile
-from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -28,14 +25,6 @@ class _FakeAdapter:
 
     def __init__(self, auth_healthy):
         self.auth_healthy = auth_healthy
-
-
-def _agent_dir_for(tmp_path: Path, agent_id: str) -> Path:
-    """``RuntimeState.save`` writes to ``runtime_json_path(agent_id)``
-    which resolves through ``state.agent_dir`` → ``$PUFFO_HOME``.
-    Tests point ``PUFFO_HOME`` at a tmp dir so save() doesn't escape
-    the sandbox."""
-    return tmp_path
 
 
 def test_check_startup_auth_pauses_on_auth_healthy_false(tmp_path, monkeypatch):
