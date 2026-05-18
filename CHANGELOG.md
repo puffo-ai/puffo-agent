@@ -4,6 +4,292 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.6] — 2026-05-18
+
+### Fixed
+
+- **Python-version precheck moved to `puffo_agent/__init__.py` and
+  fires before any submodule of the package is parsed.** Users on
+  Python 3.9 / 3.10 used to see a deep `SyntaxError` / `ImportError`
+  from inside the submodule chain at `cli.py`'s import block — the
+  actual cause (wrong Python version) was buried under the
+  wrong-looking message, and users frequently mis-attributed it as
+  "my Python is broken" (Shiva, FB-149).
+
+  Initial fix (0.8.5-rc, PR #27) added the precheck at the top of
+  `cli.py`. That covered the dominant case but had a subtle
+  weakness: Python parses an entire module before executing any line,
+  so if `cli.py` itself ever used Python 3.11-only syntax (`match` /
+  `case`, PEP 604 unions in expression position, exception groups)
+  the file would fail at parse time **before** the precheck had a
+  chance to run, and the user would be back to "deep SyntaxError"
+  from inside `cli.py`.
+
+  Move it one layer up: `puffo_agent/__init__.py` runs first when
+  Python resolves any `puffo_agent.*` submodule import — including
+  the entry-point's `from puffo_agent.portal.cli import main`. The
+  precheck now fires **before `cli.py` is even parsed**, so a future
+  3.11-only edit to `cli.py` (or any other submodule) can't bypass
+  the guard. `puffo_agent/__init__.py` itself stays deliberately
+  parseable on Python 3.6+ (f-strings only, no PEP 604, no `match`)
+  — documented in the module docstring so the constraint isn't lost.
+
+  `pyproject.toml`'s `requires-python = ">=3.11"` remains the
+  canonical metadata gate; this is the runtime safety net for users
+  on venvs whose interpreter doesn't match the metadata (e.g.
+  installed with `--ignore-requires-python` or older pip).
+
+  Tests in `test_cli_python_version.py` updated to import
+  `_require_python_311` from `puffo_agent` instead of
+  `puffo_agent.portal.cli`. Same 4-case matrix (rejects 3.9.18 /
+  3.10.12, passes 3.11.0 / 3.14.4); each reject branch asserts exit
+  code 1 + version-in-message + presence of at least one of
+  `pyenv` / `brew` / `python.org` upgrade hints. (PUF-206)
+
+- **PUF-217 test fixture: `os.rename` → `os.replace` + symlink-skip
+  guard for Windows.** The PUF-217 test fixture's fake-claude
+  subprocess used `os.rename(tmp_target, target)` to mimic Claude
+  CLI's atomic tmp+rename. On POSIX `os.rename` atomically replaces
+  an existing target, but on Windows it raises `FileExistsError`;
+  the cross-platform atomic-replace primitive is `os.replace`. Two
+  `os.rename` call sites in `test_refresh_oneshot_home_env.py`
+  swapped to `os.replace`. Additionally, the two tests that assert
+  on `agent_creds.is_symlink()` now gate on
+  `_symlinks_available(tmp_path)` and `pytest.skip` when the host
+  can't create symlinks — mirrors the existing pattern in
+  `test_host_credentials.py` (Windows without Developer Mode falls
+  through `link_host_credentials`'s copy-mode branch, so the
+  symlink-distribution invariant these tests assert on doesn't
+  apply there). Linux CI continues to exercise the full assertions;
+  Windows now skips cleanly instead of failing. Full suite:
+  **642 passed / 9 skipped / 0 failed**.
+
+### Added
+
+- **Agent startup auto-pauses when the OAuth probe says "auth is
+  dead."** When a cli-local agent's persisted session re-spawned
+  with an expired or revoked OAuth token, `Worker._run()` used to
+  proceed straight into `warm()` and the first turn — at which
+  point Claude CLI emitted `Not logged in. Please run /login` and
+  that string leaked into the channel as if it were the agent's
+  reply (FB-159 / Sheri / Yasushi mis-attributed as "my Python is
+  broken"). The startup path had no signal at all that auth was
+  broken before the first message hit production.
+
+  Now `Worker._run()` fires `adapter.refresh_ping()` between init
+  and `warm()`. The new `_check_startup_auth_or_pause()` helper
+  reads `adapter.auth_healthy` afterwards:
+  - `None` (sdk / chat-only adapters — no credential file) or
+    `True` (probe succeeded) → proceed unchanged.
+  - `False` (probe reported auth failure) → mutate the runtime to
+    `status=paused, health=auth_failed`, populate `runtime.error`
+    with a four-step recovery prompt (open a separate Terminal,
+    not from within an agent's own shell, run `claude /login`,
+    then `puffo-agent agent resume <id>`; mentions the venv full-
+    path caveat), persist, and bail before `warm()` ever spawns
+    the doomed claude subprocess. `self._warm_done.set()` is
+    still called on the early-return path so any caller awaiting
+    `wait_for_warm()` doesn't hang.
+
+  Not sticky: the existing periodic refresh tick at
+  `worker.py:737-748` can flip `runtime.health` back to `ok` if
+  the operator re-authenticates and the next probe succeeds. The
+  operator still needs to manually `puffo-agent agent resume <id>`
+  (auto-resume would risk a tight pause/resume loop if auth
+  flaps); the message in `runtime.error` is the recovery script.
+
+  Defense-in-depth triad with PUF-213 (adaptive refresh tick
+  prevents staleness during runtime) and PUF-214 (worker-layer
+  error-string leak suppression if either misses) — together they
+  close the silent-can't-recover surface for the FB-159 / FB-105
+  class.
+
+  Tests in `test_worker_startup_auth.py` (7 cases): the helper
+  matrix (`auth_healthy=False` pauses with the full recovery
+  prompt incl. agent id ≥2 occurrences; `None` / `True` proceed;
+  persistence to disk; not-sticky on probe-success), plus two
+  call-site tests using a `_startup_call_site` helper that
+  mirrors the exact pause-or-warm-then-set production block from
+  `Worker._run()` — asserts `warm_done.is_set()` on BOTH the
+  pause early-return path AND the proceed-then-warm path, catching
+  any future refactor that drops the `self._warm_done.set()` line
+  before the early return. Same call-site-mirroring pattern as
+  PUF-214's `_fallback_call_site` helper. (PUF-207)
+
+## [0.8.5] — 2026-05-18
+
+### Fixed
+
+- **`mcp__puffo__send_message` (and `send_message_with_attachments`)
+  now auto-correct a non-root `root_id`.** When an agent passed the
+  envelope id of a *reply* (rather than the thread's true root) as
+  `root_id`, the message used to encrypt with that reply id as
+  `thread_root_id` and land in a sub-thread that human clients don't
+  surface — no failure signal returned to the agent. We hit this
+  twice live on 2026-05-18 (clone-report `msg_38364760` and
+  build-test-report `msg_9e8f1a83`, both threaded under root
+  `msg_610fec10`), and both messages vanished from the operator's
+  view.
+
+  New helper `_resolve_root_id(root_id, data_client)` runs alongside
+  `_coerce_root_visibility`: it looks the supplied envelope up in the
+  local message store and substitutes its own `thread_root_id`
+  before encrypting, then appends a correction note to the tool
+  response so the agent learns the rule from the result on the spot
+  rather than depending on the primer being current.
+
+  Failure-mode contract: lookup miss / transport error / `DataNotFound`
+  fall through with the original id plus a soft warning — the send
+  still completes (better to land in the wrong thread than drop the
+  message). Cycle in the chain or chain deeper than 4 levels is
+  treated as corrupt data: the helper preserves the original `root_id`
+  and surfaces a loud "could not resolve to a true root" warning
+  instead of auto-correcting to a value it can't trust.
+
+  Walk is capped at 4 levels with cycle detection — on healthy data
+  the walk terminates in one hop (per `message_store.py`'s schema,
+  `thread_root_id` always points at a true root); the multi-hop walk
+  is corruption defense for relay data shapes that shouldn't exist.
+
+  Tests in `test_puffo_core_tools.py`: 8 unit tests on `_resolve_root_id`
+  (empty/whitespace, true root unchanged, single-level + depth-2 walk,
+  lookup miss, transport error, real `DataNotFound`, cycle + depth-cap
+  preservation), plus 5 integration tests on `send_message` /
+  `send_message_with_attachments` — including the two real
+  2026-05-18 live-failure envelope IDs as parametrised cases for a
+  date-stamped regression anchor. Full suite: **596 passed / 1
+  skipped / 0 failed**. (PUF-200)
+
+- **Worker-layer error-string leaks no longer reach the channel.**
+  Pre-fix, when Claude CLI's OAuth died mid-session (FB-159 Sheri /
+  Yasushi class) or the Anthropic API returned an authentication /
+  rate-limit / quota error (FB-105 class), the worker fed the raw
+  error string straight into `client.send_fallback_message(...)` —
+  operators saw their personal/family DMs polluted with
+  `Not logged in. Please run /login` and
+  `[puffo-agent system message] session errored on rate limiting…`,
+  and the agent retried each new message every few seconds because
+  no upstream layer recognised the state.
+
+  Two-part fix at the worker egress boundary:
+
+  *Pattern-based suppression* — anchored regexes match only the
+  worker-emitted error signatures (legitimate agent prose mentioning
+  "rate limit" / "login" / "authentication" passes through unchanged).
+  Sources: [Claude Code error reference](https://code.claude.com/docs/en/errors)
+  message-to-recovery table + [Claude API errors](https://platform.claude.com/docs/en/api/errors)
+  canonical `<type>_error` identifiers. 12 patterns ship: usage-limit
+  variants (`You've hit your <session|weekly|Opus> limit`,
+  `Credit balance is too low`), CLI-wrapped server errors
+  (`API Error: Request rejected (429)`,
+  `API Error: Server is temporarily limiting requests`,
+  `API Error: Repeated 529 Overloaded errors`,
+  `API Error: 500 ... Internal server error`), OAuth recovery class
+  (`OAuth token revoked|has expired`, `Invalid API key`,
+  `This organization has been disabled`), and the safe subset of API
+  identifiers (`authentication_error`, `rate_limit_error`,
+  `overloaded_error`, `billing_error`, `permission_error`,
+  `timeout_error`, plus the kick-text echo signature). Identifiers
+  with high false-positive risk against legitimate prose
+  (`invalid_request_error`, `not_found_error`, `api_error`, and
+  generic phrases like `Prompt is too long`, `Request timed out`,
+  `Unable to connect to API`) are deliberately excluded per
+  doc-driven audit.
+
+  *Randomised backoff after suppression* — `_handle_suppressed_reply`
+  returns `(suppressed, backoff_seconds)`. Both `Worker._run` call
+  sites (`on_message_batch` and `on_api_error_retry`) unpack the
+  tuple and `await asyncio.sleep(backoff)` on suppression instead of
+  immediately re-entering the loop. Backoff is `random.uniform(15.0,
+  60.0)` — drops the steady-state leak frequency ~30× without
+  grounding the agent (auto-pause was considered and rejected — too
+  high a recall-risk for a single leak). Module-level
+  `_SUPPRESSION_BACKOFF_MIN/MAX_SECONDS` constants let tests pin
+  against the same values.
+
+  Auth-class leaks (the 5 patterns in `_AUTH_ERROR_PATTERNS`,
+  including the new OAuth-token-revoked / Invalid-API-key /
+  disabled-org additions) also flip `runtime.health=auth_failed`
+  symmetrically across both scopes, surfacing on `puffo-agent
+  status` and in the bridge UI without polluting the channel.
+  Non-auth leaks get a "usually self-recovers — investigate the
+  daemon log if persistent" message instead of misdirecting the
+  operator to `claude /login`.
+
+  Tests in `test_worker_error_suppress.py`: 46 total, including
+  parametrized positive matches for all 12 patterns + auth-class
+  classification, parametrized skip-list negatives that pin the
+  high-FP exclusions, backoff distribution at 100 samples (range +
+  non-degenerate-random guard), and a real-`asyncio.sleep`-monkeypatch
+  call-site test that exercises the production shape end-to-end.
+  Full suite: **628 passed / 1 skipped / 0 failed**.
+
+  Defense-in-depth context: pairs with PUF-207 (startup OAuth verify)
+  and PUF-213 (adaptive credential refresh) — PUF-207 catches at
+  startup, PUF-213 prevents staleness during runtime, this catches
+  the egress leak if either misses. (PUF-214)
+
+- **OAuth-refresh probe no longer clobbers the agent's credentials
+  symlink on Linux.** On cli-local + Linux, `_run_refresh_oneshot`
+  used to override `HOME` to the agent's per-agent home dir, sending
+  Claude CLI's atomic `tmp+rename` write through the agent's
+  symlinked `.credentials.json`. The rename **replaced the symlink
+  with a regular file** at the agent path, leaving the canonical
+  host file stale. The next `_credentials_expires_in_seconds` tick
+  called `link_host_credentials`, whose copy-mode fast-path detected
+  `agent_creds.exists() and not is_symlink()` plus an mtime mismatch
+  and ran `shutil.copy2(host_creds, agent_creds)` — the **stale host
+  file overwrote the fresh-token agent file**. From the daemon's
+  perspective `expiresAt` never advanced, the adaptive-cadence floor
+  kicked in at 60s, and the refresh cycle dogpiled indefinitely.
+  Live in-band repro happened on the operator's Linux box at 18:30
+  on 2026-05-18, mid-implementation.
+
+  Fix drops the `HOME` / `USERPROFILE` override in
+  `_run_refresh_oneshot` so the refresh subprocess inherits the
+  daemon's env (the operator's HOME). Claude writes to
+  `/home/<operator>/.claude/.credentials.json` directly; the
+  per-agent symlinks distribute the fresh token via read-through.
+  The "symlink survives atomic rename writes" claim in `state.py`'s
+  `link_host_credentials` docstring is now retroactively correct
+  because rename never targets the symlink path. Long-lived
+  `ClaudeSession` agent subprocesses are unaffected —
+  `_ensure_session` still sets `HOME=<agent_home>` for normal turn
+  execution; only the short-lived refresh probe changes scope.
+
+  Operational caveat (flagged for post-deploy): dropping the HOME
+  override means the refresh subprocess now activates the
+  *operator's* `.claude.json` MCP servers (Gmail / Drive / Calendar
+  / Notion / PDF + any locally-installed) instead of the agent's.
+  Expect 2–5s of MCP startup overhead per refresh.
+  `REFRESH_ONESHOT_TIMEOUT_SECONDS = 120` so there's ample headroom,
+  but watch for `refresh one-shot rc=0 in N.Ns` log lines staying
+  under ~10s; a `--strict-mcp-config` follow-up will skip MCP
+  startup in refresh-only invocations if that becomes a problem in
+  practice.
+
+  Tests in `test_refresh_oneshot_home_env.py`:
+  `test_refresh_oneshot_inherits_operator_home` (env-mutation guard
+  — monkeypatches `asyncio.create_subprocess_exec` and asserts
+  `env["HOME"]` equals the operator's HOME, NOT the agent's
+  home_dir); `test_refresh_oneshot_write_lands_at_host_path_visible_via_agent_symlink`
+  (end-to-end-ish — fake claude subprocess does `tmp+rename` at the
+  env's HOME path, asserts agent symlink still resolves to a file
+  with the fresh `accessToken` AND
+  `_credentials_expires_in_seconds()` reads back a positive TTL);
+  `test_refresh_oneshot_does_not_create_regular_file_at_agent_path`
+  (anti-regression — agent path remains `is_symlink()` after refresh
+  + no stray `.credentials.tmp` left at the agent path; catches a
+  future refactor that reintroduces a HOME override). Full suite:
+  **600 passed / 1 skipped / 0 failed**.
+
+  Defense-in-depth context: PUF-217 closes the **disk-write side**
+  of the FB-88 refresh cascade. PUF-218 (deferred) will close the
+  disk-read side (long-lived `ClaudeSession` reloads from disk after
+  refresh). With PUF-207 (startup probe), PUF-213 (adaptive
+  cadence), and PUF-214 (egress leak suppression), the OAuth
+  lifecycle compound is fully closed on Linux. (PUF-217)
+
 ## [0.8.4] — 2026-05-17
 
 ### Added
