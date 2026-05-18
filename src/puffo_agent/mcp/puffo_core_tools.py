@@ -177,6 +177,99 @@ def _coerce_root_visibility(
     return is_visible_to_human, ""
 
 
+_RESOLVE_ROOT_MAX_DEPTH = 4
+
+
+async def _resolve_root_id(
+    root_id: str, data_client: Any,
+) -> tuple[Optional[str], str]:
+    """When an agent passes a reply's envelope id as ``root_id``,
+    look that envelope up and substitute its own ``thread_root_id``
+    so the new message threads under the real root instead of
+    silently disappearing into a sub-thread.
+
+    Runs *after* ``_coerce_root_visibility`` — the visibility
+    decision is keyed off the agent's *intent* (a non-empty
+    ``root_id`` means "threaded reply"), so a hidden-visibility
+    reply whose ``root_id`` is auto-corrected stays hidden. This
+    helper only retargets which thread the message lands in.
+
+    On healthy data ``thread_root_id`` is always a true root
+    (its own ``thread_root_id IS NULL`` per ``message_store.py``'s
+    schema contract), so the loop terminates after at most one
+    hop. The multi-step walk + cycle break are corruption defense
+    for relay data shapes the schema shouldn't produce.
+
+    Returns ``(resolved_root_or_None, note)``. ``None`` is
+    returned only when ``root_id.strip()`` is empty. ``note`` is
+    empty unless a correction or warning happened — shape mirrors
+    ``_coerce_root_visibility``. Lookup miss / transport failure
+    falls through with the original id plus a soft warning so the
+    send still completes.
+    """
+    if not root_id.strip():
+        return None, ""
+
+    current = root_id
+    seen: set[str] = set()
+    walked = False
+    cycle = False
+
+    for _ in range(_RESOLVE_ROOT_MAX_DEPTH):
+        if current in seen:
+            cycle = True
+            break
+        seen.add(current)
+        try:
+            msg = await data_client.get_message_by_envelope(current)
+        except DataNotFound:
+            msg = None
+        except Exception as exc:
+            logger.warning(
+                "resolve_root_id: lookup transport error for %s: %s",
+                current, exc,
+            )
+            return root_id, (
+                f"\nnote: could not verify root_id {root_id} is a thread "
+                "root (lookup failed); sent as-is. If this lands in the "
+                "wrong thread, pass the metadata block's thread_root_id, "
+                "not post_id."
+            )
+        if msg is None:
+            return root_id, (
+                f"\nnote: could not verify root_id {root_id} is a thread "
+                "root (message not in local store); sent as-is. If this "
+                "lands in the wrong thread, pass the metadata block's "
+                "thread_root_id, not post_id."
+            )
+        parent_root = msg.thread_root_id
+        if parent_root is None:
+            if walked:
+                return current, (
+                    f"\nnote: root_id {root_id} was a reply, not a root — "
+                    f"auto-corrected to {current}. Pass the metadata "
+                    "block's thread_root_id, not post_id."
+                )
+            return root_id, ""
+        walked = True
+        current = parent_root
+
+    # Corruption defense: ran out of depth or hit a cycle without
+    # finding a true root. Don't auto-correct to a value we can't
+    # trust — send to the original id and warn loudly.
+    reason = (
+        "cycle detected in thread chain"
+        if cycle
+        else f"chain deeper than {_RESOLVE_ROOT_MAX_DEPTH} levels"
+    )
+    return root_id, (
+        f"\nnote: could not resolve root_id {root_id} to a true thread "
+        f"root ({reason}); sent as-is. The relay's thread chain looks "
+        "corrupt — please flag this to the operator and pass the "
+        "metadata block's thread_root_id directly."
+    )
+
+
 def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
@@ -303,6 +396,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         effective_visible, fold_note = _coerce_root_visibility(
             is_visible_to_human, root_id,
         )
+        resolved_root, root_note = await _resolve_root_id(
+            root_id, cfg.data_client,
+        )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
@@ -311,7 +407,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
-            thread_root_id=root_id if root_id else None,
+            thread_root_id=resolved_root,
             content_type="text/plain",
             content=text,
             recipients=devices,
@@ -322,6 +418,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
             f"{fold_note}"
+            f"{root_note}"
         )
 
     @mcp.tool()
@@ -799,6 +896,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         effective_visible, fold_note = _coerce_root_visibility(
             is_visible_to_human, root_id,
         )
+        resolved_root, root_note = await _resolve_root_id(
+            root_id, cfg.data_client,
+        )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
@@ -807,7 +907,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
-            thread_root_id=root_id if root_id else None,
+            thread_root_id=resolved_root,
             content_type=ATTACHMENT_CONTENT_TYPE,
             content=body_content,
             recipients=devices,
@@ -815,12 +915,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         envelope = encrypt_message(inp, signing_key)
         await cfg.http_client.post("/messages", envelope)
         names = ", ".join(t.name for t in targets)
-        thread_note = f" in thread {root_id}" if root_id else ""
+        thread_note = f" in thread {resolved_root}" if resolved_root else ""
         return (
             f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} bytes "
             f"total) to {channel}{thread_note} "
             f"(envelope_id {envelope.get('envelope_id', '?')})"
             f"{fold_note}"
+            f"{root_note}"
         )
 
     @mcp.tool()

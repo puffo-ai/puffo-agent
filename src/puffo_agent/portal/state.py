@@ -179,10 +179,12 @@ def link_host_credentials(host_home: Path, agent_home: Path) -> str:
     file means any refresh (host, any agent) updates the single file
     that everyone reads.
 
-    Prefers symlink (free read-through, survives atomic rename
-    writes); falls back to copy on Windows-without-Developer-Mode.
-    Hardlinks are intentionally skipped — claude's atomic tmp+rename
-    breaks the shared inode.
+    Prefers symlink (free read-through); falls back to copy on
+    Windows-without-Developer-Mode. Hardlinks are intentionally
+    skipped — claude's atomic tmp+rename breaks the shared inode.
+    Per PUF-217, refresh-time writes run with ``HOME=host_home``
+    so claude renames at the host path, not at the agent symlink
+    — the symlink itself is never the rename target.
 
     On macOS, ``_sync_credentials_from_keychain`` materialises the
     file from the system Keychain first.

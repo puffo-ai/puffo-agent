@@ -205,16 +205,15 @@ class LocalCLIAdapter(Adapter):
         return int(expires_ms / 1000 - time.time())
 
     async def _run_refresh_oneshot(self) -> None:
-        """Spawn ``claude --print ...`` with the per-agent HOME env.
-        Same rationale as DockerCLIAdapter: only a process exit
-        flushes the refreshed token to disk.
-        """
+        """PUF-217: spawn ``claude --print`` against the operator's
+        HOME so claude writes the refreshed token to the canonical
+        host credentials file directly; per-agent symlinks surface
+        it via ``link_host_credentials``. Pre-fix, this used
+        ``HOME=<agent_home_dir>`` and claude's atomic ``tmp+rename``
+        would replace the agent's symlink with a regular file,
+        leaving the host file stale."""
         self._verify()
-        env = {
-            **os.environ,
-            "HOME": str(self.agent_home_dir),
-            "USERPROFILE": str(self.agent_home_dir),
-        }
+        env = {**os.environ}
         # --dangerously-skip-permissions is required: in --print mode
         # claude can't surface permission prompts, so without bypass
         # it exits before the API call and no refresh happens.
