@@ -117,6 +117,67 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   startup, PUF-213 prevents staleness during runtime, this catches
   the egress leak if either misses. (PUF-214)
 
+- **OAuth-refresh probe no longer clobbers the agent's credentials
+  symlink on Linux.** On cli-local + Linux, `_run_refresh_oneshot`
+  used to override `HOME` to the agent's per-agent home dir, sending
+  Claude CLI's atomic `tmp+rename` write through the agent's
+  symlinked `.credentials.json`. The rename **replaced the symlink
+  with a regular file** at the agent path, leaving the canonical
+  host file stale. The next `_credentials_expires_in_seconds` tick
+  called `link_host_credentials`, whose copy-mode fast-path detected
+  `agent_creds.exists() and not is_symlink()` plus an mtime mismatch
+  and ran `shutil.copy2(host_creds, agent_creds)` — the **stale host
+  file overwrote the fresh-token agent file**. From the daemon's
+  perspective `expiresAt` never advanced, the adaptive-cadence floor
+  kicked in at 60s, and the refresh cycle dogpiled indefinitely.
+  Live in-band repro happened on the operator's Linux box at 18:30
+  on 2026-05-18, mid-implementation.
+
+  Fix drops the `HOME` / `USERPROFILE` override in
+  `_run_refresh_oneshot` so the refresh subprocess inherits the
+  daemon's env (the operator's HOME). Claude writes to
+  `/home/<operator>/.claude/.credentials.json` directly; the
+  per-agent symlinks distribute the fresh token via read-through.
+  The "symlink survives atomic rename writes" claim in `state.py`'s
+  `link_host_credentials` docstring is now retroactively correct
+  because rename never targets the symlink path. Long-lived
+  `ClaudeSession` agent subprocesses are unaffected —
+  `_ensure_session` still sets `HOME=<agent_home>` for normal turn
+  execution; only the short-lived refresh probe changes scope.
+
+  Operational caveat (flagged for post-deploy): dropping the HOME
+  override means the refresh subprocess now activates the
+  *operator's* `.claude.json` MCP servers (Gmail / Drive / Calendar
+  / Notion / PDF + any locally-installed) instead of the agent's.
+  Expect 2–5s of MCP startup overhead per refresh.
+  `REFRESH_ONESHOT_TIMEOUT_SECONDS = 120` so there's ample headroom,
+  but watch for `refresh one-shot rc=0 in N.Ns` log lines staying
+  under ~10s; a `--strict-mcp-config` follow-up will skip MCP
+  startup in refresh-only invocations if that becomes a problem in
+  practice.
+
+  Tests in `test_refresh_oneshot_home_env.py`:
+  `test_refresh_oneshot_inherits_operator_home` (env-mutation guard
+  — monkeypatches `asyncio.create_subprocess_exec` and asserts
+  `env["HOME"]` equals the operator's HOME, NOT the agent's
+  home_dir); `test_refresh_oneshot_write_lands_at_host_path_visible_via_agent_symlink`
+  (end-to-end-ish — fake claude subprocess does `tmp+rename` at the
+  env's HOME path, asserts agent symlink still resolves to a file
+  with the fresh `accessToken` AND
+  `_credentials_expires_in_seconds()` reads back a positive TTL);
+  `test_refresh_oneshot_does_not_create_regular_file_at_agent_path`
+  (anti-regression — agent path remains `is_symlink()` after refresh
+  + no stray `.credentials.tmp` left at the agent path; catches a
+  future refactor that reintroduces a HOME override). Full suite:
+  **600 passed / 1 skipped / 0 failed**.
+
+  Defense-in-depth context: PUF-217 closes the **disk-write side**
+  of the FB-88 refresh cascade. PUF-218 (deferred) will close the
+  disk-read side (long-lived `ClaudeSession` reloads from disk after
+  refresh). With PUF-207 (startup probe), PUF-213 (adaptive
+  cadence), and PUF-214 (egress leak suppression), the OAuth
+  lifecycle compound is fully closed on Linux. (PUF-217)
+
 ## [0.8.4] — 2026-05-17
 
 ### Added
