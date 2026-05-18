@@ -1,9 +1,12 @@
-"""PUF-206: cli.py's runtime guard against Python <3.11.
+"""PUF-206: package-init runtime guard against Python <3.11.
 
-The check lives at module-level above any submodule import. We test
-the helper function directly with a mocked ``sys.version_info`` so
-the test doesn't reload the module (which would re-fire every
-submodule import + side-effect under our test harness).
+The check lives in ``puffo_agent/__init__.py`` so it fires *before*
+any submodule of the package is parsed — that way a 3.9 user gets
+the clear message even if some downstream module ever uses
+3.11-only syntax. We test the helper function directly with a mocked
+``sys.version_info`` so the test doesn't reload the module (which
+would re-fire every submodule import + side-effect under our test
+harness).
 """
 
 from __future__ import annotations
@@ -11,13 +14,12 @@ from __future__ import annotations
 import io
 import os
 import sys
-from unittest import mock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.portal.cli import _require_python_311
+from puffo_agent import _require_python_311
 
 
 class _VersionInfo(tuple):
