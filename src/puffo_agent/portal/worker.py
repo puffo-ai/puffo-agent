@@ -321,16 +321,10 @@ def _build_puffo_core_client(
     )
 
 
-# PUF-214: patterns that identify worker-layer error strings the
-# adapter sometimes hands us as ``reply``. These never come from
-# legitimate agent prose:
-# - the "/login" slash command in the Claude CLI's auth-error line,
-# - the bracketed [puffo-agent system message] prefix in the kick
-#   text echoed back (the primer tells agents never to echo it),
-# - the verbatim Anthropic API error names.
-# Patterns are intentionally specific — "rate limit" or "Not logged
-# in" alone don't match, so an agent saying "I'm hitting a rate
-# limit, retrying" passes through.
+# PUF-214: patterns matching worker-layer error strings that
+# never appear in legitimate agent prose. Anchored to specific
+# signatures so prose mentioning rate-limit / login / authentication
+# passes through.
 _WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^\s*Not logged in[\s\S]*Please run /login",
@@ -346,11 +340,10 @@ _WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _looks_like_auth_error(reply: str) -> bool:
-    """True iff ``reply`` is a Claude CLI auth-error string or the
-    Anthropic API's ``authentication_error`` marker. Used by the
-    kick-retry suppression path to set ``runtime.health="auth_failed"``
-    so the operator's ``puffo-agent status`` view shares the same
-    signal as PUF-207's startup-paused state."""
+    """True iff ``reply`` is the Claude CLI auth-error line or
+    Anthropic's ``authentication_error`` marker. Used by the
+    kick-retry suppression to flip ``runtime.health=auth_failed``
+    alongside PUF-207's startup-paused signal."""
     if not reply:
         return False
     if re.match(
@@ -365,19 +358,10 @@ def _looks_like_auth_error(reply: str) -> bool:
 
 
 def _suppress_worker_error_leak(reply: str) -> str | None:
-    """PUF-214: filter that runs against the adapter's ``reply`` text
-    before the worker calls ``send_fallback_message``. Returns
-    ``None`` when the reply matches a worker-error pattern (so the
-    caller suppresses the channel post and surfaces to the operator
-    instead). Returns the original reply unchanged otherwise.
-
-    Pre-fix, the fallback-render path posted whatever the adapter
-    handed back — including Claude CLI's "Not logged in / Please
-    run /login" string and the bracketed kick text echoed back as a
-    fake puffo-agent system frame. Both injected user-visible strings
-    that were never authored by the agent (FB-105 family / Jhope /
-    Sheri / Yasushi case-studies).
-    """
+    """Return ``None`` when ``reply`` matches a worker-error
+    pattern, signalling the caller to suppress the channel post and
+    surface to the operator instead. Returns the reply unchanged
+    otherwise. Mirrors ``_coerce_root_visibility``'s shape."""
     if not reply:
         return reply
     for pattern in _WORKER_ERROR_LEAK_PATTERNS:
@@ -394,20 +378,13 @@ def _handle_suppressed_reply(
     scope: str,
     treat_auth_as_health: bool,
 ) -> bool:
-    """PUF-214: shared landing for a suppressed worker-error leak.
-
-    Returns ``True`` when the reply was suppressed and the caller
-    should skip its ``send_fallback_message`` call; ``False`` when
-    the reply is clean and the caller should post it normally.
-
-    On suppression: log the truncated payload, populate
-    ``runtime.error`` with a scope-tagged message so the operator
-    sees signal via ``puffo-agent status`` instead of channel
-    pollution, and (when ``treat_auth_as_health`` is True and the
-    leak looks like an auth error) flip ``runtime.health`` to
-    ``auth_failed`` so this runtime-paused signal matches the
-    startup-paused signal from PUF-207.
-    """
+    """Shared landing for a suppressed worker-error leak. Returns
+    True when the reply was suppressed and the caller should skip
+    ``send_fallback_message``; False when the reply is clean. On
+    suppression: log the truncated payload, populate
+    ``runtime.error`` with a scope-tagged message, and (if
+    ``treat_auth_as_health`` and the leak looks auth-class) flip
+    ``runtime.health="auth_failed"``."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False

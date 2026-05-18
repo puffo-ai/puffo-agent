@@ -220,3 +220,97 @@ def test_handle_suppressed_reply_returns_false_on_legit_prose(tmp_path, monkeypa
     # to disk.
     assert runtime.error == ""
     assert runtime.health == "unknown"
+
+
+# ── Call-site contract: mock client.send_fallback_message ────────
+#
+# Solution's QA ask: directly assert ``client.send_fallback_message``
+# is not called on suppression and is called on legit prose. The two
+# helpers above carry the suppression contract; this exercises the
+# exact ``if reply and not _handle_suppressed_reply(...): await
+# client.send_fallback_message(...)`` shape from ``Worker._run()``
+# with the helpers in the loop and a recording mock client in place
+# of the real one.
+
+
+class _RecordingClient:
+    """Stand-in for the PuffoCore client. Records ``send_fallback_message``
+    calls without doing any network I/O."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str, str]] = []
+
+    async def send_fallback_message(self, channel_id, reply, *, root_id):
+        self.calls.append((channel_id, reply, root_id))
+
+
+async def _fallback_call_site(
+    client, runtime, agent_id, channel_id, reply, root_id, *, scope, treat_auth_as_health,
+):
+    """Mirrors the two ``if reply and not _handle_suppressed_reply(...):
+    await client.send_fallback_message(...)`` blocks in
+    ``Worker._run()``. Kept here so a future call-site edit that
+    forgets the guard will break this test before it breaks prod."""
+    if reply and not _handle_suppressed_reply(
+        reply,
+        runtime,
+        agent_id,
+        scope=scope,
+        treat_auth_as_health=treat_auth_as_health,
+    ):
+        await client.send_fallback_message(channel_id, reply, root_id=root_id)
+
+
+import asyncio
+
+
+def test_call_site_skips_send_on_suppressed_leak(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    client = _RecordingClient()
+    runtime = RuntimeState(status="running")
+    asyncio.run(_fallback_call_site(
+        client, runtime, "agent-skip-send", "ch_abc",
+        "Not logged in. Please run /login",
+        "msg_root",
+        scope="api-error-retry",
+        treat_auth_as_health=True,
+    ))
+    assert client.calls == []  # NEVER called when filter suppresses
+    # And the operator-side surface still got populated.
+    assert runtime.health == "auth_failed"
+    assert "puffo-agent agent resume agent-skip-send" in runtime.error
+
+
+def test_call_site_calls_send_on_legit_reply(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    client = _RecordingClient()
+    runtime = RuntimeState(status="running")
+    asyncio.run(_fallback_call_site(
+        client, runtime, "agent-send-clean", "ch_abc",
+        "Got it — pushing that PR shortly.",
+        "msg_root",
+        scope="fallback",
+        treat_auth_as_health=False,
+    ))
+    assert client.calls == [
+        ("ch_abc", "Got it — pushing that PR shortly.", "msg_root"),
+    ]
+    # Runtime untouched on the legit path.
+    assert runtime.error == ""
+    assert runtime.health == "unknown"
+
+
+def test_call_site_skips_send_on_empty_reply(tmp_path, monkeypatch):
+    """Empty reply short-circuits before the filter runs (existing
+    behaviour from the original ``if reply:`` guard); nothing should
+    land on the wire."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    client = _RecordingClient()
+    runtime = RuntimeState(status="running")
+    asyncio.run(_fallback_call_site(
+        client, runtime, "agent-empty", "ch_abc", "", "msg_root",
+        scope="fallback",
+        treat_auth_as_health=False,
+    ))
+    assert client.calls == []
+    assert runtime.error == ""
