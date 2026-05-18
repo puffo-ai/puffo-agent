@@ -4,6 +4,87 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.4] — 2026-05-17
+
+### Added
+
+- **Multi-agent `export` / `import` with device migration.** An
+  operator can pack N agents on the old machine into a single
+  encrypted `.puffoagent` bundle and recover them on the new machine
+  with the *same* slug — outside observers see the same agent, the
+  same channel/space memberships, the same profile; only the
+  underlying device key rotates and the old device is auto-revoked.
+
+  Architecture is enrollment-style, not key-copy: `device_id ↔
+  device_pubkey` is 1:1, so copying keys verbatim would make the old
+  and new daemon share an identity and a `/devices/{id}/revoke` call
+  would lock out both. Instead, import preserves `root_secret_key`
+  + `identity_cert` + `slug_binding` (the root identity), generates a
+  fresh `device_signing_key` + KEM key, calls the existing
+  `/devices/enroll/init` + `/devices/enroll/{nonce}/complete` to
+  register the new device, then signs a `device_revocation` with the
+  root key and POSTs it to `/devices/{old_device_id}/revoke`.
+  Best-effort revoke: if the new device is registered but the revoke
+  call 5xx's, a `pending_revoke.json` marker is written and the
+  separate `revoke-pending` command can retry without re-running
+  import.
+
+  **No server-side changes.** Uses `/devices/subkeys` (which accepts
+  device-key direct signing via `DeviceOrSubkeyAuth`) to register a
+  temporary subkey on the old device so it can sign the enrollment
+  completion, and again on the new device for the revoke call.
+
+  **Bundle format** — `.puffoagent`: 16-byte magic
+  (`PUFFO-AGENT-V1\x00\x00`) + 16-byte scrypt salt + 12-byte AES-GCM
+  nonce + AES-256-GCM-encrypted inner zip. AEAD AAD covers
+  `magic + salt` so header tampering fails decryption. Inner zip is
+  `manifest.json` + `agents/<id>/...` per agent. Password-required at
+  both ends; wrong password fails with a clean
+  `"decryption failed"` rather than a vague tag error.
+
+  **Crash safety.** Each agent imports through
+  `agents/.import-staging/<id>/` and only `shutil.move`s onto
+  `agents/<id>/` once enrollment is committed on the server. Daemon
+  startup sweeps any leftover `.import-staging/` from a prior crash.
+  Per-agent skip if the live agent dir already exists, so re-running
+  `import` on the same bundle is idempotent.
+
+  **Sanitisation.** The export drops files that are device-bound to
+  the source machine and don't carry forward: `runtime.json`,
+  `cli_session.json`, `messages.db`, `.puffo-agent/*.flag`,
+  `.puffo-agent/current_turn.json`, `workspace/.claude/.credentials.json`.
+  `messages.db` is deliberately dropped — its records are sealed
+  under the *old* KEM key, which the new device can't decrypt;
+  history that needs to survive a migration should be preserved
+  server-side.
+
+  **CLI.**
+  - `puffo-agent agent export <id>... --dest <path>` — prompts for a
+    password twice; auto-corrects `.puffoagent` extension; refuses
+    overwrite without `--force`.
+  - `puffo-agent agent import <src>` — prompts once; prints
+    per-agent `OK / PARTIAL / SKIP / FAIL` lines plus a summary.
+  - `puffo-agent agent revoke-pending [id]` — retries one agent's
+    pending revoke, or sweeps all when called without an id.
+
+  **Bridge HTTP.**
+  - `POST /v1/agents/export` — JSON
+    `{agent_ids, password}` → `application/octet-stream` blob.
+  - `POST /v1/agents/import` — JSON
+    `{bundle_b64, password}` → JSON `ImportReport`.
+  - `POST /v1/agents/{id}/revoke-pending` — owner-gated retry.
+
+  `BRIDGE_MAX_REQUEST_BYTES` raised to 64 MiB so the bridge can
+  accept a base64-wrapped multi-agent bundle.
+
+  24 new tests across `test_export_module.py`,
+  `test_import_module.py` (3-phase flow against a mocked
+  puffo-server, enrollment-failure cleanup, revoke-failure pending
+  marker, retry happy path), and `test_bridge_export_import.py`
+  (full HTTP roundtrip: export → fresh home → import →
+  verify new `device_id` replaced old; wrong-password rejection;
+  owner-gated revoke-pending). Full suite: 576 passed, 7 skipped.
+
 ## [0.8.3] — 2026-05-15
 
 ### Fixed
