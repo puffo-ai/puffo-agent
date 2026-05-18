@@ -287,6 +287,9 @@ async def run_daemon() -> int:
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)
 
+    from .import_agents import cleanup_staging_dir
+    cleanup_staging_dir()
+
     daemon_cfg = DaemonConfig.load()
     write_daemon_pid(os.getpid())
 
