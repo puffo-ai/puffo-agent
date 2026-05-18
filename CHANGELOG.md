@@ -4,6 +4,50 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.5] — 2026-05-18
+
+### Fixed
+
+- **`mcp__puffo__send_message` (and `send_message_with_attachments`)
+  now auto-correct a non-root `root_id`.** When an agent passed the
+  envelope id of a *reply* (rather than the thread's true root) as
+  `root_id`, the message used to encrypt with that reply id as
+  `thread_root_id` and land in a sub-thread that human clients don't
+  surface — no failure signal returned to the agent. We hit this
+  twice live on 2026-05-18 (clone-report `msg_38364760` and
+  build-test-report `msg_9e8f1a83`, both threaded under root
+  `msg_610fec10`), and both messages vanished from the operator's
+  view.
+
+  New helper `_resolve_root_id(root_id, data_client)` runs alongside
+  `_coerce_root_visibility`: it looks the supplied envelope up in the
+  local message store and substitutes its own `thread_root_id`
+  before encrypting, then appends a correction note to the tool
+  response so the agent learns the rule from the result on the spot
+  rather than depending on the primer being current.
+
+  Failure-mode contract: lookup miss / transport error / `DataNotFound`
+  fall through with the original id plus a soft warning — the send
+  still completes (better to land in the wrong thread than drop the
+  message). Cycle in the chain or chain deeper than 4 levels is
+  treated as corrupt data: the helper preserves the original `root_id`
+  and surfaces a loud "could not resolve to a true root" warning
+  instead of auto-correcting to a value it can't trust.
+
+  Walk is capped at 4 levels with cycle detection — on healthy data
+  the walk terminates in one hop (per `message_store.py`'s schema,
+  `thread_root_id` always points at a true root); the multi-hop walk
+  is corruption defense for relay data shapes that shouldn't exist.
+
+  Tests in `test_puffo_core_tools.py`: 8 unit tests on `_resolve_root_id`
+  (empty/whitespace, true root unchanged, single-level + depth-2 walk,
+  lookup miss, transport error, real `DataNotFound`, cycle + depth-cap
+  preservation), plus 5 integration tests on `send_message` /
+  `send_message_with_attachments` — including the two real
+  2026-05-18 live-failure envelope IDs as parametrised cases for a
+  date-stamped regression anchor. Full suite: **596 passed / 1
+  skipped / 0 failed**. (PUF-200)
+
 ## [0.8.4] — 2026-05-17
 
 ### Added
