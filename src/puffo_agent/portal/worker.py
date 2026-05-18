@@ -41,15 +41,7 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
-# Poll rate for the adapter's OAuth refresh check. The adapter
-# decides per-tick whether to actually probe based on credentials
-# mtime; this is just the upper bound on staleness.
 CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60
-
-# PUF-213: floor on the adaptive refresh-tick interval. When the
-# adapter reports the access token is already inside (or past) the
-# refresh window, we still bound the retry loop to once a minute so
-# a sustained refresh failure doesn't hammer ``_REFRESH_LOCK``.
 CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60
 
 
@@ -60,36 +52,11 @@ def _next_refresh_tick(
     threshold: int | None = None,
     floor: int = CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS,
 ) -> int:
-    """PUF-213: compute the next refresh tick adaptively.
-
-    ``refresh_ping`` only does work when the access token is within
-    ``CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS`` of expiry. The pre-
-    fix worker loop slept a fixed 10 minutes between ticks, so a
-    token whose refresh window fell entirely inside one 10-min sleep
-    could expire without ever being refreshed (FB-88 path #7 / #8).
-
-    This helper scales the next sleep to the token's TTL:
-    - ``None`` (sdk / chat-only adapter without a credentials file)
-      → fall back to ``default_tick`` — there's nothing to refresh,
-      so the loop is effectively a health heartbeat.
-    - TTL far in the future → ``default_tick``.
-    - TTL inside the refresh window → ``floor`` (60s by default).
-      Inside the window every tick triggers an actual refresh, so
-      we don't want to sleep long, but we also don't want to
-      dogpile if the refresh itself is failing.
-    - TTL between window and ``default_tick + threshold`` → wake up
-      ``threshold`` seconds before expiry so the next tick lands
-      inside the refresh window and the proactive refresh fires
-      with margin.
-    - Negative TTL (already expired) → ``floor``; we'll retry the
-      refresh on the next tick, bounded.
-
-    Returns an int number of seconds suitable for
-    ``asyncio.wait_for(stop.wait(), timeout=...)``.
-    """
+    """PUF-213: adaptive refresh sleep — bounded retry inside the
+    refresh window, wakes ``threshold`` seconds before expiry
+    otherwise; ``None`` TTL falls back to ``default_tick``."""
     if threshold is None:
-        # Imported lazily so this helper stays unit-testable without
-        # pulling in the adapter package.
+        # Lazy import keeps this helper unit-testable.
         from ..agent.adapters.base import (
             CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS as _DEFAULT_THRESHOLD,
         )
