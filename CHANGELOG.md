@@ -46,6 +46,24 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   code 1 + version-in-message + presence of at least one of
   `pyenv` / `brew` / `python.org` upgrade hints. (PUF-206)
 
+- **PUF-217 test fixture: `os.rename` → `os.replace` + symlink-skip
+  guard for Windows.** The PUF-217 test fixture's fake-claude
+  subprocess used `os.rename(tmp_target, target)` to mimic Claude
+  CLI's atomic tmp+rename. On POSIX `os.rename` atomically replaces
+  an existing target, but on Windows it raises `FileExistsError`;
+  the cross-platform atomic-replace primitive is `os.replace`. Two
+  `os.rename` call sites in `test_refresh_oneshot_home_env.py`
+  swapped to `os.replace`. Additionally, the two tests that assert
+  on `agent_creds.is_symlink()` now gate on
+  `_symlinks_available(tmp_path)` and `pytest.skip` when the host
+  can't create symlinks — mirrors the existing pattern in
+  `test_host_credentials.py` (Windows without Developer Mode falls
+  through `link_host_credentials`'s copy-mode branch, so the
+  symlink-distribution invariant these tests assert on doesn't
+  apply there). Linux CI continues to exercise the full assertions;
+  Windows now skips cleanly instead of failing. Full suite:
+  **642 passed / 9 skipped / 0 failed**.
+
 ## [0.8.5] — 2026-05-18
 
 ### Fixed
