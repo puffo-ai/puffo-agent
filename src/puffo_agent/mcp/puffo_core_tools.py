@@ -188,8 +188,21 @@ async def _resolve_root_id(
     so the new message threads under the real root instead of
     silently disappearing into a sub-thread.
 
-    Returns ``(resolved_root_or_None, note)``. ``note`` is empty
-    unless a correction or warning happened — shape mirrors
+    Runs *after* ``_coerce_root_visibility`` — the visibility
+    decision is keyed off the agent's *intent* (a non-empty
+    ``root_id`` means "threaded reply"), so a hidden-visibility
+    reply whose ``root_id`` is auto-corrected stays hidden. This
+    helper only retargets which thread the message lands in.
+
+    On healthy data ``thread_root_id`` is always a true root
+    (its own ``thread_root_id IS NULL`` per ``message_store.py``'s
+    schema contract), so the loop terminates after at most one
+    hop. The multi-step walk + cycle break are corruption defense
+    for relay data shapes the schema shouldn't produce.
+
+    Returns ``(resolved_root_or_None, note)``. ``None`` is
+    returned only when ``root_id.strip()`` is empty. ``note`` is
+    empty unless a correction or warning happened — shape mirrors
     ``_coerce_root_visibility``. Lookup miss / transport failure
     falls through with the original id plus a soft warning so the
     send still completes.
@@ -200,9 +213,11 @@ async def _resolve_root_id(
     current = root_id
     seen: set[str] = set()
     walked = False
+    cycle = False
 
     for _ in range(_RESOLVE_ROOT_MAX_DEPTH):
         if current in seen:
+            cycle = True
             break
         seen.add(current)
         try:
@@ -239,11 +254,19 @@ async def _resolve_root_id(
         walked = True
         current = parent_root
 
-    return current, (
-        f"\nnote: root_id {root_id} was a reply, not a root — "
-        f"auto-corrected to {current} after walking "
-        f"{_RESOLVE_ROOT_MAX_DEPTH} levels. Pass the metadata block's "
-        "thread_root_id, not post_id."
+    # Corruption defense: ran out of depth or hit a cycle without
+    # finding a true root. Don't auto-correct to a value we can't
+    # trust — send to the original id and warn loudly.
+    reason = (
+        "cycle detected in thread chain"
+        if cycle
+        else f"chain deeper than {_RESOLVE_ROOT_MAX_DEPTH} levels"
+    )
+    return root_id, (
+        f"\nnote: could not resolve root_id {root_id} to a true thread "
+        f"root ({reason}); sent as-is. The relay's thread chain looks "
+        "corrupt — please flag this to the operator and pass the "
+        "metadata block's thread_root_id directly."
     )
 
 
@@ -892,8 +915,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         envelope = encrypt_message(inp, signing_key)
         await cfg.http_client.post("/messages", envelope)
         names = ", ".join(t.name for t in targets)
-        thread_display = resolved_root if resolved_root else root_id
-        thread_note = f" in thread {thread_display}" if thread_display else ""
+        thread_note = f" in thread {resolved_root}" if resolved_root else ""
         return (
             f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} bytes "
             f"total) to {channel}{thread_note} "

@@ -856,20 +856,35 @@ async def test_resolve_root_id_data_not_found_treated_as_lookup_miss():
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_caps_walk_on_cycle():
-    """Defensive: if the data is corrupt and a chain loops back on
-    itself, the walk terminates and surfaces what it found rather
-    than hanging."""
+async def test_resolve_root_id_cycle_preserves_root_id_with_warning():
+    """Cycle is corrupt data — don't auto-correct to a node we
+    can't trust. Preserve the original ``root_id`` and surface a
+    loud warning so the operator can investigate."""
     dc = _FakeDataClient()
-    # Cycle: A → B → A → ...
     dc.add("msg_a", thread_root_id="msg_b")
     dc.add("msg_b", thread_root_id="msg_a")
     resolved, note = await _resolve_root_id("msg_a", dc)
-    # Resolved to whichever node the walk landed on when it detected
-    # the cycle / hit the depth cap — either is acceptable, but the
-    # call must complete and return a correction note.
-    assert resolved in ("msg_a", "msg_b")
-    assert "auto-corrected" in note
+    assert resolved == "msg_a"
+    assert "could not resolve" in note
+    assert "cycle detected" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_depth_cap_preserves_root_id_with_warning():
+    """Same corruption-defense path for a chain deeper than the
+    cap — preserve ``root_id``, warn loudly, don't auto-correct."""
+    dc = _FakeDataClient()
+    # Chain deeper than _RESOLVE_ROOT_MAX_DEPTH (4): leaf → l4 → l3 → l2 → l1 → root
+    dc.add("msg_leaf", thread_root_id="msg_l4")
+    dc.add("msg_l4", thread_root_id="msg_l3")
+    dc.add("msg_l3", thread_root_id="msg_l2")
+    dc.add("msg_l2", thread_root_id="msg_l1")
+    dc.add("msg_l1", thread_root_id="msg_root")
+    dc.add("msg_root", thread_root_id=None)
+    resolved, note = await _resolve_root_id("msg_leaf", dc)
+    assert resolved == "msg_leaf"
+    assert "could not resolve" in note
+    assert "deeper than" in note
 
 
 def _spy_encrypt_input(monkeypatch):
