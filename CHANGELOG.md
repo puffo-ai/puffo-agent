@@ -48,6 +48,75 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   date-stamped regression anchor. Full suite: **596 passed / 1
   skipped / 0 failed**. (PUF-200)
 
+- **Worker-layer error-string leaks no longer reach the channel.**
+  Pre-fix, when Claude CLI's OAuth died mid-session (FB-159 Sheri /
+  Yasushi class) or the Anthropic API returned an authentication /
+  rate-limit / quota error (FB-105 class), the worker fed the raw
+  error string straight into `client.send_fallback_message(...)` —
+  operators saw their personal/family DMs polluted with
+  `Not logged in. Please run /login` and
+  `[puffo-agent system message] session errored on rate limiting…`,
+  and the agent retried each new message every few seconds because
+  no upstream layer recognised the state.
+
+  Two-part fix at the worker egress boundary:
+
+  *Pattern-based suppression* — anchored regexes match only the
+  worker-emitted error signatures (legitimate agent prose mentioning
+  "rate limit" / "login" / "authentication" passes through unchanged).
+  Sources: [Claude Code error reference](https://code.claude.com/docs/en/errors)
+  message-to-recovery table + [Claude API errors](https://platform.claude.com/docs/en/api/errors)
+  canonical `<type>_error` identifiers. 12 patterns ship: usage-limit
+  variants (`You've hit your <session|weekly|Opus> limit`,
+  `Credit balance is too low`), CLI-wrapped server errors
+  (`API Error: Request rejected (429)`,
+  `API Error: Server is temporarily limiting requests`,
+  `API Error: Repeated 529 Overloaded errors`,
+  `API Error: 500 ... Internal server error`), OAuth recovery class
+  (`OAuth token revoked|has expired`, `Invalid API key`,
+  `This organization has been disabled`), and the safe subset of API
+  identifiers (`authentication_error`, `rate_limit_error`,
+  `overloaded_error`, `billing_error`, `permission_error`,
+  `timeout_error`, plus the kick-text echo signature). Identifiers
+  with high false-positive risk against legitimate prose
+  (`invalid_request_error`, `not_found_error`, `api_error`, and
+  generic phrases like `Prompt is too long`, `Request timed out`,
+  `Unable to connect to API`) are deliberately excluded per
+  doc-driven audit.
+
+  *Randomised backoff after suppression* — `_handle_suppressed_reply`
+  returns `(suppressed, backoff_seconds)`. Both `Worker._run` call
+  sites (`on_message_batch` and `on_api_error_retry`) unpack the
+  tuple and `await asyncio.sleep(backoff)` on suppression instead of
+  immediately re-entering the loop. Backoff is `random.uniform(15.0,
+  60.0)` — drops the steady-state leak frequency ~30× without
+  grounding the agent (auto-pause was considered and rejected — too
+  high a recall-risk for a single leak). Module-level
+  `_SUPPRESSION_BACKOFF_MIN/MAX_SECONDS` constants let tests pin
+  against the same values.
+
+  Auth-class leaks (the 5 patterns in `_AUTH_ERROR_PATTERNS`,
+  including the new OAuth-token-revoked / Invalid-API-key /
+  disabled-org additions) also flip `runtime.health=auth_failed`
+  symmetrically across both scopes, surfacing on `puffo-agent
+  status` and in the bridge UI without polluting the channel.
+  Non-auth leaks get a "usually self-recovers — investigate the
+  daemon log if persistent" message instead of misdirecting the
+  operator to `claude /login`.
+
+  Tests in `test_worker_error_suppress.py`: 46 total, including
+  parametrized positive matches for all 12 patterns + auth-class
+  classification, parametrized skip-list negatives that pin the
+  high-FP exclusions, backoff distribution at 100 samples (range +
+  non-degenerate-random guard), and a real-`asyncio.sleep`-monkeypatch
+  call-site test that exercises the production shape end-to-end.
+  Full suite: **628 passed / 1 skipped / 0 failed**.
+
+  Defense-in-depth context: pairs with PUF-207 (startup OAuth verify)
+  and PUF-213 (adaptive credential refresh) — PUF-207 catches at
+  startup, PUF-213 prevents staleness during runtime, this catches
+  the egress leak if either misses. (PUF-214)
+
 ## [0.8.4] — 2026-05-17
 
 ### Added
