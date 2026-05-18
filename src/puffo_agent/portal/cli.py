@@ -11,18 +11,9 @@ import sys
 
 
 def _require_python_311() -> None:
-    """Bail with a clear, actionable message on Python <3.11.
-
-    ``pyproject.toml`` already pins ``requires-python = ">=3.11"`` so
-    pip refuses the install on 3.10 — but users hit this anyway when
-    the package landed in a venv they later run from the wrong
-    interpreter, or via a packaging tool that bypasses pip's
-    metadata check. Without this gate the next submodule import can
-    raise ``SyntaxError`` / ``ImportError`` deep in the call chain,
-    which users mis-attribute to "my Python is broken" (Shiva,
-    FB-149). Runs before any submodule import so the failure surfaces
-    as a clear version error, not something else.
-    """
+    """Bail with a clear, actionable message on Python <3.11. Runs
+    at module load so submodule imports never get a chance to raise
+    a downstream SyntaxError/ImportError that users mis-attribute."""
     if sys.version_info < (3, 11):
         v = sys.version_info
         sys.stderr.write(
