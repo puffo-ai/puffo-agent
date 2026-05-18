@@ -64,6 +64,58 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   Windows now skips cleanly instead of failing. Full suite:
   **642 passed / 9 skipped / 0 failed**.
 
+### Added
+
+- **Agent startup auto-pauses when the OAuth probe says "auth is
+  dead."** When a cli-local agent's persisted session re-spawned
+  with an expired or revoked OAuth token, `Worker._run()` used to
+  proceed straight into `warm()` and the first turn — at which
+  point Claude CLI emitted `Not logged in. Please run /login` and
+  that string leaked into the channel as if it were the agent's
+  reply (FB-159 / Sheri / Yasushi mis-attributed as "my Python is
+  broken"). The startup path had no signal at all that auth was
+  broken before the first message hit production.
+
+  Now `Worker._run()` fires `adapter.refresh_ping()` between init
+  and `warm()`. The new `_check_startup_auth_or_pause()` helper
+  reads `adapter.auth_healthy` afterwards:
+  - `None` (sdk / chat-only adapters — no credential file) or
+    `True` (probe succeeded) → proceed unchanged.
+  - `False` (probe reported auth failure) → mutate the runtime to
+    `status=paused, health=auth_failed`, populate `runtime.error`
+    with a four-step recovery prompt (open a separate Terminal,
+    not from within an agent's own shell, run `claude /login`,
+    then `puffo-agent agent resume <id>`; mentions the venv full-
+    path caveat), persist, and bail before `warm()` ever spawns
+    the doomed claude subprocess. `self._warm_done.set()` is
+    still called on the early-return path so any caller awaiting
+    `wait_for_warm()` doesn't hang.
+
+  Not sticky: the existing periodic refresh tick at
+  `worker.py:737-748` can flip `runtime.health` back to `ok` if
+  the operator re-authenticates and the next probe succeeds. The
+  operator still needs to manually `puffo-agent agent resume <id>`
+  (auto-resume would risk a tight pause/resume loop if auth
+  flaps); the message in `runtime.error` is the recovery script.
+
+  Defense-in-depth triad with PUF-213 (adaptive refresh tick
+  prevents staleness during runtime) and PUF-214 (worker-layer
+  error-string leak suppression if either misses) — together they
+  close the silent-can't-recover surface for the FB-159 / FB-105
+  class.
+
+  Tests in `test_worker_startup_auth.py` (7 cases): the helper
+  matrix (`auth_healthy=False` pauses with the full recovery
+  prompt incl. agent id ≥2 occurrences; `None` / `True` proceed;
+  persistence to disk; not-sticky on probe-success), plus two
+  call-site tests using a `_startup_call_site` helper that
+  mirrors the exact pause-or-warm-then-set production block from
+  `Worker._run()` — asserts `warm_done.is_set()` on BOTH the
+  pause early-return path AND the proceed-then-warm path, catching
+  any future refactor that drops the `self._warm_done.set()` line
+  before the early return. Same call-site-mirroring pattern as
+  PUF-214's `_fallback_call_site` helper. (PUF-207)
+
 ## [0.8.5] — 2026-05-18
 
 ### Fixed
