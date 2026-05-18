@@ -180,6 +180,7 @@ def build_server(
     data_service_url: str,
     runtime_kind: str = "",
     harness: str = "",
+    known_agent_slugs: set[str] | None = None,
 ) -> FastMCP:
     ks = KeyStore(keystore_dir)
     http = PuffoCoreHttpClient(server_url, ks, slug)
@@ -196,6 +197,7 @@ def build_server(
         data_client=data,
         space_id=space_id,
         workspace=workspace,
+        known_agent_slugs=known_agent_slugs or set(),
     )
 
     mcp = FastMCP("puffo-core")
@@ -204,7 +206,7 @@ def build_server(
     return mcp
 
 
-def _cfg_from_env() -> dict[str, str]:
+def _cfg_from_env() -> dict[str, object]:
     required = {
         "slug": os.environ.get("PUFFO_CORE_SLUG", ""),
         "device_id": os.environ.get("PUFFO_CORE_DEVICE_ID", ""),
@@ -224,6 +226,12 @@ def _cfg_from_env() -> dict[str, str]:
     data_service_url = os.environ.get(
         "PUFFO_DATA_SERVICE_URL", "http://127.0.0.1:63386",
     )
+    # PUF-202: comma-separated peer-agent slugs the operator has
+    # opted into for invisibility. Empty / unset → empty set →
+    # every @-mention coerces. Worker writes this ENV var from
+    # daemon.yml / agent.yml at spawn time.
+    raw_peers = os.environ.get("PUFFO_KNOWN_AGENT_SLUGS", "")
+    known_agent_slugs = {s.strip().lower() for s in raw_peers.split(",") if s.strip()}
     return {
         **required,
         "space_id": os.environ.get("PUFFO_CORE_SPACE_ID", ""),
@@ -233,6 +241,7 @@ def _cfg_from_env() -> dict[str, str]:
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
+        "known_agent_slugs": known_agent_slugs,
     }
 
 

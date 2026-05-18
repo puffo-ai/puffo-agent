@@ -86,6 +86,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
+                known_agent_slugs=set(daemon_cfg.known_agent_slugs),
             )
         return adapter
 
@@ -154,6 +155,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 data_service_url="http://host.docker.internal:63386",
                 runtime_kind="cli-docker",
                 harness=agent_cfg.runtime.harness,
+                known_agent_slugs=set(daemon_cfg.known_agent_slugs),
             )
         return adapter
 
@@ -187,6 +189,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
+                known_agent_slugs=set(daemon_cfg.known_agent_slugs),
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
             )

@@ -721,6 +721,14 @@ class DaemonConfig:
     # with a verbose primer.
     max_inline_message_chars: int = 4000
     segment_chars: int = 2000
+    # PUF-202: peer-agent slugs the operator opts into for the
+    # agent-to-agent invisibility rule. When an agent sends with
+    # ``is_visible_to_human=false`` and the body contains
+    # ``@<slug>``, that slug is checked against this list; any miss
+    # coerces the message back to visible (the FB-130 medical-harm
+    # bias — better to over-coerce a peer than miss a human). Empty
+    # default → every @-mention coerces.
+    known_agent_slugs: list[str] = field(default_factory=list)
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -744,6 +752,11 @@ class DaemonConfig:
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
             max_inline_message_chars=int(raw.get("max_inline_message_chars", 4000)),
             segment_chars=int(raw.get("segment_chars", 2000)),
+            known_agent_slugs=[
+                str(s).strip().lower()
+                for s in (raw.get("known_agent_slugs") or [])
+                if str(s).strip()
+            ],
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
@@ -781,6 +794,7 @@ class DaemonConfig:
             "docker_memory_reservation": self.docker_memory_reservation,
             "max_inline_message_chars": self.max_inline_message_chars,
             "segment_chars": self.segment_chars,
+            "known_agent_slugs": list(self.known_agent_slugs),
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),

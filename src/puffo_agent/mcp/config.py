@@ -140,6 +140,7 @@ def puffo_core_mcp_env(
     data_service_url: str = "http://127.0.0.1:63386",
     runtime_kind: str = "",
     harness: str = "",
+    known_agent_slugs: set[str] | None = None,
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess.
 
@@ -148,6 +149,11 @@ def puffo_core_mcp_env(
     ``http://host.docker.internal:63386`` so the container can
     reach the host loopback. The MCP never opens ``messages.db``
     directly — the daemon is the sole owner.
+
+    ``known_agent_slugs`` (PUF-202) carries the operator's trusted
+    peer-agent slugs; an empty set means every @-mention coerces
+    visibility back to true. Wire-shape is comma-separated for the
+    ENV.
     """
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
@@ -171,6 +177,8 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
+    if known_agent_slugs:
+        env["PUFFO_KNOWN_AGENT_SLUGS"] = ",".join(sorted(known_agent_slugs))
     return env
 
 
@@ -184,6 +192,7 @@ def puffo_core_stdio_sdk_config(
     keystore_dir: str,
     workspace: str,
     agent_id: str,
+    known_agent_slugs: set[str] | None = None,
 ) -> dict:
     """Return the ``mcp_servers`` config dict for the SDK adapter."""
     return {
@@ -200,6 +209,7 @@ def puffo_core_stdio_sdk_config(
                 workspace=workspace,
                 agent_id=agent_id,
                 runtime_kind="sdk-local",
+                known_agent_slugs=known_agent_slugs,
             ),
         }
     }

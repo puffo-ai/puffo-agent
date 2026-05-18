@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -111,6 +112,15 @@ class PuffoCoreToolsConfig:
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,
     # no absolutes).
     workspace: Optional[str] = None
+    # PUF-202: peer-agent slugs the daemon trusts as agents (per
+    # daemon.yml / agent.yml). The send-time visibility coercion
+    # at ``_coerce_root_visibility`` reads this set; any @-mention
+    # whose slug isn't here gets flagged as "probably a human" and
+    # coerces ``is_visible_to_human=false`` back to true. Cache is
+    # written into the module-level ``_KNOWN_AGENT_SLUGS`` at
+    # ``register_core_tools`` time so tests and the production path
+    # share the same source of truth.
+    known_agent_slugs: set[str] = field(default_factory=set)
 
 
 async def _fetch_device_keys(
@@ -155,29 +165,98 @@ async def _fetch_device_keys(
     return devices
 
 
-def _coerce_root_visibility(
-    is_visible_to_human: bool, root_id: str,
-) -> tuple[bool, str]:
-    """Root-level (non-threaded) messages can't fold in the human UI —
-    only threaded replies do. When an agent marks a root-level message
-    ``is_visible_to_human=false`` we coerce it back to visible (so the
-    message still goes out) and return a note to splice into the tool
-    response. The agent learns from the tool result on the spot,
-    rather than depending on the primer being current.
+# PUF-202: matches ``@<slug>`` tokens in a message body. Puffo slugs
+# are lowercase alphanumeric + hyphen, length >= 2 (e.g.
+# ``equation-7256-87f7``). The regex allows the @ to follow any
+# non-alphanumeric character — opening paren, leading-quote ``>``,
+# bullet ``-``, em-dash, etc. — so ``(@slug)``, ``> @slug ...``, and
+# ``- @slug`` all match. Slugs are extracted lowercased so a user
+# typing ``@Equation-7256-87f7`` matches the canonical form in the
+# known-agents cache.
+_AT_MENTION_RE = re.compile(r"(?:(?<=^)|(?<=[^A-Za-z0-9_]))@([a-z0-9][a-z0-9-]+)", re.IGNORECASE)
 
-    Returns ``(effective_visibility, note)`` — ``note`` is empty
-    unless a coercion happened.
+# PUF-202: module-level cache of slugs the operator has confirmed are
+# agents. Look-ups happen during ``_coerce_root_visibility``; misses
+# bias toward coercing-to-visible (the "right floor" per FB-130
+# recurrence rate: miss a human is worse than over-coerce a bot).
+#
+# Cache is empty by default — Tuesday's ship-day floor is "every
+# @-mention coerces visible." A follow-up PUF will populate this
+# from the cert-sync ``identity_type`` channel once that endpoint
+# carries the field.
+_KNOWN_AGENT_SLUGS: set[str] = set()
+
+
+def _set_known_agent_slugs(slugs: set[str]) -> None:
+    """Replace the module-level known-agents cache. Used by the
+    test suite and, eventually, by the worker on startup once a
+    runtime population path lands. Slugs are normalized to lowercase
+    so callers don't have to."""
+    _KNOWN_AGENT_SLUGS.clear()
+    _KNOWN_AGENT_SLUGS.update(s.strip().lower() for s in slugs if s.strip())
+
+
+def _extract_at_mentioned_slugs(body: str) -> list[str]:
+    """Return every ``@<slug>`` token from ``body`` (lowercased,
+    insertion order, duplicates preserved). Empty when the body has
+    no mentions or is empty/None-ish."""
+    if not body:
+        return []
+    return [m.group(1).lower() for m in _AT_MENTION_RE.finditer(body)]
+
+
+def _coerce_root_visibility(
+    is_visible_to_human: bool, root_id: str, body: str = "",
+) -> tuple[bool, str]:
+    """Coerce ``is_visible_to_human=false`` to true in two cases:
+
+    1. **Root-level** sends (no ``root_id``): folding only applies
+       to threaded replies; on a root post ``false`` is meaningless
+       and the message would be sent visible anyway.
+    2. **PUF-202** — body @-mentions a slug the local known-agents
+       cache hasn't tagged as another agent. Without this, an agent
+       posting ``@<human-slug> please do X`` with ``false`` would
+       fold the message and the human would never see instructions
+       explicitly addressed to them (the FB-130 family bug;
+       Sam/Sean/Tang Yan/Maoyi-Motrin case-studies).
+
+    Returns ``(effective_visibility, note)``. ``note`` is empty
+    when no coercion happened.
     """
-    if is_visible_to_human is False and not root_id.strip():
+    if is_visible_to_human is not False:
+        return is_visible_to_human, ""
+
+    if not root_id.strip():
         return True, (
             "\nnote: is_visible_to_human=false ignored — root-level "
             "messages can't fold; sent as visible. Use false only on "
             "threaded replies (pass root_id)."
         )
-    return is_visible_to_human, ""
+
+    mentioned = _extract_at_mentioned_slugs(body)
+    unknown = [s for s in mentioned if s not in _KNOWN_AGENT_SLUGS]
+    if unknown:
+        first = unknown[0]
+        return True, (
+            f"\nnote: is_visible_to_human=false coerced to true — "
+            f"body @-mentions {first}, not in the local known-agents "
+            "cache. If "
+            f"{first} is an agent your local cache hasn't seen yet, "
+            "subsequent sends should fold normally."
+        )
+
+    return False, ""
 
 
 def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
+
+    # PUF-202: prime the module-level known-agents cache from the
+    # config supplied by the worker/daemon. The cache is shared
+    # across registered tools and the visibility-coercion helper;
+    # writing it here keeps the production path (worker injects
+    # daemon-config seed list at startup) and the test path
+    # (``_set_known_agent_slugs`` directly) on the same wire.
+    _set_known_agent_slugs(cfg.known_agent_slugs)
 
     @mcp.tool()
     async def whoami() -> str:
@@ -301,7 +380,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
 
         effective_visible, fold_note = _coerce_root_visibility(
-            is_visible_to_human, root_id,
+            is_visible_to_human, root_id, body=text,
         )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
@@ -797,7 +876,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             "attachments": [m.to_dict() for m in attachment_metas],
         }
         effective_visible, fold_note = _coerce_root_visibility(
-            is_visible_to_human, root_id,
+            is_visible_to_human, root_id, body=caption,
         )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
