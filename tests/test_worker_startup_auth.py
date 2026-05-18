@@ -9,6 +9,7 @@ True → proceed unchanged.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -117,3 +118,83 @@ def test_check_startup_auth_not_sticky(tmp_path, monkeypatch):
     reloaded = RuntimeState.load("test-agent-004")
     assert reloaded is not None
     assert reloaded.health == "ok"
+
+
+# ── Call-site contract: pause path must set warm_done before return ──
+#
+# Reviewer ask: a future refactor that drops the `self._warm_done.set()`
+# line on the pause branch would hang any caller awaiting
+# `wait_for_warm()`. Mirror the exact production shape from `Worker._run()`
+# so a regression there breaks this test before it breaks prod — same
+# pattern that landed in PUF-214's `_fallback_call_site` helper.
+
+
+async def _startup_call_site(
+    adapter, runtime, agent_id, warm_done, *, warm_called,
+):
+    """Mirrors the production block in ``Worker._run()``:
+
+        if not _check_startup_auth_or_pause(self._adapter, ...):
+            self._warm_done.set()
+            return
+        await self._adapter.warm(...)  # normal path
+        ...
+        finally:
+            self._warm_done.set()
+
+    Returns ``"paused"`` if the gate auto-paused, ``"warmed"`` if it
+    proceeded. ``warm_called`` is mutated in-place when warm() would
+    have fired."""
+    if not _check_startup_auth_or_pause(adapter, runtime, agent_id):
+        warm_done.set()
+        return "paused"
+    # Normal warm path — finally-block guarantees the gate releases.
+    try:
+        warm_called.append(True)
+    finally:
+        warm_done.set()
+    return "warmed"
+
+
+def test_call_site_releases_warm_gate_on_pause(tmp_path, monkeypatch):
+    """Load-bearing: pause-path MUST set warm_done so wait_for_warm()
+    callers don't hang. Catches a future refactor that drops the
+    `self._warm_done.set()` line before the early return."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    runtime = RuntimeState(status="running")
+    adapter = _FakeAdapter(auth_healthy=False)
+    warm_done = asyncio.Event()
+    warm_called: list[bool] = []
+
+    result = asyncio.run(_startup_call_site(
+        adapter, runtime, "agent-pause-warm", warm_done,
+        warm_called=warm_called,
+    ))
+
+    assert result == "paused"
+    # Warm gate released even though warm() never ran — that's the
+    # whole point of the early-return + set pattern.
+    assert warm_done.is_set() is True
+    assert warm_called == []  # warm() did NOT fire on pause path
+    # And the operator-side surface still got populated.
+    assert runtime.status == "paused"
+
+
+def test_call_site_releases_warm_gate_on_proceed(tmp_path, monkeypatch):
+    """Sanity: when the gate lets the agent proceed, warm() fires
+    and the gate still releases (via the finally block)."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    runtime = RuntimeState(status="running")
+    adapter = _FakeAdapter(auth_healthy=True)
+    warm_done = asyncio.Event()
+    warm_called: list[bool] = []
+
+    result = asyncio.run(_startup_call_site(
+        adapter, runtime, "agent-proceed-warm", warm_done,
+        warm_called=warm_called,
+    ))
+
+    assert result == "warmed"
+    assert warm_done.is_set() is True
+    assert warm_called == [True]
+    assert runtime.status == "running"
