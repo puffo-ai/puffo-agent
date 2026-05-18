@@ -64,6 +64,60 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   Windows now skips cleanly instead of failing. Full suite:
   **642 passed / 9 skipped / 0 failed**.
 
+- **`credential_refresh` worker loop now scales its sleep to the
+  token's TTL instead of a fixed 10-minute tick.** Pre-fix, the
+  worker slept a flat `CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60`
+  between probes. When a Claude CLI / Anthropic OAuth access token's
+  remaining lifetime was short enough that its refresh window —
+  `CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS = 5 * 60` from
+  `base.Adapter` — fell entirely inside one tick interval, the loop
+  could skip the refresh entirely. Token expired, next turn 401'd,
+  the FB-88 silent-can't-recover surface. The classic case: probe
+  at T sees TTL=600s → "above 300s threshold, skip"; next tick at
+  T+600 sees TTL=0 — refresh window was T+300 → T+600, fully
+  swallowed.
+
+  New `_next_refresh_tick(expires_in)` helper in `worker.py`
+  computes the next sleep adaptively:
+  - `None` TTL (sdk / chat-only adapters without a credentials
+    file) → fall back to `default_tick = 10 min` — the loop is a
+    pure health heartbeat in this mode.
+  - TTL far in the future → `default_tick` (capped — above the
+    refresh window the loop is just a slow heartbeat).
+  - TTL just above the window → wake `threshold` seconds before
+    expiry so the next tick lands inside the refresh window with
+    margin. Concretely: TTL=600s, threshold=300s → next tick =
+    600 - 300 = 300s, so the helper wakes at TTL=300s right at
+    the threshold — refresh fires.
+  - TTL inside the window OR negative (already expired) → clamp
+    to `CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60` so a
+    sustained refresh failure doesn't dogpile `_REFRESH_LOCK`,
+    but we still tick fast enough to retry promptly.
+
+  The helper is a pure function with module-constant defaults —
+  production call site is just `_next_refresh_tick(expires_in)`;
+  tests override `default_tick` / `threshold` / `floor` to pin
+  synthetic values that decouple them from production-constant
+  drift. The `try / except Exception → None` wrap around
+  `self._adapter._credentials_expires_in_seconds()` at the call
+  site gracefully degrades to `default_tick` if an adapter hook
+  ever throws.
+
+  8 new tests in `test_credential_refresh_policy.py`: None /
+  far-future / just-above-window (returns pre-window margin) /
+  at-window (clamps to floor) / below-window (clamps to floor) /
+  already-expired (clamps to floor) / default-cap on long horizon
+  / parametric custom-thresholds. Adapter-level integration
+  (entire `credential_refresh` loop end-to-end against a real
+  clock) deferred to a 5+ day soak as the PR description notes.
+
+  Defense-in-depth triad with PUF-207 (startup OAuth probe +
+  auto-pause) and PUF-214 (worker-error suppression at the egress
+  boundary). PUF-213 prevents the refresh window from being
+  silently missed during runtime; PUF-207 catches at startup;
+  PUF-214 keeps any error string that slips past either out of
+  user-visible channels. (PUF-213)
+
 ### Added
 
 - **Agent startup auto-pauses when the OAuth probe says "auth is
