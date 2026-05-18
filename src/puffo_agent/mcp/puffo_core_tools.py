@@ -183,37 +183,16 @@ _RESOLVE_ROOT_MAX_DEPTH = 4
 async def _resolve_root_id(
     root_id: str, data_client: Any,
 ) -> tuple[Optional[str], str]:
-    """Resolve a caller-supplied ``root_id`` to the actual thread
-    root.
-
-    Agents sometimes pass an envelope's ``post_id`` (a specific reply)
-    as ``root_id`` expecting the new message to thread under that
-    reply. But ``thread_root_id`` on the wire must point at the *root*
-    of the thread — when it points at a non-root reply the resulting
-    message lands in a sub-thread or is dropped silently by the client
-    renderer. The bug is invisible to the agent: ``send_message``
-    returns success either way. We learned that the hard way during
-    the team's first hour on 2026-05-18.
-
-    Behaviour:
-    - Empty / whitespace ``root_id`` → ``(None, "")``. No lookup;
-      the envelope's ``thread_root_id`` stays ``None`` (root-level).
-    - Looked-up message's ``thread_root_id`` is ``None`` → the
-      supplied id IS a root → return ``(root_id, "")``.
-    - Looked-up message has a non-null ``thread_root_id`` → the
-      supplied id was itself a reply; substitute the real root and
-      return a correction note naming both ids so the agent learns.
-    - Defensive: if the substituted root is also a reply (malformed
-      data; should never happen for well-formed messages), walk one
-      more level. Capped at ``_RESOLVE_ROOT_MAX_DEPTH`` to prevent
-      infinite traversal on cycles.
-    - Lookup miss / transport failure → fall through with the
-      original ``root_id`` plus a soft-warning note. The send still
-      completes; the agent is told we couldn't verify the root.
+    """When an agent passes a reply's envelope id as ``root_id``,
+    look that envelope up and substitute its own ``thread_root_id``
+    so the new message threads under the real root instead of
+    silently disappearing into a sub-thread.
 
     Returns ``(resolved_root_or_None, note)``. ``note`` is empty
-    when no correction was needed (and no warning was emitted),
-    mirroring ``_coerce_root_visibility``'s shape.
+    unless a correction or warning happened — shape mirrors
+    ``_coerce_root_visibility``. Lookup miss / transport failure
+    falls through with the original id plus a soft warning so the
+    send still completes.
     """
     if not root_id.strip():
         return None, ""
