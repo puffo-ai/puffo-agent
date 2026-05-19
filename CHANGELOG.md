@@ -4,6 +4,134 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0a3] — 2026-05-19
+
+_Pre-release published to TestPyPI only — not for general install._
+
+### Changed
+
+- **macOS Keychain integration on top of the daemon-owned
+  `CredentialRefresher`.** Claude Code 2.x stores its OAuth token in
+  the system Keychain (`"Claude Code-credentials"`), and per-agent
+  `$HOME` overrides don't isolate Keychain access (the ACL is keyed
+  on UID + signing identity, not HOME). Without daemon-level
+  intermediation, the host's `claude` binary running under a
+  puffo-agent worker re-prompts the ACL every spawn and the per-agent
+  `.credentials.json` files diverge from the operator's main CLI
+  view. GitHub issue anthropics/claude-code#37512 compounds the
+  problem: setting `CLAUDE_CODE_OAUTH_TOKEN` triggers a
+  `security delete-generic-password "Claude Code-credentials"`
+  cleanup on exit that kicks the user's main CLI / VS Code extension
+  off Keychain entirely.
+
+  This release extends the 0.8.8 `CredentialRefresher` with a
+  pluggable backend abstraction so the macOS Keychain path and the
+  Linux/Windows host-file path share the same daemon-owned lock,
+  agent fan-out, and 401-wake invariants while differing only on
+  storage:
+
+  - `CredentialBackend` Protocol (`portal/credential_refresh.py`) —
+    four methods: `expires_in_seconds`, `refresh` (async, returns
+    `RefreshOutcome.{REFRESHED, UNCHANGED, FAILED}`), `sync_to_agent`,
+    and `bootstrap`.
+  - `FileBackend` — preserves bit-identical 0.8.8 behavior on
+    Linux/Windows. Host `~/.claude/.credentials.json` is canonical;
+    refresh spawns `claude --print` with `HOME=host_home`; sync is a
+    symlink (or copy fallback) via `link_host_credentials`. External
+    rotation propagates atomically through the symlink — no
+    external-poll needed.
+  - `KeychainBackend` — macOS path. Keychain is canonical; the
+    daemon maintains a cache at
+    `~/.puffo-agent/run/claude-credentials.json` (atomic-write JSON
+    blob, chmod 600); refresh runs a sandboxed `claude --print`
+    under a tempdir `HOME` seeded from the cache so claude rotates
+    the token against Anthropic and writes the new blob back to the
+    sandbox file (which we then copy to the cache); writeback to
+    Keychain is best-effort so the operator's main CLI sees the new
+    token; `sync_to_agent` is a per-agent file copy (Keychain ACL
+    forces this — symlinking the cache wouldn't help because the
+    per-agent `claude` process still goes through Keychain anyway).
+  - `CredentialRefresher` itself stays platform-agnostic: owns the
+    `asyncio.Lock` (single-writer across all refreshes), the agent
+    home registry, the `_refresh_request` event for 401-wake, the
+    2-minute file-expiry poll, and the post-tick fan-out that calls
+    `backend.sync_to_agent(agent_home)` for every registered agent.
+    Daemon `daemon.py` picks the backend at startup based on
+    `is_macos()`.
+  - **External-rotation poll** (macOS-only): `KeychainBackend`
+    exposes `poll_external_rotation()` and the refresher runs it as
+    a sibling task on `KEYCHAIN_POLL_INTERVAL_SECONDS = 5 * 60`. The
+    poll re-reads Keychain (silent after the first "Always Allow"
+    grant), diffs against the last propagated blob, and on detected
+    change updates the cache + triggers fan-out via the same
+    `_sync_views` path. This catches rotations done by the
+    operator's main `claude` CLI or by an agent's own claude
+    subprocess self-refreshing on a 401 — neither of which the
+    daemon initiates, so neither would be visible to siblings
+    without this poll.
+  - **PATH shim** (issue #37512 workaround): every daemon start
+    writes a bash shim to
+    `~/.puffo-agent/run/keychain-shim/security` that intercepts
+    `security delete-generic-password "Claude Code-credentials"`
+    and silently no-ops it, passing every other `security`
+    invocation through to `/usr/bin/security`. The shim dir is
+    prepended to `$PATH` for every per-agent `claude` spawn and for
+    the daemon's own refresh oneshot.
+  - **`local_cli` adapter macOS env-injection**: on macOS, each
+    agent's `claude` subprocess gets `CLAUDE_CONFIG_DIR=<agent_home>/.claude`
+    and `PATH=<shim_dir>:<original PATH>`. **Deliberately does NOT
+    set `CLAUDE_CODE_OAUTH_TOKEN`** — that env var triggers the
+    same bug #37512 cleanup path and would defeat the shim's
+    protection. The per-agent `.credentials.json` is materialised by
+    `KeychainBackend.sync_to_agent` whenever the refresher's tick
+    fans out, so claude reads from there normally. Linux/Windows
+    spawn env is unchanged.
+  - Diagnostic CLI: `puffo-agent test ...` subcommand tree with 5
+    probes (`keychain-read`, `keychain-write`, `refresh-flush`,
+    `keychain-survives-token-env`, `full-probe`) plus a
+    side-effectful `refresh-flush-forced` (gated on `--yes`). Writes
+    a redacted-markdown probe report to
+    `~/.puffo-agent/probe-report.md`. Tokens are shown only as
+    `len=NNN sha256_prefix=XXXXXXXX`. Each probe SKIPs cleanly on
+    non-Darwin so the same CLI works as a sanity-check tool on
+    Linux/Windows.
+
+  The PUF-221 public API (`CredentialRefresher.register_agent` /
+  `unregister_agent` / `notify_refresh_needed` / `run_loop` /
+  `expires_in_seconds`) is unchanged — the refactor is invisible to
+  the daemon's reconcile loop and to `Worker`'s `notify_refresh_needed`
+  callback. The 0.8.8 `host_home=...` constructor signature still
+  works (it implicitly constructs a `FileBackend`) so the existing
+  `tests/test_credential_refresher.py` pins the public-API contract
+  without modification.
+
+### Tests
+
+- `tests/test_macos_credential_manager.py` (~30 tests) — pure-function
+  tests for `CredentialCache`, `install_path_shim`, the keychain
+  read/write primitives (subprocess.run mocked), `refresh_via_oneshot`
+  + `_run_claude_oneshot` (asyncio.create_subprocess_exec mocked),
+  `bootstrap_from_keychain`, plus end-to-end tests for
+  `KeychainBackend` plugged into `CredentialRefresher`
+  (`expires_in_seconds` cache-vs-Keychain path, `refresh` returning
+  `REFRESHED`/`UNCHANGED`/`FAILED`, `sync_to_agent` writing per-agent
+  files, `poll_external_rotation` detecting changes / swallowing
+  read failures, the refresher's fan-out invoking `sync_to_agent`
+  on every registered agent, FD-leak regression for the timeout
+  drain path).
+- `tests/test_macos_diagnostic.py` (~19 tests) — report rendering,
+  token redaction (raw tokens never appear in stdout / saved
+  report), off-macOS SKIPPED path on every probe, on-macOS happy
+  path with mocked subprocess, forced-expiry helpers, and the
+  `refresh-flush-forced` `--yes` gate.
+- `tests/test_credential_refresher.py` (the 12 0.8.8 pinned tests)
+  pass unchanged against the refactored class — the backend
+  abstraction is invisible to the public API.
+
+Full suite: **726 passed / 7 skipped / 0 failed** on Windows
+(macOS-specific assertions still execute because they monkeypatch
+`is_macos` to True; symlink-unavailable skips on Windows are normal).
+
 ## [0.8.8] — 2026-05-19
 
 ### Changed

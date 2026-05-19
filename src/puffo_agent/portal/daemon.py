@@ -18,8 +18,13 @@ import time
 
 from pathlib import Path
 
+from ..macos.keychain import CredentialCache, is_macos, shim_dir
 from .api import start_api_server, stop_api_server
-from .credential_refresh import CredentialRefresher
+from .credential_refresh import (
+    CredentialRefresher,
+    FileBackend,
+    KeychainBackend,
+)
 from .data_service import start_data_service, stop_data_service
 from .state import (
     AgentConfig,
@@ -56,9 +61,23 @@ class Daemon:
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
         # PUF-221: daemon owns Claude OAuth refresh — single writer to
-        # the host .credentials.json so Anthropic's single-use refresh
-        # token rotation can't be raced by N agent workers.
-        self.refresher = CredentialRefresher(host_home=Path.home())
+        # the canonical credential store so Anthropic's single-use
+        # refresh-token rotation can't be raced by N agent workers.
+        # Backend choice is platform-dependent:
+        #   - macOS: Keychain is canonical (Claude Code 2.x); cache +
+        #     PATH shim + per-agent file copies via KeychainBackend.
+        #   - Linux/Windows: host file ``~/.claude/.credentials.json``
+        #     is canonical; agent files are symlinks via FileBackend.
+        if is_macos():
+            home = home_dir()
+            backend = KeychainBackend(
+                home=home,
+                cache=CredentialCache.at(home),
+                shim_dir=shim_dir(home),
+            )
+        else:
+            backend = FileBackend(host_home=Path.home())
+        self.refresher = CredentialRefresher(backend=backend)
 
     async def run(self) -> None:
         logger.info("puffo-agent portal starting; home=%s", home_dir())

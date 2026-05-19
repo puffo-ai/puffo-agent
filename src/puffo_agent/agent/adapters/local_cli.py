@@ -22,11 +22,17 @@ import shutil
 import time
 from pathlib import Path
 
+from ...macos.keychain import (
+    install_path_shim,
+    is_macos,
+    shim_dir,
+)
 from ...mcp.config import (
     default_python_executable,
     write_cli_mcp_config,
 )
 from ...portal.state import (
+    home_dir,
     link_host_credentials,
     seed_claude_home,
     sync_host_enabled_plugins,
@@ -207,6 +213,7 @@ class LocalCLIAdapter(Adapter):
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
+            **self._macos_credential_env(),
         }
         self._session = ClaudeSession(
             agent_id=self.agent_id,
@@ -221,6 +228,36 @@ class LocalCLIAdapter(Adapter):
             extra_args=extra,
         )
         return self._session
+
+    def _macos_credential_env(self) -> dict[str, str]:
+        """macOS-only env hardening:
+
+        - ``CLAUDE_CONFIG_DIR`` points at the per-agent .claude so the
+          agent's claude reads from ``<agent_home>/.claude/.credentials.json``
+          (which the daemon's ``KeychainBackend.sync_to_agent`` keeps
+          fresh) rather than racing the operator's main CLI for the
+          Keychain entry.
+        - ``PATH`` is prepended with the security-shim dir so the
+          buggy ``security delete-generic-password`` call from Claude
+          Code issue #37512 is intercepted before it can flush the
+          operator's main CLI auth.
+
+        Deliberately does NOT set ``CLAUDE_CODE_OAUTH_TOKEN`` — that
+        env var triggers the same fallback-combiner cleanup path that
+        deletes the Keychain entry. We let claude read its token
+        from the per-agent ``.credentials.json`` like normal.
+
+        Returns ``{}`` on non-macOS so the Linux/Windows spawn env is
+        unchanged.
+        """
+        if not is_macos():
+            return {}
+        shim_path = install_path_shim(home_dir())
+        existing_path = os.environ.get("PATH", "")
+        return {
+            "CLAUDE_CONFIG_DIR": str(Path(self.agent_home_dir) / ".claude"),
+            "PATH": f"{shim_path}{os.pathsep}{existing_path}",
+        }
 
     def _permission_hook_env(self) -> dict[str, str]:
         """Env vars the PreToolUse hook script reads. Claude inherits
