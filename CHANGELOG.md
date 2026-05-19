@@ -4,6 +4,87 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.7] — 2026-05-19
+
+### Added
+
+- **Agent now reacts to space/channel membership-exit events on the
+  WS push.** Before this release the WS event router (`_handle_event`
+  in `puffo_core_client.py`) only handled `invite_to_space` /
+  `invite_to_channel` / the synthetic auto-accept
+  `accept_channel_invite`. Every other event kind was silently
+  dropped, so when the agent was removed from a space or kicked from
+  a channel its caches and outbound queues stayed stale until the
+  next reconnect / poll, and the operator got no notification about
+  what changed.
+
+  Pairs with `puffo-server` review/events (PR #74) which now
+  broadcasts these events to the affected slug too via the
+  `extra_ws_targets` union (otherwise the agent would never see
+  them — by the time the post-loop fan-out runs, the engine has
+  already removed it from the member set).
+
+  New handlers:
+
+  - `leave_space` (signer = self) — fires on both a self-signed
+    `LeaveSpace` and the puffo-server #74 synthetic cascade emitted
+    when an operator leaves (`signature ==
+    "server-auto:agent-cascade-leave-space"`). Evicts
+    `_channel_space` / `_channel_name_cache` / `_space_name_cache`
+    for the space; DMs the operator with reason-specific wording.
+
+  - `remove_from_space` (target = self) — same cache eviction; DM
+    names the kicker so the operator knows who removed their agent.
+
+  - `leave_channel` (signer = self) — voluntary channel exit; cache
+    eviction only, no DM (operator-initiated, they already know).
+
+  - `remove_from_channel` (target = self) — per-channel eviction; DM
+    references both the channel and its parent space.
+
+  - `cancel_space_invite` / `cancel_channel_invite` — if the agent
+    DM'd the operator a `y`/`n` prompt for the now-withdrawn invite,
+    send a follow-up in the same thread so the operator doesn't
+    reply `y` to nothing (server would return InviteNotFound 400).
+    No-op when no prompt was outstanding (auto-accepted, never
+    DM'd).
+
+### Hardened
+
+- **Synthetic cascade `LeaveSpace` events are re-verified against
+  `/spaces` before any visible side effect.** The synthetic events
+  puffo-server emits for agent-operator cascades carry a server-set
+  marker signature (`"server-auto:agent-cascade-leave-space"`) —
+  not a real ed25519 signature — so they aren't
+  cryptographically authenticatable on the wire. Trusting them
+  blindly meant a buggy server, WS redelivery on reconnect, or a
+  malicious server could trick the agent into evicting caches and
+  DMing the operator about a membership change that never
+  happened.
+
+  Fix: before applying the visible side effects of a synthetic
+  cascade event, re-confirm with `GET /spaces` (authoritative
+  membership API). The check returns `True` (still listed —
+  contradicts cascade, bail), `False` (confirmed gone — proceed),
+  or `None` (network error — fall through to permissive cleanup so
+  a transient flake doesn't strand the agent in a space it's been
+  cascaded out of).
+
+  Scoped to the one event kind where this defense matters; real
+  signed events skip the recheck (the server-side engine already
+  verified the signature before broadcasting, and re-verifying on
+  the agent side would need a full ed25519-verify + cert-chain
+  resolution stack for little real benefit given the server is
+  authoritative for membership state anyway).
+
+### Tests
+
+14 new pytest tests in `tests/test_membership_events.py` covering
+each handler's happy path, ignore-when-not-target, cache eviction
+contents, operator DM text, the synthetic-cascade re-check
+behavior (still-member / confirmed-gone / network-failure), and
+the `operator_slug = ""` early-provisioning case.
+
 ## [0.8.6] — 2026-05-18
 
 ### Fixed
