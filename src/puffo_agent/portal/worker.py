@@ -10,6 +10,8 @@ import asyncio
 import json
 import logging
 import os
+import random
+import re
 import shutil
 import sys
 import time
@@ -41,10 +43,34 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
-# Poll rate for the adapter's OAuth refresh check. The adapter
-# decides per-tick whether to actually probe based on credentials
-# mtime; this is just the upper bound on staleness.
 CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60
+CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60
+
+
+def _next_refresh_tick(
+    expires_in_seconds: int | None,
+    *,
+    default_tick: int = CREDENTIAL_REFRESH_TICK_SECONDS,
+    threshold: int | None = None,
+    floor: int = CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS,
+) -> int:
+    """PUF-213: adaptive refresh sleep — bounded retry inside the
+    refresh window, wakes ``threshold`` seconds before expiry
+    otherwise; ``None`` TTL falls back to ``default_tick``."""
+    if threshold is None:
+        # Lazy import keeps this helper unit-testable.
+        from ..agent.adapters.base import (
+            CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS as _DEFAULT_THRESHOLD,
+        )
+        threshold = _DEFAULT_THRESHOLD
+    if expires_in_seconds is None:
+        return default_tick
+    target = expires_in_seconds - threshold
+    if target < floor:
+        return floor
+    if target > default_tick:
+        return default_tick
+    return target
 
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
@@ -320,6 +346,173 @@ def _build_puffo_core_client(
     )
 
 
+# PUF-214: auth-class patterns — definitive evidence of OAuth /
+# API-key failure. Shared by the leak filter (suppress the leak)
+# and by health-flip detection (`runtime.health=auth_failed`).
+# Anchored / unambiguous-token patterns only, per the doc-citation
+# audit; high-FP markers like "401" / "unauthorized" / "api_error"
+# stay OUT — they collide with legitimate agent prose.
+_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*Not logged in[\s\S]*Please run /login", re.IGNORECASE),
+    re.compile(r"^\s*OAuth token (?:revoked|has expired)\b", re.IGNORECASE),
+    re.compile(r"^\s*Invalid API key\b", re.IGNORECASE),
+    re.compile(r"\bThis organization has been disabled\b", re.IGNORECASE),
+    re.compile(r"\bauthentication_error\b", re.IGNORECASE),
+)
+
+# Worker-layer leak patterns NOT in the auth-class set. Sources:
+# Claude Code error reference (CLI message-to-recovery table) +
+# Claude API platform docs (canonical <type>_error identifiers).
+_NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Internal kick message echoed back as a reply.
+    re.compile(
+        r"^\s*\[puffo-agent system message\]\s+session errored on rate",
+        re.IGNORECASE,
+    ),
+    # Subscription-plan quotas (the prod miss the reviewer surfaced).
+    re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
+    re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
+    # CLI-emitted server 429 / 5xx.
+    re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
+    re.compile(r"\bAPI Error: Server is temporarily limiting requests\b", re.IGNORECASE),
+    re.compile(r"\bAPI Error: Repeated 529 Overloaded errors\b", re.IGNORECASE),
+    re.compile(r"\bAPI Error: 500\b[\s\S]*Internal server error\b", re.IGNORECASE),
+    # API-canonical <type>_error identifiers, minus high-FP entries
+    # (invalid_request_error / not_found_error / api_error) per audit.
+    re.compile(r"\brate[_ -]limit[_ -]error\b", re.IGNORECASE),
+    re.compile(r"\boverloaded_error\b", re.IGNORECASE),
+    re.compile(r"\bbilling_error\b", re.IGNORECASE),
+    re.compile(r"\bpermission_error\b", re.IGNORECASE),
+    re.compile(r"\btimeout_error\b", re.IGNORECASE),
+)
+
+_WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    *_AUTH_ERROR_PATTERNS,
+    *_NON_AUTH_LEAK_PATTERNS,
+)
+
+# Backoff range applied after a suppressed leak fires. Random in
+# [15, 60] drops the steady-state leak frequency ~30× without
+# grounding the agent — single-batch leaks self-clear during the
+# sleep; sustained limit conditions get sampled, not hammered.
+_SUPPRESSION_BACKOFF_MIN_SECONDS = 15.0
+_SUPPRESSION_BACKOFF_MAX_SECONDS = 60.0
+
+
+def _looks_like_auth_error(reply: str) -> bool:
+    """True iff ``reply`` is one of the definitive auth-class
+    failure strings (Claude CLI re-login prompt, OAuth-token
+    revoked/expired, invalid API key, disabled org, or the
+    ``authentication_error`` API identifier). Drives the
+    ``runtime.health=auth_failed`` flip alongside PUF-207's
+    startup-paused signal."""
+    if not reply:
+        return False
+    for pattern in _AUTH_ERROR_PATTERNS:
+        if pattern.search(reply):
+            return True
+    return False
+
+
+def _suppress_worker_error_leak(reply: str) -> str | None:
+    """Return ``None`` when ``reply`` matches a worker-error
+    pattern, signalling the caller to suppress the channel post and
+    surface to the operator instead. Returns the reply unchanged
+    otherwise. Mirrors ``_coerce_root_visibility``'s shape."""
+    if not reply:
+        return reply
+    for pattern in _WORKER_ERROR_LEAK_PATTERNS:
+        if pattern.search(reply):
+            return None
+    return reply
+
+
+def _handle_suppressed_reply(
+    reply: str,
+    runtime: "RuntimeState",
+    agent_id: str,
+    *,
+    scope: str,
+) -> tuple[bool, float]:
+    """Shared landing for a suppressed worker-error leak. Returns
+    ``(suppressed, backoff_seconds)``:
+
+    - Clean prose: ``(False, 0.0)``; caller proceeds normally.
+    - Leak detected: ``(True, uniform(15, 60))``; caller skips
+      ``send_fallback_message`` and ``asyncio.sleep(backoff)`` so
+      the next batch doesn't immediately re-leak in tight loops.
+
+    On suppression: log the truncated payload, populate
+    ``runtime.error`` with a scope-tagged + leak-class-tagged
+    message, and (if auth-class) flip ``runtime.health="auth_failed"``
+    — that signal is definitive regardless of which scope surfaced
+    it."""
+    safe_reply = _suppress_worker_error_leak(reply)
+    if safe_reply is not None:
+        return False, 0.0
+    is_auth = _looks_like_auth_error(reply)
+    backoff = random.uniform(
+        _SUPPRESSION_BACKOFF_MIN_SECONDS,
+        _SUPPRESSION_BACKOFF_MAX_SECONDS,
+    )
+    logger.warning(
+        "agent %s: suppressed worker-error leak in %s reply (backoff %.1fs): %s",
+        agent_id, scope, backoff, reply[:200],
+    )
+    if is_auth:
+        runtime.health = "auth_failed"
+    if scope == "api-error-retry":
+        if is_auth:
+            runtime.error = (
+                "Worker emitted an auth-error string after an API "
+                "error; suppressed from channel post. Re-run "
+                "`claude /login`, then "
+                f"`puffo-agent agent resume {agent_id}`."
+            )
+        else:
+            runtime.error = (
+                "Worker emitted a rate-limit / quota / server-error "
+                "string after an API error; suppressed from channel "
+                "post. Usually self-recovers — investigate the daemon "
+                "log if persistent."
+            )
+    else:
+        runtime.error = (
+            "Worker emitted an auth / rate-limit / quota error string "
+            "instead of a real reply; suppressed from channel post. "
+            "Check daemon logs."
+        )
+    runtime.save(agent_id)
+    return True, backoff
+
+
+def _check_startup_auth_or_pause(
+    adapter: "Adapter", runtime: "RuntimeState", agent_id: str,
+) -> bool:
+    """PUF-207: return True on True/None (proceed); on False,
+    auto-pause the agent with a recoverable runtime.error and
+    return False."""
+    if adapter.auth_healthy is not False:
+        return True
+    runtime.status = "paused"
+    runtime.health = "auth_failed"
+    runtime.error = (
+        f"Agent {agent_id}: Claude Code OAuth is missing or expired. "
+        "Paused on startup so this agent does not spawn into a "
+        "known-broken state.\n"
+        "To recover:\n"
+        "  1. Open a separate Terminal (not from within an agent's "
+        "own shell), then run `claude` and `/login` to authenticate.\n"
+        f"  2. From the same machine, resume agent {agent_id} with "
+        f"`puffo-agent agent resume {agent_id}`\n"
+        "     (a venv install may need the full path to "
+        "`puffo-agent`)."
+    )
+    runtime.save(agent_id)
+    return False
+
+
+
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
@@ -478,6 +671,22 @@ class Worker:
             self.runtime.error = str(e)
             self.runtime.save(agent_id)
             # Init crashed before warm() — release the startup gate.
+            self._warm_done.set()
+            return
+
+        # PUF-207: pause on auth_healthy=False so we don't spawn into
+        # a known-broken state (FB-159).
+        try:
+            await self._adapter.refresh_ping()
+        except Exception as exc:
+            logger.warning(
+                "agent %s: startup auth probe failed "
+                "(will retry on refresh tick): %s",
+                agent_id, exc,
+            )
+        if not _check_startup_auth_or_pause(
+            self._adapter, self.runtime, agent_id,
+        ):
             self._warm_done.set()
             return
 
@@ -647,10 +856,20 @@ class Worker:
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
             if reply:
-                # Fallback reply when the agent skipped both
-                # send_message and [SILENT]. Post to root so the
-                # reply lands in the thread the agent was reading.
-                await client.send_fallback_message(channel_id, reply, root_id=root_id)
+                suppressed, backoff = _handle_suppressed_reply(
+                    reply,
+                    self.runtime,
+                    agent_id,
+                    scope="fallback",
+                )
+                if suppressed:
+                    await asyncio.sleep(backoff)
+                else:
+                    # Fallback reply when the agent skipped both
+                    # send_message and [SILENT].
+                    await client.send_fallback_message(
+                        channel_id, reply, root_id=root_id,
+                    )
 
         async def on_api_error_retry(
             root_id: str,
@@ -678,7 +897,21 @@ class Worker:
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
             if reply:
-                await client.send_fallback_message(channel_id, reply, root_id=root_id)
+                suppressed, backoff = _handle_suppressed_reply(
+                    reply,
+                    self.runtime,
+                    agent_id,
+                    scope="api-error-retry",
+                )
+                if suppressed:
+                    # Hottest leak site (FB-88 / FB-159 case-studies).
+                    # Backoff samples instead of hammering when the
+                    # underlying limit / outage is still active.
+                    await asyncio.sleep(backoff)
+                else:
+                    await client.send_fallback_message(
+                        channel_id, reply, root_id=root_id,
+                    )
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
@@ -692,7 +925,14 @@ class Worker:
         async def credential_refresh():
             """Periodically refresh OAuth credentials before they
             expire. The adapter's mtime check skips the work when
-            another consumer just refreshed the shared file."""
+            another consumer just refreshed the shared file.
+
+            PUF-213: the sleep duration is adaptive — when the
+            access token is close to expiry we tick more often, so
+            the refresh window never falls entirely inside one
+            sleep interval. Far from expiry we fall back to the
+            default 10-minute heartbeat.
+            """
             # Skip the first tick to avoid piling onto warm().
             try:
                 await asyncio.wait_for(
@@ -719,10 +959,17 @@ class Worker:
                 elif probed is False:
                     self.runtime.health = "auth_failed"
                 self.runtime.save(agent_id)
+                # Scale next sleep to current TTL so we never miss
+                # the refresh window.
+                try:
+                    expires_in = self._adapter._credentials_expires_in_seconds()
+                except Exception:
+                    expires_in = None
+                next_tick = _next_refresh_tick(expires_in)
                 try:
                     await asyncio.wait_for(
                         self._stop.wait(),
-                        timeout=CREDENTIAL_REFRESH_TICK_SECONDS,
+                        timeout=next_tick,
                     )
                 except asyncio.TimeoutError:
                     pass

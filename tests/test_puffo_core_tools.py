@@ -15,6 +15,7 @@ from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
     _coerce_root_visibility,
+    _resolve_root_id,
     register_core_tools,
 )
 
@@ -64,6 +65,17 @@ class FakeHttpClient:
         if path in self.responses:
             return self.responses[path]
         return {"ok": True}
+
+    async def post_bytes(self, path, headers=None, data=None):
+        """``send_message_with_attachments`` uploads each file via
+        ``POST /blobs/upload`` before encrypting the message
+        envelope; the integration tests below need this stub so the
+        upload step doesn't AttributeError on the way to the
+        envelope path. Return the canned response when set."""
+        self.calls.append(("POST_BYTES", path, len(data) if data else 0))
+        if path in self.responses:
+            return self.responses[path]
+        return {"blob_id": "blob_stub", "ok": True}
 
     async def _ensure_subkey(self):
         pass
@@ -734,6 +746,362 @@ async def test_fetch_channel_files_stub():
     mcp = _build_tools(cfg)
     result = await _call(mcp, "fetch_channel_files", {"channel": "ch_1"})
     assert "not yet implemented" in result
+
+
+# PUF-200: _resolve_root_id
+
+
+class _FakeDataClient:
+    """Stand-in for ``DataClient`` — seed thread_root_id values and
+    inject lookup failures without touching SQLite."""
+
+    def __init__(self):
+        self.messages: dict[str, object] = {}
+        self.exc: Exception | None = None
+        self.calls: list[str] = []
+
+    def add(self, envelope_id: str, thread_root_id: str | None) -> None:
+        class _Msg:
+            pass
+        m = _Msg()
+        m.envelope_id = envelope_id
+        m.thread_root_id = thread_root_id
+        self.messages[envelope_id] = m
+
+    async def get_message_by_envelope(self, envelope_id: str):
+        self.calls.append(envelope_id)
+        if self.exc is not None:
+            raise self.exc
+        return self.messages.get(envelope_id)
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_empty_skips_lookup():
+    dc = _FakeDataClient()
+    resolved, note = await _resolve_root_id("", dc)
+    assert resolved is None
+    assert note == ""
+    assert dc.calls == []
+    # Whitespace-only is also treated as empty.
+    resolved, note = await _resolve_root_id("   ", dc)
+    assert resolved is None and note == ""
+    assert dc.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_true_root_unchanged():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None)
+    resolved, note = await _resolve_root_id("msg_root", dc)
+    assert resolved == "msg_root"
+    assert note == ""
+    assert dc.calls == ["msg_root"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_reply_auto_corrected():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None)
+    dc.add("msg_reply", thread_root_id="msg_root")
+    resolved, note = await _resolve_root_id("msg_reply", dc)
+    assert resolved == "msg_root"
+    assert "auto-corrected" in note
+    assert "msg_reply" in note and "msg_root" in note
+    assert "thread_root_id" in note and "post_id" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_depth_two_chain_walks_to_root():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None)
+    dc.add("msg_mid", thread_root_id="msg_root")
+    dc.add("msg_leaf", thread_root_id="msg_mid")
+    resolved, note = await _resolve_root_id("msg_leaf", dc)
+    assert resolved == "msg_root"
+    assert "auto-corrected" in note
+    assert dc.calls == ["msg_leaf", "msg_mid", "msg_root"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_lookup_miss_falls_through_with_warning():
+    dc = _FakeDataClient()
+    resolved, note = await _resolve_root_id("msg_unknown", dc)
+    assert resolved == "msg_unknown"
+    assert "could not verify" in note
+    assert "not in local store" in note
+    assert "thread_root_id" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_transport_error_falls_through_with_warning():
+    dc = _FakeDataClient()
+    dc.exc = RuntimeError("simulated transport blip")
+    resolved, note = await _resolve_root_id("msg_anything", dc)
+    assert resolved == "msg_anything"
+    assert "could not verify" in note
+    assert "lookup failed" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_data_not_found_treated_as_lookup_miss():
+    """``DataClient.get_message_by_envelope`` raises ``DataNotFound``
+    (rather than returning None) when the data service is reachable
+    but the agent never recorded the envelope. The resolver should
+    treat that the same as a None return — fall through with the
+    "not in local store" warning, not the broader "lookup failed"
+    one."""
+    from puffo_agent.agent.message_store import DataNotFound
+    dc = _FakeDataClient()
+    dc.exc = DataNotFound("msg_only_on_server")
+    resolved, note = await _resolve_root_id("msg_only_on_server", dc)
+    assert resolved == "msg_only_on_server"
+    assert "could not verify" in note
+    assert "not in local store" in note
+    assert "lookup failed" not in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_cycle_preserves_root_id_with_warning():
+    """Cycle is corrupt data — don't auto-correct to a node we
+    can't trust. Preserve the original ``root_id`` and surface a
+    loud warning so the operator can investigate."""
+    dc = _FakeDataClient()
+    dc.add("msg_a", thread_root_id="msg_b")
+    dc.add("msg_b", thread_root_id="msg_a")
+    resolved, note = await _resolve_root_id("msg_a", dc)
+    assert resolved == "msg_a"
+    assert "could not resolve" in note
+    assert "cycle detected" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_root_id_depth_cap_preserves_root_id_with_warning():
+    """Same corruption-defense path for a chain deeper than the
+    cap — preserve ``root_id``, warn loudly, don't auto-correct."""
+    dc = _FakeDataClient()
+    # Chain deeper than _RESOLVE_ROOT_MAX_DEPTH (4): leaf → l4 → l3 → l2 → l1 → root
+    dc.add("msg_leaf", thread_root_id="msg_l4")
+    dc.add("msg_l4", thread_root_id="msg_l3")
+    dc.add("msg_l3", thread_root_id="msg_l2")
+    dc.add("msg_l2", thread_root_id="msg_l1")
+    dc.add("msg_l1", thread_root_id="msg_root")
+    dc.add("msg_root", thread_root_id=None)
+    resolved, note = await _resolve_root_id("msg_leaf", dc)
+    assert resolved == "msg_leaf"
+    assert "could not resolve" in note
+    assert "deeper than" in note
+
+
+def _spy_encrypt_input(monkeypatch):
+    """Capture the EncryptInput so tests can assert on the payload's
+    thread_root_id (which lives inside the ciphertext, not on the
+    outer envelope dict)."""
+    import puffo_agent.mcp.puffo_core_tools as pct
+    captured: dict = {}
+    real = pct.encrypt_message
+
+    def spy(inp, signing_key, **kw):
+        captured["inp"] = inp
+        return real(inp, signing_key, **kw)
+
+    monkeypatch.setattr(pct, "encrypt_message", spy)
+    return captured
+
+
+def _seed_recipient(http, recipient_slug: str):
+    recipient_kem = KemKeyPair.generate()
+    http.responses[f"/certs/sync?slugs={recipient_slug}"] = {
+        "entries": [{
+            "seq": 1, "kind": "device_cert", "slug": recipient_slug,
+            "cert": {
+                "device_id": f"dev_{recipient_slug}",
+                "kem_public_key": base64url_encode(
+                    recipient_kem.public_key_bytes()
+                ),
+            },
+        }],
+        "has_more": False,
+    }
+
+
+async def _seed_channel(ms, http, channel_id: str, space_id: str,
+                        recipient_slug: str):
+    await ms.mark_channel_space(channel_id, space_id)
+    http.responses[f"/spaces/{space_id}/channels/{channel_id}/members"] = {
+        "members": [{"slug": recipient_slug, "role": "owner"}],
+    }
+    _seed_recipient(http, recipient_slug)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrong_post_id, real_root_id, scenario",
+    [
+        # The two live failures we hit on 2026-05-18 with operator
+        # mingvase-8795 — the clone-report send (post_id of the
+        # operator's "please clone" message used as root_id) and
+        # the build-test report send (post_id of the operator's
+        # "ensure you can build/test" message used as root_id).
+        ("msg_38364760-cd04-408a-9daf-aad66a2487fc",
+         "msg_610fec10-122f-4fff-8dcb-498770809c84",
+         "clone-report-live-failure"),
+        ("msg_9e8f1a83-05ff-4775-8e07-b90999c61d53",
+         "msg_610fec10-122f-4fff-8dcb-498770809c84",
+         "build-test-report-live-failure"),
+    ],
+)
+async def test_send_message_auto_corrects_real_live_failures(
+    monkeypatch, wrong_post_id, real_root_id, scenario,
+):
+    """Each parameter is one of the two real failures we observed
+    on 2026-05-18 — operator's post is the thread root, the message
+    Calculation incorrectly passed as root_id is a reply in that
+    same thread. After the fix the EncryptInput must carry the real
+    root and the response must include the correction note."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    await ms.store({
+        "envelope_id": real_root_id, "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "real root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    await ms.store({
+        "envelope_id": wrong_post_id, "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": f"reply in thread ({scenario})", "sent_at": _now_ms(),
+        "thread_root_id": real_root_id,
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": f"replaying {scenario}",
+        "is_visible_to_human": False,
+        "root_id": wrong_post_id,
+    })
+
+    assert "posted" in result
+    assert "auto-corrected" in result
+    assert wrong_post_id in result and real_root_id in result
+    assert captured["inp"].thread_root_id == real_root_id
+
+
+@pytest.mark.asyncio
+async def test_send_message_keeps_real_root_id_unchanged(monkeypatch):
+    """Happy path: agent passes a real root id; no correction note,
+    EncryptInput's thread_root_id is the supplied id."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root post", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "correctly threaded reply",
+        "is_visible_to_human": False,
+        "root_id": "msg_root",
+    })
+
+    assert "posted" in result
+    assert "auto-corrected" not in result
+    assert "could not verify" not in result
+    assert captured["inp"].thread_root_id == "msg_root"
+
+
+@pytest.mark.asyncio
+async def test_send_message_unknown_root_id_falls_through_with_warning(monkeypatch):
+    """When the supplied root_id isn't in the local store at all
+    (could happen for very fresh messages), the send still completes
+    with the original id and the tool response carries a warning."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "racing the inbound write",
+        "is_visible_to_human": False,
+        "root_id": "msg_never_seen",
+    })
+
+    assert "posted" in result
+    assert "could not verify" in result
+    # Better to land in a wrong thread than to drop the message —
+    # the original id reaches the payload.
+    assert captured["inp"].thread_root_id == "msg_never_seen"
+
+
+@pytest.mark.asyncio
+async def test_send_message_root_level_send_skips_resolve(monkeypatch):
+    """No root_id → no lookup attempted, EncryptInput's thread_root_id
+    is None, no resolve-style note in the response."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "top-level", "is_visible_to_human": True,
+    })
+
+    assert "posted" in result
+    assert "auto-corrected" not in result
+    assert "could not verify" not in result
+    assert captured["inp"].thread_root_id is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_auto_corrects_reply_as_root_id(
+    monkeypatch, tmp_path,
+):
+    """Same auto-correction behaviour on the attachments path."""
+    cfg, http, ms = _setup()
+    cfg.workspace = tmp_path
+    (tmp_path / "hello.txt").write_bytes(b"hello attachments")
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    http.responses["/blobs/upload"] = {"blob_id": "blob_xyz"}
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    await ms.store({
+        "envelope_id": "msg_reply", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "reply", "sent_at": _now_ms(),
+        "thread_root_id": "msg_root",
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message_with_attachments", {
+        "paths": ["hello.txt"],
+        "channel": "ch_abc",
+        "is_visible_to_human": False,
+        "root_id": "msg_reply",
+        "caption": "files",
+    })
+
+    assert "uploaded" in result
+    assert "auto-corrected" in result
+    # Display string reflects the *resolved* thread, not the wrong id.
+    assert "in thread msg_root" in result
+    assert captured["inp"].thread_root_id == "msg_root"
 
 
 @pytest.mark.asyncio
