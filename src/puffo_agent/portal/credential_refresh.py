@@ -12,11 +12,14 @@ instance. Its ``run_loop`` coroutine polls
 ``~/.claude/.credentials.json`` every ``REFRESH_POLL_SECONDS``
 and triggers a refresh when ``expiresAt - now <
 REFRESH_SAFETY_MARGIN_SECONDS``, OR when something calls
-``notify_refresh_needed()`` — today the only caller is the
+``notify_refresh_needed()``. Today's two callers: (a) the
 ``puffo-agent agent refresh-token`` CLI subcommand, which drops
 a sentinel file the daemon's reconcile loop forwards into the
-in-process ``asyncio.Event``. The event short-circuits the
-2-minute poll so an operator-initiated refresh runs within ~1s.
+in-process ``asyncio.Event``; (b) the per-worker
+``on_auth_failure`` hook fired from
+``worker._handle_suppressed_reply`` when an auth-class leak is
+detected in a turn reply. The event short-circuits the 2-minute
+poll so an operator- or agent-initiated refresh runs within ~1s.
 
 The refresh itself shells out to ``claude --print "ok"`` with
 ``HOME=<host_home>`` — mechanically identical to the cli-docker
