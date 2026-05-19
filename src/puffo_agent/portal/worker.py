@@ -674,21 +674,11 @@ class Worker:
             self._warm_done.set()
             return
 
-        # PUF-207: pause on auth_healthy=False so we don't spawn into
-        # a known-broken state (FB-159).
-        try:
-            await self._adapter.refresh_ping()
-        except Exception as exc:
-            logger.warning(
-                "agent %s: startup auth probe failed "
-                "(will retry on refresh tick): %s",
-                agent_id, exc,
-            )
-        if not _check_startup_auth_or_pause(
-            self._adapter, self.runtime, agent_id,
-        ):
-            self._warm_done.set()
-            return
+        # PUF-221: per-agent refresh_ping retired — daemon-level
+        # CredentialRefresher (portal/credential_refresh.py) owns
+        # OAuth refresh + writes back to ``~/.claude/.credentials.json``
+        # as a single writer. Agents just read the disk file via the
+        # per-agent symlink the daemon refresher maintains.
 
         # Warm the adapter so persisted-session agents re-spawn their
         # subprocess now rather than on the first DM. Non-fatal.
@@ -922,57 +912,10 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
 
-        async def credential_refresh():
-            """Periodically refresh OAuth credentials before they
-            expire. The adapter's mtime check skips the work when
-            another consumer just refreshed the shared file.
-
-            PUF-213: the sleep duration is adaptive — when the
-            access token is close to expiry we tick more often, so
-            the refresh window never falls entirely inside one
-            sleep interval. Far from expiry we fall back to the
-            default 10-minute heartbeat.
-            """
-            # Skip the first tick to avoid piling onto warm().
-            try:
-                await asyncio.wait_for(
-                    self._stop.wait(),
-                    timeout=CREDENTIAL_REFRESH_TICK_SECONDS,
-                )
-                return
-            except asyncio.TimeoutError:
-                pass
-            while not self._stop.is_set():
-                try:
-                    await self._adapter.refresh_ping()
-                except Exception as exc:
-                    logger.warning(
-                        "agent %s: credential refresh tick failed: %s",
-                        agent_id, exc,
-                    )
-                # Reflect the probe result into runtime.health so
-                # ``puffoagent status`` shows auth_failed without log
-                # tailing. None pre-first-probe stays "unknown".
-                probed = getattr(self._adapter, "auth_healthy", None)
-                if probed is True:
-                    self.runtime.health = "ok"
-                elif probed is False:
-                    self.runtime.health = "auth_failed"
-                self.runtime.save(agent_id)
-                # Scale next sleep to current TTL so we never miss
-                # the refresh window.
-                try:
-                    expires_in = self._adapter._credentials_expires_in_seconds()
-                except Exception:
-                    expires_in = None
-                next_tick = _next_refresh_tick(expires_in)
-                try:
-                    await asyncio.wait_for(
-                        self._stop.wait(),
-                        timeout=next_tick,
-                    )
-                except asyncio.TimeoutError:
-                    pass
+        # PUF-221: per-agent credential_refresh coroutine retired —
+        # CredentialRefresher in portal/credential_refresh.py owns the
+        # refresh loop daemon-wide. Single writer = no multi-process
+        # rotation race on Anthropic's single-use refresh tokens.
 
         # Server-side status reporter: own heartbeat task; begin_turn /
         # end_turn fire inline from on_message via this closure. Falls
@@ -995,7 +938,6 @@ class Worker:
             reporter = _NoopReporter()  # type: ignore[assignment]
 
         hb_task = asyncio.ensure_future(heartbeat())
-        refresh_task = asyncio.ensure_future(credential_refresh())
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
         try:
             while not self._stop.is_set():
@@ -1028,9 +970,8 @@ class Worker:
         finally:
             reporter.stop()
             hb_task.cancel()
-            refresh_task.cancel()
             status_task.cancel()
-            for task in (hb_task, refresh_task, status_task):
+            for task in (hb_task, status_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):

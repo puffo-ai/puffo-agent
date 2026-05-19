@@ -16,12 +16,16 @@ import shutil
 import signal
 import time
 
+from pathlib import Path
+
 from .api import start_api_server, stop_api_server
+from .credential_refresh import CredentialRefresher
 from .data_service import start_data_service, stop_data_service
 from .state import (
     AgentConfig,
     DaemonConfig,
     agent_dir,
+    agent_home_dir,
     agents_dir,
     archive_flag_path,
     archived_dir,
@@ -49,6 +53,10 @@ class Daemon:
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
+        # PUF-221: daemon owns Claude OAuth refresh — single writer to
+        # the host .credentials.json so Anthropic's single-use refresh
+        # token rotation can't be raced by N agent workers.
+        self.refresher = CredentialRefresher(host_home=Path.home())
 
     async def run(self) -> None:
         logger.info("puffo-agent portal starting; home=%s", home_dir())
@@ -61,6 +69,9 @@ class Daemon:
         # failure — the daemon's primary job is still running agents.
         api_runner = await start_api_server(self.daemon_cfg.bridge)
         data_runner = await start_data_service(self.daemon_cfg.data_service)
+        refresher_task = asyncio.ensure_future(
+            self.refresher.run_loop(self._stop)
+        )
 
         try:
             while not self._stop.is_set():
@@ -84,6 +95,11 @@ class Daemon:
                     pass
         finally:
             await self._stop_all_workers()
+            refresher_task.cancel()
+            try:
+                await refresher_task
+            except (asyncio.CancelledError, Exception):
+                pass
             await stop_api_server(api_runner)
             await stop_data_service(data_runner)
             clear_daemon_pid()
@@ -153,6 +169,7 @@ class Daemon:
                     logger.info("agent %s: starting worker", agent_id)
                     worker = Worker(self.daemon_cfg, agent_cfg)
                     self.workers[agent_id] = worker
+                    self.refresher.register_agent(agent_home_dir(agent_id))
                     worker.start()
                     # Serialise heavy startup: ``adapter.warm()`` reads
                     # the persisted session into Node's heap, so N
@@ -164,6 +181,7 @@ class Daemon:
                     await self._stop_worker(agent_id)
                     worker = Worker(self.daemon_cfg, agent_cfg)
                     self.workers[agent_id] = worker
+                    self.refresher.register_agent(agent_home_dir(agent_id))
                     worker.start()
                     await worker.wait_warm(timeout=self._warm_serialise_timeout)
                 else:
@@ -178,6 +196,7 @@ class Daemon:
     async def _stop_worker(self, agent_id: str) -> None:
         worker = self.workers.pop(agent_id, None)
         if worker is not None:
+            self.refresher.unregister_agent(agent_home_dir(agent_id))
             await worker.stop()
 
     async def _stop_all_workers(self) -> None:
