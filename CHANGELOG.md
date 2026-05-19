@@ -77,13 +77,129 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   resolution stack for little real benefit given the server is
   authoritative for membership state anyway).
 
+### Changed
+
+- **MCP tool surface for channel discovery is now three explicit
+  tools instead of one implicitly-cross-space `list_channels`.**
+
+  - `list_spaces()` — every space the agent is a member of.
+    `GET /spaces` is server-filtered, so the result reflects
+    authoritative permissions: anything in the list is a space
+    the agent can write to.
+  - `list_channels_in_space(space_id)` — channels in one named
+    space. `space_id` is required (empty → MCP tool error) so
+    the LLM can't accidentally fall back on the legacy
+    `cfg.space_id` for routing.
+  - `list_channels_in_all_spaces()` — convenience: walks
+    `GET /spaces` plus one `GET /spaces/<sp>/channels` per
+    space, grouped output. Same behaviour as the old
+    `list_channels` cross-space rewrite, renamed for clarity.
+
+  The old `list_channels` walked `cfg.space_id`'s event stream
+  and returned `(no space configured)` when that field was
+  empty, both of which made it impossible for an agent
+  operating in multiple spaces to enumerate its true channel
+  surface. Three-tool split gives the LLM precise vocabulary
+  for "which spaces" vs "which channels in space X" and removes
+  the last MCP-surface dependency on `cfg.space_id`. Primer
+  (`shared_content.py`), tool allowlist (`mcp/config.py`), and
+  log-message tool-name examples (`local_cli.py` /
+  `docker_cli.py`) are all updated to point at the new names.
+
+### Hardened
+
+- **`send_fallback_message` no longer silently routes to
+  `self.space_id` on cache miss.** The daemon's reply-when-LLM-
+  skipped-`send_message` path used to fall back to the legacy
+  home space when the in-memory channel→space map didn't have
+  the inbound channel — under cross-space deployments or after
+  a kick/cascade that evicted the cache, that sent the reply
+  to the wrong space (server 403) or worse to a space the
+  agent had just been removed from. Now drops the reply with a
+  clear log line; legacy `self.space_id` slot stays in the
+  constructor but no code path consults it for routing.
+
+- **Membership-exit eviction now drops the persistent
+  `channel_space_map` rows too, not just the in-memory cache.**
+  The MCP subprocess reads `channel_space_map` via
+  `lookup_channel_space` to resolve `send_message` targets;
+  the 0.8.7 in-memory `_evict_*_caches` left those rows in
+  place, so after a kick/cascade the LLM would resolve a
+  channel it had been evicted from to the old space, pay a
+  round-trip, and get a 403. Added
+  `MessageStore.unmark_channel_space` and
+  `unmark_channel_space_for_space`; wired into both eviction
+  helpers (now async). Errors are logged + swallowed so a
+  transient DB hiccup never blocks the visible WS-handler
+  reaction.
+
+### Fixed
+
+- **`list_channel_members(channel)` returns the right space's
+  roster across cross-space membership.** Previously hardcoded
+  the URL with `cfg.space_id` regardless of where the channel
+  actually lived; cross-space callers got the wrong roster, a
+  404, or a 403. Now resolves the channel→space mapping from
+  the event-driven cache (see "Added" below) and round-trips
+  to the channel's actual parent space.
+
+- **`send_message` / `send_message_with_attachments` resolve the
+  target space from the event-driven cache, not a multi-call
+  walk over `/spaces` + `/spaces/<sp>/channels`.** The pre-fix
+  resolver was both slow (worst-case N+1 round-trips) and racy
+  (channel might not be in the per-space listing yet when the
+  AcceptChannelInvite has just been committed). Misses now
+  raise a clear MCP error rather than silently falling back to
+  `cfg.space_id`.
+
+### Added
+
+- **Membership events feed the channel→space cache so the agent
+  can address a freshly-joined channel before the first inbound
+  message lands on it.** `_handle_event` now records the
+  `(channel_id, space_id)` pair from `invite_to_channel` (when
+  the agent is the invitee), `accept_channel_invite` (when the
+  agent is the signer), and `create_channel` (always — the
+  server only fans `create_channel` to space members).
+  `_accept_invite` also writes the mapping synchronously after
+  posting the accept so the immediately-following intro-nudge
+  send doesn't race the WS echo back.
+
+- **Agent now reacts to space/channel membership-exit events on the
+  WS push.** Before this release the WS event router (`_handle_event`
+  in `puffo_core_client.py`) only handled `invite_to_space` /
+  `invite_to_channel` / the synthetic auto-accept
+  `accept_channel_invite`. Every other event kind was silently
+  dropped, so when the agent was removed from a space or kicked from
+  a channel its caches and outbound queues stayed stale until the
+  next reconnect / poll, and the operator got no notification about
+  what changed.
+
+  Pairs with `puffo-server` review/events (PR #74) which now
+  broadcasts these events to the affected slug too via the
+  `extra_ws_targets` union (otherwise the agent would never see
+  them — by the time the post-loop fan-out runs, the engine has
+  already removed it from the member set).
+
 ### Tests
 
-14 new pytest tests in `tests/test_membership_events.py` covering
-each handler's happy path, ignore-when-not-target, cache eviction
-contents, operator DM text, the synthetic-cascade re-check
-behavior (still-member / confirmed-gone / network-failure), and
-the `operator_slug = ""` early-provisioning case.
+40+ new pytest tests across:
+
+- `tests/test_membership_events.py` — 16 tests covering each
+  exit-event handler's happy path, ignore-when-not-target,
+  cache eviction contents (in-memory + persistent), operator
+  DM text, the synthetic-cascade re-check behavior, and the
+  `operator_slug = ""` early-provisioning case.
+- `tests/test_puffo_core_tools.py` — 10 tests for the new
+  three-tool surface plus the existing
+  `_handle_event` cache-admission tests (admission per event
+  kind + signer gate, `send_message` / `list_channel_members`
+  cache-miss raises).
+- `tests/test_channel_intro_nudge.py` — cache-admission tests
+  for the synthetic auto-accept path and the `create_channel`
+  / `invite_to_channel` mapping recording.
+- `tests/test_worker_integration.py` — pin
+  `send_fallback_message` drop-on-unknown-channel behavior.
 
 ## [0.8.6] — 2026-05-18
 
