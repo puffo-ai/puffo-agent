@@ -42,8 +42,8 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_valid_agent_id,
-    link_host_credentials,
     read_daemon_pid,
+    write_refresh_token_request,
     write_stop_request,
 )
 
@@ -619,108 +619,36 @@ def _summarise_credentials(path: Path) -> str:
     )
 
 
-def cmd_agent_refresh_ping(args: argparse.Namespace) -> int:
-    """Run the OAuth refresh one-shot against a cli-local agent and
-    print everything observable (credentials before/after, full
-    subprocess output) for reproducible diagnosis."""
-    agent_id = args.id
-    if not agent_yml_path(agent_id).exists():
-        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
-        return 2
-    cfg = AgentConfig.load(agent_id)
-    if cfg.runtime.kind != "cli-local":
+def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
+    """PUF-221: ask the daemon to refresh Claude's OAuth token and
+    distribute the new credentials to every agent.
+
+    Writes the ``refresh-token`` flag file; the daemon picks it up
+    on its next reconcile tick, wakes the credential refresher, runs
+    one ``claude --print "ok"`` against the host credentials, and
+    fans ``link_host_credentials`` to every registered agent home.
+    Single writer (daemon) = no multi-process race on Anthropic's
+    single-use refresh tokens.
+    """
+    if not is_daemon_alive():
         print(
-            f"error: refresh-ping only supports cli-local "
-            f"(agent {agent_id!r} is {cfg.runtime.kind!r}).",
+            "error: puffo-agent daemon is not running. start it with "
+            "`puffo-agent start`.",
             file=sys.stderr,
         )
         return 2
-
-    home_override = agent_home_dir(agent_id)
-    agent_creds = home_override / ".claude" / ".credentials.json"
     host_creds = Path.home() / ".claude" / ".credentials.json"
-    workspace = Path(cfg.resolve_workspace_dir())
-
-    print(f"agent: {agent_id}  runtime: {cfg.runtime.kind}  model: {cfg.runtime.model or '(default)'}")
-    print(f"agent HOME override: {home_override}")
-    print(f"workspace:           {workspace}")
+    print("host credentials:")
+    print(f"  {host_creds}")
+    print(f"  {_summarise_credentials(host_creds)}")
     print()
-    print("Before link:")
-    print(f"  agent {agent_creds}")
-    print(f"        {_summarise_credentials(agent_creds)}")
-    print(f"  host  {host_creds}")
-    print(f"        {_summarise_credentials(host_creds)}")
-    print()
-
-    # Mirror LocalCLIAdapter._verify() so the diagnostic matches
-    # production starting conditions.
-    link_mode = link_host_credentials(Path.home(), home_override)
-    print(f"link_host_credentials -> {link_mode}")
-    print("After link:")
-    print(f"  agent {agent_creds}")
-    print(f"        {_summarise_credentials(agent_creds)}")
-    print()
-
-    if shutil.which("claude") is None:
-        print("error: claude binary not on PATH", file=sys.stderr)
-        return 2
-
-    cmd = [
-        "claude", "--dangerously-skip-permissions",
-        "--print", "--max-turns", "1",
-        "--output-format", "stream-json", "--verbose",
-    ]
-    if cfg.runtime.model:
-        cmd.extend(["--model", cfg.runtime.model])
-    cmd.append("ok")
-
-    env = {
-        **os.environ,
-        "HOME": str(home_override),
-        "USERPROFILE": str(home_override),
-    }
-
-    print(f"running: {' '.join(cmd)}")
-    print(f"  cwd={workspace}")
-    print(f"  HOME={home_override}  USERPROFILE={home_override}")
-    print()
-
-    started = time.time()
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(workspace),
-            env=env,
-            capture_output=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.time() - started
-        print(f"timed out after {elapsed:.1f}s", file=sys.stderr)
-        if exc.stdout:
-            print("--- stdout ---")
-            print(exc.stdout.decode("utf-8", errors="replace"))
-        if exc.stderr:
-            print("--- stderr ---")
-            print(exc.stderr.decode("utf-8", errors="replace"))
-        return 3
-    elapsed = time.time() - started
-
-    print(f"rc={proc.returncode}  elapsed={elapsed:.1f}s")
-    print()
-    print("--- stdout ---")
-    stdout = proc.stdout.decode("utf-8", errors="replace")
-    print(stdout or "(empty)")
-    print()
-    print("--- stderr ---")
-    stderr = proc.stderr.decode("utf-8", errors="replace")
-    print(stderr or "(empty)")
-    print()
-    print("After:")
-    print(f"  agent {agent_creds}")
-    print(f"        {_summarise_credentials(agent_creds)}")
-    print(f"  host  {host_creds}")
-    print(f"        {_summarise_credentials(host_creds)}")
+    write_refresh_token_request()
+    print("refresh request written; daemon will pick it up on its "
+          "next reconcile tick (typically <1s).")
+    print(
+        f"after a few seconds, re-check {host_creds} mtime + "
+        "expiresAt to confirm the refresh landed."
+    )
     return 0
 
 
@@ -1432,16 +1360,16 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("id")
     resume.set_defaults(func=cmd_agent_resume)
 
-    refresh_ping = agent_sub.add_parser(
-        "refresh-ping",
+    refresh_token = agent_sub.add_parser(
+        "refresh-token",
         help=(
-            "Diagnostic: run the OAuth refresh one-shot against a "
-            "cli-local agent and print credentials before/after + "
-            "full subprocess output."
+            "Ask the daemon to refresh Claude's OAuth token and "
+            "distribute the new credentials to every agent. Single "
+            "writer (daemon) — no per-agent race on the on-disk "
+            "refresh token."
         ),
     )
-    refresh_ping.add_argument("id")
-    refresh_ping.set_defaults(func=cmd_agent_refresh_ping)
+    refresh_token.set_defaults(func=cmd_agent_refresh_token)
 
     runtime = agent_sub.add_parser(
         "runtime",

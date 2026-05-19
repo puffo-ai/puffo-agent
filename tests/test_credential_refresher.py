@@ -250,3 +250,33 @@ def test_run_loop_wakes_early_on_refresh_request(tmp_path, monkeypatch):
     wake_latency = refreshes[0] - started
     # Conservative bound: should wake within 1s of the event.
     assert wake_latency < 1.0, f"wake_latency={wake_latency:.3f}s — event didn't short-circuit poll"
+
+
+# ── refresh-token flag round-trip (CLI ↔ daemon sentinel) ──────
+
+
+def test_refresh_token_request_flag_round_trip(tmp_path, monkeypatch):
+    """``puffo-agent agent refresh-token`` writes the sentinel
+    ``write_refresh_token_request()``; the daemon's reconcile loop
+    detects via ``refresh_token_request_path().exists()`` and clears
+    via ``clear_refresh_token_request()``. Round-trip should be
+    consistent and idempotent."""
+    from puffo_agent.portal.state import (
+        clear_refresh_token_request,
+        refresh_token_request_path,
+        write_refresh_token_request,
+    )
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+
+    assert not refresh_token_request_path().exists()
+    write_refresh_token_request()
+    assert refresh_token_request_path().exists()
+    # The payload is the unix ts at write time — readable as an int.
+    assert refresh_token_request_path().read_text().isdigit()
+
+    clear_refresh_token_request()
+    assert not refresh_token_request_path().exists()
+    # Clearing a missing flag is idempotent (daemon may catch a stale
+    # flag on next tick after it was already cleared).
+    clear_refresh_token_request()
+    assert not refresh_token_request_path().exists()

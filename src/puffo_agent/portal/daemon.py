@@ -30,12 +30,14 @@ from .state import (
     archive_flag_path,
     archived_dir,
     clear_daemon_pid,
+    clear_refresh_token_request,
     clear_stop_request,
     delete_flag_path,
     discover_agents,
     home_dir,
     is_daemon_alive,
     read_daemon_pid,
+    refresh_token_request_path,
     restart_flag_path,
     stop_request_path,
     write_daemon_pid,
@@ -89,6 +91,14 @@ class Daemon:
                     )
                     self._stop.set()
                     break
+                # PUF-221: ``puffo-agent agent refresh-token`` flag —
+                # wake the credential refresher so the operator can
+                # force a refresh + fan-out without waiting for the
+                # 2-min poll.
+                if refresh_token_request_path().exists():
+                    logger.info("refresh-token sentinel detected; notifying refresher")
+                    self.refresher.notify_refresh_needed()
+                    clear_refresh_token_request()
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=interval)
                 except asyncio.TimeoutError:

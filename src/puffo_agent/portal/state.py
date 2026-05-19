@@ -1142,6 +1142,28 @@ def clear_stop_request() -> None:
             pass
 
 
+def refresh_token_request_path() -> Path:
+    """PUF-221: file sentinel ``puffo-agent agent refresh-token``
+    writes to ask the daemon to run an OAuth refresh + fan view-sync
+    to every agent. Daemon's reconcile loop picks it up and clears."""
+    return home_dir() / ".refresh_token_requested"
+
+
+def write_refresh_token_request() -> None:
+    path = refresh_token_request_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(int(time.time())), encoding="utf-8")
+
+
+def clear_refresh_token_request() -> None:
+    path = refresh_token_request_path()
+    if path.exists():
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Atomic YAML write
 # ─────────────────────────────────────────────────────────────────────────────
