@@ -560,94 +560,115 @@ async def test_get_thread_history_empty_window():
 
 
 @pytest.mark.asyncio
-async def test_list_channels():
-    """Channels come from ``/spaces/<sp>/events`` replay — there's no
-    standalone channels endpoint on puffo-server."""
+async def test_list_channels_enumerates_all_spaces():
+    """The tool now walks every space the agent is a member of, not
+    just ``cfg.space_id``. Server-filtered ``GET /spaces`` returns
+    the actual membership; per-space ``GET /spaces/<sp>/channels``
+    enumerates the channels with one round-trip each."""
     cfg, http, ms = _setup()
-    http.responses["/spaces/sp_test/events"] = {
-        "events": [
-            {"kind": "create_space", "payload": {"space_id": "sp_test", "name": "Test"}},
-            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
-            {"kind": "create_channel", "payload": {"channel_id": "ch_2", "name": "Random"}},
-            {"kind": "invite_to_space", "payload": {"invitee_slug": "alice-0001"}},
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_team", "name": "Team"},
+            {"space_id": "sp_other", "name": "Other"},
         ],
-        "has_more": False,
+    }
+    http.responses["/spaces/sp_team/channels"] = {
+        "channels": [
+            {"channel_id": "ch_g_team", "name": "General", "is_public": True},
+            {"channel_id": "ch_rand", "name": "Random", "is_public": False},
+        ],
+    }
+    http.responses["/spaces/sp_other/channels"] = {
+        "channels": [
+            {"channel_id": "ch_g_other", "name": "General", "is_public": True},
+        ],
     }
     mcp = _build_tools(cfg)
     result = await _call(mcp, "list_channels")
-    assert "General" in result
-    assert "Random" in result
-    assert "ch_1" in result
-    assert "ch_2" in result
+
+    # Both spaces named, grouped, with all their channels.
+    assert "sp_team" in result and "Team" in result
+    assert "sp_other" in result and "Other" in result
+    assert "ch_g_team" in result and "ch_rand" in result
+    assert "ch_g_other" in result
+    # One /spaces + one /spaces/<sp>/channels per space.
+    assert ("GET", "/spaces", None) in http.calls
+    assert ("GET", "/spaces/sp_team/channels", None) in http.calls
+    assert ("GET", "/spaces/sp_other/channels", None) in http.calls
 
 
 @pytest.mark.asyncio
-async def test_list_channels_paginates_via_since():
-    """``list_channels`` walks ``/spaces/<sp>/events`` page-by-page
-    using ``?since=<next_cursor>``. Guards against a regression of
-    the ``?cursor=`` bug — the server's axum extractor silently
-    ignored the wrong-named key, so paginated calls re-fetched the
-    first page forever and the tool never returned."""
+async def test_list_channels_returns_empty_message_with_no_spaces():
+    """Agent not in any space (new install, fully cascaded out) —
+    no /spaces/<sp>/channels round-trips at all."""
     cfg, http, ms = _setup()
-    # Page 1: one channel + cursor pointing at page 2.
-    http.responses["/spaces/sp_test/events"] = {
-        "events": [
-            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
-        ],
-        "has_more": True,
-        "next_cursor": "cursor_page2",
-    }
-    # Page 2: second channel + end of stream. Registered against the
-    # exact ``?since=`` URL so a regression to ``?cursor=`` would miss
-    # this entry and fall back to page 1 (loop forever).
-    http.responses["/spaces/sp_test/events?since=cursor_page2"] = {
-        "events": [
-            {"kind": "create_channel", "payload": {"channel_id": "ch_2", "name": "Random"}},
-        ],
-        "has_more": False,
-    }
+    http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
     result = await _call(mcp, "list_channels")
 
-    assert "General" in result
-    assert "ch_1" in result
-    assert "Random" in result
-    assert "ch_2" in result
-
-    events_calls = [c for c in http.calls if c[1].startswith("/spaces/sp_test/events")]
-    # Exactly two requests: page 1 (no query) + page 2 (?since=).
-    assert len(events_calls) == 2, events_calls
-    assert events_calls[0][1] == "/spaces/sp_test/events"
-    assert "?since=cursor_page2" in events_calls[1][1]
+    assert "not a member" in result
+    # No per-space round-trip — bail after the empty /spaces list.
+    per_space_calls = [c for c in http.calls if "/channels" in c[1]]
+    assert per_space_calls == []
 
 
 @pytest.mark.asyncio
-async def test_list_channels_bails_on_stuck_cursor():
-    """If the server ever regresses and returns the same cursor it
-    was just sent, the tool must stop instead of spinning. Mirrors
-    the strict-advance guard in ``fetchChannelsFromEvents``
-    (web) and ``_resolve_channel_name`` (this package)."""
+async def test_list_channels_ignores_cfg_space_id():
+    """Req 3 / FB diagnostic: ``cfg.space_id`` is legacy metadata and
+    must not gate the LLM's view. An agent with ``cfg.space_id``
+    pointing at a space it IS NOT in must still see channels in the
+    spaces it IS in. Pre-fix would have walked
+    ``/spaces/sp_legacy/events`` (404 or empty) and returned
+    ``(no channels in this space)``."""
     cfg, http, ms = _setup()
-    # Both the initial and the ``?since=stuck`` request hand back
-    # the same ``next_cursor`` — a real regression would loop, the
-    # guarded loop bails after the second fetch.
-    page = {
-        "events": [
-            {"kind": "create_channel", "payload": {"channel_id": "ch_1", "name": "General"}},
-        ],
-        "has_more": True,
-        "next_cursor": "stuck",
+    cfg.space_id = "sp_legacy_not_a_member"  # explicit miss
+    http.responses["/spaces"] = {
+        "spaces": [{"space_id": "sp_real", "name": "Real"}],
     }
-    http.responses["/spaces/sp_test/events"] = page
-    http.responses["/spaces/sp_test/events?since=stuck"] = page
+    http.responses["/spaces/sp_real/channels"] = {
+        "channels": [
+            {"channel_id": "ch_only", "name": "general"},
+        ],
+    }
     mcp = _build_tools(cfg)
     result = await _call(mcp, "list_channels")
 
-    assert "General" in result
-    events_calls = [c for c in http.calls if c[1].startswith("/spaces/sp_test/events")]
-    # Two calls: initial, then one with ``?since=stuck`` whose
-    # ``next_cursor`` is also ``stuck`` — the guard breaks the loop.
-    assert len(events_calls) == 2, events_calls
+    assert "ch_only" in result
+    assert "sp_real" in result
+    # Never reached the legacy path.
+    legacy_calls = [
+        c for c in http.calls
+        if "sp_legacy_not_a_member" in c[1]
+    ]
+    assert legacy_calls == [], (
+        f"expected no calls into cfg.space_id, got {legacy_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_channels_tolerates_per_space_string_response():
+    """Tight race after AcceptSpaceInvite: ``GET /spaces/<sp>/channels``
+    returns the SPA-route HTML stub (decoded as ``str``) before the
+    materialiser commits. Treat as "no channels yet" rather than
+    crashing the tool."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_a", "name": "A"},
+            {"space_id": "sp_b", "name": "B"},
+        ],
+    }
+    http.responses["/spaces/sp_a/channels"] = ""  # racy / unhealthy
+    http.responses["/spaces/sp_b/channels"] = {
+        "channels": [{"channel_id": "ch_x", "name": "general"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels")
+
+    # sp_a present, but empty-channels marker; sp_b lists its channel.
+    assert "sp_a" in result
+    assert "(no channels)" in result
+    assert "ch_x" in result
 
 
 @pytest.mark.asyncio

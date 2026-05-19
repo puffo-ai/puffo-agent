@@ -54,6 +54,23 @@ def _make_client(
     client._processed_invite_ids = set()
     client._pending_invite_dms = {}
 
+    # _evict_*_caches now also drops persistent ``channel_space_map``
+    # rows so the MCP subprocess's send_message tool doesn't keep
+    # resolving channels we've been evicted from. The harness
+    # doesn't open a real MessageStore, so stub the two methods the
+    # eviction path uses and capture invocations for assertions.
+    unmark_calls: dict[str, list] = {"space": [], "channel": []}
+
+    class _StubStore:
+        async def unmark_channel_space(self, channel_id: str) -> None:
+            unmark_calls["channel"].append(channel_id)
+
+        async def unmark_channel_space_for_space(self, space_id: str) -> None:
+            unmark_calls["space"].append(space_id)
+
+    client.store = _StubStore()
+    client._unmark_calls = unmark_calls  # type: ignore[attr-defined]
+
     sent: list[dict] = []
 
     async def _stub_send_dm(recipient_slug: str, text: str, root_id: str) -> dict | None:
@@ -422,6 +439,55 @@ async def test_cancel_invite_with_no_outstanding_dm_is_noop():
 
 
 # ─── operator_slug unset ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_evict_space_caches_clears_persistent_channel_space_map():
+    """RemoveFromSpace / synthetic cascade evicts the persistent
+    ``channel_space_map`` rows too, not just the in-memory caches.
+    Without this the MCP subprocess's ``lookup_channel_space`` would
+    keep handing the LLM a space the agent's been evicted from."""
+    client, sent = _make_client()
+    client._channel_space["ch_1"] = "sp_1"
+    client._channel_space["ch_other"] = "sp_2"
+
+    event = {
+        "kind": "remove_from_space",
+        "signer_slug": "alice-0001",
+        "payload": {"space_id": "sp_1", "removed_slug": "agent-1"},
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    # In-memory + persistent both touched, scoped to sp_1.
+    assert "ch_1" not in client._channel_space
+    assert client._channel_space.get("ch_other") == "sp_2"
+    assert client._unmark_calls["space"] == ["sp_1"]
+    assert client._unmark_calls["channel"] == []
+
+
+@pytest.mark.asyncio
+async def test_evict_channel_caches_clears_single_persistent_row():
+    """RemoveFromChannel only drops the single channel's mapping,
+    leaving siblings in the same space alone."""
+    client, sent = _make_client()
+    client._channel_space["ch_priv"] = "sp_1"
+    client._channel_space["ch_other"] = "sp_1"
+
+    event = {
+        "kind": "remove_from_channel",
+        "signer_slug": "alice-0001",
+        "payload": {
+            "space_id": "sp_1",
+            "channel_id": "ch_priv",
+            "removed_slug": "agent-1",
+        },
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert "ch_priv" not in client._channel_space
+    assert client._channel_space.get("ch_other") == "sp_1"
+    assert client._unmark_calls["channel"] == ["ch_priv"]
+    assert client._unmark_calls["space"] == []
 
 
 @pytest.mark.asyncio

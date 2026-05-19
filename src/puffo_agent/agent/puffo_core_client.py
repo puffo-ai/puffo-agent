@@ -1285,27 +1285,51 @@ class PuffoCoreMessageClient:
             return
         await self.store.mark_channel_space(channel_id, space_id)
 
-    def _evict_space_caches(self, space_id: str) -> None:
+    async def _evict_space_caches(self, space_id: str) -> None:
         """Drop every cached entry tied to a space we've left/been
-        kicked from. The membership server is authoritative so
-        we don't need this to stay correct — leaving stale entries
-        just risks the agent racing to send into a space it isn't
-        in (server 403s, worker logs a confusing failure). Reverse-
-        scans ``_channel_space`` for channels mapped to this space."""
+        kicked from. Two layers:
+
+          1. In-memory ``_channel_space`` / name caches consumed by
+             the daemon's send paths (e.g. ``send_fallback_message``).
+          2. The persistent ``channel_space_map`` table consumed by
+             the MCP subprocess via ``lookup_channel_space`` — without
+             evicting this too, the LLM's ``send_message`` would
+             happily resolve a channel we're no longer in and pay
+             one round-trip just to get the server's 403.
+
+        Reverse-scans ``_channel_space`` for the in-memory side;
+        the persistent layer takes a ``DELETE WHERE space_id = ?``."""
         if not space_id:
             return
         for cid in [c for c, s in self._channel_space.items() if s == space_id]:
             self._channel_space.pop(cid, None)
             self._channel_name_cache.pop(cid, None)
         self._space_name_cache.pop(space_id, None)
+        try:
+            await self.store.unmark_channel_space_for_space(space_id)
+        except Exception:
+            logger.exception(
+                "unmark_channel_space_for_space failed for sp=%s "
+                "(non-fatal — in-memory eviction already ran)",
+                space_id,
+            )
 
-    def _evict_channel_caches(self, channel_id: str) -> None:
+    async def _evict_channel_caches(self, channel_id: str) -> None:
         """Smaller-scope twin of ``_evict_space_caches`` for the
-        per-channel kick paths."""
+        per-channel kick paths. Same two-layer eviction (in-memory
+        + persistent map)."""
         if not channel_id:
             return
         self._channel_space.pop(channel_id, None)
         self._channel_name_cache.pop(channel_id, None)
+        try:
+            await self.store.unmark_channel_space(channel_id)
+        except Exception:
+            logger.exception(
+                "unmark_channel_space failed for ch=%s "
+                "(non-fatal — in-memory eviction already ran)",
+                channel_id,
+            )
 
     async def _dm_operator_membership_change(self, text: str) -> None:
         """Best-effort operator notification on membership exit. No-op
@@ -1354,7 +1378,7 @@ class PuffoCoreMessageClient:
             )
             return
         space_label = await self._resolve_space_name(space_id)
-        self._evict_space_caches(space_id)
+        await self._evict_space_caches(space_id)
         reason = (
             "your space exit cascaded to me"
             if synthetic else "I signed a LeaveSpace"
@@ -1397,7 +1421,7 @@ class PuffoCoreMessageClient:
         if not space_id:
             return
         space_label = await self._resolve_space_name(space_id)
-        self._evict_space_caches(space_id)
+        await self._evict_space_caches(space_id)
         kicker_display = (
             await self._fetch_display_name(kicker_slug) if kicker_slug else ""
         )
@@ -1415,7 +1439,7 @@ class PuffoCoreMessageClient:
         avoid noise. Cache cleanup still runs."""
         if not channel_id:
             return
-        self._evict_channel_caches(channel_id)
+        await self._evict_channel_caches(channel_id)
 
     async def _on_kicked_from_channel(
         self, *, channel_id: str, space_id: str, kicker_slug: str,
@@ -1427,7 +1451,7 @@ class PuffoCoreMessageClient:
             space_id=space_id, channel_id=channel_id,
         )
         space_label = await self._resolve_space_name(space_id) if space_id else ""
-        self._evict_channel_caches(channel_id)
+        await self._evict_channel_caches(channel_id)
         kicker_display = (
             await self._fetch_display_name(kicker_slug) if kicker_slug else ""
         )
@@ -2376,10 +2400,24 @@ class PuffoCoreMessageClient:
         )
 
         if channel_id:
-            # Channel reply — prefer the space learned from the inbound
-            # envelope (so cross-space channels work) and fall back to
-            # the configured home space.
-            target_space_id = self._channel_space.get(channel_id, self.space_id)
+            # Channel reply — resolve the space from the in-memory
+            # channel→space map (populated by inbound envelopes +
+            # membership events). No silent fallback to
+            # ``self.space_id``: the configured "home" space is
+            # legacy metadata that shouldn't decide where outbound
+            # messages route. If the cache misses, the agent either
+            # hasn't seen this channel yet or has been evicted from
+            # it; either way, sending blindly to a guessed space
+            # gets a 403 or worse (wrong-space cross-talk).
+            target_space_id = self._channel_space.get(channel_id)
+            if not target_space_id:
+                logger.warning(
+                    "send_fallback_message: no known space for channel %s — "
+                    "dropping (agent may have been removed, or the channel "
+                    "id is stale)",
+                    channel_id,
+                )
+                return
             members_resp = await self.http.get(
                 f"/spaces/{target_space_id}/channels/{channel_id}/members"
             )

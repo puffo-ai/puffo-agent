@@ -268,6 +268,39 @@ class MessageStore:
         )
         await db.commit()
 
+    async def unmark_channel_space(self, channel_id: str) -> None:
+        """Drop a single channel→space mapping. Called by the per-
+        channel eviction path (``_on_kicked_from_channel`` /
+        ``_on_left_channel`` in puffo_core_client) so subsequent
+        MCP-tool resolution doesn't keep routing into a channel
+        we're no longer in. Idempotent — non-existent rows are
+        silently skipped."""
+        if not channel_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            "DELETE FROM channel_space_map WHERE channel_id = ?",
+            (channel_id,),
+        )
+        await db.commit()
+
+    async def unmark_channel_space_for_space(self, space_id: str) -> None:
+        """Per-space companion to ``unmark_channel_space`` — drops
+        every channel→space mapping whose space matches. Called by
+        the space-level eviction path (``_on_left_space`` /
+        ``_on_kicked_from_space``) when the agent has been removed
+        from a whole space, so MCP-tool resolution for any of that
+        space's channels fast-fails locally instead of round-tripping
+        the server for a guaranteed-403."""
+        if not space_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            "DELETE FROM channel_space_map WHERE space_id = ?",
+            (space_id,),
+        )
+        await db.commit()
+
     async def get_channel_history(
         self,
         channel_id: str,

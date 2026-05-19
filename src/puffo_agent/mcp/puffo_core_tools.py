@@ -474,45 +474,55 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def list_channels() -> str:
-        """List channels in the agent's configured space (id + name).
+        """List channels in every space the agent is a member of.
 
-        Channels are derived by replaying ``/spaces/<sp>/events`` and
-        surfacing every ``create_channel`` payload — there is no
-        direct ``/spaces/<sp>/channels`` endpoint.
+        Output is grouped by space::
+
+            Space sp_X (Team):
+              - ch_a  general
+              - ch_b  random
+            Space sp_Y (Other):
+              - ch_c  general
+
+        The legacy ``cfg.space_id`` is intentionally NOT consulted:
+        agents operate cross-space (an operator can invite the
+        agent into channels in any space they're also in) and the
+        LLM needs the full membership view to route ``send_message``
+        targets correctly. Walks one ``GET /spaces`` plus one
+        ``GET /spaces/<sp>/channels`` per space — both endpoints
+        are server-filtered to memberships the agent actually has,
+        so the result reflects authoritative permissions.
         """
-        if not cfg.space_id:
-            return "(no space configured)"
-        space_id = cfg.space_id
-        # cursor is ``<issued_at>:<signer_slug>:<event_id>``. Colons
-        # are legal in query strings but encode anyway for safety.
-        cursor: Optional[str] = None
-        prev_cursor: Optional[str] = None
-        channels: list[tuple[str, str]] = []
-        while True:
-            if cursor is not None:
-                path = (
-                    f"/spaces/{space_id}/events"
-                    f"?since={urllib.parse.quote(cursor, safe='')}"
-                )
-            else:
-                path = f"/spaces/{space_id}/events"
-            data = await cfg.http_client.get(path)
-            for entry in data.get("events", []):
-                if entry.get("kind") == "create_channel":
-                    payload = entry.get("payload", {}) or {}
-                    cid = payload.get("channel_id", "")
-                    name = payload.get("name", "")
-                    if cid:
-                        channels.append((cid, name))
-            if not data.get("has_more"):
-                break
-            prev_cursor = cursor
-            cursor = data.get("next_cursor")
-            if cursor is None or cursor == prev_cursor:
-                break
-        if not channels:
-            return "(no channels in this space)"
-        return "\n".join(f"- {cid}  {name}" for cid, name in channels)
+        spaces_data = await cfg.http_client.get("/spaces")
+        spaces_entries = (spaces_data or {}).get("spaces", []) or []
+        if not spaces_entries:
+            return "(no spaces — the agent is not a member of any space)"
+        lines: list[str] = []
+        for sp in spaces_entries:
+            space_id = sp.get("space_id", "")
+            space_name = sp.get("name", "") or space_id
+            if not space_id:
+                continue
+            ch_data = await cfg.http_client.get(
+                f"/spaces/{space_id}/channels"
+            )
+            # The endpoint returns the SPA-route HTML stub (decoded
+            # as ``str``) when called during a tight race against
+            # the materialiser. Treat that as "no channels yet";
+            # the agent will see them on the next call.
+            channels = (
+                ch_data.get("channels", []) if isinstance(ch_data, dict) else []
+            )
+            lines.append(f"Space {space_id} ({space_name}):")
+            if not channels:
+                lines.append("  (no channels)")
+                continue
+            for ch in channels:
+                cid = ch.get("channel_id", "")
+                name = ch.get("name", "") or cid
+                if cid:
+                    lines.append(f"  - {cid}  {name}")
+        return "\n".join(lines) if lines else "(no channels)"
 
     @mcp.tool()
     async def list_channel_members(channel: str) -> str:
