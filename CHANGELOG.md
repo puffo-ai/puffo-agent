@@ -4,6 +4,59 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0b1] — 2026-05-19
+
+_Pre-release published to TestPyPI only — not for general install._
+
+Beta-promote of `0.9.0a3` with the post-review polish folded in.
+Code is unchanged from the architectural pass; this is the first
+version intended for macOS-colleague verification.
+
+### Polished (from PR #20 review)
+
+- **`portal/credential_refresh.py`**: dropped the unconditional
+  top-level import of `KEYCHAIN_POLL_INTERVAL_SECONDS` from the
+  macos package. Now lazy-imported inside `_external_rotation_loop`,
+  matching every other macos touchpoint in the file. The
+  platform-agnostic module no longer pulls the macos package into
+  its import graph on Linux/Windows.
+
+- **`portal/credential_refresh.py`**: restored the `cwd=host_home`
+  justification comment in `FileBackend.refresh` that was
+  accidentally dropped in the 0.9.0a3 backend-abstraction port.
+  The choice is non-obvious — `claude --print` writes project-
+  transcript files into cwd, so pointing it at the daemon's launch
+  directory would leak them. Mirror of the rationale that landed in
+  PUF-221 PR #32 round 4.
+
+- **`agent/adapters/local_cli.py`**: adapter spawn no longer
+  re-installs the PATH shim on every worker spawn. `KeychainBackend.
+  bootstrap()` already runs `install_path_shim` once at daemon
+  start; the adapter now just computes `shim_dir(home_dir())` for
+  the env var. Removes per-spawn `write_text` + `chmod` overhead and
+  closes a concurrent-spawn write-write race the bootstrap path
+  doesn't have.
+
+- **`portal/diagnostic.py`**: noted in code that the `#37512` repro
+  probe (the only place we deliberately set `CLAUDE_CODE_OAUTH_TOKEN
+  =<real token>`) makes the token briefly visible to `ps auxe` for
+  the duration of the claude subprocess. Intentional — the probe's
+  whole purpose is to reproduce that issue — but worth surfacing for
+  anyone running on a shared host.
+
+- **`portal/diagnostic.py` + `macos/keychain.py`**: paired
+  ``keep in sync`` warnings on `_run_sandboxed_claude_oneshot`
+  (sync, diagnostic-side) and `refresh_via_oneshot` (async,
+  production-side). They share env shape + claude args; the
+  diagnostic loses its load-bearing value the moment they drift.
+
+- **`portal/diagnostic.py`** module docstring: stale
+  `puffo_agent.macos.credential_manager` → `puffo_agent.macos.keychain`
+  (one-word swap, the post-rebase module path).
+
+Tests unchanged: **726 passed / 7 skipped / 0 failed** locally on
+Windows.
+
 ## [0.9.0a3] — 2026-05-19
 
 _Pre-release published to TestPyPI only — not for general install._
