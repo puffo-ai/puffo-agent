@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 
 from ...macos.keychain import (
-    install_path_shim,
     is_macos,
     shim_dir,
 )
@@ -252,7 +251,13 @@ class LocalCLIAdapter(Adapter):
         """
         if not is_macos():
             return {}
-        shim_path = install_path_shim(home_dir())
+        # Just compute the shim path — ``KeychainBackend.bootstrap()``
+        # installed the actual script once at daemon start
+        # (credential_refresh.py → keychain.install_path_shim).
+        # Re-installing on every adapter spawn would be wasted I/O
+        # and would race on the same file path when two workers spawn
+        # concurrently.
+        shim_path = shim_dir(home_dir())
         existing_path = os.environ.get("PATH", "")
         return {
             "CLAUDE_CONFIG_DIR": str(Path(self.agent_home_dir) / ".claude"),

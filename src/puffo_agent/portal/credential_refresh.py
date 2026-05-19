@@ -68,10 +68,6 @@ REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
-# Re-export from macos.keychain for callers that want the constant
-# without importing the macos package directly.
-from ..macos.keychain import KEYCHAIN_POLL_INTERVAL_SECONDS  # noqa: E402
-
 
 class RefreshOutcome(enum.Enum):
     """Result of a single backend refresh attempt."""
@@ -151,6 +147,11 @@ class FileBackend:
         ]
         started = time.time()
         try:
+            # cwd=host_home so claude's project-resolution doesn't
+            # drift into the daemon's launch directory (which is
+            # whatever the operator ran `puffo-agent start` from);
+            # the host home is the operator's normal claude
+            # working dir and matches single-process /login UX.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -467,6 +468,12 @@ class CredentialRefresher:
         rotation. Runs as a sibling task to the main run_loop so the
         two cadences don't entangle (file-expiry poll = 2 min;
         external-rotation poll = 5 min)."""
+        # Lazy import — keeps the platform-agnostic module free of a
+        # hard dependency on the macos package, matching the pattern
+        # used inside ``KeychainBackend`` for every other macos
+        # touchpoint.
+        from ..macos.keychain import KEYCHAIN_POLL_INTERVAL_SECONDS
+
         interval = KEYCHAIN_POLL_INTERVAL_SECONDS
         while not stop_event.is_set():
             try:

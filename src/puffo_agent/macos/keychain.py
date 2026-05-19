@@ -333,6 +333,11 @@ async def refresh_via_oneshot(
     ``.credentials.json`` with a fresh token; copy it back to the cache.
 
     Returns (ok, reason_when_not_ok).
+
+    ⚠️ **Keep in sync with** ``portal.diagnostic._run_sandboxed_claude_oneshot``:
+    that probe is a sync mirror of this function so the diagnostic
+    can run without an asyncio event loop. Any env / arg change here
+    must be mirrored there or the probe stops validating prod.
     """
     if not is_macos():
         return (False, "not_macos")

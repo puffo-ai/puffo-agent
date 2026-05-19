@@ -1,7 +1,7 @@
 """``puffo-agent test ...`` — macOS Keychain integration probes.
 
 Designed to be run by a colleague on a real macOS host so we can
-verify the assumptions baked into ``puffo_agent.macos.credential_manager``
+verify the assumptions baked into ``puffo_agent.macos.keychain``
 *before* promoting v0.9.0a* from TestPyPI to PyPI. Each subcommand:
 
   - Returns a structured ``ProbeReport`` (markdown) on stdout.
@@ -249,6 +249,14 @@ def _run_sandboxed_claude_oneshot(
 
     The sandbox dir must already exist. On timeout / claude missing,
     returncode is -1 and stderr describes the failure mode.
+
+    ⚠️ **Keep in sync with** ``macos.keychain.refresh_via_oneshot`` +
+    ``_run_claude_oneshot``: this probe re-implements the same
+    sandbox-HOME dance (``HOME``/``USERPROFILE``/``CLAUDE_CONFIG_DIR``/
+    PATH-shim + identical claude args) synchronously so the diagnostic
+    can run without an asyncio event loop. The diagnostic's
+    load-bearing value evaporates the moment the two drift, so any env
+    or arg change to the production refresh **must** be mirrored here.
     """
     sandbox_claude_dir = sandbox / ".claude"
     sandbox_claude_dir.mkdir(parents=True, exist_ok=True)
@@ -617,6 +625,14 @@ def probe_keychain_survives_token_env() -> ProbeReport:
     )
 
     def _run_oneshot(path_value: str) -> tuple[int, str]:
+        # The token is briefly visible to ``ps auxe`` (and any other
+        # process in the user's ps namespace) while this claude
+        # subprocess runs. Accepted because this probe's whole
+        # purpose is to reproduce anthropics/claude-code#37512,
+        # which only fires when ``CLAUDE_CODE_OAUTH_TOKEN`` is set
+        # — production refresh paths deliberately do NOT set it.
+        # Run on a personal macOS workstation, not a shared host /
+        # CI runner / dev container.
         env = {
             **os.environ,
             "CLAUDE_CODE_OAUTH_TOKEN": access_token,
