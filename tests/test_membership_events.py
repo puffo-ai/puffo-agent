@@ -25,7 +25,11 @@ from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 # ─── Fixture ───────────────────────────────────────────────────────
 
 
-def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, list[dict]]:
+def _make_client(
+    operator_slug: str = "op-1",
+    spaces_response: dict | None = None,
+    spaces_raises: bool = False,
+) -> tuple[PuffoCoreMessageClient, list[dict]]:
     """Bare client with just enough state to exercise the WS router.
 
     Stubs:
@@ -33,6 +37,11 @@ def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, l
       * ``_resolve_space_name`` / ``_resolve_channel_name`` /
         ``_fetch_display_name`` return canonical labels so DM text
         assertions don't depend on /spaces or /identities lookups.
+      * ``self.http`` stubs ``GET /spaces`` per ``spaces_response``
+        (or raises when ``spaces_raises=True``) — drives the
+        ``_still_member_of_space`` check in the synthetic-cascade
+        path. Default returns an empty member list, so by default
+        synthetic-cascade tests see "confirmed gone" and proceed.
 
     Returns the client + a list the stubbed ``_send_dm`` appends to.
     """
@@ -64,6 +73,16 @@ def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, l
     client._resolve_space_name = _stub_space_name  # type: ignore[assignment]
     client._resolve_channel_name = _stub_channel_name  # type: ignore[assignment]
     client._fetch_display_name = _stub_display_name  # type: ignore[assignment]
+
+    class _StubHttp:
+        async def get(self, path: str):
+            if spaces_raises:
+                raise RuntimeError("simulated /spaces failure")
+            if path == "/spaces":
+                return spaces_response or {"spaces": []}
+            return {}
+
+    client.http = _StubHttp()
     return client, sent
 
 
@@ -119,6 +138,85 @@ async def test_leave_space_self_signed_dm_mentions_self_action():
     await client._handle_event(scope="sp_1", event=event)
     assert len(sent) == 1
     assert "signed a LeaveSpace" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_leave_space_synthetic_cascade_ignored_when_still_member():
+    """Defence-in-depth: synthetic events have a server-set marker
+    signature, not a real ed25519 signature. If the server emits a
+    cascade but ``GET /spaces`` still lists us as a member, the
+    cascade contradicts authoritative state — bail out without
+    DMing the operator or evicting caches. Catches buggy server
+    emits, WS redelivery on reconnect, and a malicious server
+    crafting a fake cascade."""
+    client, sent = _make_client(
+        spaces_response={"spaces": [{"space_id": "sp_1", "name": "Team"}]},
+    )
+    client._channel_space["ch_1"] = "sp_1"
+    client._space_name_cache["sp_1"] = "Team"
+
+    event = {
+        "kind": "leave_space",
+        "signer_slug": "agent-1",
+        "signature": "server-auto:agent-cascade-leave-space",
+        "payload": {"space_id": "sp_1"},
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    # Authoritative state wins — caches preserved, operator not DM'd.
+    assert client._channel_space.get("ch_1") == "sp_1"
+    assert "sp_1" in client._space_name_cache
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_leave_space_synthetic_cascade_proceeds_when_spaces_lookup_fails():
+    """The membership re-check is best-effort. If ``GET /spaces``
+    blows up (network, server down), the agent falls through to the
+    normal cleanup rather than blocking on a flake — better to risk
+    a redundant DM than strand the agent in a space it's been
+    cascaded out of."""
+    client, sent = _make_client(spaces_raises=True)
+    client._channel_space["ch_1"] = "sp_1"
+
+    event = {
+        "kind": "leave_space",
+        "signer_slug": "agent-1",
+        "signature": "server-auto:agent-cascade-leave-space",
+        "payload": {"space_id": "sp_1"},
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    # Eviction + DM happen — None ≠ True so the gate falls through.
+    assert "ch_1" not in client._channel_space
+    assert len(sent) == 1
+    assert "cascaded" in sent[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_leave_space_real_signed_self_skips_membership_recheck():
+    """Real (non-synthetic) self-signed LeaveSpace doesn't need the
+    authoritative re-check — the agent's own key signed it, so we
+    aren't second-guessing the server. Wire-shape test: stubbing
+    ``GET /spaces`` to STILL list us would block the path if the
+    check ran; this asserts it doesn't."""
+    client, sent = _make_client(
+        spaces_response={"spaces": [{"space_id": "sp_1", "name": "Team"}]},
+    )
+    client._channel_space["ch_1"] = "sp_1"
+
+    event = {
+        "kind": "leave_space",
+        "signer_slug": "agent-1",
+        "signature": "real-ed25519-sig",
+        "payload": {"space_id": "sp_1"},
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    # Cleanup + DM still fire — the membership re-check is gated on
+    # ``synthetic``.
+    assert "ch_1" not in client._channel_space
+    assert len(sent) == 1
 
 
 @pytest.mark.asyncio

@@ -1276,8 +1276,29 @@ class PuffoCoreMessageClient:
         was cascaded out by the server when its operator left
         (puffo-server #74 emits a synthetic ``LeaveSpace`` per agent
         with ``signature = "server-auto:agent-cascade-leave-space"``).
-        Either way, clean caches and tell the operator why."""
+        Either way, clean caches and tell the operator why.
+
+        Synthetic events aren't cryptographically signed — the
+        ``signature`` field is a server-set marker — so before
+        applying the visible side effect (operator DM), verify the
+        cascade actually happened by asking the server's authoritative
+        membership API. Defends against buggy server emits, WS
+        redelivery on reconnect, and a malicious server crafting a
+        cascade event the agent has no way to refute on the wire.
+        Real signed LeaveSpace events skip the check (the agent itself
+        signed it; server-side engine already verified the signer)."""
         if not space_id:
+            return
+        # ``_still_member_of_space`` returns True / False / None.
+        # We only ignore the cascade on a definitive "still a member";
+        # ``None`` (network error) falls through to the permissive path
+        # so a transient /spaces flake can't block legitimate cleanup.
+        if synthetic and await self._still_member_of_space(space_id) is True:
+            logger.warning(
+                "synthetic LeaveSpace for sp=%s but /spaces still lists "
+                "us — ignoring (likely server bug or WS redelivery)",
+                space_id,
+            )
             return
         space_label = await self._resolve_space_name(space_id)
         self._evict_space_caches(space_id)
@@ -1288,6 +1309,30 @@ class PuffoCoreMessageClient:
         await self._dm_operator_membership_change(
             f"Removed from space **{space_label}**({space_id}) — {reason}."
         )
+
+    async def _still_member_of_space(self, space_id: str) -> bool | None:
+        """Authoritative membership check via ``GET /spaces``.
+
+        Returns:
+          * ``True``  — server still lists us as a member (cascade event
+                        contradicts authoritative state, caller should ignore).
+          * ``False`` — server does NOT list us (cascade matches reality,
+                        caller should proceed with cleanup).
+          * ``None``  — request failed; caller falls through to the
+                        permissive path rather than blocking on a flake.
+        """
+        try:
+            data = await self.http.get("/spaces")
+        except Exception:
+            logger.exception(
+                "membership re-check for sp=%s failed — falling through",
+                space_id,
+            )
+            return None
+        for entry in data.get("spaces") or []:
+            if entry.get("space_id") == space_id:
+                return True
+        return False
 
     async def _on_kicked_from_space(
         self, *, space_id: str, kicker_slug: str,
