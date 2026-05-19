@@ -127,12 +127,22 @@ class PuffoAgent:
         if not batch:
             return None
         for msg in batch:
+            # PUF-227: render each message with ITS OWN channel/space
+            # context, not the batch-level cached channel_meta. The
+            # admit-into-existing-batch path at puffo_core_client.py
+            # appends new messages without updating entry.channel_meta;
+            # if a thread root receives messages from two different
+            # channels in the same in-queue batch, channel_meta would
+            # carry the FIRST message's context for every subsequent
+            # render. Each msg dict already carries channel_id /
+            # channel_name / space_id / space_name from the envelope
+            # decode — use them.
             self._append_user(
-                channel_meta.get("channel_name", ""),
+                msg.get("channel_name", ""),
                 msg.get("sender_slug", ""),
                 msg.get("sender_email", ""),
                 msg.get("text", ""),
-                channel_id=channel_meta.get("channel_id", ""),
+                channel_id=msg.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
                 sender_is_bot=msg.get("sender_is_bot", False),
@@ -140,8 +150,8 @@ class PuffoAgent:
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
                 followups=None,
-                space_id=channel_meta.get("space_id", ""),
-                space_name=channel_meta.get("space_name", ""),
+                space_id=msg.get("space_id", ""),
+                space_name=msg.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
                 is_visible_to_human=msg.get("is_visible_to_human", True),
             )
@@ -150,7 +160,7 @@ class PuffoAgent:
         # agent itself decides who to reply to.
         last_msg = batch[-1]
         return await self._run_turn_and_route(
-            channel_name=channel_meta.get("channel_name", ""),
+            channel_name=last_msg.get("channel_name", ""),
             sender=last_msg.get("sender_slug", ""),
             on_progress=on_progress,
         )
@@ -185,20 +195,22 @@ class PuffoAgent:
         # adapter API for a single user_message, so concatenate.
         fallback_chunks: list[str] = []
         for msg in fallback_batch:
+            # PUF-227: per-msg channel/space fields — symmetric with
+            # handle_message_batch.
             fallback_chunks.append(self._format_user_block(
-                channel_name=channel_meta.get("channel_name", ""),
+                channel_name=msg.get("channel_name", ""),
                 sender=msg.get("sender_slug", ""),
                 sender_email=msg.get("sender_email", ""),
                 text=msg.get("text", ""),
-                channel_id=channel_meta.get("channel_id", ""),
+                channel_id=msg.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
                 sender_is_bot=msg.get("sender_is_bot", False),
                 mentions=msg.get("mentions") or [],
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
-                space_id=channel_meta.get("space_id", ""),
-                space_name=channel_meta.get("space_name", ""),
+                space_id=msg.get("space_id", ""),
+                space_name=msg.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
@@ -217,14 +229,17 @@ class PuffoAgent:
 
         # Route reply the same way as a normal turn so the consumer
         # picks up AgentAPIError again on consecutive rate-limit
-        # failures.
+        # failures. The assistant log entry's channel_name is a
+        # display label — use the LAST batch msg's channel so the
+        # tag matches what the agent is most likely replying about.
+        last_channel_name = (
+            fallback_batch[-1].get("channel_name", "") if fallback_batch else ""
+        )
         send_message_called = bool(result.metadata.get("send_message_targets"))
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
         if send_message_called:
             if result.reply:
-                self._append_assistant(
-                    channel_meta.get("channel_name", ""), result.reply,
-                )
+                self._append_assistant(last_channel_name, result.reply)
             return None
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
         if "[SILENT]" in joined:
@@ -240,7 +255,7 @@ class PuffoAgent:
         if not text_parts and not result.reply:
             return None
         fallback = _format_assistant_fallback(text_parts, result.reply)
-        self._append_assistant(channel_meta.get("channel_name", ""), fallback)
+        self._append_assistant(last_channel_name, fallback)
         return fallback
 
     async def _run_turn_and_route(

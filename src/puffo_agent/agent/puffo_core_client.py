@@ -61,9 +61,16 @@ class _ThreadEntry:
     - ``in_queue`` flips False between successful dispatch and the
       next arrival on this root, so a later message reopens the
       entry cleanly instead of stacking into a stale batch.
-    - ``channel_meta`` is captured on the first enqueue and reused
-      on dispatch; the thread/channel/space context is invariant
-      for a given root.
+    - ``channel_meta`` is a batch-level summary captured when a
+      new batch opens (first enqueue OR reopen after dispatch). It
+      is NOT load-bearing for per-message rendering — PUF-227 moved
+      the per-message channel/space context into each ``msg_dict``
+      so the prompt block is pinned to the envelope, not to a
+      thread cache. Today's consumers (``handle_message_batch``,
+      ``handle_api_error_retry``) read channel/space fields off
+      each msg, so cross-channel admit on the same root_id (server
+      / UI bug or otherwise) can no longer leak one channel's
+      context into another envelope's rendered block.
     - ``dispatching_ids`` is the set of envelope_ids currently being
       sent to the agent (the batch the consumer just claimed but
       hasn't finished). A duplicate WS delivery that lands during

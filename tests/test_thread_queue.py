@@ -62,12 +62,21 @@ def _make_client_for_queue(store: MessageStore) -> PuffoCoreMessageClient:
     return client
 
 
-def _msg(envelope_id: str, sender: str = "alice-0001", sent_at: int | None = None) -> dict:
+def _msg(
+    envelope_id: str,
+    sender: str = "alice-0001",
+    sent_at: int | None = None,
+    *,
+    channel_id: str = "ch_1",
+    channel_name: str = "general",
+    space_id: str = "sp_1",
+    space_name: str = "Team",
+) -> dict:
     return {
-        "channel_id": "ch_1",
-        "channel_name": "general",
-        "space_id": "sp_1",
-        "space_name": "Team",
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "space_id": space_id,
+        "space_name": space_name,
         "sender_slug": sender,
         "sender_email": "",
         "text": f"hello from {envelope_id}",
@@ -81,12 +90,18 @@ def _msg(envelope_id: str, sender: str = "alice-0001", sent_at: int | None = Non
     }
 
 
-def _channel_meta() -> dict:
+def _channel_meta(
+    *,
+    channel_id: str = "ch_1",
+    channel_name: str = "general",
+    space_id: str = "sp_1",
+    space_name: str = "Team",
+) -> dict:
     return {
-        "channel_id": "ch_1",
-        "channel_name": "general",
-        "space_id": "sp_1",
-        "space_name": "Team",
+        "channel_id": channel_id,
+        "channel_name": channel_name,
+        "space_id": space_id,
+        "space_name": space_name,
         "is_dm": False,
     }
 
@@ -894,4 +909,96 @@ async def test_pre_existing_cursor_blocks_redelivered_messages():
     assert await store.get_last_processed_sent_at("env_root") == 500
     # A fresh root has no entry → returns 0 → admits everything.
     assert await store.get_last_processed_sent_at("env_fresh") == 0
+    await store.close()
+
+
+# ─── PUF-227: cross-channel same-root admit ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_admit_same_root_two_channels_preserves_per_msg_fields():
+    """Scout's PUF-227 symptom shape, isolated to the queue layer.
+
+    Two messages arrive on the SAME root_id but from DIFFERENT
+    channels (the canonical untested case the intake flagged).
+    The append-to-existing-batch path does NOT update
+    ``entry.channel_meta`` — so a batch-level read of the cached
+    channel_meta would inherit message-1's channel context for
+    message-2's render. PUF-227's fix moves per-message context
+    into each msg_dict; we assert that each msg in the resulting
+    batch still carries its OWN channel_id / channel_name /
+    space_id / space_name, regardless of the batch-level cache."""
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    msg_general = _msg(
+        "env_general_1",
+        channel_id="ch_general", channel_name="General",
+    )
+    msg_gtm = _msg(
+        "env_gtm_1",
+        channel_id="ch_gtm", channel_name="gtm",
+    )
+
+    await client._admit_thread_message(
+        root_id="env_thread_root",
+        priority=PRIORITY_MENTIONED_HUMAN,
+        msg_dict=msg_general,
+        channel_meta=_channel_meta(channel_id="ch_general", channel_name="General"),
+    )
+    await client._admit_thread_message(
+        root_id="env_thread_root",
+        priority=PRIORITY_MENTIONED_HUMAN,
+        msg_dict=msg_gtm,
+        channel_meta=_channel_meta(channel_id="ch_gtm", channel_name="gtm"),
+    )
+
+    entry = client._thread_state["env_thread_root"]
+    # Both messages landed in the same in-queue batch (append path).
+    assert len(entry.messages) == 2
+    # Each msg carries its OWN channel context — this is the
+    # source of truth handle_message_batch reads from per PUF-227.
+    assert entry.messages[0]["channel_id"] == "ch_general"
+    assert entry.messages[0]["channel_name"] == "General"
+    assert entry.messages[1]["channel_id"] == "ch_gtm"
+    assert entry.messages[1]["channel_name"] == "gtm"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_admit_same_root_reopen_resets_channel_meta_to_new_msg():
+    """Per the PUF-227 docstring update: ``entry.channel_meta`` is a
+    batch-level summary captured at first enqueue OR reopen after
+    dispatch. After the consumer drains a batch and a new message
+    arrives on the same root from a different channel, the reopen
+    path at puffo_core_client.py:821-839 overwrites channel_meta to
+    the NEW message's. We assert this for the docstring contract."""
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+
+    msg1 = _msg("env_1", channel_id="ch_general", channel_name="General")
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=msg1,
+        channel_meta=_channel_meta(channel_id="ch_general", channel_name="General"),
+    )
+    # Simulate the consumer claiming the batch (set in_queue=False).
+    entry = client._thread_state["env_root"]
+    entry.in_queue = False
+    entry.messages = []
+
+    msg2 = _msg("env_2", channel_id="ch_gtm", channel_name="gtm")
+    await client._admit_thread_message(
+        root_id="env_root",
+        priority=PRIORITY_HUMAN,
+        msg_dict=msg2,
+        channel_meta=_channel_meta(channel_id="ch_gtm", channel_name="gtm"),
+    )
+
+    entry = client._thread_state["env_root"]
+    # Reopen path reset the batch + updated channel_meta to NEW.
+    assert entry.in_queue is True
+    assert entry.messages == [msg2]
+    assert entry.channel_meta["channel_id"] == "ch_gtm"
     await store.close()
