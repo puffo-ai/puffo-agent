@@ -11,11 +11,12 @@ Implementation: the daemon owns one ``CredentialRefresher``
 instance. Its ``run_loop`` coroutine polls
 ``~/.claude/.credentials.json`` every ``REFRESH_POLL_SECONDS``
 and triggers a refresh when ``expiresAt - now <
-REFRESH_SAFETY_MARGIN_SECONDS``, OR when any agent worker calls
-``notify_refresh_needed()`` after detecting a 401 from its
-long-lived ``claude`` subprocess (the in-process
-``asyncio.Event`` short-circuits the polling cadence so recovery
-is immediate, not bounded by the 2-minute poll).
+REFRESH_SAFETY_MARGIN_SECONDS``, OR when something calls
+``notify_refresh_needed()`` — today the only caller is the
+``puffo-agent agent refresh-token`` CLI subcommand, which drops
+a sentinel file the daemon's reconcile loop forwards into the
+in-process ``asyncio.Event``. The event short-circuits the
+2-minute poll so an operator-initiated refresh runs within ~1s.
 
 The refresh itself shells out to ``claude --print "ok"`` with
 ``HOME=<host_home>`` — mechanically identical to the cli-docker

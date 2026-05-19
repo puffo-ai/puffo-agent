@@ -189,97 +189,6 @@ class LocalCLIAdapter(Adapter):
             await self._session.aclose()
             self._session = None
 
-    def _credentials_expires_in_seconds(self) -> int | None:
-        # All cli-local agents share the HOST's .credentials.json
-        # (symlink where permitted, periodic copy elsewhere). Parse
-        # ``expiresAt`` directly — mtime only advances on rewrite,
-        # not while the token is still valid. The link call here
-        # doubles as the periodic re-sync for copy-mode agents.
-        link_host_credentials(Path.home(), self.agent_home_dir)
-        host_credentials = Path.home() / ".claude" / ".credentials.json"
-        try:
-            data = json.loads(host_credentials.read_text(encoding="utf-8"))
-            expires_ms = int(data["claudeAiOauth"]["expiresAt"])
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-        return int(expires_ms / 1000 - time.time())
-
-    async def _run_refresh_oneshot(self) -> None:
-        """PUF-217: spawn ``claude --print`` against the operator's
-        HOME so claude writes the refreshed token to the canonical
-        host credentials file directly; per-agent symlinks surface
-        it via ``link_host_credentials``. Pre-fix, this used
-        ``HOME=<agent_home_dir>`` and claude's atomic ``tmp+rename``
-        would replace the agent's symlink with a regular file,
-        leaving the host file stale."""
-        self._verify()
-        env = {**os.environ}
-        # --dangerously-skip-permissions is required: in --print mode
-        # claude can't surface permission prompts, so without bypass
-        # it exits before the API call and no refresh happens.
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-        ]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        cmd.append("ok")
-        started_at = time.time()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=self.workspace_dir,
-            )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(),
-                timeout=REFRESH_ONESHOT_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "agent %s: refresh one-shot timed out after %ds",
-                self.agent_id, REFRESH_ONESHOT_TIMEOUT_SECONDS,
-            )
-            return
-        except FileNotFoundError:
-            logger.warning(
-                "agent %s: refresh one-shot: claude binary missing",
-                self.agent_id,
-            )
-            return
-        elapsed = time.time() - started_at
-        out_text = stdout.decode("utf-8", errors="replace")
-        err_text = stderr.decode("utf-8", errors="replace")
-        # Doubles as an inference smoke test (auth status can
-        # report OK while every API call returns 401). The worker
-        # reads auth_healthy to suppress noisy replies while the
-        # operator re-auths.
-        if looks_like_auth_failure(out_text, err_text):
-            logger.error(
-                "agent %s: refresh one-shot hit an auth failure "
-                "(rc=%d in %.1fs). operator re-auth likely required. "
-                "stdout: %s | stderr: %s",
-                self.agent_id, proc.returncode, elapsed,
-                out_text.strip()[-400:], err_text.strip()[-400:],
-            )
-            self.auth_healthy = False
-        elif proc.returncode != 0:
-            logger.warning(
-                "agent %s: refresh one-shot rc=%d in %.1fs | "
-                "stdout: %s | stderr: %s",
-                self.agent_id, proc.returncode, elapsed,
-                out_text.strip()[-400:], err_text.strip()[-400:],
-            )
-        else:
-            logger.debug(
-                "agent %s: refresh one-shot rc=0 in %.1fs",
-                self.agent_id, elapsed,
-            )
-            self.auth_healthy = True
-
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.aclose()
@@ -485,8 +394,9 @@ class LocalCLIAdapter(Adapter):
             )
         # Symlink the agent's .credentials.json to the host's so
         # every refresh is visible across agents. Falls back to copy
-        # on systems where symlinks aren't permitted; the copy is
-        # re-synced on every refresh_ping tick.
+        # on systems where symlinks aren't permitted; the daemon's
+        # CredentialRefresher post-tick view-sync (PUF-221) keeps the
+        # copy fresh.
         mode = link_host_credentials(host_home, self.agent_home_dir)
         logger.info(
             "agent %s: shared host credentials (%s)",

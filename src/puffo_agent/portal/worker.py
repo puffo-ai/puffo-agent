@@ -43,35 +43,6 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
-CREDENTIAL_REFRESH_TICK_SECONDS = 10 * 60
-CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS = 60
-
-
-def _next_refresh_tick(
-    expires_in_seconds: int | None,
-    *,
-    default_tick: int = CREDENTIAL_REFRESH_TICK_SECONDS,
-    threshold: int | None = None,
-    floor: int = CREDENTIAL_REFRESH_TICK_FLOOR_SECONDS,
-) -> int:
-    """PUF-213: adaptive refresh sleep — bounded retry inside the
-    refresh window, wakes ``threshold`` seconds before expiry
-    otherwise; ``None`` TTL falls back to ``default_tick``."""
-    if threshold is None:
-        # Lazy import keeps this helper unit-testable.
-        from ..agent.adapters.base import (
-            CREDENTIAL_REFRESH_BEFORE_EXPIRY_SECONDS as _DEFAULT_THRESHOLD,
-        )
-        threshold = _DEFAULT_THRESHOLD
-    if expires_in_seconds is None:
-        return default_tick
-    target = expires_in_seconds - threshold
-    if target < floor:
-        return floor
-    if target > default_tick:
-        return default_tick
-    return target
-
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     """Construct the adapter for ``runtime.kind``. Raises on unknown
@@ -484,32 +455,6 @@ def _handle_suppressed_reply(
         )
     runtime.save(agent_id)
     return True, backoff
-
-
-def _check_startup_auth_or_pause(
-    adapter: "Adapter", runtime: "RuntimeState", agent_id: str,
-) -> bool:
-    """PUF-207: return True on True/None (proceed); on False,
-    auto-pause the agent with a recoverable runtime.error and
-    return False."""
-    if adapter.auth_healthy is not False:
-        return True
-    runtime.status = "paused"
-    runtime.health = "auth_failed"
-    runtime.error = (
-        f"Agent {agent_id}: Claude Code OAuth is missing or expired. "
-        "Paused on startup so this agent does not spawn into a "
-        "known-broken state.\n"
-        "To recover:\n"
-        "  1. Open a separate Terminal (not from within an agent's "
-        "own shell), then run `claude` and `/login` to authenticate.\n"
-        f"  2. From the same machine, resume agent {agent_id} with "
-        f"`puffo-agent agent resume {agent_id}`\n"
-        "     (a venv install may need the full path to "
-        "`puffo-agent`)."
-    )
-    runtime.save(agent_id)
-    return False
 
 
 
