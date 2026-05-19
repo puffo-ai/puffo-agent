@@ -4,6 +4,99 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.8] — 2026-05-19
+
+### Changed
+
+- **Claude OAuth credential refresh is now daemon-owned — one writer,
+  N readers, one shared file.** Anthropic's OAuth uses single-use
+  refresh tokens: every successful `/oauth/token` rotate issues a new
+  `refresh_token` and invalidates the previous one. With the
+  pre-existing per-agent `Adapter.refresh_ping` design, N long-lived
+  `claude` subprocesses each held an in-memory RT and refreshed
+  independently; the first one to rotate invalidated the disk RT
+  every other agent was about to read, and the daemon's per-agent
+  `claude --print "ok"` writer races burned each other's in-memory
+  copies. The net was a silent 401 cascade with no operator-visible
+  signal until every agent flipped `auth_failed` at once.
+
+  New `CredentialRefresher` (`portal/credential_refresh.py`) lives in
+  the daemon process. Its `run_loop` polls
+  `~/.claude/.credentials.json` every 2 minutes, triggers a refresh
+  via `claude --print "ok"` with `HOME=<host_home>` when
+  `expiresAt - now < 10 min`, **or** when `notify_refresh_needed()`
+  is called. The refresh subprocess is serialized by an
+  `asyncio.Lock` so Anthropic's RT rotation can never be observed
+  mid-write by another caller. Three triggers feed the refresher:
+
+  1. **Host expiry** — 2-minute poll + 10-minute safety margin.
+  2. **Per-agent expiry** — collapses into (1) because per-agent
+     credentials are symlinks (or, on Windows without Developer
+     Mode, copies that `_sync_views` re-writes every tick) of the
+     same host file.
+  3. **401 from a worker turn** — `_handle_suppressed_reply` fires
+     an `on_auth_failure` callback wired through `Worker.__init__`
+     into `refresher.notify_refresh_needed()`, short-circuiting the
+     2-minute poll so the refresh kicks within ~1 s. The callback
+     fires **only on the auth-class leak branch** (not on rate-
+     limit / 5xx / quota leaks — credential rotation isn't the fix
+     for an Anthropic outage). Callback exceptions are swallowed so
+     a broken hook can't break the suppression flow, and
+     `runtime.health = "auth_failed"` happens **before** the
+     callback so a guaranteed-throw callback can't leave health in
+     a torn state.
+
+  After every tick — whether the tick refreshed, skipped, or errored
+  — the refresher fans out `state.link_host_credentials(host_home,
+  agent_home)` to each registered agent. This means an operator
+  running `claude /login` externally on the device propagates to
+  every agent's view on the next 2-minute poll without daemon
+  restart (empirically observed 2026-05-19 05:34–05:37 UTC: operator
+  `claude /login` rewrote the host file and both running agents
+  recovered automatically on their next inbound message).
+
+  CLI surface: per-agent `agent refresh-ping <id>` is replaced by
+  one `agent refresh-token` subcommand that writes a sentinel file
+  the daemon's reconcile loop forwards into the in-process
+  `asyncio.Event`. Same `stop_request` pattern that already exists
+  in `state.py`, symmetric for operator-side debugging.
+
+  Retires PUF-207 (startup `_check_startup_auth_or_pause` probe +
+  `auth_healthy` flag), PUF-213 (`_next_refresh_tick` adaptive
+  cadence in worker), PUF-217 (`HOME=agent_home` rewrite-symlink
+  bug), and PUF-218 (per-agent `_REFRESH_LOCK`). Net ~656 LOC
+  removed: `Adapter.refresh_ping` / `_run_refresh_oneshot` (both
+  adapters) / `_credentials_expires_in_seconds` / `auth_healthy` /
+  `_REFRESH_LOCK` / `_check_startup_auth_or_pause` /
+  `_next_refresh_tick`, plus 4 whole test files (`test_refresh_ping
+  .py`, `test_credential_refresh_policy.py`,
+  `test_refresh_oneshot_home_env.py`, `test_worker_startup_auth.py`)
+  and 2 surgical removals from `test_cli_session_recovery.py`.
+
+### Tests
+
+- `tests/test_credential_refresher.py` — 12 new tests: disk-read
+  variants (fresh / missing / corrupt), `register_agent` /
+  `unregister_agent` set semantics, `notify_refresh_needed` event
+  bit, `_tick` no-refresh-when-fresh path with explicit
+  `link_host_credentials` assertion (locks the "sync regardless of
+  refresh result" contract), `_tick` refresh-when-close-to-expiry
+  asserting `env["HOME"] == host_home`, `_tick` refresh on
+  `triggered_by_agent=True`, view-sync fan-out across multiple
+  registered agents, `run_loop` stop-event observance, `run_loop`
+  wake-on-event with <1 s latency assertion (vs. the 100 s poll
+  interval), CLI sentinel-file write/read/clear round trip.
+- `tests/test_worker_error_suppress.py` — 3 new tests on the
+  `on_auth_failure` callback contract: positive (auth-class leak
+  fires callback + flips health), negative (429 leak suppresses
+  reply but does NOT fire callback or flip health), defensive
+  (raising callback → health still flips, suppression still
+  returns True).
+
+Full suite: **676 passed / 1 skipped / 0 failed** post-cleanup (was
+706 pre-cleanup; –30 from the 4 deleted test files and 2 surgical
+removals).
+
 ## [0.8.7] — 2026-05-19
 
 ### Added
