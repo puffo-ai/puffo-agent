@@ -781,7 +781,7 @@ class DockerCLIAdapter(Adapter):
         logger.warning(
             "agent %s: cli-docker MCP tools unavailable — puffo_core is "
             "not configured. populate `puffo_core:` in agent.yml so "
-            "send_message / list_channels / etc. show up under "
+            "send_message / list_channels_in_all_spaces / etc. show up under "
             "claude-code's tool surface.",
             self.agent_id,
         )

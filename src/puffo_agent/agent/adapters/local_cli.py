@@ -457,7 +457,7 @@ class LocalCLIAdapter(Adapter):
         logger.warning(
             "agent %s: cli-local MCP tools unavailable — puffo_core is "
             "not configured. populate `puffo_core:` in agent.yml to "
-            "enable send_message / list_channels / etc.",
+            "enable send_message / list_channels_in_all_spaces / etc.",
             self.agent_id,
         )
         return []

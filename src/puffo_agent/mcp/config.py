@@ -24,7 +24,9 @@ MCP_SERVER_NAME = "puffo"
 PUFFO_CORE_TOOL_NAMES = (
     "send_message",
     "send_message_with_attachments",
-    "list_channels",
+    "list_spaces",
+    "list_channels_in_all_spaces",
+    "list_channels_in_space",
     "list_channel_members",
     "get_channel_history",
     "get_thread_history",

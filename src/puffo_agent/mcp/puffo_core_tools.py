@@ -269,8 +269,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         """Post a message to a Puffo.ai channel or DM a user.
 
         channel: '@<slug>' for a DM (e.g. '@alice-1234'), or a raw
-            channel id (e.g. 'ch_<uuid>'). Use ``list_channels`` to
-            discover ids — '#name' shortcuts are not supported.
+            channel id (e.g. 'ch_<uuid>'). Use
+            ``list_channels_in_all_spaces`` (or ``list_spaces`` +
+            ``list_channels_in_space``) to discover ids — '#name'
+            shortcuts are not supported.
         text: message body. Markdown preserved verbatim.
         is_visible_to_human: REQUIRED — decide whether a human should
             see this message inline. ``true`` for anything a person
@@ -290,7 +292,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             raise RuntimeError(
                 "'#<name>' channel addressing isn't supported; "
                 "use the channel id (e.g. 'ch_<uuid>') or call "
-                "list_channels to look one up."
+                "list_channels_in_all_spaces to look one up."
             )
 
         if channel_ref.startswith("@"):
@@ -473,7 +475,59 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    async def list_channels() -> str:
+    async def list_spaces() -> str:
+        """List spaces this agent is a member of (id + name).
+
+        ``GET /spaces`` is server-filtered to memberships the
+        agent actually has, so the result reflects authoritative
+        permissions — channels can be enumerated for any space
+        listed here via ``list_channels_in_space``."""
+        data = await cfg.http_client.get("/spaces")
+        spaces_entries = (data or {}).get("spaces", []) or []
+        if not spaces_entries:
+            return "(not a member of any space)"
+        lines: list[str] = []
+        for sp in spaces_entries:
+            sid = sp.get("space_id", "")
+            name = sp.get("name", "") or sid
+            if sid:
+                lines.append(f"- {sid}  {name}")
+        return "\n".join(lines) if lines else "(not a member of any space)"
+
+    @mcp.tool()
+    async def list_channels_in_space(space_id: str) -> str:
+        """List channels in a single space the agent is a member of.
+
+        ``GET /spaces/<space_id>/channels`` is server-filtered to the
+        agent's actual channel memberships; this tool just formats the
+        result. The legacy ``cfg.space_id`` is not consulted — pass
+        the explicit ``space_id`` to scope the query. Use
+        ``list_spaces`` to enumerate valid ``space_id``s first.
+
+        Tight-race note: just after AcceptSpaceInvite the endpoint can
+        briefly return the SPA-route HTML stub (decoded as ``str``)
+        while the materialiser commits. Treat that as "no channels yet"
+        rather than crashing the tool.
+        """
+        sid = (space_id or "").strip()
+        if not sid:
+            raise RuntimeError("space_id is required")
+        data = await cfg.http_client.get(f"/spaces/{sid}/channels")
+        channels = (
+            data.get("channels", []) if isinstance(data, dict) else []
+        ) or []
+        if not channels:
+            return "(no channels — agent may not be a member of this space yet)"
+        lines: list[str] = []
+        for ch in channels:
+            cid = ch.get("channel_id", "")
+            name = ch.get("name", "") or cid
+            if cid:
+                lines.append(f"- {cid}  {name}")
+        return "\n".join(lines) if lines else "(no channels)"
+
+    @mcp.tool()
+    async def list_channels_in_all_spaces() -> str:
         """List channels in every space the agent is a member of.
 
         Output is grouped by space::
@@ -484,19 +538,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             Space sp_Y (Other):
               - ch_c  general
 
-        The legacy ``cfg.space_id`` is intentionally NOT consulted:
-        agents operate cross-space (an operator can invite the
-        agent into channels in any space they're also in) and the
-        LLM needs the full membership view to route ``send_message``
-        targets correctly. Walks one ``GET /spaces`` plus one
-        ``GET /spaces/<sp>/channels`` per space — both endpoints
-        are server-filtered to memberships the agent actually has,
-        so the result reflects authoritative permissions.
-        """
+        Convenience over ``list_spaces`` + ``list_channels_in_space``
+        for the case where the LLM wants the full membership picture
+        in one tool call. Walks one ``GET /spaces`` plus one
+        ``GET /spaces/<sp>/channels`` per space."""
         spaces_data = await cfg.http_client.get("/spaces")
         spaces_entries = (spaces_data or {}).get("spaces", []) or []
         if not spaces_entries:
-            return "(no spaces — the agent is not a member of any space)"
+            return "(not a member of any space)"
         lines: list[str] = []
         for sp in spaces_entries:
             space_id = sp.get("space_id", "")
@@ -506,10 +555,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ch_data = await cfg.http_client.get(
                 f"/spaces/{space_id}/channels"
             )
-            # The endpoint returns the SPA-route HTML stub (decoded
-            # as ``str``) when called during a tight race against
-            # the materialiser. Treat that as "no channels yet";
-            # the agent will see them on the next call.
             channels = (
                 ch_data.get("channels", []) if isinstance(ch_data, dict) else []
             )

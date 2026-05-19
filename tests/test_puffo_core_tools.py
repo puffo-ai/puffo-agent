@@ -560,11 +560,87 @@ async def test_get_thread_history_empty_window():
 
 
 @pytest.mark.asyncio
-async def test_list_channels_enumerates_all_spaces():
-    """The tool now walks every space the agent is a member of, not
-    just ``cfg.space_id``. Server-filtered ``GET /spaces`` returns
-    the actual membership; per-space ``GET /spaces/<sp>/channels``
-    enumerates the channels with one round-trip each."""
+async def test_list_spaces_returns_server_filtered_memberships():
+    """``GET /spaces`` is server-filtered to memberships the agent
+    actually has; the tool just formats the result. Server-side
+    enforcement means "if it's in the list, the agent can write
+    there" — pair with ``list_channels_in_space`` for the channel
+    detail."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces"] = {
+        "spaces": [
+            {"space_id": "sp_team", "name": "Team"},
+            {"space_id": "sp_other", "name": "Other"},
+        ],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_spaces")
+    assert "sp_team" in result and "Team" in result
+    assert "sp_other" in result and "Other" in result
+    # No per-space round-trips — list_spaces stays cheap.
+    per_space_calls = [c for c in http.calls if "/channels" in c[1]]
+    assert per_space_calls == []
+
+
+@pytest.mark.asyncio
+async def test_list_spaces_returns_empty_marker_when_not_a_member():
+    cfg, http, ms = _setup()
+    http.responses["/spaces"] = {"spaces": []}
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_spaces")
+    assert "not a member" in result
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_space_scopes_to_one_space():
+    """``list_channels_in_space(space_id)`` round-trips exactly one
+    ``GET /spaces/<sp>/channels`` and formats the result. No
+    ``GET /spaces`` enumeration; no ``cfg.space_id`` consulting."""
+    cfg, http, ms = _setup()
+    cfg.space_id = "sp_legacy"  # must be irrelevant
+    http.responses["/spaces/sp_target/channels"] = {
+        "channels": [
+            {"channel_id": "ch_g", "name": "general"},
+            {"channel_id": "ch_r", "name": "random"},
+        ],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_target"})
+
+    assert "ch_g" in result and "general" in result
+    assert "ch_r" in result and "random" in result
+    # Exactly one round-trip; never to cfg.space_id or /spaces.
+    assert ("GET", "/spaces/sp_target/channels", None) in http.calls
+    assert not any(c[1] == "/spaces" for c in http.calls)
+    assert not any("sp_legacy" in c[1] for c in http.calls)
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_space_requires_space_id():
+    """Missing ``space_id`` is a contract error — surface it as an
+    MCP tool error rather than silently using ``cfg.space_id``."""
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception):
+        await _call(mcp, "list_channels_in_space", {"space_id": ""})
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_space_tolerates_string_response():
+    """Tight race after AcceptSpaceInvite: server briefly returns
+    the SPA HTML stub (``str``). Treat as "no channels yet"."""
+    cfg, http, ms = _setup()
+    http.responses["/spaces/sp_racy/channels"] = ""
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_racy"})
+    assert "no channels" in result
+
+
+@pytest.mark.asyncio
+async def test_list_channels_in_all_spaces_enumerates_all_spaces():
+    """One ``GET /spaces`` + one ``GET /spaces/<sp>/channels`` per
+    space, grouped output. Convenience shortcut over ``list_spaces``
+    + per-space calls."""
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {
         "spaces": [
@@ -584,7 +660,7 @@ async def test_list_channels_enumerates_all_spaces():
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
+    result = await _call(mcp, "list_channels_in_all_spaces")
 
     # Both spaces named, grouped, with all their channels.
     assert "sp_team" in result and "Team" in result
@@ -598,28 +674,25 @@ async def test_list_channels_enumerates_all_spaces():
 
 
 @pytest.mark.asyncio
-async def test_list_channels_returns_empty_message_with_no_spaces():
+async def test_list_channels_in_all_spaces_returns_empty_message_with_no_spaces():
     """Agent not in any space (new install, fully cascaded out) —
     no /spaces/<sp>/channels round-trips at all."""
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
+    result = await _call(mcp, "list_channels_in_all_spaces")
 
     assert "not a member" in result
-    # No per-space round-trip — bail after the empty /spaces list.
     per_space_calls = [c for c in http.calls if "/channels" in c[1]]
     assert per_space_calls == []
 
 
 @pytest.mark.asyncio
-async def test_list_channels_ignores_cfg_space_id():
-    """Req 3 / FB diagnostic: ``cfg.space_id`` is legacy metadata and
-    must not gate the LLM's view. An agent with ``cfg.space_id``
+async def test_list_channels_in_all_spaces_ignores_cfg_space_id():
+    """Req 3 anchor: ``cfg.space_id`` is legacy metadata and must
+    not gate the LLM's view. An agent with ``cfg.space_id``
     pointing at a space it IS NOT in must still see channels in the
-    spaces it IS in. Pre-fix would have walked
-    ``/spaces/sp_legacy/events`` (404 or empty) and returned
-    ``(no channels in this space)``."""
+    spaces it IS in."""
     cfg, http, ms = _setup()
     cfg.space_id = "sp_legacy_not_a_member"  # explicit miss
     http.responses["/spaces"] = {
@@ -631,11 +704,10 @@ async def test_list_channels_ignores_cfg_space_id():
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
+    result = await _call(mcp, "list_channels_in_all_spaces")
 
     assert "ch_only" in result
     assert "sp_real" in result
-    # Never reached the legacy path.
     legacy_calls = [
         c for c in http.calls
         if "sp_legacy_not_a_member" in c[1]
@@ -646,11 +718,9 @@ async def test_list_channels_ignores_cfg_space_id():
 
 
 @pytest.mark.asyncio
-async def test_list_channels_tolerates_per_space_string_response():
-    """Tight race after AcceptSpaceInvite: ``GET /spaces/<sp>/channels``
-    returns the SPA-route HTML stub (decoded as ``str``) before the
-    materialiser commits. Treat as "no channels yet" rather than
-    crashing the tool."""
+async def test_list_channels_in_all_spaces_tolerates_per_space_string_response():
+    """One space's ``/channels`` returns the SPA HTML stub (tight
+    race); other spaces still enumerate cleanly."""
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {
         "spaces": [
@@ -663,9 +733,8 @@ async def test_list_channels_tolerates_per_space_string_response():
         "channels": [{"channel_id": "ch_x", "name": "general"}],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels")
+    result = await _call(mcp, "list_channels_in_all_spaces")
 
-    # sp_a present, but empty-channels marker; sp_b lists its channel.
     assert "sp_a" in result
     assert "(no channels)" in result
     assert "ch_x" in result
@@ -1126,13 +1195,15 @@ async def test_send_message_with_attachments_auto_corrects_reply_as_root_id(
 
 
 @pytest.mark.asyncio
-async def test_all_9_tools_registered():
+async def test_core_tools_registered():
     cfg, _, _ = _setup()
     mcp = _build_tools(cfg)
     tool_names = {t.name for t in await mcp.list_tools()}
     expected = {
         "whoami", "send_message", "get_channel_history",
-        "list_channels", "list_channel_members", "get_user_info",
-        "get_post", "send_message_with_attachments", "fetch_channel_files",
+        "list_spaces", "list_channels_in_all_spaces",
+        "list_channels_in_space", "list_channel_members",
+        "get_user_info", "get_post", "send_message_with_attachments",
+        "fetch_channel_files",
     }
     assert expected.issubset(tool_names)
