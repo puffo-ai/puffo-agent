@@ -184,6 +184,11 @@ class CredentialRefresher:
             ]
             started = time.time()
             try:
+                # cwd=host_home so claude's project-resolution doesn't
+                # drift into the daemon's launch directory (which is
+                # whatever the operator ran `puffo-agent start` from);
+                # the host home is the operator's normal claude
+                # working dir and matches single-process /login UX.
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
@@ -217,7 +222,7 @@ class CredentialRefresher:
                 )
                 return
             if before is not None and after is not None and after <= before:
-                logger.warning(
+                logger.error(
                     "credential refresh exit=0 but expiresAt didn't advance "
                     "(before=%ds, after=%ds) — claude may not be rewriting "
                     "credentials.json on this build; operator may need "

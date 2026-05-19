@@ -48,7 +48,7 @@ from ...portal.state import (
     sync_host_mcp_servers,
     sync_host_skills,
 )
-from .base import Adapter, TurnContext, TurnResult, looks_like_auth_failure
+from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 
 
@@ -77,12 +77,6 @@ CLAUDE_CODE_NPM_VERSION = "2.1.117"
 
 # Pinned Gemini CLI version (same reproducibility rationale).
 GEMINI_CLI_NPM_VERSION = "0.38.2"
-
-# Refresh one-shot timeout. Cold claude + OAuth refresh + one-turn
-# API call lands at 5-15s normally, can stretch past 30s on a busy
-# host; 120s covers the chain without letting a wedged subprocess
-# stall the tick.
-REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
 # Kept minimal. The claude CLI refuses --dangerously-skip-permissions
 # as root, so we create a non-root ``agent`` user. UID doesn't need

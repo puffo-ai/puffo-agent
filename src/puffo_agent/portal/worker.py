@@ -17,6 +17,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Callable, Optional
 
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
@@ -404,6 +405,7 @@ def _handle_suppressed_reply(
     agent_id: str,
     *,
     scope: str,
+    on_auth_failure: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
     ``(suppressed, backoff_seconds)``:
@@ -417,7 +419,10 @@ def _handle_suppressed_reply(
     ``runtime.error`` with a scope-tagged + leak-class-tagged
     message, and (if auth-class) flip ``runtime.health="auth_failed"``
     — that signal is definitive regardless of which scope surfaced
-    it."""
+    it. ``on_auth_failure`` fires on the auth-class branch only;
+    PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
+    here so a 401-leak short-circuits the 2-min poll instead of
+    waiting for the next tick."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False, 0.0
@@ -432,6 +437,14 @@ def _handle_suppressed_reply(
     )
     if is_auth:
         runtime.health = "auth_failed"
+        if on_auth_failure is not None:
+            try:
+                on_auth_failure()
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: on_auth_failure callback raised: %s",
+                    agent_id, exc,
+                )
     if scope == "api-error-retry":
         if is_auth:
             runtime.error = (
@@ -461,9 +474,20 @@ def _handle_suppressed_reply(
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
-    def __init__(self, daemon_cfg: DaemonConfig, agent_cfg: AgentConfig):
+    def __init__(
+        self,
+        daemon_cfg: DaemonConfig,
+        agent_cfg: AgentConfig,
+        *,
+        notify_refresh_needed: Optional[Callable[[], None]] = None,
+    ):
         self.daemon_cfg = daemon_cfg
         self.agent_cfg = agent_cfg
+        # PUF-221: daemon-owned CredentialRefresher hook. Fired from
+        # the auth-class leak branch in _handle_suppressed_reply so a
+        # 401 surfacing in a reply short-circuits the daemon's 2-min
+        # poll instead of waiting for the next tick.
+        self._notify_refresh_needed = notify_refresh_needed
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),
@@ -796,6 +820,7 @@ class Worker:
                     self.runtime,
                     agent_id,
                     scope="fallback",
+                    on_auth_failure=self._notify_refresh_needed,
                 )
                 if suppressed:
                     await asyncio.sleep(backoff)
@@ -837,6 +862,7 @@ class Worker:
                     self.runtime,
                     agent_id,
                     scope="api-error-retry",
+                    on_auth_failure=self._notify_refresh_needed,
                 )
                 if suppressed:
                     # Hottest leak site (FB-88 / FB-159 case-studies).

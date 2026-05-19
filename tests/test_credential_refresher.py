@@ -90,10 +90,13 @@ def test_notify_refresh_needed_sets_event(tmp_path):
 
 def test_tick_no_refresh_when_fresh_and_no_agent_trigger(tmp_path, monkeypatch):
     """Fresh token + no 401 from any agent → tick should NOT spawn a
-    refresh subprocess. It should still call view-sync so external
-    `claude /login` propagates."""
+    refresh subprocess. It SHOULD still call view-sync so external
+    `claude /login` (operator running it manually) propagates to
+    registered agents."""
     _write_creds(tmp_path, expires_in_seconds=3600)  # 1h, well above 10min margin
     r = CredentialRefresher(host_home=tmp_path)
+    agent_a = tmp_path / "agent_a"
+    r.register_agent(agent_a)
 
     spawned: list = []
 
@@ -103,8 +106,18 @@ def test_tick_no_refresh_when_fresh_and_no_agent_trigger(tmp_path, monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
+    sync_calls: list[tuple[Path, Path]] = []
+
+    def fake_link(host_home, agent_home):
+        sync_calls.append((host_home, agent_home))
+
+    monkeypatch.setattr(credential_refresh, "link_host_credentials", fake_link)
+
     asyncio.run(r._tick())
     assert spawned == []
+    # View-sync MUST fire even when no refresh happened — that's how
+    # an out-of-band `claude /login` from the operator propagates.
+    assert sync_calls == [(tmp_path, agent_a)]
 
 
 # ── _tick: when close to expiry → refresh fires ───────────────

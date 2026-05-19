@@ -104,34 +104,6 @@ class Adapter(ABC):
         return None
 
 
-# Case-insensitive substrings that mark a claude CLI output as an
-# auth failure rather than a real reply. Kept deliberately strong so
-# a user asking about HTTP auth doesn't flip the health flag.
-_AUTH_FAILURE_SIGNATURES = (
-    "api error: 401",
-    "invalid authentication credentials",
-    '"type":"authentication_error"',
-    "authentication_error",
-    "invalid_grant",
-    "please run /login",
-    "please run `claude /login`",
-    "run `claude login`",
-)
-
-
-def looks_like_auth_failure(*parts: str) -> bool:
-    """True if any string contains a claude auth-failure signature.
-    Case-insensitive.
-    """
-    for p in parts:
-        if not p:
-            continue
-        low = p.lower()
-        if any(sig in low for sig in _AUTH_FAILURE_SIGNATURES):
-            return True
-    return False
-
-
 def format_history_as_prompt(messages: list[dict]) -> str:
     """Render shell conversation history as a single prompt string.
     Used by the SDK adapter (one-shot per turn); CLI adapters keep a

@@ -294,6 +294,76 @@ def test_round2_skip_list_passes_through(prose):
         assert _suppress_worker_error_leak(prose) == prose
 
 
+# ── PUF-221 reviewer iter: on_auth_failure callback ────────────────
+
+
+def test_handle_suppressed_reply_fires_notify_on_auth_class(tmp_path, monkeypatch):
+    """Auth-class leak → ``on_auth_failure`` callback fires once. This
+    is the wire the daemon hooks ``CredentialRefresher.notify_refresh_needed``
+    into, so a 401 surfacing mid-turn short-circuits the 2-min poll."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    runtime = RuntimeState(status="running")
+    fired: list[int] = []
+
+    def on_auth_failure():
+        fired.append(1)
+
+    suppressed, _ = _handle_suppressed_reply(
+        "Not logged in · Please run /login",
+        runtime,
+        "agent-callback",
+        scope="api-error-retry",
+        on_auth_failure=on_auth_failure,
+    )
+    assert suppressed is True
+    assert runtime.health == "auth_failed"
+    assert fired == [1]
+
+
+def test_handle_suppressed_reply_skips_notify_on_non_auth_leak(tmp_path, monkeypatch):
+    """Non-auth leak (rate-limit / quota / 5xx) → suppression fires
+    but ``on_auth_failure`` does NOT — we don't want to wake the
+    refresher for an Anthropic outage that has nothing to do with
+    credentials."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    runtime = RuntimeState(status="running")
+    fired: list[int] = []
+
+    def on_auth_failure():
+        fired.append(1)
+
+    suppressed, _ = _handle_suppressed_reply(
+        "Error: 429 rate_limit_error — too many requests.",
+        runtime,
+        "agent-callback-rl",
+        scope="api-error-retry",
+        on_auth_failure=on_auth_failure,
+    )
+    assert suppressed is True
+    assert runtime.health == "unknown"  # NOT auth_failed
+    assert fired == []
+
+
+def test_handle_suppressed_reply_swallows_notify_exception(tmp_path, monkeypatch):
+    """A raising callback must not break the suppression flow —
+    health still flips, return value still True."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    runtime = RuntimeState(status="running")
+
+    def on_auth_failure():
+        raise RuntimeError("boom")
+
+    suppressed, _ = _handle_suppressed_reply(
+        "Not logged in · Please run /login",
+        runtime,
+        "agent-callback-raises",
+        scope="fallback",
+        on_auth_failure=on_auth_failure,
+    )
+    assert suppressed is True
+    assert runtime.health == "auth_failed"
+
+
 def test_round2_oauth_revoked_flips_health(tmp_path, monkeypatch):
     """OAuth-token-revoked is a new auth-class pattern — must flip
     runtime.health symmetrically with the existing 'Not logged in'

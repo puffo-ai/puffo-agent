@@ -177,7 +177,11 @@ class Daemon:
             if desired_state == "running":
                 if worker is None:
                     logger.info("agent %s: starting worker", agent_id)
-                    worker = Worker(self.daemon_cfg, agent_cfg)
+                    worker = Worker(
+                        self.daemon_cfg,
+                        agent_cfg,
+                        notify_refresh_needed=self.refresher.notify_refresh_needed,
+                    )
                     self.workers[agent_id] = worker
                     self.refresher.register_agent(agent_home_dir(agent_id))
                     worker.start()
@@ -189,7 +193,11 @@ class Daemon:
                 elif _worker_needs_restart(worker.agent_cfg, agent_cfg):
                     logger.info("agent %s: config changed, restarting worker", agent_id)
                     await self._stop_worker(agent_id)
-                    worker = Worker(self.daemon_cfg, agent_cfg)
+                    worker = Worker(
+                        self.daemon_cfg,
+                        agent_cfg,
+                        notify_refresh_needed=self.refresher.notify_refresh_needed,
+                    )
                     self.workers[agent_id] = worker
                     self.refresher.register_agent(agent_home_dir(agent_id))
                     worker.start()

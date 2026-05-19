@@ -34,14 +34,11 @@ from ...portal.state import (
     sync_host_plugins,
     sync_host_skills,
 )
-from .base import Adapter, TurnContext, TurnResult, looks_like_auth_failure
+from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 
 logger = logging.getLogger(__name__)
 
-
-# See docker_cli for rationale.
-REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
 # How long the permission proxy hook waits for an owner reply before
 # denying. Exposed to the hook via PUFFO_PERMISSION_TIMEOUT.
