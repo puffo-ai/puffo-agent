@@ -49,21 +49,26 @@ VALID_PROVIDERS: frozenset[str] = frozenset({
 HARNESS_CLAUDE_CODE = "claude-code"
 HARNESS_HERMES      = "hermes"
 HARNESS_GEMINI_CLI  = "gemini-cli"
+HARNESS_CODEX       = "codex"
 
 VALID_HARNESSES: frozenset[str] = frozenset({
     HARNESS_CLAUDE_CODE,
     HARNESS_HERMES,
     HARNESS_GEMINI_CLI,
+    HARNESS_CODEX,
 })
 
 
 # ── Constraints ───────────────────────────────────────────────────────────────
 
-# Harness → providers it supports.
+# Harness → providers it supports. ``codex`` is OpenAI-only but is
+# NOT the default for openai (see DEFAULT_HARNESS_FOR_PROVIDER below);
+# operators opt in via ``runtime.harness: codex`` in agent.yml.
 HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_CLAUDE_CODE: frozenset({PROVIDER_ANTHROPIC}),
     HARNESS_HERMES:      frozenset({PROVIDER_ANTHROPIC, PROVIDER_OPENAI}),
     HARNESS_GEMINI_CLI:  frozenset({PROVIDER_GOOGLE}),
+    HARNESS_CODEX:       frozenset({PROVIDER_OPENAI}),
 }
 
 
@@ -211,6 +216,7 @@ __all__ = [
     "PROVIDER_ANTHROPIC", "PROVIDER_OPENAI", "PROVIDER_GOOGLE",
     # harness constants
     "HARNESS_CLAUDE_CODE", "HARNESS_HERMES", "HARNESS_GEMINI_CLI",
+    "HARNESS_CODEX",
     # sets
     "VALID_RUNTIMES", "RESERVED_RUNTIMES",
     "VALID_PROVIDERS", "VALID_HARNESSES",

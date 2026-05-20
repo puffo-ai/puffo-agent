@@ -28,11 +28,15 @@ message keys, ed25519-signed events, structured AAD, and
 - **Per runtime kind** (see [Runtime kinds](#runtime-kinds) below):
   - `chat-local` — none beyond the provider key.
   - `sdk-local` — `pip install puffo-agent[sdk]`.
-  - `cli-local` — `claude` CLI on `$PATH` + `claude login` on the
-    host. Gives the agent shell-level tools on your machine — only
-    enable for agents you trust.
+  - `cli-local` — by default, `claude` CLI on `$PATH` + `claude login`
+    on the host. With `runtime.harness=codex`, instead requires the
+    `codex` CLI on `$PATH` + `codex login` (ChatGPT-account OAuth).
+    Gives the agent shell-level tools on your machine — only enable
+    for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket.
+    to the daemon socket. Supports `claude-code`, `hermes`, and
+    `gemini-cli` harnesses; codex inside Docker is not yet
+    supported.
 
 ## Install
 
@@ -239,8 +243,8 @@ A few constraints worth knowing:
 
 - **`chat-local`** — direct LLM call from inside the daemon (anthropic / openai / google). Default.
 - **`sdk-local`** — Claude Agent SDK in-process (anthropic only). `pip install puffo-agent[sdk]` first.
-- **`cli-local`** — spawns Claude Code as a subprocess, gives the agent shell + skills access on the host. Requires `claude login` on the host.
-- **`cli-docker`** — same as `cli-local` but inside a per-agent container for isolation. Requires Docker.
+- **`cli-local`** — spawns a CLI agent harness as a subprocess on the host. Defaults to Claude Code (`claude login` once); with `runtime.harness=codex` instead spawns OpenAI's `codex app-server` (`codex login` once, ChatGPT-account OAuth — no API key path). Gives the agent shell + skills access on the host.
+- **`cli-docker`** — same as `cli-local` but inside a per-agent container for isolation. Requires Docker. Supports `claude-code`, `hermes`, and `gemini-cli` harnesses; codex inside Docker is not yet supported (use `cli-local` for codex).
 
 Switch runtime kind / model / harness:
 

@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.9.1] — 2026-05-20
 
 ### Fixed
 
@@ -41,6 +41,510 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   local cache) will wipe the id with no backfill. Acceptable given
   rarity in practice; if it surfaces as a common issue a lazy-
   backfill path can be added in a follow-up.
+
+## [0.9.0] — 2026-05-20
+
+First stable release combining macOS Keychain integration (previously
+shipped as `0.9.0a3` / `0.9.0b1` on TestPyPI), the codex cli-local
+harness (previously `0.10.0a1` / `0.10.0a2`), and daemon-owned
+credential refresh extended to codex OAuth (previously `0.11.0a1`).
+All four pre-releases are superseded by this version — promote
+straight from `0.8.8` to `0.9.0`. The macOS Keychain backend and a
+sibling codex file backend both plug into the PUF-221 single-writer
+single-truth refresh model.
+
+> **Scope note — codex is `cli-local` only.** `runtime.kind=cli-docker`
+> with `runtime.harness=codex` is **not supported** in this release;
+> the bundled Docker image installs `claude-code`, `gemini-cli`, and
+> `hermes` but not the codex npm package, and the cli-docker adapter
+> has no codex turn handler. Tracked for a future release. Use
+> `runtime.kind=cli-local` to run a codex agent today.
+
+### Added (macOS Keychain integration)
+
+- **`CredentialRefresher` now has a pluggable backend abstraction so
+  macOS Keychain and Linux/Windows file storage share the same
+  daemon-owned single-writer lock, agent fan-out, and 401-wake
+  invariants while differing only on storage.** Claude Code 2.x
+  stores its OAuth token in the system Keychain
+  (`"Claude Code-credentials"`); without daemon-level intermediation,
+  the host's `claude` binary running under a puffo-agent worker
+  re-prompts the ACL every spawn and the per-agent
+  `.credentials.json` files diverge from the operator's main CLI
+  view. `KeychainBackend` (macOS) maintains a daemon cache at
+  `~/.puffo-agent/run/claude-credentials.json` and runs refreshes
+  in a sandboxed `claude --print` under a tempdir HOME seeded from
+  the cache, then writes the rotated blob back to Keychain best-
+  effort so the operator's main CLI sees the new token. `FileBackend`
+  (Linux/Windows) preserves bit-identical 0.8.8 behaviour. Selected
+  by `is_macos()` at daemon startup. See `0.9.0a3` below for the
+  full design.
+- **External-rotation poll** (macOS-only): a sibling task re-reads
+  Keychain every 5 minutes and fans rotations to siblings via the
+  same `_sync_views` path — catches refreshes done by the operator's
+  main `claude` CLI or by an agent's own subprocess self-refreshing
+  on a 401, neither of which the daemon would otherwise observe.
+- **PATH shim for anthropics/claude-code#37512**: every daemon start
+  writes a bash shim to `~/.puffo-agent/run/keychain-shim/security`
+  that intercepts `security delete-generic-password "Claude Code-
+  credentials"` (the upstream cleanup that kicks the operator's main
+  CLI / VS Code extension off Keychain) and silently no-ops it. Pre-
+  pended to `$PATH` for every per-agent `claude` spawn.
+- **Diagnostic CLI**: `puffo-agent test ...` with 5 probes
+  (`keychain-read`, `keychain-write`, `refresh-flush`,
+  `keychain-survives-token-env`, `full-probe`) plus the side-
+  effectful `refresh-flush-forced` (gated on `--yes`). Writes a
+  redacted-markdown probe report to `~/.puffo-agent/probe-report.md`;
+  tokens shown only as `len=NNN sha256_prefix=XXXXXXXX`. Every probe
+  SKIPs cleanly on non-Darwin so the same CLI is a sanity tool on
+  Linux/Windows.
+
+### Added (codex cli-local harness)
+
+- **New `runtime.harness: codex` option for OpenAI's `codex` CLI on
+  `runtime.kind=cli-local`,** running as a long-lived
+  `codex app-server` JSON-RPC subprocess. Sibling to claude-code on
+  the cli-local path; claude-code is untouched, codex is opt-in.
+  Components: `agent/harness/codex.py` (`CodexHarness`),
+  `agent/adapters/codex_session.py` (`CodexSession` — JSON-RPC over
+  stdio, `thread/start` + `turn/start` + `item/*` event stream, server-
+  initiated approval requests auto-decided under `bypassPermissions`,
+  conversation id persisted to `<CODEX_HOME>/codex_session.json` so
+  daemon restarts resume cleanly), `LocalCLIAdapter` harness dispatch,
+  per-agent `CODEX_HOME` at `~/.puffo-agent/agents/<id>/.codex/`,
+  AGENTS.md at `$CODEX_HOME/AGENTS.md` (reload hot-swaps via
+  `current_instructions` on the next `sendUserTurn`), and a TOML
+  emitter `write_codex_mcp_config` for codex's `[mcp_servers.puffo]`
+  schema.
+- Auth model: **codex `cli-local` requires `codex login` (ChatGPT-
+  account OAuth)** — the same trust model as cli-local claude-code
+  (`claude login` and shared `~/.claude/.credentials.json`). The
+  adapter symlinks (or copies on Windows non-developer-mode) the
+  operator's `~/.codex/auth.json` into each agent's `$CODEX_HOME`.
+  No `OPENAI_API_KEY` path — `runtime.api_key` /
+  `daemon.openai.api_key` are now only honoured by `chat-local` and
+  `sdk-local` (which talk to OpenAI directly via the Python SDK).
+
+### Added (codex daemon-owned refresh)
+
+- `CodexFileBackend` in `portal.credential_refresh` — parallel to
+  `FileBackend` (claude), targeting `~/.codex/auth.json`. Cross-platform
+  file-mode auth; macOS Keychain support deferred (operator on
+  `cli_auth_credentials_store = "keyring"` won't benefit from
+  pre-emptive refresh — per-agent file-mode pin still lets the agent's
+  own codex subprocess refresh in isolation).
+- `_jwt_exp_unix` helper — decodes the access_token JWT's `exp` claim
+  without signature verification. Codex's `auth.json` has no top-level
+  expiry; the only authoritative source is the JWT, and codex's own
+  `last_refresh` field uses an ~8-day staleness heuristic that's too
+  coarse for our refresh-before-expiry strategy.
+- Sibling `Daemon.codex_refresher` running its own `run_loop` task,
+  independent of the claude refresher. Both share the event loop but
+  hold independent locks + poll cadences; the files they touch don't
+  collide so there's no contention.
+- `Daemon._refresher_for(agent_cfg)` routes registration by
+  `runtime.harness`: codex → codex refresher, anything else → claude.
+- 27 new tests in `test_codex_credential_refresh.py`: JWT decoder
+  (5 happy / unhappy paths), `CodexFileBackend.expires_in_seconds`
+  (5 disk states), `sync_to_agent` (codex-dir gating), `bootstrap`
+  (host file presence), `refresh` (spawn shape, binary missing,
+  exp-didn't-advance, timeout, FileNotFoundError, nonzero exit),
+  refresher wiring (close-to-expiry, agent-401-trigger,
+  view-sync-fans-to-codex-only-agents), daemon harness routing,
+  unregister idempotency, and config.toml auth-store pinning.
+
+### Changed (config pinning)
+
+- `write_codex_mcp_config` writes `cli_auth_credentials_store = "file"`
+  at the top level of every per-agent `$CODEX_HOME/config.toml`,
+  **even when `puffo_core:` is not configured**. Codex's default
+  `auto` store would otherwise pick macOS Keychain for some agents
+  (depending on platform + install state), breaking the symlink-
+  propagation model that lets the daemon refresh tokens once and
+  fan out to N agents. The MCP config emitter's `command` / `args`
+  / `env` parameters are now optional — passing none still produces
+  a valid config that locks the agent into file-mode auth.
+
+### Known limitations
+
+- **macOS Keychain path has not been verified on a real Mac.** The
+  `KeychainBackend`, external-rotation poll, `security` PATH shim,
+  and 5 diagnostic probes carry the design from the 0.9.0a3 / 0.9.0b1
+  alphas (whose changelog noted the betas were "intended for macOS-
+  colleague verification" — that verification was never completed
+  before this release). Unit-test coverage is real (~30 tests in
+  `test_macos_credential_manager.py` + ~19 in `test_macos_diagnostic.py`)
+  but every test monkeypatches `is_macos` to `True` and mocks
+  `subprocess.run` for the `/usr/bin/security` and
+  `asyncio.create_subprocess_exec` for `claude --print` calls — no
+  test exercises the real Keychain ACL prompt, the real
+  `delete-generic-password` interception, or live token rotation on
+  a Darwin box. Linux/Windows paths use `FileBackend` and are
+  unaffected by this gap. macOS operators running 0.9.0 should treat
+  the Keychain integration as **first-real-deploy**: report any
+  prompt loops, missing tokens, or `puffo-agent test full-probe`
+  failures so we can ship 0.9.1.
+- **Host codex must be on `cli_auth_credentials_store = "file"`.**
+  If the operator's `~/.codex/config.toml` pins keyring (default
+  `auto` on macOS), `CodexFileBackend.bootstrap` returns
+  "no-host-codex-auth" and the daemon-owned refresh is a no-op.
+  Each agent's codex still refreshes its own per-agent file
+  independently (we force file mode in the per-agent config); the
+  only loss is the PUF-221 multi-agent race protection. Future work:
+  `CodexKeychainBackend`, or auto-installing the file setting in the
+  operator's host config.
+- `runtime.kind=cli-docker` with `runtime.harness=codex` is **not
+  supported** — see the scope note at the top of this release.
+
+## [0.10.0a2] — 2026-05-15
+
+> **Pre-release published to TestPyPI only — not for general install.**
+
+### Fixed (codex cli-local alpha)
+
+End-to-end debugging session against a real `codex app-server`
+binary pinned a sequence of wrong assumptions in `0.10.0a1`. Every
+fix below was driven by either a live error trace from the codex
+process or a direct re-read of `codex-rs/app-server-protocol/src/
+protocol/v2.rs` + `codex-rs/app-server/README.md`.
+
+- **Windows codex binary resolution.** `asyncio.create_subprocess_exec`
+  goes through `CreateProcess`, which doesn't honour `PATHEXT` —
+  npm-installed `codex.cmd` was unreachable as bare `"codex"`.
+  Resolve via `shutil.which` before spawning so the full
+  `C:\Program Files\nodejs\codex.cmd` path is used.
+
+- **Wire method names** (the codex App Server's helpful error
+  response listed every method it knows, which made this exact):
+  `newConversation` → `thread/start`,
+  `resumeConversation` → `thread/resume`,
+  `sendUserTurn` → `turn/start`,
+  `interruptTurn` → `turn/interrupt`.
+  Plus an explicit `initialize` handshake on spawn (best-effort —
+  some App Server versions skip it).
+
+- **`thread/start` param shape.** Wire schema is **camelCase**
+  (`approvalPolicy`, NOT `approval_policy` — the Python SDK FAQ
+  was about the Python wrapper, not the JSON). Thread-level sandbox
+  field is bare `sandbox` (single word — not `sandbox_mode`, not
+  `sandboxMode`). Two prior cycles silently dropped our params and
+  fell back to codex defaults until this was pinned. System prompt
+  is NOT a param — codex reads `$CODEX_HOME/AGENTS.md` directly.
+  `instructions` field removed from both `thread/start` and
+  `turn/start`.
+
+- **`approvalPolicy: "never"` means auto-approve** (i.e. never
+  bother the client), not auto-deny. Counter-intuitive name; pinned
+  by live behaviour. Used together with `sandbox:
+  "danger-full-access"` for the puffo trust model (operator vouches
+  for the agent + machine, all tools allowed). cli-local runs as
+  the operator's UID anyway — codex's in-process sandbox would only
+  block legitimate work.
+
+- **`turn/start.input` is a structured array**
+  (`[{type: "text", text: ...}]`), not a bare string. Old shape
+  was rejected with "missing field `input`" before we figured this
+  out.
+
+- **`thread/start` response is nested**: `{thread: {id, ...}}`,
+  not flat `{threadId: ...}`. `_extract_thread_id` walks the
+  envelope defensively so a near-future minor rename doesn't break
+  us silently.
+
+- **5 distinct server-initiated request methods**, 3 distinct
+  response shapes, each handled explicitly (the previous
+  substring-match dispatcher confused them all):
+  - `item/commandExecution/requestApproval`
+    → `{decision: "accept"}` (variant names `accept` /
+    `acceptForSession` / `decline` / `cancel`, NOT `approved`).
+  - `item/fileChange/requestApproval` → same envelope.
+  - `item/permissions/requestApproval` →
+    `{scope: "session", permissions: …}` (mirrors back the
+    requested permissions).
+  - `mcpServer/elicitation/request` →
+    `{action: "accept", content: {}}` (the canonical mechanism
+    when an MCP tool call needs approval).
+  - `item/tool/call` → `{contentItems: [...], success: false}`
+    (dynamic-tool-invocation contract; we don't register any).
+
+- **`item/agentMessage/delta` payload shape.** Text fragment lives
+  at `params.delta` directly, NOT nested under `params.item.text`.
+  Missing this lost most of the streaming reply text — only the
+  final `item/completed` ever landed in the buffer. Fixed handler
+  reads `params.delta`; final completed item is preferred over
+  delta concatenation when they disagree.
+
+- **`mcp__puffo__send_message` detection.** codex emits a
+  `item/completed` notification with `type: "mcpToolCall"`,
+  `server: "puffo"`, `tool: "send_message"`, `status: "completed"`
+  whenever the agent successfully invokes a puffo MCP tool.
+  `CodexSession` now accumulates these into
+  `TurnResult.metadata["send_message_targets"]` — the same field
+  the claude-code adapter populates, so `core.py`'s reply-routing
+  logic is harness-agnostic. Without this, every codex reply
+  triggered the `[SILENT]`-fallback path (folded, not visible).
+
+- **StreamReader buffer raised from 64 KiB to 16 MiB.** Single
+  codex notifications (full MCP tool catalog on
+  `mcpServer/startupStatus/updated`, session snapshot on
+  `thread/started`) routinely exceed 64 KiB; the reader loop died
+  with `LimitOverrunError`, and subsequent turns timed out
+  reading from a dead pipe.
+
+- **Codex OAuth fallback** via shared `~/.codex/auth.json`. When
+  `runtime.api_key` is unset, the adapter symlinks (copy-fallback
+  on Windows non-dev-mode) the operator's `codex login` token
+  into `$CODEX_HOME/auth.json` per agent — same pattern as
+  `link_host_credentials` for claude-code. ChatGPT-account
+  subscribers can run puffo-agent codex agents on their plan
+  quota without separately-paid API tokens.
+
+### Operator note
+
+Existing `~/.puffo-agent/agents/<id>/.codex/codex_session.json`
+files carry conversation IDs whose `approvalPolicy` / `sandbox`
+config was BAKED at thread creation time. `thread/resume` doesn't
+re-apply those params, so 0.10.0a1 agents won't pick up the new
+config without deleting that file. Delete it (or move it aside)
+on upgrade.
+
+## [0.10.0a1] — 2026-05-15
+
+> **Pre-release published to TestPyPI only — not for general install.**
+> Install with `pip install --index-url https://test.pypi.org/simple/
+> --extra-index-url https://pypi.org/simple/ puffo-agent==0.10.0a1`.
+
+### Added
+
+- **Codex harness on `cli-local` (alpha).** New `runtime.harness: codex`
+  option for OpenAI's `codex` CLI, running as a long-lived
+  `codex app-server` JSON-RPC subprocess. Sibling to claude-code on the
+  cli-local path; claude-code is untouched, codex is opt-in.
+
+  Components:
+  - `agent/harness/codex.py` (`CodexHarness`) + `runtime_matrix`
+    entries (`HARNESS_CODEX` + `HARNESS_PROVIDERS[codex] = {openai}`).
+    Default harness for openai remains `hermes` — codex must be opted
+    into per agent.
+  - `agent/adapters/codex_session.py` (`CodexSession`) — JSON-RPC
+    over stdio: `newConversation` / `sendUserTurn` request/response,
+    `item/*` notification stream accumulated into the reply,
+    `turn/completed` resolves the turn, server-initiated approval
+    requests auto-decided under `bypassPermissions`. Conversation id
+    persisted to `<CODEX_HOME>/codex_session.json` so daemon restarts
+    `resumeConversation` instead of reopening from scratch.
+  - `LocalCLIAdapter` dispatches by `harness.name()`: codex agents
+    route through `CodexSession`, everything else stays on
+    `ClaudeSession`. `refresh_ping` / `_run_refresh_oneshot` short-
+    circuit for codex (static `OPENAI_API_KEY`, no OAuth rotation).
+  - Per-agent `CODEX_HOME` (`~/.puffo-agent/agents/<id>/.codex/`).
+    Two auth paths supported: explicit `runtime.api_key` → injected
+    as `OPENAI_API_KEY` env (cleanest, no rotation), OR ChatGPT-
+    account OAuth via `codex login` (operator runs it once, the
+    adapter symlinks `~/.codex/auth.json` into each agent's
+    `$CODEX_HOME`; copy fallback on Windows non-dev-mode). Fail-loud
+    error at spawn when neither path is usable. AGENTS.md lives at
+    `$CODEX_HOME/AGENTS.md`; reload hot-swaps the in-memory
+    `current_instructions` field carried by each `sendUserTurn` call.
+  - `mcp/config.py` gains `write_codex_mcp_config` — a TOML emitter
+    for codex's `[mcp_servers.puffo]` schema with per-server `env`
+    table for the existing `puffo_core_mcp_env` payload.
+
+  Out of scope for v1 (will follow): per-turn item-event streaming to
+  StatusReporter; codex-shaped health probe; cli-docker codex.
+
+  Self-update for codex agents in v1 is limited to
+  `reload_system_prompt` (re-writes AGENTS.md). `install_skill` /
+  `refresh` / `install_mcp_server` / `uninstall_*` remain
+  claude-code-only — the existing `_require_claude_code` MCP gates
+  surface a clear error.
+
+  This release ships to TestPyPI only. The codex App Server JSON-RPC
+  contract is still pre-1.0 upstream; we treat 0.10.0a1 as the
+  verification vehicle. Promote to PyPI 0.10.0 once a colleague has
+  walked an agent through a real end-to-end turn against the actual
+  `codex app-server` binary.
+
+## [0.9.0b1] — 2026-05-19
+
+_Pre-release published to TestPyPI only — not for general install._
+
+Beta-promote of `0.9.0a3` with the post-review polish folded in.
+Code is unchanged from the architectural pass; this is the first
+version intended for macOS-colleague verification.
+
+### Polished (from PR #20 review)
+
+- **`portal/credential_refresh.py`**: dropped the unconditional
+  top-level import of `KEYCHAIN_POLL_INTERVAL_SECONDS` from the
+  macos package. Now lazy-imported inside `_external_rotation_loop`,
+  matching every other macos touchpoint in the file. The
+  platform-agnostic module no longer pulls the macos package into
+  its import graph on Linux/Windows.
+
+- **`portal/credential_refresh.py`**: restored the `cwd=host_home`
+  justification comment in `FileBackend.refresh` that was
+  accidentally dropped in the 0.9.0a3 backend-abstraction port.
+  The choice is non-obvious — `claude --print` writes project-
+  transcript files into cwd, so pointing it at the daemon's launch
+  directory would leak them. Mirror of the rationale that landed in
+  PUF-221 PR #32 round 4.
+
+- **`agent/adapters/local_cli.py`**: adapter spawn no longer
+  re-installs the PATH shim on every worker spawn. `KeychainBackend.
+  bootstrap()` already runs `install_path_shim` once at daemon
+  start; the adapter now just computes `shim_dir(home_dir())` for
+  the env var. Removes per-spawn `write_text` + `chmod` overhead and
+  closes a concurrent-spawn write-write race the bootstrap path
+  doesn't have.
+
+- **`portal/diagnostic.py`**: noted in code that the `#37512` repro
+  probe (the only place we deliberately set `CLAUDE_CODE_OAUTH_TOKEN
+  =<real token>`) makes the token briefly visible to `ps auxe` for
+  the duration of the claude subprocess. Intentional — the probe's
+  whole purpose is to reproduce that issue — but worth surfacing for
+  anyone running on a shared host.
+
+- **`portal/diagnostic.py` + `macos/keychain.py`**: paired
+  ``keep in sync`` warnings on `_run_sandboxed_claude_oneshot`
+  (sync, diagnostic-side) and `refresh_via_oneshot` (async,
+  production-side). They share env shape + claude args; the
+  diagnostic loses its load-bearing value the moment they drift.
+
+- **`portal/diagnostic.py`** module docstring: stale
+  `puffo_agent.macos.credential_manager` → `puffo_agent.macos.keychain`
+  (one-word swap, the post-rebase module path).
+
+Tests unchanged: **726 passed / 7 skipped / 0 failed** locally on
+Windows.
+
+## [0.9.0a3] — 2026-05-19
+
+_Pre-release published to TestPyPI only — not for general install._
+
+### Changed
+
+- **macOS Keychain integration on top of the daemon-owned
+  `CredentialRefresher`.** Claude Code 2.x stores its OAuth token in
+  the system Keychain (`"Claude Code-credentials"`), and per-agent
+  `$HOME` overrides don't isolate Keychain access (the ACL is keyed
+  on UID + signing identity, not HOME). Without daemon-level
+  intermediation, the host's `claude` binary running under a
+  puffo-agent worker re-prompts the ACL every spawn and the per-agent
+  `.credentials.json` files diverge from the operator's main CLI
+  view. GitHub issue anthropics/claude-code#37512 compounds the
+  problem: setting `CLAUDE_CODE_OAUTH_TOKEN` triggers a
+  `security delete-generic-password "Claude Code-credentials"`
+  cleanup on exit that kicks the user's main CLI / VS Code extension
+  off Keychain entirely.
+
+  This release extends the 0.8.8 `CredentialRefresher` with a
+  pluggable backend abstraction so the macOS Keychain path and the
+  Linux/Windows host-file path share the same daemon-owned lock,
+  agent fan-out, and 401-wake invariants while differing only on
+  storage:
+
+  - `CredentialBackend` Protocol (`portal/credential_refresh.py`) —
+    four methods: `expires_in_seconds`, `refresh` (async, returns
+    `RefreshOutcome.{REFRESHED, UNCHANGED, FAILED}`), `sync_to_agent`,
+    and `bootstrap`.
+  - `FileBackend` — preserves bit-identical 0.8.8 behavior on
+    Linux/Windows. Host `~/.claude/.credentials.json` is canonical;
+    refresh spawns `claude --print` with `HOME=host_home`; sync is a
+    symlink (or copy fallback) via `link_host_credentials`. External
+    rotation propagates atomically through the symlink — no
+    external-poll needed.
+  - `KeychainBackend` — macOS path. Keychain is canonical; the
+    daemon maintains a cache at
+    `~/.puffo-agent/run/claude-credentials.json` (atomic-write JSON
+    blob, chmod 600); refresh runs a sandboxed `claude --print`
+    under a tempdir `HOME` seeded from the cache so claude rotates
+    the token against Anthropic and writes the new blob back to the
+    sandbox file (which we then copy to the cache); writeback to
+    Keychain is best-effort so the operator's main CLI sees the new
+    token; `sync_to_agent` is a per-agent file copy (Keychain ACL
+    forces this — symlinking the cache wouldn't help because the
+    per-agent `claude` process still goes through Keychain anyway).
+  - `CredentialRefresher` itself stays platform-agnostic: owns the
+    `asyncio.Lock` (single-writer across all refreshes), the agent
+    home registry, the `_refresh_request` event for 401-wake, the
+    2-minute file-expiry poll, and the post-tick fan-out that calls
+    `backend.sync_to_agent(agent_home)` for every registered agent.
+    Daemon `daemon.py` picks the backend at startup based on
+    `is_macos()`.
+  - **External-rotation poll** (macOS-only): `KeychainBackend`
+    exposes `poll_external_rotation()` and the refresher runs it as
+    a sibling task on `KEYCHAIN_POLL_INTERVAL_SECONDS = 5 * 60`. The
+    poll re-reads Keychain (silent after the first "Always Allow"
+    grant), diffs against the last propagated blob, and on detected
+    change updates the cache + triggers fan-out via the same
+    `_sync_views` path. This catches rotations done by the
+    operator's main `claude` CLI or by an agent's own claude
+    subprocess self-refreshing on a 401 — neither of which the
+    daemon initiates, so neither would be visible to siblings
+    without this poll.
+  - **PATH shim** (issue #37512 workaround): every daemon start
+    writes a bash shim to
+    `~/.puffo-agent/run/keychain-shim/security` that intercepts
+    `security delete-generic-password "Claude Code-credentials"`
+    and silently no-ops it, passing every other `security`
+    invocation through to `/usr/bin/security`. The shim dir is
+    prepended to `$PATH` for every per-agent `claude` spawn and for
+    the daemon's own refresh oneshot.
+  - **`local_cli` adapter macOS env-injection**: on macOS, each
+    agent's `claude` subprocess gets `CLAUDE_CONFIG_DIR=<agent_home>/.claude`
+    and `PATH=<shim_dir>:<original PATH>`. **Deliberately does NOT
+    set `CLAUDE_CODE_OAUTH_TOKEN`** — that env var triggers the
+    same bug #37512 cleanup path and would defeat the shim's
+    protection. The per-agent `.credentials.json` is materialised by
+    `KeychainBackend.sync_to_agent` whenever the refresher's tick
+    fans out, so claude reads from there normally. Linux/Windows
+    spawn env is unchanged.
+  - Diagnostic CLI: `puffo-agent test ...` subcommand tree with 5
+    probes (`keychain-read`, `keychain-write`, `refresh-flush`,
+    `keychain-survives-token-env`, `full-probe`) plus a
+    side-effectful `refresh-flush-forced` (gated on `--yes`). Writes
+    a redacted-markdown probe report to
+    `~/.puffo-agent/probe-report.md`. Tokens are shown only as
+    `len=NNN sha256_prefix=XXXXXXXX`. Each probe SKIPs cleanly on
+    non-Darwin so the same CLI works as a sanity-check tool on
+    Linux/Windows.
+
+  The PUF-221 public API (`CredentialRefresher.register_agent` /
+  `unregister_agent` / `notify_refresh_needed` / `run_loop` /
+  `expires_in_seconds`) is unchanged — the refactor is invisible to
+  the daemon's reconcile loop and to `Worker`'s `notify_refresh_needed`
+  callback. The 0.8.8 `host_home=...` constructor signature still
+  works (it implicitly constructs a `FileBackend`) so the existing
+  `tests/test_credential_refresher.py` pins the public-API contract
+  without modification.
+
+### Tests
+
+- `tests/test_macos_credential_manager.py` (~30 tests) — pure-function
+  tests for `CredentialCache`, `install_path_shim`, the keychain
+  read/write primitives (subprocess.run mocked), `refresh_via_oneshot`
+  + `_run_claude_oneshot` (asyncio.create_subprocess_exec mocked),
+  `bootstrap_from_keychain`, plus end-to-end tests for
+  `KeychainBackend` plugged into `CredentialRefresher`
+  (`expires_in_seconds` cache-vs-Keychain path, `refresh` returning
+  `REFRESHED`/`UNCHANGED`/`FAILED`, `sync_to_agent` writing per-agent
+  files, `poll_external_rotation` detecting changes / swallowing
+  read failures, the refresher's fan-out invoking `sync_to_agent`
+  on every registered agent, FD-leak regression for the timeout
+  drain path).
+- `tests/test_macos_diagnostic.py` (~19 tests) — report rendering,
+  token redaction (raw tokens never appear in stdout / saved
+  report), off-macOS SKIPPED path on every probe, on-macOS happy
+  path with mocked subprocess, forced-expiry helpers, and the
+  `refresh-flush-forced` `--yes` gate.
+- `tests/test_credential_refresher.py` (the 12 0.8.8 pinned tests)
+  pass unchanged against the refactored class — the backend
+  abstraction is invisible to the public API.
+
+Full suite: **726 passed / 7 skipped / 0 failed** on Windows
+(macOS-specific assertions still execute because they monkeypatch
+`is_macos` to True; symlink-unavailable skips on Windows are normal).
 
 ## [0.8.8] — 2026-05-19
 
@@ -1486,7 +1990,9 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.8.3...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.10.0a2...HEAD
+[0.10.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a2
+[0.10.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3
 [0.8.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.2
 [0.8.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.1

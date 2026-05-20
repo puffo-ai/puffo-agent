@@ -253,15 +253,21 @@ this agent. Four options. **The starter `agent.yml` defaults to
 CLI that drives it. Defaults exist; you only set them if you want
 non-default.
 
-| `provider`   | `harness`     | Models you can pick                                  |
-|--------------|---------------|------------------------------------------------------|
-| `anthropic`  | `claude-code` | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` |
-| `anthropic`  | `hermes`      | Same as above (multi-provider harness)               |
-| `openai`     | `hermes`      | `gpt-4o`, `gpt-4-turbo`, etc.                        |
-| `google`     | `gemini-cli`  | `gemini-2.5-pro`, `gemini-2.5-flash`                 |
+| `provider`   | `harness`     | Models you can pick                                  | Runtime kinds                |
+|--------------|---------------|------------------------------------------------------|------------------------------|
+| `anthropic`  | `claude-code` | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | all                          |
+| `anthropic`  | `hermes`      | Same as above (multi-provider harness)               | `cli-docker` only            |
+| `openai`     | `hermes`      | `gpt-4o`, `gpt-4-turbo`, etc.                        | `cli-docker` only            |
+| `openai`     | `codex`       | `gpt-5.5`, `gpt-5`, etc. (whatever your `codex` CLI supports) | **`cli-local` only** in 0.9.0 |
+| `google`     | `gemini-cli`  | `gemini-2.5-pro`, `gemini-2.5-flash`                 | `cli-docker` only            |
 
 Defaults if you leave them blank: `anthropic` + `claude-code` (so a
 plain `kind: cli-local` agent runs Anthropic via Claude Code).
+
+> **Codex inside Docker is not yet supported** in 0.9.0. The bundled
+> Docker image installs `claude-code`, `gemini-cli`, and `hermes` but
+> not the codex npm package, and the cli-docker adapter has no codex
+> turn handler. Pick `kind: cli-local` for codex agents today.
 
 ### 4d — `api_key:` — runtime-specific
 
@@ -269,7 +275,7 @@ plain `kind: cli-local` agent runs Anthropic via Claude Code).
 |---------------|----------------------------------------------------------------------------------|
 | `chat-local`  | **Yes** — the daemon talks to the provider directly. Set `runtime.api_key`.      |
 | `sdk-local`   | **Yes** — same reason as chat-local.                                             |
-| `cli-local`   | **No** for `claude-code` (Claude Code uses the host's saved auth — `claude login` once). **Yes** for `hermes`/`gemini-cli` if those CLIs aren't already authenticated on the host. |
+| `cli-local`   | **No** for `claude-code` (uses host's saved auth — `claude login` once). **No** for `codex` either — codex agents share the host's `codex login` (ChatGPT-account OAuth); no `OPENAI_API_KEY` path on `cli-local`. **Yes** for `hermes`/`gemini-cli` if those CLIs aren't already authenticated on the host. |
 | `cli-docker`  | **No** for `claude-code` (the per-agent container reuses the operator's host claude auth via a bind-mount). **Yes** for openai/google as above. |
 
 When set, `api_key` is the raw provider key (e.g. an Anthropic
@@ -314,6 +320,19 @@ runtime:
   model: claude-opus-4-7
   harness: claude-code
   # api_key not needed; container bind-mounts host's ~/.claude
+```
+
+**`cli-local` with Codex + OpenAI** (ChatGPT-account OAuth, no API key):
+
+```yaml
+runtime:
+  kind: cli-local
+  provider: openai
+  harness: codex
+  model: gpt-5.5
+  permission_mode: bypassPermissions
+  # api_key not needed; codex shares the host's ~/.codex/auth.json
+  # (run `codex login` once on the host first).
 ```
 
 **`cli-local` with Hermes + OpenAI**:
