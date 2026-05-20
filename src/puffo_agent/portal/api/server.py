@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 # aiohttp's default 1 MiB cap is below ``MAX_AVATAR_BYTES`` (4 MiB
-# raw → ~5.4 MiB after base64 + JSON envelope). 8 MiB covers the
-# avatar with headroom for identity-bundle bodies. Per-handler caps
-# still apply on top.
-BRIDGE_MAX_REQUEST_BYTES = 8 * 1024 * 1024
+# raw → ~5.4 MiB after base64 + JSON envelope). The ``import`` endpoint
+# also POSTs base64-encoded bundles that can hold N agents' workspaces,
+# so the cap is sized generously. Per-handler caps still apply on top.
+BRIDGE_MAX_REQUEST_BYTES = 64 * 1024 * 1024
 
 
 def build_app(cfg: BridgeConfig) -> web.Application:
@@ -52,6 +52,9 @@ def build_app(cfg: BridgeConfig) -> web.Application:
     app.router.add_get("/v1/agents/{id}/files", h.list_files)
     app.router.add_get("/v1/agents/{id}/files/raw", h.read_file)
     app.router.add_get("/v1/agents/{id}/claude-md", h.get_claude_md)
+    app.router.add_post("/v1/agents/export", h.agents_export)
+    app.router.add_post("/v1/agents/import", h.agents_import)
+    app.router.add_post("/v1/agents/{id}/revoke-pending", h.agent_revoke_pending)
     return app
 
 

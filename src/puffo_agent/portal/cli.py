@@ -16,7 +16,6 @@ import shutil
 import subprocess
 import sys
 import time
-import zipfile
 from pathlib import Path
 
 from .api.pairing import clear_pairing, load_pairing
@@ -43,8 +42,8 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_valid_agent_id,
-    link_host_credentials,
     read_daemon_pid,
+    write_refresh_token_request,
     write_stop_request,
 )
 
@@ -620,108 +619,36 @@ def _summarise_credentials(path: Path) -> str:
     )
 
 
-def cmd_agent_refresh_ping(args: argparse.Namespace) -> int:
-    """Run the OAuth refresh one-shot against a cli-local agent and
-    print everything observable (credentials before/after, full
-    subprocess output) for reproducible diagnosis."""
-    agent_id = args.id
-    if not agent_yml_path(agent_id).exists():
-        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
-        return 2
-    cfg = AgentConfig.load(agent_id)
-    if cfg.runtime.kind != "cli-local":
+def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
+    """PUF-221: ask the daemon to refresh Claude's OAuth token and
+    distribute the new credentials to every agent.
+
+    Writes the ``refresh-token`` flag file; the daemon picks it up
+    on its next reconcile tick, wakes the credential refresher, runs
+    one ``claude --print "ok"`` against the host credentials, and
+    fans ``link_host_credentials`` to every registered agent home.
+    Single writer (daemon) = no multi-process race on Anthropic's
+    single-use refresh tokens.
+    """
+    if not is_daemon_alive():
         print(
-            f"error: refresh-ping only supports cli-local "
-            f"(agent {agent_id!r} is {cfg.runtime.kind!r}).",
+            "error: puffo-agent daemon is not running. start it with "
+            "`puffo-agent start`.",
             file=sys.stderr,
         )
         return 2
-
-    home_override = agent_home_dir(agent_id)
-    agent_creds = home_override / ".claude" / ".credentials.json"
     host_creds = Path.home() / ".claude" / ".credentials.json"
-    workspace = Path(cfg.resolve_workspace_dir())
-
-    print(f"agent: {agent_id}  runtime: {cfg.runtime.kind}  model: {cfg.runtime.model or '(default)'}")
-    print(f"agent HOME override: {home_override}")
-    print(f"workspace:           {workspace}")
+    print("host credentials:")
+    print(f"  {host_creds}")
+    print(f"  {_summarise_credentials(host_creds)}")
     print()
-    print("Before link:")
-    print(f"  agent {agent_creds}")
-    print(f"        {_summarise_credentials(agent_creds)}")
-    print(f"  host  {host_creds}")
-    print(f"        {_summarise_credentials(host_creds)}")
-    print()
-
-    # Mirror LocalCLIAdapter._verify() so the diagnostic matches
-    # production starting conditions.
-    link_mode = link_host_credentials(Path.home(), home_override)
-    print(f"link_host_credentials -> {link_mode}")
-    print("After link:")
-    print(f"  agent {agent_creds}")
-    print(f"        {_summarise_credentials(agent_creds)}")
-    print()
-
-    if shutil.which("claude") is None:
-        print("error: claude binary not on PATH", file=sys.stderr)
-        return 2
-
-    cmd = [
-        "claude", "--dangerously-skip-permissions",
-        "--print", "--max-turns", "1",
-        "--output-format", "stream-json", "--verbose",
-    ]
-    if cfg.runtime.model:
-        cmd.extend(["--model", cfg.runtime.model])
-    cmd.append("ok")
-
-    env = {
-        **os.environ,
-        "HOME": str(home_override),
-        "USERPROFILE": str(home_override),
-    }
-
-    print(f"running: {' '.join(cmd)}")
-    print(f"  cwd={workspace}")
-    print(f"  HOME={home_override}  USERPROFILE={home_override}")
-    print()
-
-    started = time.time()
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(workspace),
-            env=env,
-            capture_output=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.time() - started
-        print(f"timed out after {elapsed:.1f}s", file=sys.stderr)
-        if exc.stdout:
-            print("--- stdout ---")
-            print(exc.stdout.decode("utf-8", errors="replace"))
-        if exc.stderr:
-            print("--- stderr ---")
-            print(exc.stderr.decode("utf-8", errors="replace"))
-        return 3
-    elapsed = time.time() - started
-
-    print(f"rc={proc.returncode}  elapsed={elapsed:.1f}s")
-    print()
-    print("--- stdout ---")
-    stdout = proc.stdout.decode("utf-8", errors="replace")
-    print(stdout or "(empty)")
-    print()
-    print("--- stderr ---")
-    stderr = proc.stderr.decode("utf-8", errors="replace")
-    print(stderr or "(empty)")
-    print()
-    print("After:")
-    print(f"  agent {agent_creds}")
-    print(f"        {_summarise_credentials(agent_creds)}")
-    print(f"  host  {host_creds}")
-    print(f"        {_summarise_credentials(host_creds)}")
+    write_refresh_token_request()
+    print("refresh request written; daemon will pick it up on its "
+          "next reconcile tick (typically <1s).")
+    print(
+        f"after a few seconds, re-check {host_creds} mtime + "
+        "expiresAt to confirm the refresh landed."
+    )
     return 0
 
 
@@ -1107,24 +1034,135 @@ def cmd_api_status(args: argparse.Namespace) -> int:
 
 
 def cmd_agent_export(args: argparse.Namespace) -> int:
-    agent_id = args.id
-    src = agent_dir(agent_id)
-    if not src.exists():
-        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+    from . import export as exp
+
+    agent_ids: list[str] = args.ids
+    missing = [a for a in agent_ids if not agent_dir(a).exists()]
+    if missing:
+        print(f"error: agent(s) not found: {', '.join(missing)}", file=sys.stderr)
         return 2
     dest = Path(args.dest)
-    if dest.suffix.lower() != ".zip":
-        dest = dest.with_suffix(".zip")
-    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for path in src.rglob("*"):
-            if path.is_file():
-                # Skip any tmp files mid-write.
-                if path.suffix == ".tmp":
-                    continue
-                arcname = Path(agent_id) / path.relative_to(src)
-                zf.write(path, arcname=str(arcname))
-    print(f"exported {agent_id!r} → {dest}")
+    if dest.suffix.lower() != ".puffoagent":
+        dest = dest.with_suffix(".puffoagent")
+    if dest.exists() and not args.force:
+        print(f"error: {dest} already exists (pass --force to overwrite)", file=sys.stderr)
+        return 2
+
+    password = _prompt_password_twice("Set export password: ")
+    if password is None:
+        return 130
+
+    try:
+        blob = exp.pack(agent_ids, password)
+    except exp.ExportError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    dest.write_bytes(blob)
+    print(f"exported {len(agent_ids)} agent(s) → {dest} ({len(blob):,} bytes)")
     return 0
+
+
+def cmd_agent_import(args: argparse.Namespace) -> int:
+    from . import export as exp
+    from . import import_agents
+
+    src = Path(args.src)
+    if not src.is_file():
+        print(f"error: {src} not found", file=sys.stderr)
+        return 2
+    try:
+        blob = src.read_bytes()
+    except OSError as e:
+        print(f"error: cannot read {src}: {e}", file=sys.stderr)
+        return 2
+
+    password = _prompt_password_once("Import password: ")
+    if password is None:
+        return 130
+
+    try:
+        report = asyncio.run(import_agents.import_bundle(blob, password))
+    except exp.ImportPackError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    width = max((len(r.agent_id) for r in report.results), default=10)
+    for r in report.results:
+        tag = {
+            "imported": "OK     ",
+            "imported_pending_revoke": "PARTIAL",
+            "skipped": "SKIP   ",
+            "failed": "FAIL   ",
+        }.get(r.status, r.status)
+        line = f"  [{tag}] {r.agent_id.ljust(width)}"
+        if r.detail:
+            line += f"  — {r.detail}"
+        print(line)
+
+    print(
+        f"\nsummary: {report.imported} imported "
+        f"({report.pending_revokes} pending revoke), "
+        f"{report.skipped} skipped, {report.failed} failed"
+    )
+    return 0 if report.failed == 0 else 1
+
+
+def cmd_agent_revoke_pending(args: argparse.Namespace) -> int:
+    from . import import_agents
+
+    if args.id:
+        result = asyncio.run(import_agents.revoke_pending(args.id))
+        if result.status == "imported":
+            print(f"OK: revoked {result.old_device_id} for agent {result.agent_id}")
+            return 0
+        if result.status == "skipped":
+            print(f"skip: {result.detail}")
+            return 0
+        print(f"FAIL: {result.detail}", file=sys.stderr)
+        return 1
+
+    pending = import_agents.list_pending_revokes()
+    if not pending:
+        print("no pending revokes")
+        return 0
+    print(f"{len(pending)} pending revoke(s):")
+    for agent_id, old_device_id in pending:
+        result = asyncio.run(import_agents.revoke_pending(agent_id))
+        tag = "OK  " if result.status == "imported" else "FAIL"
+        print(f"  [{tag}] {agent_id}  old={old_device_id}  {result.detail}")
+    return 0
+
+
+def _prompt_password_once(prompt: str) -> str | None:
+    import getpass
+
+    try:
+        pw = getpass.getpass(prompt)
+    except (KeyboardInterrupt, EOFError):
+        print(file=sys.stderr)
+        return None
+    if not pw:
+        print("error: empty password", file=sys.stderr)
+        return None
+    return pw
+
+
+def _prompt_password_twice(prompt: str) -> str | None:
+    import getpass
+
+    try:
+        pw = getpass.getpass(prompt)
+        confirm = getpass.getpass("Confirm password:    ")
+    except (KeyboardInterrupt, EOFError):
+        print(file=sys.stderr)
+        return None
+    if not pw:
+        print("error: empty password", file=sys.stderr)
+        return None
+    if pw != confirm:
+        print("error: passwords do not match", file=sys.stderr)
+        return None
+    return pw
 
 
 def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
@@ -1322,16 +1360,16 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("id")
     resume.set_defaults(func=cmd_agent_resume)
 
-    refresh_ping = agent_sub.add_parser(
-        "refresh-ping",
+    refresh_token = agent_sub.add_parser(
+        "refresh-token",
         help=(
-            "Diagnostic: run the OAuth refresh one-shot against a "
-            "cli-local agent and print credentials before/after + "
-            "full subprocess output."
+            "Ask the daemon to refresh Claude's OAuth token and "
+            "distribute the new credentials to every agent. Single "
+            "writer (daemon) — no per-agent race on the on-disk "
+            "refresh token."
         ),
     )
-    refresh_ping.add_argument("id")
-    refresh_ping.set_defaults(func=cmd_agent_refresh_ping)
+    refresh_token.set_defaults(func=cmd_agent_refresh_token)
 
     runtime = agent_sub.add_parser(
         "runtime",
@@ -1469,10 +1507,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rename.set_defaults(func=cmd_agent_rename)
 
-    export = agent_sub.add_parser("export", help="Export agent profile + memory + config as a zip")
-    export.add_argument("id")
-    export.add_argument("dest", help="Destination .zip file")
+    export = agent_sub.add_parser(
+        "export",
+        help="Encrypted export of N agents into a .puffoagent bundle",
+    )
+    export.add_argument("ids", nargs="+", metavar="agent_id", help="agent id(s) to export")
+    export.add_argument("--dest", required=True, help="Destination .puffoagent file")
+    export.add_argument("--force", action="store_true", help="Overwrite dest if it exists")
     export.set_defaults(func=cmd_agent_export)
+
+    imp = agent_sub.add_parser(
+        "import",
+        help="Restore agents from a .puffoagent bundle on this daemon",
+    )
+    imp.add_argument("src", help="Path to the .puffoagent file")
+    imp.set_defaults(func=cmd_agent_import)
+
+    revoke_pending = agent_sub.add_parser(
+        "revoke-pending",
+        help="Retry the post-import revocation of an old device",
+    )
+    revoke_pending.add_argument(
+        "id",
+        nargs="?",
+        default=None,
+        help="agent id to retry (omit to retry all pending)",
+    )
+    revoke_pending.set_defaults(func=cmd_agent_revoke_pending)
 
     reset_primer = agent_sub.add_parser(
         "reset-primer",

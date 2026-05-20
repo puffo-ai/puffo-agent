@@ -1475,3 +1475,120 @@ def _bad(msg: str) -> web.Response:
 
 def _not_found(msg: str) -> web.Response:
     return web.json_response({"error": msg}, status=404)
+
+
+# ────────────────────────────────────────────────────────────────────
+# /v1/agents/export, /v1/agents/import, /v1/agents/{id}/revoke-pending
+# Multi-agent migration. See ``portal/export.py`` and
+# ``portal/import_agents.py`` for the on-disk + server-side flow.
+# ────────────────────────────────────────────────────────────────────
+
+
+async def agents_export(request: web.Request) -> web.Response:
+    from .. import export as exp
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return _bad("body must be JSON")
+    if not isinstance(payload, dict):
+        return _bad("body must be a JSON object")
+
+    raw_ids = payload.get("agent_ids")
+    if not isinstance(raw_ids, list) or not raw_ids or not all(isinstance(a, str) for a in raw_ids):
+        return _bad("agent_ids must be a non-empty list of strings")
+    password = payload.get("password")
+    if not isinstance(password, str) or not password:
+        return _bad("password must be a non-empty string")
+    for aid in raw_ids:
+        if not is_valid_agent_id(aid):
+            return _bad(f"invalid agent id: {aid!r}")
+
+    try:
+        blob = exp.pack(raw_ids, password, exported_by_slug=request.get("paired_slug", ""))
+    except exp.ExportError as exc:
+        return _bad(str(exc))
+
+    logger.info("bridge: export packed agents=%s bytes=%d", raw_ids, len(blob))
+    return web.Response(
+        body=blob,
+        content_type="application/octet-stream",
+        headers={"content-disposition": 'attachment; filename="agents.puffoagent"'},
+    )
+
+
+async def agents_import(request: web.Request) -> web.Response:
+    from .. import export as exp
+    from .. import import_agents as imp
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return _bad("body must be JSON")
+    if not isinstance(payload, dict):
+        return _bad("body must be a JSON object")
+
+    bundle_b64 = payload.get("bundle_b64")
+    password = payload.get("password")
+    if not isinstance(bundle_b64, str) or not bundle_b64:
+        return _bad("bundle_b64 must be a non-empty base64url string")
+    if not isinstance(password, str) or not password:
+        return _bad("password must be a non-empty string")
+
+    try:
+        blob = base64url_decode(bundle_b64)
+    except Exception as exc:
+        return _bad(f"bundle_b64 decode failed: {exc}")
+
+    try:
+        report = await imp.import_bundle(blob, password)
+    except exp.ImportPackError as exc:
+        return _bad(str(exc))
+
+    body = {
+        "total": report.total,
+        "imported": report.imported,
+        "skipped": report.skipped,
+        "failed": report.failed,
+        "pending_revokes": report.pending_revokes,
+        "results": [
+            {
+                "agent_id": r.agent_id,
+                "status": r.status,
+                "detail": r.detail,
+                "new_device_id": r.new_device_id,
+                "old_device_id": r.old_device_id,
+            }
+            for r in report.results
+        ],
+    }
+    logger.info(
+        "bridge: import done total=%d imported=%d skipped=%d failed=%d pending_revokes=%d",
+        report.total, report.imported, report.skipped, report.failed, report.pending_revokes,
+    )
+    return web.json_response(body)
+
+
+async def agent_revoke_pending(request: web.Request) -> web.Response:
+    from .. import import_agents as imp
+
+    agent_id = request.match_info["id"]
+    if not is_valid_agent_id(agent_id):
+        return _bad("invalid agent id")
+    if not agent_yml_path(agent_id).exists():
+        return _not_found("agent not found")
+    paired_root = request["paired_root_pubkey"]
+    if not is_owner(agent_id, paired_root):
+        return web.json_response(
+            {"error": "only the agent's operator can retry its revoke"},
+            status=403,
+        )
+    result = await imp.revoke_pending(agent_id)
+    body = {
+        "agent_id": result.agent_id,
+        "status": result.status,
+        "detail": result.detail,
+        "old_device_id": result.old_device_id,
+    }
+    status = 200 if result.status in ("imported", "skipped") else 502
+    return web.json_response(body, status=status)

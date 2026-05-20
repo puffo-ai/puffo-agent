@@ -340,6 +340,12 @@ async def test_puffo_core_client_send_fallback_message_encrypts():
         http_client=http,
         message_store=ms,
     )
+    # Pre-seed the channel→space cache: ``send_fallback_message``
+    # no longer silently falls back to ``self.space_id`` (legacy
+    # home space) when the cache misses. Production fills this
+    # cache from inbound envelopes + membership events; the smoke
+    # test seeds it directly.
+    client._channel_space["ch_abc"] = "sp_test"
     await client.send_fallback_message("ch_abc", "hello world", root_id="")
 
     # Channel resolution: members endpoint -> /certs/sync.
@@ -366,4 +372,60 @@ async def test_puffo_core_client_send_fallback_message_encrypts():
     assert r["device_id"] == "dev_recipient"
     assert "hpke_enc" in r
     assert "wrapped_content_key" in r
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_send_fallback_message_drops_when_channel_space_unknown():
+    """Regression for the ``self.space_id`` silent-fallback at
+    line 2382 — the agent used to route an unknown-channel reply
+    to its legacy home space, which under cross-space deployments
+    (or after a kick / cascade that evicted the in-memory cache)
+    sent the reply to the wrong place or to a space the agent had
+    just been kicked from. Now the path drops the reply with a
+    clear log line instead."""
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    ks, ks_dir, d, kem_kp = _make_keystore()
+    db_path = os.path.join(d, "messages.db")
+    ms = MessageStore(db_path)
+    await ms.open()
+
+    class _NoHttp:
+        def __init__(self):
+            self.calls = []
+
+        async def get(self, path):
+            self.calls.append(("GET", path))
+            raise AssertionError(
+                f"send_fallback_message must NOT round-trip when "
+                f"channel→space is unknown; got GET {path}"
+            )
+
+        async def post(self, path, body=None):
+            self.calls.append(("POST", path))
+            raise AssertionError(
+                f"send_fallback_message must NOT POST when "
+                f"channel→space is unknown; got POST {path}"
+            )
+
+        async def _ensure_subkey(self):
+            pass
+
+    http = _NoHttp()
+    client = PuffoCoreMessageClient(
+        slug="bot-0001",
+        device_id="dev_test",
+        space_id="sp_legacy_home",  # ← used to be the silent fallback
+        keystore=ks,
+        http_client=http,
+        message_store=ms,
+    )
+    # Crucially: do NOT pre-seed ``_channel_space``. The pre-fix
+    # behaviour would have read ``self.space_id`` and routed to
+    # ``/spaces/sp_legacy_home/...``; the post-fix behaviour drops.
+    await client.send_fallback_message("ch_unknown", "reply", root_id="")
+
+    # No HTTP at all — the FakeHttp ``raise`` ensures it.
+    assert http.calls == []
     await ms.close()

@@ -642,3 +642,154 @@ async def test_handle_event_synthetic_accept_missing_ids_is_safe():
     assert client._queue.qsize() == 0
 
     await store.close()
+
+
+# ─── _handle_event: channel→space cache writes ────────────────────
+#
+# Membership events landing on the WS are the source of truth for
+# ``lookup_channel_space``; this lets ``send_message`` /
+# ``list_channel_members`` resolve any channel the agent has been
+# admitted to, without walking ``/spaces`` as a fallback. Each event
+# kind that carries the ``(channel_id, space_id)`` pair has its own
+# admission test below to lock the gate down.
+
+
+@pytest.mark.asyncio
+async def test_handle_event_synthetic_accept_records_channel_space():
+    """Server-emitted auto-accept synthetic event populates the
+    channel→space cache so the immediately-following intro-nudge
+    send (and any subsequent MCP tool call) can resolve the channel
+    without depending on inbound messages."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert await store.lookup_channel_space("ch_1") == "sp_1"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_create_channel_records_mapping():
+    """``create_channel`` events fan to every space member, so seeing
+    one proves the agent has access to that space — record the
+    channel→space tuple unconditionally."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = {
+        "type": "signed_event",
+        "version": 1,
+        "event_id": "ev_create_1",
+        "kind": "create_channel",
+        "signer_slug": "alice-0001",
+        "signer_device_id": "dev_alice",
+        "signer_subkey_id": "sk_alice",
+        "signature": "fake-sig",
+        "payload": {
+            "space_id": "sp_team",
+            "channel_id": "ch_secret",
+            "name": "secret-room",
+            "is_public": False,
+        },
+    }
+    await client._handle_event(scope="sp_team", event=event)
+    assert await store.lookup_channel_space("ch_secret") == "sp_team"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_invite_to_channel_for_self_records_mapping(
+    monkeypatch,
+):
+    """Inviting *this agent* into a channel makes the channel
+    addressable even before the agent has accepted (the LLM might
+    look members up to decide whether to accept). The branch also
+    fires ``_poll_pending_invites``; stub it so the test stays
+    network-free."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+    polled = 0
+
+    async def _stub_poll() -> None:
+        nonlocal polled
+        polled += 1
+
+    client._poll_pending_invites = _stub_poll  # type: ignore[assignment]
+
+    event = {
+        "type": "signed_event",
+        "version": 1,
+        "event_id": "ev_invite_1",
+        "kind": "invite_to_channel",
+        "signer_slug": "alice-0001",
+        "signer_device_id": "dev_alice",
+        "signer_subkey_id": "sk_alice",
+        "signature": "fake-sig",
+        "payload": {
+            "space_id": "sp_team",
+            "channel_id": "ch_secret",
+            "invitee_slug": "agent-1",
+            "issued_at": 1_700_000_000_000,
+            "nonce": "n",
+        },
+    }
+    await client._handle_event(scope="sp_team", event=event)
+    assert await store.lookup_channel_space("ch_secret") == "sp_team"
+    assert polled == 1, "expected pending-invites poll to fire"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_invite_to_channel_for_other_skips_cache(
+    monkeypatch,
+):
+    """Server fans channel invites to every space member — when the
+    invitee is someone else, the cache must NOT pick up the
+    mapping (we don't know if we have access)."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    async def _stub_poll() -> None:
+        # Should never be called when invitee != self.
+        raise AssertionError("poll fired for someone else's invite")
+
+    client._poll_pending_invites = _stub_poll  # type: ignore[assignment]
+
+    event = {
+        "kind": "invite_to_channel",
+        "signer_slug": "alice-0001",
+        "payload": {
+            "space_id": "sp_team",
+            "channel_id": "ch_secret",
+            "invitee_slug": "someone-else",
+        },
+    }
+    await client._handle_event(scope="sp_team", event=event)
+    assert await store.lookup_channel_space("ch_secret") is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_accept_signed_by_other_skips_cache():
+    """A ``accept_channel_invite`` signed by someone else (an admin
+    accepting on behalf of a peer, or just fan-out) does not prove
+    we have access. Cache must stay clean."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+
+    event = _synthetic_accept_event(
+        agent_slug="someone-else",  # signer != self.slug
+        space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+    assert await store.lookup_channel_space("ch_1") is None
+    await store.close()

@@ -1137,9 +1137,38 @@ class PuffoCoreMessageClient:
         To avoid bare-ID DMs we use the WS push as a trigger and
         defer to ``_poll_pending_invites``; the processed-id cache
         prevents the next periodic poll from double-acting.
+
+        Side effect: any event carrying a (channel_id, space_id)
+        pair gets recorded via ``store.mark_channel_space``. This
+        keeps the channel→space cache populated even for channels
+        the agent has just been added to but hasn't received a
+        message in yet — MCP tools (``send_message``,
+        ``list_channel_members``) read that cache to construct the
+        space-scoped server URLs and bail loudly on miss rather
+        than walking ``/spaces`` as a fallback (the FB-76 era
+        resolver was removed once events became authoritative).
         """
         kind = event.get("kind")
         payload = event.get("payload") or {}
+
+        # Cache channel→space from any membership event that carries
+        # the pair, before falling through to the kind-specific
+        # handlers. The conditions on which kinds + signers we trust
+        # are deliberately narrow: ``invite_to_channel`` is recorded
+        # only when WE are the invitee (the WS fans invites to every
+        # space member, but other people's invites tell us nothing
+        # about channels we can access); ``accept_channel_invite`` is
+        # recorded only when WE are the signer (the agent's own
+        # accept, or the server-emitted auto-accept synthetic which
+        # signs-as-us); ``create_channel`` is recorded unconditionally
+        # — the server only fans create_channel to space members, so
+        # if we see it we have access to the space.
+        try:
+            await self._maybe_cache_channel_space(kind, event, payload)
+        except Exception:
+            # Never let cache bookkeeping break the rest of event
+            # routing — invite polling / intro nudges must still run.
+            logger.exception("mark_channel_space from %s failed", kind)
 
         if kind in ("invite_to_space", "invite_to_channel"):
             if payload.get("invitee_slug") != self.slug:
@@ -1182,6 +1211,319 @@ class PuffoCoreMessageClient:
                     space_id, channel_id,
                 )
             return
+
+        # Membership-exit events. Pair-wise: the kick path
+        # (RemoveFromSpace / RemoveFromChannel) is target-addressed
+        # via ``removed_slug``; the leave path (LeaveSpace /
+        # LeaveChannel) is signer-addressed. The synthetic LeaveSpace
+        # the server emits when an operator leaves (puffo-server #74
+        # agent-cascade) is signed-as-the-agent — same predicate as
+        # a real self-signed leave, so it lands in the same branch.
+        if kind == "leave_space" and event.get("signer_slug") == self.slug:
+            await self._on_left_space(
+                space_id=payload.get("space_id") or "",
+                synthetic=str(event.get("signature") or "").startswith(
+                    "server-auto:agent-cascade-leave-space"
+                ),
+            )
+            return
+
+        if kind == "remove_from_space" and payload.get("removed_slug") == self.slug:
+            await self._on_kicked_from_space(
+                space_id=payload.get("space_id") or "",
+                kicker_slug=event.get("signer_slug") or "",
+            )
+            return
+
+        if kind == "leave_channel" and event.get("signer_slug") == self.slug:
+            await self._on_left_channel(
+                channel_id=payload.get("channel_id") or "",
+            )
+            return
+
+        if kind == "remove_from_channel" and payload.get("removed_slug") == self.slug:
+            await self._on_kicked_from_channel(
+                channel_id=payload.get("channel_id") or "",
+                space_id=payload.get("space_id") or "",
+                kicker_slug=event.get("signer_slug") or "",
+            )
+            return
+
+        # Invite-withdrawn paths. The server emits the cancel to the
+        # invitee's session too (puffo-server review/events: invitee
+        # added to ``extra_ws_targets`` for cancel/reject). If the
+        # operator is still holding an un-answered y/n DM, follow up
+        # so they don't reply ``y`` to a dead invite.
+        if kind in ("cancel_space_invite", "cancel_channel_invite"):
+            await self._on_invite_canceled(
+                invitation_event_id=payload.get("invitation_event_id") or "",
+                scope="space" if kind == "cancel_space_invite" else "channel",
+            )
+            return
+
+    async def _maybe_cache_channel_space(
+        self, kind: str | None, event: dict, payload: dict,
+    ) -> None:
+        """Record (channel_id, space_id) from events that authoritatively
+        prove the agent can reach the channel. See ``_handle_event``
+        for the rationale per kind."""
+        if not kind:
+            return
+        channel_id = payload.get("channel_id") or ""
+        space_id = payload.get("space_id") or ""
+        if not channel_id or not space_id:
+            return
+        if kind == "invite_to_channel":
+            if payload.get("invitee_slug") != self.slug:
+                return
+        elif kind == "accept_channel_invite":
+            if event.get("signer_slug") != self.slug:
+                return
+        elif kind == "create_channel":
+            pass  # always cache; server only fans to space members
+        else:
+            return
+        await self.store.mark_channel_space(channel_id, space_id)
+
+    async def _evict_space_caches(self, space_id: str) -> None:
+        """Drop every cached entry tied to a space we've left/been
+        kicked from. Two layers:
+
+          1. In-memory ``_channel_space`` / name caches consumed by
+             the daemon's send paths (e.g. ``send_fallback_message``).
+          2. The persistent ``channel_space_map`` table consumed by
+             the MCP subprocess via ``lookup_channel_space`` — without
+             evicting this too, the LLM's ``send_message`` would
+             happily resolve a channel we're no longer in and pay
+             one round-trip just to get the server's 403.
+
+        Reverse-scans ``_channel_space`` for the in-memory side;
+        the persistent layer takes a ``DELETE WHERE space_id = ?``."""
+        if not space_id:
+            return
+        for cid in [c for c, s in self._channel_space.items() if s == space_id]:
+            self._channel_space.pop(cid, None)
+            self._channel_name_cache.pop(cid, None)
+        self._space_name_cache.pop(space_id, None)
+        try:
+            await self.store.unmark_channel_space_for_space(space_id)
+        except Exception:
+            logger.exception(
+                "unmark_channel_space_for_space failed for sp=%s "
+                "(non-fatal — in-memory eviction already ran)",
+                space_id,
+            )
+
+    async def _evict_channel_caches(self, channel_id: str) -> None:
+        """Smaller-scope twin of ``_evict_space_caches`` for the
+        per-channel kick paths. Same two-layer eviction (in-memory
+        + persistent map)."""
+        if not channel_id:
+            return
+        self._channel_space.pop(channel_id, None)
+        self._channel_name_cache.pop(channel_id, None)
+        try:
+            await self.store.unmark_channel_space(channel_id)
+        except Exception:
+            logger.exception(
+                "unmark_channel_space failed for ch=%s "
+                "(non-fatal — in-memory eviction already ran)",
+                channel_id,
+            )
+
+    async def _dm_operator_membership_change(self, text: str) -> None:
+        """Best-effort operator notification on membership exit. No-op
+        when ``operator_slug`` isn't configured (early provisioning,
+        smoke fixtures); exception suppression matches the existing
+        invite-DM helpers so a failed DM never crashes the WS handler."""
+        if not self.operator_slug:
+            logger.info(
+                "membership change but no operator_slug; not DMing: %s", text,
+            )
+            return
+        try:
+            await self._send_dm(self.operator_slug, text, root_id="")
+        except Exception:
+            logger.exception(
+                "failed to DM operator about membership change: %s", text,
+            )
+
+    async def _on_left_space(self, *, space_id: str, synthetic: bool) -> None:
+        """Agent exited a space — either signed LeaveSpace itself, or
+        was cascaded out by the server when its operator left
+        (puffo-server #74 emits a synthetic ``LeaveSpace`` per agent
+        with ``signature = "server-auto:agent-cascade-leave-space"``).
+        Either way, clean caches and tell the operator why.
+
+        Synthetic events aren't cryptographically signed — the
+        ``signature`` field is a server-set marker — so before
+        applying the visible side effect (operator DM), verify the
+        cascade actually happened by asking the server's authoritative
+        membership API. Defends against buggy server emits, WS
+        redelivery on reconnect, and a malicious server crafting a
+        cascade event the agent has no way to refute on the wire.
+        Real signed LeaveSpace events skip the check (the agent itself
+        signed it; server-side engine already verified the signer)."""
+        if not space_id:
+            return
+        # ``_still_member_of_space`` returns True / False / None.
+        # We only ignore the cascade on a definitive "still a member";
+        # ``None`` (network error) falls through to the permissive path
+        # so a transient /spaces flake can't block legitimate cleanup.
+        if synthetic and await self._still_member_of_space(space_id) is True:
+            logger.warning(
+                "synthetic LeaveSpace for sp=%s but /spaces still lists "
+                "us — ignoring (likely server bug or WS redelivery)",
+                space_id,
+            )
+            return
+        space_label = await self._resolve_space_name(space_id)
+        await self._evict_space_caches(space_id)
+        reason = (
+            "your space exit cascaded to me"
+            if synthetic else "I signed a LeaveSpace"
+        )
+        await self._dm_operator_membership_change(
+            f"Removed from space **{space_label}**({space_id}) — {reason}."
+        )
+
+    async def _still_member_of_space(self, space_id: str) -> bool | None:
+        """Authoritative membership check via ``GET /spaces``.
+
+        Returns:
+          * ``True``  — server still lists us as a member (cascade event
+                        contradicts authoritative state, caller should ignore).
+          * ``False`` — server does NOT list us (cascade matches reality,
+                        caller should proceed with cleanup).
+          * ``None``  — request failed; caller falls through to the
+                        permissive path rather than blocking on a flake.
+        """
+        try:
+            data = await self.http.get("/spaces")
+        except Exception:
+            logger.exception(
+                "membership re-check for sp=%s failed — falling through",
+                space_id,
+            )
+            return None
+        for entry in data.get("spaces") or []:
+            if entry.get("space_id") == space_id:
+                return True
+        return False
+
+    async def _on_kicked_from_space(
+        self, *, space_id: str, kicker_slug: str,
+    ) -> None:
+        """Owner (or owner-cascade synthetic from puffo-server review/events)
+        removed us from a space. Different wording from
+        ``_on_left_space`` so the operator can tell apart "I left it"
+        from "they kicked me"."""
+        if not space_id:
+            return
+        space_label = await self._resolve_space_name(space_id)
+        await self._evict_space_caches(space_id)
+        kicker_display = (
+            await self._fetch_display_name(kicker_slug) if kicker_slug else ""
+        )
+        kicker_label = (
+            f"**{kicker_display}**(@{kicker_slug})"
+            if kicker_display else f"@{kicker_slug}" if kicker_slug else "the space owner"
+        )
+        await self._dm_operator_membership_change(
+            f"Removed from space **{space_label}**({space_id}) by {kicker_label}."
+        )
+
+    async def _on_left_channel(self, *, channel_id: str) -> None:
+        """Voluntary channel exit (agent signed LeaveChannel itself).
+        Operator-initiated tooling already knows; skip the DM to
+        avoid noise. Cache cleanup still runs."""
+        if not channel_id:
+            return
+        await self._evict_channel_caches(channel_id)
+
+    async def _on_kicked_from_channel(
+        self, *, channel_id: str, space_id: str, kicker_slug: str,
+    ) -> None:
+        """Owner kicked us out of a private channel."""
+        if not channel_id:
+            return
+        channel_label = await self._resolve_channel_name(
+            space_id=space_id, channel_id=channel_id,
+        )
+        space_label = await self._resolve_space_name(space_id) if space_id else ""
+        await self._evict_channel_caches(channel_id)
+        kicker_display = (
+            await self._fetch_display_name(kicker_slug) if kicker_slug else ""
+        )
+        kicker_label = (
+            f"**{kicker_display}**(@{kicker_slug})"
+            if kicker_display else f"@{kicker_slug}" if kicker_slug else "the space owner"
+        )
+        location = f"channel **{channel_label}**({channel_id})"
+        if space_id:
+            location += f" in space **{space_label}**({space_id})"
+        await self._dm_operator_membership_change(
+            f"Removed from {location} by {kicker_label}."
+        )
+
+    async def _on_invite_canceled(
+        self, *, invitation_event_id: str, scope: str,
+    ) -> None:
+        """A pending invite for us was withdrawn. If we DM'd the
+        operator a y/n prompt for it, follow up so they know not to
+        reply ``y`` (would 400 against an InviteNotFound at the
+        server). No-op when we either auto-accepted, never DM'd,
+        or already cleaned up — matched by ``_pending_invite_dms``
+        absence."""
+        if not invitation_event_id:
+            return
+        target_env_id: str | None = None
+        for env_id, meta in self._pending_invite_dms.items():
+            if meta.get("invitation_event_id") == invitation_event_id:
+                target_env_id = env_id
+                break
+        if target_env_id is None:
+            return
+        meta = self._pending_invite_dms.pop(target_env_id)
+        # Add to processed-set too so a stale pending-invite poll
+        # response (server-side cache lag) can't re-fire the DM.
+        self._processed_invite_ids.add(invitation_event_id)
+
+        inviter_slug = meta.get("inviter_slug") or ""
+        space_id = meta.get("space_id") or ""
+        channel_id = meta.get("channel_id") or ""
+        space_name = meta.get("space_name") or None
+        channel_name = meta.get("channel_name") or None
+        space_label = (
+            f"**{space_name}**({space_id})" if space_name else space_id
+        )
+        inviter_display = (
+            await self._fetch_display_name(inviter_slug) if inviter_slug else ""
+        )
+        inviter_label = (
+            f"**{inviter_display}**(@{inviter_slug})"
+            if inviter_display else f"@{inviter_slug}" if inviter_slug else "the inviter"
+        )
+        if scope == "channel":
+            channel_label = (
+                f"**{channel_name}**({channel_id})" if channel_name else channel_id
+            )
+            target = f"channel {channel_label} in space {space_label}"
+        else:
+            target = f"space {space_label}"
+        text = (
+            f"{inviter_label} withdrew the invite to {target} — "
+            f"ignore my earlier prompt."
+        )
+        try:
+            await self._send_dm(
+                self.operator_slug, text, root_id=target_env_id,
+            )
+        except Exception:
+            logger.exception(
+                "failed to DM operator about canceled invite (event_id=%s)",
+                invitation_event_id,
+            )
 
     async def _poll_pending_invites(self) -> None:
         """Pull pending invites the agent hasn't acted on. Space
@@ -1472,6 +1814,22 @@ class PuffoCoreMessageClient:
             "/spaces/events",
             {"space_id": space_id, "events": [signed]},
         )
+
+        # Belt + suspenders: record the channel→space mapping
+        # synchronously here. The server fans the accept event back
+        # over WS and ``_handle_event`` records it too, but that's
+        # async — without this immediate write, the intro nudge's
+        # ``send_message`` call (queued right below) could race the
+        # WS echo and hit a cache miss on a channel the agent has
+        # just provably joined.
+        if kind == "invite_to_channel" and channel_id and space_id:
+            try:
+                await self.store.mark_channel_space(channel_id, space_id)
+            except Exception:
+                logger.exception(
+                    "mark_channel_space after manual accept failed "
+                    "(space=%s channel=%s)", space_id, channel_id,
+                )
 
         # Accepting an invite triggers a one-shot self-introduction
         # nudge: we enqueue a synthetic ``[puffo-agent system message]``
@@ -2042,10 +2400,24 @@ class PuffoCoreMessageClient:
         )
 
         if channel_id:
-            # Channel reply — prefer the space learned from the inbound
-            # envelope (so cross-space channels work) and fall back to
-            # the configured home space.
-            target_space_id = self._channel_space.get(channel_id, self.space_id)
+            # Channel reply — resolve the space from the in-memory
+            # channel→space map (populated by inbound envelopes +
+            # membership events). No silent fallback to
+            # ``self.space_id``: the configured "home" space is
+            # legacy metadata that shouldn't decide where outbound
+            # messages route. If the cache misses, the agent either
+            # hasn't seen this channel yet or has been evicted from
+            # it; either way, sending blindly to a guessed space
+            # gets a 403 or worse (wrong-space cross-talk).
+            target_space_id = self._channel_space.get(channel_id)
+            if not target_space_id:
+                logger.warning(
+                    "send_fallback_message: no known space for channel %s — "
+                    "dropping (agent may have been removed, or the channel "
+                    "id is stale)",
+                    channel_id,
+                )
+                return
             members_resp = await self.http.get(
                 f"/spaces/{target_space_id}/channels/{channel_id}/members"
             )
