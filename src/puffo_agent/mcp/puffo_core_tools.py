@@ -186,7 +186,11 @@ async def _validate_root_same_channel(
         # Daemon-log grep symmetry with the receiver-side
         # _validate_incoming_parent_id wipes — same "wiped %s — ..."
         # shape so operators can filter both sides with one regex.
-        logger.info(
+        # Transport errors stay at WARNING (vs INFO for the other 3
+        # wipe branches) — distinguishes "we couldn't verify
+        # (operationally interesting)" from "we verified and it
+        # failed validation (expected steady-state)".
+        logger.warning(
             "validate_root_same_channel: wiped %s — lookup transport error: %s",
             resolved_root, exc,
         )
