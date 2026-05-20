@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
 
-from .state import link_host_credentials
+from .state import link_host_codex_auth, link_host_credentials
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,34 @@ logger = logging.getLogger(__name__)
 REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
+
+# Codex's OAuth access_token is a JWT — the only authoritative expiry
+# is the ``exp`` claim inside the token. Codex's own ``last_refresh``
+# field uses an ~8-day staleness heuristic that's too coarse for our
+# refresh-before-expiry strategy (claude rotates hourly; codex's
+# access_token similarly expires in tens of minutes).
+def _jwt_exp_unix(token: str) -> int | None:
+    """Decode a JWT's ``exp`` claim without signature verification.
+
+    Signature verification is OpenAI's job at use time; we only need
+    the expiry timestamp to schedule pre-emptive refresh. Returns the
+    Unix-seconds expiry, or None if the token isn't a parseable JWT.
+    """
+    import base64
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload_b64 = parts[1]
+    padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+    try:
+        payload = base64.urlsafe_b64decode(padded).decode("utf-8")
+        claims = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)):
+        return None
+    return int(exp)
 
 
 class RefreshOutcome(enum.Enum):
@@ -204,6 +232,141 @@ class FileBackend:
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
         return (True, "host_file_authoritative")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CodexFileBackend — cli-local + cli-docker, all platforms
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class CodexFileBackend:
+    """Host-file-canonical backend for codex OAuth (``~/.codex/auth.json``).
+
+    Codex stores OAuth credentials there when the operator runs
+    ``codex login``. Each agent's ``$CODEX_HOME`` is forced into
+    ``cli_auth_credentials_store = "file"`` by ``write_codex_config_toml``
+    so the host file is the single source of truth across platforms —
+    including macOS, where codex's default ``auto`` mode would otherwise
+    pick Keychain and break the symlink-propagation model.
+
+    Refresh runs ``codex exec --ephemeral --skip-git-repo-check`` with
+    a trivial prompt; codex's auth pipeline kicks in the same way the
+    long-running ``codex app-server`` would, rotates the OAuth bundle
+    if stale, and writes back atomically to auth.json.
+
+    Per-agent sync is a symlink (or copy fallback on Windows
+    non-developer-mode) via ``link_host_codex_auth``.
+    """
+    host_home: Path
+
+    @property
+    def host_auth(self) -> Path:
+        return self.host_home / ".codex" / "auth.json"
+
+    def expires_in_seconds(self) -> int | None:
+        try:
+            data = json.loads(self.host_auth.read_text(encoding="utf-8"))
+            access = data.get("tokens", {}).get("access_token")
+        except (OSError, ValueError, TypeError):
+            return None
+        if not isinstance(access, str) or not access:
+            return None
+        exp_unix = _jwt_exp_unix(access)
+        if exp_unix is None:
+            return None
+        return int(exp_unix - time.time())
+
+    async def refresh(self) -> RefreshOutcome:
+        before = self.expires_in_seconds()
+        env = {**os.environ, "HOME": str(self.host_home)}
+        devnull = "NUL" if os.name == "nt" else "/dev/null"
+        codex_bin = _resolve_codex_bin()
+        if codex_bin is None:
+            logger.warning(
+                "codex credential refresh: codex binary missing on PATH"
+            )
+            return RefreshOutcome.FAILED
+        # ``--ephemeral`` skips session-file writes; ``-o NUL`` discards
+        # codex's final message; ``--skip-git-repo-check`` so refresh
+        # works outside a git repo (the daemon's cwd).
+        cmd = [
+            codex_bin, "exec",
+            "--ephemeral", "--skip-git-repo-check",
+            "-o", devnull,
+            "ok",
+        ]
+        started = time.time()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=str(self.host_home),
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=REFRESH_ONESHOT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "codex credential refresh timed out after %ds",
+                REFRESH_ONESHOT_TIMEOUT_SECONDS,
+            )
+            return RefreshOutcome.FAILED
+        except FileNotFoundError:
+            logger.warning(
+                "codex credential refresh: codex binary missing on PATH"
+            )
+            return RefreshOutcome.FAILED
+        elapsed = time.time() - started
+        after = self.expires_in_seconds()
+        if proc.returncode != 0:
+            err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
+            logger.warning(
+                "codex credential refresh rc=%d in %.1fs | "
+                "stdout: %s | stderr: %s",
+                proc.returncode, elapsed, out_tail, err_tail,
+            )
+            return RefreshOutcome.FAILED
+        if before is not None and after is not None and after <= before:
+            logger.info(
+                "codex credential refresh exit=0 but exp didn't advance "
+                "(before=%ds, after=%ds) — token still fresh or "
+                "operator on keyring store (cli_auth_credentials_store)",
+                before, after,
+            )
+            return RefreshOutcome.UNCHANGED
+        logger.info(
+            "codex credential refresh ok in %.1fs (expires_in: %s -> %s)",
+            elapsed, before, after,
+        )
+        return RefreshOutcome.REFRESHED
+
+    def sync_to_agent(self, agent_home: Path) -> None:
+        agent_codex_home = agent_home / ".codex"
+        # Only codex agents have a ``.codex`` subdir (created lazily by
+        # ``LocalCLIAdapter._ensure_codex_session``). Skip claude-only
+        # agents to avoid cluttering them with a stray auth.json.
+        if not agent_codex_home.exists():
+            return
+        link_host_codex_auth(self.host_home, agent_codex_home)
+
+    async def bootstrap(self) -> tuple[bool, Optional[str]]:
+        if not self.host_auth.exists():
+            return (False, "no-host-codex-auth")
+        return (True, "host_codex_file_authoritative")
+
+
+def _resolve_codex_bin() -> str | None:
+    """Resolve the ``codex`` executable. On Windows, npm-installed
+    shims like ``codex.cmd`` aren't found by ``CreateProcess`` from a
+    bare ``"codex"`` argv; ``shutil.which`` honours PATHEXT so the
+    ``.cmd`` is reachable from the daemon's subprocess.
+    """
+    import shutil
+    return shutil.which("codex")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

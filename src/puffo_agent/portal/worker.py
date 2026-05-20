@@ -198,8 +198,6 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
         operator = ""
         from ..agent.harness import build_harness
         harness = build_harness(agent_cfg.runtime.harness)
-        # Codex needs a model + OPENAI_API_KEY; for everything else the
-        # daemon's anthropic model is the right default.
         if harness.name() == "codex":
             model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
         else:
@@ -216,20 +214,6 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             permission_mode=agent_cfg.runtime.permission_mode,
             harness=harness,
         )
-        if harness.name() == "codex":
-            # Two auth paths supported:
-            #   1. Static OPENAI_API_KEY (cleanest — per-agent isolation,
-            #      no OAuth rotation race).
-            #   2. ChatGPT-account OAuth via `codex login` (operator runs
-            #      it once; the adapter symlinks ~/.codex/auth.json into
-            #      each agent's $CODEX_HOME).
-            # We pass the key down when set; absence means "use the
-            # OAuth file at ~/.codex/auth.json". The adapter raises a
-            # clear error if neither path is usable when the agent
-            # actually tries to spawn.
-            adapter.openai_api_key = (
-                agent_cfg.runtime.api_key or daemon_cfg.openai.api_key or ""
-            )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core

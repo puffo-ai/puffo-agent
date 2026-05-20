@@ -4,6 +4,88 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.0a1] — 2026-05-19
+
+> **Pre-release published to TestPyPI only — not for general install.**
+
+Combined integration alpha that bundles `0.9.0b1` macOS Keychain
+support and `0.10.0a2` codex cli-local, with daemon-owned credential
+refresh extended to codex OAuth. Branched from `feat/codex-cli-local`
+with `main` (0.8.8) and `feat/macos-transparent-keychain` merged
+in; the macOS Keychain backend is now alongside a sibling codex
+file backend that mirrors PUF-221's single-writer single-truth model.
+
+### Added (codex daemon-owned refresh)
+
+- `CodexFileBackend` in `portal.credential_refresh` — parallel to
+  `FileBackend` (claude), targeting `~/.codex/auth.json`. Cross-platform
+  file-mode auth; macOS Keychain support deferred (operator on
+  `cli_auth_credentials_store = "keyring"` won't benefit from
+  pre-emptive refresh — per-agent file-mode pin still lets the agent's
+  own codex subprocess refresh in isolation).
+- `_jwt_exp_unix` helper — decodes the access_token JWT's `exp` claim
+  without signature verification. Codex's `auth.json` has no top-level
+  expiry; the only authoritative source is the JWT, and codex's own
+  `last_refresh` field uses an ~8-day staleness heuristic that's too
+  coarse for our refresh-before-expiry strategy.
+- Sibling `Daemon.codex_refresher` running its own `run_loop` task,
+  independent of the claude refresher. Both share the event loop but
+  hold independent locks + poll cadences; the files they touch don't
+  collide so there's no contention.
+- `Daemon._refresher_for(agent_cfg)` routes registration by
+  `runtime.harness`: codex → codex refresher, anything else → claude.
+- 27 new tests in `test_codex_credential_refresh.py`: JWT decoder
+  (5 happy / unhappy paths), `CodexFileBackend.expires_in_seconds`
+  (5 disk states), `sync_to_agent` (codex-dir gating), `bootstrap`
+  (host file presence), `refresh` (spawn shape, binary missing,
+  exp-didn't-advance, timeout, FileNotFoundError, nonzero exit),
+  refresher wiring (close-to-expiry, agent-401-trigger,
+  view-sync-fans-to-codex-only-agents), daemon harness routing,
+  unregister idempotency, and config.toml auth-store pinning.
+
+### Changed (codex cli-local + cli-docker scope reduction)
+
+- **Removed `OPENAI_API_KEY` paths from cli-local + cli-docker codex.**
+  Now `runtime.api_key` / `daemon.openai.api_key` is only honoured by
+  `chat-local` and `sdk-local` (which talk to OpenAI directly via the
+  Python SDK). cli-local + cli-docker codex agents require
+  `codex login` and the shared `~/.codex/auth.json` — same trust model
+  as cli-local claude (`claude login` and shared
+  `~/.claude/.credentials.json`).
+- `LocalCLIAdapter.__init__` no longer carries an `openai_api_key`
+  field; the `env["OPENAI_API_KEY"] = ...` injection in
+  `_ensure_codex_session` is gone. `link_host_codex_auth` is the
+  only auth path; missing host file raises with a clear remediation
+  pointer.
+- `worker.py` no longer touches `adapter.openai_api_key` for the
+  codex branch — that whole `if harness.name() == "codex"` block is
+  deleted.
+- `write_codex_mcp_config` now writes
+  `cli_auth_credentials_store = "file"` at the top level of every
+  per-agent `$CODEX_HOME/config.toml`, **even when puffo_core is
+  not configured**. Codex's default `auto` store would otherwise
+  pick macOS Keychain for some agents (depending on platform +
+  install state), breaking the symlink-propagation model. The MCP
+  config emitter's `command` / `args` / `env` parameters are now
+  optional — passing none still produces a valid config that locks
+  the agent into file-mode auth.
+
+### Known limitations (Phase 0 verification still pending)
+
+- **Host codex must be on `cli_auth_credentials_store = "file"`.**
+  If the operator's `~/.codex/config.toml` pins keyring (default
+  `auto` on macOS), `CodexFileBackend.bootstrap` returns "no-host-codex-auth"
+  and the daemon-owned refresh is a no-op. Each agent's codex still
+  refreshes its own per-agent file independently (we force file mode
+  in the per-agent config); the only loss is the PUF-221 multi-agent
+  race protection. Future work: add a `CodexKeychainBackend` or
+  auto-install the file setting in the operator's host config.
+- `codex exec` is assumed to honour the same auth pipeline as
+  `codex app-server` (research finding from `codex-rs/login/src/auth/manager.rs`).
+  Phase 0 verification: a real codex install with an expiring access
+  token should refresh + write back to `auth.json` when invoked
+  by the daemon at < 10-min margin.
+
 ## [0.10.0a2] — 2026-05-15
 
 > **Pre-release published to TestPyPI only — not for general install.**

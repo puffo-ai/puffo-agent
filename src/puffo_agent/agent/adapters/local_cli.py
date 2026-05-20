@@ -150,10 +150,6 @@ class LocalCLIAdapter(Adapter):
             )
         self.harness = harness
         self.puffo_core_mcp_env: dict[str, str] | None = None
-        # Caller injects the OpenAI key (from agent.yml or env) into
-        # this field; codex reads it as ``OPENAI_API_KEY`` env. Unused
-        # for the claude-code path.
-        self.openai_api_key: str = ""
         self._verified = False
         # claude-code path uses ClaudeSession (long-lived stream-json);
         # codex path uses CodexSession (long-lived JSON-RPC). Only one
@@ -253,8 +249,10 @@ class LocalCLIAdapter(Adapter):
         if not agents_md.exists():
             agents_md.write_text("", encoding="utf-8")
 
-        # Per-server env injection for the puffo_core MCP server runs
-        # through ``write_codex_mcp_config`` (TOML, not JSON).
+        # Always write config.toml — pins ``cli_auth_credentials_store``
+        # to "file" so codex uses ``$CODEX_HOME/auth.json`` (not macOS
+        # Keychain) and our symlink/refresh model works. MCP section
+        # only when puffo_core is configured.
         if self.puffo_core_mcp_env:
             write_codex_mcp_config(
                 codex_home / "config.toml",
@@ -263,6 +261,7 @@ class LocalCLIAdapter(Adapter):
                 env=self.puffo_core_mcp_env,
             )
         else:
+            write_codex_mcp_config(codex_home / "config.toml")
             logger.warning(
                 "agent %s: codex MCP tools unavailable — puffo_core is "
                 "not configured. populate `puffo_core:` in agent.yml to "
@@ -272,34 +271,20 @@ class LocalCLIAdapter(Adapter):
 
         env = {
             **os.environ,
-            # Per-agent isolation for codex sessions/config/instructions.
-            # Plan §2.D — Phase 0 #8 verifies the App Server actually
-            # honours this.
             "CODEX_HOME": str(codex_home),
         }
-        if self.openai_api_key:
-            env["OPENAI_API_KEY"] = self.openai_api_key
-        else:
-            # OAuth fallback: share the operator's ``~/.codex/auth.json``
-            # into this agent's $CODEX_HOME so codex picks up the
-            # ``codex login`` session. Symlink-preferred (refresh rotations
-            # propagate instantly across agents); copy fallback on
-            # Windows non-dev-mode. Fail loud with a clear message if
-            # neither auth path exists — there's no way the agent can
-            # talk to OpenAI without one or the other.
-            auth_mode = link_host_codex_auth(Path.home(), codex_home)
-            if auth_mode == "no-host-file":
-                raise RuntimeError(
-                    f"agent {self.agent_id!r}: codex needs auth — either "
-                    "set runtime.api_key in agent.yml / openai.api_key in "
-                    "daemon.yml / export OPENAI_API_KEY, OR run "
-                    "`codex login` in your own shell so ~/.codex/auth.json "
-                    "exists."
-                )
-            logger.info(
-                "agent %s: shared host codex auth (%s)",
-                self.agent_id, auth_mode,
+        auth_mode = link_host_codex_auth(Path.home(), codex_home)
+        if auth_mode == "no-host-file":
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: codex needs auth — run "
+                "`codex login` in your own shell so ~/.codex/auth.json "
+                "exists; cli-local + cli-docker only support codex's "
+                "OAuth (ChatGPT account) credentials, not raw API keys."
             )
+        logger.info(
+            "agent %s: shared host codex auth (%s)",
+            self.agent_id, auth_mode,
+        )
         # Subprocess argv — ``codex app-server`` is the documented entry
         # point for embedding codex as a long-running agent. Resolve
         # the binary via shutil.which so npm-installed shims like

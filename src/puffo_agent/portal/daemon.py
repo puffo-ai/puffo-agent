@@ -21,6 +21,7 @@ from pathlib import Path
 from ..macos.keychain import CredentialCache, is_macos, shim_dir
 from .api import start_api_server, stop_api_server
 from .credential_refresh import (
+    CodexFileBackend,
     CredentialRefresher,
     FileBackend,
     KeychainBackend,
@@ -78,6 +79,15 @@ class Daemon:
         else:
             backend = FileBackend(host_home=Path.home())
         self.refresher = CredentialRefresher(backend=backend)
+        # Sibling refresher for codex OAuth (~/.codex/auth.json). Always
+        # FileBackend — the per-agent config.toml pins codex into file
+        # mode (see ``write_codex_mcp_config``) so we don't need a
+        # macOS-Keychain variant here. Both refreshers share the
+        # daemon's event loop but have independent locks + poll loops;
+        # they touch different files so there's no contention.
+        self.codex_refresher = CredentialRefresher(
+            backend=CodexFileBackend(host_home=Path.home()),
+        )
 
     async def run(self) -> None:
         logger.info("puffo-agent portal starting; home=%s", home_dir())
@@ -92,6 +102,9 @@ class Daemon:
         data_runner = await start_data_service(self.daemon_cfg.data_service)
         refresher_task = asyncio.ensure_future(
             self.refresher.run_loop(self._stop)
+        )
+        codex_refresher_task = asyncio.ensure_future(
+            self.codex_refresher.run_loop(self._stop)
         )
 
         try:
@@ -115,8 +128,9 @@ class Daemon:
                 # force a refresh + fan-out without waiting for the
                 # 2-min poll.
                 if refresh_token_request_path().exists():
-                    logger.info("refresh-token sentinel detected; notifying refresher")
+                    logger.info("refresh-token sentinel detected; notifying refreshers")
                     self.refresher.notify_refresh_needed()
+                    self.codex_refresher.notify_refresh_needed()
                     clear_refresh_token_request()
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=interval)
@@ -124,11 +138,12 @@ class Daemon:
                     pass
         finally:
             await self._stop_all_workers()
-            refresher_task.cancel()
-            try:
-                await refresher_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            for t in (refresher_task, codex_refresher_task):
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
             await stop_api_server(api_runner)
             await stop_data_service(data_runner)
             clear_daemon_pid()
@@ -199,10 +214,10 @@ class Daemon:
                     worker = Worker(
                         self.daemon_cfg,
                         agent_cfg,
-                        notify_refresh_needed=self.refresher.notify_refresh_needed,
+                        notify_refresh_needed=self._notify_refresh_for(agent_cfg),
                     )
                     self.workers[agent_id] = worker
-                    self.refresher.register_agent(agent_home_dir(agent_id))
+                    self._register_with_refresher(agent_cfg)
                     worker.start()
                     # Serialise heavy startup: ``adapter.warm()`` reads
                     # the persisted session into Node's heap, so N
@@ -215,10 +230,10 @@ class Daemon:
                     worker = Worker(
                         self.daemon_cfg,
                         agent_cfg,
-                        notify_refresh_needed=self.refresher.notify_refresh_needed,
+                        notify_refresh_needed=self._notify_refresh_for(agent_cfg),
                     )
                     self.workers[agent_id] = worker
-                    self.refresher.register_agent(agent_home_dir(agent_id))
+                    self._register_with_refresher(agent_cfg)
                     worker.start()
                     await worker.wait_warm(timeout=self._warm_serialise_timeout)
                 else:
@@ -230,10 +245,30 @@ class Daemon:
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
 
+    def _refresher_for(self, agent_cfg: AgentConfig) -> CredentialRefresher:
+        """Pick the right refresher for an agent's harness. Codex
+        agents only need their own auth.json refresh; claude-code +
+        every other harness routes through the Claude refresher."""
+        if (agent_cfg.runtime.harness or "claude-code") == "codex":
+            return self.codex_refresher
+        return self.refresher
+
+    def _register_with_refresher(self, agent_cfg: AgentConfig) -> None:
+        self._refresher_for(agent_cfg).register_agent(
+            agent_home_dir(agent_cfg.id),
+        )
+
+    def _notify_refresh_for(self, agent_cfg: AgentConfig):
+        return self._refresher_for(agent_cfg).notify_refresh_needed
+
     async def _stop_worker(self, agent_id: str) -> None:
         worker = self.workers.pop(agent_id, None)
         if worker is not None:
-            self.refresher.unregister_agent(agent_home_dir(agent_id))
+            # Unregister from both refreshers — set ops are idempotent
+            # and we don't keep harness info after the worker dies.
+            home = agent_home_dir(agent_id)
+            self.refresher.unregister_agent(home)
+            self.codex_refresher.unregister_agent(home)
             await worker.stop()
 
     async def _stop_all_workers(self) -> None:
