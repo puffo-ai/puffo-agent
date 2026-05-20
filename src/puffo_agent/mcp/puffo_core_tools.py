@@ -183,8 +183,11 @@ async def _validate_root_same_channel(
     except DataNotFound:
         msg = None
     except Exception as exc:
-        logger.warning(
-            "validate_root_same_channel: lookup transport error for %s: %s",
+        # Daemon-log grep symmetry with the receiver-side
+        # _validate_incoming_parent_id wipes — same "wiped %s — ..."
+        # shape so operators can filter both sides with one regex.
+        logger.info(
+            "validate_root_same_channel: wiped %s — lookup transport error: %s",
             resolved_root, exc,
         )
         return None, (
@@ -193,12 +196,21 @@ async def _validate_root_same_channel(
             "top-level."
         )
     if msg is None:
+        logger.info(
+            "validate_root_same_channel: wiped %s — parent not in local cache",
+            resolved_root,
+        )
         return None, (
             f"\nnote: thread_root_id {resolved_root} not in local cache; "
             "wiped to null and sent as top-level. Agents can only reply "
             "in threads whose root is in their own local message store."
         )
     if expected_channel_id and msg.channel_id != expected_channel_id:
+        logger.info(
+            "validate_root_same_channel: wiped %s — parent channel %r != "
+            "outbound channel %r",
+            resolved_root, msg.channel_id, expected_channel_id,
+        )
         return None, (
             f"\nnote: thread_root_id {resolved_root} belongs to channel "
             f"{msg.channel_id!r}, not the outbound channel "
@@ -210,6 +222,11 @@ async def _validate_root_same_channel(
         and msg.space_id
         and msg.space_id != expected_space_id
     ):
+        logger.info(
+            "validate_root_same_channel: wiped %s — parent space %r != "
+            "outbound space %r",
+            resolved_root, msg.space_id, expected_space_id,
+        )
         return None, (
             f"\nnote: thread_root_id {resolved_root} belongs to space "
             f"{msg.space_id!r}, not the outbound space "

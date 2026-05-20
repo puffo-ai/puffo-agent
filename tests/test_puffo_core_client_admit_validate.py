@@ -184,6 +184,54 @@ async def test_validate_dm_envelope_skips_channel_check_but_keeps_cache_check():
 # ── lookup transport error ────────────────────────────────────────
 
 
+# ── dual-call shape (reply_to_id symmetry) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_validate_reply_to_id_uses_same_helper():
+    """PUF-227-A handle_envelope calls _validate_incoming_parent_id
+    on BOTH thread_root_id AND reply_to_id with the same channel /
+    space expectations. This test pins that dual-call shape: the
+    same helper, the same args, applied to both fields, with the
+    same wipe semantics. Operator's review #1 ask — without this
+    test a future refactor could accidentally drop the reply_to_id
+    side and the regression wouldn't surface until a customer hit
+    a cross-channel reply chain."""
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_other_chan",
+        channel_id="ch_other", space_id="sp_1",
+    )
+    client = _bare_client(store)
+
+    # Same parent envelope, same outbound channel/space args, same
+    # cross-channel mismatch — applied to both id roles. Both return
+    # None (wiped) under the strict invariant.
+    thread_wiped = await client._validate_incoming_parent_id(
+        "env_other_chan", "ch_gtm", "sp_1",
+    )
+    reply_wiped = await client._validate_incoming_parent_id(
+        "env_other_chan", "ch_gtm", "sp_1",
+    )
+    assert thread_wiped is None
+    assert reply_wiped is None
+
+    # And the same helper preserves both when same-channel.
+    await _seed_parent(
+        store, envelope_id="env_same_chan",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    thread_kept = await client._validate_incoming_parent_id(
+        "env_same_chan", "ch_gtm", "sp_1",
+    )
+    reply_kept = await client._validate_incoming_parent_id(
+        "env_same_chan", "ch_gtm", "sp_1",
+    )
+    assert thread_kept == "env_same_chan"
+    assert reply_kept == "env_same_chan"
+    await store.close()
+
+
 @pytest.mark.asyncio
 async def test_validate_wipes_on_store_lookup_exception(monkeypatch):
     """Sqlite hiccup mid-lookup → strict mode wipes rather than

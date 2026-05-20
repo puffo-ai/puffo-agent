@@ -4,6 +4,44 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **PUF-227-A: strict same-channel cache validation on `thread_root_id`
+  + `reply_to_id`.** The puffo-server can't validate that a reply's
+  `channel_id` matches its `thread_root_id`'s parent channel — both
+  the `thread_root_id` and `reply_to_id` fields live inside the
+  E2E-encrypted `MessagePayload`, so the server is blind. Without
+  client-side enforcement, a sender that stamps a cross-channel id
+  (server bug, UI bug, or buggy agent compose path) can poison the
+  recipient's thread-batching cache and surface as the wrong
+  channel's metadata to the agent's prompt. Scout's PUF-227 symptom
+  traced to exactly this shape.
+
+  Both sides now enforce the invariant. On send,
+  `mcp/puffo_core_tools.py`'s `send_message` +
+  `send_message_with_attachments` resolve the root via PUF-200's
+  `_resolve_root_id` chain walk, then look it up in the agent's
+  local message store via the new `_validate_root_same_channel`
+  helper. If the parent isn't in cache OR lives in a different
+  channel/space than the outbound envelope, the id is wiped to
+  `null` and a warning note is folded into the tool response so the
+  agent can self-correct on its next compose. On admit,
+  `agent/puffo_core_client.py`'s `handle_envelope` runs the
+  symmetric `_validate_incoming_parent_id` against both
+  `payload.thread_root_id` and `payload.reply_to_id` BEFORE storing
+  the envelope. Wiped ids propagate through `root_id` computation,
+  `msg_dict.root_id`, and the invite-DM intercept — so a cross-
+  channel parent never coalesces a fresh envelope into a stale
+  thread-cache entry's `channel_meta`.
+
+  Known limitation: out-of-order WS-reconnect-replay delivery (a
+  recipient receiving a reply before its parent has landed in
+  local cache) will wipe the id with no backfill. Acceptable given
+  rarity in practice; if it surfaces as a common issue a lazy-
+  backfill path can be added in a follow-up.
+
 ## [0.8.8] — 2026-05-19
 
 ### Changed
