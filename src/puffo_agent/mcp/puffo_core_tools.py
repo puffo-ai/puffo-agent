@@ -150,6 +150,96 @@ def _coerce_root_visibility(
 _RESOLVE_ROOT_MAX_DEPTH = 4
 
 
+async def _validate_root_same_channel(
+    resolved_root: Optional[str],
+    expected_channel_id: Optional[str],
+    expected_space_id: Optional[str],
+    data_client: Any,
+) -> tuple[Optional[str], str]:
+    """PUF-227-A: enforce the operator's strict-cache invariant on
+    send. If ``resolved_root`` is set, look the parent envelope up
+    in the agent's local message store. Wipe the id to ``None``
+    when:
+      - the parent isn't in local cache (strict per operator's
+        Q1(a) — "client should only see thread_root_id that's in
+        its local cache");
+      - the parent's ``channel_id`` differs from the outbound
+        ``expected_channel_id`` (this is the load-bearing PUF-227
+        check — cross-channel thread_root_id is the bug Scout's
+        symptom traced back to);
+      - the parent's ``space_id`` differs from the outbound
+        ``expected_space_id`` (belt-and-braces alongside the
+        channel check).
+
+    On wipe, returns a warning ``note`` for the tool response so
+    the agent can self-correct on its next compose. Pass-through
+    case (parent in cache + same channel/space): returns
+    ``(resolved_root, "")``.
+    """
+    if not resolved_root or not resolved_root.strip():
+        return resolved_root, ""
+    try:
+        msg = await data_client.get_message_by_envelope(resolved_root)
+    except DataNotFound:
+        msg = None
+    except Exception as exc:
+        # Daemon-log grep symmetry with the receiver-side
+        # _validate_incoming_parent_id wipes — same "wiped %s — ..."
+        # shape so operators can filter both sides with one regex.
+        # Transport errors stay at WARNING (vs INFO for the other 3
+        # wipe branches) — distinguishes "we couldn't verify
+        # (operationally interesting)" from "we verified and it
+        # failed validation (expected steady-state)".
+        logger.warning(
+            "validate_root_same_channel: wiped %s — lookup transport error: %s",
+            resolved_root, exc,
+        )
+        return None, (
+            f"\nnote: thread_root_id {resolved_root} could not be verified "
+            "(local cache lookup failed); wiped to null and sent as "
+            "top-level."
+        )
+    if msg is None:
+        logger.info(
+            "validate_root_same_channel: wiped %s — parent not in local cache",
+            resolved_root,
+        )
+        return None, (
+            f"\nnote: thread_root_id {resolved_root} not in local cache; "
+            "wiped to null and sent as top-level. Agents can only reply "
+            "in threads whose root is in their own local message store."
+        )
+    if expected_channel_id and msg.channel_id != expected_channel_id:
+        logger.info(
+            "validate_root_same_channel: wiped %s — parent channel %r != "
+            "outbound channel %r",
+            resolved_root, msg.channel_id, expected_channel_id,
+        )
+        return None, (
+            f"\nnote: thread_root_id {resolved_root} belongs to channel "
+            f"{msg.channel_id!r}, not the outbound channel "
+            f"{expected_channel_id!r}; wiped to null and sent as "
+            "top-level."
+        )
+    if (
+        expected_space_id
+        and msg.space_id
+        and msg.space_id != expected_space_id
+    ):
+        logger.info(
+            "validate_root_same_channel: wiped %s — parent space %r != "
+            "outbound space %r",
+            resolved_root, msg.space_id, expected_space_id,
+        )
+        return None, (
+            f"\nnote: thread_root_id {resolved_root} belongs to space "
+            f"{msg.space_id!r}, not the outbound space "
+            f"{expected_space_id!r}; wiped to null and sent as "
+            "top-level."
+        )
+    return resolved_root, ""
+
+
 async def _resolve_root_id(
     root_id: str, data_client: Any,
 ) -> tuple[Optional[str], str]:
@@ -343,6 +433,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         resolved_root, root_note = await _resolve_root_id(
             root_id, cfg.data_client,
         )
+        resolved_root, validate_note = await _validate_root_same_channel(
+            resolved_root, channel_id, send_space_id, cfg.data_client,
+        )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
@@ -363,6 +456,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
             f"{fold_note}"
             f"{root_note}"
+            f"{validate_note}"
         )
 
     @mcp.tool()
@@ -891,6 +985,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         resolved_root, root_note = await _resolve_root_id(
             root_id, cfg.data_client,
         )
+        resolved_root, validate_note = await _validate_root_same_channel(
+            resolved_root, channel_id, send_space_id, cfg.data_client,
+        )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=cfg.slug,
@@ -914,6 +1011,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"(envelope_id {envelope.get('envelope_id', '?')})"
             f"{fold_note}"
             f"{root_note}"
+            f"{validate_note}"
         )
 
     @mcp.tool()

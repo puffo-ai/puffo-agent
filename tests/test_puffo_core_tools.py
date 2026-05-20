@@ -16,6 +16,7 @@ from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
     _coerce_root_visibility,
     _resolve_root_id,
+    _validate_root_same_channel,
     register_core_tools,
 )
 
@@ -850,12 +851,21 @@ class _FakeDataClient:
         self.exc: Exception | None = None
         self.calls: list[str] = []
 
-    def add(self, envelope_id: str, thread_root_id: str | None) -> None:
+    def add(
+        self,
+        envelope_id: str,
+        thread_root_id: str | None,
+        *,
+        channel_id: str | None = None,
+        space_id: str | None = None,
+    ) -> None:
         class _Msg:
             pass
         m = _Msg()
         m.envelope_id = envelope_id
         m.thread_root_id = thread_root_id
+        m.channel_id = channel_id
+        m.space_id = space_id
         self.messages[envelope_id] = m
 
     async def get_message_by_envelope(self, envelope_id: str):
@@ -1110,10 +1120,15 @@ async def test_send_message_keeps_real_root_id_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_send_message_unknown_root_id_falls_through_with_warning(monkeypatch):
-    """When the supplied root_id isn't in the local store at all
-    (could happen for very fresh messages), the send still completes
-    with the original id and the tool response carries a warning."""
+async def test_send_message_unknown_root_id_wiped_to_null_with_warning(monkeypatch):
+    """PUF-227-A: strict cache-validation invariant. An unknown
+    root_id (not in this agent's local store) gets WIPED to null
+    before the envelope ships — the operator locked Q1(a) "client
+    should only see thread_root_id that's in its local cache." The
+    tool response carries a warning so the agent self-corrects on
+    its next compose. Replaces PUF-200's "fall through with the
+    original id" behavior, which was the permissive shape PUF-227-A
+    explicitly overrides."""
     cfg, http, ms = _setup()
     await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
     captured = _spy_encrypt_input(monkeypatch)
@@ -1127,10 +1142,11 @@ async def test_send_message_unknown_root_id_falls_through_with_warning(monkeypat
     })
 
     assert "posted" in result
-    assert "could not verify" in result
-    # Better to land in a wrong thread than to drop the message —
-    # the original id reaches the payload.
-    assert captured["inp"].thread_root_id == "msg_never_seen"
+    assert "not in local cache" in result
+    assert "wiped to null" in result or "sent as top-level" in result
+    # PUF-227-A strict: invalid id wiped to None, NOT carried into
+    # the payload.
+    assert captured["inp"].thread_root_id is None
 
 
 @pytest.mark.asyncio
@@ -1207,3 +1223,115 @@ async def test_core_tools_registered():
         "fetch_channel_files",
     }
     assert expected.issubset(tool_names)
+
+
+# PUF-227-A: _validate_root_same_channel — strict cache + channel-
+# match validation, applied AFTER _resolve_root_id on the sender path.
+
+
+@pytest.mark.asyncio
+async def test_validate_root_passes_through_when_no_root_id():
+    """``resolved_root=None`` is the top-level-post case; helper is a
+    no-op and returns no warning."""
+    dc = _FakeDataClient()
+    out, note = await _validate_root_same_channel(None, "ch_x", "sp_1", dc)
+    assert out is None
+    assert note == ""
+
+
+@pytest.mark.asyncio
+async def test_validate_root_passes_through_when_parent_in_same_channel():
+    """Parent envelope exists locally + matches outbound channel +
+    space → pass through unchanged, no warning."""
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x", space_id="sp_1")
+    out, note = await _validate_root_same_channel("msg_root", "ch_x", "sp_1", dc)
+    assert out == "msg_root"
+    assert note == ""
+
+
+@pytest.mark.asyncio
+async def test_validate_root_wipes_when_parent_in_different_channel():
+    """Scout's PUF-227 symptom shape on the sender side. Parent
+    exists in cache but its channel doesn't match outbound — wipe
+    to None + emit warning."""
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_root",
+        thread_root_id=None,
+        channel_id="ch_general",
+        space_id="sp_1",
+    )
+    out, note = await _validate_root_same_channel(
+        "msg_root", "ch_gtm", "sp_1", dc,
+    )
+    assert out is None
+    assert "different" in note.lower() or "belongs to" in note.lower()
+    assert "ch_general" in note
+    assert "ch_gtm" in note
+
+
+@pytest.mark.asyncio
+async def test_validate_root_wipes_when_parent_not_in_cache():
+    """Strict per operator's Q1(a): parent-not-in-cache → wipe to
+    None. No permissive fallback."""
+    dc = _FakeDataClient()
+    out, note = await _validate_root_same_channel(
+        "msg_unknown", "ch_x", "sp_1", dc,
+    )
+    assert out is None
+    assert "not in local cache" in note
+    assert "msg_unknown" in note
+
+
+@pytest.mark.asyncio
+async def test_validate_root_wipes_when_parent_in_different_space():
+    """Cross-space parent — same defense as cross-channel."""
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_root",
+        thread_root_id=None,
+        channel_id="ch_x",
+        space_id="sp_OTHER",
+    )
+    out, note = await _validate_root_same_channel(
+        "msg_root", "ch_x", "sp_1", dc,
+    )
+    assert out is None
+    assert "different" in note.lower() or "belongs to space" in note.lower()
+    assert "sp_OTHER" in note
+
+
+@pytest.mark.asyncio
+async def test_validate_root_wipes_on_lookup_transport_error():
+    """Strict mode: if the local-cache lookup itself errors out
+    (sqlite hiccup, DataClient transport blip), treat as 'not
+    verified' and wipe — don't ship an unverifiable id."""
+    dc = _FakeDataClient()
+    dc.exc = RuntimeError("simulated lookup failure")
+    out, note = await _validate_root_same_channel(
+        "msg_any", "ch_x", "sp_1", dc,
+    )
+    assert out is None
+    assert "could not be verified" in note
+    assert "lookup failed" in note
+
+
+@pytest.mark.asyncio
+async def test_validate_root_dm_envelope_no_channel_id_passes_through():
+    """DM context: no channel_id to compare against; helper still
+    enforces cache presence but skips the channel-match check.
+    (Cross-DM-thread validation is out of scope for this ticket per
+    the build plan.)"""
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_dm_root",
+        thread_root_id=None,
+        channel_id=None,
+        space_id=None,
+    )
+    out, note = await _validate_root_same_channel(
+        "msg_dm_root", None, None, dc,
+    )
+    assert out == "msg_dm_root"
+    assert note == ""
