@@ -540,6 +540,20 @@ class PuffoCoreMessageClient:
                 )
                 return
 
+            # PUF-227-A: strict cache-validation invariant for incoming
+            # ids. Any thread_root_id / reply_to_id that doesn't point
+            # to a same-channel parent in our local message_store gets
+            # wiped to None before storage — the agent's local view
+            # never honors a thread linkage that can't be resolved here.
+            # Catches the Scout-class symptom: a server / UI / sender
+            # that stamps a cross-channel id can't poison the recipient
+            # daemon's thread state.
+            validated_thread_root_id = await self._validate_incoming_parent_id(
+                payload.thread_root_id, payload.channel_id, payload.space_id,
+            )
+            validated_reply_to_id = await self._validate_incoming_parent_id(
+                payload.reply_to_id, payload.channel_id, payload.space_id,
+            )
             await self.store.store({
                 "envelope_id": payload.envelope_id,
                 "envelope_kind": payload.envelope_kind,
@@ -550,9 +564,14 @@ class PuffoCoreMessageClient:
                 "content_type": payload.content_type,
                 "content": payload.content,
                 "sent_at": payload.sent_at,
-                "thread_root_id": payload.thread_root_id,
-                "reply_to_id": payload.reply_to_id,
+                "thread_root_id": validated_thread_root_id,
+                "reply_to_id": validated_reply_to_id,
             })
+            # Rebind for downstream code (root_id resolution at the
+            # batch-coalesce step, channel_meta construction, etc.) so
+            # admit-time wipes propagate through the agent prompt.
+            payload_thread_root_id = validated_thread_root_id
+            payload_reply_to_id = validated_reply_to_id
 
             # Self-echo lands here too now (see ``handle_envelope``'s
             # opening comment). Persist it — so ``get_channel_history``
@@ -567,14 +586,17 @@ class PuffoCoreMessageClient:
             # Daemon-side intercept: ``y``/``n`` in the thread of an
             # outstanding invite-DM accepts/rejects the invite without
             # waking the LLM. Other text falls through to the queue.
+            # PUF-227-A: use the validated thread_root_id — an invite-DM
+            # thread linkage that doesn't resolve in local cache is also
+            # invalid for the inline-handler path.
             if (
                 payload.envelope_kind == "dm"
                 and payload.sender_slug == self.operator_slug
-                and payload.thread_root_id
-                and payload.thread_root_id in self._pending_invite_dms
+                and payload_thread_root_id
+                and payload_thread_root_id in self._pending_invite_dms
             ):
                 handled = await self._maybe_handle_invite_reply(
-                    thread_root_id=payload.thread_root_id,
+                    thread_root_id=payload_thread_root_id,
                     text=str(payload.content) if payload.content else "",
                 )
                 if handled:
@@ -660,7 +682,12 @@ class PuffoCoreMessageClient:
             # (priority same or lower) or bump the slot to the new
             # higher priority. The agent processes one whole thread
             # at a time in ``on_message_batch``.
-            root_id = payload.thread_root_id or payload.envelope_id
+            # PUF-227-A: route on the VALIDATED thread_root_id. If
+            # admit-time validation wiped it (parent not in cache or
+            # cross-channel), the message gets a fresh per-envelope
+            # root_id and lands in its own batch — never inheriting a
+            # stale channel_meta from an unrelated thread.
+            root_id = payload_thread_root_id or payload.envelope_id
 
             # Cross-restart dedup: after a daemon restart the server
             # redelivers anything in /messages/pending. If we already
@@ -710,7 +737,7 @@ class PuffoCoreMessageClient:
                 "sender_display_name": sender_display_name,
                 "sender_email": "",
                 "text": llm_text,
-                "root_id": payload.thread_root_id or "",
+                "root_id": payload_thread_root_id or "",
                 "is_dm": is_dm,
                 "attachments": attachment_paths,
                 "sender_is_bot": sender_is_bot,
@@ -1711,6 +1738,56 @@ class PuffoCoreMessageClient:
                 return name
         self._display_name_cache[slug] = ""
         return ""
+
+    async def _validate_incoming_parent_id(
+        self,
+        parent_id: Optional[str],
+        expected_channel_id: Optional[str],
+        expected_space_id: Optional[str],
+    ) -> Optional[str]:
+        """PUF-227-A: strict cache-validation for incoming thread_root_id
+        / reply_to_id. Returns the original id when the referenced
+        parent envelope is in our local message store AND lives in
+        the same channel/space as the incoming envelope; otherwise
+        returns ``None`` (admit-time wipe). Caller stores the wiped
+        value so all downstream reads — admit-batch routing, prompt
+        render, history queries — see the validated id.
+        """
+        if not parent_id:
+            return parent_id
+        try:
+            parent = await self.store.get_message_by_envelope(parent_id)
+        except Exception as exc:
+            logger.warning(
+                "_validate_incoming_parent_id: lookup failed for %s: %s",
+                parent_id, exc,
+            )
+            return None
+        if parent is None:
+            logger.info(
+                "_validate_incoming_parent_id: wiped %s — parent not in local cache",
+                parent_id,
+            )
+            return None
+        if expected_channel_id and parent.channel_id != expected_channel_id:
+            logger.info(
+                "_validate_incoming_parent_id: wiped %s — parent channel "
+                "%r != incoming channel %r",
+                parent_id, parent.channel_id, expected_channel_id,
+            )
+            return None
+        if (
+            expected_space_id
+            and parent.space_id
+            and parent.space_id != expected_space_id
+        ):
+            logger.info(
+                "_validate_incoming_parent_id: wiped %s — parent space "
+                "%r != incoming space %r",
+                parent_id, parent.space_id, expected_space_id,
+            )
+            return None
+        return parent_id
 
     async def _resolve_space_name(self, space_id: str) -> str:
         """Space name via ``GET /spaces``, cached per session. Returns
