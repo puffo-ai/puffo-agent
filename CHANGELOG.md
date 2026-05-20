@@ -4,16 +4,88 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.11.0a1] — 2026-05-19
+## [0.9.0] — 2026-05-20
 
-> **Pre-release published to TestPyPI only — not for general install.**
+First stable release combining macOS Keychain integration (previously
+shipped as `0.9.0a3` / `0.9.0b1` on TestPyPI), the codex cli-local
+harness (previously `0.10.0a1` / `0.10.0a2`), and daemon-owned
+credential refresh extended to codex OAuth (previously `0.11.0a1`).
+All four pre-releases are superseded by this version — promote
+straight from `0.8.8` to `0.9.0`. The macOS Keychain backend and a
+sibling codex file backend both plug into the PUF-221 single-writer
+single-truth refresh model.
 
-Combined integration alpha that bundles `0.9.0b1` macOS Keychain
-support and `0.10.0a2` codex cli-local, with daemon-owned credential
-refresh extended to codex OAuth. Branched from `feat/codex-cli-local`
-with `main` (0.8.8) and `feat/macos-transparent-keychain` merged
-in; the macOS Keychain backend is now alongside a sibling codex
-file backend that mirrors PUF-221's single-writer single-truth model.
+> **Scope note — codex is `cli-local` only.** `runtime.kind=cli-docker`
+> with `runtime.harness=codex` is **not supported** in this release;
+> the bundled Docker image installs `claude-code`, `gemini-cli`, and
+> `hermes` but not the codex npm package, and the cli-docker adapter
+> has no codex turn handler. Tracked for a future release. Use
+> `runtime.kind=cli-local` to run a codex agent today.
+
+### Added (macOS Keychain integration)
+
+- **`CredentialRefresher` now has a pluggable backend abstraction so
+  macOS Keychain and Linux/Windows file storage share the same
+  daemon-owned single-writer lock, agent fan-out, and 401-wake
+  invariants while differing only on storage.** Claude Code 2.x
+  stores its OAuth token in the system Keychain
+  (`"Claude Code-credentials"`); without daemon-level intermediation,
+  the host's `claude` binary running under a puffo-agent worker
+  re-prompts the ACL every spawn and the per-agent
+  `.credentials.json` files diverge from the operator's main CLI
+  view. `KeychainBackend` (macOS) maintains a daemon cache at
+  `~/.puffo-agent/run/claude-credentials.json` and runs refreshes
+  in a sandboxed `claude --print` under a tempdir HOME seeded from
+  the cache, then writes the rotated blob back to Keychain best-
+  effort so the operator's main CLI sees the new token. `FileBackend`
+  (Linux/Windows) preserves bit-identical 0.8.8 behaviour. Selected
+  by `is_macos()` at daemon startup. See `0.9.0a3` below for the
+  full design.
+- **External-rotation poll** (macOS-only): a sibling task re-reads
+  Keychain every 5 minutes and fans rotations to siblings via the
+  same `_sync_views` path — catches refreshes done by the operator's
+  main `claude` CLI or by an agent's own subprocess self-refreshing
+  on a 401, neither of which the daemon would otherwise observe.
+- **PATH shim for anthropics/claude-code#37512**: every daemon start
+  writes a bash shim to `~/.puffo-agent/run/keychain-shim/security`
+  that intercepts `security delete-generic-password "Claude Code-
+  credentials"` (the upstream cleanup that kicks the operator's main
+  CLI / VS Code extension off Keychain) and silently no-ops it. Pre-
+  pended to `$PATH` for every per-agent `claude` spawn.
+- **Diagnostic CLI**: `puffo-agent test ...` with 5 probes
+  (`keychain-read`, `keychain-write`, `refresh-flush`,
+  `keychain-survives-token-env`, `full-probe`) plus the side-
+  effectful `refresh-flush-forced` (gated on `--yes`). Writes a
+  redacted-markdown probe report to `~/.puffo-agent/probe-report.md`;
+  tokens shown only as `len=NNN sha256_prefix=XXXXXXXX`. Every probe
+  SKIPs cleanly on non-Darwin so the same CLI is a sanity tool on
+  Linux/Windows.
+
+### Added (codex cli-local harness)
+
+- **New `runtime.harness: codex` option for OpenAI's `codex` CLI on
+  `runtime.kind=cli-local`,** running as a long-lived
+  `codex app-server` JSON-RPC subprocess. Sibling to claude-code on
+  the cli-local path; claude-code is untouched, codex is opt-in.
+  Components: `agent/harness/codex.py` (`CodexHarness`),
+  `agent/adapters/codex_session.py` (`CodexSession` — JSON-RPC over
+  stdio, `thread/start` + `turn/start` + `item/*` event stream, server-
+  initiated approval requests auto-decided under `bypassPermissions`,
+  conversation id persisted to `<CODEX_HOME>/codex_session.json` so
+  daemon restarts resume cleanly), `LocalCLIAdapter` harness dispatch,
+  per-agent `CODEX_HOME` at `~/.puffo-agent/agents/<id>/.codex/`,
+  AGENTS.md at `$CODEX_HOME/AGENTS.md` (reload hot-swaps via
+  `current_instructions` on the next `sendUserTurn`), and a TOML
+  emitter `write_codex_mcp_config` for codex's `[mcp_servers.puffo]`
+  schema.
+- Auth model: **codex `cli-local` requires `codex login` (ChatGPT-
+  account OAuth)** — the same trust model as cli-local claude-code
+  (`claude login` and shared `~/.claude/.credentials.json`). The
+  adapter symlinks (or copies on Windows non-developer-mode) the
+  operator's `~/.codex/auth.json` into each agent's `$CODEX_HOME`.
+  No `OPENAI_API_KEY` path — `runtime.api_key` /
+  `daemon.openai.api_key` are now only honoured by `chat-local` and
+  `sdk-local` (which talk to OpenAI directly via the Python SDK).
 
 ### Added (codex daemon-owned refresh)
 
@@ -43,48 +115,48 @@ file backend that mirrors PUF-221's single-writer single-truth model.
   view-sync-fans-to-codex-only-agents), daemon harness routing,
   unregister idempotency, and config.toml auth-store pinning.
 
-### Changed (codex cli-local + cli-docker scope reduction)
+### Changed (config pinning)
 
-- **Removed `OPENAI_API_KEY` paths from cli-local + cli-docker codex.**
-  Now `runtime.api_key` / `daemon.openai.api_key` is only honoured by
-  `chat-local` and `sdk-local` (which talk to OpenAI directly via the
-  Python SDK). cli-local + cli-docker codex agents require
-  `codex login` and the shared `~/.codex/auth.json` — same trust model
-  as cli-local claude (`claude login` and shared
-  `~/.claude/.credentials.json`).
-- `LocalCLIAdapter.__init__` no longer carries an `openai_api_key`
-  field; the `env["OPENAI_API_KEY"] = ...` injection in
-  `_ensure_codex_session` is gone. `link_host_codex_auth` is the
-  only auth path; missing host file raises with a clear remediation
-  pointer.
-- `worker.py` no longer touches `adapter.openai_api_key` for the
-  codex branch — that whole `if harness.name() == "codex"` block is
-  deleted.
-- `write_codex_mcp_config` now writes
-  `cli_auth_credentials_store = "file"` at the top level of every
-  per-agent `$CODEX_HOME/config.toml`, **even when puffo_core is
-  not configured**. Codex's default `auto` store would otherwise
-  pick macOS Keychain for some agents (depending on platform +
-  install state), breaking the symlink-propagation model. The MCP
-  config emitter's `command` / `args` / `env` parameters are now
-  optional — passing none still produces a valid config that locks
-  the agent into file-mode auth.
+- `write_codex_mcp_config` writes `cli_auth_credentials_store = "file"`
+  at the top level of every per-agent `$CODEX_HOME/config.toml`,
+  **even when `puffo_core:` is not configured**. Codex's default
+  `auto` store would otherwise pick macOS Keychain for some agents
+  (depending on platform + install state), breaking the symlink-
+  propagation model that lets the daemon refresh tokens once and
+  fan out to N agents. The MCP config emitter's `command` / `args`
+  / `env` parameters are now optional — passing none still produces
+  a valid config that locks the agent into file-mode auth.
 
-### Known limitations (Phase 0 verification still pending)
+### Known limitations
 
+- **macOS Keychain path has not been verified on a real Mac.** The
+  `KeychainBackend`, external-rotation poll, `security` PATH shim,
+  and 5 diagnostic probes carry the design from the 0.9.0a3 / 0.9.0b1
+  alphas (whose changelog noted the betas were "intended for macOS-
+  colleague verification" — that verification was never completed
+  before this release). Unit-test coverage is real (~30 tests in
+  `test_macos_credential_manager.py` + ~19 in `test_macos_diagnostic.py`)
+  but every test monkeypatches `is_macos` to `True` and mocks
+  `subprocess.run` for the `/usr/bin/security` and
+  `asyncio.create_subprocess_exec` for `claude --print` calls — no
+  test exercises the real Keychain ACL prompt, the real
+  `delete-generic-password` interception, or live token rotation on
+  a Darwin box. Linux/Windows paths use `FileBackend` and are
+  unaffected by this gap. macOS operators running 0.9.0 should treat
+  the Keychain integration as **first-real-deploy**: report any
+  prompt loops, missing tokens, or `puffo-agent test full-probe`
+  failures so we can ship 0.9.1.
 - **Host codex must be on `cli_auth_credentials_store = "file"`.**
   If the operator's `~/.codex/config.toml` pins keyring (default
-  `auto` on macOS), `CodexFileBackend.bootstrap` returns "no-host-codex-auth"
-  and the daemon-owned refresh is a no-op. Each agent's codex still
-  refreshes its own per-agent file independently (we force file mode
-  in the per-agent config); the only loss is the PUF-221 multi-agent
-  race protection. Future work: add a `CodexKeychainBackend` or
-  auto-install the file setting in the operator's host config.
-- `codex exec` is assumed to honour the same auth pipeline as
-  `codex app-server` (research finding from `codex-rs/login/src/auth/manager.rs`).
-  Phase 0 verification: a real codex install with an expiring access
-  token should refresh + write back to `auth.json` when invoked
-  by the daemon at < 10-min margin.
+  `auto` on macOS), `CodexFileBackend.bootstrap` returns
+  "no-host-codex-auth" and the daemon-owned refresh is a no-op.
+  Each agent's codex still refreshes its own per-agent file
+  independently (we force file mode in the per-agent config); the
+  only loss is the PUF-221 multi-agent race protection. Future work:
+  `CodexKeychainBackend`, or auto-installing the file setting in the
+  operator's host config.
+- `runtime.kind=cli-docker` with `runtime.harness=codex` is **not
+  supported** — see the scope note at the top of this release.
 
 ## [0.10.0a2] — 2026-05-15
 

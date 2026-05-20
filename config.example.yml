@@ -20,8 +20,8 @@ anthropic:
   model:   "claude-sonnet-4-6"   # empty = provider default
 
 openai:
-  api_key: ""                    # https://platform.openai.com/
-  model:   "gpt-4o"
+  api_key: ""                    # https://platform.openai.com/ — used by chat-local + sdk-local only
+  model:   "gpt-4o"              # also used as the default model for cli-local + harness=codex
 
 google:
   api_key: ""                    # required for cli-docker + harness=gemini-cli
