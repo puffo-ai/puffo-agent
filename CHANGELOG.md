@@ -21,6 +21,38 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   Older web clients that don't read the fields are unaffected
   (extra JSON keys are ignored client-side).
 
+- **Profile cache (display_name + avatar_url) is now TTL'd and
+  manually-refreshable via the MCP `get_user_info` tool.** The
+  per-slug `_display_name_cache` was previously session-lifetime —
+  an operator (or any other user) renaming themselves on
+  puffo-server meant the agent rendered the stale name in its
+  prompt forever (until daemon restart). Three fixes layered:
+
+  1. The cache itself becomes TTL'd at 10 min (`_PROFILE_CACHE_TTL_SECONDS`)
+     and now carries both display_name + avatar_url (was just the
+     name). Renames + avatar swaps propagate within the TTL window
+     without operator intervention.
+
+  2. `get_user_info` MCP tool fix: was reading `entry.get("username")`
+     which silently dropped the display_name (server returns
+     `display_name`). Now reads the right field, also surfaces
+     `avatar_url` in the tool response. Renamed the output keys
+     from `display:` / `avatar:` to `display_name:` / `avatar_url:`
+     to match the wire fields.
+
+  3. `get_user_info` now POSTs the just-fetched values back to
+     the daemon's profile cache via the new
+     `POST /v1/data/{agent_id}/profile-cache` data-service route.
+     The next render in the daemon picks up the fresh values
+     immediately — operators wanting "right now" don't have to
+     wait for the TTL. Mechanism: data-service holds a module-
+     level setter the daemon wires to its worker registry; setter
+     finds the agent's worker and calls
+     `Worker.set_profile_cache(slug, name, avatar)` →
+     `PuffoCoreMessageClient.set_profile(...)`. Best-effort —
+     transport failures don't break the tool's reply, the TTL
+     catches up regardless.
+
 - **In-memory `_channel_space` dict now mirrors the persistent
   `channel_space_map` table.** Previously `_maybe_cache_channel_space`
   only wrote to the persistent store (used by the MCP subprocess via

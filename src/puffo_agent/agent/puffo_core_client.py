@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
@@ -35,6 +36,14 @@ PRIORITY_MENTIONED_BOT = 2
 PRIORITY_HUMAN = 3
 PRIORITY_BOT = 4
 PRIORITY_SYSTEM = 5
+
+# Per-slug profile cache TTL — keeps display_name + avatar_url
+# fresh enough that a rename / avatar change on puffo-server
+# propagates within ~10 min on the next render, without paying
+# a /identities/profiles HTTP round-trip on every inbound msg.
+# Operators wanting "right now" can fire the MCP get_user_profile
+# tool which force-refreshes regardless of TTL.
+_PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
 
 @dataclass
@@ -424,9 +433,14 @@ class PuffoCoreMessageClient:
         # slug → root_pubkey for inviters, to avoid hammering
         # /certs/sync on bursts of invites from the same person.
         self._inviter_root_cache: dict[str, bytes] = {}
-        # slug → display_name from /identities/profiles. Empty strings
-        # are cached too so unset display_names don't trigger re-fetch.
-        self._display_name_cache: dict[str, str] = {}
+        # slug → (display_name, avatar_url, fetched_at_monotonic) from
+        # /identities/profiles. TTL'd at _PROFILE_CACHE_TTL_SECONDS so
+        # operator name / avatar changes propagate without daemon
+        # restart (was previously session-lifetime, leaving the agent
+        # rendering the stale name forever). Empty fields are cached
+        # under the same TTL — transient lookup failures self-heal at
+        # the next tick instead of pinning a permanent "" miss.
+        self._profile_cache: dict[str, tuple[str, str, float]] = {}
         # Invitation event_ids the worker has already processed; per-
         # listen() (cleared on reconnect). Server-side state is the
         # durable record — this cache just avoids repeating work
@@ -1726,26 +1740,60 @@ class PuffoCoreMessageClient:
         return root_pk
 
     async def _fetch_display_name(self, slug: str) -> str:
-        """display_name via /identities/profiles, cached per session.
-        Empty string on miss/failure; caller falls back to ``@slug``."""
+        """display_name via the unified profile cache. Empty string
+        on miss/failure; caller falls back to ``@slug``. Thin wrapper
+        kept for source compat with the dozen call sites that only
+        care about the name."""
+        name, _ = await self._fetch_user_profile(slug)
+        return name
+
+    def set_profile(self, slug: str, display_name: str, avatar_url: str) -> None:
+        """Inject fresh values into the profile cache, bypassing TTL.
+        Used by the MCP ``get_user_info`` tool to share its just-
+        fetched values with the daemon's render path so the next
+        inbound envelope renders with the new display_name + avatar
+        without waiting for the cache to expire."""
         if not slug:
-            return ""
-        if slug in self._display_name_cache:
-            return self._display_name_cache[slug]
+            return
+        self._profile_cache[slug] = (display_name, avatar_url, time.monotonic())
+
+    async def _fetch_user_profile(
+        self, slug: str, *, force_refresh: bool = False,
+    ) -> tuple[str, str]:
+        """``(display_name, avatar_url)`` via /identities/profiles,
+        cached for ``_PROFILE_CACHE_TTL_SECONDS``. Empty strings on
+        miss/failure; same TTL applies so a transient lookup
+        failure doesn't pin a permanent miss.
+
+        ``force_refresh=True`` bypasses the cache for the read (the
+        MCP ``get_user_profile`` tool's path) but still writes back
+        so subsequent reads see the fresh value.
+        """
+        if not slug:
+            return ("", "")
+        now = time.monotonic()
+        if not force_refresh:
+            cached = self._profile_cache.get(slug)
+            if cached is not None and now - cached[2] < _PROFILE_CACHE_TTL_SECONDS:
+                return (cached[0], cached[1])
+        name = ""
+        avatar_url = ""
         try:
             data = await self.http.get(
                 f"/identities/profiles?slugs={slug}",
             )
-        except Exception:
-            self._display_name_cache[slug] = ""
-            return ""
-        for entry in data.get("profiles") or []:
-            if entry.get("slug") == slug:
-                name = (entry.get("display_name") or "").strip()
-                self._display_name_cache[slug] = name
-                return name
-        self._display_name_cache[slug] = ""
-        return ""
+            for entry in data.get("profiles") or []:
+                if entry.get("slug") == slug:
+                    name = (entry.get("display_name") or "").strip()
+                    avatar_url = (entry.get("avatar_url") or "").strip()
+                    break
+        except Exception as exc:
+            logger.debug(
+                "_fetch_user_profile: lookup failed for %s: %s",
+                slug, exc,
+            )
+        self._profile_cache[slug] = (name, avatar_url, now)
+        return (name, avatar_url)
 
     async def _validate_incoming_parent_id(
         self,

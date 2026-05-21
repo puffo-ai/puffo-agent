@@ -773,7 +773,10 @@ async def test_get_user_info():
     http.responses["/identities/profiles?slugs=alice-0001"] = {
         "profiles": [{
             "slug": "alice-0001",
-            "username": "Alice",
+            # Server returns ``display_name`` (was previously
+            # ``username`` in this fixture, mirroring a bug in
+            # the production tool — both were fixed together).
+            "display_name": "Alice",
             "bio": "A test user",
             "avatar_url": None,
             "profile_updated_at": 1700000000000,

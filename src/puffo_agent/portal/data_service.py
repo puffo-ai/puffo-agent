@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, Optional
 
 from aiohttp import web
 
@@ -27,6 +27,25 @@ class DataServiceConfig:
     enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63386
+
+
+# Set by the daemon at startup so the new POST profile-cache route
+# can reach back into the running PuffoCoreMessageClient. Module-
+# level (not stored on the App) because the build_app signature is
+# locked by aiohttp's pluggable-config story and the alternative
+# (custom AppKey) doesn't buy us anything beyond a wrapper.
+_PROFILE_SETTER: Optional[Callable[[str, str, str, str], None]] = None
+
+
+def set_profile_setter(
+    fn: Optional[Callable[[str, str, str, str], None]],
+) -> None:
+    """Daemon-side hook. ``fn(agent_id, slug, display_name, avatar_url)``
+    is called by the POST profile-cache route to inject MCP-tool-fresh
+    values into the agent's in-memory cache. ``None`` clears the hook
+    (used by tests + on shutdown)."""
+    global _PROFILE_SETTER
+    _PROFILE_SETTER = fn
 
 
 @dataclass
@@ -288,6 +307,51 @@ def _msg_to_dict(m: Any) -> dict[str, Any]:
     }
 
 
+async def update_profile_cache(request: web.Request) -> web.Response:
+    """POST {slug, display_name, avatar_url} — inject fresh values
+    into the agent's in-memory ``_profile_cache``. Body shape::
+
+        {"slug": "alice-0001", "display_name": "Alice", "avatar_url": "..."}
+
+    Called by the MCP ``get_user_info`` tool right after its
+    ``/identities/profiles`` fetch so the daemon's render path picks
+    up the new values immediately instead of waiting for the TTL.
+    No-op (200) when the daemon hasn't wired the setter — keeps the
+    tool resilient against partial-startup states. 400 on malformed
+    body."""
+    agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+    slug = str(body.get("slug") or "")
+    if not slug:
+        return web.json_response({"error": "slug is required"}, status=400)
+    display_name = str(body.get("display_name") or "")
+    avatar_url = str(body.get("avatar_url") or "")
+    setter = _PROFILE_SETTER
+    if setter is None:
+        logger.debug(
+            "data-service: profile-cache write for agent=%s slug=%s "
+            "skipped — setter not wired (daemon partial startup?)",
+            agent_id, slug,
+        )
+        return web.json_response({"ok": True, "note": "setter not wired"})
+    try:
+        setter(agent_id, slug, display_name, avatar_url)
+    except Exception as exc:
+        logger.exception(
+            "data-service: profile-cache setter raised for agent=%s slug=%s: %s",
+            agent_id, slug, exc,
+        )
+        return web.json_response(
+            {"error": f"setter raised: {exc}"}, status=500,
+        )
+    return web.json_response({"ok": True})
+
+
 # ── Lifecycle ────────────────────────────────────────────────────
 
 
@@ -313,6 +377,10 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     app.router.add_get(
         "/v1/data/{agent_id}/messages/{envelope_id}",
         get_message_by_envelope,
+    )
+    app.router.add_post(
+        "/v1/data/{agent_id}/profile-cache",
+        update_profile_cache,
     )
     app.on_shutdown.append(_close_all_stores)
     return app

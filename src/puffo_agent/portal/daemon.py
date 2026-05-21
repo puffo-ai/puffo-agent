@@ -26,7 +26,7 @@ from .credential_refresh import (
     FileBackend,
     KeychainBackend,
 )
-from .data_service import start_data_service, stop_data_service
+from .data_service import set_profile_setter, start_data_service, stop_data_service
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -99,6 +99,11 @@ class Daemon:
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
         api_runner = await start_api_server(self.daemon_cfg.bridge)
+        # Wire the data-service profile-cache writer to find the
+        # right worker by agent_id. ``Worker.set_profile_cache`` is a
+        # no-op before warm() finishes, so a race during partial
+        # startup is safe.
+        set_profile_setter(self._set_worker_profile_cache)
         data_runner = await start_data_service(self.daemon_cfg.data_service)
         refresher_task = asyncio.ensure_future(
             self.refresher.run_loop(self._stop)
@@ -145,6 +150,7 @@ class Daemon:
                 except (asyncio.CancelledError, Exception):
                     pass
             await stop_api_server(api_runner)
+            set_profile_setter(None)
             await stop_data_service(data_runner)
             clear_daemon_pid()
             clear_stop_request()
@@ -260,6 +266,20 @@ class Daemon:
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         return self._refresher_for(agent_cfg).notify_refresh_needed
+
+    def _set_worker_profile_cache(
+        self, agent_id: str, slug: str, display_name: str, avatar_url: str,
+    ) -> None:
+        """Data-service shim — find the worker for ``agent_id`` and
+        inject fresh profile values into its in-memory cache. Called
+        from the data service's POST profile-cache route, which the
+        MCP ``get_user_info`` tool hits right after fetching from
+        puffo-server. Silently no-ops when the worker is gone (agent
+        stopped between the tool's fetch and the POST)."""
+        worker = self.workers.get(agent_id)
+        if worker is None:
+            return
+        worker.set_profile_cache(slug, display_name, avatar_url)
 
     async def _stop_worker(self, agent_id: str) -> None:
         worker = self.workers.pop(agent_id, None)
