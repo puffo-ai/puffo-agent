@@ -272,3 +272,39 @@ class DataClient:
                 "data-service: get_message_by_envelope transport: %s", exc,
             )
             return None
+
+    async def update_profile_cache(
+        self, slug: str, display_name: str, avatar_url: str,
+    ) -> None:
+        """Push fresh ``display_name`` + ``avatar_url`` into the
+        daemon's in-memory profile cache for this agent's view.
+        Called by the MCP ``get_user_info`` tool right after its
+        ``/identities/profiles`` round-trip so the daemon's render
+        path sees the new values immediately. Best-effort — transport
+        failures log + drop (next render gets the values when the
+        TTL'd cache expires anyway).
+        """
+        if not slug:
+            return
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/profile-cache"
+        )
+        body = {
+            "slug": slug,
+            "display_name": display_name,
+            "avatar_url": avatar_url,
+        }
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    logger.warning(
+                        "data-service: update_profile_cache %s -> %d %s",
+                        path, resp.status, text,
+                    )
+        except aiohttp.ClientError as exc:
+            logger.warning(
+                "data-service: update_profile_cache transport: %s", exc,
+            )

@@ -695,6 +695,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def get_user_info(username: str) -> str:
         """Look up a user by slug or @-handle.
         Returns slug, display name, bio, and avatar URL when set.
+
+        Always fetches fresh from puffo-server (bypasses the daemon's
+        TTL'd profile cache) and writes the result back to that cache
+        so the next inbound message renders with the new values.
+        Use this when the operator says someone renamed themselves.
         """
         slug = (username or "").lstrip("@").strip()
         if not slug:
@@ -709,13 +714,32 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         if not profiles:
             return f"(no profile for {slug})"
         p = profiles[0]
+        # Server returns ``display_name`` (was previously read as
+        # ``username`` here, which silently dropped the field for
+        # every lookup — the line was never printed).
+        display_name = (p.get("display_name") or "").strip()
+        avatar_url = (p.get("avatar_url") or "").strip()
+        bio = (p.get("bio") or "").strip()
+        # Push the just-fetched values into the daemon's profile
+        # cache for this agent's view so the next render of an
+        # inbound message uses the fresh display_name + avatar
+        # instead of waiting for the TTL to expire.
+        try:
+            await cfg.data_client.update_profile_cache(
+                slug, display_name, avatar_url,
+            )
+        except Exception as exc:
+            logger.warning(
+                "get_user_info: failed to refresh daemon cache for %s: %s",
+                slug, exc,
+            )
         lines = [f"slug: {p.get('slug', slug)}"]
-        if p.get("username"):
-            lines.append(f"display: {p['username']}")
-        if p.get("bio"):
-            lines.append(f"bio: {p['bio']}")
-        if p.get("avatar_url"):
-            lines.append(f"avatar: {p['avatar_url']}")
+        if display_name:
+            lines.append(f"display_name: {display_name}")
+        if bio:
+            lines.append(f"bio: {bio}")
+        if avatar_url:
+            lines.append(f"avatar_url: {avatar_url}")
         return "\n".join(lines)
 
     @mcp.tool()

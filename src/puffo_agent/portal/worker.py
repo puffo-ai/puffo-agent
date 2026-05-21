@@ -559,6 +559,18 @@ class Worker:
         except asyncio.TimeoutError:
             return False
 
+    def set_profile_cache(
+        self, slug: str, display_name: str, avatar_url: str,
+    ) -> None:
+        """Cross-process bridge for the MCP ``get_user_info`` tool —
+        the subprocess fetches fresh from puffo-server then POSTs the
+        result here via the data service, so the next daemon render
+        sees the fresh display_name + avatar without waiting for the
+        TTL. No-op until the worker's PuffoCoreMessageClient has been
+        constructed (warm() hasn't completed yet)."""
+        if self._client is not None:
+            self._client.set_profile(slug, display_name, avatar_url)
+
     async def stop(self) -> None:
         self._stop.set()
         if self._task is not None:

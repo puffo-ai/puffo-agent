@@ -6,6 +6,106 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.9.1] — 2026-05-20
 
+### Added
+
+- **`runtime_harness` and `runtime_model` fields on `/v1/agents`
+  summary response.** The bridge's per-agent summary previously
+  only exposed `runtime_kind` (cli-local / cli-docker / chat-local /
+  sdk-local). With codex joining claude-code on the cli-local path,
+  web clients couldn't distinguish a codex agent from a claude-code
+  agent without fetching the full `/v1/agents/<id>` detail per
+  card. Adds `cfg.runtime.harness` so the My-Agents grid can label
+  a card as "Codex · local" vs "Claude Code · local" from the
+  summary alone, and `cfg.runtime.model` so the per-card edit form
+  can pre-fill the model dropdown without a per-card detail fetch.
+  Older web clients that don't read the fields are unaffected
+  (extra JSON keys are ignored client-side).
+
+- **Agent primer (`DEFAULT_SHARED_CLAUDE_MD` + skill cards) audited
+  and trimmed.** Cut ~45% by length (~17K → ~9.3K chars) while
+  closing 5 documentation gaps surfaced in 0.9.0 / 0.9.1 work:
+  (1) the PUF-227-A `root_id` cache-validation invariant is now
+  explicit in both the main primer and the `send_message` skill —
+  agents are told to pass the true thread root and warned that
+  cross-channel `root_id` gets wiped to null; (2) the
+  "Your two CLAUDE.md layers" + "Permission prompts" sections
+  explicitly call out the codex-agent equivalents (`AGENTS.md`,
+  daemon-trust auto-approval) so codex agents reading the shared
+  primer aren't told to look at files they don't have; (3) the
+  `get_user_info` skill + tool catalogue document the new
+  force-refresh behavior + the operator-rename trigger for calling
+  it; (4) the `refresh(model=...)` description lists the valid
+  Claude Code models (`claude-opus-4-7`, `claude-opus-4-6-1m`,
+  `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`); (5) the
+  workspace section adds a "credentials are daemon-managed" note so
+  agents don't try to write `~/.claude/.credentials.json` or
+  `~/.codex/auth.json` themselves. Section framework (14 headers in
+  the primer + 10 skill cards) is unchanged — only the prose got
+  tighter.
+
+- **Profile cache (display_name + avatar_url) is now TTL'd and
+  manually-refreshable via the MCP `get_user_info` tool.** The
+  per-slug `_display_name_cache` was previously session-lifetime —
+  an operator (or any other user) renaming themselves on
+  puffo-server meant the agent rendered the stale name in its
+  prompt forever (until daemon restart). Three fixes layered:
+
+  1. The cache itself becomes TTL'd at 10 min (`_PROFILE_CACHE_TTL_SECONDS`)
+     and now carries both display_name + avatar_url (was just the
+     name). Renames + avatar swaps propagate within the TTL window
+     without operator intervention.
+
+  2. `get_user_info` MCP tool fix: was reading `entry.get("username")`
+     which silently dropped the display_name (server returns
+     `display_name`). Now reads the right field, also surfaces
+     `avatar_url` in the tool response. Renamed the output keys
+     from `display:` / `avatar:` to `display_name:` / `avatar_url:`
+     to match the wire fields.
+
+  3. `get_user_info` now POSTs the just-fetched values back to
+     the daemon's profile cache via the new
+     `POST /v1/data/{agent_id}/profile-cache` data-service route.
+     The next render in the daemon picks up the fresh values
+     immediately — operators wanting "right now" don't have to
+     wait for the TTL. Mechanism: data-service holds a module-
+     level setter the daemon wires to its worker registry; setter
+     finds the agent's worker and calls
+     `Worker.set_profile_cache(slug, name, avatar)` →
+     `PuffoCoreMessageClient.set_profile(...)`. Best-effort —
+     transport failures don't break the tool's reply, the TTL
+     catches up regardless.
+
+- **In-memory `_channel_space` dict now mirrors the persistent
+  `channel_space_map` table.** Previously `_maybe_cache_channel_space`
+  only wrote to the persistent store (used by the MCP subprocess via
+  `lookup_channel_space`), leaving the in-memory dict (used by
+  `send_fallback_message`) empty until the first real inbound
+  envelope landed in the channel. An agent auto-accepted into a
+  channel via the operator-trust synthetic `accept_channel_invite`
+  would drop fallback replies (`no known space for channel …`)
+  until that first envelope — including its own intro-nudge reply
+  if the LLM didn't use the MCP `send_message` tool.
+
+  Two layers fixed: (a) every successful `mark_channel_space` call
+  in `_maybe_cache_channel_space` now also mirrors into
+  `self._channel_space[channel_id] = space_id`; (b)
+  `send_fallback_message` falls back to `store.lookup_channel_space`
+  on in-memory miss and backfills the dict on hit. (b) also covers
+  the post-daemon-restart case where the in-memory dict is empty
+  but the persistent table has the mapping from a prior session.
+
+- **`harness` is now editable via `PATCH /v1/agents/<id>/runtime`.**
+  The endpoint previously rejected the `harness` key with a "not
+  editable here" comment — operators had to drop to `agent.yml` or
+  `puffo-agent agent runtime --harness` to switch a running agent
+  between codex and claude-code. With the web client gaining a
+  harness dropdown in the agent edit form (puffo-core-han-group
+  PR #130), the bridge accepts harness alongside the existing
+  fields. `validate_triple` continues to enforce kind/provider/
+  harness combo correctness — invalid combos return 400 before
+  save. The reconcile loop catches the change on its next tick and
+  respawns the worker on the new harness.
+
 ### Fixed
 
 - **PUF-227-A: strict same-channel cache validation on `thread_root_id`
