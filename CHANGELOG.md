@@ -21,6 +21,28 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   Older web clients that don't read the fields are unaffected
   (extra JSON keys are ignored client-side).
 
+- **Agent primer (`DEFAULT_SHARED_CLAUDE_MD` + skill cards) audited
+  and trimmed.** Cut ~45% by length (~17K → ~9.3K chars) while
+  closing 5 documentation gaps surfaced in 0.9.0 / 0.9.1 work:
+  (1) the PUF-227-A `root_id` cache-validation invariant is now
+  explicit in both the main primer and the `send_message` skill —
+  agents are told to pass the true thread root and warned that
+  cross-channel `root_id` gets wiped to null; (2) the
+  "Your two CLAUDE.md layers" + "Permission prompts" sections
+  explicitly call out the codex-agent equivalents (`AGENTS.md`,
+  daemon-trust auto-approval) so codex agents reading the shared
+  primer aren't told to look at files they don't have; (3) the
+  `get_user_info` skill + tool catalogue document the new
+  force-refresh behavior + the operator-rename trigger for calling
+  it; (4) the `refresh(model=...)` description lists the valid
+  Claude Code models (`claude-opus-4-7`, `claude-opus-4-6-1m`,
+  `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`); (5) the
+  workspace section adds a "credentials are daemon-managed" note so
+  agents don't try to write `~/.claude/.credentials.json` or
+  `~/.codex/auth.json` themselves. Section framework (14 headers in
+  the primer + 10 skill cards) is unchanged — only the prose got
+  tighter.
+
 - **Profile cache (display_name + avatar_url) is now TTL'd and
   manually-refreshable via the MCP `get_user_info` tool.** The
   per-slug `_display_name_cache` was previously session-lifetime —
