@@ -19,6 +19,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   summary alone. Older web clients that don't read the field are
   unaffected (extra JSON keys are ignored client-side).
 
+- **`harness` is now editable via `PATCH /v1/agents/<id>/runtime`.**
+  The endpoint previously rejected the `harness` key with a "not
+  editable here" comment — operators had to drop to `agent.yml` or
+  `puffo-agent agent runtime --harness` to switch a running agent
+  between codex and claude-code. With the web client gaining a
+  harness dropdown in the agent edit form (puffo-core-han-group
+  PR #130), the bridge accepts harness alongside the existing
+  fields. `validate_triple` continues to enforce kind/provider/
+  harness combo correctness — invalid combos return 400 before
+  save. The reconcile loop catches the change on its next tick and
+  respawns the worker on the new harness.
+
 ### Fixed
 
 - **PUF-227-A: strict same-channel cache validation on `thread_root_id`

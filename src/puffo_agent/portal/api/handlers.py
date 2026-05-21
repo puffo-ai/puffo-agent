@@ -436,10 +436,13 @@ async def update_runtime(request: web.Request) -> web.Response:
     """Patch the agent's runtime block. Owner-only.
 
     Accepts any subset of: ``kind``, ``provider``, ``model``,
-    ``api_key``, ``permission_mode``, ``allowed_tools``,
+    ``harness``, ``api_key``, ``permission_mode``, ``allowed_tools``,
     ``docker_image``, ``max_turns``. Missing fields are untouched.
-    ``harness`` is intentionally not editable here — switching
-    harness usually requires host-level auth setup too.
+    ``harness`` editing requires the corresponding CLI to already be
+    installed + authenticated on the host (`claude login` /
+    `codex login` / ...) — the worker will hit auth_failed on first
+    turn otherwise. validate_triple below catches kind/provider/
+    harness combo violations before save.
 
     The reconcile loop notices ``runtime`` changed and respawns the
     worker on its next tick.
@@ -465,11 +468,12 @@ async def update_runtime(request: web.Request) -> web.Response:
     cfg = AgentConfig.load(agent_id)
     rt = cfg.runtime
 
-    # ``harness`` is excluded by design.
     if "kind" in payload:
         rt.kind = str(payload["kind"])
     if "provider" in payload:
         rt.provider = str(payload["provider"])
+    if "harness" in payload:
+        rt.harness = str(payload["harness"])
     if "model" in payload:
         rt.model = str(payload["model"])
     if "api_key" in payload:
