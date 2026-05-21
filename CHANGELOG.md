@@ -8,16 +8,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`runtime_harness` field on `/v1/agents` summary response.** The
-  bridge's per-agent summary previously only exposed `runtime_kind`
-  (cli-local / cli-docker / chat-local / sdk-local). With codex
-  joining claude-code on the cli-local path, web clients couldn't
-  distinguish a codex agent from a claude-code agent without
-  fetching the full `/v1/agents/<id>` detail per card. Adds
-  `cfg.runtime.harness` to the items dict so the My-Agents grid can
-  label a card as "Codex · local" vs "Claude Code · local" from the
-  summary alone. Older web clients that don't read the field are
-  unaffected (extra JSON keys are ignored client-side).
+- **`runtime_harness` and `runtime_model` fields on `/v1/agents`
+  summary response.** The bridge's per-agent summary previously
+  only exposed `runtime_kind` (cli-local / cli-docker / chat-local /
+  sdk-local). With codex joining claude-code on the cli-local path,
+  web clients couldn't distinguish a codex agent from a claude-code
+  agent without fetching the full `/v1/agents/<id>` detail per
+  card. Adds `cfg.runtime.harness` so the My-Agents grid can label
+  a card as "Codex · local" vs "Claude Code · local" from the
+  summary alone, and `cfg.runtime.model` so the per-card edit form
+  can pre-fill the model dropdown without a per-card detail fetch.
+  Older web clients that don't read the fields are unaffected
+  (extra JSON keys are ignored client-side).
 
 - **In-memory `_channel_space` dict now mirrors the persistent
   `channel_space_map` table.** Previously `_maybe_cache_channel_space`

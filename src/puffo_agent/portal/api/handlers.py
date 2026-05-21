@@ -267,6 +267,7 @@ async def list_agents(request: web.Request) -> web.Response:
             "state": cfg.state,
             "runtime_kind": cfg.runtime.kind,
             "runtime_harness": cfg.runtime.harness,
+            "runtime_model": cfg.runtime.model,
             "runtime_status": rs_status,
             "runtime_health": rs.health if rs else "unknown",
             "msg_count": rs.msg_count if rs else 0,
