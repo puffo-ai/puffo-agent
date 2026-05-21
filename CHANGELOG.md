@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.9.1] — 2026-05-20
 
+### Added
+
+- **`runtime_harness` field on `/v1/agents` summary response.** The
+  bridge's per-agent summary previously only exposed `runtime_kind`
+  (cli-local / cli-docker / chat-local / sdk-local). With codex
+  joining claude-code on the cli-local path, web clients couldn't
+  distinguish a codex agent from a claude-code agent without
+  fetching the full `/v1/agents/<id>` detail per card. Adds
+  `cfg.runtime.harness` to the items dict so the My-Agents grid can
+  label a card as "Codex · local" vs "Claude Code · local" from the
+  summary alone. Older web clients that don't read the field are
+  unaffected (extra JSON keys are ignored client-side).
+
 ### Fixed
 
 - **PUF-227-A: strict same-channel cache validation on `thread_root_id`
