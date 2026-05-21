@@ -19,6 +19,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   summary alone. Older web clients that don't read the field are
   unaffected (extra JSON keys are ignored client-side).
 
+- **In-memory `_channel_space` dict now mirrors the persistent
+  `channel_space_map` table.** Previously `_maybe_cache_channel_space`
+  only wrote to the persistent store (used by the MCP subprocess via
+  `lookup_channel_space`), leaving the in-memory dict (used by
+  `send_fallback_message`) empty until the first real inbound
+  envelope landed in the channel. An agent auto-accepted into a
+  channel via the operator-trust synthetic `accept_channel_invite`
+  would drop fallback replies (`no known space for channel …`)
+  until that first envelope — including its own intro-nudge reply
+  if the LLM didn't use the MCP `send_message` tool.
+
+  Two layers fixed: (a) every successful `mark_channel_space` call
+  in `_maybe_cache_channel_space` now also mirrors into
+  `self._channel_space[channel_id] = space_id`; (b)
+  `send_fallback_message` falls back to `store.lookup_channel_space`
+  on in-memory miss and backfills the dict on hit. (b) also covers
+  the post-daemon-restart case where the in-memory dict is empty
+  but the persistent table has the mapping from a prior session.
+
 - **`harness` is now editable via `PATCH /v1/agents/<id>/runtime`.**
   The endpoint previously rejected the `harness` key with a "not
   editable here" comment — operators had to drop to `agent.yml` or

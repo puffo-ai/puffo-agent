@@ -1311,6 +1311,14 @@ class PuffoCoreMessageClient:
         else:
             return
         await self.store.mark_channel_space(channel_id, space_id)
+        # Mirror to the in-memory dict that ``send_fallback_message``
+        # reads. Without this, an agent that's just joined a channel
+        # via a synthetic accept_channel_invite (operator-trust auto-
+        # accept) would drop fallback replies until the first real
+        # inbound envelope in that channel populated this dict via
+        # ``handle_envelope`` — including the intro nudge's own
+        # outbound, which never goes through handle_envelope.
+        self._channel_space[channel_id] = space_id
 
     async def _evict_space_caches(self, space_id: str) -> None:
         """Drop every cached entry tied to a space we've left/been
@@ -2487,6 +2495,22 @@ class PuffoCoreMessageClient:
             # it; either way, sending blindly to a guessed space
             # gets a 403 or worse (wrong-space cross-talk).
             target_space_id = self._channel_space.get(channel_id)
+            if not target_space_id:
+                # In-memory miss — try the persistent channel_space_map
+                # before giving up. Catches the post-daemon-restart
+                # case (in-memory dict empty until first inbound
+                # envelope) and any membership-event path that
+                # forgot to mirror to the dict. Backfill on hit so
+                # subsequent calls go through the fast path.
+                target_space_id = await self.store.lookup_channel_space(channel_id) or ""
+                if target_space_id:
+                    self._channel_space[channel_id] = target_space_id
+                    logger.info(
+                        "send_fallback_message: hydrated in-memory "
+                        "channel_space for %s from persistent store "
+                        "(sp=%s)",
+                        channel_id, target_space_id,
+                    )
             if not target_space_id:
                 logger.warning(
                     "send_fallback_message: no known space for channel %s — "
