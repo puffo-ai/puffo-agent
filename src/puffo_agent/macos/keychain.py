@@ -334,6 +334,16 @@ async def refresh_via_oneshot(
 
     Returns (ok, reason_when_not_ok).
 
+    A non-zero claude exit code is **not** by itself a hard failure:
+    claude may rotate the OAuth token successfully (writing the new blob
+    to ``.credentials.json``) and then exit non-zero from a later,
+    unrelated step. Dropping the new blob in that case strands the user
+    with the prior refresh_token, which Anthropic has already
+    invalidated — main CLI then can't recover without ``claude login``.
+    So we always inspect the sandbox file after the process exits: if
+    it contains a rotated access_token, we accept it and report
+    ``"token_refreshed_rc=N"`` so the non-zero exit stays visible.
+
     ⚠️ **Keep in sync with** ``portal.diagnostic._run_sandboxed_claude_oneshot``:
     that probe is a sync mirror of this function so the diagnostic
     can run without an asyncio event loop. Any env / arg change here
@@ -369,22 +379,37 @@ async def refresh_via_oneshot(
         # mode would bypass storage entirely.
         rc, err = await _run_claude_oneshot(env, str(sandbox_path), timeout=timeout)
         if rc is None:
+            # Spawn/timeout — no sandbox state to salvage.
             return (False, err)
-        if rc != 0:
-            return (False, f"claude_exit_code={rc}")
 
+        # Always read sandbox creds, regardless of rc. Parse failures
+        # only matter as a fallback signal when rc != 0.
         try:
             refreshed = sandbox_creds.read_text(encoding="utf-8")
         except FileNotFoundError:
+            if rc != 0:
+                return (False, f"claude_exit_code={rc}")
             return (False, "refreshed_credentials_missing")
         try:
             new_token = (
                 (json.loads(refreshed).get("claudeAiOauth") or {}).get("accessToken")
             ) or ""
         except json.JSONDecodeError:
+            if rc != 0:
+                return (False, f"claude_exit_code={rc}")
             return (False, "refreshed_credentials_unparseable")
 
+        rotated = bool(new_token) and old_token != new_token
+
+        # rc != 0 with no rotation: real failure, nothing to salvage.
+        if rc != 0 and not rotated:
+            return (False, f"claude_exit_code={rc}")
+
         cache.write(refreshed)
-        if old_token and new_token and old_token == new_token:
+        if rc != 0:
+            # Salvage path: keep the rotation, surface the rc so the
+            # caller can log + investigate the non-zero exit separately.
+            return (True, f"token_refreshed_rc={rc}")
+        if not rotated:
             return (True, "token_unchanged")
         return (True, "token_refreshed")

@@ -416,12 +416,25 @@ def probe_refresh_flush_forced() -> ProbeReport:
 
     **Has real side effects:** Anthropic rotates the refresh_token on
     every successful refresh, so the user's pre-probe refresh_token is
-    invalidated as soon as claude succeeds. We write the freshly-issued
-    blob back to the Keychain so the user's main CLI / VS Code
-    extension stays authenticated. If that writeback fails, the user
-    is left in a degraded state where their main CLI will need a re-
-    login (the new tokens still live in our run-dir cache, but main
-    CLI doesn't know about them).
+    invalidated as soon as claude succeeds. We always reconcile the
+    Keychain state at the end so the user's main CLI / VS Code extension
+    keeps a working token.
+
+    Rotation may happen via two paths and we must handle both:
+
+      1. ``claude`` rewrites the sandbox ``.credentials.json`` — we
+         writeback to Keychain ourselves.
+      2. ``claude`` writes the new blob directly to the user's real
+         Keychain. On macOS, ``$HOME`` does NOT isolate Keychain access
+         (ACL is keyed on UID + signing identity, not HOME), so the
+         sandbox claude reaches the real Keychain anyway and writes
+         there itself. No writeback needed.
+
+    Critically, ``rc != 0`` does **not** mean "Anthropic side-effect
+    didn't happen": claude can rotate successfully and then exit non-
+    zero from a later unrelated step. We always re-read Keychain + the
+    sandbox file after the run and decide writeback from observed
+    state, not from rc.
 
     Designed for occasional manual verification, NOT for every
     deploy. The natural ``refresh-flush`` is the everyday probe.
@@ -449,8 +462,9 @@ def probe_refresh_flush_forced() -> ProbeReport:
     rpt.add(
         "prerequisite-keychain",
         VERDICT_OK,
-        "original blob captured (will write back at the end to keep "
-        "main CLI alive)",
+        "original blob captured; will reconcile Keychain against actual "
+        "post-run state (claude in sandbox can write the real Keychain "
+        "directly because $HOME doesn't isolate it on macOS)",
     )
 
     mutated = _force_expiry(read_result.blob, seconds_in_past=60)
@@ -466,7 +480,7 @@ def probe_refresh_flush_forced() -> ProbeReport:
         "force-expiry",
         VERDICT_OK,
         "set claudeAiOauth.expiresAt = now - 60s in sandbox copy "
-        "(Keychain entry untouched until writeback step)",
+        "(Keychain entry will be re-read after the sandbox run)",
     )
 
     home = home_dir()
@@ -482,88 +496,135 @@ def probe_refresh_flush_forced() -> ProbeReport:
         )
         elapsed_ms = int((time.time() - started) * 1000)
 
-        if code != 0:
+        # Re-read Keychain regardless of rc: claude may have written
+        # straight to the real Keychain (HOME doesn't isolate it), so
+        # the rc alone doesn't tell us whether rotation happened.
+        post_read = read_keychain_blob()
+        keychain_after_blob = post_read.blob if post_read.ok else None
+        keychain_after_token = _access_token(keychain_after_blob or "")
+        sandbox_token = _access_token(refreshed or "")
+
+        sandbox_rotated = bool(sandbox_token) and sandbox_token != old_token
+        keychain_rotated = (
+            bool(keychain_after_token) and keychain_after_token != old_token
+        )
+
+        if code == 0:
+            rpt.add("claude-oneshot", VERDICT_OK, f"exit=0, elapsed_ms={elapsed_ms}")
+        else:
+            # rc != 0 is only a real failure if NOTHING rotated. If
+            # something did rotate, surface it as NEEDS_ATTENTION so
+            # the operator investigates the exit code separately.
+            verdict = (
+                VERDICT_NEEDS_ATTENTION
+                if (sandbox_rotated or keychain_rotated)
+                else VERDICT_FAIL
+            )
             rpt.add(
                 "claude-oneshot",
-                VERDICT_FAIL,
+                verdict,
                 f"exit={code}, elapsed_ms={elapsed_ms}\n"
-                f"stderr (last 500): {stderr_tail}",
+                f"stderr (last 500): {stderr_tail}\n"
+                "(continuing: inspecting Keychain + sandbox creds for "
+                "partial rotation regardless of rc)",
+            )
+
+        # Decide from observed state, not rc.
+        if not sandbox_rotated and not keychain_rotated:
+            rpt.add(
+                "rotation-outcome",
+                VERDICT_FAIL,
+                "neither sandbox creds nor Keychain show a new "
+                "access_token. claude did not reach Anthropic's refresh "
+                "endpoint, or the refresh failed. Keychain unchanged — "
+                "main CLI is safe.\n"
+                f"old:           {_redact_token(old_token)}\n"
+                f"sandbox after: {_redact_token(sandbox_token)}\n"
+                f"keychain after: {_redact_token(keychain_after_token)}",
             )
             rpt.summary = (
-                "Forced refresh failed before completing. Anthropic "
-                "side-effect did not happen — Keychain untouched."
-            )
-            return rpt
-        rpt.add("claude-oneshot", VERDICT_OK, f"exit=0, elapsed_ms={elapsed_ms}")
-
-        if refreshed is None:
-            rpt.add(
-                "credentials-file",
-                VERDICT_FAIL,
-                "sandbox .credentials.json was DELETED — flush failed",
+                "Forced expiry did not produce a rotation. No Anthropic "
+                "side-effect; Keychain untouched."
             )
             return rpt
 
-        new_token = _access_token(refreshed)
-        rotated = bool(new_token) and old_token != new_token
         rpt.add(
-            "credentials-file",
-            VERDICT_OK if rotated else VERDICT_FAIL,
-            "token rotated: {}\nold: {}\nnew: {}\n{}".format(
-                rotated,
+            "rotation-outcome",
+            VERDICT_OK,
+            "rotation detected: sandbox_rotated={}, keychain_rotated={}\n"
+            "old:           {}\n"
+            "sandbox after: {}\n"
+            "keychain after: {}".format(
+                sandbox_rotated,
+                keychain_rotated,
                 _redact_token(old_token),
-                _redact_token(new_token),
-                (
-                    "claude saw the past expiresAt and refreshed."
-                    if rotated else
-                    "claude did NOT rotate despite forced expiry — "
-                    "the refresh code path is broken or behind a flag "
-                    "we don't set."
-                ),
+                _redact_token(sandbox_token),
+                _redact_token(keychain_after_token),
             ),
         )
 
-        if not rotated:
-            rpt.summary = (
-                "Forced expiry did not trigger refresh. Investigate "
-                "before promoting — `refresh_via_oneshot` will silently "
-                "no-op in production."
-            )
-            return rpt
-
-        # Critical: writeback the freshly-rotated blob to Keychain so
-        # the user's main CLI doesn't get stranded with an invalid
-        # refresh_token. Anthropic invalidated the original
-        # refresh_token the moment they issued the new one.
-        wb_ok, wb_reason = writeback_to_keychain(refreshed)
-        if wb_ok:
+        # Reconcile Keychain. Writeback only when Keychain doesn't
+        # already hold the rotated blob — naively writing the original
+        # back on any failure path would clobber a token claude just
+        # rotated into Keychain itself, leaving the user with an
+        # Anthropic-invalidated refresh_token.
+        if (
+            keychain_rotated
+            and sandbox_rotated
+            and keychain_after_token == sandbox_token
+        ):
             rpt.add(
                 "keychain-writeback",
                 VERDICT_OK,
-                "freshly-rotated tokens written back to Keychain; "
-                "main CLI / VS Code extension will see them on next "
-                "use",
+                "Keychain already holds the rotated token (claude wrote "
+                "it directly); no writeback needed.",
             )
-            rpt.summary = (
-                "Forced refresh succeeded end-to-end: claude rotated "
-                "the token AND we synced the new value back to "
-                "Keychain. `refresh_via_oneshot` will work as "
-                "designed in production."
-            )
-        else:
+        elif keychain_rotated and not sandbox_rotated:
             rpt.add(
                 "keychain-writeback",
-                VERDICT_NEEDS_ATTENTION,
-                f"writeback failed: {wb_reason}\n"
-                "Main CLI's view of the credentials is now STALE. "
-                "Run `puffo-agent test keychain-write` to diagnose; "
-                "user may need to re-login via `claude` in a terminal "
-                "to recover.",
+                VERDICT_OK,
+                "Keychain holds a new token from claude's direct write; "
+                "sandbox creds file was not updated. Trusting Keychain "
+                "as canonical — no writeback needed.",
             )
+        elif sandbox_rotated and refreshed is not None:
+            # Either Keychain wasn't rotated (we must writeback) or
+            # there's a disagreement between sandbox and Keychain (we
+            # prefer the sandbox blob since it's the one we definitively
+            # observed claude write during this run).
+            wb_ok, wb_reason = writeback_to_keychain(refreshed)
+            if wb_ok:
+                rpt.add(
+                    "keychain-writeback",
+                    VERDICT_OK,
+                    "rotated sandbox blob written back to Keychain; "
+                    "main CLI / VS Code extension will see it on next "
+                    "use.",
+                )
+            else:
+                rpt.add(
+                    "keychain-writeback",
+                    VERDICT_NEEDS_ATTENTION,
+                    f"writeback failed: {wb_reason}\n"
+                    "Main CLI's view of the credentials is now STALE. "
+                    "Run `puffo-agent test keychain-write` to diagnose; "
+                    "user may need to re-login via `claude` in a "
+                    "terminal to recover.",
+                )
+
+        if code == 0:
             rpt.summary = (
-                "Forced refresh worked but writeback to Keychain "
-                "failed. Main CLI is now in a degraded state and may "
-                "need a manual re-login."
+                "Forced refresh succeeded end-to-end: claude rotated "
+                "the token and the new value is live in Keychain. "
+                "`refresh_via_oneshot` will work as designed in "
+                "production."
+            )
+        else:
+            rpt.summary = (
+                f"Forced refresh: claude exited {code} but Anthropic-"
+                "side rotation DID happen and Keychain is reconciled. "
+                "Refresh mechanism is effective; investigate the non-"
+                "zero exit code separately."
             )
 
     return rpt

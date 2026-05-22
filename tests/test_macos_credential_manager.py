@@ -322,6 +322,64 @@ def test_refresh_via_oneshot_handles_claude_exit_failure(monkeypatch, tmp_path):
     assert reason == "claude_exit_code=1"
 
 
+def test_refresh_via_oneshot_salvages_rotation_on_nonzero_exit(
+    monkeypatch, tmp_path,
+):
+    """claude can rotate the OAuth token successfully and then exit
+    non-zero from a later unrelated step. The pre-fix behaviour dropped
+    the rotated blob in that case, leaving Anthropic to invalidate the
+    refresh_token while the user's main CLI was stuck on it — needing
+    a manual ``claude login`` to recover. Now we always read the
+    sandbox file and accept the rotation regardless of rc."""
+    _force_macos(monkeypatch)
+    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
+    cache = cm.CredentialCache.at(tmp_path)
+    cache.write(_BLOB)
+
+    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
+        # claude wrote a fresh blob, THEN died.
+        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
+        sandbox_creds.write_text(_REFRESHED_BLOB, encoding="utf-8")
+        return _FakeAsyncProc(1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    ok, reason = asyncio.run(
+        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
+    )
+    assert ok is True
+    assert reason == "token_refreshed_rc=1"
+    # The rotated blob must be in the cache so writeback can pick it up.
+    assert cache.access_token() == "sk-ant-NEW-access"
+
+
+def test_refresh_via_oneshot_failure_with_unchanged_blob_still_fails(
+    monkeypatch, tmp_path,
+):
+    """If claude exits non-zero AND the sandbox file shows no rotation
+    (claude wrote it back identical, or failed before reaching the
+    refresh path), the refresh is a real failure — don't pretend
+    success."""
+    _force_macos(monkeypatch)
+    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
+    cache = cm.CredentialCache.at(tmp_path)
+    cache.write(_BLOB)
+
+    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
+        # Sandbox file contains the same token as the input.
+        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
+        sandbox_creds.write_text(_BLOB, encoding="utf-8")
+        return _FakeAsyncProc(7)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    ok, reason = asyncio.run(
+        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
+    )
+    assert ok is False
+    assert reason == "claude_exit_code=7"
+    # Cache must remain on the original blob.
+    assert cache.access_token() == "sk-ant-original-access"
+
+
 def test_refresh_via_oneshot_skipped_off_macos(monkeypatch, tmp_path):
     _disable_macos(monkeypatch)
     cache = cm.CredentialCache.at(tmp_path)

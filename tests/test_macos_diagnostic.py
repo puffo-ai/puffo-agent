@@ -224,3 +224,156 @@ def test_refresh_flush_forced_requires_yes_flag(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "rotates" in captured.err.lower()
     assert "--yes" in captured.err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# refresh-flush-forced — rc-vs-rotation reconciliation
+#
+# The probe must decide writeback + verdict from the observed Keychain
+# and sandbox-creds state after the run, not from claude's exit code.
+# Pre-fix it took an rc-based early return and either dropped a real
+# rotation (stranding the user with an Anthropic-invalidated RT) or
+# falsely reported "Keychain untouched" when claude had already updated
+# the Keychain via its own native write.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BLOB_NEW = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-ant-NEW",
+        "refreshToken": "rt-NEW",
+        "expiresAt": 9_999_999_500,
+    },
+})
+
+
+def _force_macos_for_probe(monkeypatch):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(diag, "is_macos", lambda: True)
+    monkeypatch.setattr(diag.shutil, "which", lambda b: "/usr/local/bin/claude")
+    monkeypatch.setattr(diag, "install_path_shim", lambda home: home / "shim")
+
+
+def _stub_keychain_reads(monkeypatch, prerequisite_blob, post_blob):
+    """Stub ``read_keychain_blob`` so the prerequisite read returns one
+    blob and the post-sandbox read returns another."""
+    calls = {"n": 0}
+
+    def fake_read():
+        calls["n"] += 1
+        blob = prerequisite_blob if calls["n"] == 1 else post_blob
+        return cm.KeychainReadResult(True, blob, None, None)
+
+    monkeypatch.setattr(diag, "read_keychain_blob", fake_read)
+
+
+def _stub_subprocess(monkeypatch, *, sandbox_after_blob, rc):
+    """Stub ``subprocess.run`` so the sandbox claude appears to write
+    the given blob (or nothing, if None) and exits with ``rc``."""
+    def fake_run(*args, cwd=None, **kwargs):
+        if sandbox_after_blob is not None:
+            Path(cwd, ".claude", ".credentials.json").write_text(
+                sandbox_after_blob, encoding="utf-8",
+            )
+        return _FakeCompletedProcess(rc, stdout="", stderr="downstream boom")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+
+def test_forced_rc_nonzero_but_sandbox_rotated_triggers_writeback(monkeypatch):
+    """claude rotated, wrote the new blob to the sandbox file, then
+    exited non-zero. Keychain still holds the original (claude didn't
+    rewrite it). Probe MUST writeback so main CLI doesn't get stranded
+    on the Anthropic-invalidated RT."""
+    _force_macos_for_probe(monkeypatch)
+    # Prerequisite read + post read both return the original — claude
+    # only updated the sandbox file, not Keychain.
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB)
+    _stub_subprocess(monkeypatch, sandbox_after_blob=_BLOB_NEW, rc=1)
+
+    written = []
+    monkeypatch.setattr(
+        diag, "writeback_to_keychain",
+        lambda blob: (written.append(blob) or (True, None)),
+    )
+
+    rpt = diag.probe_refresh_flush_forced()
+    body = rpt.render_markdown()
+
+    # Salvaged rotation → overall NEEDS_ATTENTION, not FAIL.
+    assert rpt.overall() == diag.VERDICT_NEEDS_ATTENTION, body
+    assert "rotation detected" in body
+    assert "written back to Keychain" in body
+    # Writeback was called with the rotated blob.
+    assert len(written) == 1
+    assert json.loads(written[0])["claudeAiOauth"]["accessToken"] == "sk-ant-NEW"
+
+
+def test_forced_rc_nonzero_with_keychain_rotated_skips_writeback(monkeypatch):
+    """claude wrote the new blob directly into the real Keychain (HOME
+    doesn't isolate Keychain) and then exited non-zero without updating
+    the sandbox file. Keychain is already correct; writeback would be a
+    no-op at best and a clobber at worst — must NOT be called."""
+    _force_macos_for_probe(monkeypatch)
+    # Prerequisite read returns original; post read returns rotated.
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB_NEW)
+    # Sandbox file unchanged from the mutated blob.
+    _stub_subprocess(monkeypatch, sandbox_after_blob=None, rc=1)
+
+    written = []
+    monkeypatch.setattr(
+        diag, "writeback_to_keychain",
+        lambda blob: (written.append(blob) or (True, None)),
+    )
+
+    rpt = diag.probe_refresh_flush_forced()
+    body = rpt.render_markdown()
+
+    assert rpt.overall() == diag.VERDICT_NEEDS_ATTENTION, body
+    assert "claude wrote it directly" in body or "claude's direct write" in body
+    assert written == [], (
+        "writeback must NOT be called when Keychain already has the "
+        "rotated token — would clobber a fresh blob with stale data"
+    )
+
+
+def test_forced_rc_nonzero_with_no_rotation_is_real_failure(monkeypatch):
+    """claude exited non-zero AND neither Keychain nor sandbox file
+    shows rotation. Real failure; Keychain unchanged; main CLI safe.
+    Must report FAIL without any writeback."""
+    _force_macos_for_probe(monkeypatch)
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB)
+    _stub_subprocess(monkeypatch, sandbox_after_blob=None, rc=1)
+
+    written = []
+    monkeypatch.setattr(
+        diag, "writeback_to_keychain",
+        lambda blob: (written.append(blob) or (True, None)),
+    )
+
+    rpt = diag.probe_refresh_flush_forced()
+    body = rpt.render_markdown()
+
+    assert rpt.overall() == diag.VERDICT_FAIL, body
+    assert "did not produce a rotation" in body or "Keychain unchanged" in body
+    assert written == []
+
+
+def test_forced_rc_zero_happy_path_writes_back(monkeypatch):
+    """Sanity: the original happy path (claude exits 0, sandbox file
+    has a rotated token, Keychain still on the original) still works
+    end-to-end with writeback."""
+    _force_macos_for_probe(monkeypatch)
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB)
+    _stub_subprocess(monkeypatch, sandbox_after_blob=_BLOB_NEW, rc=0)
+
+    written = []
+    monkeypatch.setattr(
+        diag, "writeback_to_keychain",
+        lambda blob: (written.append(blob) or (True, None)),
+    )
+
+    rpt = diag.probe_refresh_flush_forced()
+    body = rpt.render_markdown()
+
+    assert rpt.overall() == diag.VERDICT_OK, body
+    assert len(written) == 1
+    assert json.loads(written[0])["claudeAiOauth"]["accessToken"] == "sk-ant-NEW"
