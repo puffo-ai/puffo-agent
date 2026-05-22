@@ -179,6 +179,7 @@ class LocalCLIAdapter(Adapter):
         self._hermes_bin: str | None = None
         self._hermes_home: Path | None = None
         self._hermes_mcp_registered = False
+        self._hermes_audit: AuditLog | None = None
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         self._verify()
@@ -389,6 +390,10 @@ class LocalCLIAdapter(Adapter):
 
         self._hermes_home = self.agent_home_dir / ".hermes"
         self._seed_hermes_home(host_hermes_home, self._hermes_home)
+        self._hermes_audit = AuditLog(
+            Path(self.workspace_dir) / ".puffo-agent" / "audit.log",
+            self.agent_id,
+        )
         self._log_host_runtime_banner()
 
     def _seed_hermes_home(self, host_dir: Path, agent_dir: Path) -> None:
@@ -427,6 +432,9 @@ class LocalCLIAdapter(Adapter):
                 "error": "hermes not verified before run_turn",
             })
         await self._ensure_hermes_mcp_registered_local()
+
+        if self._hermes_audit is not None and not _retried:
+            self._hermes_audit.write("turn.input", content=user_message)
 
         has_prior_session = self.session_file.exists()
         prompt = user_message if has_prior_session else stitch_hermes_prompt(
@@ -479,6 +487,12 @@ class LocalCLIAdapter(Adapter):
                 stdout_text.strip()[:400],
                 stderr_text.strip()[-400:] or "(empty)",
             )
+            if self._hermes_audit is not None:
+                self._hermes_audit.write(
+                    "turn.error", rc=rc,
+                    stdout_snippet=stdout_text[:400],
+                    stderr_tail=stderr_text[-400:],
+                )
             return TurnResult(reply="", metadata={
                 "error": f"hermes exited rc={rc}",
                 "stdout_snippet": stdout_text[:400],
@@ -495,6 +509,17 @@ class LocalCLIAdapter(Adapter):
             logger.warning(
                 "agent %s: hermes rc=0 but parser found no reply. "
                 "stdout: %r", self.agent_id, stdout_text[:400],
+            )
+        if self._hermes_audit is not None:
+            for name in tool_calls:
+                self._hermes_audit.write("tool", name=name)
+            if reply:
+                self._hermes_audit.write("assistant.text", text=reply)
+            self._hermes_audit.write(
+                "turn.result",
+                session_id=session_id, elapsed_seconds=round(elapsed, 2),
+                tool_count=len(tool_calls),
+                stdout_raw=stdout_text[:2000],
             )
 
         # Sentinel for ``--continue`` on subsequent turns.
