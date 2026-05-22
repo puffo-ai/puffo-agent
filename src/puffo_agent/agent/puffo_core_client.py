@@ -813,6 +813,10 @@ class PuffoCoreMessageClient:
             self._consume_queue(on_message, on_api_error_retry),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
+        # Fire-and-forget; the WS subscribe below doesn't wait for
+        # the warmup. Worst case the first message pays the lazy
+        # fetch as before.
+        warm_task = asyncio.ensure_future(self._warm_member_caches())
 
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
@@ -828,7 +832,8 @@ class PuffoCoreMessageClient:
         finally:
             consumer_task.cancel()
             invite_poll_task.cancel()
-            for task in (consumer_task, invite_poll_task):
+            warm_task.cancel()
+            for task in (consumer_task, invite_poll_task, warm_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -1877,6 +1882,102 @@ class PuffoCoreMessageClient:
             )
             return None
         return parent_id
+
+    async def _warm_member_caches(self) -> None:
+        """Background prefetch on ``listen()`` startup: walks ``GET
+        /spaces`` and fans out parallel member + channel fetches per
+        space so first-message lazy fills don't pay the round trip
+        or miss recently-joined members. Non-blocking; per-fetch
+        failures are logged + skipped (the existing lazy paths re-
+        try on demand)."""
+        started = time.monotonic()
+        try:
+            spaces_resp = await self.http.get("/spaces")
+        except Exception as exc:
+            logger.debug("warm_member_caches: /spaces failed: %s", exc)
+            return
+        space_entries = spaces_resp.get("spaces") or []
+        for entry in space_entries:
+            sid = entry.get("space_id") or ""
+            name = (entry.get("name") or "").strip()
+            if sid and name:
+                self._space_name_cache.setdefault(sid, name)
+        space_ids = [
+            e.get("space_id") or ""
+            for e in space_entries
+            if e.get("space_id")
+        ]
+        if not space_ids:
+            return
+
+        async def warm_one(space_id: str) -> set[str]:
+            members_task = asyncio.create_task(
+                self._get_space_members(space_id),
+            )
+            channels_task = asyncio.create_task(
+                self._warm_channels_for_space(space_id),
+            )
+            members = await members_task
+            await channels_task
+            return set(members.keys())
+
+        all_slugs: set[str] = set()
+        for result in await asyncio.gather(
+            *(warm_one(sid) for sid in space_ids),
+            return_exceptions=True,
+        ):
+            if isinstance(result, set):
+                all_slugs |= result
+        new_slugs = [s for s in all_slugs if s not in self._profile_cache]
+        if new_slugs:
+            await self._bulk_fetch_profiles(new_slugs)
+        logger.info(
+            "warm_member_caches: %d spaces, %d members, %d new profiles in %.2fs",
+            len(space_ids), len(all_slugs), len(new_slugs),
+            time.monotonic() - started,
+        )
+
+    async def _warm_channels_for_space(self, space_id: str) -> None:
+        try:
+            resp = await self.http.get(f"/spaces/{space_id}/channels")
+        except Exception:
+            return
+        for ch in resp.get("channels", []) or []:
+            cid = ch.get("channel_id") or ""
+            name = (ch.get("name") or "").strip()
+            if not cid:
+                continue
+            # ``setdefault`` so a faster-arriving WS event that
+            # populated these isn't clobbered with potentially older
+            # data we just fetched.
+            self._channel_space.setdefault(cid, space_id)
+            if name:
+                self._channel_name_cache.setdefault(cid, name)
+            try:
+                await self.store.mark_channel_space(cid, space_id)
+            except Exception:
+                pass
+
+    async def _bulk_fetch_profiles(self, slugs: list[str]) -> None:
+        """Batch ``/identities/profiles?slugs=...``; chunked so a
+        many-member space doesn't blow the URL length."""
+        now = time.monotonic()
+        CHUNK = 50
+        for i in range(0, len(slugs), CHUNK):
+            chunk = slugs[i:i + CHUNK]
+            try:
+                data = await self.http.get(
+                    f"/identities/profiles?slugs={','.join(chunk)}",
+                )
+            except Exception:
+                continue
+            for entry in data.get("profiles") or []:
+                slug = entry.get("slug") or ""
+                if not slug:
+                    continue
+                name = (entry.get("display_name") or "").strip()
+                avatar_url = (entry.get("avatar_url") or "").strip()
+                self._profile_cache[slug] = (name, avatar_url, now)
 
     async def _get_space_members(self, space_id: str) -> dict[str, str]:
         """``slug -> identity_type`` for ``space_id``. Cached per
