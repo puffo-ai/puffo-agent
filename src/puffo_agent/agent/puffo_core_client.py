@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
@@ -28,6 +29,12 @@ from .events import random_nonce, sign_event
 from .message_store import MessageStore
 
 logger = logging.getLogger(__name__)
+
+# Mirrors the web client's remark-mentions pattern; non-word
+# leader so ``foo@bar-1234`` (an email) doesn't match.
+_MENTION_RE = re.compile(
+    r"(?:^|\W)@([a-z][a-z0-9-]*-[a-f0-9]{4})", re.IGNORECASE,
+)
 
 
 # Lower number = higher priority — drained first by the consumer loop.
@@ -466,6 +473,10 @@ class PuffoCoreMessageClient:
         self._space_name_cache: dict[str, str] = {}
         self._channel_name_cache: dict[str, str] = {}
 
+        # Per-space member-slug cache for mention scoping (matches the
+        # web client's per-space gate). Lazy, session-lifetime.
+        self._space_member_slugs: dict[str, set[str]] = {}
+
     async def listen(
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
@@ -647,23 +658,34 @@ class PuffoCoreMessageClient:
                 # invites would otherwise fail).
                 self._channel_space[payload.channel_id] = payload.space_id
 
-            # puffo-core has no structural mention objects yet, so
-            # synthesise the dict shape core.py:_append_user expects
-            # (``username``/``is_bot``/``is_self``) when the text
-            # contains `@<our slug>` literally.
-            is_mention = f"@{self.slug}" in raw_text
+            # Parse all ``@<slug>`` and scope to space members
+            # (matches the web client). Self is always kept.
+            self_slug_lower = self.slug.lower()
+            seen: set[str] = set()
+            parsed: list[str] = []
+            for m in _MENTION_RE.finditer(raw_text):
+                slug = m.group(1).lower()
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                parsed.append(slug)
+            is_mention = self_slug_lower in seen
+            space_members = (
+                await self._get_space_members(payload.space_id)
+                if payload.space_id
+                else set()
+            )
             mentions: list[dict] = []
-            if is_mention:
-                mentions.append({
-                    "username": self.slug,
-                    "is_bot": True,
-                    "is_self": True,
-                })
+            for slug in parsed:
+                if slug == self_slug_lower:
+                    mentions.append({"username": self.slug, "is_bot": True, "is_self": True})
+                    continue
+                if space_members and slug not in space_members:
+                    continue
+                mentions.append({"username": slug, "is_bot": False, "is_self": False})
 
-            # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`,
-            # the unambiguous "you are being addressed" signal documented
-            # in the shared primer. Other handles stay un-rewrapped so
-            # peer addressing reads naturally.
+            # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
+            # (the documented "addressed to you" signal).
             clean_text = raw_text.replace(
                 f"@{self.slug}", f"@you({self.slug})",
             ).strip() if is_mention else raw_text
@@ -1354,6 +1376,7 @@ class PuffoCoreMessageClient:
             self._channel_space.pop(cid, None)
             self._channel_name_cache.pop(cid, None)
         self._space_name_cache.pop(space_id, None)
+        self._space_member_slugs.pop(space_id, None)
         try:
             await self.store.unmark_channel_space_for_space(space_id)
         except Exception:
@@ -1844,6 +1867,23 @@ class PuffoCoreMessageClient:
             )
             return None
         return parent_id
+
+    async def _get_space_members(self, space_id: str) -> set[str]:
+        """Member slugs for ``space_id``. Cached per session; empty set
+        on miss/failure (caller treats unknown space as "no scope")."""
+        if not space_id:
+            return set()
+        cached = self._space_member_slugs.get(space_id)
+        if cached is not None:
+            return cached
+        try:
+            resp = await self.http.get(f"/spaces/{space_id}/members")
+        except Exception:
+            self._space_member_slugs[space_id] = set()
+            return set()
+        slugs = {m.get("slug", "") for m in resp.get("members", []) if m.get("slug")}
+        self._space_member_slugs[space_id] = slugs
+        return slugs
 
     async def _resolve_space_name(self, space_id: str) -> str:
         """Space name via ``GET /spaces``, cached per session. Returns
