@@ -16,8 +16,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   both an initial-paint mode and a delta-polling mode:
 
   1. **Tail mode** (default, or explicit `?tail=N`): returns the
-     last `N` lines, default 200, capped at 2000. Implemented via
-     reverse-seek in 64 KB chunks off the file end (`_read_tail_bytes`)
+     last `N` lines, default 30 (web UI Logs tab budget — ~1000
+     chars total), capped at 2000 for operator-driven investigation.
+     Implemented via reverse-seek in 64 KB chunks off the file end
+     (`_read_tail_bytes`)
      rather than `read_bytes()` — `audit.log` has no rotation at
      the writer side yet, so for a long-lived agent the file can
      grow to hundreds of MB and a full-file read would scale badly.

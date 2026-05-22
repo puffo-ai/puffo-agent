@@ -996,9 +996,11 @@ async def archive_agent(request: web.Request) -> web.Response:
 
 
 # Default number of trailing lines returned when no ``tail`` query
-# param is supplied. 200 is plenty for the on-mount paint without
-# blowing the wire response size on a busy agent.
-_LOG_DEFAULT_TAIL = 200
+# param is supplied. The web UI's Logs tab caps total displayed text
+# at ~1000 chars (no scroll history), so 30 lines at ~80 chars each
+# is the right initial-paint budget. Operators investigating an
+# incident can still request up to ``_LOG_MAX_TAIL`` explicitly.
+_LOG_DEFAULT_TAIL = 30
 # Hard cap on ``tail`` — protects against accidental huge fetches
 # from a chatty agent. 2000 lines * ~300 bytes / line ≈ 600 KB.
 _LOG_MAX_TAIL = 2000

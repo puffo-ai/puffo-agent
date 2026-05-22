@@ -99,7 +99,7 @@ async def test_log_tail_returns_last_n_lines(client):
     assert j["next_cursor"] == log_path.stat().st_size
 
 
-async def test_log_default_tail_is_200(client):
+async def test_log_default_tail_is_30(client):
     user = make_user()
     await _pair(client, user)
     home = os.environ["PUFFO_AGENT_HOME"]
@@ -113,9 +113,10 @@ async def test_log_default_tail_is_200(client):
     h = signed_headers(user, "GET", "/v1/agents/agt-default/log"); h.update(_HOST)
     r = await client.get("/v1/agents/agt-default/log", headers=h)
     j = await r.json()
-    assert len(j["lines"]) == 200
-    # Last 200 of 250 → events 50..249.
-    assert j["lines"][0]["n"] == 50
+    # Default tail = 30 (web UI's Logs tab budget — ~1000 chars total).
+    assert len(j["lines"]) == 30
+    # Last 30 of 250 → events 220..249.
+    assert j["lines"][0]["n"] == 220
     assert j["lines"][-1]["n"] == 249
 
 
