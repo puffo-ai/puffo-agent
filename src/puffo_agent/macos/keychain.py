@@ -205,12 +205,30 @@ class CredentialCache:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bootstrap_from_keychain(cache: CredentialCache) -> tuple[bool, Optional[str]]:
-    """Materialise the cache from the Keychain if the cache is missing
-    or empty. Returns (ok, reason_when_not_ok)."""
-    if cache.exists() and cache.access_token():
-        return (True, "cache_already_warm")
+    """Materialise the cache from the Keychain on daemon start.
+
+    Always reads Keychain — Keychain is canonical, and while the daemon
+    was stopped the user (or anything else with the user's UID +
+    signing identity) may have rotated the token via interactive
+    ``claude /login``, the main CLI's own refresh-on-expiry, a VS Code
+    plugin write, etc. A warm-cache short-circuit here previously
+    caused the daemon to start with a stale RT, sync that stale RT to
+    every agent's per-agent ``.credentials.json``, and then the
+    spawned claude subprocesses immediately 401'd on Anthropic until
+    the auth-error wake-up eventually pulled the current token from
+    Keychain. The one extra ``security`` call per daemon start is
+    cheap insurance against that startup race.
+
+    If Keychain read fails *and* the cache still has a token, fall
+    back to the cache so the daemon at least limps along (the 5-min
+    external-rotation poll will keep trying Keychain).
+
+    Returns ``(ok, reason_when_not_ok)``.
+    """
     read = read_keychain_blob()
-    if not read.ok:
-        return (False, read.error)
-    cache.write(read.blob)
-    return (True, "bootstrapped")
+    if read.ok and read.blob:
+        cache.write(read.blob)
+        return (True, "bootstrapped")
+    if cache.exists() and cache.access_token():
+        return (True, f"keychain_read_failed_fell_back_to_cache: {read.error}")
+    return (False, read.error)

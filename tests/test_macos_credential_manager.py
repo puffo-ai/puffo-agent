@@ -192,21 +192,50 @@ def test_bootstrap_writes_cache(monkeypatch, tmp_path):
     assert cache.read() == _BLOB
 
 
-def test_bootstrap_skips_when_cache_warm(monkeypatch, tmp_path):
+def test_bootstrap_overwrites_stale_cache_with_keychain(monkeypatch, tmp_path):
+    """Regression: daemon restart with a stale cache (e.g. the user
+    /login'd while the daemon was off) MUST pull the canonical blob
+    from Keychain on bootstrap, not blindly trust the cache. Otherwise
+    the daemon sync_to_agent fans out the stale RT, the spawned claude
+    workers immediately 401, and the user sees auth errors until the
+    401-wake recovers."""
+    _force_macos(monkeypatch)
+    cache = cm.CredentialCache.at(tmp_path)
+    cache.write(_BLOB)  # stale cache from a previous daemon session
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _FakeCompletedProcess(0, stdout=_REFRESHED_BLOB),
+    )
+    ok, reason = cm.bootstrap_from_keychain(cache)
+    assert ok is True
+    assert reason == "bootstrapped"
+    # Cache now reflects the canonical Keychain blob, not the stale one.
+    assert cache.read() == _REFRESHED_BLOB
+
+
+def test_bootstrap_falls_back_to_cache_when_keychain_read_fails(
+    monkeypatch, tmp_path,
+):
+    """Transient Keychain read failure shouldn't crash the daemon if
+    the cache has plausibly-current credentials — the 5-min external-
+    rotation poll will keep trying. Degraded-mode boot."""
     _force_macos(monkeypatch)
     cache = cm.CredentialCache.at(tmp_path)
     cache.write(_BLOB)
-
-    def _fake_run(*a, **k):
-        raise AssertionError("should not have run security")
-
-    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _FakeCompletedProcess(1, stderr="transient"),
+    )
     ok, reason = cm.bootstrap_from_keychain(cache)
     assert ok is True
-    assert reason == "cache_already_warm"
+    assert "fell_back_to_cache" in reason
+    # Cache untouched.
+    assert cache.read() == _BLOB
 
 
-def test_bootstrap_propagates_read_error(monkeypatch, tmp_path):
+def test_bootstrap_propagates_read_error_when_no_cache(monkeypatch, tmp_path):
+    """No cache + Keychain unreadable → daemon can't bootstrap. Fail
+    cleanly so the operator sees the cause."""
     _force_macos(monkeypatch)
     monkeypatch.setattr(
         subprocess, "run",
