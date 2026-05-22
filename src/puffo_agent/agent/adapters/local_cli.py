@@ -570,14 +570,27 @@ class LocalCLIAdapter(Adapter):
         })
 
     async def _ensure_hermes_mcp_registered_local(self) -> None:
-        """Register the puffo MCP server with hermes' per-agent
-        config. Mirrors the docker adapter's registration, just
-        spawns the binary directly (no ``docker exec``) and points
-        ``HERMES_HOME`` at the per-agent dir so the write lands in
-        the agent's config, not the operator's.
+        """Register the puffo MCP server in hermes' per-agent
+        ``config.yaml``.
 
-        Hermes prompts ``Enable all N tools? [Y/n/select]`` before
-        writing; we pipe ``y\\n`` to accept.
+        Writes directly to ``<HERMES_HOME>/config.yaml`` instead of
+        shelling to ``hermes mcp add``. Reason: ``hermes mcp add``'s
+        ``--args`` uses argparse ``nargs='*'``, which stops greedy
+        collection at the first ``-X``-shaped token — so a value
+        like ``-m`` (the python module flag) is parsed as a *new*
+        top-level option and the command rc=2's with "unrecognized
+        arguments: -m ...". Direct YAML write produces the exact
+        same schema hermes loads on startup and sidesteps the
+        argv-quoting issue.
+
+        Schema (per upstream ``hermes_cli/mcp_config.py``):
+
+            mcp_servers:
+              puffo:
+                command: <python>
+                args: [-m, puffo_agent.mcp.puffo_core_server]
+                env: {KEY: VAL, ...}
+                enabled: true
         """
         if self._hermes_mcp_registered:
             return
@@ -589,49 +602,55 @@ class LocalCLIAdapter(Adapter):
                 self.agent_id,
             )
             return
-        if self._hermes_bin is None or self._hermes_home is None:
+        if self._hermes_home is None:
             return
 
-        env = {
-            **os.environ,
-            "HERMES_HOME": str(self._hermes_home),
-        }
+        config_path = self._hermes_home / "config.yaml"
+        if not config_path.is_file():
+            logger.warning(
+                "agent %s: hermes config.yaml missing at %s — can't "
+                "register puffo MCP (chat will work, tool calls won't)",
+                self.agent_id, config_path,
+            )
+            return
+
         mcp_env = dict(self.puffo_core_mcp_env)
-        # Match the docker adapter's contract — MCP routes data
-        # reads through the daemon's data service over HTTP, not
-        # direct SQLite open.
         mcp_env["PUFFO_WORKSPACE"] = self.workspace_dir
         mcp_env["PUFFO_RUNTIME_KIND"] = "cli-local"
         mcp_env["PUFFO_HARNESS"] = "hermes"
-        env_flags = [f"{k}={v}" for k, v in mcp_env.items()]
 
-        # Remove stale registration first so the add below is clean.
-        await hermes_run_cmd(
-            [self._hermes_bin, "mcp", "remove", "puffo"],
-            env=env, check=False,
-        )
-        rc, stdout, stderr = await hermes_run_cmd(
-            [
-                self._hermes_bin, "mcp", "add", "puffo",
-                "--command", default_python_executable(),
-                "--args", "-m", "puffo_agent.mcp.puffo_core_server",
-                "--env", *env_flags,
-            ],
-            env=env, check=False, stdin=b"y\n",
-        )
-        if rc != 0:
+        import yaml
+        try:
+            with config_path.open("r", encoding="utf-8") as fh:
+                config = yaml.safe_load(fh) or {}
+        except (OSError, yaml.YAMLError) as exc:
             logger.warning(
-                "agent %s: hermes mcp add puffo rc=%d | stdout: %s | "
-                "stderr: %s (chat will work, tool calls won't)",
-                self.agent_id, rc,
-                stdout.decode("utf-8", errors="replace").strip()[-400:],
-                stderr.decode("utf-8", errors="replace").strip()[-400:],
+                "agent %s: couldn't read hermes config.yaml at %s: %s "
+                "(chat will work, tool calls won't)",
+                self.agent_id, config_path, exc,
+            )
+            return
+
+        servers = config.setdefault("mcp_servers", {})
+        servers["puffo"] = {
+            "command": default_python_executable(),
+            "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
+            "env": mcp_env,
+            "enabled": True,
+        }
+        try:
+            with config_path.open("w", encoding="utf-8") as fh:
+                yaml.safe_dump(config, fh, sort_keys=False)
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't write hermes config.yaml at %s: %s "
+                "(chat will work, tool calls won't)",
+                self.agent_id, config_path, exc,
             )
             return
         logger.info(
-            "agent %s: registered puffo MCP server with hermes "
-            "(per-agent HERMES_HOME=%s)",
-            self.agent_id, self._hermes_home,
+            "agent %s: registered puffo MCP server in %s",
+            self.agent_id, config_path,
         )
         self._hermes_mcp_registered = True
 
