@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -39,10 +40,17 @@ from ...portal.state import (
     sync_host_plugins,
     sync_host_skills,
 )
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin
+from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
+from .hermes_helpers import (
+    HERMES_NO_RESUME_SIGNATURE,
+    hermes_model_id,
+    parse_hermes_reply,
+    run_cmd as hermes_run_cmd,
+    stitch_hermes_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +98,19 @@ def _is_puffo_agent_hook_entry(entry: object) -> bool:
     )
 
 
+def _host_hermes_home() -> Path:
+    """``$HERMES_HOME`` → ``%LOCALAPPDATA%\\hermes`` on Windows →
+    ``~/.hermes`` elsewhere. Mirrors upstream ``get_hermes_home``."""
+    env = os.environ.get("HERMES_HOME", "").strip()
+    if env:
+        return Path(env).expanduser()
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            return Path(local_appdata) / "hermes"
+    return Path.home() / ".hermes"
+
+
 def _sanitise_permission_mode(mode: str, agent_id: str) -> str:
     """Validate ``mode`` against the supported set; unsupported
     values fall back to ``bypassPermissions`` with a WARNING so a
@@ -135,11 +156,10 @@ class LocalCLIAdapter(Adapter):
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
-        # cli-local supports claude-code (default) and codex (alpha).
-        # hermes / gemini-cli remain cli-docker-only — replicating
-        # their containerised setup on the operator's own host needs
-        # its own design pass.
-        if harness.name() in ("hermes", "gemini-cli"):
+        # cli-local supports claude-code (default), codex (alpha),
+        # and hermes (alpha — one-shot CLI per turn, no long-lived
+        # session). gemini-cli remains cli-docker-only.
+        if harness.name() == "gemini-cli":
             raise RuntimeError(
                 f"agent {agent_id!r}: runtime.harness={harness.name()!r} is "
                 "not supported with runtime.kind=cli-local yet. Use "
@@ -150,10 +170,16 @@ class LocalCLIAdapter(Adapter):
         self.puffo_core_mcp_env: dict[str, str] | None = None
         self._verified = False
         # claude-code path uses ClaudeSession (long-lived stream-json);
-        # codex path uses CodexSession (long-lived JSON-RPC). Only one
-        # is non-None at a time — selected by ``harness.name()``.
+        # codex path uses CodexSession (long-lived JSON-RPC). hermes
+        # has no long-lived session — every turn is a fresh
+        # ``hermes chat`` subprocess, continuity comes from hermes'
+        # own state.db indexed by per-agent HERMES_HOME + sentinel.
         self._session: ClaudeSession | None = None
         self._codex_session: CodexSession | None = None
+        self._hermes_bin: str | None = None
+        self._hermes_home: Path | None = None
+        self._hermes_mcp_registered = False
+        self._hermes_audit: AuditLog | None = None
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         self._verify()
@@ -161,6 +187,8 @@ class LocalCLIAdapter(Adapter):
         if self.harness.name() == "codex":
             session = self._ensure_codex_session()
             return await session.run_turn(user_message, ctx.system_prompt)
+        if self.harness.name() == "hermes":
+            return await self._run_hermes_turn(user_message, ctx.system_prompt)
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
@@ -178,6 +206,12 @@ class LocalCLIAdapter(Adapter):
             # a fresh turn would.
             session = self._ensure_codex_session()
             return await session.run_turn(
+                fallback_user_message, ctx.system_prompt,
+            )
+        if self.harness.name() == "hermes":
+            # hermes always runs one-shot — the retry is just a
+            # normal turn against the fallback payload.
+            return await self._run_hermes_turn(
                 fallback_user_message, ctx.system_prompt,
             )
         session = self._ensure_session()
@@ -200,6 +234,12 @@ class LocalCLIAdapter(Adapter):
                 )
                 return
             await session.warm(system_prompt)
+            return
+        if self.harness.name() == "hermes":
+            # hermes is one-shot per turn; no subprocess to keep
+            # warm. ``_verify`` already validated the binary +
+            # seeded HERMES_HOME, so there's nothing left to do
+            # until the first message arrives.
             return
         session = self._ensure_session()
         if not session.has_persisted_session():
@@ -312,6 +352,325 @@ class LocalCLIAdapter(Adapter):
             model=self.model,
         )
         return self._codex_session
+
+    # ── hermes (cli-local) ────────────────────────────────────────────
+    # hermes is one-shot per turn: every turn spawns
+    # ``hermes chat --quiet -q <prompt>``. No long-lived session
+    # process to keep warm. State lives in the per-agent
+    # ``HERMES_HOME=<agent_home_dir>/.hermes`` directory which we
+    # seed from the operator's ``~/.hermes`` on first verify so the
+    # agent inherits the operator's provider keys + ``hermes setup``
+    # choices without sharing the operator's chat history.
+
+    def _verify_hermes(self) -> None:
+        """Resolve hermes binary + seed per-agent HERMES_HOME from
+        the host's template + pin model/provider from agent.yml."""
+        bin_path = resolve_hermes_bin()
+        if bin_path is None:
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: hermes binary not found. "
+                "Tried $PUFFO_HERMES_BIN, $PATH, and known installer "
+                "paths. Install: POSIX ``curl -fsSL https://"
+                "raw.githubusercontent.com/NousResearch/hermes-agent/"
+                "main/scripts/install.sh | bash``, or Windows ``iex "
+                "(irm https://raw.githubusercontent.com/NousResearch/"
+                "hermes-agent/main/scripts/install.ps1)``. Restart the "
+                "daemon shell, or set ``PUFFO_HERMES_BIN``."
+            )
+        self._hermes_bin = bin_path
+
+        host_hermes_home = _host_hermes_home()
+        host_config = host_hermes_home / "config.yaml"
+        if not host_config.is_file():
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: ``{host_config}`` missing — "
+                "hermes installer should have created it. Re-run the "
+                "install one-liner from the README."
+            )
+
+        self._hermes_home = self.agent_home_dir / ".hermes"
+        self._seed_hermes_home(host_hermes_home, self._hermes_home)
+        self._pin_hermes_model(self._hermes_home / "config.yaml")
+        self._hermes_audit = AuditLog(
+            Path(self.workspace_dir) / ".puffo-agent" / "audit.log",
+            self.agent_id,
+        )
+        self._log_host_runtime_banner()
+
+    def _seed_hermes_home(self, host_dir: Path, agent_dir: Path) -> None:
+        """Idempotent copy of ``config.yaml`` + ``.env`` from the
+        host's HERMES_HOME. ``state.db`` is deliberately not copied
+        so each agent gets fresh session/memory state."""
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        for filename in ("config.yaml", ".env"):
+            src = host_dir / filename
+            dst = agent_dir / filename
+            if dst.exists() or not src.is_file():
+                continue
+            try:
+                dst.write_bytes(src.read_bytes())
+                logger.info(
+                    "agent %s: seeded per-agent HERMES_HOME with %s",
+                    self.agent_id, filename,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't seed %s: %s",
+                    self.agent_id, src, exc,
+                )
+
+    def _pin_hermes_model(self, config_path: Path) -> None:
+        """Rewrite ``model.default`` + ``model.provider`` from
+        agent.yml's runtime config every verify. Lets puffo-agent
+        own the model/provider choice without operators needing to
+        run ``hermes setup``."""
+        provider, default = self._hermes_provider_and_model()
+        import yaml
+        try:
+            with config_path.open("r", encoding="utf-8") as fh:
+                config = yaml.safe_load(fh) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "agent %s: couldn't read %s to pin model: %s",
+                self.agent_id, config_path, exc,
+            )
+            return
+        model = config.setdefault("model", {})
+        if model.get("default") == default and model.get("provider") == provider:
+            return
+        model["default"] = default
+        model["provider"] = provider
+        try:
+            with config_path.open("w", encoding="utf-8") as fh:
+                yaml.safe_dump(config, fh, sort_keys=False)
+            logger.info(
+                "agent %s: pinned hermes model to %s/%s",
+                self.agent_id, provider, default,
+            )
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't write %s: %s",
+                self.agent_id, config_path, exc,
+            )
+
+    def _hermes_provider_and_model(self) -> tuple[str, str]:
+        """Split ``hermes_model_id(self.model)`` into (provider, model)
+        — the shape hermes' ``config.yaml`` expects."""
+        spec = hermes_model_id(self.model)
+        if "/" in spec:
+            provider, _, default = spec.partition("/")
+            return provider, default
+        return "anthropic", spec
+
+    async def _run_hermes_turn(
+        self,
+        user_message: str,
+        system_prompt: str,
+        *,
+        _retried: bool = False,
+    ) -> TurnResult:
+        """One-shot ``hermes chat -q`` per turn. Continuity rides on
+        the per-agent ``HERMES_HOME``'s state.db + sentinel."""
+        if self._hermes_bin is None or self._hermes_home is None:
+            return TurnResult(reply="", metadata={
+                "error": "hermes not verified before run_turn",
+            })
+        await self._ensure_hermes_mcp_registered_local()
+
+        if self._hermes_audit is not None and not _retried:
+            self._hermes_audit.write("turn.input", content=user_message)
+
+        has_prior_session = self.session_file.exists()
+        prompt = user_message if has_prior_session else stitch_hermes_prompt(
+            system_prompt, user_message,
+        )
+        env = {
+            **os.environ,
+            "HERMES_HOME": str(self._hermes_home),
+        }
+        cmd = [
+            self._hermes_bin, "chat",
+            "--quiet",
+            "--source", f"puffoagent:{self.agent_id}",
+            "--model", hermes_model_id(self.model),
+        ]
+        if has_prior_session:
+            cmd.append("--continue")
+        cmd.extend(["-q", prompt])
+
+        started = time.time()
+        rc, stdout, stderr = await hermes_run_cmd(
+            cmd, env=env, cwd=self.workspace_dir, check=False,
+        )
+        elapsed = time.time() - started
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+
+        # Stale sentinel — clear + retry once without --continue.
+        if (
+            rc != 0
+            and HERMES_NO_RESUME_SIGNATURE in stdout_text
+            and not _retried
+        ):
+            logger.info(
+                "agent %s: hermes rejected --continue; clearing sentinel + retry",
+                self.agent_id,
+            )
+            try:
+                self.session_file.unlink()
+            except OSError:
+                pass
+            return await self._run_hermes_turn(
+                user_message, system_prompt, _retried=True,
+            )
+
+        if rc != 0:
+            logger.error(
+                "agent %s: hermes turn rc=%d in %.1fs | stdout: %r | stderr: %s",
+                self.agent_id, rc, elapsed,
+                stdout_text.strip()[:400],
+                stderr_text.strip()[-400:] or "(empty)",
+            )
+            if self._hermes_audit is not None:
+                self._hermes_audit.write(
+                    "turn.error", rc=rc,
+                    stdout_snippet=stdout_text[:400],
+                    stderr_tail=stderr_text[-400:],
+                )
+            return TurnResult(reply="", metadata={
+                "error": f"hermes exited rc={rc}",
+                "stdout_snippet": stdout_text[:400],
+                "stderr_tail": stderr_text[-400:],
+            })
+
+        reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
+        if tool_calls:
+            logger.info(
+                "agent %s: hermes turn invoked %d tool(s): %s",
+                self.agent_id, len(tool_calls), ", ".join(tool_calls),
+            )
+        if not reply:
+            logger.warning(
+                "agent %s: hermes rc=0 but parser found no reply. "
+                "stdout: %r", self.agent_id, stdout_text[:400],
+            )
+        if self._hermes_audit is not None:
+            for name in tool_calls:
+                self._hermes_audit.write("tool", name=name)
+            if reply:
+                self._hermes_audit.write("assistant.text", text=reply)
+            self._hermes_audit.write(
+                "turn.result",
+                session_id=session_id, elapsed_seconds=round(elapsed, 2),
+                tool_count=len(tool_calls),
+                stdout_raw=stdout_text[:2000],
+            )
+
+        # Sentinel for ``--continue`` on subsequent turns.
+        if not has_prior_session:
+            try:
+                self.session_file.parent.mkdir(parents=True, exist_ok=True)
+                self.session_file.write_text(
+                    json.dumps({
+                        "harness": "hermes",
+                        "session_id": session_id,
+                        "first_turn_at": int(time.time()),
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't write hermes session_file: %s",
+                    self.agent_id, exc,
+                )
+
+        # Hermes turns are always silent — ``--quiet`` stdout doesn't
+        # surface MCP calls, so we can't tell whether send_message
+        # fired. Skip the fallback regardless; reply text kept in
+        # metadata for debug.
+        return TurnResult(
+            reply="",
+            tool_calls=len(tool_calls),
+            metadata={
+                "harness": "hermes",
+                "session_id": session_id,
+                "elapsed_seconds": round(elapsed, 2),
+                "tools_invoked": tool_calls,
+                "send_message_targets": [{"channel": "", "root_id": ""}],
+                "hermes_assistant_text": reply,
+            },
+        )
+
+    async def _ensure_hermes_mcp_registered_local(self) -> None:
+        """Register the puffo MCP server in hermes' per-agent
+        ``config.yaml``.
+
+        Direct YAML write — ``hermes mcp add`` is unusable because
+        its argparse ``--args nargs='*'`` chokes on ``-m`` (parses
+        it as the top-level ``-m MODEL`` flag).
+        """
+        if self._hermes_mcp_registered:
+            return
+        if self.puffo_core_mcp_env is None:
+            logger.warning(
+                "agent %s: hermes MCP registration skipped — puffo_core "
+                "is not configured", self.agent_id,
+            )
+            return
+        if self._hermes_home is None:
+            return
+
+        config_path = self._hermes_home / "config.yaml"
+        if not config_path.is_file():
+            logger.warning(
+                "agent %s: hermes config.yaml missing at %s",
+                self.agent_id, config_path,
+            )
+            return
+
+        mcp_env = dict(self.puffo_core_mcp_env)
+        mcp_env["PUFFO_WORKSPACE"] = self.workspace_dir
+        mcp_env["PUFFO_RUNTIME_KIND"] = "cli-local"
+        mcp_env["PUFFO_HARNESS"] = "hermes"
+
+        import yaml
+        try:
+            with config_path.open("r", encoding="utf-8") as fh:
+                config = yaml.safe_load(fh) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "agent %s: couldn't read %s: %s",
+                self.agent_id, config_path, exc,
+            )
+            return
+
+        servers = config.setdefault("mcp_servers", {})
+        # No ``tools:`` field — hermes' interactive add saves
+        # ``tools: {include: [...]}`` only when the operator filters.
+        # Omitting it leaves all discovered tools enabled. A bare-list
+        # ``tools:`` is interpreted as a filter and silently drops
+        # everything.
+        servers["puffo"] = {
+            "command": default_python_executable(),
+            "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
+            "env": mcp_env,
+            "enabled": True,
+        }
+        try:
+            with config_path.open("w", encoding="utf-8") as fh:
+                yaml.safe_dump(config, fh, sort_keys=False)
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't write hermes config.yaml at %s: %s "
+                "(chat will work, tool calls won't)",
+                self.agent_id, config_path, exc,
+            )
+            return
+        logger.info(
+            "agent %s: registered puffo MCP server in %s",
+            self.agent_id, config_path,
+        )
+        self._hermes_mcp_registered = True
 
     def _ensure_session(self) -> ClaudeSession:
         if self._session is not None:
@@ -523,6 +882,10 @@ class LocalCLIAdapter(Adapter):
             # We deliberately skip the claude-seed / link-credentials
             # bookkeeping below — none of it applies to codex, and
             # touching ~/.claude/* for a codex agent would be confusing.
+            self._verified = True
+            return
+        if self.harness.name() == "hermes":
+            self._verify_hermes()
             self._verified = True
             return
         if resolve_claude_bin() is None:

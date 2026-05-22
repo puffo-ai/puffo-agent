@@ -83,3 +83,50 @@ def test_bundle_paths_per_platform(platform_value, want_first, monkeypatch):
         assert paths[0].as_posix() == want_first
     else:
         assert want_first in str(paths[0]).lower()
+
+
+def test_hermes_env_override_wins(tmp_path, monkeypatch):
+    """``$PUFFO_HERMES_BIN`` beats PATH + bundle paths."""
+    fake = _make_exe(tmp_path, "fake_hermes")
+    monkeypatch.setenv("PUFFO_HERMES_BIN", str(fake))
+    monkeypatch.setattr("shutil.which", lambda _name: "/some/other/hermes")
+    assert cli_bin.resolve_hermes_bin() == str(fake)
+
+
+def test_hermes_path_used_when_env_unset(monkeypatch):
+    monkeypatch.delenv("PUFFO_HERMES_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda _name: "/usr/local/bin/hermes")
+    assert cli_bin.resolve_hermes_bin() == "/usr/local/bin/hermes"
+
+
+def test_hermes_returns_none_on_full_miss(monkeypatch):
+    monkeypatch.delenv("PUFFO_HERMES_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(cli_bin, "_hermes_bundle_paths", lambda: [])
+    assert cli_bin.resolve_hermes_bin() is None
+
+
+def test_hermes_resolver_uses_its_own_env(tmp_path, monkeypatch):
+    """``resolve_hermes_bin`` reads ``PUFFO_HERMES_BIN`` only — make
+    sure namespace doesn't leak from the codex / claude env vars.
+    """
+    fake_hermes = _make_exe(tmp_path, "fake_hermes")
+    monkeypatch.setenv("PUFFO_HERMES_BIN", str(fake_hermes))
+    monkeypatch.setenv("PUFFO_CODEX_BIN", "/should/not/leak")
+    monkeypatch.setenv("PUFFO_CLAUDE_BIN", "/should/not/leak")
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr(cli_bin, "_hermes_bundle_paths", lambda: [])
+    assert cli_bin.resolve_hermes_bin() == str(fake_hermes)
+
+
+@pytest.mark.parametrize("platform_value,want_substr", [
+    ("darwin", ".local/bin/hermes"),
+    ("linux", ".local/bin/hermes"),
+    ("win32", "hermes"),
+])
+def test_hermes_bundle_paths_per_platform(platform_value, want_substr, monkeypatch):
+    monkeypatch.setattr(cli_bin.sys, "platform", platform_value)
+    paths = cli_bin._hermes_bundle_paths()
+    assert paths, f"no candidates for platform {platform_value!r}"
+    first = paths[0].as_posix() if platform_value != "win32" else str(paths[0])
+    assert want_substr in first

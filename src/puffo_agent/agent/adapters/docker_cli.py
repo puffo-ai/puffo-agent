@@ -32,13 +32,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import shutil
 import time
 from pathlib import Path
 
 from ...mcp.config import (
     write_cli_mcp_config,
+)
+from .hermes_helpers import (
+    HERMES_NO_RESUME_SIGNATURE,
+    hermes_model_id,
+    parse_hermes_reply,
+    stitch_hermes_prompt,
 )
 from ...portal.state import (
     seed_claude_home,
@@ -357,7 +362,7 @@ class DockerCLIAdapter(Adapter):
         await self._ensure_hermes_mcp_registered()
 
         has_prior_session = self.session_file.exists()
-        prompt = user_message if has_prior_session else _stitch_hermes_prompt(
+        prompt = user_message if has_prior_session else stitch_hermes_prompt(
             system_prompt, user_message,
         )
         cmd = [
@@ -371,7 +376,7 @@ class DockerCLIAdapter(Adapter):
             "--provider", "anthropic",
             "--quiet",
             "--source", f"puffoagent:{self.agent_id}",
-            "--model", _hermes_model_id(self.model),
+            "--model", hermes_model_id(self.model),
         ]
         if has_prior_session:
             cmd.append("--continue")
@@ -387,7 +392,7 @@ class DockerCLIAdapter(Adapter):
         # Clear + retry once without --continue.
         if (
             rc != 0
-            and _HERMES_NO_RESUME_SIGNATURE in stdout_text
+            and HERMES_NO_RESUME_SIGNATURE in stdout_text
             and not _retried
         ):
             logger.info(
@@ -415,7 +420,12 @@ class DockerCLIAdapter(Adapter):
                 "stderr_tail": stderr_text[-400:],
             })
 
-        reply, session_id = _parse_hermes_reply(stdout_text)
+        reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
+        if tool_calls:
+            logger.info(
+                "agent %s: hermes turn invoked %d tool(s): %s",
+                self.agent_id, len(tool_calls), ", ".join(tool_calls),
+            )
         if not reply:
             logger.warning(
                 "agent %s: hermes rc=0 but parser found no reply. "
@@ -448,10 +458,18 @@ class DockerCLIAdapter(Adapter):
             self.agent_id, elapsed, len(reply), session_id or "?",
             has_prior_session,
         )
-        return TurnResult(reply=reply, metadata={
-            "harness": "hermes",
-            "session_id": session_id,
-        })
+        # Always silent — see ``_run_hermes_turn`` in local_cli.py.
+        return TurnResult(
+            reply="",
+            tool_calls=len(tool_calls),
+            metadata={
+                "harness": "hermes",
+                "session_id": session_id,
+                "tools_invoked": tool_calls,
+                "send_message_targets": [{"channel": "", "root_id": ""}],
+                "hermes_assistant_text": reply,
+            },
+        )
 
     # ── Gemini harness ────────────────────────────────────────────
 
@@ -1066,30 +1084,9 @@ async def _image_exists_locally(tag: str) -> bool:
     return rc == 0
 
 
-# Exact stdout line hermes emits when ``--continue`` is passed but
-# its session store has nothing to resume.
-_HERMES_NO_RESUME_SIGNATURE = "No previous CLI session found to continue"
-
-# Banner / metadata lines from ``hermes --quiet``. Skip-matching
-# these isolates the actual response text. Session id arrives on
-# either the "Resumed session" line (with ``--continue``) or a
-# standalone ``session_id:`` line; sometimes absent on fresh
-# sessions (we tolerate that).
-_HERMES_SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)\s*$")
-_HERMES_RESUMED_SESSION_RE = re.compile(
-    r"^↻\s*Resumed session\s+(\S+).*$"
-)
-_HERMES_MODEL_NORMALISED_RE = re.compile(
-    r"^⚠️\s+Normalized model .*$"
-)
-# Continuation line of the "Normalized model" banner. Match a bare
-# provider name followed by a period so we don't eat reply text
-# that happens to start with one.
-_HERMES_MODEL_NORMALISED_TAIL_RE = re.compile(r"^[a-z0-9\-]+\.$")
-
-
 # Host-side Claude Code credentials path. Read on every hermes turn
-# because hermes' own auto-discovery is unreliable.
+# because hermes' own auto-discovery is unreliable inside the
+# container even with the credentials file bind-mounted in.
 _HOST_CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 
 
@@ -1106,51 +1103,6 @@ def _read_claude_access_token() -> str:
     except (OSError, ValueError):
         return ""
     return ((data.get("claudeAiOauth") or {}).get("accessToken") or "").strip()
-
-
-def _hermes_model_id(model: str) -> str:
-    """Translate ``runtime.model`` into ``<provider>/<model>`` form.
-    Strips Claude-Code suffixes hermes rejects (e.g. ``[1m]``);
-    prepends ``anthropic/`` if absent; empty → default.
-    """
-    base = (model or "").split("[", 1)[0].strip()
-    if not base:
-        return "anthropic/claude-opus-4-6"
-    return base if "/" in base else f"anthropic/{base}"
-
-
-def _stitch_hermes_prompt(system_prompt: str, user_message: str) -> str:
-    """First-turn system-prompt inlining for hermes (which has no
-    ``--system`` flag). Subsequent turns rely on ``--continue`` and
-    skip this entirely."""
-    if not system_prompt:
-        return user_message
-    return f"{system_prompt}\n\n---\n\n{user_message}"
-
-
-def _parse_hermes_reply(stdout_text: str) -> tuple[str, str]:
-    """Pull (reply, session_id) out of ``hermes chat --quiet`` stdout.
-    Filter known banner / metadata lines and capture session_id from
-    whichever marker emits it (may be absent on fresh sessions).
-    """
-    session_id = ""
-    content: list[str] = []
-    for line in stdout_text.splitlines():
-        m = _HERMES_SESSION_ID_RE.match(line)
-        if m:
-            session_id = m.group(1)
-            continue
-        m = _HERMES_RESUMED_SESSION_RE.match(line)
-        if m:
-            session_id = session_id or m.group(1)
-            continue
-        if _HERMES_MODEL_NORMALISED_RE.match(line):
-            continue
-        if _HERMES_MODEL_NORMALISED_TAIL_RE.match(line):
-            continue
-        content.append(line)
-    reply = "\n".join(content).strip()
-    return reply, session_id
 
 
 def _puffo_gemini_mcp_entry(

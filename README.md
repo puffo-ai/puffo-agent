@@ -243,7 +243,7 @@ A few constraints worth knowing:
 
 - **`chat-local`** — direct LLM call from inside the daemon (anthropic / openai / google). Default.
 - **`sdk-local`** — Claude Agent SDK in-process (anthropic only). `pip install puffo-agent[sdk]` first.
-- **`cli-local`** — spawns a CLI agent harness as a subprocess on the host. Defaults to Claude Code (`claude login` once); with `runtime.harness=codex` instead spawns OpenAI's `codex app-server` (`codex login` once, ChatGPT-account OAuth — no API key path). Gives the agent shell + skills access on the host.
+- **`cli-local`** — spawns a CLI agent harness as a subprocess on the host. Defaults to Claude Code (`claude login` once); with `runtime.harness=codex` instead spawns OpenAI's `codex app-server` (`codex login` once, ChatGPT-account OAuth — no API key path). `runtime.harness=hermes` is supported in alpha — one-shot `hermes chat -q` per turn (no long-lived session), continuity comes from the per-agent `HERMES_HOME` seeded from your `~/.hermes/`. **Prereqs for hermes**: install the Hermes Agent CLI (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \| bash`, then `source ~/.bashrc`), and run `hermes setup` once on the host so `~/.hermes/config.yaml` exists with a provider configured. Override the binary path with `PUFFO_HERMES_BIN=/abs/path/to/hermes` if it's not on the daemon's `$PATH`. Gives the agent shell + skills access on the host.
 - **`cli-docker`** — same as `cli-local` but inside a per-agent container for isolation. Requires Docker. Supports `claude-code`, `hermes`, and `gemini-cli` harnesses; codex inside Docker is not yet supported (use `cli-local` for codex).
 
 Switch runtime kind / model / harness:
