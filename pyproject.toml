@@ -37,6 +37,11 @@ dependencies = [
     "aiosqlite>=0.20",
     "anthropic>=0.25",
     "cryptography>=43.0",
+    # PUF-239: standard 5-field crontab parser for the per-agent
+    # cron scheduler. Used by ``portal/cron_scheduler.py`` +
+    # ``portal/cron_state.validate_schedule`` to compute the next
+    # fire time + reject bad expressions at registration.
+    "croniter>=3.0",
     "mcp>=1.0",
     # Pillow: dimension-check + downscale inbound image attachments so
     # an oversized image can't poison the agent's claude session.

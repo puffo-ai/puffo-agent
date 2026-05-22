@@ -1011,6 +1011,47 @@ async def get_log(request: web.Request) -> web.Response:
 
 
 # ────────────────────────────────────────────────────────────────────
+# /v1/agents/{id}/crons — PUF-239 operator visibility surface
+# ────────────────────────────────────────────────────────────────────
+
+
+async def list_crons(request: web.Request) -> web.Response:
+    """Return the agent's registered cron schedules.
+
+    Same paired-identity middleware as every other ``/v1/agents/{id}/*``
+    route — non-paired callers get 401 before reaching this handler.
+    """
+    agent_id = request.match_info["id"]
+    if not agent_yml_path(agent_id).exists():
+        return _not_found("agent not found")
+    from ..cron_state import load_crons
+    crons = load_crons(agent_id)
+    return web.json_response({
+        "agent_id": agent_id,
+        "crons": [c.to_dict() for c in crons],
+    })
+
+
+async def disable_cron_endpoint(request: web.Request) -> web.Response:
+    """Flip ``enabled = False`` on the matching cron row. 404 when
+    no row matches the supplied ``cron_id`` so a re-DELETE after the
+    first one stays surfaced rather than silently succeeding — gives
+    the operator a clear audit signal."""
+    agent_id = request.match_info["id"]
+    cron_id = request.match_info["cron_id"]
+    if not agent_yml_path(agent_id).exists():
+        return _not_found("agent not found")
+    from ..cron_state import disable_cron as state_disable_cron
+    updated = state_disable_cron(agent_id, cron_id)
+    if updated is None:
+        return _not_found(f"no cron {cron_id} on agent {agent_id}")
+    return web.json_response({
+        "agent_id": agent_id,
+        "cron": updated.to_dict(),
+    })
+
+
+# ────────────────────────────────────────────────────────────────────
 # /v1/agents/{id}/files + /files/raw
 # ────────────────────────────────────────────────────────────────────
 

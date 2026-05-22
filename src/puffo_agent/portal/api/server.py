@@ -49,6 +49,11 @@ def build_app(cfg: BridgeConfig) -> web.Application:
     app.router.add_post("/v1/agents/{id}/resume", h.resume_agent)
     app.router.add_post("/v1/agents/{id}/archive", h.archive_agent)
     app.router.add_get("/v1/agents/{id}/log", h.get_log)
+    # PUF-239: per-agent cron scheduler — list + disable. POST
+    # (operator-side registration) is deferred per the intake; agents
+    # are the sole registration path via the MCP ``set_cron`` tool.
+    app.router.add_get("/v1/agents/{id}/crons", h.list_crons)
+    app.router.add_delete("/v1/agents/{id}/crons/{cron_id}", h.disable_cron_endpoint)
     app.router.add_get("/v1/agents/{id}/files", h.list_files)
     app.router.add_get("/v1/agents/{id}/files/raw", h.read_file)
     app.router.add_get("/v1/agents/{id}/claude-md", h.get_claude_md)

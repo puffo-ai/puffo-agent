@@ -196,6 +196,7 @@ def build_server(
         data_client=data,
         space_id=space_id,
         workspace=workspace,
+        agent_id=agent_id,
     )
 
     mcp = FastMCP("puffo-core")

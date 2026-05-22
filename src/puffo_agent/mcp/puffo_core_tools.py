@@ -81,6 +81,13 @@ class PuffoCoreToolsConfig:
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,
     # no absolutes).
     workspace: Optional[str] = None
+    # PUF-239: agent_id (daemon-local id, distinct from ``slug``).
+    # Used by ``set_cron`` / ``list_crons`` / ``disable_cron`` to
+    # locate the agent's ``~/.puffo-agent/agents/<id>/.crons.json``
+    # sidecar. Optional only so existing call sites that don't
+    # construct the config from the MCP server entry can degrade
+    # gracefully (the cron tools refuse to register when missing).
+    agent_id: Optional[str] = None
 
 
 async def _fetch_device_keys(
@@ -1045,3 +1052,105 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         Note: blob query API integration is pending.
         """
         return "(fetch_channel_files: blob query API not yet implemented)"
+
+    # ── PUF-239: per-agent cron scheduler ─────────────────────────────
+    #
+    # Three MCP tools — ``set_cron`` / ``list_crons`` / ``disable_cron``
+    # — that read + write the sidecar at
+    # ``~/.puffo-agent/agents/<agent_id>/.crons.json``. The daemon-
+    # side ``CronScheduler`` reads the same sidecar on its tick and
+    # fires the prompts via the worker's normal turn loop. Mutation
+    # via these tools is the only registration path (operator
+    # endpoints are list/disable-only in v1).
+    #
+    # The tools refuse to register when ``cfg.agent_id`` isn't set —
+    # legacy MCP servers constructed without ``agent_id`` (the local
+    # test harness, mostly) shouldn't crash on import; they just
+    # don't expose the cron surface.
+
+    if cfg.agent_id:
+        from ..portal.cron_state import (
+            CronSchedule,
+            disable_cron as _state_disable_cron,
+            load_crons,
+            new_cron_id,
+            now_ms,
+            upsert_cron,
+            validate_schedule,
+        )
+
+        _agent_id_const = cfg.agent_id
+
+        @mcp.tool()
+        async def set_cron(schedule: str, prompt: str) -> str:
+            """Register a recurring task for yourself.
+
+            ``schedule`` is a standard 5-field crontab expression
+            (``m h dom mon dow``) interpreted in UTC; e.g.
+            ``"0 9 * * *"`` for 09:00 UTC every day. ``prompt`` is
+            the synthetic message the daemon will hand back to you
+            when the schedule fires — you'll receive it as a
+            ``[scheduled task — cron <id>] ...`` system message and
+            decide how to respond.
+
+            Returns the assigned ``cron_id`` on success; an error
+            string starting with ``"error:"`` when the cron syntax
+            doesn't parse or the prompt is empty.
+            """
+            if not isinstance(prompt, str) or not prompt.strip():
+                return "error: prompt must be a non-empty string"
+            ok, reason = validate_schedule(schedule)
+            if not ok:
+                return f"error: {reason}"
+            cron = CronSchedule(
+                id=new_cron_id(),
+                schedule=schedule.strip(),
+                prompt=prompt.strip(),
+                enabled=True,
+                created_at=now_ms(),
+                last_fire=None,
+                fire_count=0,
+            )
+            saved = upsert_cron(_agent_id_const, cron)
+            return (
+                f"registered cron {saved.id} — schedule={saved.schedule!r}"
+            )
+
+        @mcp.tool()
+        async def list_crons() -> str:
+            """List your registered cron schedules. Returns a
+            multi-line text block ordered by registration time;
+            each line carries the cron's id, schedule, enabled
+            flag, last-fire timestamp, and prompt preview."""
+            crons = load_crons(_agent_id_const)
+            if not crons:
+                return "(no crons registered)"
+            lines: list[str] = []
+            for c in crons:
+                last = (
+                    _ts_to_iso(c.last_fire) if c.last_fire is not None
+                    else "never"
+                )
+                # Truncate the prompt to keep the list readable;
+                # operators get the full prose via the GET endpoint.
+                preview = c.prompt if len(c.prompt) <= 80 else c.prompt[:77] + "..."
+                lines.append(
+                    f"{c.id}  schedule={c.schedule!r}  "
+                    f"enabled={c.enabled}  last_fire={last}  "
+                    f"fires={c.fire_count}  prompt={preview!r}"
+                )
+            return "\n".join(lines)
+
+        @mcp.tool()
+        async def disable_cron(cron_id: str) -> str:
+            """Disable a previously-registered cron by id. The row
+            stays in ``.crons.json`` (for audit) but ``enabled``
+            flips to false; the scheduler skips it on subsequent
+            ticks. Re-enable via a fresh ``set_cron`` with the same
+            schedule + prompt."""
+            if not isinstance(cron_id, str) or not cron_id.strip():
+                return "error: cron_id must be a non-empty string"
+            updated = _state_disable_cron(_agent_id_const, cron_id.strip())
+            if updated is None:
+                return f"error: no cron found with id {cron_id}"
+            return f"disabled cron {updated.id}"
