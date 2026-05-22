@@ -10,8 +10,10 @@ are allowed.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -993,21 +995,213 @@ async def archive_agent(request: web.Request) -> web.Response:
 # ────────────────────────────────────────────────────────────────────
 
 
+# Default number of trailing lines returned when no ``tail`` query
+# param is supplied. The web UI's Logs tab caps total displayed text
+# at ~1000 chars (no scroll history), so 30 lines at ~80 chars each
+# is the right initial-paint budget. Operators investigating an
+# incident can still request up to ``_LOG_MAX_TAIL`` explicitly.
+_LOG_DEFAULT_TAIL = 30
+# Hard cap on ``tail`` — protects against accidental huge fetches
+# from a chatty agent. 2000 lines * ~300 bytes / line ≈ 600 KB.
+_LOG_MAX_TAIL = 2000
+# Cap on bytes returned in delta mode. Prevents a busy agent + slow
+# poller combination from delivering a multi-MB response in one
+# tick. When the delta exceeds this, we serve a partial window +
+# advance ``next_cursor`` to the partial offset so the client picks
+# up the rest on the next poll.
+_LOG_MAX_DELTA_BYTES = 256 * 1024
+# Reverse-seek chunk size — read this many bytes per pass off the
+# end of the file when building a tail response. Keeps memory
+# bounded for unbounded ``audit.log`` files until rotation lands
+# at the writer side.
+_LOG_TAIL_CHUNK_BYTES = 64 * 1024
+# Marker event used when a line in audit.log can't be parsed as
+# JSON. Surfaces the raw text so the operator can still see what
+# the agent emitted instead of dropping the line silently.
+_LOG_MALFORMED_EVENT = "_raw"
+
+
+def _parse_log_line(raw: str) -> dict[str, Any]:
+    """Decode one NDJSON line from audit.log. Falls back to a
+    ``_raw`` event wrapper if the line isn't valid JSON so the
+    client can still display the bytes. Synthesizes ``ts`` at the
+    ingestion moment so future sort-by-ts in the UI doesn't bunch
+    every ``_raw`` event at top-of-list because of an empty
+    timestamp."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "event": _LOG_MALFORMED_EVENT,
+            "msg": raw[:1024],
+        }
+
+
+def _read_tail_bytes(path: Path, file_size: int, target_lines: int) -> bytes:
+    """Reverse-seek the last ``target_lines + 1`` newlines off the
+    end of ``path``. Reads in ``_LOG_TAIL_CHUNK_BYTES`` chunks until
+    enough newlines are visible (or BOF is reached) so memory stays
+    bounded on a multi-MB audit.log. Returns the suffix bytes
+    starting at the byte after the (target_lines+1)-th-from-last
+    newline — enough to capture ``target_lines`` full lines (the
+    +1 ensures we don't accidentally start mid-line)."""
+    if file_size == 0:
+        return b""
+    with path.open("rb") as f:
+        # ``newlines_needed`` is the number of ``\n`` markers that
+        # delimit ``target_lines`` full lines from the back of the
+        # file. We need one more newline than lines to land on the
+        # start of a line cleanly; absent that extra newline (file
+        # starts with a partial line at BOF) we just return from the
+        # earliest read offset.
+        newlines_needed = target_lines + 1
+        offset = file_size
+        buf = b""
+        while offset > 0:
+            chunk_size = min(_LOG_TAIL_CHUNK_BYTES, offset)
+            offset -= chunk_size
+            f.seek(offset)
+            buf = f.read(chunk_size) + buf
+            if buf.count(b"\n") >= newlines_needed:
+                break
+        # Slice off everything before the (newlines_needed)-th-from-
+        # last newline so the result starts at a clean line boundary.
+        # If we didn't accumulate that many newlines (whole file
+        # smaller than tail window), return what we have.
+        if buf.count(b"\n") >= newlines_needed:
+            # ``rfind`` newline_needed times from the end.
+            pos = len(buf)
+            for _ in range(newlines_needed):
+                pos = buf.rfind(b"\n", 0, pos)
+                if pos == -1:
+                    break
+            if pos != -1:
+                buf = buf[pos + 1:]
+        return buf
+
+
 async def get_log(request: web.Request) -> web.Response:
-    """Stub — per-agent log capture is not implemented yet. The
-    daemon currently writes a single combined stderr stream.
+    """Return the agent's per-agent audit.log entries.
+
+    Query params:
+      * ``tail`` (default 200, max 2000) — last N lines. Mutually
+        exclusive with ``since``; passing both is a 400.
+      * ``since`` (optional, int byte-offset) — return lines written
+        after this point for delta polling, capped at
+        ``_LOG_MAX_DELTA_BYTES`` per response (the cursor advances
+        partially so the client picks up the rest on the next poll).
+        When the file has shrunk below ``since`` (rotation / archive)
+        the cursor resets to 0.
+
+    Response: ``{agent_id, lines, next_cursor, note?, state?}``.
+    ``state`` is populated when ``lines`` is empty so the client
+    can distinguish "never wrote" vs "caught up via delta":
+    ``"never_written"`` (audit.log doesn't exist yet) or
+    ``"up_to_date"`` (delta returned nothing). ``note`` carries the
+    matching human-readable explanation.
     """
     agent_id = request.match_info["id"]
     if not agent_yml_path(agent_id).exists():
         return _not_found("agent not found")
-    return web.json_response({
+
+    cfg = AgentConfig.load(agent_id)
+    log_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "audit.log"
+
+    raw_tail = request.query.get("tail")
+    raw_since = request.query.get("since")
+    if raw_tail is not None and raw_since is not None:
+        # 400 instead of silently picking one — silent precedence
+        # masks confused callers and the surface is small enough
+        # that explicit-is-better-than-implicit wins.
+        return web.json_response(
+            {"error": "tail and since are mutually exclusive"},
+            status=400,
+        )
+
+    try:
+        tail = int(raw_tail) if raw_tail is not None else _LOG_DEFAULT_TAIL
+    except ValueError:
+        tail = _LOG_DEFAULT_TAIL
+    tail = max(1, min(_LOG_MAX_TAIL, tail))
+
+    since: int | None
+    if raw_since is None:
+        since = None
+    else:
+        try:
+            since = max(0, int(raw_since))
+        except ValueError:
+            since = None
+
+    if not log_path.exists():
+        return web.json_response({
+            "agent_id": agent_id,
+            "lines": [],
+            "next_cursor": 0,
+            "state": "never_written",
+            "note": "audit log not yet created",
+        })
+
+    file_size = log_path.stat().st_size
+
+    lines: list[dict[str, Any]] = []
+    if since is not None:
+        # Delta mode — read from the caller's last cursor. A file
+        # that's shrunk (rotated / archived) below the cursor
+        # resets to 0 so the next response carries the full window.
+        # Cap the per-response byte count so a slow-poller + busy-
+        # agent combination can't trigger multi-MB allocations.
+        offset = since if since <= file_size else 0
+        with log_path.open("rb") as f:
+            f.seek(offset)
+            content = f.read(_LOG_MAX_DELTA_BYTES)
+        # Defensive trim: if the cap landed mid-line, drop the
+        # partial trailing chunk so the client doesn't see a
+        # truncated JSON record. The dropped bytes are still
+        # before ``next_cursor`` (advancement is based on slice
+        # length); a future patch could try a smarter mid-line
+        # backtrack, but truncate-at-newline is the cheap-correct
+        # default.
+        if len(content) == _LOG_MAX_DELTA_BYTES:
+            last_nl = content.rfind(b"\n")
+            if last_nl > 0:
+                content = content[: last_nl + 1]
+        next_cursor = offset + len(content)
+        for raw in content.decode("utf-8", errors="replace").splitlines():
+            if raw.strip():
+                lines.append(_parse_log_line(raw))
+    else:
+        # Tail mode — reverse-seek off the end of the file rather
+        # than loading the whole thing. ``audit.log`` has no
+        # rotation today (``cli_session.AuditLog.write`` just
+        # appends), so unbounded growth is realistic and a
+        # full-file ``read_bytes()`` would scale badly for a
+        # long-lived agent.
+        suffix = _read_tail_bytes(log_path, file_size, tail)
+        decoded = suffix.decode("utf-8", errors="replace")
+        all_lines = [line for line in decoded.splitlines() if line.strip()]
+        for raw in all_lines[-tail:]:
+            lines.append(_parse_log_line(raw))
+        next_cursor = file_size
+
+    body: dict[str, Any] = {
         "agent_id": agent_id,
-        "lines": [],
-        "note": (
-            "per-agent log capture is not implemented yet — daemon "
-            "currently writes a single combined stream. follow-up PR."
-        ),
-    })
+        "lines": lines,
+        "next_cursor": next_cursor,
+    }
+    if not lines:
+        # Distinct empty-state signals — the client uses ``state`` to
+        # pick the right copy + the matching ``note`` is the
+        # human-readable form. Missing-file is handled above before
+        # we reach this branch.
+        if since is not None:
+            body["state"] = "up_to_date"
+            body["note"] = "no new entries since cursor"
+        else:
+            body["state"] = "empty"
+            body["note"] = "audit log is empty"
+    return web.json_response(body)
 
 
 # ────────────────────────────────────────────────────────────────────
