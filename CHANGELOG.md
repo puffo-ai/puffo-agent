@@ -4,6 +4,94 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.3] — 2026-05-22
+
+### Fixed
+
+- **macOS credential refresh: drop sandbox HOME, mirror FileBackend.**
+  The macOS ``KeychainBackend.refresh`` ran ``claude --print "ok"`` in
+  a tempdir sandbox with a seeded ``.credentials.json``, then copied
+  the rotated blob back to Keychain. The design wedged the user's
+  *main* Claude Code CLI out of session in three independent ways:
+
+  1. Sandbox HOME broke the ``security`` CLI's keychain lookup →
+     ``loginKC:queryCreate`` popup → user dismissed →
+     ``authd -60008`` → claude failed → no rotation (lucky).
+  2. With keychain visibility symlinked in, claude *did* rotate
+     against Anthropic and write the new blob to the real Keychain,
+     but then exited non-zero before flushing to the sandbox file.
+     The daemon couldn't tell rotation happened; Anthropic had
+     already invalidated the prior refresh-token → main CLI 401.
+  3. Even when claude exited 0, its on-exit cleanup deleted the
+     sandbox ``.credentials.json`` before the daemon read it back.
+
+  All three were caused by hiding claude's refresh behind our own
+  sandbox. None exist on Linux/Windows, where ``FileBackend`` lets
+  claude refresh with the real HOME — the same code path that runs
+  every interactive ``claude`` invocation.
+
+  ``KeychainBackend.refresh`` now runs ``claude --print "ok"`` with
+  ``HOME=Path.home()``, mirroring ``FileBackend.refresh``. claude
+  reads Keychain, refreshes if expired, writes the rotated blob to
+  Keychain. The daemon re-reads Keychain and byte-compares
+  before/after to classify ``REFRESHED`` vs ``UNCHANGED`` vs
+  ``FAILED``. ``LocalCLIAdapter._macos_credential_env`` drops the
+  PATH shim and keeps only ``CLAUDE_CONFIG_DIR`` isolation. The
+  5-minute Keychain poll is unchanged and is now the only
+  macOS-specific path in the refresher.
+
+  Deleted as a consequence: ``_stage_keychain_visibility``,
+  ``install_path_shim``, ``_run_claude_oneshot``,
+  ``refresh_via_oneshot``, ``_run_sandboxed_claude_oneshot``,
+  ``_force_expiry``, ``probe_refresh_flush_forced``,
+  ``probe_keychain_survives_token_env``. ``probe_refresh_flush`` is
+  rewritten to mirror production (real HOME, Keychain
+  before/after). Net **-1071 lines**.
+
+- **macOS bootstrap always reads Keychain on daemon start.**
+  ``bootstrap_from_keychain`` previously short-circuited with
+  ``cache_already_warm`` whenever the run-dir cache file held any
+  access-token. But while the daemon was stopped, the user could
+  have rotated the token via interactive ``claude /login``, the main
+  CLI's refresh-on-expiry, a VS Code plugin write, etc. Trusting the
+  cache there caused the daemon to start with a stale refresh-token,
+  fan it out to every agent's per-agent ``.credentials.json``, and
+  then immediately 401 against Anthropic until the on-401 wake-up
+  finally pulled the canonical token from Keychain. Bootstrap now
+  always reads Keychain; the one extra ``security`` call per daemon
+  start eliminates the startup auth-flap. If the Keychain read fails
+  *and* the cache still has a token, fall back to the cache so the
+  daemon limps along (the 5-min external-rotation poll keeps
+  retrying Keychain).
+
+- **Codex / Claude binary resolution now searches beyond `$PATH`.**
+  Operators who installed Codex via the desktop app (binary at
+  ``/Applications/Codex.app/Contents/Resources/codex``) hit
+  ``[Errno 2] No such file or directory: 'codex'`` when the daemon
+  spawned ``codex app-server``, because the LaunchAgent ``PATH``
+  excludes both ``/opt/homebrew/bin`` and the ``.app`` bundle. The
+  bug surfaced as the agent reporting ``runtime=running`` but never
+  replying — the spawn error fell to an unhandled exception in
+  ``handle_message_batch``.
+
+  Added ``puffo_agent.agent.cli_bin`` with ``resolve_codex_bin()`` /
+  ``resolve_claude_bin()`` that try, in order:
+  1. ``$PUFFO_CODEX_BIN`` / ``$PUFFO_CLAUDE_BIN`` (operator override).
+  2. ``shutil.which(...)`` (npm / brew / scoop install).
+  3. OS-specific bundle paths: ``Codex.app`` on macOS;
+     ``%LOCALAPPDATA%\Programs\codex`` / ``%PROGRAMFILES%\Codex``
+     on Windows; ``/opt/Codex`` and ``/usr/lib/codex`` on Linux.
+     Symmetric defensive paths for ``claude``.
+
+  Every existing call site (codex session spawn, credential refresh,
+  preflight diagnostic, macOS keychain probe) routes through the
+  new resolver, so the lookup order is uniform across the daemon.
+
+  When the resolver returns ``None``, the codex session spawn now
+  raises a clear ``RuntimeError`` naming both the env-var override
+  and the install steps, instead of letting ``FileNotFoundError``
+  bubble up from ``create_subprocess_exec``.
+
 ## [0.9.2] — 2026-05-22
 
 ### Fixed

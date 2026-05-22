@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ..agent.cli_bin import resolve_claude_bin
 from ..macos.keychain import (
     KEYCHAIN_SERVICE,
     is_macos,
@@ -234,11 +235,13 @@ def probe_refresh_flush() -> ProbeReport:
     if not is_macos():
         rpt.add("platform-check", VERDICT_SKIPPED, "not Darwin — probe skipped")
         return rpt
-    if shutil.which("claude") is None:
+    claude_bin = resolve_claude_bin()
+    if claude_bin is None:
         rpt.add(
             "prerequisite-claude",
             VERDICT_FAIL,
-            "`claude` not on PATH — install Claude Code first.",
+            "`claude` not resolvable via $PUFFO_CLAUDE_BIN, PATH, or "
+            "known bundle paths — install Claude Code first.",
         )
         return rpt
 
@@ -259,7 +262,7 @@ def probe_refresh_flush() -> ProbeReport:
     try:
         proc = subprocess.run(
             [
-                "claude", "--dangerously-skip-permissions",
+                claude_bin, "--dangerously-skip-permissions",
                 "--print", "--max-turns", "1",
                 "--output-format", "stream-json", "--verbose",
                 "ok",
