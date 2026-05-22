@@ -283,13 +283,15 @@ async def _run_claude_oneshot(
     ``(returncode, error_reason)`` — ``returncode`` is None on
     failure paths. Always cleans up the subprocess + pipe FDs even on
     early-return paths (timeout / spawn error)."""
-    if shutil.which("claude") is None:
+    from ..agent.cli_bin import resolve_claude_bin
+    claude_bin = resolve_claude_bin()
+    if claude_bin is None:
         return (None, "claude_binary_missing")
     proc: asyncio.subprocess.Process | None = None
     try:
         try:
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--dangerously-skip-permissions",
+                claude_bin, "--dangerously-skip-permissions",
                 "--print", "--max-turns", "1",
                 "--output-format", "stream-json", "--verbose",
                 "ok",

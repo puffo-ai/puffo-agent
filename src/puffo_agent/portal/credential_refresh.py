@@ -360,13 +360,13 @@ class CodexFileBackend:
 
 
 def _resolve_codex_bin() -> str | None:
-    """Resolve the ``codex`` executable. On Windows, npm-installed
-    shims like ``codex.cmd`` aren't found by ``CreateProcess`` from a
-    bare ``"codex"`` argv; ``shutil.which`` honours PATHEXT so the
-    ``.cmd`` is reachable from the daemon's subprocess.
-    """
-    import shutil
-    return shutil.which("codex")
+    """Resolve the ``codex`` executable via the shared resolver
+    (``agent.cli_bin``). Covers PATH + ``PUFFO_CODEX_BIN`` env
+    override + macOS / Windows / Linux bundle paths so a LaunchAgent
+    PATH that misses ``/opt/homebrew/bin`` or ``Codex.app`` still
+    finds the binary the operator installed."""
+    from ..agent.cli_bin import resolve_codex_bin as _resolver
+    return _resolver()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

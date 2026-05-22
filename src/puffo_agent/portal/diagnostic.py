@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ..agent.cli_bin import resolve_claude_bin
 from ..macos.keychain import (
     KEYCHAIN_SERVICE,
     install_path_shim,
@@ -82,7 +83,7 @@ class ProbeReport:
         lines.append("")
         lines.append(f"- Platform: `{platform.system()} {platform.release()}`")
         lines.append(f"- Python: `{sys.version.split()[0]}`")
-        lines.append(f"- claude on PATH: `{shutil.which('claude') or '(none)'}`")
+        lines.append(f"- claude resolved: `{resolve_claude_bin() or '(none)'}`")
         lines.append("")
         for s in self.steps:
             lines.append(f"## {s.name} — {s.verdict}")
@@ -340,11 +341,12 @@ def probe_refresh_flush() -> ProbeReport:
     if not is_macos():
         rpt.add("platform-check", VERDICT_SKIPPED, "not Darwin — probe skipped")
         return rpt
-    if shutil.which("claude") is None:
+    if resolve_claude_bin() is None:
         rpt.add(
             "prerequisite-claude",
             VERDICT_FAIL,
-            "`claude` not on PATH — install Claude Code first.",
+            "`claude` not resolvable via $PUFFO_CLAUDE_BIN, PATH, or "
+            "known bundle paths — install Claude Code first.",
         )
         return rpt
 
@@ -430,11 +432,12 @@ def probe_refresh_flush_forced() -> ProbeReport:
     if not is_macos():
         rpt.add("platform-check", VERDICT_SKIPPED, "not Darwin — probe skipped")
         return rpt
-    if shutil.which("claude") is None:
+    if resolve_claude_bin() is None:
         rpt.add(
             "prerequisite-claude",
             VERDICT_FAIL,
-            "`claude` not on PATH — install Claude Code first.",
+            "`claude` not resolvable via $PUFFO_CLAUDE_BIN, PATH, or "
+            "known bundle paths — install Claude Code first.",
         )
         return rpt
 
@@ -580,11 +583,12 @@ def probe_keychain_survives_token_env() -> ProbeReport:
     if not is_macos():
         rpt.add("platform-check", VERDICT_SKIPPED, "not Darwin — probe skipped")
         return rpt
-    if shutil.which("claude") is None:
+    if resolve_claude_bin() is None:
         rpt.add(
             "prerequisite-claude",
             VERDICT_FAIL,
-            "`claude` not on PATH — install Claude Code first.",
+            "`claude` not resolvable via $PUFFO_CLAUDE_BIN, PATH, or "
+            "known bundle paths — install Claude Code first.",
         )
         return rpt
 
@@ -724,7 +728,7 @@ def probe_full() -> ProbeReport:
     rpt.add(
         "environment",
         VERDICT_OK,
-        f"home_dir: {home_dir()}\nclaude: {shutil.which('claude')}\n"
+        f"home_dir: {home_dir()}\nclaude: {resolve_claude_bin()}\n"
         f"shim_dir: {shim_dir(home_dir())}",
     )
 
