@@ -8,6 +8,49 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`runtime.kind=cli-local` now supports `runtime.harness=hermes`
+  (alpha).** Previously a hermes harness on cli-local raised a hard
+  `RuntimeError` at construction; the only supported runtime was
+  cli-docker. cli-local now mirrors the docker adapter's one-shot
+  `hermes chat --quiet -q "<prompt>"` model: each turn is a fresh
+  subprocess (no long-lived session process to keep warm), and
+  cross-turn continuity rides on hermes' own `state.db` via
+  `--continue`. Cold start per turn is ~3-7s.
+
+  **Per-agent isolation**: every agent gets its own
+  `HERMES_HOME=~/.puffo-agent/agents/<id>/.hermes/` so multiple
+  agents on one host don't collide on `--continue`. On first
+  `_verify`, `config.yaml` and `.env` (provider keys) are copied
+  from the operator's `~/.hermes/` into the per-agent dir;
+  `state.db` is deliberately **not** copied — each agent starts
+  with a fresh memory / session store, and the operator's chat
+  history stays in the operator's home.
+
+  **Pre-flight checks** (raised loudly from `_verify` so the daemon
+  log names exactly what's wrong):
+  - `hermes` binary resolvable via `$PUFFO_HERMES_BIN`, `$PATH`,
+    or known installer locations (`~/.local/bin/hermes` on POSIX,
+    `%LOCALAPPDATA%\hermes\bin` on Windows). Failure quotes both
+    `install.sh` and `install.ps1` one-liners.
+  - `~/.hermes/config.yaml` exists on the host. Operator must have
+    run `hermes setup` at least once and configured a provider via
+    `hermes model`. Failure tells them to do exactly that.
+
+  **MCP**: the daemon registers the puffo MCP server with hermes'
+  per-agent config via `hermes mcp add puffo` on first turn
+  (`HERMES_HOME` env scopes the registration to the per-agent dir,
+  not the operator's). Failure logs and continues — chat works,
+  tool calls don't.
+
+  cli-docker hermes support is unchanged.
+
+- **`puffo_agent.agent.cli_bin.resolve_hermes_bin()`** added,
+  matching `resolve_codex_bin()` / `resolve_claude_bin()`. Looks
+  up `$PUFFO_HERMES_BIN`, `shutil.which("hermes")`, then OS-specific
+  installer bundle paths — same three-tier pattern as the other
+  resolvers so `launchd` / systemd narrow-PATH contexts find a
+  user-installed `hermes` without symlink hacks.
+
 - **`GET /v1/agents/{id}/log` now reads the agent's audit log.** The
   route was scaffolded but the handler was a stub returning
   `{lines: []}`. It now reads NDJSON from `~/.puffo-agent/agents/

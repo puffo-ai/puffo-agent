@@ -256,8 +256,8 @@ non-default.
 | `provider`   | `harness`     | Models you can pick                                  | Runtime kinds                |
 |--------------|---------------|------------------------------------------------------|------------------------------|
 | `anthropic`  | `claude-code` | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | all                          |
-| `anthropic`  | `hermes`      | Same as above (multi-provider harness)               | `cli-docker` only            |
-| `openai`     | `hermes`      | `gpt-4o`, `gpt-4-turbo`, etc.                        | `cli-docker` only            |
+| `anthropic`  | `hermes`      | Same as above (multi-provider harness)               | `cli-docker`, `cli-local` (alpha) |
+| `openai`     | `hermes`      | `gpt-4o`, `gpt-4-turbo`, etc.                        | `cli-docker`, `cli-local` (alpha) |
 | `openai`     | `codex`       | `gpt-5.5`, `gpt-5`, etc. (whatever your `codex` CLI supports) | **`cli-local` only** in 0.9.0 |
 | `google`     | `gemini-cli`  | `gemini-2.5-pro`, `gemini-2.5-flash`                 | `cli-docker` only            |
 
@@ -275,7 +275,7 @@ plain `kind: cli-local` agent runs Anthropic via Claude Code).
 |---------------|----------------------------------------------------------------------------------|
 | `chat-local`  | **Yes** — the daemon talks to the provider directly. Set `runtime.api_key`.      |
 | `sdk-local`   | **Yes** — same reason as chat-local.                                             |
-| `cli-local`   | **No** for `claude-code` (uses host's saved auth — `claude login` once). **No** for `codex` either — codex agents share the host's `codex login` (ChatGPT-account OAuth); no `OPENAI_API_KEY` path on `cli-local`. **Yes** for `hermes`/`gemini-cli` if those CLIs aren't already authenticated on the host. |
+| `cli-local`   | **No** for `claude-code` (uses host's saved auth — `claude login` once). **No** for `codex` either — codex agents share the host's `codex login` (ChatGPT-account OAuth); no `OPENAI_API_KEY` path on `cli-local`. **No** for `hermes` if you've run `hermes setup` on the host — keys live in `~/.hermes/.env`, which the daemon copies into each agent's `HERMES_HOME` on first verify. Set `PUFFO_HERMES_BIN` if `hermes` isn't on the daemon's `$PATH`. **Yes** for `gemini-cli` (cli-docker only). |
 | `cli-docker`  | **No** for `claude-code` (the per-agent container reuses the operator's host claude auth via a bind-mount). **Yes** for openai/google as above. |
 
 When set, `api_key` is the raw provider key (e.g. an Anthropic
@@ -335,7 +335,7 @@ runtime:
   # (run `codex login` once on the host first).
 ```
 
-**`cli-local` with Hermes + OpenAI**:
+**`cli-local` with Hermes + OpenAI** (alpha):
 
 ```yaml
 runtime:
@@ -343,8 +343,27 @@ runtime:
   provider: openai
   harness: hermes
   model: gpt-4o
-  api_key: sk-xxxxxxxxxxxxxxxxxxxx
+  # No api_key field: hermes reads from the per-agent HERMES_HOME's
+  # .env, which the daemon seeds from your ~/.hermes/.env on first
+  # verify.
 ```
+
+**Prereqs for hermes cli-local:**
+
+1. **Install the Hermes Agent CLI** on the host:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+   source ~/.bashrc
+   ```
+   (Windows: see Hermes README for the PowerShell install line; native Windows is upstream early-beta — WSL2 is the most-tested path.)
+
+2. **Run `hermes setup` once on the host** so `~/.hermes/config.yaml` and `~/.hermes/.env` (provider keys) exist. The daemon copies these into each agent's per-agent `HERMES_HOME=~/.puffo-agent/agents/<id>/.hermes/` on first verify, so every agent inherits your provider choice without sharing your chat history.
+
+3. **(optional) `PUFFO_HERMES_BIN`** env var if `hermes` isn't on the daemon's `$PATH` — e.g. `launchd` / systemd contexts where `~/.local/bin` isn't inherited.
+
+4. **`puffo_core:` configured in `agent.yml`** for tool calls. Without it, hermes still chats, but `send_message` / `list_channels` / etc. won't be wired (the daemon logs a warning).
+
+If any of these are missing, the daemon raises a clear `RuntimeError` from `_verify` at first turn naming exactly what to fix.
 
 ---
 

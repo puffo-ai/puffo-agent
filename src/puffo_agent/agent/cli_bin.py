@@ -40,6 +40,19 @@ def resolve_claude_bin() -> str | None:
     return _resolve("claude", "PUFFO_CLAUDE_BIN", _claude_bundle_paths())
 
 
+def resolve_hermes_bin() -> str | None:
+    """Return the absolute path of the ``hermes`` binary, or ``None``.
+
+    The upstream installer (``install.sh`` / ``install.ps1``) drops
+    the launcher in ``~/.local/bin`` on POSIX and
+    ``%LOCALAPPDATA%\\hermes\\bin`` on Windows; both are usually on
+    ``$PATH`` after the post-install ``source ~/.bashrc`` step.
+    Bundle-path fallback covers the LaunchAgent narrow-PATH case
+    that bit Codex.app the same way.
+    """
+    return _resolve("hermes", "PUFFO_HERMES_BIN", _hermes_bundle_paths())
+
+
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
     env_override = os.environ.get(env_var)
     if env_override:
@@ -94,6 +107,29 @@ def _claude_bundle_paths() -> list[Path]:
         "/opt/Claude/claude",
         "/opt/claude/claude",
         "/usr/lib/claude/claude",
+    )
+
+
+def _hermes_bundle_paths() -> list[Path]:
+    """Hermes' upstream installer drops the launcher in ``~/.local/bin``
+    on POSIX (default) and ``%LOCALAPPDATA%\\hermes\\bin`` on native
+    Windows. The dev-checkout ``setup-hermes.sh`` symlinks the same
+    into ``~/.local/bin/hermes`` so the fallback covers both modes.
+    """
+    if sys.platform == "win32":
+        return _expand(
+            r"%LOCALAPPDATA%\hermes\bin\hermes.exe",
+            r"%LOCALAPPDATA%\hermes\bin\hermes.cmd",
+            r"%LOCALAPPDATA%\hermes\bin\hermes",
+            r"%USERPROFILE%\.local\bin\hermes.exe",
+            r"%USERPROFILE%\.local\bin\hermes",
+        )
+    # macOS + Linux + WSL2 — installer default + a few common venv
+    # locations operators sometimes pip-install into.
+    return _expand(
+        "~/.local/bin/hermes",
+        "/usr/local/bin/hermes",
+        "/opt/homebrew/bin/hermes",
     )
 
 

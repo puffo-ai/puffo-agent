@@ -39,10 +39,17 @@ from ...portal.state import (
     sync_host_plugins,
     sync_host_skills,
 )
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin
+from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
+from .hermes_helpers import (
+    HERMES_NO_RESUME_SIGNATURE,
+    hermes_model_id,
+    parse_hermes_reply,
+    run_cmd as hermes_run_cmd,
+    stitch_hermes_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,11 +142,10 @@ class LocalCLIAdapter(Adapter):
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
-        # cli-local supports claude-code (default) and codex (alpha).
-        # hermes / gemini-cli remain cli-docker-only — replicating
-        # their containerised setup on the operator's own host needs
-        # its own design pass.
-        if harness.name() in ("hermes", "gemini-cli"):
+        # cli-local supports claude-code (default), codex (alpha),
+        # and hermes (alpha — one-shot CLI per turn, no long-lived
+        # session). gemini-cli remains cli-docker-only.
+        if harness.name() == "gemini-cli":
             raise RuntimeError(
                 f"agent {agent_id!r}: runtime.harness={harness.name()!r} is "
                 "not supported with runtime.kind=cli-local yet. Use "
@@ -150,10 +156,15 @@ class LocalCLIAdapter(Adapter):
         self.puffo_core_mcp_env: dict[str, str] | None = None
         self._verified = False
         # claude-code path uses ClaudeSession (long-lived stream-json);
-        # codex path uses CodexSession (long-lived JSON-RPC). Only one
-        # is non-None at a time — selected by ``harness.name()``.
+        # codex path uses CodexSession (long-lived JSON-RPC). hermes
+        # has no long-lived session — every turn is a fresh
+        # ``hermes chat`` subprocess, continuity comes from hermes'
+        # own state.db indexed by per-agent HERMES_HOME + sentinel.
         self._session: ClaudeSession | None = None
         self._codex_session: CodexSession | None = None
+        self._hermes_bin: str | None = None
+        self._hermes_home: Path | None = None
+        self._hermes_mcp_registered = False
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         self._verify()
@@ -161,6 +172,8 @@ class LocalCLIAdapter(Adapter):
         if self.harness.name() == "codex":
             session = self._ensure_codex_session()
             return await session.run_turn(user_message, ctx.system_prompt)
+        if self.harness.name() == "hermes":
+            return await self._run_hermes_turn(user_message, ctx.system_prompt)
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
@@ -178,6 +191,12 @@ class LocalCLIAdapter(Adapter):
             # a fresh turn would.
             session = self._ensure_codex_session()
             return await session.run_turn(
+                fallback_user_message, ctx.system_prompt,
+            )
+        if self.harness.name() == "hermes":
+            # hermes always runs one-shot — the retry is just a
+            # normal turn against the fallback payload.
+            return await self._run_hermes_turn(
                 fallback_user_message, ctx.system_prompt,
             )
         session = self._ensure_session()
@@ -200,6 +219,12 @@ class LocalCLIAdapter(Adapter):
                 )
                 return
             await session.warm(system_prompt)
+            return
+        if self.harness.name() == "hermes":
+            # hermes is one-shot per turn; no subprocess to keep
+            # warm. ``_verify`` already validated the binary +
+            # seeded HERMES_HOME, so there's nothing left to do
+            # until the first message arrives.
             return
         session = self._ensure_session()
         if not session.has_persisted_session():
@@ -312,6 +337,274 @@ class LocalCLIAdapter(Adapter):
             model=self.model,
         )
         return self._codex_session
+
+    # ── hermes (cli-local) ────────────────────────────────────────────
+    # hermes is one-shot per turn: every turn spawns
+    # ``hermes chat --quiet -q <prompt>``. No long-lived session
+    # process to keep warm. State lives in the per-agent
+    # ``HERMES_HOME=<agent_home_dir>/.hermes`` directory which we
+    # seed from the operator's ``~/.hermes`` on first verify so the
+    # agent inherits the operator's provider keys + ``hermes setup``
+    # choices without sharing the operator's chat history.
+
+    def _verify_hermes(self) -> None:
+        """Pre-flight for the hermes cli-local path.
+
+        Fail-loud expectations the operator needs to satisfy:
+
+        1. ``hermes`` is installed and resolvable (env / PATH / bundle).
+        2. ``~/.hermes/config.yaml`` exists on the host — operator
+           has run ``hermes setup`` at least once and configured a
+           provider via ``hermes model``.
+        3. ``~/.hermes/.env`` (provider keys) exists OR the operator
+           exported provider keys via the daemon's environment.
+
+        On success: seeds the per-agent ``HERMES_HOME`` from the
+        operator's ``~/.hermes`` and logs the host-runtime banner
+        (cli-local has host-level access; same warning as claude).
+        """
+        bin_path = resolve_hermes_bin()
+        if bin_path is None:
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: hermes binary not found. Tried "
+                "$PUFFO_HERMES_BIN, $PATH, and known installer paths "
+                "(``~/.local/bin/hermes`` on POSIX, "
+                "``%LOCALAPPDATA%\\hermes\\bin`` on Windows). Install "
+                "Hermes Agent — POSIX: ``curl -fsSL "
+                "https://raw.githubusercontent.com/NousResearch/hermes-agent/"
+                "main/scripts/install.sh | bash``; PowerShell: ``iex "
+                "(irm https://raw.githubusercontent.com/NousResearch/"
+                "hermes-agent/main/scripts/install.ps1)`` — then ``source "
+                "~/.bashrc`` and re-run the daemon. Or set "
+                "``PUFFO_HERMES_BIN=/abs/path/to/hermes``."
+            )
+        self._hermes_bin = bin_path
+
+        host_hermes_home = Path.home() / ".hermes"
+        host_config = host_hermes_home / "config.yaml"
+        if not host_config.is_file():
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: hermes is installed but "
+                f"``{host_config}`` is missing — operator hasn't run "
+                "``hermes setup`` yet. On the host, run ``hermes setup`` "
+                "(or ``hermes model`` + ``hermes config set``) once to "
+                "pick a provider and persist credentials, then restart "
+                "the daemon."
+            )
+
+        self._hermes_home = self.agent_home_dir / ".hermes"
+        self._seed_hermes_home(host_hermes_home, self._hermes_home)
+
+        self._log_host_runtime_banner()
+
+    def _seed_hermes_home(self, host_dir: Path, agent_dir: Path) -> None:
+        """Copy ``config.yaml`` and ``.env`` (provider keys) from the
+        operator's ``~/.hermes`` into the per-agent HERMES_HOME on
+        first verify. Deliberately does NOT copy ``state.db``: that's
+        per-agent (sessions, memory, FTS history are all in there).
+        Idempotent — re-running only fills files that don't exist yet.
+        """
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        for filename in ("config.yaml", ".env"):
+            src = host_dir / filename
+            dst = agent_dir / filename
+            if dst.exists() or not src.is_file():
+                continue
+            try:
+                dst.write_bytes(src.read_bytes())
+                logger.info(
+                    "agent %s: seeded per-agent HERMES_HOME with %s from %s",
+                    self.agent_id, filename, host_dir,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't copy %s into per-agent HERMES_HOME "
+                    "(%s) — hermes turns may fail with no provider config",
+                    self.agent_id, src, exc,
+                )
+
+    async def _run_hermes_turn(
+        self,
+        user_message: str,
+        system_prompt: str,
+        *,
+        _retried: bool = False,
+    ) -> TurnResult:
+        """One-shot hermes turn on the host, mirroring the docker
+        adapter's ``_run_hermes_chat`` minus the ``docker exec``
+        wrapper. Continuity comes from the per-agent
+        ``HERMES_HOME``'s state.db + a sentinel file marking
+        whether ``--continue`` is safe to pass.
+        """
+        if self._hermes_bin is None or self._hermes_home is None:
+            # _verify already raised if these were missing; defensive
+            # re-check to surface a clear error if someone bypasses
+            # the normal lifecycle.
+            return TurnResult(reply="", metadata={
+                "error": "hermes not verified before run_turn",
+            })
+
+        # MCP registration is best-effort — chat still works without
+        # tools. Idempotent per-adapter-instance after first success.
+        await self._ensure_hermes_mcp_registered_local()
+
+        has_prior_session = self.session_file.exists()
+        prompt = user_message if has_prior_session else stitch_hermes_prompt(
+            system_prompt, user_message,
+        )
+        env = {
+            **os.environ,
+            "HERMES_HOME": str(self._hermes_home),
+        }
+        cmd = [
+            self._hermes_bin, "chat",
+            "--quiet",
+            "--source", f"puffoagent:{self.agent_id}",
+            "--model", hermes_model_id(self.model),
+        ]
+        if has_prior_session:
+            cmd.append("--continue")
+        cmd.extend(["-q", prompt])
+
+        started = time.time()
+        rc, stdout, stderr = await hermes_run_cmd(
+            cmd, env=env, cwd=self.workspace_dir, check=False,
+        )
+        elapsed = time.time() - started
+        stdout_text = stdout.decode("utf-8", errors="replace")
+        stderr_text = stderr.decode("utf-8", errors="replace")
+
+        # Stale sentinel: hermes' state.db has no session matching
+        # ours (e.g. operator wiped ``~/.hermes`` since last turn).
+        # Clear + retry once without --continue.
+        if (
+            rc != 0
+            and HERMES_NO_RESUME_SIGNATURE in stdout_text
+            and not _retried
+        ):
+            logger.info(
+                "agent %s: hermes rejected --continue; clearing sentinel and retrying fresh",
+                self.agent_id,
+            )
+            try:
+                self.session_file.unlink()
+            except OSError:
+                pass
+            return await self._run_hermes_turn(
+                user_message, system_prompt, _retried=True,
+            )
+
+        if rc != 0:
+            logger.error(
+                "agent %s: hermes turn rc=%d in %.1fs | stdout: %r | stderr: %s",
+                self.agent_id, rc, elapsed,
+                stdout_text.strip()[:400],
+                stderr_text.strip()[-400:] or "(empty)",
+            )
+            return TurnResult(reply="", metadata={
+                "error": f"hermes exited rc={rc}",
+                "stdout_snippet": stdout_text[:400],
+                "stderr_tail": stderr_text[-400:],
+            })
+
+        reply, session_id = parse_hermes_reply(stdout_text)
+        if not reply:
+            logger.warning(
+                "agent %s: hermes rc=0 but parser found no reply. "
+                "stdout: %r", self.agent_id, stdout_text[:400],
+            )
+
+        # First success: write the sentinel so subsequent turns pass
+        # --continue. session_id is captured for debug only.
+        if not has_prior_session:
+            try:
+                self.session_file.parent.mkdir(parents=True, exist_ok=True)
+                self.session_file.write_text(
+                    json.dumps({
+                        "harness": "hermes",
+                        "session_id": session_id,
+                        "first_turn_at": int(time.time()),
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't write hermes session_file: %s "
+                    "(next turn will start a fresh session)",
+                    self.agent_id, exc,
+                )
+
+        return TurnResult(reply=reply, metadata={
+            "harness": "hermes",
+            "session_id": session_id,
+            "elapsed_seconds": round(elapsed, 2),
+        })
+
+    async def _ensure_hermes_mcp_registered_local(self) -> None:
+        """Register the puffo MCP server with hermes' per-agent
+        config. Mirrors the docker adapter's registration, just
+        spawns the binary directly (no ``docker exec``) and points
+        ``HERMES_HOME`` at the per-agent dir so the write lands in
+        the agent's config, not the operator's.
+
+        Hermes prompts ``Enable all N tools? [Y/n/select]`` before
+        writing; we pipe ``y\\n`` to accept.
+        """
+        if self._hermes_mcp_registered:
+            return
+        if self.puffo_core_mcp_env is None:
+            logger.warning(
+                "agent %s: hermes MCP registration skipped — puffo_core "
+                "is not configured. Populate `puffo_core:` in agent.yml "
+                "to enable tool calls under hermes.",
+                self.agent_id,
+            )
+            return
+        if self._hermes_bin is None or self._hermes_home is None:
+            return
+
+        env = {
+            **os.environ,
+            "HERMES_HOME": str(self._hermes_home),
+        }
+        mcp_env = dict(self.puffo_core_mcp_env)
+        # Match the docker adapter's contract — MCP routes data
+        # reads through the daemon's data service over HTTP, not
+        # direct SQLite open.
+        mcp_env["PUFFO_WORKSPACE"] = self.workspace_dir
+        mcp_env["PUFFO_RUNTIME_KIND"] = "cli-local"
+        mcp_env["PUFFO_HARNESS"] = "hermes"
+        env_flags = [f"{k}={v}" for k, v in mcp_env.items()]
+
+        # Remove stale registration first so the add below is clean.
+        await hermes_run_cmd(
+            [self._hermes_bin, "mcp", "remove", "puffo"],
+            env=env, check=False,
+        )
+        rc, stdout, stderr = await hermes_run_cmd(
+            [
+                self._hermes_bin, "mcp", "add", "puffo",
+                "--command", default_python_executable(),
+                "--args", "-m", "puffo_agent.mcp.puffo_core_server",
+                "--env", *env_flags,
+            ],
+            env=env, check=False, stdin=b"y\n",
+        )
+        if rc != 0:
+            logger.warning(
+                "agent %s: hermes mcp add puffo rc=%d | stdout: %s | "
+                "stderr: %s (chat will work, tool calls won't)",
+                self.agent_id, rc,
+                stdout.decode("utf-8", errors="replace").strip()[-400:],
+                stderr.decode("utf-8", errors="replace").strip()[-400:],
+            )
+            return
+        logger.info(
+            "agent %s: registered puffo MCP server with hermes "
+            "(per-agent HERMES_HOME=%s)",
+            self.agent_id, self._hermes_home,
+        )
+        self._hermes_mcp_registered = True
 
     def _ensure_session(self) -> ClaudeSession:
         if self._session is not None:
@@ -523,6 +816,10 @@ class LocalCLIAdapter(Adapter):
             # We deliberately skip the claude-seed / link-credentials
             # bookkeeping below — none of it applies to codex, and
             # touching ~/.claude/* for a codex agent would be confusing.
+            self._verified = True
+            return
+        if self.harness.name() == "hermes":
+            self._verify_hermes()
             self._verified = True
             return
         if resolve_claude_bin() is None:

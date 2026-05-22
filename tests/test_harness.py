@@ -230,24 +230,24 @@ def test_harness_empty_means_backward_compat_not_blocked():
 
 
 def test_hermes_model_id_strips_claude_code_suffix():
-    from puffo_agent.agent.adapters.docker_cli import _hermes_model_id
+    from puffo_agent.agent.adapters.hermes_helpers import hermes_model_id as _hermes_model_id
     # claude-code's [1m] context-window suffix is unknown to hermes.
     assert _hermes_model_id("claude-opus-4-6[1m]") == "anthropic/claude-opus-4-6"
 
 
 def test_hermes_model_id_prepends_anthropic_prefix_when_missing():
-    from puffo_agent.agent.adapters.docker_cli import _hermes_model_id
+    from puffo_agent.agent.adapters.hermes_helpers import hermes_model_id as _hermes_model_id
     assert _hermes_model_id("claude-sonnet-4-6") == "anthropic/claude-sonnet-4-6"
 
 
 def test_hermes_model_id_keeps_explicit_provider_prefix():
-    from puffo_agent.agent.adapters.docker_cli import _hermes_model_id
+    from puffo_agent.agent.adapters.hermes_helpers import hermes_model_id as _hermes_model_id
     assert _hermes_model_id("openrouter/anthropic/claude-opus-4-6") == \
         "openrouter/anthropic/claude-opus-4-6"
 
 
 def test_hermes_model_id_empty_returns_default():
-    from puffo_agent.agent.adapters.docker_cli import _hermes_model_id
+    from puffo_agent.agent.adapters.hermes_helpers import hermes_model_id as _hermes_model_id
     # Empty / missing -> sensible default so hermes always gets a
     # concrete --model.
     assert _hermes_model_id("").startswith("anthropic/")
@@ -255,7 +255,7 @@ def test_hermes_model_id_empty_returns_default():
 
 
 def test_parse_hermes_reply_first_turn():
-    from puffo_agent.agent.adapters.docker_cli import _parse_hermes_reply
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
     stdout = (
         "⚠️  Normalized model 'anthropic/claude-opus-4-6' to 'claude-opus-4-6' for \n"
         "anthropic.\n"
@@ -271,7 +271,7 @@ def test_parse_hermes_reply_first_turn():
 def test_parse_hermes_reply_resumed_turn():
     """--continue prepends a ``↻ Resumed session`` line; parser must
     still pick up the reply after session_id."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_hermes_reply
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
     stdout = (
         "⚠️  Normalized model 'anthropic/claude-opus-4-6' to 'claude-opus-4-6' for \n"
         "anthropic.\n"
@@ -287,7 +287,7 @@ def test_parse_hermes_reply_resumed_turn():
 
 def test_parse_hermes_reply_multiline_body():
     """Multi-line replies preserve internal newlines."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_hermes_reply
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
     stdout = (
         "session_id: abc\n"
         "line one\n"
@@ -303,7 +303,7 @@ def test_parse_hermes_reply_no_session_id_but_reply_present():
     """Some hermes invocations under ``--quiet`` emit no ``session_id:``
     line on fresh sessions; parser must still extract the reply.
     """
-    from puffo_agent.agent.adapters.docker_cli import _parse_hermes_reply
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
     stdout = (
         "⚠️  Normalized model 'anthropic/claude-opus-4-6' to 'claude-opus-4-6' for \n"
         "anthropic.\n"
@@ -317,7 +317,7 @@ def test_parse_hermes_reply_no_session_id_but_reply_present():
 def test_parse_hermes_reply_resumed_session_id_captured_without_session_id_line():
     """The ``↻ Resumed session <id>`` line alone is enough to capture
     session_id when no standalone ``session_id:`` line follows."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_hermes_reply
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
     stdout = (
         "⚠️  Normalized model 'anthropic/claude-opus-4-6' to 'claude-opus-4-6' for \n"
         "anthropic.\n"
@@ -334,7 +334,7 @@ def test_parse_hermes_reply_filters_banner_lines_narrowly():
     that is one word + period (e.g. ``anthropic.``). Regular prose
     ending in a period is not eaten.
     """
-    from puffo_agent.agent.adapters.docker_cli import _parse_hermes_reply
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
     stdout = (
         "⚠️  Normalized model 'x/y' to 'y' for \n"
         "anthropic.\n"
@@ -356,7 +356,7 @@ def test_parse_hermes_reply_filters_banner_lines_narrowly():
 def test_stitch_hermes_prompt_first_turn():
     """Hermes has no --system flag for ``chat -q``; system prompt is
     inlined above the user message with a visible separator."""
-    from puffo_agent.agent.adapters.docker_cli import _stitch_hermes_prompt
+    from puffo_agent.agent.adapters.hermes_helpers import stitch_hermes_prompt as _stitch_hermes_prompt
     stitched = _stitch_hermes_prompt("You are Puffo.", "hello")
     assert stitched == "You are Puffo.\n\n---\n\nhello"
 
@@ -364,30 +364,122 @@ def test_stitch_hermes_prompt_first_turn():
 def test_stitch_hermes_prompt_no_system_passes_through():
     """Empty system prompt -> user_message through unchanged, no stray
     separator at the top."""
-    from puffo_agent.agent.adapters.docker_cli import _stitch_hermes_prompt
+    from puffo_agent.agent.adapters.hermes_helpers import stitch_hermes_prompt as _stitch_hermes_prompt
     assert _stitch_hermes_prompt("", "hello") == "hello"
     assert _stitch_hermes_prompt(None, "hello") == "hello"  # type: ignore[arg-type]
 
 
-# ── cli-local rejects harness=hermes ─────────────────────────────────────────
+# ── cli-local accepts harness=hermes (binary check happens in _verify) ──────
 
 
-def test_local_cli_rejects_hermes_harness():
-    """cli-local doesn't support hermes yet; reject at construction so
-    the daemon log shows a clear error rather than silently misbehaving.
+def test_local_cli_accepts_hermes_harness_at_construction():
+    """cli-local construction with hermes harness doesn't raise — the
+    binary + ``~/.hermes/config.yaml`` pre-flight is deferred to
+    ``_verify`` (first turn / warm), matching the codex path. This
+    keeps adapter registry construction cheap and lets the operator
+    see a clear error from ``_verify`` only when they actually try
+    to spawn the runtime.
     """
     from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-    with pytest.raises(RuntimeError, match="not.+supported.+cli-local"):
-        LocalCLIAdapter(
-            agent_id="t",
-            model="",
-            workspace_dir="/tmp/ws",
-            claude_dir="/tmp/ws/.claude",
-            session_file="/tmp/sess.json",
-            mcp_config_file="/tmp/mcp.json",
-            agent_home_dir="/tmp/agent",
-            harness=HermesHarness(),
-        )
+    LocalCLIAdapter(
+        agent_id="t",
+        model="",
+        workspace_dir="/tmp/ws",
+        claude_dir="/tmp/ws/.claude",
+        session_file="/tmp/sess.json",
+        mcp_config_file="/tmp/mcp.json",
+        agent_home_dir="/tmp/agent",
+        harness=HermesHarness(),
+    )
+
+
+def test_local_cli_hermes_verify_raises_when_binary_missing(monkeypatch, tmp_path):
+    """``_verify`` is the lazy pre-flight — when the operator hasn't
+    installed hermes, surface a clear install message naming
+    ``$PUFFO_HERMES_BIN`` so they can fix it without grepping source.
+    """
+    from puffo_agent.agent.adapters import local_cli as local_cli_mod
+    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: None)
+    adapter = local_cli_mod.LocalCLIAdapter(
+        agent_id="t",
+        model="",
+        workspace_dir=str(tmp_path / "ws"),
+        claude_dir=str(tmp_path / "ws" / ".claude"),
+        session_file=str(tmp_path / "sess.json"),
+        mcp_config_file=str(tmp_path / "mcp.json"),
+        agent_home_dir=str(tmp_path / "agent"),
+        harness=HermesHarness(),
+    )
+    with pytest.raises(RuntimeError, match="hermes binary not found"):
+        adapter._verify()
+
+
+def test_local_cli_hermes_verify_raises_when_host_config_missing(monkeypatch, tmp_path):
+    """If hermes is installed but ``~/.hermes/config.yaml`` doesn't
+    exist, the operator hasn't run ``hermes setup`` yet. Surface
+    that explicitly rather than letting the first turn fail with a
+    cryptic provider-not-configured error from hermes itself.
+    """
+    from puffo_agent.agent.adapters import local_cli as local_cli_mod
+    fake_bin = tmp_path / "hermes"
+    fake_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
+    # Point Path.home() at a tmpdir with no ``.hermes/`` so the
+    # config.yaml check fails the way it would for a fresh operator.
+    empty_home = tmp_path / "fake_home"
+    empty_home.mkdir()
+    monkeypatch.setattr(local_cli_mod.Path, "home", classmethod(lambda cls: empty_home))
+    adapter = local_cli_mod.LocalCLIAdapter(
+        agent_id="t",
+        model="",
+        workspace_dir=str(tmp_path / "ws"),
+        claude_dir=str(tmp_path / "ws" / ".claude"),
+        session_file=str(tmp_path / "sess.json"),
+        mcp_config_file=str(tmp_path / "mcp.json"),
+        agent_home_dir=str(tmp_path / "agent"),
+        harness=HermesHarness(),
+    )
+    with pytest.raises(RuntimeError, match="hermes setup"):
+        adapter._verify()
+
+
+def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
+    """First successful ``_verify`` copies ``config.yaml`` and
+    ``.env`` from the operator's ``~/.hermes`` into the per-agent
+    ``HERMES_HOME``. ``state.db`` deliberately does NOT get copied —
+    each agent gets a fresh session/memory store.
+    """
+    from puffo_agent.agent.adapters import local_cli as local_cli_mod
+    fake_bin = tmp_path / "hermes"
+    fake_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
+
+    host_home = tmp_path / "operator_home"
+    host_hermes = host_home / ".hermes"
+    host_hermes.mkdir(parents=True)
+    (host_hermes / "config.yaml").write_text("provider: anthropic\n")
+    (host_hermes / ".env").write_text("ANTHROPIC_API_KEY=sk-test\n")
+    (host_hermes / "state.db").write_bytes(b"PERSONAL_DATA")
+    monkeypatch.setattr(local_cli_mod.Path, "home", classmethod(lambda cls: host_home))
+
+    agent_home = tmp_path / "agent"
+    adapter = local_cli_mod.LocalCLIAdapter(
+        agent_id="t",
+        model="",
+        workspace_dir=str(tmp_path / "ws"),
+        claude_dir=str(tmp_path / "ws" / ".claude"),
+        session_file=str(tmp_path / "sess.json"),
+        mcp_config_file=str(tmp_path / "mcp.json"),
+        agent_home_dir=str(agent_home),
+        harness=HermesHarness(),
+    )
+    adapter._verify()
+
+    per_agent = agent_home / ".hermes"
+    assert (per_agent / "config.yaml").read_text() == "provider: anthropic\n"
+    assert (per_agent / ".env").read_text() == "ANTHROPIC_API_KEY=sk-test\n"
+    # Operator's chat history must stay in the operator's HOME.
+    assert not (per_agent / "state.db").exists()
 
 
 def test_local_cli_accepts_claude_code_harness():
