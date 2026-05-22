@@ -568,15 +568,35 @@ class LocalCLIAdapter(Adapter):
                     self.agent_id, exc,
                 )
 
+        # When the LLM called send_message via MCP, the daemon's
+        # fallback path in core.py would post the assistant text as
+        # well — duplicating the message. Mirror the claude-code
+        # contract by populating ``send_message_targets``: any
+        # truthy list value tells ``core._run_turn_and_route`` that
+        # MCP already posted, so the fallback is skipped.
+        #
+        # Limitation: tool_calls comes from the ``🔧 Auto-repaired
+        # tool name`` banner, which only fires when hermes had to
+        # rewrite the LLM's emitted name. Once the model learns the
+        # correct ``mcp_puffo_send_message`` name (via session
+        # continuity), the banner stops + this detection misses. A
+        # real fix needs MCP-server-side invocation tracking; this
+        # is the band-aid.
+        metadata: dict = {
+            "harness": "hermes",
+            "session_id": session_id,
+            "elapsed_seconds": round(elapsed, 2),
+            "tools_invoked": tool_calls,
+        }
+        if any("send_message" in name for name in tool_calls):
+            metadata["send_message_targets"] = [
+                {"channel": "", "root_id": ""} for _ in tool_calls
+                if "send_message" in _
+            ]
         return TurnResult(
             reply=reply,
             tool_calls=len(tool_calls),
-            metadata={
-                "harness": "hermes",
-                "session_id": session_id,
-                "elapsed_seconds": round(elapsed, 2),
-                "tools_invoked": tool_calls,
-            },
+            metadata=metadata,
         )
 
     async def _ensure_hermes_mcp_registered_local(self) -> None:
