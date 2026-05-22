@@ -590,7 +590,6 @@ class LocalCLIAdapter(Adapter):
         mcp_env["PUFFO_HARNESS"] = "hermes"
 
         import yaml
-        from ...mcp.puffo_core_server import list_tool_names
         try:
             with config_path.open("r", encoding="utf-8") as fh:
                 config = yaml.safe_load(fh) or {}
@@ -602,14 +601,16 @@ class LocalCLIAdapter(Adapter):
             return
 
         servers = config.setdefault("mcp_servers", {})
-        # ``tools:`` lets ``hermes list_mcp_servers`` enumerate puffo
-        # without waiting for interactive discovery.
+        # No ``tools:`` field — hermes' interactive add saves
+        # ``tools: {include: [...]}`` only when the operator filters.
+        # Omitting it leaves all discovered tools enabled. A bare-list
+        # ``tools:`` is interpreted as a filter and silently drops
+        # everything.
         servers["puffo"] = {
             "command": default_python_executable(),
             "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
             "env": mcp_env,
             "enabled": True,
-            "tools": list_tool_names(),
         }
         try:
             with config_path.open("w", encoding="utf-8") as fh:
