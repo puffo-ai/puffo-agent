@@ -32,6 +32,7 @@ from typing import Optional
 
 from ..macos.keychain import (
     KEYCHAIN_SERVICE,
+    _stage_keychain_visibility,
     install_path_shim,
     is_macos,
     read_keychain_blob,
@@ -262,6 +263,10 @@ def _run_sandboxed_claude_oneshot(
     sandbox_claude_dir.mkdir(parents=True, exist_ok=True)
     sandbox_creds = sandbox_claude_dir / ".credentials.json"
     sandbox_creds.write_text(blob, encoding="utf-8")
+
+    # Mirror production: symlink real ~/Library/Keychains in so the
+    # security CLI doesn't ask the user to create a new login keychain.
+    _stage_keychain_visibility(sandbox)
 
     env = {
         **os.environ,

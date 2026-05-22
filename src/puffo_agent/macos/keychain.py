@@ -2,9 +2,21 @@
 
 Claude Code 2.x stores its OAuth token in the system Keychain
 (``"Claude Code-credentials"``). Per-agent ``$HOME`` overrides don't
-isolate Keychain access (Keychain ACL is keyed by user UID + signing
-identity, not by HOME), so the host's claude binary running under a
-puffo-agent worker can trigger an ACL re-prompt every spawn.
+isolate Keychain ACL access (Keychain ACL is keyed by user UID +
+signing identity, not by HOME), so the host's claude binary running
+under a puffo-agent worker can trigger an ACL re-prompt every spawn.
+
+BUT — and this caught us in production — HOME *does* affect the
+``security`` CLI's lookup of the user's login keychain file. The CLI
+constructs ``$HOME/Library/Keychains/login.keychain-db`` to find the
+default keychain. With a sandbox HOME and no such path, ``security``
+fires the ``loginKC:queryCreate`` authorization mechanism asking the
+user to create a brand-new login keychain. Users almost always dismiss
+that dialog, the keychain write fails, claude exits non-zero, and any
+freshly-rotated OAuth tokens are lost in flight (Anthropic has already
+invalidated the prior refresh_token by that point). The fix in this
+module: ``_stage_keychain_visibility`` symlinks the real
+``~/Library/Keychains`` into the sandbox HOME before claude runs.
 
 Also: GitHub issue anthropics/claude-code#37512 documents that setting
 ``CLAUDE_CODE_OAUTH_TOKEN`` causes the CLI to silently
@@ -179,6 +191,33 @@ fi
 
 exec "$REAL" "$@"
 """
+
+
+def _stage_keychain_visibility(sandbox: Path) -> Optional[str]:
+    """Symlink the user's ``~/Library/Keychains`` into the sandbox HOME
+    so the ``security`` CLI (and anything else doing
+    ``$HOME``-relative keychain lookup) reaches the real login keychain
+    instead of firing the ``loginKC:queryCreate`` authorization dialog.
+
+    See module docstring for the full incident description. Returns
+    ``None`` on success, or a short reason string on best-effort
+    failure — the refresh attempt still proceeds since claude *may*
+    succeed via the framework path even without this staging.
+    """
+    real_keychains = Path.home() / "Library" / "Keychains"
+    if not real_keychains.exists():
+        return "real_keychains_missing"
+    try:
+        sandbox_library = sandbox / "Library"
+        sandbox_library.mkdir(parents=True, exist_ok=True)
+        target = sandbox_library / "Keychains"
+        # Idempotent: a prior call already linked it.
+        if target.is_symlink() or target.exists():
+            return None
+        os.symlink(real_keychains, target)
+    except OSError as exc:
+        return f"symlink_failed: {exc}"
+    return None
 
 
 def shim_dir(home: Path) -> Path:
@@ -365,6 +404,14 @@ async def refresh_via_oneshot(
         sandbox_claude_dir.mkdir(parents=True, exist_ok=True)
         sandbox_creds = sandbox_claude_dir / ".credentials.json"
         sandbox_creds.write_text(blob, encoding="utf-8")
+
+        stage_err = _stage_keychain_visibility(sandbox_path)
+        if stage_err is not None:
+            logger.info(
+                "refresh sandbox: keychain visibility staging skipped "
+                "(%s); claude may still succeed via framework path",
+                stage_err,
+            )
 
         env = {
             **os.environ,

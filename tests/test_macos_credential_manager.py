@@ -305,6 +305,60 @@ def test_refresh_via_oneshot_token_unchanged(monkeypatch, tmp_path):
     assert reason == "token_unchanged"
 
 
+def test_stage_keychain_visibility_creates_symlink(monkeypatch, tmp_path):
+    """The helper must symlink the real ~/Library/Keychains into the
+    sandbox so the security CLI's HOME-relative lookup finds the user's
+    login keychain instead of asking to create a new one."""
+    real_home = tmp_path / "real_home"
+    real_keychains = real_home / "Library" / "Keychains"
+    real_keychains.mkdir(parents=True)
+    (real_keychains / "login.keychain-db").write_bytes(b"")
+    monkeypatch.setattr(cm.Path, "home", classmethod(lambda cls: real_home))
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+
+    err = cm._stage_keychain_visibility(sandbox)
+    assert err is None
+    target = sandbox / "Library" / "Keychains"
+    assert target.is_symlink()
+    assert (target / "login.keychain-db").exists()
+
+
+def test_stage_keychain_visibility_is_idempotent(monkeypatch, tmp_path):
+    """Calling twice on the same sandbox must not error and must not
+    end up with a nested or broken symlink."""
+    real_home = tmp_path / "real_home"
+    (real_home / "Library" / "Keychains").mkdir(parents=True)
+    monkeypatch.setattr(cm.Path, "home", classmethod(lambda cls: real_home))
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+
+    assert cm._stage_keychain_visibility(sandbox) is None
+    assert cm._stage_keychain_visibility(sandbox) is None
+    target = sandbox / "Library" / "Keychains"
+    assert target.is_symlink()
+    # Symlink target should still be the real dir, not a recursive link.
+    assert target.resolve() == (real_home / "Library" / "Keychains").resolve()
+
+
+def test_stage_keychain_visibility_missing_real_keychains(monkeypatch, tmp_path):
+    """If the real ~/Library/Keychains doesn't exist (unusual but
+    possible in CI / fresh accounts), return a reason instead of
+    crashing — the caller treats this as best-effort."""
+    real_home = tmp_path / "real_home"
+    real_home.mkdir()  # no Library/Keychains under it
+    monkeypatch.setattr(cm.Path, "home", classmethod(lambda cls: real_home))
+
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+
+    err = cm._stage_keychain_visibility(sandbox)
+    assert err == "real_keychains_missing"
+    assert not (sandbox / "Library" / "Keychains").exists()
+
+
 def test_refresh_via_oneshot_handles_claude_exit_failure(monkeypatch, tmp_path):
     _force_macos(monkeypatch)
     monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
