@@ -4,8 +4,8 @@
 We can't actually call the macOS ``security`` binary on a Linux / CI
 runner, so the keychain primitives are exercised via
 ``subprocess.run`` / ``asyncio.create_subprocess_exec`` monkey-patches.
-The cache, shim, refresh-oneshot, and the end-to-end refresher fan-out
-are real code paths that run on every platform.
+The cache, refresh path, and end-to-end refresher fan-out are real
+code paths that run on every platform.
 """
 
 from __future__ import annotations
@@ -71,7 +71,6 @@ def test_cache_write_is_atomic(tmp_path):
     cache.write(_BLOB)
     assert cache.path.exists()
     cache.write(_REFRESHED_BLOB)
-    # No leftover tmp files.
     siblings = list(cache.path.parent.glob(".claude-credentials.json.tmp.*"))
     assert siblings == []
     assert cache.read() == _REFRESHED_BLOB
@@ -80,37 +79,16 @@ def test_cache_write_is_atomic(tmp_path):
 def test_cache_access_token_handles_malformed_blob(tmp_path):
     cache = cm.CredentialCache.at(tmp_path)
     cache.path.parent.mkdir(parents=True, exist_ok=True)
-    cache.path.write_text("not json {", encoding="utf-8")
+    cache.path.write_text("not json", encoding="utf-8")
     assert cache.access_token() is None
-    assert cache.expires_at_seconds() is None
 
 
 def test_cache_expires_at_seconds(tmp_path):
     cache = cm.CredentialCache.at(tmp_path)
     cache.write(_BLOB)
-    assert cache.expires_at_seconds() == 9_999_999.000
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PATH shim
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_install_path_shim_writes_executable(tmp_path):
-    d = cm.install_path_shim(tmp_path)
-    binary = d / "security"
-    assert binary.exists()
-    body = binary.read_text(encoding="utf-8")
-    assert body.startswith("#!/bin/bash")
-    assert "delete-generic-password" in body
-    assert "Claude Code-credentials" in body
-    assert "/usr/bin/security" in body
-
-
-def test_install_path_shim_overwrites_existing(tmp_path):
-    d = cm.install_path_shim(tmp_path)
-    (d / "security").write_text("# manually edited", encoding="utf-8")
-    cm.install_path_shim(tmp_path)
-    assert "#!/bin/bash" in (d / "security").read_text(encoding="utf-8")
+    expires = cache.expires_at_seconds()
+    assert expires is not None
+    assert expires == 9_999_999_000 / 1000.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,21 +192,50 @@ def test_bootstrap_writes_cache(monkeypatch, tmp_path):
     assert cache.read() == _BLOB
 
 
-def test_bootstrap_skips_when_cache_warm(monkeypatch, tmp_path):
+def test_bootstrap_overwrites_stale_cache_with_keychain(monkeypatch, tmp_path):
+    """Regression: daemon restart with a stale cache (e.g. the user
+    /login'd while the daemon was off) MUST pull the canonical blob
+    from Keychain on bootstrap, not blindly trust the cache. Otherwise
+    the daemon sync_to_agent fans out the stale RT, the spawned claude
+    workers immediately 401, and the user sees auth errors until the
+    401-wake recovers."""
+    _force_macos(monkeypatch)
+    cache = cm.CredentialCache.at(tmp_path)
+    cache.write(_BLOB)  # stale cache from a previous daemon session
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _FakeCompletedProcess(0, stdout=_REFRESHED_BLOB),
+    )
+    ok, reason = cm.bootstrap_from_keychain(cache)
+    assert ok is True
+    assert reason == "bootstrapped"
+    # Cache now reflects the canonical Keychain blob, not the stale one.
+    assert cache.read() == _REFRESHED_BLOB
+
+
+def test_bootstrap_falls_back_to_cache_when_keychain_read_fails(
+    monkeypatch, tmp_path,
+):
+    """Transient Keychain read failure shouldn't crash the daemon if
+    the cache has plausibly-current credentials — the 5-min external-
+    rotation poll will keep trying. Degraded-mode boot."""
     _force_macos(monkeypatch)
     cache = cm.CredentialCache.at(tmp_path)
     cache.write(_BLOB)
-
-    def _fake_run(*a, **k):
-        raise AssertionError("should not have run security")
-
-    monkeypatch.setattr(subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: _FakeCompletedProcess(1, stderr="transient"),
+    )
     ok, reason = cm.bootstrap_from_keychain(cache)
     assert ok is True
-    assert reason == "cache_already_warm"
+    assert "fell_back_to_cache" in reason
+    # Cache untouched.
+    assert cache.read() == _BLOB
 
 
-def test_bootstrap_propagates_read_error(monkeypatch, tmp_path):
+def test_bootstrap_propagates_read_error_when_no_cache(monkeypatch, tmp_path):
+    """No cache + Keychain unreadable → daemon can't bootstrap. Fail
+    cleanly so the operator sees the cause."""
     _force_macos(monkeypatch)
     monkeypatch.setattr(
         subprocess, "run",
@@ -241,127 +248,30 @@ def test_bootstrap_propagates_read_error(monkeypatch, tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Refresh oneshot — subprocess mocked
+# KeychainBackend — plugged into CredentialRefresher
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _FakeAsyncProc:
-    def __init__(self, returncode: int):
+    def __init__(self, returncode: int, stdout: bytes = b"", stderr: bytes = b""):
         self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
 
     async def communicate(self):
-        return (b"", b"")
+        return (self._stdout, self._stderr)
 
     def kill(self):
         pass
 
 
-def test_refresh_via_oneshot_rotates_token(monkeypatch, tmp_path):
-    _force_macos(monkeypatch)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
-    cache = cm.CredentialCache.at(tmp_path)
-    cache.write(_BLOB)
-
-    sandbox_seen = {}
-
-    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
-        sandbox_seen["cwd"] = cwd
-        sandbox_seen["env"] = env
-        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
-        sandbox_creds.write_text(_REFRESHED_BLOB, encoding="utf-8")
-        return _FakeAsyncProc(0)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
-
-    ok, reason = asyncio.run(
-        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
-    )
-    assert ok is True
-    assert reason == "token_refreshed"
-    assert cache.access_token() == "sk-ant-NEW-access"
-    # Must NOT set CLAUDE_CODE_OAUTH_TOKEN — that env var triggers the
-    # bug #37512 Keychain-delete path on exit.
-    assert "CLAUDE_CODE_OAUTH_TOKEN" not in (sandbox_seen.get("env") or {})
-    # PATH must include the shim dir.
-    path_val = (sandbox_seen.get("env") or {}).get("PATH", "")
-    assert str(tmp_path / "shim") in path_val
-
-
-def test_refresh_via_oneshot_token_unchanged(monkeypatch, tmp_path):
-    _force_macos(monkeypatch)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
-    cache = cm.CredentialCache.at(tmp_path)
-    cache.write(_BLOB)
-
-    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
-        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
-        sandbox_creds.write_text(_BLOB, encoding="utf-8")
-        return _FakeAsyncProc(0)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
-    ok, reason = asyncio.run(
-        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
-    )
-    assert ok is True
-    assert reason == "token_unchanged"
-
-
-def test_refresh_via_oneshot_handles_claude_exit_failure(monkeypatch, tmp_path):
-    _force_macos(monkeypatch)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
-    cache = cm.CredentialCache.at(tmp_path)
-    cache.write(_BLOB)
-
-    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
-        return _FakeAsyncProc(1)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
-    ok, reason = asyncio.run(
-        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
-    )
-    assert ok is False
-    assert reason == "claude_exit_code=1"
-
-
-def test_refresh_via_oneshot_skipped_off_macos(monkeypatch, tmp_path):
-    _disable_macos(monkeypatch)
-    cache = cm.CredentialCache.at(tmp_path)
-    cache.write(_BLOB)
-    ok, reason = asyncio.run(
-        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
-    )
-    assert ok is False
-    assert reason == "not_macos"
-
-
-def test_refresh_via_oneshot_skipped_when_claude_missing(monkeypatch, tmp_path):
-    _force_macos(monkeypatch)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: None)
-    cache = cm.CredentialCache.at(tmp_path)
-    cache.write(_BLOB)
-    ok, reason = asyncio.run(
-        cm.refresh_via_oneshot(cache, tmp_path / "shim"),
-    )
-    assert ok is False
-    assert reason == "claude_binary_missing"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# KeychainBackend — plugged into CredentialRefresher
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _make_keychain_backend(home: Path) -> cr.KeychainBackend:
     cache = cm.CredentialCache.at(home)
-    return cr.KeychainBackend(
-        home=home, cache=cache, shim_dir=home / "run" / "keychain-shim",
-    )
+    return cr.KeychainBackend(home=home, cache=cache)
 
 
-def test_keychain_backend_bootstrap_installs_shim_and_reads_keychain(
-    monkeypatch, tmp_path,
-):
-    """``bootstrap`` should populate the cache from Keychain and
-    install the PATH shim. The refresher calls this once on
-    daemon-loop entry."""
+def test_keychain_backend_bootstrap_reads_keychain(monkeypatch, tmp_path):
+    """``bootstrap`` should populate the cache from Keychain. The
+    refresher calls this once on daemon-loop entry."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
     monkeypatch.setattr(
         subprocess, "run",
@@ -371,10 +281,7 @@ def test_keychain_backend_bootstrap_installs_shim_and_reads_keychain(
     ok, reason = asyncio.run(backend.bootstrap())
     assert ok is True
     assert reason == "bootstrapped"
-    # Cache materialised from the Keychain.
     assert backend.cache.read() == _BLOB
-    # Shim installed.
-    assert (tmp_path / "run" / "keychain-shim" / "security").exists()
     # Internal last-propagated marker populated so the external-poll
     # loop has a baseline to diff against.
     assert backend._last_propagated_blob == _BLOB
@@ -445,56 +352,70 @@ def test_keychain_backend_sync_skips_when_cache_empty(tmp_path, monkeypatch):
     assert not (agent_home / ".claude" / ".credentials.json").exists()
 
 
-def test_keychain_backend_refresh_returns_refreshed_on_token_rotation(
-    monkeypatch, tmp_path,
-):
-    """Backend refresh: cache → refresh oneshot → cache write →
-    writeback to Keychain (best-effort). Returns REFRESHED when the
-    access token actually rotated."""
-    monkeypatch.setattr(cm, "is_macos", lambda: True)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
+def _stub_keychain_sequence(monkeypatch, blobs):
+    """Stub ``cm.read_keychain_blob`` to return successive blobs from
+    ``blobs`` on each call (last one repeats if exhausted)."""
+    queue = list(blobs)
 
-    backend = _make_keychain_backend(tmp_path)
-    backend.cache.write(_BLOB)
+    def fake_read(timeout=cm.SECURITY_TIMEOUT_SECONDS):
+        blob = queue.pop(0) if len(queue) > 1 else queue[0]
+        return cm.KeychainReadResult(True, blob, None, None)
+
+    monkeypatch.setattr(cm, "read_keychain_blob", fake_read)
+
+
+def test_keychain_backend_refresh_uses_real_home(monkeypatch, tmp_path):
+    """KeychainBackend.refresh must spawn ``claude --print`` with the
+    user's real HOME (NOT a sandbox HOME) — mirrors FileBackend so
+    claude's own OAuth path writes Keychain directly the same way the
+    user's interactive ``claude`` invocation does."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+
+    spawned = {}
 
     async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
-        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
-        sandbox_creds.write_text(_REFRESHED_BLOB, encoding="utf-8")
+        spawned["env"] = env
+        spawned["cwd"] = cwd
+        spawned["argv"] = args
         return _FakeAsyncProc(0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    # First Keychain read returns the pre-refresh blob; second returns
+    # the post-refresh (rotated) blob.
+    _stub_keychain_sequence(monkeypatch, [_BLOB, _REFRESHED_BLOB])
 
-    writeback_calls: list = []
-
-    def _fake_writeback(blob, timeout=cm.SECURITY_TIMEOUT_SECONDS):
-        writeback_calls.append(blob)
-        return (True, None)
-
-    monkeypatch.setattr(cm, "writeback_to_keychain", _fake_writeback)
+    backend = _make_keychain_backend(tmp_path)
+    backend.cache.write(_BLOB)
 
     outcome = asyncio.run(backend.refresh())
     assert outcome == cr.RefreshOutcome.REFRESHED
-    assert backend.cache.access_token() == "sk-ant-NEW-access"
-    assert writeback_calls == [_REFRESHED_BLOB]
+    # HOME = real user HOME, not a sandbox tempdir.
+    assert spawned["env"]["HOME"] == str(Path.home())
+    assert spawned["cwd"] == str(Path.home())
+    # Sentinel against #37512 regression — must never set this env var.
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in spawned["env"]
+    # Cache is now synced to the rotated blob (read straight from Keychain).
+    assert backend.cache.read() == _REFRESHED_BLOB
     assert backend._last_propagated_blob == _REFRESHED_BLOB
 
 
-def test_keychain_backend_refresh_returns_unchanged_when_token_stays(
+def test_keychain_backend_refresh_returns_unchanged_when_token_stays_fresh(
     monkeypatch, tmp_path,
 ):
+    """When claude sees the token isn't close to expiring, it skips
+    the OAuth round-trip and Keychain stays put. Backend reports
+    UNCHANGED, not FAILED."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
 
-    backend = _make_keychain_backend(tmp_path)
-    backend.cache.write(_BLOB)
-
-    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
-        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
-        sandbox_creds.write_text(_BLOB, encoding="utf-8")  # same blob back
+    async def _fake_spawn(*args, **kwargs):
         return _FakeAsyncProc(0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    # Same blob both reads → Keychain unchanged.
+    _stub_keychain_sequence(monkeypatch, [_BLOB, _BLOB])
 
+    backend = _make_keychain_backend(tmp_path)
+    backend.cache.write(_BLOB)
     outcome = asyncio.run(backend.refresh())
     assert outcome == cr.RefreshOutcome.UNCHANGED
 
@@ -503,18 +424,43 @@ def test_keychain_backend_refresh_returns_failed_on_claude_exit_failure(
     monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(cm, "is_macos", lambda: True)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
 
-    backend = _make_keychain_backend(tmp_path)
-    backend.cache.write(_BLOB)
-
-    async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
-        return _FakeAsyncProc(1)
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeAsyncProc(1, stderr=b"boom")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
 
+    backend = _make_keychain_backend(tmp_path)
+    backend.cache.write(_BLOB)
     outcome = asyncio.run(backend.refresh())
     assert outcome == cr.RefreshOutcome.FAILED
+
+
+def test_keychain_backend_refresh_returns_failed_on_post_keychain_read_failure(
+    monkeypatch, tmp_path,
+):
+    """claude exits 0 but the post-refresh Keychain re-read fails (e.g.
+    transient permission issue). Don't poison the cache — return
+    FAILED so the daemon retries on the next tick."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeAsyncProc(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            False, None, "exit_code=44", None,
+        ),
+    )
+
+    backend = _make_keychain_backend(tmp_path)
+    backend.cache.write(_BLOB)
+    outcome = asyncio.run(backend.refresh())
+    assert outcome == cr.RefreshOutcome.FAILED
+    # Cache must not have been clobbered.
+    assert backend.cache.read() == _BLOB
 
 
 def test_keychain_backend_poll_external_rotation_detects_change(
@@ -584,7 +530,20 @@ def test_refresher_with_keychain_backend_fans_sync_to_registered_agents(
     plumbed through the backend abstraction."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
     backend = _make_keychain_backend(tmp_path)
-    backend.cache.write(_BLOB)
+    # Seed with a blob whose expiresAt is comfortably outside the
+    # refresh safety margin, so _tick goes straight to _sync_views
+    # without trying to spawn claude — otherwise the test would either
+    # spawn the real binary (polluting tester credentials!) or need a
+    # subprocess monkeypatch we don't care about here.
+    import time as _time
+    far_future_blob = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "x",
+            "refreshToken": "y",
+            "expiresAt": int((_time.time() + 24 * 3600) * 1000),  # +24h
+        },
+    })
+    backend.cache.write(far_future_blob)
     refresher = cr.CredentialRefresher(backend=backend)
 
     agent_a = tmp_path / "agent-a"
@@ -594,19 +553,17 @@ def test_refresher_with_keychain_backend_fans_sync_to_registered_agents(
 
     asyncio.run(refresher._tick())
 
-    assert (agent_a / ".claude" / ".credentials.json").read_text() == _BLOB
-    assert (agent_b / ".claude" / ".credentials.json").read_text() == _BLOB
+    assert (agent_a / ".claude" / ".credentials.json").read_text() == far_future_blob
+    assert (agent_b / ".claude" / ".credentials.json").read_text() == far_future_blob
 
 
 def test_refresher_with_keychain_backend_refreshes_when_close_to_expiry(
     monkeypatch, tmp_path,
 ):
     """Cache blob expiring soon → refresher triggers
-    backend.refresh()."""
+    backend.refresh() with real HOME (mirror FileBackend)."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
     backend = _make_keychain_backend(tmp_path)
-    # Seed with a blob expiring in 1 minute (well inside the 10-min margin).
     import time as _time
     soon_expiry = int((_time.time() + 60) * 1000)
     near_expiry_blob = json.dumps({
@@ -622,71 +579,19 @@ def test_refresher_with_keychain_backend_refreshes_when_close_to_expiry(
 
     async def _fake_spawn(*args, env=None, cwd=None, **kwargs):
         spawned.append(env)
-        # Pretend claude wrote a rotated blob.
-        sandbox_creds = Path(cwd) / ".claude" / ".credentials.json"
-        sandbox_creds.write_text(_REFRESHED_BLOB, encoding="utf-8")
         return _FakeAsyncProc(0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
-    monkeypatch.setattr(cm, "writeback_to_keychain", lambda *a, **k: (True, None))
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            True, _REFRESHED_BLOB, None, None,
+        ),
+    )
 
     refresher = cr.CredentialRefresher(backend=backend)
     asyncio.run(refresher._tick())
     assert spawned, "backend.refresh should have run claude --print"
-    # Refresh ran inside a sandbox HOME (not the operator's), so HOME
-    # must be a tempdir, not host_home.
+    # Refresh uses real HOME — same model as FileBackend.
     env = spawned[0]
-    assert "HOME" in env
-    assert env["HOME"] != str(Path.home())
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FD-leak regression — timeout path drains pipes
-# ─────────────────────────────────────────────────────────────────────────────
-
-def test_timeout_path_kills_proc_and_drains_pipes(monkeypatch, tmp_path):
-    """The previous timeout path returned without awaiting proc.wait()
-    + pipe close, leaking 3 FDs (stdin/stdout/stderr) per timed-out
-    refresh. Under multi-agent load this surfaced as ``[Errno 24]
-    Too many open files``. Verify the helper kills + drains."""
-    monkeypatch.setattr(cm.shutil, "which", lambda b: "/usr/local/bin/claude")
-
-    kill_called = {"value": False}
-    drain_calls = {"value": 0}
-
-    class _HangingProc:
-        returncode = None  # alive
-
-        async def communicate(self):
-            if drain_calls["value"] == 0:
-                drain_calls["value"] += 1
-                await asyncio.sleep(60)
-                return (b"", b"")
-            drain_calls["value"] += 1
-            self.returncode = -9
-            return (b"", b"")
-
-        def kill(self):
-            kill_called["value"] = True
-
-        async def wait(self):
-            self.returncode = -9
-
-    async def _fake_spawn(*args, **kwargs):
-        return _HangingProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
-
-    async def _drive():
-        return await cm._run_claude_oneshot(
-            env={}, cwd=str(tmp_path), timeout=0.1,
-        )
-
-    rc, err = asyncio.run(_drive())
-    assert rc is None
-    assert err == "refresh_oneshot_timeout"
-    assert kill_called["value"], "proc.kill() must run on timeout"
-    assert drain_calls["value"] == 2, (
-        "expected one wait_for'd communicate() + one drain communicate() "
-        "after kill — got %d" % drain_calls["value"]
-    )
+    assert env["HOME"] == str(Path.home())

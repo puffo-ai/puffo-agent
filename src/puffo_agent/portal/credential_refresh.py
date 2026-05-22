@@ -379,6 +379,15 @@ class KeychainBackend:
     agent via per-agent file copies (Keychain ACL is keyed on UID +
     signing identity, not HOME, so a symlink trick wouldn't help).
 
+    Refresh strategy: identical to ``FileBackend`` — run
+    ``claude --print "ok"`` with the *real* user HOME and let claude's
+    own OAuth path read Keychain, rotate against Anthropic if expired,
+    and write the rotated blob back to Keychain. This is exactly what
+    the operator's interactive ``claude`` invocation does, so we share
+    its battle-tested refresh code path instead of reinventing it via
+    sandbox + cache-seeding (which proved fragile: see the keychain.py
+    module docstring for the failure modes).
+
     External-rotation poll: every ``KEYCHAIN_POLL_INTERVAL_SECONDS``
     (5 min), re-read the Keychain (silent after the first
     "Always Allow" grant) and compare to the last-known blob. On
@@ -392,11 +401,9 @@ class KeychainBackend:
         self,
         home: Path,
         cache,  # ..macos.keychain.CredentialCache
-        shim_dir: Path,
     ):
         self.home = home
         self.cache = cache
-        self.shim_dir = shim_dir
         # Last blob propagated to agents — cheap byte-equality key so
         # the poll loop only fans out on real changes.
         self._last_propagated_blob: Optional[str] = None
@@ -429,34 +436,99 @@ class KeychainBackend:
         return int(ms / 1000 - time.time())
 
     async def refresh(self) -> RefreshOutcome:
-        from ..macos.keychain import (
-            refresh_via_oneshot,
-            writeback_to_keychain,
-        )
+        from ..macos.keychain import read_keychain_blob
 
-        before = self.cache.read()
-        ok, reason = await refresh_via_oneshot(self.cache, self.shim_dir)
-        if not ok:
+        # Snapshot Keychain before claude runs so we can byte-compare
+        # after. Cache.read() is not enough — agent processes may have
+        # rotated Keychain externally between ticks and the cache is a
+        # lagging mirror.
+        kr_before = read_keychain_blob()
+        before_blob = kr_before.blob if kr_before.ok else None
+
+        # Real user HOME — claude reads Keychain, refreshes if expired,
+        # writes back to Keychain. Identical pattern to FileBackend.
+        # cwd=host_home so claude's project-resolution lands in the
+        # operator's normal working dir (matches single-process /login
+        # UX) instead of wherever the daemon was launched from.
+        host_home = Path.home()
+        env = {**os.environ, "HOME": str(host_home)}
+        cmd = [
+            "claude", "--dangerously-skip-permissions",
+            "--print", "--max-turns", "1",
+            "--output-format", "stream-json", "--verbose",
+            "ok",
+        ]
+        started = time.time()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+                cwd=str(host_home),
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=REFRESH_ONESHOT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
             logger.warning(
-                "claude credential refresh failed: %s", reason,
+                "claude credential refresh timed out after %ds",
+                REFRESH_ONESHOT_TIMEOUT_SECONDS,
             )
             return RefreshOutcome.FAILED
-        logger.info("claude credential refresh: %s", reason)
-        after = self.cache.read()
-        if after and after != before:
-            # Push the rotated blob back to Keychain best-effort so the
-            # operator's main CLI / VS Code extension see the new token.
-            wb_ok, wb_reason = writeback_to_keychain(after)
-            if wb_ok:
-                logger.info("claude credential writeback to keychain: ok")
-            else:
-                logger.info(
-                    "claude credential writeback to keychain skipped: %s",
-                    wb_reason,
-                )
-            self._last_propagated_blob = after
-            return RefreshOutcome.REFRESHED
-        return RefreshOutcome.UNCHANGED
+        except FileNotFoundError:
+            logger.warning(
+                "claude credential refresh: claude binary missing on PATH"
+            )
+            return RefreshOutcome.FAILED
+        elapsed = time.time() - started
+
+        if proc.returncode != 0:
+            err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
+            logger.warning(
+                "claude credential refresh rc=%d in %.1fs | stdout: %s | stderr: %s",
+                proc.returncode, elapsed, out_tail, err_tail,
+            )
+            return RefreshOutcome.FAILED
+
+        # Pull the post-refresh blob straight from Keychain — that's
+        # where claude wrote it. Then sync our cache so agent fan-out
+        # has fresh bytes.
+        kr_after = read_keychain_blob()
+        if not kr_after.ok or not kr_after.blob:
+            logger.warning(
+                "claude credential refresh exit=0 but Keychain re-read "
+                "failed (%s); cache untouched",
+                kr_after.error,
+            )
+            return RefreshOutcome.FAILED
+        try:
+            self.cache.write(kr_after.blob)
+        except OSError as exc:
+            logger.warning(
+                "claude credential refresh: cache write failed: %s", exc,
+            )
+
+        # Byte-compare the Keychain blob before and after. Anything
+        # else (e.g. comparing int(expires_in_seconds)) loses
+        # sub-second resolution to time.time()'s fractional part.
+        if before_blob is not None and before_blob == kr_after.blob:
+            logger.info(
+                "claude credential refresh ok in %.1fs but Keychain "
+                "unchanged — token was still fresh; claude skipped the "
+                "OAuth round-trip",
+                elapsed,
+            )
+            return RefreshOutcome.UNCHANGED
+
+        self._last_propagated_blob = kr_after.blob
+        logger.info(
+            "claude credential refresh ok in %.1fs (Keychain rotated)",
+            elapsed,
+        )
+        return RefreshOutcome.REFRESHED
 
     def sync_to_agent(self, agent_home: Path) -> None:
         """Atomic-write the cache blob to the agent's per-agent
@@ -486,12 +558,8 @@ class KeychainBackend:
             )
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
-        from ..macos.keychain import (
-            bootstrap_from_keychain,
-            install_path_shim,
-        )
+        from ..macos.keychain import bootstrap_from_keychain
 
-        install_path_shim(self.home)
         ok, reason = bootstrap_from_keychain(self.cache)
         if ok:
             self._last_propagated_blob = self.cache.read()

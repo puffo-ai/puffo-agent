@@ -34,6 +34,14 @@ _BLOB = json.dumps({
     },
 })
 
+_BLOB_NEW = json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-ant-NEW",
+        "refreshToken": "rt-NEW",
+        "expiresAt": 9_999_999_500,
+    },
+})
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Report rendering
@@ -94,6 +102,12 @@ def test_summarise_blob_handles_invalid_json():
     assert "invalid JSON" in summary
 
 
+def test_access_token_extraction():
+    assert diag._access_token(_BLOB) == "sk-ant-AAAA"
+    assert diag._access_token("not json") == ""
+    assert diag._access_token(json.dumps({})) == ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Off-macOS: every probe returns SKIPPED cleanly
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,13 +133,6 @@ def test_refresh_flush_skipped_off_macos(monkeypatch):
     assert rpt.overall() == diag.VERDICT_SKIPPED
 
 
-def test_keychain_survives_token_env_skipped_off_macos(monkeypatch):
-    monkeypatch.setattr(cm, "is_macos", lambda: False)
-    monkeypatch.setattr(diag, "is_macos", lambda: False)
-    rpt = diag.probe_keychain_survives_token_env()
-    assert rpt.overall() == diag.VERDICT_SKIPPED
-
-
 def test_full_probe_off_macos(monkeypatch):
     monkeypatch.setattr(cm, "is_macos", lambda: False)
     monkeypatch.setattr(diag, "is_macos", lambda: False)
@@ -136,7 +143,7 @@ def test_full_probe_off_macos(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# On-macOS: keychain-read happy path with mocked subprocess
+# On-macOS: keychain-read / keychain-write happy path with mocked subprocess
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _FakeCompletedProcess:
@@ -172,55 +179,80 @@ def test_keychain_write_roundtrip_success(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Forced-expiry helpers
+# refresh-flush — passive probe over real HOME
+#
+# Pre-fix the probe ran claude in a sandbox HOME with a seeded
+# .credentials.json and inspected the sandbox file after; that turned
+# out to be fragile (claude deletes the sandbox file on exit, security
+# CLI's HOME-relative keychain lookup fires loginKC:queryCreate). The
+# new design mirrors production: real HOME, then re-read Keychain to
+# see if the access_token rotated.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_force_expiry_mutates_expires_at():
-    import time
-    out = diag._force_expiry(_BLOB, seconds_in_past=120)
-    assert out is not None
-    parsed = json.loads(out)
-    expires_ms = parsed["claudeAiOauth"]["expiresAt"]
-    # expiresAt should now be in the past (within the last few seconds).
-    assert expires_ms < int(time.time() * 1000)
-    # accessToken and refreshToken should be preserved verbatim — we only
-    # touched expiresAt.
-    assert parsed["claudeAiOauth"]["accessToken"] == "sk-ant-AAAA"
-    assert parsed["claudeAiOauth"]["refreshToken"] == "rt-BBBB"
+def _force_macos_for_probe(monkeypatch):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(diag, "is_macos", lambda: True)
+    monkeypatch.setattr(diag.shutil, "which", lambda b: "/usr/local/bin/claude")
 
 
-def test_force_expiry_rejects_malformed_blob():
-    assert diag._force_expiry("not json") is None
+def _stub_keychain_reads(monkeypatch, prerequisite_blob, post_blob):
+    """Stub ``read_keychain_blob`` so the prerequisite read returns one
+    blob and the post-claude-run read returns another."""
+    calls = {"n": 0}
+
+    def fake_read(timeout=cm.SECURITY_TIMEOUT_SECONDS):
+        calls["n"] += 1
+        blob = prerequisite_blob if calls["n"] == 1 else post_blob
+        return cm.KeychainReadResult(True, blob, None, None)
+
+    monkeypatch.setattr(diag, "read_keychain_blob", fake_read)
 
 
-def test_force_expiry_rejects_missing_oauth_dict():
-    assert diag._force_expiry(json.dumps({"unrelated": 1})) is None
+def _stub_subprocess(monkeypatch, *, rc, env_captured=None):
+    """Stub the ``claude --print`` subprocess to exit with the given
+    rc. Optionally capture the env dict it was launched with."""
+    def fake_run(*args, env=None, cwd=None, **kwargs):
+        if env_captured is not None:
+            env_captured["env"] = env
+            env_captured["cwd"] = cwd
+        return _FakeCompletedProcess(rc, stdout="", stderr="")
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
 
-def test_access_token_extraction():
-    assert diag._access_token(_BLOB) == "sk-ant-AAAA"
-    assert diag._access_token("not json") == ""
-    assert diag._access_token(json.dumps({})) == ""
+def test_refresh_flush_reports_rotation_on_token_change(monkeypatch):
+    _force_macos_for_probe(monkeypatch)
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB_NEW)
+    captured = {}
+    _stub_subprocess(monkeypatch, rc=0, env_captured=captured)
+
+    rpt = diag.probe_refresh_flush()
+    body = rpt.render_markdown()
+
+    assert rpt.overall() == diag.VERDICT_OK, body
+    assert "token rotated: True" in body
+    # Must use real HOME — mirror production.
+    assert captured["env"]["HOME"] == str(Path.home())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# refresh-flush-forced subcommand
-# ─────────────────────────────────────────────────────────────────────────────
+def test_refresh_flush_reports_needs_attention_when_token_stays(monkeypatch):
+    """Token is still fresh, so claude correctly skips OAuth. Report
+    NEEDS_ATTENTION (not FAIL) with an explanation."""
+    _force_macos_for_probe(monkeypatch)
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB)
+    _stub_subprocess(monkeypatch, rc=0)
 
-def test_refresh_flush_forced_skipped_off_macos(monkeypatch):
-    monkeypatch.setattr(cm, "is_macos", lambda: False)
-    monkeypatch.setattr(diag, "is_macos", lambda: False)
-    rpt = diag.probe_refresh_flush_forced()
-    assert rpt.overall() == diag.VERDICT_SKIPPED
+    rpt = diag.probe_refresh_flush()
+    body = rpt.render_markdown()
+
+    assert rpt.overall() == diag.VERDICT_NEEDS_ATTENTION, body
+    assert "token rotated: False" in body
+    assert "current token is still valid" in body
 
 
-def test_refresh_flush_forced_requires_yes_flag(monkeypatch, capsys):
-    """The forced subcommand has destructive side effects; without
-    --yes it must refuse and exit non-zero."""
-    import argparse
-    ns = argparse.Namespace(yes=False)
-    code = diag.cmd_test_refresh_flush_forced(ns)
-    assert code == 2
-    captured = capsys.readouterr()
-    assert "rotates" in captured.err.lower()
-    assert "--yes" in captured.err
+def test_refresh_flush_reports_fail_on_claude_nonzero_exit(monkeypatch):
+    _force_macos_for_probe(monkeypatch)
+    _stub_keychain_reads(monkeypatch, _BLOB, _BLOB)
+    _stub_subprocess(monkeypatch, rc=1)
+
+    rpt = diag.probe_refresh_flush()
+    assert rpt.overall() == diag.VERDICT_FAIL
