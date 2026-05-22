@@ -470,16 +470,18 @@ def test_local_cli_hermes_verify_raises_when_host_config_missing(monkeypatch, tm
         agent_home_dir=str(tmp_path / "agent"),
         harness=HermesHarness(),
     )
-    with pytest.raises(RuntimeError, match="hermes setup"):
+    with pytest.raises(RuntimeError, match="hermes installer"):
         adapter._verify()
 
 
 def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
-    """First successful ``_verify`` copies ``config.yaml`` and
-    ``.env`` from the host HERMES_HOME into the per-agent
-    ``HERMES_HOME``. ``state.db`` deliberately does NOT get copied —
-    each agent gets a fresh session/memory store.
+    """First successful ``_verify`` copies ``.env`` from the host
+    HERMES_HOME and seeds config.yaml; ``state.db`` deliberately
+    does NOT get copied — each agent gets a fresh session/memory
+    store. Model/provider get pinned from agent.yml — see
+    ``test_local_cli_hermes_pins_model_from_agent_yml``.
     """
+    import yaml as _yaml
     from puffo_agent.agent.adapters import local_cli as local_cli_mod
     fake_bin = tmp_path / "hermes"
     fake_bin.write_text("#!/bin/sh\n")
@@ -487,7 +489,9 @@ def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
 
     host_hermes = tmp_path / "host_hermes"
     host_hermes.mkdir()
-    (host_hermes / "config.yaml").write_text("provider: anthropic\n")
+    (host_hermes / "config.yaml").write_text(
+        "model:\n  default: gpt-5.5\n  provider: openai\n"
+    )
     (host_hermes / ".env").write_text("ANTHROPIC_API_KEY=sk-test\n")
     (host_hermes / "state.db").write_bytes(b"PERSONAL_DATA")
     monkeypatch.setenv("HERMES_HOME", str(host_hermes))
@@ -495,7 +499,7 @@ def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
     agent_home = tmp_path / "agent"
     adapter = local_cli_mod.LocalCLIAdapter(
         agent_id="t",
-        model="",
+        model="claude-sonnet-4-6",
         workspace_dir=str(tmp_path / "ws"),
         claude_dir=str(tmp_path / "ws" / ".claude"),
         session_file=str(tmp_path / "sess.json"),
@@ -506,10 +510,56 @@ def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
     adapter._verify()
 
     per_agent = agent_home / ".hermes"
-    assert (per_agent / "config.yaml").read_text() == "provider: anthropic\n"
+    cfg = _yaml.safe_load((per_agent / "config.yaml").read_text())
+    # Model section was pinned from agent.yml's runtime.model — the
+    # host template's gpt-5.5/openai is overridden.
+    assert cfg["model"]["default"] == "claude-sonnet-4-6"
+    assert cfg["model"]["provider"] == "anthropic"
     assert (per_agent / ".env").read_text() == "ANTHROPIC_API_KEY=sk-test\n"
     # Operator's chat history must stay in the operator's HOME.
     assert not (per_agent / "state.db").exists()
+
+
+def test_local_cli_hermes_pins_model_from_agent_yml(monkeypatch, tmp_path):
+    """``_pin_hermes_model`` rewrites the per-agent config.yaml's
+    ``model.default`` + ``model.provider`` on every verify, so
+    operators don't need ``hermes setup`` and each agent can carry
+    its own model/provider without polluting the host's choice.
+    """
+    import yaml as _yaml
+    from puffo_agent.agent.adapters import local_cli as local_cli_mod
+    fake_bin = tmp_path / "hermes"
+    fake_bin.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
+
+    # Host config picks anthropic + claude-sonnet but agent.yml asks
+    # for a provider-prefixed openai model — pin should override.
+    host_hermes = tmp_path / "host_hermes"
+    host_hermes.mkdir()
+    (host_hermes / "config.yaml").write_text(
+        "model:\n  default: claude-sonnet-4-6\n  provider: anthropic\n"
+        "agent:\n  max_turns: 90\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(host_hermes))
+
+    agent_home = tmp_path / "agent"
+    adapter = local_cli_mod.LocalCLIAdapter(
+        agent_id="t",
+        model="openai/gpt-4o",
+        workspace_dir=str(tmp_path / "ws"),
+        claude_dir=str(tmp_path / "ws" / ".claude"),
+        session_file=str(tmp_path / "sess.json"),
+        mcp_config_file=str(tmp_path / "mcp.json"),
+        agent_home_dir=str(agent_home),
+        harness=HermesHarness(),
+    )
+    adapter._verify()
+
+    cfg = _yaml.safe_load((agent_home / ".hermes" / "config.yaml").read_text())
+    assert cfg["model"]["default"] == "gpt-4o"
+    assert cfg["model"]["provider"] == "openai"
+    # Other host-template sections survive the pin.
+    assert cfg["agent"]["max_turns"] == 90
 
 
 def test_host_hermes_home_respects_env_var(monkeypatch, tmp_path):

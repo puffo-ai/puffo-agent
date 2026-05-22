@@ -357,7 +357,11 @@ runtime:
    ```
    (Windows: see Hermes README for the PowerShell install line; native Windows is upstream early-beta — WSL2 is the most-tested path.)
 
-2. **Run `hermes setup` once on the host** so `~/.hermes/config.yaml` and `~/.hermes/.env` (provider keys) exist. The daemon copies these into each agent's per-agent `HERMES_HOME=~/.puffo-agent/agents/<id>/.hermes/` on first verify, so every agent inherits your provider choice without sharing your chat history.
+   The installer creates `~/.hermes/config.yaml` + `~/.hermes/.env` from templates. **You don't need to run `hermes setup`** — puffo-agent overrides `model.default` + `model.provider` from your `agent.yml` on every verify, so the model/provider choice lives in puffo-agent's config and the per-agent `HERMES_HOME` gets re-pinned on each daemon start.
+
+2. **Provider credentials** (pick one):
+   - **Anthropic** (default for hermes harness): run `claude login` on the host once — hermes reads `~/.claude/.credentials.json` directly, no API key needed.
+   - **Other providers** (OpenRouter, OpenAI, NovitaAI, etc.): export the relevant key (`OPENROUTER_API_KEY`, etc.) in the daemon's environment, or put it in `~/.hermes/.env` (the daemon copies it into each agent's per-agent `HERMES_HOME` on first verify).
 
 3. **(optional) `PUFFO_HERMES_BIN`** env var if `hermes` isn't on the daemon's `$PATH` — e.g. `launchd` / systemd contexts where `~/.local/bin` isn't inherited.
 

@@ -364,8 +364,7 @@ class LocalCLIAdapter(Adapter):
 
     def _verify_hermes(self) -> None:
         """Resolve hermes binary + seed per-agent HERMES_HOME from
-        the host's. Both checks fail loud so the daemon log names
-        what's wrong."""
+        the host's template + pin model/provider from agent.yml."""
         bin_path = resolve_hermes_bin()
         if bin_path is None:
             raise RuntimeError(
@@ -385,11 +384,13 @@ class LocalCLIAdapter(Adapter):
         if not host_config.is_file():
             raise RuntimeError(
                 f"agent {self.agent_id!r}: ``{host_config}`` missing — "
-                "run ``hermes setup`` on the host first."
+                "hermes installer should have created it. Re-run the "
+                "install one-liner from the README."
             )
 
         self._hermes_home = self.agent_home_dir / ".hermes"
         self._seed_hermes_home(host_hermes_home, self._hermes_home)
+        self._pin_hermes_model(self._hermes_home / "config.yaml")
         self._hermes_audit = AuditLog(
             Path(self.workspace_dir) / ".puffo-agent" / "audit.log",
             self.agent_id,
@@ -397,9 +398,9 @@ class LocalCLIAdapter(Adapter):
         self._log_host_runtime_banner()
 
     def _seed_hermes_home(self, host_dir: Path, agent_dir: Path) -> None:
-        """Copy ``config.yaml`` + ``.env`` from the host's HERMES_HOME
-        on first verify. ``state.db`` is deliberately not copied —
-        each agent gets fresh session/memory state."""
+        """Idempotent copy of ``config.yaml`` + ``.env`` from the
+        host's HERMES_HOME. ``state.db`` is deliberately not copied
+        so each agent gets fresh session/memory state."""
         agent_dir.mkdir(parents=True, exist_ok=True)
         for filename in ("config.yaml", ".env"):
             src = host_dir / filename
@@ -417,6 +418,49 @@ class LocalCLIAdapter(Adapter):
                     "agent %s: couldn't seed %s: %s",
                     self.agent_id, src, exc,
                 )
+
+    def _pin_hermes_model(self, config_path: Path) -> None:
+        """Rewrite ``model.default`` + ``model.provider`` from
+        agent.yml's runtime config every verify. Lets puffo-agent
+        own the model/provider choice without operators needing to
+        run ``hermes setup``."""
+        provider, default = self._hermes_provider_and_model()
+        import yaml
+        try:
+            with config_path.open("r", encoding="utf-8") as fh:
+                config = yaml.safe_load(fh) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(
+                "agent %s: couldn't read %s to pin model: %s",
+                self.agent_id, config_path, exc,
+            )
+            return
+        model = config.setdefault("model", {})
+        if model.get("default") == default and model.get("provider") == provider:
+            return
+        model["default"] = default
+        model["provider"] = provider
+        try:
+            with config_path.open("w", encoding="utf-8") as fh:
+                yaml.safe_dump(config, fh, sort_keys=False)
+            logger.info(
+                "agent %s: pinned hermes model to %s/%s",
+                self.agent_id, provider, default,
+            )
+        except OSError as exc:
+            logger.warning(
+                "agent %s: couldn't write %s: %s",
+                self.agent_id, config_path, exc,
+            )
+
+    def _hermes_provider_and_model(self) -> tuple[str, str]:
+        """Split ``hermes_model_id(self.model)`` into (provider, model)
+        — the shape hermes' ``config.yaml`` expects."""
+        spec = hermes_model_id(self.model)
+        if "/" in spec:
+            provider, _, default = spec.partition("/")
+            return provider, default
+        return "anthropic", spec
 
     async def _run_hermes_turn(
         self,
