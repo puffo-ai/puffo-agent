@@ -458,27 +458,17 @@ class DockerCLIAdapter(Adapter):
             self.agent_id, elapsed, len(reply), session_id or "?",
             has_prior_session,
         )
-        # Mirror the claude-code contract: when send_message was
-        # called via MCP, populate ``send_message_targets`` so the
-        # daemon's core.py skips the fallback post. Detection here
-        # piggybacks on the ``🔧 Auto-repaired`` banner, so it only
-        # fires when hermes had to rewrite the LLM's emitted tool
-        # name — see _run_hermes_turn in local_cli.py for the same
-        # band-aid + limitation note.
-        metadata: dict = {
-            "harness": "hermes",
-            "session_id": session_id,
-            "tools_invoked": tool_calls,
-        }
-        if any("send_message" in name for name in tool_calls):
-            metadata["send_message_targets"] = [
-                {"channel": "", "root_id": ""} for _ in tool_calls
-                if "send_message" in _
-            ]
+        # Always silent — see ``_run_hermes_turn`` in local_cli.py.
         return TurnResult(
-            reply=reply,
+            reply="",
             tool_calls=len(tool_calls),
-            metadata=metadata,
+            metadata={
+                "harness": "hermes",
+                "session_id": session_id,
+                "tools_invoked": tool_calls,
+                "send_message_targets": [{"channel": "", "root_id": ""}],
+                "hermes_assistant_text": reply,
+            },
         )
 
     # ── Gemini harness ────────────────────────────────────────────

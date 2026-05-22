@@ -236,6 +236,22 @@ def _cfg_from_env() -> dict[str, str]:
     }
 
 
+def list_tool_names() -> list[str]:
+    """Names of every tool puffo's MCP server exposes. Used to
+    pre-populate the ``tools:`` list in hermes' config.yaml so
+    ``hermes list_mcp_servers`` surfaces the puffo entry without
+    waiting for interactive discovery.
+    """
+    mcp = FastMCP("puffo-core")
+    cfg = PuffoCoreToolsConfig(
+        slug="", device_id="", keystore=None,
+        http_client=None, data_client=None,
+    )
+    register_core_tools(mcp, cfg)
+    _register_local_tools(mcp, workspace="", runtime_kind="", harness="")
+    return sorted(mcp._tool_manager._tools.keys())
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     cfg = _cfg_from_env()

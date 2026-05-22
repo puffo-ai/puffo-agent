@@ -99,17 +99,8 @@ def _is_puffo_agent_hook_entry(entry: object) -> bool:
 
 
 def _host_hermes_home() -> Path:
-    """Operator-side HERMES_HOME, mirroring upstream
-    ``hermes_constants.get_hermes_home`` so we look in the same
-    place hermes itself does:
-
-    * ``$HERMES_HOME`` if set (Windows installer sets this in user
-      env; multi-profile setups override it manually).
-    * ``~/.hermes`` on macOS / Linux / WSL2.
-    * ``%LOCALAPPDATA%\\hermes`` on native Windows — the PS1
-      installer writes config / .env / state into the LocalAppData
-      tree, not into the home dir.
-    """
+    """``$HERMES_HOME`` → ``%LOCALAPPDATA%\\hermes`` on Windows →
+    ``~/.hermes`` elsewhere. Mirrors upstream ``get_hermes_home``."""
     env = os.environ.get("HERMES_HOME", "").strip()
     if env:
         return Path(env).expanduser()
@@ -371,41 +362,20 @@ class LocalCLIAdapter(Adapter):
     # choices without sharing the operator's chat history.
 
     def _verify_hermes(self) -> None:
-        """Pre-flight for the hermes cli-local path.
-
-        Fail-loud expectations the operator needs to satisfy:
-
-        1. ``hermes`` is installed and resolvable (env / PATH / bundle).
-        2. ``<host_hermes_home>/config.yaml`` exists on the host —
-           operator has run ``hermes setup`` at least once and
-           configured a provider via ``hermes model``.
-
-        Host HERMES_HOME lookup order:
-          - ``$HERMES_HOME`` env var (the installer sets this on
-            Windows; operators set it explicitly on multi-profile
-            setups).
-          - ``~/.hermes`` on macOS / Linux / WSL2.
-          - ``%LOCALAPPDATA%\\hermes`` on native Windows — that's
-            where ``install.ps1`` actually drops the config / data
-            tree (not ``~/.hermes`` as on POSIX).
-
-        On success: seeds the per-agent ``HERMES_HOME`` from the
-        host HERMES_HOME and logs the host-runtime banner.
-        """
+        """Resolve hermes binary + seed per-agent HERMES_HOME from
+        the host's. Both checks fail loud so the daemon log names
+        what's wrong."""
         bin_path = resolve_hermes_bin()
         if bin_path is None:
             raise RuntimeError(
-                f"agent {self.agent_id!r}: hermes binary not found. Tried "
-                "$PUFFO_HERMES_BIN, $PATH, and known installer paths "
-                "(``~/.local/bin/hermes`` on POSIX, "
-                "``%LOCALAPPDATA%\\hermes\\hermes-agent\\venv\\Scripts`` "
-                "on Windows). Install Hermes Agent — POSIX: ``curl -fsSL "
-                "https://raw.githubusercontent.com/NousResearch/hermes-agent/"
-                "main/scripts/install.sh | bash``; PowerShell: ``iex "
+                f"agent {self.agent_id!r}: hermes binary not found. "
+                "Tried $PUFFO_HERMES_BIN, $PATH, and known installer "
+                "paths. Install: POSIX ``curl -fsSL https://"
+                "raw.githubusercontent.com/NousResearch/hermes-agent/"
+                "main/scripts/install.sh | bash``, or Windows ``iex "
                 "(irm https://raw.githubusercontent.com/NousResearch/"
-                "hermes-agent/main/scripts/install.ps1)`` — then restart "
-                "your shell / daemon so the new PATH is picked up. Or "
-                "set ``PUFFO_HERMES_BIN=/abs/path/to/hermes``."
+                "hermes-agent/main/scripts/install.ps1)``. Restart the "
+                "daemon shell, or set ``PUFFO_HERMES_BIN``."
             )
         self._hermes_bin = bin_path
 
@@ -413,26 +383,18 @@ class LocalCLIAdapter(Adapter):
         host_config = host_hermes_home / "config.yaml"
         if not host_config.is_file():
             raise RuntimeError(
-                f"agent {self.agent_id!r}: hermes is installed but "
-                f"``{host_config}`` is missing — operator hasn't run "
-                "``hermes setup`` yet. On the host, run ``hermes setup`` "
-                "(or ``hermes model`` + ``hermes config set``) once to "
-                "pick a provider and persist credentials, then restart "
-                "the daemon."
+                f"agent {self.agent_id!r}: ``{host_config}`` missing — "
+                "run ``hermes setup`` on the host first."
             )
 
         self._hermes_home = self.agent_home_dir / ".hermes"
         self._seed_hermes_home(host_hermes_home, self._hermes_home)
-
         self._log_host_runtime_banner()
 
     def _seed_hermes_home(self, host_dir: Path, agent_dir: Path) -> None:
-        """Copy ``config.yaml`` and ``.env`` (provider keys) from the
-        operator's ``~/.hermes`` into the per-agent HERMES_HOME on
-        first verify. Deliberately does NOT copy ``state.db``: that's
-        per-agent (sessions, memory, FTS history are all in there).
-        Idempotent — re-running only fills files that don't exist yet.
-        """
+        """Copy ``config.yaml`` + ``.env`` from the host's HERMES_HOME
+        on first verify. ``state.db`` is deliberately not copied —
+        each agent gets fresh session/memory state."""
         agent_dir.mkdir(parents=True, exist_ok=True)
         for filename in ("config.yaml", ".env"):
             src = host_dir / filename
@@ -442,13 +404,12 @@ class LocalCLIAdapter(Adapter):
             try:
                 dst.write_bytes(src.read_bytes())
                 logger.info(
-                    "agent %s: seeded per-agent HERMES_HOME with %s from %s",
-                    self.agent_id, filename, host_dir,
+                    "agent %s: seeded per-agent HERMES_HOME with %s",
+                    self.agent_id, filename,
                 )
             except OSError as exc:
                 logger.warning(
-                    "agent %s: couldn't copy %s into per-agent HERMES_HOME "
-                    "(%s) — hermes turns may fail with no provider config",
+                    "agent %s: couldn't seed %s: %s",
                     self.agent_id, src, exc,
                 )
 
@@ -459,22 +420,12 @@ class LocalCLIAdapter(Adapter):
         *,
         _retried: bool = False,
     ) -> TurnResult:
-        """One-shot hermes turn on the host, mirroring the docker
-        adapter's ``_run_hermes_chat`` minus the ``docker exec``
-        wrapper. Continuity comes from the per-agent
-        ``HERMES_HOME``'s state.db + a sentinel file marking
-        whether ``--continue`` is safe to pass.
-        """
+        """One-shot ``hermes chat -q`` per turn. Continuity rides on
+        the per-agent ``HERMES_HOME``'s state.db + sentinel."""
         if self._hermes_bin is None or self._hermes_home is None:
-            # _verify already raised if these were missing; defensive
-            # re-check to surface a clear error if someone bypasses
-            # the normal lifecycle.
             return TurnResult(reply="", metadata={
                 "error": "hermes not verified before run_turn",
             })
-
-        # MCP registration is best-effort — chat still works without
-        # tools. Idempotent per-adapter-instance after first success.
         await self._ensure_hermes_mcp_registered_local()
 
         has_prior_session = self.session_file.exists()
@@ -503,16 +454,14 @@ class LocalCLIAdapter(Adapter):
         stdout_text = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
 
-        # Stale sentinel: hermes' state.db has no session matching
-        # ours (e.g. operator wiped ``~/.hermes`` since last turn).
-        # Clear + retry once without --continue.
+        # Stale sentinel — clear + retry once without --continue.
         if (
             rc != 0
             and HERMES_NO_RESUME_SIGNATURE in stdout_text
             and not _retried
         ):
             logger.info(
-                "agent %s: hermes rejected --continue; clearing sentinel and retrying fresh",
+                "agent %s: hermes rejected --continue; clearing sentinel + retry",
                 self.agent_id,
             )
             try:
@@ -548,8 +497,7 @@ class LocalCLIAdapter(Adapter):
                 "stdout: %r", self.agent_id, stdout_text[:400],
             )
 
-        # First success: write the sentinel so subsequent turns pass
-        # --continue. session_id is captured for debug only.
+        # Sentinel for ``--continue`` on subsequent turns.
         if not has_prior_session:
             try:
                 self.session_file.parent.mkdir(parents=True, exist_ok=True)
@@ -563,73 +511,41 @@ class LocalCLIAdapter(Adapter):
                 )
             except OSError as exc:
                 logger.warning(
-                    "agent %s: couldn't write hermes session_file: %s "
-                    "(next turn will start a fresh session)",
+                    "agent %s: couldn't write hermes session_file: %s",
                     self.agent_id, exc,
                 )
 
-        # When the LLM called send_message via MCP, the daemon's
-        # fallback path in core.py would post the assistant text as
-        # well — duplicating the message. Mirror the claude-code
-        # contract by populating ``send_message_targets``: any
-        # truthy list value tells ``core._run_turn_and_route`` that
-        # MCP already posted, so the fallback is skipped.
-        #
-        # Limitation: tool_calls comes from the ``🔧 Auto-repaired
-        # tool name`` banner, which only fires when hermes had to
-        # rewrite the LLM's emitted name. Once the model learns the
-        # correct ``mcp_puffo_send_message`` name (via session
-        # continuity), the banner stops + this detection misses. A
-        # real fix needs MCP-server-side invocation tracking; this
-        # is the band-aid.
-        metadata: dict = {
-            "harness": "hermes",
-            "session_id": session_id,
-            "elapsed_seconds": round(elapsed, 2),
-            "tools_invoked": tool_calls,
-        }
-        if any("send_message" in name for name in tool_calls):
-            metadata["send_message_targets"] = [
-                {"channel": "", "root_id": ""} for _ in tool_calls
-                if "send_message" in _
-            ]
+        # Hermes turns are always silent — ``--quiet`` stdout doesn't
+        # surface MCP calls, so we can't tell whether send_message
+        # fired. Skip the fallback regardless; reply text kept in
+        # metadata for debug.
         return TurnResult(
-            reply=reply,
+            reply="",
             tool_calls=len(tool_calls),
-            metadata=metadata,
+            metadata={
+                "harness": "hermes",
+                "session_id": session_id,
+                "elapsed_seconds": round(elapsed, 2),
+                "tools_invoked": tool_calls,
+                "send_message_targets": [{"channel": "", "root_id": ""}],
+                "hermes_assistant_text": reply,
+            },
         )
 
     async def _ensure_hermes_mcp_registered_local(self) -> None:
         """Register the puffo MCP server in hermes' per-agent
         ``config.yaml``.
 
-        Writes directly to ``<HERMES_HOME>/config.yaml`` instead of
-        shelling to ``hermes mcp add``. Reason: ``hermes mcp add``'s
-        ``--args`` uses argparse ``nargs='*'``, which stops greedy
-        collection at the first ``-X``-shaped token — so a value
-        like ``-m`` (the python module flag) is parsed as a *new*
-        top-level option and the command rc=2's with "unrecognized
-        arguments: -m ...". Direct YAML write produces the exact
-        same schema hermes loads on startup and sidesteps the
-        argv-quoting issue.
-
-        Schema (per upstream ``hermes_cli/mcp_config.py``):
-
-            mcp_servers:
-              puffo:
-                command: <python>
-                args: [-m, puffo_agent.mcp.puffo_core_server]
-                env: {KEY: VAL, ...}
-                enabled: true
+        Direct YAML write — ``hermes mcp add`` is unusable because
+        its argparse ``--args nargs='*'`` chokes on ``-m`` (parses
+        it as the top-level ``-m MODEL`` flag).
         """
         if self._hermes_mcp_registered:
             return
         if self.puffo_core_mcp_env is None:
             logger.warning(
                 "agent %s: hermes MCP registration skipped — puffo_core "
-                "is not configured. Populate `puffo_core:` in agent.yml "
-                "to enable tool calls under hermes.",
-                self.agent_id,
+                "is not configured", self.agent_id,
             )
             return
         if self._hermes_home is None:
@@ -638,8 +554,7 @@ class LocalCLIAdapter(Adapter):
         config_path = self._hermes_home / "config.yaml"
         if not config_path.is_file():
             logger.warning(
-                "agent %s: hermes config.yaml missing at %s — can't "
-                "register puffo MCP (chat will work, tool calls won't)",
+                "agent %s: hermes config.yaml missing at %s",
                 self.agent_id, config_path,
             )
             return
@@ -650,23 +565,26 @@ class LocalCLIAdapter(Adapter):
         mcp_env["PUFFO_HARNESS"] = "hermes"
 
         import yaml
+        from ...mcp.puffo_core_server import list_tool_names
         try:
             with config_path.open("r", encoding="utf-8") as fh:
                 config = yaml.safe_load(fh) or {}
         except (OSError, yaml.YAMLError) as exc:
             logger.warning(
-                "agent %s: couldn't read hermes config.yaml at %s: %s "
-                "(chat will work, tool calls won't)",
+                "agent %s: couldn't read %s: %s",
                 self.agent_id, config_path, exc,
             )
             return
 
         servers = config.setdefault("mcp_servers", {})
+        # ``tools:`` lets ``hermes list_mcp_servers`` enumerate puffo
+        # without waiting for interactive discovery.
         servers["puffo"] = {
             "command": default_python_executable(),
             "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
             "env": mcp_env,
             "enabled": True,
+            "tools": list_tool_names(),
         }
         try:
             with config_path.open("w", encoding="utf-8") as fh:
