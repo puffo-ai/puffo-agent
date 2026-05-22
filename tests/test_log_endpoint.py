@@ -68,7 +68,10 @@ async def test_log_missing_file_returns_empty_with_note(client):
     assert j["agent_id"] == "agt-fresh"
     assert j["lines"] == []
     assert j["next_cursor"] == 0
-    assert "note" in j
+    # PUF-238 polish: distinct state + note from the "up_to_date"
+    # delta case so the client can branch on a stable signal.
+    assert j["state"] == "never_written"
+    assert j["note"] == "audit log not yet created"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -207,9 +210,10 @@ async def test_log_since_empty_when_caller_at_eof(client):
     j = await r.json()
     assert j["lines"] == []
     assert j["next_cursor"] == size
-    # Empty delta still gets the empty-state note so the client can
-    # render distinctly from "haven't loaded yet."
-    assert "note" in j
+    # PUF-238 polish: "up_to_date" is the empty-delta signal,
+    # distinct from "never_written" (audit log doesn't exist yet).
+    assert j["state"] == "up_to_date"
+    assert j["note"] == "no new entries since cursor"
 
 
 async def test_log_since_past_eof_resets_to_zero(client):
@@ -257,6 +261,139 @@ async def test_log_malformed_line_preserved_as_raw_event(client):
     assert j["lines"][0]["event"] == "good"
     assert j["lines"][1]["event"] == "_raw"
     assert "this is not JSON" in j["lines"][1]["msg"]
+    # PUF-238 polish: synthesized ts on _raw events should be a
+    # non-empty ISO-8601 string so sort-by-ts in the client doesn't
+    # bunch every malformed row at top-of-list.
+    raw_ts = j["lines"][1]["ts"]
+    assert raw_ts, "synthesized ts must be non-empty"
+    # ISO format is "YYYY-MM-DDTHH:MM:SS+00:00" (or similar with TZ).
+    from datetime import datetime
+    parsed = datetime.fromisoformat(raw_ts)
+    assert parsed is not None
+
+
+# ────────────────────────────────────────────────────────────────────
+# Polish (PR #39 review)
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_log_tail_and_since_mutually_exclusive_returns_400(client):
+    user = make_user()
+    await _pair(client, user)
+    home = os.environ["PUFFO_AGENT_HOME"]
+    write_test_agent(home, "agt-conflict")
+    _write_audit_lines(
+        _audit_log_path(home, "agt-conflict"),
+        [{"ts": "t", "agent": "agt-conflict", "event": "x"}],
+    )
+
+    h = signed_headers(
+        user, "GET", "/v1/agents/agt-conflict/log?tail=10&since=0",
+    ); h.update(_HOST)
+    r = await client.get(
+        "/v1/agents/agt-conflict/log?tail=10&since=0", headers=h,
+    )
+    assert r.status == 400
+    j = await r.json()
+    assert "mutually exclusive" in j["error"]
+
+
+async def test_log_delta_caps_at_max_bytes_and_advances_partial_cursor(client):
+    user = make_user()
+    await _pair(client, user)
+    home = os.environ["PUFFO_AGENT_HOME"]
+    write_test_agent(home, "agt-big-delta")
+    log_path = _audit_log_path(home, "agt-big-delta")
+    # Write a single very-long-line file so the response would hit
+    # the cap. Each line is ~400 bytes; 1000 lines ≈ 400 KB > the
+    # 256 KB delta cap → response must truncate + cursor advances
+    # partially.
+    payload = "z" * 380
+    _write_audit_lines(
+        log_path,
+        [
+            {"ts": f"2026-05-22T00:00:{i % 60:02d}Z", "event": "fill", "n": i, "p": payload}
+            for i in range(1000)
+        ],
+    )
+
+    h = signed_headers(user, "GET", "/v1/agents/agt-big-delta/log?since=0")
+    h.update(_HOST)
+    r = await client.get("/v1/agents/agt-big-delta/log?since=0", headers=h)
+    j = await r.json()
+    # Returned partial — fewer than the full 1000 lines.
+    assert len(j["lines"]) < 1000
+    # Cursor advanced to where the partial read stopped, NOT to EOF.
+    assert j["next_cursor"] < log_path.stat().st_size
+    # Cursor still strictly positive (we didn't refuse to read
+    # anything).
+    assert j["next_cursor"] > 0
+
+
+async def test_log_delta_partial_cursor_drives_next_poll_to_completion(client):
+    # Belt-and-braces: pass the partial cursor from poll 1 back as
+    # ``since`` on poll 2; verify it picks up where the first one
+    # left off. This is the operator's described client behaviour —
+    # if it fails, the cap is a footgun.
+    user = make_user()
+    await _pair(client, user)
+    home = os.environ["PUFFO_AGENT_HOME"]
+    write_test_agent(home, "agt-paged")
+    log_path = _audit_log_path(home, "agt-paged")
+    payload = "z" * 380
+    _write_audit_lines(
+        log_path,
+        [
+            {"ts": "t", "event": "fill", "n": i, "p": payload}
+            for i in range(1000)
+        ],
+    )
+
+    h1 = signed_headers(user, "GET", "/v1/agents/agt-paged/log?since=0")
+    h1.update(_HOST)
+    r1 = await client.get("/v1/agents/agt-paged/log?since=0", headers=h1)
+    j1 = await r1.json()
+    cursor = j1["next_cursor"]
+    first_count = len(j1["lines"])
+
+    h2 = signed_headers(user, "GET", f"/v1/agents/agt-paged/log?since={cursor}")
+    h2.update(_HOST)
+    r2 = await client.get(f"/v1/agents/agt-paged/log?since={cursor}", headers=h2)
+    j2 = await r2.json()
+    # Together the two pages cover everything written; no overlap
+    # (the cursor advances exclusively).
+    assert first_count + len(j2["lines"]) == 1000
+
+
+async def test_log_tail_uses_reverse_seek_on_a_large_file(client):
+    # Smoke test for the reverse-seek path. We can't easily measure
+    # memory in a unit test, but we can verify correctness on a
+    # file that's larger than the chunk size — the tail-200 result
+    # must contain the last 200 rows in order regardless of
+    # how many chunks the seek had to load.
+    user = make_user()
+    await _pair(client, user)
+    home = os.environ["PUFFO_AGENT_HOME"]
+    write_test_agent(home, "agt-large")
+    log_path = _audit_log_path(home, "agt-large")
+    # 3000 ~80-byte rows ≈ 240 KB — comfortably larger than the
+    # 64 KB chunk size so the reverse-seek loop runs at least twice.
+    _write_audit_lines(
+        log_path,
+        [
+            {"ts": "t", "agent": "agt-large", "event": "row", "n": i}
+            for i in range(3000)
+        ],
+    )
+
+    h = signed_headers(user, "GET", "/v1/agents/agt-large/log?tail=200")
+    h.update(_HOST)
+    r = await client.get("/v1/agents/agt-large/log?tail=200", headers=h)
+    j = await r.json()
+    assert len(j["lines"]) == 200
+    # Last 200 of 3000 → rows 2800..2999, in order.
+    assert j["lines"][0]["n"] == 2800
+    assert j["lines"][-1]["n"] == 2999
 
 
 async def test_log_unknown_agent_returns_404(client):
