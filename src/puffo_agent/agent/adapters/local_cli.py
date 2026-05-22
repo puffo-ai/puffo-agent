@@ -536,7 +536,12 @@ class LocalCLIAdapter(Adapter):
                 "stderr_tail": stderr_text[-400:],
             })
 
-        reply, session_id = parse_hermes_reply(stdout_text)
+        reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
+        if tool_calls:
+            logger.info(
+                "agent %s: hermes turn invoked %d tool(s): %s",
+                self.agent_id, len(tool_calls), ", ".join(tool_calls),
+            )
         if not reply:
             logger.warning(
                 "agent %s: hermes rc=0 but parser found no reply. "
@@ -563,11 +568,16 @@ class LocalCLIAdapter(Adapter):
                     self.agent_id, exc,
                 )
 
-        return TurnResult(reply=reply, metadata={
-            "harness": "hermes",
-            "session_id": session_id,
-            "elapsed_seconds": round(elapsed, 2),
-        })
+        return TurnResult(
+            reply=reply,
+            tool_calls=len(tool_calls),
+            metadata={
+                "harness": "hermes",
+                "session_id": session_id,
+                "elapsed_seconds": round(elapsed, 2),
+                "tools_invoked": tool_calls,
+            },
+        )
 
     async def _ensure_hermes_mcp_registered_local(self) -> None:
         """Register the puffo MCP server in hermes' per-agent

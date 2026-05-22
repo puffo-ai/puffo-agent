@@ -38,6 +38,13 @@ _HERMES_MODEL_NORMALISED_RE = re.compile(r"^⚠️\s+Normalized model .*$")
 # provider name followed by a period so we don't eat reply text
 # that happens to start with one.
 _HERMES_MODEL_NORMALISED_TAIL_RE = re.compile(r"^[a-z0-9\-]+\.$")
+# Tool-event banner hermes emits inline with the reply when a tool
+# is invoked. Captures the original (typically auto-repaired) tool
+# name so the adapter can count + log tool calls without parsing
+# the session DB.
+_HERMES_TOOL_REPAIR_RE = re.compile(
+    r"^🔧\s+Auto-repaired tool name:\s*'([^']+)'\s*->\s*'([^']+)'\s*$"
+)
 
 
 def hermes_model_id(model: str) -> str:
@@ -61,12 +68,17 @@ def stitch_hermes_prompt(system_prompt: str, user_message: str) -> str:
     return f"{system_prompt}\n\n---\n\n{user_message}"
 
 
-def parse_hermes_reply(stdout_text: str) -> tuple[str, str]:
-    """Pull (reply, session_id) out of ``hermes chat --quiet`` stdout.
-    Filter banner lines and capture session_id from whichever marker
-    emits it (may be absent on fresh sessions).
+def parse_hermes_reply(stdout_text: str) -> tuple[str, str, list[str]]:
+    """Pull (reply, session_id, tool_calls) out of ``hermes chat
+    --quiet`` stdout. Filter banner lines, capture session_id from
+    whichever marker emits it (may be absent on fresh sessions),
+    and collect the *original* tool names from any
+    ``🔧 Auto-repaired tool name`` lines — that banner is hermes'
+    way of telling us a tool was invoked under ``--quiet``, so it's
+    also our only signal for tool-call observability here.
     """
     session_id = ""
+    tool_calls: list[str] = []
     content: list[str] = []
     for line in stdout_text.splitlines():
         m = _HERMES_SESSION_ID_RE.match(line)
@@ -81,8 +93,12 @@ def parse_hermes_reply(stdout_text: str) -> tuple[str, str]:
             continue
         if _HERMES_MODEL_NORMALISED_TAIL_RE.match(line):
             continue
+        m = _HERMES_TOOL_REPAIR_RE.match(line)
+        if m:
+            tool_calls.append(m.group(1))
+            continue
         content.append(line)
-    return "\n".join(content).strip(), session_id
+    return "\n".join(content).strip(), session_id, tool_calls
 
 
 async def run_cmd(

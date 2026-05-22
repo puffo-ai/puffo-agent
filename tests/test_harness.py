@@ -263,7 +263,7 @@ def test_parse_hermes_reply_first_turn():
         "session_id: 20260422_214146_02b4d1\n"
         "🚀✨🎯"
     )
-    reply, session_id = _parse_hermes_reply(stdout)
+    reply, session_id, _tools = _parse_hermes_reply(stdout)
     assert reply == "🚀✨🎯"
     assert session_id == "20260422_214146_02b4d1"
 
@@ -280,7 +280,7 @@ def test_parse_hermes_reply_resumed_turn():
         "session_id: 20260422_213753_5d42f9\n"
         "Hello there, how are you?"
     )
-    reply, session_id = _parse_hermes_reply(stdout)
+    reply, session_id, _tools = _parse_hermes_reply(stdout)
     assert reply == "Hello there, how are you?"
     assert session_id == "20260422_213753_5d42f9"
 
@@ -294,7 +294,7 @@ def test_parse_hermes_reply_multiline_body():
         "line two\n"
         "line three"
     )
-    reply, session_id = _parse_hermes_reply(stdout)
+    reply, session_id, _tools = _parse_hermes_reply(stdout)
     assert reply == "line one\nline two\nline three"
     assert session_id == "abc"
 
@@ -309,7 +309,7 @@ def test_parse_hermes_reply_no_session_id_but_reply_present():
         "anthropic.\n"
         "[SILENT]"
     )
-    reply, session_id = _parse_hermes_reply(stdout)
+    reply, session_id, _tools = _parse_hermes_reply(stdout)
     assert reply == "[SILENT]"
     assert session_id == ""
 
@@ -324,7 +324,7 @@ def test_parse_hermes_reply_resumed_session_id_captured_without_session_id_line(
         "↻ Resumed session 20260422_222809_425056 (1 user message, 2 total messages)\n"
         "你好 @han.dev！有什么我可以帮你的吗？😊"
     )
-    reply, session_id = _parse_hermes_reply(stdout)
+    reply, session_id, _tools = _parse_hermes_reply(stdout)
     assert reply == "你好 @han.dev！有什么我可以帮你的吗？😊"
     assert session_id == "20260422_222809_425056"
 
@@ -344,13 +344,43 @@ def test_parse_hermes_reply_filters_banner_lines_narrowly():
         "- bullet point\n"
         "- another"
     )
-    reply, session_id = _parse_hermes_reply(stdout)
+    reply, session_id, _tools = _parse_hermes_reply(stdout)
     assert session_id == "sid-123"
     assert "The answer is 42." in reply
     assert "Further context: hermes." in reply
     assert "- bullet point" in reply
     assert "- another" in reply
     assert "anthropic." not in reply
+
+
+def test_parse_hermes_reply_extracts_tool_calls_and_strips_banner():
+    """The ``🔧 Auto-repaired tool name`` banner is hermes' only
+    signal under ``--quiet`` that a tool was invoked. Parser must
+    strip it from the reply AND capture the original tool name so
+    the adapter can count + log tool calls.
+    """
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
+    stdout = (
+        "session_id: sid-123\n"
+        "🔧 Auto-repaired tool name: 'puffo_send_message' -> 'mcp_puffo_send_message'\n"
+        "🔧 Auto-repaired tool name: 'puffo_list_channels' -> 'mcp_puffo_list_channels'\n"
+        "Done!"
+    )
+    reply, session_id, tools = _parse_hermes_reply(stdout)
+    assert session_id == "sid-123"
+    assert tools == ["puffo_send_message", "puffo_list_channels"]
+    assert "🔧" not in reply
+    assert reply == "Done!"
+
+
+def test_parse_hermes_reply_tool_calls_empty_when_no_repair_banner():
+    """No tool-repair banners → empty tool_calls list; reply unaffected."""
+    from puffo_agent.agent.adapters.hermes_helpers import parse_hermes_reply as _parse_hermes_reply
+    reply, session_id, tools = _parse_hermes_reply(
+        "session_id: sid-X\nplain reply"
+    )
+    assert reply == "plain reply"
+    assert tools == []
 
 
 def test_stitch_hermes_prompt_first_turn():
