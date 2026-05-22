@@ -48,6 +48,7 @@ def _make_client(
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "agent-1"
     client.operator_slug = operator_slug
+    client.workspace = ""
     client._channel_space = {}
     client._space_name_cache = {}
     client._channel_name_cache = {}

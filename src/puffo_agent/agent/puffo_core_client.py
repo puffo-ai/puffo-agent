@@ -6,11 +6,14 @@ and encrypted reply posting.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import random
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
@@ -464,18 +467,23 @@ class PuffoCoreMessageClient:
         # the next tick instead of pinning a permanent "" miss.
         self._profile_cache: dict[str, tuple[str, str, float]] = {}
         # Invitation event_ids the worker has already processed.
-        # PUF-240: persisted across reconnects (was reset per
-        # ``listen()`` call; that wiped the dedup every WS cycle
-        # and the next 30s ``_poll_pending_invites`` re-emitted
-        # the operator-confirm prompt for every still-pending
-        # invite — N reconnects ⇒ N duplicate prompts in the
-        # operator's confirm thread). Server-side ``pending_invites``
-        # rows stay until the operator acts, so the only thing
-        # holding off re-emission is this set. Initialised once on
-        # ``__init__`` and never cleared inside ``listen()``.
-        # In-memory only across daemon restarts — disk-persist is
-        # a follow-up if restart-driven multi-emit surfaces.
+        # PUF-240: persisted across reconnects AND across daemon
+        # restarts. Was reset per ``listen()`` call (wiped on every
+        # WS cycle), so the next 30s ``_poll_pending_invites`` re-
+        # emitted the operator-confirm prompt for every still-
+        # pending invite — N reconnects ⇒ N duplicate prompts in
+        # the operator's confirm thread. Server-side
+        # ``pending_invites`` rows stay until the operator acts, so
+        # the only thing holding off re-emission is this set.
+        #
+        # In-memory: initialised on ``__init__`` and never cleared
+        # inside ``listen()``. On disk: hydrated at construct time
+        # from ``<workspace>/.puffo-agent/processed_invites.json``,
+        # appended via ``_persist_processed_invite`` after each add
+        # so a daemon restart between invite-and-act doesn't
+        # multi-emit either.
         self._processed_invite_ids: set[str] = set()
+        self._processed_invite_ids.update(self._load_processed_invites())
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
         # reply in that thread can be intercepted inside the daemon.
@@ -834,16 +842,18 @@ class PuffoCoreMessageClient:
         self._queue = asyncio.PriorityQueue()
         self._queue_seq = 0
         self._thread_state: dict[str, _ThreadEntry] = {}
-        # PUF-240: ``_processed_invite_ids`` initialisation moved to
-        # ``__init__`` (line 470) and intentionally NOT cleared here.
-        # The prior comment "auto-accept is idempotent against
-        # server-side state" only justified safety for the
-        # auto-accept branch; the operator-DM branch is NOT
-        # idempotent (each call sends a new DM), and resetting the
-        # dedup on every reconnect was producing the ~10× duplicate
-        # prompt symptom Sam reported. Server-side ``pending_invites``
-        # remains the source of truth; the in-memory set only avoids
-        # repeating work the agent already did in this process.
+        # PUF-240: ``_processed_invite_ids`` is owned by ``__init__``
+        # and intentionally NOT cleared here. The prior comment
+        # "auto-accept is idempotent against server-side state" only
+        # justified safety for the auto-accept branch; the operator-
+        # DM branch is NOT idempotent (each call sends a new DM), and
+        # resetting the dedup on every reconnect was producing the
+        # ~10× duplicate prompt symptom Sam reported. The set is now
+        # also disk-persisted at
+        # ``<workspace>/.puffo-agent/processed_invites.json`` so a
+        # daemon restart between invite-and-act doesn't re-emit
+        # either. Server-side ``pending_invites`` remains the source
+        # of truth.
         consumer_task = asyncio.ensure_future(
             self._consume_queue(on_message, on_api_error_retry),
         )
@@ -1610,6 +1620,7 @@ class PuffoCoreMessageClient:
         # Add to processed-set too so a stale pending-invite poll
         # response (server-side cache lag) can't re-fire the DM.
         self._processed_invite_ids.add(invitation_event_id)
+        self._persist_processed_invite(invitation_event_id)
 
         inviter_slug = meta.get("inviter_slug") or ""
         space_id = meta.get("space_id") or ""
@@ -1645,6 +1656,65 @@ class PuffoCoreMessageClient:
             self._log.exception(
                 "failed to DM operator about canceled invite (event_id=%s)",
                 invitation_event_id,
+            )
+
+    def _processed_invites_path(self) -> Path | None:
+        """Sidecar where ``_processed_invite_ids`` persists across
+        daemon restarts. Mirrors ``cron_state.py``'s sidecar shape
+        (PUF-239) — ``<workspace>/.puffo-agent/processed_invites.json``.
+        Returns ``None`` when no workspace is configured (test
+        harnesses construct the client with ``workspace=""``); in
+        that case persistence is a no-op and the in-memory dedup
+        still works."""
+        if not self.workspace:
+            return None
+        return Path(self.workspace) / ".puffo-agent" / "processed_invites.json"
+
+    def _load_processed_invites(self) -> set[str]:
+        """Hydrate the persisted dedup set from disk. Returns an
+        empty set on missing-file / corrupt-JSON / unreadable-row —
+        the scheduler shouldn't crash on a malformed sidecar, and
+        the worst case is one batch of legitimate re-emit while the
+        operator acts."""
+        path = self._processed_invites_path()
+        if path is None or not path.exists():
+            return set()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._log.warning(
+                "processed_invites.json unreadable (%s); starting empty",
+                exc,
+            )
+            return set()
+        if not isinstance(raw, dict):
+            return set()
+        ids = raw.get("processed_invite_ids")
+        if not isinstance(ids, list):
+            return set()
+        return {str(x) for x in ids if isinstance(x, str) and x}
+
+    def _persist_processed_invite(self, invitation_event_id: str) -> None:
+        """Append ``invitation_event_id`` to the on-disk dedup
+        sidecar. Best-effort: a write failure logs + leaves the
+        in-memory set unchanged. Atomic-write via temp-file +
+        ``os.replace`` so a crash mid-write doesn't corrupt the
+        file."""
+        path = self._processed_invites_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "processed_invite_ids": sorted(self._processed_invite_ids),
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            self._log.warning(
+                "failed to persist processed_invites (event_id=%s): %s",
+                invitation_event_id, exc,
             )
 
     async def _poll_pending_invites(self) -> None:
@@ -1737,6 +1807,7 @@ class PuffoCoreMessageClient:
                     kind, inviter_slug, invitation_event_id,
                 )
                 self._processed_invite_ids.add(invitation_event_id)
+                self._persist_processed_invite(invitation_event_id)
             except Exception:
                 self._log.exception(
                     "failed to auto-accept %s from operator %s (event_id=%s)",
@@ -1757,6 +1828,7 @@ class PuffoCoreMessageClient:
                 # Mark processed even on DM failure — the operator
                 # still sees the invite in their chat client.
                 self._processed_invite_ids.add(invitation_event_id)
+                self._persist_processed_invite(invitation_event_id)
 
     async def _inviter_is_operator(self, inviter_slug: str) -> bool:
         """True iff ``inviter_slug``'s root pubkey matches our

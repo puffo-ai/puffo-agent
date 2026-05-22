@@ -18,12 +18,18 @@ processed invite even when fed the same server response twice.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
 
-def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, list[dict]]:
+def _make_client(
+    operator_slug: str = "op-1",
+    workspace: str = "",
+) -> tuple[PuffoCoreMessageClient, list[dict]]:
     """Bare client harness mirroring ``test_membership_events.py``.
 
     Stubs ``_send_dm`` (captures into ``sent``), the name-resolution
@@ -32,11 +38,22 @@ def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, l
     round-trip — keeps every test on the operator-DM branch), and
     ``http.get`` for ``/invites?direction=received`` so the poll
     loop returns whatever the test sets via ``_invites_response``.
+
+    ``workspace`` lets a test point the client at a real on-disk
+    dir so ``_persist_processed_invite`` / ``_load_processed_invites``
+    exercise the sidecar. Defaults to ``""`` — persistence becomes a
+    no-op (``_processed_invites_path`` returns ``None``) and only
+    the in-memory dedup is tested.
     """
+    import logging
+
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "agent-1"
     client.operator_slug = operator_slug
+    client.workspace = workspace
+    client._log = logging.getLogger("test-puf-240")
     client._processed_invite_ids = set()
+    client._processed_invite_ids.update(client._load_processed_invites())
     client._pending_invite_dms = {}
     client._operator_root_pubkey = b"op-root-pk"
     client._inviter_root_cache = {}
@@ -76,8 +93,6 @@ def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, l
 
     client.http = _StubHttp()
 
-    import logging
-    client._log = logging.getLogger("test-puf-240")
     return client, sent
 
 
@@ -182,3 +197,35 @@ async def test_dedup_persists_across_failed_dm_attempt():
     client._send_dm = _capturing_send_dm  # type: ignore[assignment]
     await client._poll_pending_invites()
     assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_dedup_survives_daemon_restart(tmp_path: Path):
+    """PUF-240 daemon-restart class. The in-memory dedup is now also
+    sidecar-persisted to ``<workspace>/.puffo-agent/processed_invites.json``
+    so a daemon restart between invite-and-act doesn't multi-emit
+    either. Simulate the restart by constructing a SECOND client
+    pointed at the same workspace — its ``_load_processed_invites``
+    should rehydrate the set and the next poll should NOT re-fire
+    the operator DM."""
+    workspace = str(tmp_path)
+    client_a, sent_a = _make_client(workspace=workspace)
+    client_a._invites_response = {"invites": [_invite_row("ev_restart")]}
+
+    # First daemon lifetime: emit + persist.
+    await client_a._poll_pending_invites()
+    assert len(sent_a) == 1
+    sidecar = tmp_path / ".puffo-agent" / "processed_invites.json"
+    assert sidecar.exists()
+    payload = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert "ev_restart" in payload["processed_invite_ids"]
+
+    # Simulate daemon restart — fresh PuffoCoreMessageClient instance,
+    # same workspace dir. Server-side pending_invites still returns
+    # the same row (the operator hasn't acted yet).
+    client_b, sent_b = _make_client(workspace=workspace)
+    client_b._invites_response = {"invites": [_invite_row("ev_restart")]}
+
+    assert "ev_restart" in client_b._processed_invite_ids
+    await client_b._poll_pending_invites()
+    assert sent_b == []
