@@ -18,7 +18,7 @@ import time
 
 from pathlib import Path
 
-from ..macos.keychain import CredentialCache, is_macos, shim_dir
+from ..macos.keychain import CredentialCache, is_macos
 from .api import start_api_server, stop_api_server
 from .credential_refresh import (
     CodexFileBackend,
@@ -66,7 +66,7 @@ class Daemon:
         # refresh-token rotation can't be raced by N agent workers.
         # Backend choice is platform-dependent:
         #   - macOS: Keychain is canonical (Claude Code 2.x); cache +
-        #     PATH shim + per-agent file copies via KeychainBackend.
+        #     per-agent file copies via KeychainBackend.
         #   - Linux/Windows: host file ``~/.claude/.credentials.json``
         #     is canonical; agent files are symlinks via FileBackend.
         if is_macos():
@@ -74,7 +74,6 @@ class Daemon:
             backend = KeychainBackend(
                 home=home,
                 cache=CredentialCache.at(home),
-                shim_dir=shim_dir(home),
             )
         else:
             backend = FileBackend(host_home=Path.home())

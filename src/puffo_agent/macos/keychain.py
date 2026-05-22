@@ -1,60 +1,49 @@
 """macOS Keychain primitives for Claude Code OAuth credentials.
 
 Claude Code 2.x stores its OAuth token in the system Keychain
-(``"Claude Code-credentials"``). Per-agent ``$HOME`` overrides don't
-isolate Keychain ACL access (Keychain ACL is keyed by user UID +
-signing identity, not by HOME), so the host's claude binary running
-under a puffo-agent worker can trigger an ACL re-prompt every spawn.
-
-BUT — and this caught us in production — HOME *does* affect the
-``security`` CLI's lookup of the user's login keychain file. The CLI
-constructs ``$HOME/Library/Keychains/login.keychain-db`` to find the
-default keychain. With a sandbox HOME and no such path, ``security``
-fires the ``loginKC:queryCreate`` authorization mechanism asking the
-user to create a brand-new login keychain. Users almost always dismiss
-that dialog, the keychain write fails, claude exits non-zero, and any
-freshly-rotated OAuth tokens are lost in flight (Anthropic has already
-invalidated the prior refresh_token by that point). The fix in this
-module: ``_stage_keychain_visibility`` symlinks the real
-``~/Library/Keychains`` into the sandbox HOME before claude runs.
-
-Also: GitHub issue anthropics/claude-code#37512 documents that setting
-``CLAUDE_CODE_OAUTH_TOKEN`` causes the CLI to silently
-``security delete-generic-password "Claude Code-credentials"`` on exit
-via its fallback-combiner cleanup path — which kicks the user's main
-CLI / VS Code extension off. Anthropic did not fix it; the issue auto-
-closed in April 2026.
+(``"Claude Code-credentials"``). The Keychain is the canonical store on
+macOS; the daemon-side ``KeychainBackend`` (in
+``portal/credential_refresh.py``) just reads it for expiry inspection,
+triggers refresh by running ``claude --print ok`` exactly the way an
+interactive user does, and maintains an on-disk cache so each agent can
+read a per-agent ``.credentials.json`` without round-tripping through
+``security`` every read.
 
 This module provides the storage primitives only:
 
   - **Keychain read / write** via the ``security`` CLI.
-  - **PATH shim** that intercepts the buggy delete-generic-password
-    call from issue #37512.
   - **CredentialCache** — atomic-write JSON blob to
     ``~/.puffo-agent/run/claude-credentials.json``, daemon-owned.
   - **Bootstrap** — populate the cache from Keychain on first call.
-  - **Refresh oneshot** — run a sandboxed ``claude --print`` so claude
-    rotates the token and writes the new blob back to the cache.
 
-The async ``CredentialRefresher`` lifecycle (poll loop, agent fan-out,
-401-wake) lives in ``portal/credential_refresh.py`` and delegates here
-via the ``KeychainBackend`` adapter — this module stays
-synchronous-primitive-only so it's straightforward to unit-test off
-macOS.
+Refresh itself is *not* in this module. The previous design ran claude
+in a sandboxed ``$HOME`` with a forged ``.credentials.json`` seeded
+from the cache, then copied the resulting blob back; in production that
+turned out to be brittle: claude on macOS deleted the sandbox creds
+file on exit before flushing the rotated blob, sandboxing HOME caused
+``security`` to fire ``loginKC:queryCreate`` authorization prompts, and
+the only outcome was burning Anthropic refresh-tokens that we then
+couldn't capture. The current design runs claude with the user's real
+``$HOME`` (identical to the FileBackend on Linux/Windows) so claude's
+own refresh path writes straight to Keychain, exactly the way the user
+running ``claude`` interactively expects. The daemon picks the
+rotation up via cache expiry inspection and propagates it to agents.
+
+GitHub issue anthropics/claude-code#37512 documented that setting
+``CLAUDE_CODE_OAUTH_TOKEN`` caused the CLI to silently
+``security delete-generic-password "Claude Code-credentials"`` on exit
+via its fallback-combiner cleanup path. We never set that env var, and
+the real-HOME refresh path doesn't either, so the bug doesn't apply.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import platform
-import shutil
 import stat
 import subprocess
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -67,20 +56,11 @@ logger = logging.getLogger(__name__)
 # #37512 and reproducible with ``security dump-keychain | grep``.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 
-# File names — picked deliberately short + obvious.
+# File name for the cache JSON blob — picked deliberately short + obvious.
 CACHE_FILENAME = "claude-credentials.json"
-SHIM_FILENAME = "security"
-
-# Refresh every 6h. Claude Code OAuth access tokens TTL is 8h, so the
-# 2h margin means a slow / failed refresh has a retry before tokens
-# actually expire.
-REFRESH_INTERVAL_SECONDS = 6 * 3600
 
 # How long we wait for a single ``security`` invocation.
 SECURITY_TIMEOUT_SECONDS = 60
-
-# Refresh oneshot timeout.
-REFRESH_ONESHOT_TIMEOUT_SECONDS = 90
 
 # How often the Keychain-poll loop wakes to detect tokens rotated by
 # OTHER processes (operator's main CLI, an agent's own claude
@@ -139,7 +119,12 @@ def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainRea
 def writeback_to_keychain(
     blob: str, timeout: float = SECURITY_TIMEOUT_SECONDS,
 ) -> tuple[bool, Optional[str]]:
-    """Upsert the JSON blob into the Keychain entry. Best-effort."""
+    """Upsert the JSON blob into the Keychain entry. Best-effort.
+
+    Only used by external-rotation poll when we detect Keychain drifted
+    from cache for some reason; the canonical refresh path lets claude
+    itself update Keychain.
+    """
     if not is_macos():
         return (False, "not_macos")
     try:
@@ -158,87 +143,6 @@ def writeback_to_keychain(
     if result.returncode != 0:
         return (False, f"exit_code={result.returncode}; stderr={result.stderr.strip()!r}")
     return (True, None)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PATH shim
-# ─────────────────────────────────────────────────────────────────────────────
-
-_SHIM_BODY = r"""#!/bin/bash
-# Auto-generated by puffo-agent. Intercepts
-# `security delete-generic-password "Claude Code-credentials"` and
-# silently no-ops it (Claude Code issue #37512), passing every other
-# `security` invocation through to the real binary.
-#
-# DO NOT EDIT — overwritten on daemon start.
-REAL=/usr/bin/security
-
-is_delete=0
-for arg in "$@"; do
-  if [ "$arg" = "delete-generic-password" ]; then
-    is_delete=1
-    break
-  fi
-done
-
-if [ "$is_delete" = "1" ]; then
-  for arg in "$@"; do
-    if [ "$arg" = "Claude Code-credentials" ]; then
-      exit 0
-    fi
-  done
-fi
-
-exec "$REAL" "$@"
-"""
-
-
-def _stage_keychain_visibility(sandbox: Path) -> Optional[str]:
-    """Symlink the user's ``~/Library/Keychains`` into the sandbox HOME
-    so the ``security`` CLI (and anything else doing
-    ``$HOME``-relative keychain lookup) reaches the real login keychain
-    instead of firing the ``loginKC:queryCreate`` authorization dialog.
-
-    See module docstring for the full incident description. Returns
-    ``None`` on success, or a short reason string on best-effort
-    failure — the refresh attempt still proceeds since claude *may*
-    succeed via the framework path even without this staging.
-    """
-    real_keychains = Path.home() / "Library" / "Keychains"
-    if not real_keychains.exists():
-        return "real_keychains_missing"
-    try:
-        sandbox_library = sandbox / "Library"
-        sandbox_library.mkdir(parents=True, exist_ok=True)
-        target = sandbox_library / "Keychains"
-        # Idempotent: a prior call already linked it.
-        if target.is_symlink() or target.exists():
-            return None
-        os.symlink(real_keychains, target)
-    except OSError as exc:
-        return f"symlink_failed: {exc}"
-    return None
-
-
-def shim_dir(home: Path) -> Path:
-    """Where the PATH shim binary lives. Inside daemon run dir so it
-    auto-cleans on uninstall."""
-    return home / "run" / "keychain-shim"
-
-
-def install_path_shim(home: Path) -> Path:
-    """Write the security-shim script and chmod it executable. Returns
-    the directory to prepend to ``PATH``. Idempotent."""
-    d = shim_dir(home)
-    d.mkdir(parents=True, exist_ok=True)
-    binary = d / SHIM_FILENAME
-    binary.write_text(_SHIM_BODY, encoding="utf-8")
-    binary.chmod(
-        stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-        | stat.S_IRGRP | stat.S_IXGRP
-        | stat.S_IROTH | stat.S_IXOTH,
-    )
-    return d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,7 +201,7 @@ class CredentialCache:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bootstrap + Refresh
+# Bootstrap
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bootstrap_from_keychain(cache: CredentialCache) -> tuple[bool, Optional[str]]:
@@ -310,153 +214,3 @@ def bootstrap_from_keychain(cache: CredentialCache) -> tuple[bool, Optional[str]
         return (False, read.error)
     cache.write(read.blob)
     return (True, "bootstrapped")
-
-
-async def _run_claude_oneshot(
-    env: dict[str, str],
-    cwd: str,
-    *,
-    timeout: float = REFRESH_ONESHOT_TIMEOUT_SECONDS,
-) -> tuple[Optional[int], str]:
-    """Spawn ``claude --print --max-turns 1 "ok"`` and wait. Returns
-    ``(returncode, error_reason)`` — ``returncode`` is None on
-    failure paths. Always cleans up the subprocess + pipe FDs even on
-    early-return paths (timeout / spawn error)."""
-    if shutil.which("claude") is None:
-        return (None, "claude_binary_missing")
-    proc: asyncio.subprocess.Process | None = None
-    try:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "claude", "--dangerously-skip-permissions",
-                "--print", "--max-turns", "1",
-                "--output-format", "stream-json", "--verbose",
-                "ok",
-                env=env, cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            return (None, "claude_binary_missing")
-
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                await proc.communicate()
-            except Exception:
-                pass
-            return (None, "refresh_oneshot_timeout")
-        return (proc.returncode, "")
-    finally:
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except (ProcessLookupError, OSError):
-                pass
-
-
-async def refresh_via_oneshot(
-    cache: CredentialCache,
-    shim_dir_path: Path,
-    *,
-    timeout: float = REFRESH_ONESHOT_TIMEOUT_SECONDS,
-) -> tuple[bool, Optional[str]]:
-    """macOS path: run a one-turn ``claude --print`` in a sandbox $HOME
-    seeded from the cache. On exit, Claude has rewritten
-    ``.credentials.json`` with a fresh token; copy it back to the cache.
-
-    Returns (ok, reason_when_not_ok).
-
-    A non-zero claude exit code is **not** by itself a hard failure:
-    claude may rotate the OAuth token successfully (writing the new blob
-    to ``.credentials.json``) and then exit non-zero from a later,
-    unrelated step. Dropping the new blob in that case strands the user
-    with the prior refresh_token, which Anthropic has already
-    invalidated — main CLI then can't recover without ``claude login``.
-    So we always inspect the sandbox file after the process exits: if
-    it contains a rotated access_token, we accept it and report
-    ``"token_refreshed_rc=N"`` so the non-zero exit stays visible.
-
-    ⚠️ **Keep in sync with** ``portal.diagnostic._run_sandboxed_claude_oneshot``:
-    that probe is a sync mirror of this function so the diagnostic
-    can run without an asyncio event loop. Any env / arg change here
-    must be mirrored there or the probe stops validating prod.
-    """
-    if not is_macos():
-        return (False, "not_macos")
-    blob = cache.read()
-    if not blob:
-        return (False, "cache_empty")
-    try:
-        old_token = ((json.loads(blob).get("claudeAiOauth") or {}).get("accessToken")) or ""
-    except json.JSONDecodeError:
-        old_token = ""
-
-    with tempfile.TemporaryDirectory(prefix="puffo-agent-refresh-") as sandbox:
-        sandbox_path = Path(sandbox)
-        sandbox_claude_dir = sandbox_path / ".claude"
-        sandbox_claude_dir.mkdir(parents=True, exist_ok=True)
-        sandbox_creds = sandbox_claude_dir / ".credentials.json"
-        sandbox_creds.write_text(blob, encoding="utf-8")
-
-        stage_err = _stage_keychain_visibility(sandbox_path)
-        if stage_err is not None:
-            logger.info(
-                "refresh sandbox: keychain visibility staging skipped "
-                "(%s); claude may still succeed via framework path",
-                stage_err,
-            )
-
-        env = {
-            **os.environ,
-            "HOME": str(sandbox_path),
-            "USERPROFILE": str(sandbox_path),
-            "CLAUDE_CONFIG_DIR": str(sandbox_claude_dir),
-            "PATH": f"{shim_dir_path}{os.pathsep}{os.environ.get('PATH', '')}",
-        }
-        # Deliberately NO ``CLAUDE_CODE_OAUTH_TOKEN``: we want claude's
-        # native refresh path to engage (read .credentials.json → if
-        # expired refresh against Anthropic → write back). The env-var
-        # mode would bypass storage entirely.
-        rc, err = await _run_claude_oneshot(env, str(sandbox_path), timeout=timeout)
-        if rc is None:
-            # Spawn/timeout — no sandbox state to salvage.
-            return (False, err)
-
-        # Always read sandbox creds, regardless of rc. Parse failures
-        # only matter as a fallback signal when rc != 0.
-        try:
-            refreshed = sandbox_creds.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            if rc != 0:
-                return (False, f"claude_exit_code={rc}")
-            return (False, "refreshed_credentials_missing")
-        try:
-            new_token = (
-                (json.loads(refreshed).get("claudeAiOauth") or {}).get("accessToken")
-            ) or ""
-        except json.JSONDecodeError:
-            if rc != 0:
-                return (False, f"claude_exit_code={rc}")
-            return (False, "refreshed_credentials_unparseable")
-
-        rotated = bool(new_token) and old_token != new_token
-
-        # rc != 0 with no rotation: real failure, nothing to salvage.
-        if rc != 0 and not rotated:
-            return (False, f"claude_exit_code={rc}")
-
-        cache.write(refreshed)
-        if rc != 0:
-            # Salvage path: keep the rotation, surface the rc so the
-            # caller can log + investigate the non-zero exit separately.
-            return (True, f"token_refreshed_rc={rc}")
-        if not rotated:
-            return (True, "token_unchanged")
-        return (True, "token_refreshed")

@@ -22,10 +22,7 @@ import shutil
 import time
 from pathlib import Path
 
-from ...macos.keychain import (
-    is_macos,
-    shim_dir,
-)
+from ...macos.keychain import is_macos
 from ...mcp.config import (
     default_python_executable,
     write_cli_mcp_config,
@@ -345,32 +342,20 @@ class LocalCLIAdapter(Adapter):
           (which the daemon's ``KeychainBackend.sync_to_agent`` keeps
           fresh) rather than racing the operator's main CLI for the
           Keychain entry.
-        - ``PATH`` is prepended with the security-shim dir so the
-          buggy ``security delete-generic-password`` call from Claude
-          Code issue #37512 is intercepted before it can flush the
-          operator's main CLI auth.
 
         Deliberately does NOT set ``CLAUDE_CODE_OAUTH_TOKEN`` — that
-        env var triggers the same fallback-combiner cleanup path that
-        deletes the Keychain entry. We let claude read its token
-        from the per-agent ``.credentials.json`` like normal.
+        env var triggers the fallback-combiner cleanup path from Claude
+        Code issue #37512 that deletes the Keychain entry. We let
+        claude read its token from the per-agent ``.credentials.json``
+        like normal.
 
         Returns ``{}`` on non-macOS so the Linux/Windows spawn env is
         unchanged.
         """
         if not is_macos():
             return {}
-        # Just compute the shim path — ``KeychainBackend.bootstrap()``
-        # installed the actual script once at daemon start
-        # (credential_refresh.py → keychain.install_path_shim).
-        # Re-installing on every adapter spawn would be wasted I/O
-        # and would race on the same file path when two workers spawn
-        # concurrently.
-        shim_path = shim_dir(home_dir())
-        existing_path = os.environ.get("PATH", "")
         return {
             "CLAUDE_CONFIG_DIR": str(Path(self.agent_home_dir) / ".claude"),
-            "PATH": f"{shim_path}{os.pathsep}{existing_path}",
         }
 
     def _permission_hook_env(self) -> dict[str, str]:
