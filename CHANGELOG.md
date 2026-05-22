@@ -4,6 +4,54 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] — 2026-05-22
+
+### Fixed
+
+- **Multi-mention extraction.** `handle_envelope` previously checked
+  only `f"@{self.slug}" in raw_text` and emitted at most one row
+  in the prompt's `mentions:` metadata block. A message like
+  `@alice-1234 @bob-5678 @you(test-...)` would surface only the
+  self-mention to the LLM. Now extracts every `@<slug>` via a
+  regex mirroring the web client's `remark-mentions` pattern.
+
+- **Per-space mention scoping.** Mentions are filtered against the
+  message's space members — slugs from another space drop out the
+  same way they do in the web client. DMs skip the filter (the
+  scope is undefined there). Self is always kept regardless.
+
+- **`is_bot` label correctness.** Non-self mentions now derive
+  `is_bot` from the `identity_type` field returned by
+  `GET /spaces/{id}/members`, so the prompt sees `(agent)` /
+  `(human)` for other slugs instead of every non-self defaulting
+  to `(human)`.
+
+### Added
+
+- **Startup cache prefetch.** `listen()` now spawns a background
+  `_warm_member_caches()` task that walks `GET /spaces` once and
+  fans out parallel `GET /spaces/{id}/members` +
+  `GET /spaces/{id}/channels` requests per space, then bulk-
+  resolves member profiles via `GET /identities/profiles?slugs=...`
+  (chunked 50/req). Warms:
+  - `_space_members` (slug → identity_type) — mention scoping
+  - `_channel_space` + persistent `channel_space_map` — MCP
+    `send_message` skips a round trip
+  - `_space_name_cache`, `_channel_name_cache` — prompt rendering
+  - `_profile_cache` — display-name resolution
+
+  Non-blocking: WS subscribe doesn't await it. Per-fetch failures
+  are logged and skipped (the existing lazy paths re-try on
+  demand). Membership events that arrive during the warmup still
+  invalidate the cache correctly via the new event-router hook.
+
+- **Event-router invalidation of `_space_members`.** Any
+  `accept_space_invite` / `leave_space` / `remove_from_space`
+  for a space we have cached pops that entry, so the next mention
+  extraction re-fetches and picks up the new joiner / dropped
+  leaver. Closes the "Nora joined after cache populated, her
+  mention silently dropped" class of bug.
+
 ## [0.9.1] — 2026-05-20
 
 ### Added

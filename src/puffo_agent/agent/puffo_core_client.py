@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
@@ -28,6 +29,21 @@ from .events import random_nonce, sign_event
 from .message_store import MessageStore
 
 logger = logging.getLogger(__name__)
+
+
+class _AgentLogger(logging.LoggerAdapter):
+    """Prepends ``[<agent_slug>]`` to every message so multi-agent
+    daemon logs can be grepped per agent."""
+
+    def process(self, msg, kwargs):
+        return f"[{self.extra['agent']}] {msg}", kwargs
+
+
+# Mirrors the web client's remark-mentions pattern; non-word
+# leader so ``foo@bar-1234`` (an email) doesn't match.
+_MENTION_RE = re.compile(
+    r"(?:^|\W)@([a-z][a-z0-9-]*-[a-f0-9]{4})", re.IGNORECASE,
+)
 
 
 # Lower number = higher priority — drained first by the consumer loop.
@@ -384,6 +400,12 @@ class PuffoCoreMessageClient:
     the worker's expected parameter signature.
     """
 
+    # Class-level fallback so ``__new__``-built test fixtures (which
+    # skip ``__init__``) still have a working logger. Real instances
+    # override this in ``__init__`` with the agent-slug-prefixed
+    # ``_AgentLogger``.
+    _log: logging.Logger | logging.LoggerAdapter = logger
+
     def __init__(
         self,
         slug: str,
@@ -466,6 +488,15 @@ class PuffoCoreMessageClient:
         self._space_name_cache: dict[str, str] = {}
         self._channel_name_cache: dict[str, str] = {}
 
+        # Per-space member cache (slug → identity_type) for mention
+        # scoping + bot-vs-human labelling. Lazy, session-lifetime.
+        self._space_members: dict[str, dict[str, str]] = {}
+
+        # All ``self._log.X(...)`` calls in this class get an
+        # ``[<agent_slug>]`` prefix so multi-agent daemon logs are
+        # filterable per agent.
+        self._log = _AgentLogger(logger, {"agent": self.slug})
+
     async def listen(
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
@@ -513,7 +544,7 @@ class PuffoCoreMessageClient:
             try:
                 sender_pks = await self._key_cache.get_signing_keys(sender_slug)
             except Exception as e:
-                logger.warning(
+                self._log.warning(
                     "could not fetch signing keys for %s — skipping (%s)",
                     sender_slug, e,
                 )
@@ -548,7 +579,7 @@ class PuffoCoreMessageClient:
                     pass
 
             if payload is None:
-                logger.warning(
+                self._log.warning(
                     "decryption failed for %s (%d sender keys tried) — skipping",
                     envelope.get("envelope_id"), len(sender_pks),
                 )
@@ -647,23 +678,35 @@ class PuffoCoreMessageClient:
                 # invites would otherwise fail).
                 self._channel_space[payload.channel_id] = payload.space_id
 
-            # puffo-core has no structural mention objects yet, so
-            # synthesise the dict shape core.py:_append_user expects
-            # (``username``/``is_bot``/``is_self``) when the text
-            # contains `@<our slug>` literally.
-            is_mention = f"@{self.slug}" in raw_text
+            # Parse all ``@<slug>`` and scope to space members
+            # (matches the web client). Self is always kept.
+            self_slug_lower = self.slug.lower()
+            seen: set[str] = set()
+            parsed: list[str] = []
+            for m in _MENTION_RE.finditer(raw_text):
+                slug = m.group(1).lower()
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                parsed.append(slug)
+            is_mention = self_slug_lower in seen
+            space_members = (
+                await self._get_space_members(payload.space_id)
+                if payload.space_id
+                else {}
+            )
             mentions: list[dict] = []
-            if is_mention:
-                mentions.append({
-                    "username": self.slug,
-                    "is_bot": True,
-                    "is_self": True,
-                })
+            for slug in parsed:
+                if slug == self_slug_lower:
+                    mentions.append({"username": self.slug, "is_bot": True, "is_self": True})
+                    continue
+                if space_members and slug not in space_members:
+                    continue
+                is_bot = space_members.get(slug) == "agent"
+                mentions.append({"username": slug, "is_bot": is_bot, "is_self": False})
 
-            # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`,
-            # the unambiguous "you are being addressed" signal documented
-            # in the shared primer. Other handles stay un-rewrapped so
-            # peer addressing reads naturally.
+            # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
+            # (the documented "addressed to you" signal).
             clean_text = raw_text.replace(
                 f"@{self.slug}", f"@you({self.slug})",
             ).strip() if is_mention else raw_text
@@ -709,7 +752,7 @@ class PuffoCoreMessageClient:
             # skip — the agent has seen this.
             last_processed = await self.store.get_last_processed_sent_at(root_id)
             if payload.sent_at <= last_processed:
-                logger.info(
+                self._log.info(
                     "handle_envelope: cursor-rejected duplicate envelope=%s "
                     "(sent_at=%d <= last_processed=%d, root=%s)",
                     payload.envelope_id, payload.sent_at,
@@ -790,6 +833,10 @@ class PuffoCoreMessageClient:
             self._consume_queue(on_message, on_api_error_retry),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
+        # Fire-and-forget; the WS subscribe below doesn't wait for
+        # the warmup. Worst case the first message pays the lazy
+        # fetch as before.
+        warm_task = asyncio.ensure_future(self._warm_member_caches())
 
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
@@ -805,7 +852,8 @@ class PuffoCoreMessageClient:
         finally:
             consumer_task.cancel()
             invite_poll_task.cancel()
-            for task in (consumer_task, invite_poll_task):
+            warm_task.cancel()
+            for task in (consumer_task, invite_poll_task, warm_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -853,7 +901,7 @@ class PuffoCoreMessageClient:
         # gets dispatched as the next batch — agent sees the same
         # envelope across two turns. See ``_ThreadEntry`` docstring.
         if entry is not None and incoming_id and incoming_id in entry.dispatching_ids:
-            logger.info(
+            self._log.info(
                 "_admit_thread_message: dispatching_ids-rejected duplicate "
                 "envelope=%s root=%s", incoming_id, root_id,
             )
@@ -889,7 +937,7 @@ class PuffoCoreMessageClient:
         if incoming_id and any(
             m.get("envelope_id") == incoming_id for m in entry.messages
         ):
-            logger.info(
+            self._log.info(
                 "_admit_thread_message: in-batch-rejected duplicate "
                 "envelope=%s root=%s (pending batch=%d)",
                 incoming_id, root_id, len(entry.messages),
@@ -946,7 +994,7 @@ class PuffoCoreMessageClient:
         entry.dispatching_ids = set()
 
         if on_api_error_retry is None:
-            logger.warning(
+            self._log.warning(
                 "agent reply contained 'API Error' for thread %s "
                 "(last envelope %s); no retry callback wired, "
                 "abandoning batch",
@@ -956,7 +1004,7 @@ class PuffoCoreMessageClient:
 
         for attempt in range(1, self.MAX_API_ERROR_RETRIES + 1):
             delay = random.uniform(15.0, 45.0)
-            logger.warning(
+            self._log.warning(
                 "agent reply contained 'API Error' for thread %s "
                 "(last envelope %s); kick-retry %d/%d in %.1fs",
                 root_id, last_envelope, attempt,
@@ -978,13 +1026,13 @@ class PuffoCoreMessageClient:
                             root_id, tail_sent_at,
                         )
                     except Exception:
-                        logger.exception(
+                        self._log.exception(
                             "mark_thread_processed(%s, %d) failed "
                             "after kick-retry; agent may re-process "
                             "after restart",
                             root_id, tail_sent_at,
                         )
-                logger.info(
+                self._log.info(
                     "agent thread %s recovered after kick-retry %d/%d",
                     root_id, attempt, self.MAX_API_ERROR_RETRIES,
                 )
@@ -995,12 +1043,12 @@ class PuffoCoreMessageClient:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception(
+                self._log.exception(
                     "kick-retry %d/%d for thread %s raised; abandoning",
                     attempt, self.MAX_API_ERROR_RETRIES, root_id,
                 )
                 return
-        logger.warning(
+        self._log.warning(
             "agent thread %s exhausted %d kick-retries (last envelope %s); "
             "abandoning the batch — agent will see these messages via "
             "get_channel_history on the next dispatch",
@@ -1073,7 +1121,7 @@ class PuffoCoreMessageClient:
                     seen_ids.add(mid)
                 deduped.append(m)
             if dropped:
-                logger.warning(
+                self._log.warning(
                     "consumer dropped %d in-batch duplicate envelope_id(s) "
                     "for thread %s before dispatch: %s",
                     len(dropped), root_id, dropped,
@@ -1124,7 +1172,7 @@ class PuffoCoreMessageClient:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception(
+                self._log.exception(
                     "on_message_batch handler failed for thread %s (%d messages)",
                     root_id, len(batch),
                 )
@@ -1143,7 +1191,7 @@ class PuffoCoreMessageClient:
                 try:
                     await self.store.mark_thread_processed(root_id, tail_sent_at)
                 except Exception:
-                    logger.exception(
+                    self._log.exception(
                         "mark_thread_processed(%s, %d) failed; agent "
                         "may re-process this thread after a restart",
                         root_id, tail_sent_at,
@@ -1209,7 +1257,16 @@ class PuffoCoreMessageClient:
         except Exception:
             # Never let cache bookkeeping break the rest of event
             # routing — invite polling / intro nudges must still run.
-            logger.exception("mark_channel_space from %s failed", kind)
+            self._log.exception("mark_channel_space from %s failed", kind)
+
+        # Drop the per-space member cache when anyone joins / leaves /
+        # is removed so the next mention extraction re-fetches; without
+        # this the cache misses the new joiner and their @-mention is
+        # silently dropped from the metadata.
+        if kind in ("accept_space_invite", "leave_space", "remove_from_space"):
+            evict_space_id = payload.get("space_id") or ""
+            if evict_space_id:
+                self._space_members.pop(evict_space_id, None)
 
         if kind in ("invite_to_space", "invite_to_channel"):
             if payload.get("invitee_slug") != self.slug:
@@ -1246,7 +1303,7 @@ class PuffoCoreMessageClient:
                     channel_id=channel_id,
                 )
             except Exception:
-                logger.exception(
+                self._log.exception(
                     "failed to enqueue intro nudge for server-auto-"
                     "accepted channel (space=%s channel=%s)",
                     space_id, channel_id,
@@ -1354,10 +1411,11 @@ class PuffoCoreMessageClient:
             self._channel_space.pop(cid, None)
             self._channel_name_cache.pop(cid, None)
         self._space_name_cache.pop(space_id, None)
+        self._space_members.pop(space_id, None)
         try:
             await self.store.unmark_channel_space_for_space(space_id)
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "unmark_channel_space_for_space failed for sp=%s "
                 "(non-fatal — in-memory eviction already ran)",
                 space_id,
@@ -1374,7 +1432,7 @@ class PuffoCoreMessageClient:
         try:
             await self.store.unmark_channel_space(channel_id)
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "unmark_channel_space failed for ch=%s "
                 "(non-fatal — in-memory eviction already ran)",
                 channel_id,
@@ -1386,14 +1444,14 @@ class PuffoCoreMessageClient:
         smoke fixtures); exception suppression matches the existing
         invite-DM helpers so a failed DM never crashes the WS handler."""
         if not self.operator_slug:
-            logger.info(
+            self._log.info(
                 "membership change but no operator_slug; not DMing: %s", text,
             )
             return
         try:
             await self._send_dm(self.operator_slug, text, root_id="")
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "failed to DM operator about membership change: %s", text,
             )
 
@@ -1420,7 +1478,7 @@ class PuffoCoreMessageClient:
         # ``None`` (network error) falls through to the permissive path
         # so a transient /spaces flake can't block legitimate cleanup.
         if synthetic and await self._still_member_of_space(space_id) is True:
-            logger.warning(
+            self._log.warning(
                 "synthetic LeaveSpace for sp=%s but /spaces still lists "
                 "us — ignoring (likely server bug or WS redelivery)",
                 space_id,
@@ -1450,7 +1508,7 @@ class PuffoCoreMessageClient:
         try:
             data = await self.http.get("/spaces")
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "membership re-check for sp=%s failed — falling through",
                 space_id,
             )
@@ -1569,7 +1627,7 @@ class PuffoCoreMessageClient:
                 self.operator_slug, text, root_id=target_env_id,
             )
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "failed to DM operator about canceled invite (event_id=%s)",
                 invitation_event_id,
             )
@@ -1582,12 +1640,12 @@ class PuffoCoreMessageClient:
         try:
             data = await self.http.get("/invites?direction=received")
         except Exception:
-            logger.exception("invite poll failed")
+            self._log.exception("invite poll failed")
             return
         invites = data.get("invites") or []
         if not invites:
             return
-        logger.info("invite poll: %d pending invite(s)", len(invites))
+        self._log.info("invite poll: %d pending invite(s)", len(invites))
         for entry in invites:
             invitation_event_id = entry.get("invitation_event_id", "")
             if not invitation_event_id:
@@ -1604,7 +1662,7 @@ class PuffoCoreMessageClient:
                 else ""
             )
             if not kind:
-                logger.warning(
+                self._log.warning(
                     "unknown invite scope %r (event_id=%s) — skipping",
                     scope, invitation_event_id,
                 )
@@ -1638,14 +1696,14 @@ class PuffoCoreMessageClient:
         otherwise DM the operator. Idempotent on
         ``_processed_invite_ids``."""
         if not invitation_event_id or not inviter_slug or not space_id:
-            logger.warning(
+            self._log.warning(
                 "invite missing required fields: kind=%s event_id=%s "
                 "signer=%s space=%s",
                 kind, invitation_event_id, inviter_slug, space_id,
             )
             return
         if kind == "invite_to_channel" and not channel_id:
-            logger.warning(
+            self._log.warning(
                 "channel invite missing channel_id: event_id=%s",
                 invitation_event_id,
             )
@@ -1659,13 +1717,13 @@ class PuffoCoreMessageClient:
                 await self._accept_invite(
                     kind, invitation_event_id, space_id, channel_id,
                 )
-                logger.info(
+                self._log.info(
                     "auto-accepted %s from operator %s (event_id=%s)",
                     kind, inviter_slug, invitation_event_id,
                 )
                 self._processed_invite_ids.add(invitation_event_id)
             except Exception:
-                logger.exception(
+                self._log.exception(
                     "failed to auto-accept %s from operator %s (event_id=%s)",
                     kind, inviter_slug, invitation_event_id,
                 )
@@ -1700,7 +1758,7 @@ class PuffoCoreMessageClient:
         try:
             inviter_pk = await self._fetch_inviter_root_pubkey(inviter_slug)
         except Exception as e:
-            logger.warning(
+            self._log.warning(
                 "could not look up identity_cert for inviter %s: %s",
                 inviter_slug, e,
             )
@@ -1788,7 +1846,7 @@ class PuffoCoreMessageClient:
                     avatar_url = (entry.get("avatar_url") or "").strip()
                     break
         except Exception as exc:
-            logger.debug(
+            self._log.debug(
                 "_fetch_user_profile: lookup failed for %s: %s",
                 slug, exc,
             )
@@ -1814,19 +1872,19 @@ class PuffoCoreMessageClient:
         try:
             parent = await self.store.get_message_by_envelope(parent_id)
         except Exception as exc:
-            logger.warning(
+            self._log.warning(
                 "_validate_incoming_parent_id: lookup failed for %s: %s",
                 parent_id, exc,
             )
             return None
         if parent is None:
-            logger.info(
+            self._log.info(
                 "_validate_incoming_parent_id: wiped %s — parent not in local cache",
                 parent_id,
             )
             return None
         if expected_channel_id and parent.channel_id != expected_channel_id:
-            logger.info(
+            self._log.info(
                 "_validate_incoming_parent_id: wiped %s — parent channel "
                 "%r != incoming channel %r",
                 parent_id, parent.channel_id, expected_channel_id,
@@ -1837,13 +1895,131 @@ class PuffoCoreMessageClient:
             and parent.space_id
             and parent.space_id != expected_space_id
         ):
-            logger.info(
+            self._log.info(
                 "_validate_incoming_parent_id: wiped %s — parent space "
                 "%r != incoming space %r",
                 parent_id, parent.space_id, expected_space_id,
             )
             return None
         return parent_id
+
+    async def _warm_member_caches(self) -> None:
+        """Background prefetch on ``listen()`` startup: walks ``GET
+        /spaces`` and fans out parallel member + channel fetches per
+        space so first-message lazy fills don't pay the round trip
+        or miss recently-joined members. Non-blocking; per-fetch
+        failures are logged + skipped (the existing lazy paths re-
+        try on demand)."""
+        started = time.monotonic()
+        try:
+            spaces_resp = await self.http.get("/spaces")
+        except Exception as exc:
+            self._log.debug("warm_member_caches: /spaces failed: %s", exc)
+            return
+        space_entries = spaces_resp.get("spaces") or []
+        for entry in space_entries:
+            sid = entry.get("space_id") or ""
+            name = (entry.get("name") or "").strip()
+            if sid and name:
+                self._space_name_cache.setdefault(sid, name)
+        space_ids = [
+            e.get("space_id") or ""
+            for e in space_entries
+            if e.get("space_id")
+        ]
+        if not space_ids:
+            return
+
+        async def warm_one(space_id: str) -> set[str]:
+            members_task = asyncio.create_task(
+                self._get_space_members(space_id),
+            )
+            channels_task = asyncio.create_task(
+                self._warm_channels_for_space(space_id),
+            )
+            members = await members_task
+            await channels_task
+            return set(members.keys())
+
+        all_slugs: set[str] = set()
+        for result in await asyncio.gather(
+            *(warm_one(sid) for sid in space_ids),
+            return_exceptions=True,
+        ):
+            if isinstance(result, set):
+                all_slugs |= result
+        new_slugs = [s for s in all_slugs if s not in self._profile_cache]
+        if new_slugs:
+            await self._bulk_fetch_profiles(new_slugs)
+        self._log.info(
+            "warm_member_caches: %d spaces, %d members, %d new profiles in %.2fs",
+            len(space_ids), len(all_slugs), len(new_slugs),
+            time.monotonic() - started,
+        )
+
+    async def _warm_channels_for_space(self, space_id: str) -> None:
+        try:
+            resp = await self.http.get(f"/spaces/{space_id}/channels")
+        except Exception:
+            return
+        for ch in resp.get("channels", []) or []:
+            cid = ch.get("channel_id") or ""
+            name = (ch.get("name") or "").strip()
+            if not cid:
+                continue
+            # ``setdefault`` so a faster-arriving WS event that
+            # populated these isn't clobbered with potentially older
+            # data we just fetched.
+            self._channel_space.setdefault(cid, space_id)
+            if name:
+                self._channel_name_cache.setdefault(cid, name)
+            try:
+                await self.store.mark_channel_space(cid, space_id)
+            except Exception:
+                pass
+
+    async def _bulk_fetch_profiles(self, slugs: list[str]) -> None:
+        """Batch ``/identities/profiles?slugs=...``; chunked so a
+        many-member space doesn't blow the URL length."""
+        now = time.monotonic()
+        CHUNK = 50
+        for i in range(0, len(slugs), CHUNK):
+            chunk = slugs[i:i + CHUNK]
+            try:
+                data = await self.http.get(
+                    f"/identities/profiles?slugs={','.join(chunk)}",
+                )
+            except Exception:
+                continue
+            for entry in data.get("profiles") or []:
+                slug = entry.get("slug") or ""
+                if not slug:
+                    continue
+                name = (entry.get("display_name") or "").strip()
+                avatar_url = (entry.get("avatar_url") or "").strip()
+                self._profile_cache[slug] = (name, avatar_url, now)
+
+    async def _get_space_members(self, space_id: str) -> dict[str, str]:
+        """``slug -> identity_type`` for ``space_id``. Cached per
+        session; empty dict on miss/failure (caller treats an unknown
+        space as "no scope")."""
+        if not space_id:
+            return {}
+        cached = self._space_members.get(space_id)
+        if cached is not None:
+            return cached
+        try:
+            resp = await self.http.get(f"/spaces/{space_id}/members")
+        except Exception:
+            self._space_members[space_id] = {}
+            return {}
+        members = {
+            m["slug"]: m.get("identity_type") or "human"
+            for m in resp.get("members", [])
+            if m.get("slug")
+        }
+        self._space_members[space_id] = members
+        return members
 
     async def _resolve_space_name(self, space_id: str) -> str:
         """Space name via ``GET /spaces``, cached per session. Returns
@@ -1959,7 +2135,7 @@ class PuffoCoreMessageClient:
             try:
                 await self.store.mark_channel_space(channel_id, space_id)
             except Exception:
-                logger.exception(
+                self._log.exception(
                     "mark_channel_space after manual accept failed "
                     "(space=%s channel=%s)", space_id, channel_id,
                 )
@@ -1981,7 +2157,7 @@ class PuffoCoreMessageClient:
                     space_id,
                 )
             except Exception:
-                logger.exception(
+                self._log.exception(
                     "failed to look up General channel for intro nudge "
                     "(space=%s)", space_id,
                 )
@@ -1993,7 +2169,7 @@ class PuffoCoreMessageClient:
                 )
             except Exception:
                 # Intro is best-effort; never block the accept.
-                logger.exception(
+                self._log.exception(
                     "failed to enqueue channel intro nudge "
                     "(space=%s channel=%s)", space_id, intro_channel_id,
                 )
@@ -2024,7 +2200,7 @@ class PuffoCoreMessageClient:
             await asyncio.sleep(delay)
             data = await self.http.get(f"/spaces/{space_id}/channels")
             if not isinstance(data, dict):
-                logger.info(
+                self._log.info(
                     "channels endpoint not ready for space=%s "
                     "(attempt %d/%d) — retrying",
                     space_id,
@@ -2050,7 +2226,7 @@ class PuffoCoreMessageClient:
                 if not found_cid and entry.get("is_public") and cid:
                     found_cid = cid
             return found_cid
-        logger.warning(
+        self._log.warning(
             "gave up looking up General channel for space=%s after %d "
             "attempts — intro nudge will be skipped",
             space_id, len(retry_delays),
@@ -2152,7 +2328,7 @@ class PuffoCoreMessageClient:
             # delivers the prompt even if sqlite fails (disk full,
             # permission, etc.). Log loud so the operator can spot
             # the inconsistency between prompt + history.
-            logger.warning(
+            self._log.warning(
                 "intro-nudge: failed to persist envelope=%s to messages.db: %s",
                 envelope_id, exc,
             )
@@ -2163,7 +2339,7 @@ class PuffoCoreMessageClient:
             msg_dict=msg_dict,
             channel_meta=channel_meta,
         )
-        logger.info(
+        self._log.info(
             "enqueued channel-intro nudge for channel=%s (space=%s)",
             channel_id, space_id,
         )
@@ -2219,12 +2395,12 @@ class PuffoCoreMessageClient:
                     kind, invitation_event_id, space_id, channel_id,
                 )
                 confirm = f"Accepted invite to {target}. ✓"
-                logger.info(
+                self._log.info(
                     "operator-confirmed accept of %s (event_id=%s)",
                     kind, invitation_event_id,
                 )
             except Exception as exc:
-                logger.exception(
+                self._log.exception(
                     "operator-confirmed accept of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
@@ -2235,12 +2411,12 @@ class PuffoCoreMessageClient:
                     kind, invitation_event_id, space_id, channel_id,
                 )
                 confirm = f"Rejected invite from {inviter_label} to {target}."
-                logger.info(
+                self._log.info(
                     "operator-confirmed reject of %s (event_id=%s)",
                     kind, invitation_event_id,
                 )
             except Exception as exc:
-                logger.exception(
+                self._log.exception(
                     "operator-confirmed reject of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
@@ -2254,7 +2430,7 @@ class PuffoCoreMessageClient:
                 self.operator_slug, confirm, root_id=thread_root_id,
             )
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "failed to confirm invite-reply outcome to operator",
             )
         return True
@@ -2320,7 +2496,7 @@ class PuffoCoreMessageClient:
         labels degrade to bare IDs.
         """
         if not self.operator_slug:
-            logger.warning(
+            self._log.warning(
                 "received %s from non-operator %s but no operator_slug "
                 "configured — leaving invite pending (event_id=%s)",
                 kind, inviter_slug, invitation_event_id,
@@ -2352,7 +2528,7 @@ class PuffoCoreMessageClient:
         try:
             envelope = await self._send_dm(self.operator_slug, text, root_id="")
         except Exception:
-            logger.exception(
+            self._log.exception(
                 "failed to DM operator about invite from %s (event_id=%s)",
                 inviter_slug, invitation_event_id,
             )
@@ -2398,7 +2574,7 @@ class PuffoCoreMessageClient:
             try:
                 meta = AttachmentMeta.from_dict(raw)
             except Exception:
-                logger.warning("attachment meta parse failed: %r", raw)
+                self._log.warning("attachment meta parse failed: %r", raw)
                 continue
             ciphertext = await _fetch_blob_with_retry(
                 self.http, meta.blob_id,
@@ -2408,7 +2584,7 @@ class PuffoCoreMessageClient:
             try:
                 plaintext = decrypt_attachment(ciphertext, meta)
             except Exception as exc:
-                logger.warning(
+                self._log.warning(
                     "attachment decrypt failed (%s/%s): %s",
                     meta.blob_id, meta.filename, exc,
                 )
@@ -2421,7 +2597,7 @@ class PuffoCoreMessageClient:
             try:
                 target.write_bytes(plaintext)
             except OSError as exc:
-                logger.warning(
+                self._log.warning(
                     "attachment save failed (%s): %s", target, exc,
                 )
                 continue
@@ -2449,7 +2625,7 @@ class PuffoCoreMessageClient:
         )
         devices = await self._fetch_device_keys([self.slug, recipient_slug])
         if not devices:
-            logger.warning(
+            self._log.warning(
                 "no recipient devices for DM to %s — dropping", recipient_slug,
             )
             return None
@@ -2469,7 +2645,7 @@ class PuffoCoreMessageClient:
         try:
             await self.http.post("/messages", envelope)
         except HttpError:
-            logger.exception("DM send to %s failed", recipient_slug)
+            self._log.exception("DM send to %s failed", recipient_slug)
             raise
         return envelope
 
@@ -2553,14 +2729,14 @@ class PuffoCoreMessageClient:
                 target_space_id = await self.store.lookup_channel_space(channel_id) or ""
                 if target_space_id:
                     self._channel_space[channel_id] = target_space_id
-                    logger.info(
+                    self._log.info(
                         "send_fallback_message: hydrated in-memory "
                         "channel_space for %s from persistent store "
                         "(sp=%s)",
                         channel_id, target_space_id,
                     )
             if not target_space_id:
-                logger.warning(
+                self._log.warning(
                     "send_fallback_message: no known space for channel %s — "
                     "dropping (agent may have been removed, or the channel "
                     "id is stale)",
@@ -2576,7 +2752,7 @@ class PuffoCoreMessageClient:
                 if m.get("slug")
             ]
             if not member_slugs:
-                logger.warning(
+                self._log.warning(
                     "channel %s has no members — dropping reply", channel_id,
                 )
                 return
@@ -2589,7 +2765,7 @@ class PuffoCoreMessageClient:
             # DM reply — route to whoever just DMed us.
             recipient = self._last_dm_sender
             if not recipient:
-                logger.warning(
+                self._log.warning(
                     "send_fallback_message called with empty channel_id but no DM "
                     "context — dropping reply",
                 )
@@ -2601,13 +2777,13 @@ class PuffoCoreMessageClient:
             send_channel_id = None
 
         if not devices:
-            logger.warning(
+            self._log.warning(
                 "no recipient devices found (kind=%s target=%s) — dropping",
                 envelope_kind, recipient_slug or channel_id,
             )
             return
 
-        logger.info(
+        self._log.info(
             "send_fallback_message: kind=%s target=%s devices=%d",
             envelope_kind, recipient_slug or channel_id, len(devices),
         )
@@ -2633,13 +2809,13 @@ class PuffoCoreMessageClient:
         # wrapped in ``{"envelope": ...}``.
         try:
             resp = await self.http.post("/messages", envelope)
-            logger.info(
+            self._log.info(
                 "send_fallback_message sent: envelope_id=%s queued=%s",
                 envelope.get("envelope_id"),
                 (resp or {}).get("devices_queued"),
             )
         except Exception:
-            logger.exception("send_fallback_message: POST /messages failed")
+            self._log.exception("send_fallback_message: POST /messages failed")
             raise
 
         # No mirror-write here anymore. The WS echo path now persists
