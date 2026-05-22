@@ -51,7 +51,7 @@ def _make_client(
     client._channel_space = {}
     client._space_name_cache = {}
     client._channel_name_cache = {}
-    client._space_member_slugs = {}
+    client._space_members = {}
     client._processed_invite_ids = set()
     client._pending_invite_dms = {}
 

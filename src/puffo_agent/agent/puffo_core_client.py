@@ -473,9 +473,9 @@ class PuffoCoreMessageClient:
         self._space_name_cache: dict[str, str] = {}
         self._channel_name_cache: dict[str, str] = {}
 
-        # Per-space member-slug cache for mention scoping (matches the
-        # web client's per-space gate). Lazy, session-lifetime.
-        self._space_member_slugs: dict[str, set[str]] = {}
+        # Per-space member cache (slug → identity_type) for mention
+        # scoping + bot-vs-human labelling. Lazy, session-lifetime.
+        self._space_members: dict[str, dict[str, str]] = {}
 
     async def listen(
         self,
@@ -673,7 +673,7 @@ class PuffoCoreMessageClient:
             space_members = (
                 await self._get_space_members(payload.space_id)
                 if payload.space_id
-                else set()
+                else {}
             )
             mentions: list[dict] = []
             for slug in parsed:
@@ -682,7 +682,8 @@ class PuffoCoreMessageClient:
                     continue
                 if space_members and slug not in space_members:
                     continue
-                mentions.append({"username": slug, "is_bot": False, "is_self": False})
+                is_bot = space_members.get(slug) == "agent"
+                mentions.append({"username": slug, "is_bot": is_bot, "is_self": False})
 
             # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
             # (the documented "addressed to you" signal).
@@ -1376,7 +1377,7 @@ class PuffoCoreMessageClient:
             self._channel_space.pop(cid, None)
             self._channel_name_cache.pop(cid, None)
         self._space_name_cache.pop(space_id, None)
-        self._space_member_slugs.pop(space_id, None)
+        self._space_members.pop(space_id, None)
         try:
             await self.store.unmark_channel_space_for_space(space_id)
         except Exception:
@@ -1868,22 +1869,27 @@ class PuffoCoreMessageClient:
             return None
         return parent_id
 
-    async def _get_space_members(self, space_id: str) -> set[str]:
-        """Member slugs for ``space_id``. Cached per session; empty set
-        on miss/failure (caller treats unknown space as "no scope")."""
+    async def _get_space_members(self, space_id: str) -> dict[str, str]:
+        """``slug -> identity_type`` for ``space_id``. Cached per
+        session; empty dict on miss/failure (caller treats an unknown
+        space as "no scope")."""
         if not space_id:
-            return set()
-        cached = self._space_member_slugs.get(space_id)
+            return {}
+        cached = self._space_members.get(space_id)
         if cached is not None:
             return cached
         try:
             resp = await self.http.get(f"/spaces/{space_id}/members")
         except Exception:
-            self._space_member_slugs[space_id] = set()
-            return set()
-        slugs = {m.get("slug", "") for m in resp.get("members", []) if m.get("slug")}
-        self._space_member_slugs[space_id] = slugs
-        return slugs
+            self._space_members[space_id] = {}
+            return {}
+        members = {
+            m["slug"]: m.get("identity_type") or "human"
+            for m in resp.get("members", [])
+            if m.get("slug")
+        }
+        self._space_members[space_id] = members
+        return members
 
     async def _resolve_space_name(self, space_id: str) -> str:
         """Space name via ``GET /spaces``, cached per session. Returns
