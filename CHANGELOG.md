@@ -4,6 +4,83 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.4] — 2026-05-22
+
+### Added
+
+- **`GET /v1/agents/{id}/log` now reads the agent's audit log.** The
+  route was scaffolded but the handler was a stub returning
+  `{lines: []}`. It now reads NDJSON from `~/.puffo-agent/agents/
+  <agent_id>/workspace/.puffo-agent/audit.log` (the same file
+  `cli_session.AuditLog.write` appends to on every turn) and exposes
+  both an initial-paint mode and a delta-polling mode:
+
+  1. **Tail mode** (default, or explicit `?tail=N`): returns the
+     last `N` lines, default 200, capped at 2000. Implemented via
+     reverse-seek in 64 KB chunks off the file end (`_read_tail_bytes`)
+     rather than `read_bytes()` — `audit.log` has no rotation at
+     the writer side yet, so for a long-lived agent the file can
+     grow to hundreds of MB and a full-file read would scale badly.
+     The reverse-seek bounds memory at roughly `tail × avg_line_size`
+     regardless of total file length.
+  2. **Delta mode** (`?since=<byte-offset>`): returns lines written
+     after the caller's previous cursor for cheap polling, capped
+     at 256 KB per response (`_LOG_MAX_DELTA_BYTES`). When the cap
+     hits, the response trims back to the previous newline (no
+     truncated JSON record) and `next_cursor` advances to the
+     partial offset so the next poll picks up the rest. Two-page
+     coverage is covered by
+     `test_log_delta_partial_cursor_drives_next_poll_to_completion`.
+
+  **Rotation safety**: a `since` cursor past current `file_size`
+  (file shrunk because the operator rotated/archived `audit.log` out
+  of band) resets to 0 so the next response carries a fresh initial
+  tail instead of returning empty and leaving the client stuck.
+
+  **Mutually exclusive query params**: passing both `tail` and
+  `since` is a `400` (`tail and since are mutually exclusive`)
+  rather than a silent precedence rule — small enough surface that
+  explicit-is-better-than-implicit pays for itself in debug time.
+
+  **Malformed-line preservation**: lines that don't parse as JSON
+  are surfaced as `{event: "_raw", ts: <ingestion time>, msg: <raw
+  text, truncated to 1024 bytes>}` instead of being dropped. `ts`
+  is synthesized from `datetime.now(timezone.utc)` at parse time so
+  a future UI sorting by timestamp doesn't bunch every `_raw` event
+  at top-of-list because of an empty string.
+
+  **Distinct empty states** via a new `state` field on the response
+  so the client can branch on a stable signal:
+  - `never_written` (`note: "audit log not yet created"`) — the
+    `.puffo-agent/audit.log` doesn't exist yet on disk.
+  - `up_to_date` (`note: "no new entries since cursor"`) — delta
+    mode returned nothing because the caller is already at EOF.
+  - `empty` (`note: "audit log is empty"`) — file exists but has
+    no content (rare; the writer touches the file on first run).
+
+  Response shape: `{agent_id, lines, next_cursor, state?, note?}`.
+  `lines[i]` is the parsed NDJSON record per line, or the `_raw`
+  wrapper described above. `next_cursor` is a byte-offset suitable
+  for the next `?since=` call.
+
+  Auth: unchanged — the existing pairing middleware
+  (`portal/api/auth.py`) rejects unsigned-paired callers with 401
+  before the handler runs.
+
+  Closes the server half of PUF-238.
+
+### Tests
+
+- `tests/test_log_endpoint.py` — 15 tests covering:
+  missing-file empty state + `state="never_written"`; tail default
+  (200), explicit, cap at 2000, invalid-int fallback; `since` delta
+  after cursor; `since` at EOF (empty + `state="up_to_date"`);
+  `since` past EOF resets to 0 (rotation safety); malformed line
+  preserved as `_raw` event; reverse-seek correctness on a 3000-row
+  file larger than the 64 KB chunk size; delta cap + partial cursor
+  + two-page completion; `tail`+`since` combo returns 400; unknown
+  agent id → 404; unpaired caller → 401.
+
 ## [0.9.3] — 2026-05-22
 
 ### Fixed
