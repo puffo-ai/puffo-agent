@@ -4,6 +4,38 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.3] — 2026-05-22
+
+### Fixed
+
+- **Codex / Claude binary resolution now searches beyond `$PATH`.**
+  Operators who installed Codex via the desktop app (binary at
+  ``/Applications/Codex.app/Contents/Resources/codex``) hit
+  ``[Errno 2] No such file or directory: 'codex'`` when the daemon
+  spawned ``codex app-server``, because the LaunchAgent ``PATH``
+  excludes both ``/opt/homebrew/bin`` and the ``.app`` bundle. The
+  bug surfaced as the agent reporting ``runtime=running`` but never
+  replying — the spawn error fell to an unhandled exception in
+  ``handle_message_batch``.
+
+  Added ``puffo_agent.agent.cli_bin`` with ``resolve_codex_bin()`` /
+  ``resolve_claude_bin()`` that try, in order:
+  1. ``$PUFFO_CODEX_BIN`` / ``$PUFFO_CLAUDE_BIN`` (operator override).
+  2. ``shutil.which(...)`` (npm / brew / scoop install).
+  3. OS-specific bundle paths: ``Codex.app`` on macOS;
+     ``%LOCALAPPDATA%\Programs\codex`` / ``%PROGRAMFILES%\Codex``
+     on Windows; ``/opt/Codex`` and ``/usr/lib/codex`` on Linux.
+     Symmetric defensive paths for ``claude``.
+
+  Every existing call site (codex session spawn, credential refresh,
+  preflight diagnostic, macOS keychain probe) routes through the
+  new resolver, so the lookup order is uniform across the daemon.
+
+  When the resolver returns ``None``, the codex session spawn now
+  raises a clear ``RuntimeError`` naming both the env-var override
+  and the install steps, instead of letting ``FileNotFoundError``
+  bubble up from ``create_subprocess_exec``.
+
 ## [0.9.2] — 2026-05-22
 
 ### Fixed

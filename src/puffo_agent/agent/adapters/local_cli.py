@@ -42,6 +42,7 @@ from ...portal.state import (
     sync_host_plugins,
     sync_host_skills,
 )
+from ..cli_bin import resolve_claude_bin, resolve_codex_bin
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
@@ -287,11 +288,21 @@ class LocalCLIAdapter(Adapter):
         )
         # Subprocess argv — ``codex app-server`` is the documented entry
         # point for embedding codex as a long-running agent. Resolve
-        # the binary via shutil.which so npm-installed shims like
-        # ``codex.cmd`` (Windows) work: asyncio.create_subprocess_exec
-        # goes through CreateProcess and does NOT honour PATHEXT, so
-        # the bare name ``codex`` fails to find ``codex.cmd``.
-        codex_bin = shutil.which("codex") or "codex"
+        # via the shared resolver so PATH + ``PUFFO_CODEX_BIN`` env
+        # override + macOS / Windows / Linux .app bundle paths all
+        # work. LaunchAgent on macOS has a narrow PATH that misses
+        # both ``/opt/homebrew/bin`` and the Codex.app bundle, so the
+        # plain ``shutil.which`` would fail even when the operator
+        # has Codex installed via the desktop app.
+        codex_bin = resolve_codex_bin()
+        if codex_bin is None:
+            raise RuntimeError(
+                "codex binary not found. Tried $PUFFO_CODEX_BIN, "
+                "$PATH, and the Codex.app / Windows / Linux bundle "
+                "paths. Install the Codex CLI (`npm install -g "
+                "@openai/codex`), Codex.app, or set "
+                "``PUFFO_CODEX_BIN=/abs/path/to/codex``."
+            )
         argv = [codex_bin, "app-server"]
 
         self._codex_session = CodexSession(
@@ -529,11 +540,12 @@ class LocalCLIAdapter(Adapter):
             # touching ~/.claude/* for a codex agent would be confusing.
             self._verified = True
             return
-        if shutil.which("claude") is None:
+        if resolve_claude_bin() is None:
             raise RuntimeError(
-                "claude binary not found on PATH. install the Claude Code CLI "
-                "(`npm install -g @anthropic-ai/claude-code`) to use runtime "
-                "kind 'cli-local'."
+                "claude binary not found. Tried $PUFFO_CLAUDE_BIN, "
+                "$PATH, and known bundle paths. Install the Claude "
+                "Code CLI (`npm install -g @anthropic-ai/claude-code`) "
+                "or set ``PUFFO_CLAUDE_BIN=/abs/path/to/claude``."
             )
         # Seed the per-agent virtual $HOME on first use (settings,
         # .claude.json). Credentials are handled separately via
