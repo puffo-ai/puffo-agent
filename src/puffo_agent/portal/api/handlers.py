@@ -993,21 +993,110 @@ async def archive_agent(request: web.Request) -> web.Response:
 # ────────────────────────────────────────────────────────────────────
 
 
+# Default number of trailing lines returned when no ``tail`` query
+# param is supplied. 200 is plenty for the on-mount paint without
+# blowing the wire response size on a busy agent.
+_LOG_DEFAULT_TAIL = 200
+# Hard cap on ``tail`` — protects against accidental huge fetches
+# from a chatty agent. 2000 lines * ~300 bytes / line ≈ 600 KB.
+_LOG_MAX_TAIL = 2000
+# Marker event used when a line in audit.log can't be parsed as
+# JSON. Surfaces the raw text so the operator can still see what
+# the agent emitted instead of dropping the line silently.
+_LOG_MALFORMED_EVENT = "_raw"
+
+
+def _parse_log_line(raw: str) -> dict[str, Any]:
+    """Decode one NDJSON line from audit.log. Falls back to a
+    ``_raw`` event wrapper if the line isn't valid JSON so the
+    client can still display the bytes."""
+    import json
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {"ts": "", "event": _LOG_MALFORMED_EVENT, "msg": raw[:1024]}
+
+
 async def get_log(request: web.Request) -> web.Response:
-    """Stub — per-agent log capture is not implemented yet. The
-    daemon currently writes a single combined stderr stream.
+    """Return the agent's per-agent audit.log entries.
+
+    Query params:
+      * ``tail`` (default 200, max 2000) — last N lines.
+      * ``since`` (optional, int byte-offset) — return lines written
+        after this point for delta polling. When the file has
+        shrunk below ``since`` (rotation / archive) the cursor
+        resets to 0.
+
+    Response: ``{agent_id, lines, next_cursor, note?}``. ``note`` is
+    populated when the agent has no log content yet so the client
+    can distinguish "never wrote" from "wrote and then we polled
+    deltas since".
     """
     agent_id = request.match_info["id"]
     if not agent_yml_path(agent_id).exists():
         return _not_found("agent not found")
-    return web.json_response({
+
+    cfg = AgentConfig.load(agent_id)
+    log_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "audit.log"
+
+    try:
+        tail = int(request.query.get("tail", _LOG_DEFAULT_TAIL))
+    except ValueError:
+        tail = _LOG_DEFAULT_TAIL
+    tail = max(1, min(_LOG_MAX_TAIL, tail))
+
+    since_raw = request.query.get("since")
+    since: int | None
+    if since_raw is None:
+        since = None
+    else:
+        try:
+            since = max(0, int(since_raw))
+        except ValueError:
+            since = None
+
+    if not log_path.exists():
+        return web.json_response({
+            "agent_id": agent_id,
+            "lines": [],
+            "next_cursor": 0,
+            "note": "no log entries yet",
+        })
+
+    file_size = log_path.stat().st_size
+
+    lines: list[dict[str, Any]] = []
+    if since is not None:
+        # Delta mode — read from the caller's last cursor. A file
+        # that's shrunk (rotated / archived) below the cursor
+        # resets to 0 so the next response carries the full window.
+        offset = since if since <= file_size else 0
+        with log_path.open("rb") as f:
+            f.seek(offset)
+            content = f.read()
+        next_cursor = offset + len(content)
+        for raw in content.decode("utf-8", errors="replace").splitlines():
+            if raw.strip():
+                lines.append(_parse_log_line(raw))
+    else:
+        # Tail mode — read the whole file (the MAX_TAIL bound on
+        # the response makes the memory hit predictable) and slice
+        # the last N lines. NDJSON files in practice stay small
+        # (rotation lives at the daemon layer, not here).
+        decoded = log_path.read_bytes().decode("utf-8", errors="replace")
+        all_lines = [line for line in decoded.splitlines() if line.strip()]
+        for raw in all_lines[-tail:]:
+            lines.append(_parse_log_line(raw))
+        next_cursor = file_size
+
+    body: dict[str, Any] = {
         "agent_id": agent_id,
-        "lines": [],
-        "note": (
-            "per-agent log capture is not implemented yet — daemon "
-            "currently writes a single combined stream. follow-up PR."
-        ),
-    })
+        "lines": lines,
+        "next_cursor": next_cursor,
+    }
+    if not lines:
+        body["note"] = "no log entries yet"
+    return web.json_response(body)
 
 
 # ────────────────────────────────────────────────────────────────────
