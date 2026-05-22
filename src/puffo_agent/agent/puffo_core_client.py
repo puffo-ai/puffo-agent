@@ -1234,6 +1234,15 @@ class PuffoCoreMessageClient:
             # routing — invite polling / intro nudges must still run.
             logger.exception("mark_channel_space from %s failed", kind)
 
+        # Drop the per-space member cache when anyone joins / leaves /
+        # is removed so the next mention extraction re-fetches; without
+        # this the cache misses the new joiner and their @-mention is
+        # silently dropped from the metadata.
+        if kind in ("accept_space_invite", "leave_space", "remove_from_space"):
+            evict_space_id = payload.get("space_id") or ""
+            if evict_space_id:
+                self._space_members.pop(evict_space_id, None)
+
         if kind in ("invite_to_space", "invite_to_channel"):
             if payload.get("invitee_slug") != self.slug:
                 return  # Server fans the event to space members too.
