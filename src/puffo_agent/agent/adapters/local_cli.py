@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -95,6 +96,28 @@ def _is_puffo_agent_hook_entry(entry: object) -> bool:
         isinstance(h, dict) and _HOOK_COMMAND_MARKER in (h.get("command") or "")
         for h in hooks
     )
+
+
+def _host_hermes_home() -> Path:
+    """Operator-side HERMES_HOME, mirroring upstream
+    ``hermes_constants.get_hermes_home`` so we look in the same
+    place hermes itself does:
+
+    * ``$HERMES_HOME`` if set (Windows installer sets this in user
+      env; multi-profile setups override it manually).
+    * ``~/.hermes`` on macOS / Linux / WSL2.
+    * ``%LOCALAPPDATA%\\hermes`` on native Windows — the PS1
+      installer writes config / .env / state into the LocalAppData
+      tree, not into the home dir.
+    """
+    env = os.environ.get("HERMES_HOME", "").strip()
+    if env:
+        return Path(env).expanduser()
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            return Path(local_appdata) / "hermes"
+    return Path.home() / ".hermes"
 
 
 def _sanitise_permission_mode(mode: str, agent_id: str) -> str:
@@ -353,15 +376,21 @@ class LocalCLIAdapter(Adapter):
         Fail-loud expectations the operator needs to satisfy:
 
         1. ``hermes`` is installed and resolvable (env / PATH / bundle).
-        2. ``~/.hermes/config.yaml`` exists on the host — operator
-           has run ``hermes setup`` at least once and configured a
-           provider via ``hermes model``.
-        3. ``~/.hermes/.env`` (provider keys) exists OR the operator
-           exported provider keys via the daemon's environment.
+        2. ``<host_hermes_home>/config.yaml`` exists on the host —
+           operator has run ``hermes setup`` at least once and
+           configured a provider via ``hermes model``.
+
+        Host HERMES_HOME lookup order:
+          - ``$HERMES_HOME`` env var (the installer sets this on
+            Windows; operators set it explicitly on multi-profile
+            setups).
+          - ``~/.hermes`` on macOS / Linux / WSL2.
+          - ``%LOCALAPPDATA%\\hermes`` on native Windows — that's
+            where ``install.ps1`` actually drops the config / data
+            tree (not ``~/.hermes`` as on POSIX).
 
         On success: seeds the per-agent ``HERMES_HOME`` from the
-        operator's ``~/.hermes`` and logs the host-runtime banner
-        (cli-local has host-level access; same warning as claude).
+        host HERMES_HOME and logs the host-runtime banner.
         """
         bin_path = resolve_hermes_bin()
         if bin_path is None:
@@ -369,18 +398,18 @@ class LocalCLIAdapter(Adapter):
                 f"agent {self.agent_id!r}: hermes binary not found. Tried "
                 "$PUFFO_HERMES_BIN, $PATH, and known installer paths "
                 "(``~/.local/bin/hermes`` on POSIX, "
-                "``%LOCALAPPDATA%\\hermes\\bin`` on Windows). Install "
-                "Hermes Agent — POSIX: ``curl -fsSL "
+                "``%LOCALAPPDATA%\\hermes\\hermes-agent\\venv\\Scripts`` "
+                "on Windows). Install Hermes Agent — POSIX: ``curl -fsSL "
                 "https://raw.githubusercontent.com/NousResearch/hermes-agent/"
                 "main/scripts/install.sh | bash``; PowerShell: ``iex "
                 "(irm https://raw.githubusercontent.com/NousResearch/"
-                "hermes-agent/main/scripts/install.ps1)`` — then ``source "
-                "~/.bashrc`` and re-run the daemon. Or set "
-                "``PUFFO_HERMES_BIN=/abs/path/to/hermes``."
+                "hermes-agent/main/scripts/install.ps1)`` — then restart "
+                "your shell / daemon so the new PATH is picked up. Or "
+                "set ``PUFFO_HERMES_BIN=/abs/path/to/hermes``."
             )
         self._hermes_bin = bin_path
 
-        host_hermes_home = Path.home() / ".hermes"
+        host_hermes_home = _host_hermes_home()
         host_config = host_hermes_home / "config.yaml"
         if not host_config.is_file():
             raise RuntimeError(

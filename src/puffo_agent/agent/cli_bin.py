@@ -111,18 +111,20 @@ def _claude_bundle_paths() -> list[Path]:
 
 
 def _hermes_bundle_paths() -> list[Path]:
-    """Hermes' upstream installer drops the launcher in ``~/.local/bin``
-    on POSIX (default) and ``%LOCALAPPDATA%\\hermes\\bin`` on native
-    Windows. The dev-checkout ``setup-hermes.sh`` symlinks the same
-    into ``~/.local/bin/hermes`` so the fallback covers both modes.
+    """Hermes' Windows installer puts the launcher inside its private
+    venv (``%LOCALAPPDATA%\\hermes\\hermes-agent\\venv\\Scripts\\hermes.exe``)
+    and prepends that ``Scripts`` dir to user PATH. POSIX flavours
+    drop a ``hermes`` shim in ``~/.local/bin``. The bundle paths
+    cover both layouts so a daemon started before the post-install
+    PATH refresh (launchd / scheduled task / new shell) still finds
+    the binary.
     """
     if sys.platform == "win32":
         return _expand(
+            r"%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts\hermes.exe",
+            r"%LOCALAPPDATA%\hermes\hermes-agent\venv\Scripts\hermes.cmd",
             r"%LOCALAPPDATA%\hermes\bin\hermes.exe",
-            r"%LOCALAPPDATA%\hermes\bin\hermes.cmd",
-            r"%LOCALAPPDATA%\hermes\bin\hermes",
             r"%USERPROFILE%\.local\bin\hermes.exe",
-            r"%USERPROFILE%\.local\bin\hermes",
         )
     # macOS + Linux + WSL2 — installer default + a few common venv
     # locations operators sometimes pip-install into.

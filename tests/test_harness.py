@@ -415,20 +415,21 @@ def test_local_cli_hermes_verify_raises_when_binary_missing(monkeypatch, tmp_pat
 
 
 def test_local_cli_hermes_verify_raises_when_host_config_missing(monkeypatch, tmp_path):
-    """If hermes is installed but ``~/.hermes/config.yaml`` doesn't
-    exist, the operator hasn't run ``hermes setup`` yet. Surface
-    that explicitly rather than letting the first turn fail with a
-    cryptic provider-not-configured error from hermes itself.
+    """If hermes is installed but the host HERMES_HOME's
+    ``config.yaml`` doesn't exist, the operator hasn't run
+    ``hermes setup`` yet. Surface that explicitly rather than
+    letting the first turn fail with a cryptic provider-not-
+    configured error from hermes itself.
     """
     from puffo_agent.agent.adapters import local_cli as local_cli_mod
     fake_bin = tmp_path / "hermes"
     fake_bin.write_text("#!/bin/sh\n")
     monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
-    # Point Path.home() at a tmpdir with no ``.hermes/`` so the
-    # config.yaml check fails the way it would for a fresh operator.
-    empty_home = tmp_path / "fake_home"
+    # Point HERMES_HOME at a tmpdir with no config.yaml so the
+    # check fails the way it would for a fresh operator.
+    empty_home = tmp_path / "fake_hermes_home"
     empty_home.mkdir()
-    monkeypatch.setattr(local_cli_mod.Path, "home", classmethod(lambda cls: empty_home))
+    monkeypatch.setenv("HERMES_HOME", str(empty_home))
     adapter = local_cli_mod.LocalCLIAdapter(
         agent_id="t",
         model="",
@@ -445,7 +446,7 @@ def test_local_cli_hermes_verify_raises_when_host_config_missing(monkeypatch, tm
 
 def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
     """First successful ``_verify`` copies ``config.yaml`` and
-    ``.env`` from the operator's ``~/.hermes`` into the per-agent
+    ``.env`` from the host HERMES_HOME into the per-agent
     ``HERMES_HOME``. ``state.db`` deliberately does NOT get copied —
     each agent gets a fresh session/memory store.
     """
@@ -454,13 +455,12 @@ def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
     fake_bin.write_text("#!/bin/sh\n")
     monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
 
-    host_home = tmp_path / "operator_home"
-    host_hermes = host_home / ".hermes"
-    host_hermes.mkdir(parents=True)
+    host_hermes = tmp_path / "host_hermes"
+    host_hermes.mkdir()
     (host_hermes / "config.yaml").write_text("provider: anthropic\n")
     (host_hermes / ".env").write_text("ANTHROPIC_API_KEY=sk-test\n")
     (host_hermes / "state.db").write_bytes(b"PERSONAL_DATA")
-    monkeypatch.setattr(local_cli_mod.Path, "home", classmethod(lambda cls: host_home))
+    monkeypatch.setenv("HERMES_HOME", str(host_hermes))
 
     agent_home = tmp_path / "agent"
     adapter = local_cli_mod.LocalCLIAdapter(
@@ -480,6 +480,36 @@ def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
     assert (per_agent / ".env").read_text() == "ANTHROPIC_API_KEY=sk-test\n"
     # Operator's chat history must stay in the operator's HOME.
     assert not (per_agent / "state.db").exists()
+
+
+def test_host_hermes_home_respects_env_var(monkeypatch, tmp_path):
+    """``$HERMES_HOME`` always wins — multi-profile / non-default
+    Windows install layouts go through this."""
+    from puffo_agent.agent.adapters import local_cli as local_cli_mod
+    target = tmp_path / "custom_home"
+    monkeypatch.setenv("HERMES_HOME", str(target))
+    assert local_cli_mod._host_hermes_home() == target
+
+
+def test_host_hermes_home_falls_back_per_platform(monkeypatch, tmp_path):
+    """No ``$HERMES_HOME``: POSIX uses ``~/.hermes``; Windows uses
+    ``%LOCALAPPDATA%\\hermes`` (the PS1 installer's actual target).
+    """
+    from puffo_agent.agent.adapters import local_cli as local_cli_mod
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    # POSIX branch
+    monkeypatch.setattr(local_cli_mod.sys, "platform", "linux")
+    fake_home = tmp_path / "operator_home"
+    monkeypatch.setattr(
+        local_cli_mod.Path, "home", classmethod(lambda cls: fake_home),
+    )
+    assert local_cli_mod._host_hermes_home() == fake_home / ".hermes"
+    # Windows branch — LOCALAPPDATA wins over Path.home() because
+    # the installer writes there, not into the user profile root.
+    monkeypatch.setattr(local_cli_mod.sys, "platform", "win32")
+    fake_localappdata = tmp_path / "AppData" / "Local"
+    monkeypatch.setenv("LOCALAPPDATA", str(fake_localappdata))
+    assert local_cli_mod._host_hermes_home() == fake_localappdata / "hermes"
 
 
 def test_local_cli_accepts_claude_code_harness():
