@@ -145,6 +145,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   + two-page completion; `tail`+`since` combo returns 400; unknown
   agent id → 404; unpaired caller → 401.
 
+### Fixed
+
+- **PUF-240: invite-dedup wiped on every WS reconnect, causing
+  duplicate operator-confirm DMs.** ``_processed_invite_ids`` was
+  initialised inside ``listen()`` and reset on every reconnect. The
+  auto-accept branch is idempotent against server-side state, but
+  the operator-DM branch is **not** — each call sends a fresh DM.
+  When the WS cycled, the 30 s ``_invite_poll_loop`` re-emitted the
+  ``Reply ✓ / ✗`` prompt for every still-pending invite, so N
+  reconnects produced N duplicate prompts in the operator's confirm
+  thread (~10× in field reports). Initialisation moved to
+  ``__init__``; nothing inside ``listen()`` clears it. In-memory
+  only — disk-persist across daemon restart is deliberately not
+  bundled (rare surface; punt to a follow-up if it actually
+  surfaces).
+
 ## [0.9.3] — 2026-05-22
 
 ### Fixed

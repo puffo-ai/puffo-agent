@@ -464,17 +464,11 @@ class PuffoCoreMessageClient:
         # the next tick instead of pinning a permanent "" miss.
         self._profile_cache: dict[str, tuple[str, str, float]] = {}
         # Invitation event_ids the worker has already processed.
-        # PUF-240: persisted across reconnects (was reset per
-        # ``listen()`` call; that wiped the dedup every WS cycle
-        # and the next 30s ``_poll_pending_invites`` re-emitted
-        # the operator-confirm prompt for every still-pending
-        # invite — N reconnects ⇒ N duplicate prompts in the
-        # operator's confirm thread). Server-side ``pending_invites``
-        # rows stay until the operator acts, so the only thing
-        # holding off re-emission is this set. Initialised once on
-        # ``__init__`` and never cleared inside ``listen()``.
-        # In-memory only across daemon restarts — disk-persist is
-        # a follow-up if restart-driven multi-emit surfaces.
+        # Lifetime-scoped — the operator-DM branch isn't idempotent
+        # against server-side state, so resetting on reconnect would
+        # re-emit the operator-confirm prompt for every still-pending
+        # invite. Lost on daemon restart (acceptable: re-DM rate is
+        # naturally rare).
         self._processed_invite_ids: set[str] = set()
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
@@ -834,16 +828,6 @@ class PuffoCoreMessageClient:
         self._queue = asyncio.PriorityQueue()
         self._queue_seq = 0
         self._thread_state: dict[str, _ThreadEntry] = {}
-        # PUF-240: ``_processed_invite_ids`` initialisation moved to
-        # ``__init__`` (line 470) and intentionally NOT cleared here.
-        # The prior comment "auto-accept is idempotent against
-        # server-side state" only justified safety for the
-        # auto-accept branch; the operator-DM branch is NOT
-        # idempotent (each call sends a new DM), and resetting the
-        # dedup on every reconnect was producing the ~10× duplicate
-        # prompt symptom Sam reported. Server-side ``pending_invites``
-        # remains the source of truth; the in-memory set only avoids
-        # repeating work the agent already did in this process.
         consumer_task = asyncio.ensure_future(
             self._consume_queue(on_message, on_api_error_retry),
         )
