@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS channel_space_map (
     space_id TEXT NOT NULL,
     learned_at INTEGER NOT NULL
 );
+
+-- PUF-249: TTL-bounded restart-surviving dedup for the operator-DM
+-- invite-emit path. The in-memory ``_processed_invite_ids`` set on
+-- ``PuffoCoreClient`` covers the within-process case; this table is
+-- the cross-process restart defense. Operator's PUF-240-B closure
+-- framing locked the fix shape to "throttling > full persistence":
+-- bounded TTL (default 24h) lets the gentle-reminder restart-re-emit
+-- still happen for a stale invite the operator forgot, but caps the
+-- frequency so 20-over-8-days never recurs.
+CREATE TABLE IF NOT EXISTS invite_emit_throttle (
+    invitation_event_id TEXT PRIMARY KEY,
+    last_emitted_at INTEGER NOT NULL
+);
 """
 
 
@@ -591,6 +604,50 @@ class MessageStore:
                VALUES (?, ?)
                ON CONFLICT(channel_id) DO NOTHING""",
             (channel_id, _now_ms()),
+        )
+        await db.commit()
+
+    async def was_invite_emitted_within(
+        self,
+        invitation_event_id: str,
+        ttl_ms: int,
+        *,
+        now_ms: int | None = None,
+    ) -> bool:
+        """True iff this ``invitation_event_id`` was emitted to the
+        operator within the last ``ttl_ms``. Survives daemon restart
+        (sqlite-backed). See PUF-249 + the ``invite_emit_throttle``
+        schema comment."""
+        if not invitation_event_id or ttl_ms <= 0:
+            return False
+        db = await self._ensure_db()
+        cutoff = (now_ms if now_ms is not None else _now_ms()) - ttl_ms
+        async with db.execute(
+            "SELECT last_emitted_at FROM invite_emit_throttle "
+            "WHERE invitation_event_id = ?",
+            (invitation_event_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None and row["last_emitted_at"] >= cutoff
+
+    async def record_invite_emit(
+        self,
+        invitation_event_id: str,
+        *,
+        now_ms: int | None = None,
+    ) -> None:
+        """Stamp the last-emit time for ``invitation_event_id``.
+        Idempotent (upsert)."""
+        if not invitation_event_id:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO invite_emit_throttle
+               (invitation_event_id, last_emitted_at)
+               VALUES (?, ?)
+               ON CONFLICT(invitation_event_id) DO UPDATE SET
+                   last_emitted_at = excluded.last_emitted_at""",
+            (invitation_event_id, now_ms if now_ms is not None else _now_ms()),
         )
         await db.commit()
 

@@ -61,6 +61,14 @@ PRIORITY_SYSTEM = 5
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
+# PUF-249: cap operator-DM re-emit of the same still-pending invite
+# to once-per-window. Operator's PUF-240-B closure framing locked
+# the value to "same-invite-once-per-24h". Bounded TTL so a stale
+# invite the operator legitimately forgot still gets a gentle
+# reminder eventually (the "feature not bug" intent), just not 20×
+# in 8 days.
+_INVITE_EMIT_THROTTLE_TTL_SECONDS = 24 * 60 * 60
+
 
 @dataclass
 class _ThreadEntry:
@@ -1727,6 +1735,21 @@ class PuffoCoreMessageClient:
                     kind, inviter_slug, invitation_event_id,
                 )
         else:
+            # PUF-249: restart-surviving throttle. The auto-accept arm
+            # above always tries to drain the server-side pending row,
+            # so it stays uncapped; this arm is the operator-DM emit
+            # surface where 20-over-8-days happened on Sean's daemon.
+            ttl_ms = _INVITE_EMIT_THROTTLE_TTL_SECONDS * 1000
+            if await self.store.was_invite_emitted_within(
+                invitation_event_id, ttl_ms,
+            ):
+                self._log.info(
+                    "throttled operator-DM for %s (event_id=%s) — already emitted within %ss",
+                    kind, invitation_event_id,
+                    _INVITE_EMIT_THROTTLE_TTL_SECONDS,
+                )
+                self._processed_invite_ids.add(invitation_event_id)
+                return
             try:
                 await self._notify_operator_of_invite(
                     kind=kind,
@@ -1741,6 +1764,10 @@ class PuffoCoreMessageClient:
                 # Mark processed even on DM failure — the operator
                 # still sees the invite in their chat client.
                 self._processed_invite_ids.add(invitation_event_id)
+                # Stamp the throttle even on DM failure for the same
+                # reason: the operator saw the inbound either way, so
+                # a restart-retry within the TTL would be redundant.
+                await self.store.record_invite_emit(invitation_event_id)
 
     async def _inviter_is_operator(self, inviter_slug: str) -> bool:
         """True iff ``inviter_slug``'s root pubkey matches our

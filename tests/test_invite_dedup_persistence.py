@@ -76,6 +76,18 @@ def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, l
 
     client.http = _StubHttp()
 
+    # PUF-249 wires a throttle gate atop the operator-DM arm; this
+    # PUF-240 test harness doesn't exercise it, so a no-op stub keeps
+    # the in-memory dedup invariants the load-bearing assertion here.
+    class _NoThrottleStore:
+        async def was_invite_emitted_within(self, *args, **kwargs):
+            return False
+
+        async def record_invite_emit(self, *args, **kwargs):
+            return None
+
+    client.store = _NoThrottleStore()
+
     import logging
     client._log = logging.getLogger("test-puf-240")
     return client, sent
