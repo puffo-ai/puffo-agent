@@ -6,6 +6,7 @@ and encrypted reply posting.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -310,6 +311,61 @@ def _maybe_redact_long_text(
 # on disk in bounds. 1568px is Anthropic's recommended max — well
 # under the 2000px hard cap.
 _MAX_IMAGE_EDGE_PX = 1568
+
+
+def _format_invite_error(exc: Exception, verb: str) -> str:
+    """PUF-247: translate an invite-accept/reject failure into a
+    user-facing message that's safe to surface in the operator-DM
+    confirm. Raw ``exc`` is preserved in the caller's ``log.exception``
+    for diagnostic; this helper produces ONLY the human-readable text.
+
+    ``verb`` is ``"accept"`` or ``"reject"`` — used to compose the
+    verb-correct prefix ("Couldn't accept invite", "Couldn't reject
+    invite") so a single helper covers both catch sites.
+
+    PUF-247 symptom (Sam's tier-1 screenshot): pre-fix this returned
+    ``"HTTP 400: {\\"error\\": \\"INVALID_PAYLOAD\\", \\"message\\":
+    \\"channel not found: ch_...\\"}"`` — raw JSON dumped to chat as
+    the agent's reply. Post-fix the typed error class becomes
+    ``"Couldn't {verb} invite — that channel is no longer available."``
+    """
+    prefix = f"Couldn't {verb} invite"
+    if isinstance(exc, HttpError):
+        # ``HttpError.body`` is the raw response text; try JSON-parse
+        # to extract structured error + message codes the server sends.
+        # Non-JSON bodies fall through to the generic status-class branch.
+        error_code = ""
+        message_text = ""
+        try:
+            parsed = json.loads(exc.body)
+            if isinstance(parsed, dict):
+                error_code = str(parsed.get("error") or "")
+                message_text = str(parsed.get("message") or "")
+        except (ValueError, TypeError):
+            pass
+
+        # Specific known mappings — match on substrings of the server's
+        # ``message`` field. Keep the list short + literal; a future
+        # server change to the message text just falls through to the
+        # generic 4xx branch (which is still safe).
+        lower_msg = message_text.lower()
+        if "channel not found" in lower_msg:
+            return f"{prefix} — that channel is no longer available."
+        if "space not found" in lower_msg:
+            return f"{prefix} — that space is no longer available."
+        if exc.status == 403 or error_code == "FORBIDDEN":
+            return f"{prefix} — you don't have permission for this one."
+        if exc.status == 409 or error_code == "CONFLICT":
+            return f"{prefix} — looks like it's already been handled."
+
+        # Status-class fallbacks. Never echo ``exc.body`` to the user
+        # — that's the leak this whole helper exists to prevent.
+        if 400 <= exc.status < 500:
+            return f"{prefix} — please try again."
+        if exc.status >= 500:
+            return f"{prefix} — Puffo server hit an issue. Please try again in a moment."
+
+    return f"{prefix} — unexpected error. Please try again."
 
 
 def _downscale_oversized_image(path) -> None:
@@ -2403,7 +2459,14 @@ class PuffoCoreMessageClient:
                     "operator-confirmed accept of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
-                confirm = f"Couldn't accept invite to {target}: {exc}"
+                # PUF-247: route the exception through the translation
+                # helper so the operator-DM confirm carries
+                # human-readable text, NOT the raw server response
+                # body. The verbose ``exc`` is already in the log
+                # via ``log.exception`` above for diagnostic.
+                confirm = (
+                    f"{_format_invite_error(exc, 'accept')} ({target})"
+                )
         else:  # reject
             try:
                 await self._reject_invite(
@@ -2419,7 +2482,12 @@ class PuffoCoreMessageClient:
                     "operator-confirmed reject of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
-                confirm = f"Couldn't reject invite to {target}: {exc}"
+                # PUF-247: same helper as the accept path — translate
+                # raw HTTP/JSON into human-readable text before it
+                # reaches the operator-DM confirm string.
+                confirm = (
+                    f"{_format_invite_error(exc, 'reject')} ({target})"
+                )
 
         # Drop from pending so a duplicate ``y`` later in the same
         # thread doesn't re-attempt (server would reject it anyway).
