@@ -1074,15 +1074,14 @@ class RuntimeState:
     last_event_at: int = 0
     error: str = ""
     # Worker-side health, independent of ``status``. Values:
-    #   "ok"                      — last refresh-ping smoke test passed
-    #   "auth_failed"             — adapter saw 401 / authentication_error
-    #   "api_error_abandoned"     — kick-retry exhausted on rate-limit /
-    #                               API-error class, batch silently
-    #                               abandoned. PUF-252 ships this as the
-    #                               data layer; FB-197 (status dot) +
-    #                               FB-198 (restart lever) on Nova's
-    #                               canonical lane consume it on the UI.
-    #   "unknown"                 — no probe yet
+    #   "ok"                  — refresh-ping passed, or a turn cleared a
+    #                           prior abandon
+    #   "auth_failed"         — adapter saw 401 / authentication_error;
+    #                           cleared only by the CredentialRefresher
+    #                           success-ping (PUF-221's lane)
+    #   "api_error_abandoned" — kick-retry exhausted, batch silently
+    #                           abandoned; cleared on next successful turn
+    #   "unknown"             — no probe yet
     health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
 
     @classmethod

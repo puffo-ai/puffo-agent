@@ -86,17 +86,39 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   affordances on Nova's canonical lane (FB-197 status dot + FB-198
   restart lever, both in the Operator Action Panel cluster) are
   the correct recovery surface and ship separately. The
-  ``runtime.error`` copy explicitly cites the user-action path:
-  *"The agent has gone silent on this thread until it is
-  refreshed/restarted."*
+  ``runtime.error`` copy cites the user-action path; PUF-255 in
+  the same release widens it to *"...until a new message arrives
+  OR the agent is refreshed/restarted"* since PUF-255's recovery-
+  clear makes the new-message half a real path.
+
+- **PUF-255: recovery-clear matched-pair closes the one-way
+  state-honesty loop.** Adds the symmetric EXIT edge to PUF-252's
+  ENTER edge: a new ``on_turn_success`` callback fires after every
+  successful turn completion (fresh-dispatch + kick-retry-recovery
+  paths) and ``Worker._clear_api_error_abandoned_if_recoverable``
+  flips ``runtime.health`` back to ``"ok"`` when it was
+  ``api_error_abandoned``. Without this, a recovered agent stayed
+  labelled ``api_error_abandoned`` until process restart, so
+  FB-197/198 would render a stale "agent is broken" indicator
+  forever. **Marks PUF-252's "deferred recovery-clear" debt as
+  ✓ done** (Solution flagged at PR #45 QA gap-3; operator caught
+  the same gap independently).
+
+  Scope-bounded: callback only clears ``api_error_abandoned``.
+  ``auth_failed`` stays in PUF-221's CredentialRefresher lane (a
+  single lucky turn during a partial-401 window shouldn't reset
+  the broader credential state). Per-thread-event vs global-flag
+  granularity mismatch documented in-source as PUF-253 design
+  input.
 
   Known follow-up debts deliberately deferred:
 
-  - **PUF-258**: ``runtime.health`` is currently a one-way state
-    machine — nothing in the codebase ever sets ``health = "ok"``,
-    so both ``auth_failed`` and ``api_error_abandoned`` are
-    permanent labels until a process restart resets RuntimeState
-    defaults. Predates PUF-252; out of scope here.
+  - **PUF-258**: ``runtime.health`` is still a one-way state
+    machine in the ``auth_failed`` direction — PUF-255 closes
+    the ``api_error_abandoned`` exit edge, but nothing sets
+    ``auth_failed`` back to ``ok`` (cleared only on next
+    refresh-success-ping or process restart). Symmetric exit
+    edge for the auth path tracked separately.
   - **PUF-253**: ``runtime.error`` is a single-field string;
     consecutive abandons overwrite each other. UI design input
     for FB-197/198 needs to decide between append-with-cap, a

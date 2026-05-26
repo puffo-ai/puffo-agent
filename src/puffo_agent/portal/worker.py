@@ -514,6 +514,36 @@ def _handle_suppressed_reply(
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
+    @staticmethod
+    def _clear_api_error_abandoned_if_recoverable(
+        runtime: "RuntimeState",
+        agent_id: str,
+        root_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """Clear ``runtime.health = "api_error_abandoned"`` back to
+        ``"ok"`` on the next successful turn. ``auth_failed`` is
+        deliberately left alone — PUF-221's CredentialRefresher
+        owns that lifecycle and a single lucky turn shouldn't
+        substitute for the refresh-success-ping.
+
+        Known granularity mismatch (PUF-253 design input):
+        ``api_error_abandoned`` is a thread-level event but
+        ``runtime.health`` is an agent-global flag, so a success
+        on thread B clears it even if thread A is still stuck.
+        Last-write-wins until ``runtime.error`` becomes a list.
+        """
+        if runtime.health != "api_error_abandoned":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: api-error-recovery on thread %s; "
+            "runtime.health cleared back to ok",
+            agent_id, root_id,
+        )
+
     def __init__(
         self,
         daemon_cfg: DaemonConfig,
@@ -957,13 +987,22 @@ class Worker:
             self.runtime.error = (
                 f"Worker abandoned a batch on thread {root_id} after "
                 f"{attempts} rate-limit kick-retries. The agent has "
-                "gone silent on this thread until it is refreshed/"
-                "restarted."
+                "gone silent on this thread until a new message "
+                "arrives OR the agent is refreshed/restarted."
             )
             self.runtime.save(agent_id)
             logger.warning(
                 "agent %s: api-error-abandon on thread %s (attempts=%d)",
                 agent_id, root_id, attempts,
+            )
+
+        async def on_turn_success(
+            root_id: str,
+            batch: list[dict],
+            channel_meta: dict,
+        ):
+            Worker._clear_api_error_abandoned_if_recoverable(
+                self.runtime, agent_id, root_id, logger,
             )
 
         async def heartbeat():
@@ -1009,6 +1048,7 @@ class Worker:
                         on_message=on_message_batch,
                         on_api_error_retry=on_api_error_retry,
                         on_api_error_abandon=on_api_error_abandon,
+                        on_turn_success=on_turn_success,
                     )
                 except asyncio.CancelledError:
                     raise

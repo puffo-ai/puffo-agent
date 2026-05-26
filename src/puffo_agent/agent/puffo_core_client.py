@@ -506,6 +506,7 @@ class PuffoCoreMessageClient:
         on_message: Callable[..., Coroutine[Any, Any, Any]],
         on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
         on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """``on_message`` is the thread-batch callback. Despite the
         legacy parameter name kept for caller compatibility, it's
@@ -532,6 +533,11 @@ class PuffoCoreMessageClient:
         invisible. Invoked as ``on_api_error_abandon(root_id,
         batch, channel_meta, attempts)``. When omitted, the
         abandon stays silent (pre-PUF-252 behaviour).
+
+        ``on_turn_success`` is the recovery-side matched-pair
+        for ``on_api_error_abandon``. Fires on every successful
+        turn exit (fresh dispatch AND kick-retry recovery).
+        Invoked as ``on_turn_success(root_id, batch, channel_meta)``.
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -844,7 +850,7 @@ class PuffoCoreMessageClient:
         self._queue_seq = 0
         self._thread_state: dict[str, _ThreadEntry] = {}
         consumer_task = asyncio.ensure_future(
-            self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon),
+            self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon, on_turn_success),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
         # Fire-and-forget; the WS subscribe below doesn't wait for
@@ -980,6 +986,7 @@ class PuffoCoreMessageClient:
         channel_meta: dict,
         on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
         on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
         last_envelope: str,
     ) -> None:
         """Loop the API-Error kick-retry path until the agent
@@ -1058,6 +1065,12 @@ class PuffoCoreMessageClient:
                     "agent thread %s recovered after kick-retry %d/%d",
                     root_id, attempt, self.MAX_API_ERROR_RETRIES,
                 )
+                await self._fire_turn_success(
+                    on_turn_success=on_turn_success,
+                    root_id=root_id,
+                    batch=batch,
+                    channel_meta=channel_meta,
+                )
                 return
             except AgentAPIError:
                 # Still rate-limited; loop with another backoff.
@@ -1120,11 +1133,31 @@ class PuffoCoreMessageClient:
                 root_id,
             )
 
+    async def _fire_turn_success(
+        self,
+        *,
+        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        root_id: str,
+        batch: list[dict],
+        channel_meta: dict,
+    ) -> None:
+        """Recovery-side matched-pair for ``_fire_api_error_abandon``."""
+        if on_turn_success is None:
+            return
+        try:
+            await on_turn_success(root_id, batch, channel_meta)
+        except Exception:
+            self._log.exception(
+                "on_turn_success callback raised for thread %s",
+                root_id,
+            )
+
     async def _consume_queue(
         self,
         on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
         on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
         on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """Drain the priority queue serially. One turn at a time so
         the underlying session keeps a coherent conversation history;
@@ -1233,6 +1266,7 @@ class PuffoCoreMessageClient:
                     channel_meta=channel_meta,
                     on_api_error_retry=on_api_error_retry,
                     on_api_error_abandon=on_api_error_abandon,
+                    on_turn_success=on_turn_success,
                     last_envelope=last_envelope,
                 )
                 continue
@@ -1268,6 +1302,13 @@ class PuffoCoreMessageClient:
             # cursor check from this point on, so the in-memory
             # dispatching_ids set has done its job and can be released.
             entry.dispatching_ids = set()
+
+            await self._fire_turn_success(
+                on_turn_success=on_turn_success,
+                root_id=root_id,
+                batch=batch,
+                channel_meta=channel_meta,
+            )
 
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the
