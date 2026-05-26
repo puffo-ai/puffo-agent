@@ -6,6 +6,7 @@ and encrypted reply posting.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -24,6 +25,7 @@ from ..crypto.message import (
 )
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
+from ._invite_strings import format_invite_error
 from .core import AgentAPIError
 from .events import random_nonce, sign_event
 from .message_store import MessageStore
@@ -1600,19 +1602,20 @@ class PuffoCoreMessageClient:
         channel_id = meta.get("channel_id") or ""
         space_name = meta.get("space_name") or None
         channel_name = meta.get("channel_name") or None
-        space_label = (
-            f"**{space_name}**({space_id})" if space_name else space_id
-        )
+        # Label = name only; bare ID only as fallback. The operator
+        # already saw the IDs in the original invite-DM, so repeating
+        # them here is noise.
+        space_label = f"**{space_name}**" if space_name else space_id
         inviter_display = (
             await self._fetch_display_name(inviter_slug) if inviter_slug else ""
         )
         inviter_label = (
-            f"**{inviter_display}**(@{inviter_slug})"
+            f"**{inviter_display}** (@{inviter_slug})"
             if inviter_display else f"@{inviter_slug}" if inviter_slug else "the inviter"
         )
         if scope == "channel":
             channel_label = (
-                f"**{channel_name}**({channel_id})" if channel_name else channel_id
+                f"**{channel_name}**" if channel_name else channel_id
             )
             target = f"channel {channel_label} in space {space_label}"
         else:
@@ -2370,12 +2373,10 @@ class PuffoCoreMessageClient:
         inviter_slug = meta.get("inviter_slug") or "?"
         space_name = meta.get("space_name") or None
         channel_name = meta.get("channel_name") or None
-        space_label = (
-            f"**{space_name}**({space_id})" if space_name else space_id
-        )
+        space_label = f"**{space_name}**" if space_name else space_id
         if kind == "invite_to_channel":
             channel_label = (
-                f"**{channel_name}**({channel_id})" if channel_name else channel_id
+                f"**{channel_name}**" if channel_name else channel_id
             )
             target = f"channel {channel_label} in space {space_label}"
         else:
@@ -2384,7 +2385,7 @@ class PuffoCoreMessageClient:
         # original DM lookup.
         inviter_display = await self._fetch_display_name(inviter_slug)
         inviter_label = (
-            f"**{inviter_display}**(@{inviter_slug})"
+            f"**{inviter_display}** (@{inviter_slug})"
             if inviter_display else f"@{inviter_slug}"
         )
 
@@ -2403,7 +2404,7 @@ class PuffoCoreMessageClient:
                     "operator-confirmed accept of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
-                confirm = f"Couldn't accept invite to {target}: {exc}"
+                confirm = f"{format_invite_error(exc, 'accept')} ({target})"
         else:  # reject
             try:
                 await self._reject_invite(
@@ -2419,7 +2420,7 @@ class PuffoCoreMessageClient:
                     "operator-confirmed reject of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
-                confirm = f"Couldn't reject invite to {target}: {exc}"
+                confirm = f"{format_invite_error(exc, 'reject')} ({target})"
 
         # Drop from pending so a duplicate ``y`` later in the same
         # thread doesn't re-attempt (server would reject it anyway).
