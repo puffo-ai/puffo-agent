@@ -521,16 +521,17 @@ class PuffoCoreMessageClient:
         a duplicate of the original user input on every retry). When
         omitted, the consumer abandons the batch on first failure.
 
-        PUF-252 bug-1: ``on_api_error_abandon`` is the
-        state-honesty hook fired exactly once when kick-retries
-        have all failed and the batch is being abandoned. The
-        worker uses this to flip ``runtime.health`` +
-        ``runtime.error`` so bug-2's UI affordance has a signal
-        to surface (Sam's "agent went silent without warning"
-        symptom from PUF-252). Invoked as
-        ``on_api_error_abandon(root_id, batch, channel_meta,
-        attempts)``. When omitted, the abandon stays silent (the
-        pre-PUF-252 behaviour).
+        PUF-252: ``on_api_error_abandon`` is the state-honesty
+        hook fired exactly once when kick-retries have all failed
+        and the batch is being abandoned. The worker uses this to
+        flip ``runtime.health`` + ``runtime.error`` so the
+        discoverable-action affordances on Nova's lane (FB-197
+        status dot + FB-198 restart lever, both in the Operator
+        Action Panel cluster) have a signal to surface — Sam's
+        "agent went silent without warning" symptom stops being
+        invisible. Invoked as ``on_api_error_abandon(root_id,
+        batch, channel_meta, attempts)``. When omitted, the
+        abandon stays silent (pre-PUF-252 behaviour).
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -1099,13 +1100,14 @@ class PuffoCoreMessageClient:
         channel_meta: dict,
         attempts: int,
     ) -> None:
-        """PUF-252 bug-1: state-honesty hook fired exactly once per
+        """PUF-252: state-honesty hook fired exactly once per
         abandoned batch. ``attempts`` is the number of kick-retries
         that actually fired (0 when no retry callback was wired, or
         an internal raise short-circuited the loop before any
         attempt completed). The worker uses this to flip
-        ``runtime.health`` so bug-2's UI affordance surfaces the
-        "agent went silent" signal."""
+        ``runtime.health`` so FB-197 (status dot) + FB-198 (restart
+        lever) on Nova's lane can surface the "agent went silent"
+        signal."""
         if on_api_error_abandon is None:
             return
         try:

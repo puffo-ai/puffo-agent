@@ -1078,9 +1078,10 @@ class RuntimeState:
     #   "auth_failed"             — adapter saw 401 / authentication_error
     #   "api_error_abandoned"     — kick-retry exhausted on rate-limit /
     #                               API-error class, batch silently
-    #                               abandoned. Bug-2 UI affordance reads
-    #                               this to render "agent has gone silent
-    #                               — refresh?" prompt (PUF-252).
+    #                               abandoned. PUF-252 ships this as the
+    #                               data layer; FB-197 (status dot) +
+    #                               FB-198 (restart lever) on Nova's
+    #                               canonical lane consume it on the UI.
     #   "unknown"                 — no probe yet
     health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
 
