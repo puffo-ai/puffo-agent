@@ -1075,13 +1075,21 @@ class RuntimeState:
     error: str = ""
     # Worker-side health, independent of ``status``. Values:
     #   "ok"                      — last refresh-ping smoke test passed
+    #                               OR PUF-255 cleared an abandoned state
+    #                               after a successful turn recovery
     #   "auth_failed"             — adapter saw 401 / authentication_error
+    #                               (PUF-221's CredentialRefresher lane;
+    #                               cleared by refresh-success-ping, not
+    #                               by PUF-255's turn-success hook)
     #   "api_error_abandoned"     — kick-retry exhausted on rate-limit /
     #                               API-error class, batch silently
-    #                               abandoned. PUF-252 ships this as the
-    #                               data layer; FB-197 (status dot) +
-    #                               FB-198 (restart lever) on Nova's
-    #                               canonical lane consume it on the UI.
+    #                               abandoned. PUF-252 ships the enter
+    #                               edge; PUF-255 ships the exit edge
+    #                               (recovery-clear on next successful
+    #                               turn). FB-197 (status dot) + FB-198
+    #                               (restart lever) on Nova's canonical
+    #                               lane consume the resulting
+    #                               bidirectional signal on the UI.
     #   "unknown"                 — no probe yet
     health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
 

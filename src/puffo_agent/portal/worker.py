@@ -957,13 +957,49 @@ class Worker:
             self.runtime.error = (
                 f"Worker abandoned a batch on thread {root_id} after "
                 f"{attempts} rate-limit kick-retries. The agent has "
-                "gone silent on this thread until it is refreshed/"
-                "restarted."
+                "gone silent on this thread until a new message "
+                "arrives OR the agent is refreshed/restarted."
             )
             self.runtime.save(agent_id)
             logger.warning(
                 "agent %s: api-error-abandon on thread %s (attempts=%d)",
                 agent_id, root_id, attempts,
+            )
+
+        async def on_turn_success(
+            root_id: str,
+            batch: list[dict],
+            channel_meta: dict,
+        ):
+            """PUF-255: recovery-side matched-pair for
+            ``on_api_error_abandon``. Fires on every successful
+            turn exit (fresh dispatch + kick-retry recovery).
+            Clears ``runtime.health = "api_error_abandoned"`` back
+            to ``"ok"`` so puffo-server learns when the agent
+            recovers -- closes the bidirectional state-honesty
+            loop PUF-252 opened (server learned about breakage
+            but never about healing pre-PUF-255).
+
+            Only clears the ``api_error_abandoned`` state.
+            ``auth_failed`` is owned by PUF-221's credential-
+            refresh lane (recovery there happens via the
+            CredentialRefresher's success-ping, not via a turn
+            completing); leaving that alone keeps the two
+            health-state lifecycles cleanly partitioned.
+
+            No-op when ``runtime.health`` is already ``"ok"`` /
+            ``"unknown"`` -- avoids needless ``runtime.save``
+            churn on the steady-state hot path.
+            """
+            if self.runtime.health != "api_error_abandoned":
+                return
+            self.runtime.health = "ok"
+            self.runtime.error = ""
+            self.runtime.save(agent_id)
+            logger.info(
+                "agent %s: api-error-recovery on thread %s; "
+                "runtime.health cleared back to ok",
+                agent_id, root_id,
             )
 
         async def heartbeat():
@@ -1009,6 +1045,7 @@ class Worker:
                         on_message=on_message_batch,
                         on_api_error_retry=on_api_error_retry,
                         on_api_error_abandon=on_api_error_abandon,
+                        on_turn_success=on_turn_success,
                     )
                 except asyncio.CancelledError:
                     raise

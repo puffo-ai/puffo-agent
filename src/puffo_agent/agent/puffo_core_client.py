@@ -506,6 +506,7 @@ class PuffoCoreMessageClient:
         on_message: Callable[..., Coroutine[Any, Any, Any]],
         on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
         on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """``on_message`` is the thread-batch callback. Despite the
         legacy parameter name kept for caller compatibility, it's
@@ -532,6 +533,19 @@ class PuffoCoreMessageClient:
         invisible. Invoked as ``on_api_error_abandon(root_id,
         batch, channel_meta, attempts)``. When omitted, the
         abandon stays silent (pre-PUF-252 behaviour).
+
+        PUF-255: ``on_turn_success`` is the recovery-side
+        matched-pair for ``on_api_error_abandon``. Fired at every
+        successful turn completion (both the fresh dispatch path
+        and the kick-retry-recovery path). The worker uses this
+        to clear ``runtime.health`` back from
+        ``"api_error_abandoned"`` to ``"ok"``, closing the loop
+        so puffo-server learns when the agent recovers. Without
+        this, PUF-252's state-honesty is one-way -- the server
+        learns when the agent breaks but never when it heals.
+        Invoked as ``on_turn_success(root_id, batch,
+        channel_meta)``. When omitted, the success stays
+        silent on the worker layer.
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -844,7 +858,7 @@ class PuffoCoreMessageClient:
         self._queue_seq = 0
         self._thread_state: dict[str, _ThreadEntry] = {}
         consumer_task = asyncio.ensure_future(
-            self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon),
+            self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon, on_turn_success),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
         # Fire-and-forget; the WS subscribe below doesn't wait for
@@ -980,6 +994,7 @@ class PuffoCoreMessageClient:
         channel_meta: dict,
         on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
         on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
         last_envelope: str,
     ) -> None:
         """Loop the API-Error kick-retry path until the agent
@@ -1058,6 +1073,17 @@ class PuffoCoreMessageClient:
                     "agent thread %s recovered after kick-retry %d/%d",
                     root_id, attempt, self.MAX_API_ERROR_RETRIES,
                 )
+                # PUF-255: the kick-retry path is the OTHER success
+                # exit (vs the fresh-dispatch path in ``_consume_queue``).
+                # Both fire the turn-success hook so the worker can
+                # clear ``api_error_abandoned`` regardless of which
+                # success path got us here.
+                await self._fire_turn_success(
+                    on_turn_success=on_turn_success,
+                    root_id=root_id,
+                    batch=batch,
+                    channel_meta=channel_meta,
+                )
                 return
             except AgentAPIError:
                 # Still rate-limited; loop with another backoff.
@@ -1120,11 +1146,41 @@ class PuffoCoreMessageClient:
                 root_id,
             )
 
+    async def _fire_turn_success(
+        self,
+        *,
+        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        root_id: str,
+        batch: list[dict],
+        channel_meta: dict,
+    ) -> None:
+        """PUF-255: recovery-side matched-pair for
+        ``_fire_api_error_abandon``. Fired on every successful turn
+        exit (both the fresh-dispatch path in ``_consume_queue`` and
+        the kick-retry-recovery path in ``_do_api_error_retries``).
+        The worker callback decides whether the success is a
+        recovery (clear ``runtime.health = "api_error_abandoned"``)
+        or a normal turn (no-op). Callback exceptions are caught +
+        logged -- the turn itself stands; this is purely
+        observational."""
+        if on_turn_success is None:
+            return
+        try:
+            await on_turn_success(root_id, batch, channel_meta)
+        except Exception:
+            self._log.exception(
+                "on_turn_success callback raised for thread %s; "
+                "the turn-success itself stands -- the callback's job "
+                "is purely observational",
+                root_id,
+            )
+
     async def _consume_queue(
         self,
         on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
         on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
         on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """Drain the priority queue serially. One turn at a time so
         the underlying session keeps a coherent conversation history;
@@ -1233,6 +1289,7 @@ class PuffoCoreMessageClient:
                     channel_meta=channel_meta,
                     on_api_error_retry=on_api_error_retry,
                     on_api_error_abandon=on_api_error_abandon,
+                    on_turn_success=on_turn_success,
                     last_envelope=last_envelope,
                 )
                 continue
@@ -1268,6 +1325,18 @@ class PuffoCoreMessageClient:
             # cursor check from this point on, so the in-memory
             # dispatching_ids set has done its job and can be released.
             entry.dispatching_ids = set()
+
+            # PUF-255: turn-success hook. Fires after every successful
+            # fresh-dispatch turn so the worker can clear a previous
+            # ``api_error_abandoned`` state. The consumer stays
+            # worker-state-agnostic; the worker callback decides
+            # whether the success is a recovery or just a normal turn.
+            await self._fire_turn_success(
+                on_turn_success=on_turn_success,
+                root_id=root_id,
+                batch=batch,
+                channel_meta=channel_meta,
+            )
 
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the
