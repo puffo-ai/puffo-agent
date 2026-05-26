@@ -4,6 +4,45 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.5] — unreleased
+
+### Fixed
+
+- **PUF-247: invite accept/reject failures no longer dump raw HTTP/JSON
+  into the operator's chat.** When ``POST /invitations/{id}/accept``
+  or ``/reject`` returned a 4xx/5xx, the catch-site formatted the
+  confirm string as ``f"Couldn't accept invite to {target}: {exc}"``,
+  and ``str(HttpError)`` expands as ``"HTTP {status}: {body}"`` — so
+  the server's JSON envelope (``{"error":"INVALID_PAYLOAD","message":
+  "channel not found: ch_..."}``) leaked verbatim into the agent's
+  reply, exposing internal error classes + channel IDs to anyone in
+  the thread (Sam's tier-1 mobile-Safari screenshot).
+
+  Both catch sites in ``puffo_core_client._maybe_handle_invite_reply``
+  now route through a new ``puffo_agent.agent._invite_strings``
+  module's ``format_invite_error(exc, verb)`` helper that classifies
+  the failure (``channel not found`` / ``space not found`` /
+  ``FORBIDDEN`` / ``CONFLICT`` / generic 4xx / 5xx / non-HttpError)
+  and returns short ASCII-only friendly copy that never echoes the
+  body. Diagnostic ``log.exception`` calls in the catch handlers are
+  unchanged — the raw exception still lands in the daemon log.
+
+  Channel/space mappings use deliberately ambiguous language ("isn't
+  reachable right now. Try again later.") rather than confident "no
+  longer available" while PUF-247 bug-1 (root-cause discrimination:
+  stale invite vs. envelope corruption vs. creation-ordering race) is
+  still open — promote to definitive copy once bug-1 lands.
+
+- **PUF-247: bare ``(ch_...)`` / ``(sp_...)`` IDs trimmed from
+  operator-facing invite labels.** ``_on_invite_canceled`` and
+  ``_maybe_handle_invite_reply`` previously composed labels as
+  ``f"**{name}**({id})"``; the IDs are noise in the operator's read
+  (they already saw them in the original invite-DM). Reduced to
+  ``f"**{name}**"`` with the bare ID as fallback only when the name
+  is missing. Original ``_handle_invite_event`` invite-emit copy
+  keeps the IDs so the operator can disambiguate same-named pending
+  invites at decision time.
+
 ## [0.9.4] — 2026-05-22
 
 ### Added

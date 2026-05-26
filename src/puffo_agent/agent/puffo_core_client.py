@@ -1602,12 +1602,9 @@ class PuffoCoreMessageClient:
         channel_id = meta.get("channel_id") or ""
         space_name = meta.get("space_name") or None
         channel_name = meta.get("channel_name") or None
-        # PUF-247 reviewer iter: labels carry NAME only (with bare ID
-        # as fallback when the name is missing), NOT ``name (id)``.
-        # The id is noise in the operator's read; if they need to
-        # disambiguate the channel they have the original invite-DM
-        # in context. Same shape used at the operator-reply confirm
-        # site (``_maybe_handle_invite_reply``).
+        # Label = name only; bare ID only as fallback. The operator
+        # already saw the IDs in the original invite-DM, so repeating
+        # them here is noise.
         space_label = f"**{space_name}**" if space_name else space_id
         inviter_display = (
             await self._fetch_display_name(inviter_slug) if inviter_slug else ""
@@ -2376,8 +2373,6 @@ class PuffoCoreMessageClient:
         inviter_slug = meta.get("inviter_slug") or "?"
         space_name = meta.get("space_name") or None
         channel_name = meta.get("channel_name") or None
-        # Label shape matches ``_handle_invite_event`` -- name only,
-        # bare ID as fallback. See the rationale comment there.
         space_label = f"**{space_name}**" if space_name else space_id
         if kind == "invite_to_channel":
             channel_label = (
@@ -2409,14 +2404,7 @@ class PuffoCoreMessageClient:
                     "operator-confirmed accept of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
-                # PUF-247: route the exception through the translation
-                # helper so the operator-DM confirm carries
-                # human-readable text, NOT the raw server response
-                # body. The verbose ``exc`` is already in the log
-                # via ``log.exception`` above for diagnostic.
-                confirm = (
-                    f"{format_invite_error(exc, 'accept')} ({target})"
-                )
+                confirm = f"{format_invite_error(exc, 'accept')} ({target})"
         else:  # reject
             try:
                 await self._reject_invite(
@@ -2432,12 +2420,7 @@ class PuffoCoreMessageClient:
                     "operator-confirmed reject of %s (event_id=%s) failed",
                     kind, invitation_event_id,
                 )
-                # PUF-247: same helper as the accept path — translate
-                # raw HTTP/JSON into human-readable text before it
-                # reaches the operator-DM confirm string.
-                confirm = (
-                    f"{format_invite_error(exc, 'reject')} ({target})"
-                )
+                confirm = f"{format_invite_error(exc, 'reject')} ({target})"
 
         # Drop from pending so a duplicate ``y`` later in the same
         # thread doesn't re-attempt (server would reject it anyway).
