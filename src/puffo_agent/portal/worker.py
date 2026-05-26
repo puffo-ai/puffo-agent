@@ -521,43 +521,17 @@ class Worker:
         root_id: str,
         log: logging.Logger,
     ) -> None:
-        """PUF-255: recovery-side matched-pair for
-        ``on_api_error_abandon``. Called from the
-        ``on_turn_success`` closure on every successful turn exit
-        (fresh dispatch + kick-retry recovery). Clears
-        ``runtime.health = "api_error_abandoned"`` back to
-        ``"ok"`` so puffo-server learns when the agent recovers --
-        closes the bidirectional state-honesty loop PUF-252
-        opened (server learned about breakage but never about
-        healing pre-PUF-255).
+        """Clear ``runtime.health = "api_error_abandoned"`` back to
+        ``"ok"`` on the next successful turn. ``auth_failed`` is
+        deliberately left alone — PUF-221's CredentialRefresher
+        owns that lifecycle and a single lucky turn shouldn't
+        substitute for the refresh-success-ping.
 
-        Only clears the ``api_error_abandoned`` state.
-        ``auth_failed`` is owned by PUF-221's credential-refresh
-        lane (recovery there happens via the
-        CredentialRefresher's success-ping, not via a turn
-        completing); leaving that alone keeps the two
-        health-state lifecycles cleanly partitioned.
-
-        No-op when ``runtime.health`` is already ``"ok"`` /
-        ``"unknown"`` -- avoids needless ``runtime.save`` churn
-        on the steady-state hot path.
-
-        **Known granularity mismatch (PUF-253 design input):**
-        ``api_error_abandoned`` is a thread-level event (thread A
-        abandoned its batch) but ``runtime.health`` is an
-        agent-global flag. A successful turn on thread B clears
-        the flag globally even though thread A's batch may
-        still be stuck. Current behaviour is last-write-wins;
-        the per-thread error history that would let the recovery
-        be thread-scoped is tracked separately as PUF-253's
-        design constraint for the eventual ``runtime.error``
-        list shape. UI consumers (FB-197/198) should expect this
-        coarseness until PUF-253 design lands.
-
-        Lifted from the local closure so tests exercise the real
-        function rather than a re-implemented stub -- a future
-        change here actually breaks the tests that pin its
-        contract.
+        Known granularity mismatch (PUF-253 design input):
+        ``api_error_abandoned`` is a thread-level event but
+        ``runtime.health`` is an agent-global flag, so a success
+        on thread B clears it even if thread A is still stuck.
+        Last-write-wins until ``runtime.error`` becomes a list.
         """
         if runtime.health != "api_error_abandoned":
             return

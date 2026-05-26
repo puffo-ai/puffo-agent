@@ -534,18 +534,10 @@ class PuffoCoreMessageClient:
         batch, channel_meta, attempts)``. When omitted, the
         abandon stays silent (pre-PUF-252 behaviour).
 
-        PUF-255: ``on_turn_success`` is the recovery-side
-        matched-pair for ``on_api_error_abandon``. Fired at every
-        successful turn completion (both the fresh dispatch path
-        and the kick-retry-recovery path). The worker uses this
-        to clear ``runtime.health`` back from
-        ``"api_error_abandoned"`` to ``"ok"``, closing the loop
-        so puffo-server learns when the agent recovers. Without
-        this, PUF-252's state-honesty is one-way -- the server
-        learns when the agent breaks but never when it heals.
-        Invoked as ``on_turn_success(root_id, batch,
-        channel_meta)``. When omitted, the success stays
-        silent on the worker layer.
+        ``on_turn_success`` is the recovery-side matched-pair
+        for ``on_api_error_abandon``. Fires on every successful
+        turn exit (fresh dispatch AND kick-retry recovery).
+        Invoked as ``on_turn_success(root_id, batch, channel_meta)``.
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -1073,11 +1065,6 @@ class PuffoCoreMessageClient:
                     "agent thread %s recovered after kick-retry %d/%d",
                     root_id, attempt, self.MAX_API_ERROR_RETRIES,
                 )
-                # PUF-255: the kick-retry path is the OTHER success
-                # exit (vs the fresh-dispatch path in ``_consume_queue``).
-                # Both fire the turn-success hook so the worker can
-                # clear ``api_error_abandoned`` regardless of which
-                # success path got us here.
                 await self._fire_turn_success(
                     on_turn_success=on_turn_success,
                     root_id=root_id,
@@ -1154,24 +1141,14 @@ class PuffoCoreMessageClient:
         batch: list[dict],
         channel_meta: dict,
     ) -> None:
-        """PUF-255: recovery-side matched-pair for
-        ``_fire_api_error_abandon``. Fired on every successful turn
-        exit (both the fresh-dispatch path in ``_consume_queue`` and
-        the kick-retry-recovery path in ``_do_api_error_retries``).
-        The worker callback decides whether the success is a
-        recovery (clear ``runtime.health = "api_error_abandoned"``)
-        or a normal turn (no-op). Callback exceptions are caught +
-        logged -- the turn itself stands; this is purely
-        observational."""
+        """Recovery-side matched-pair for ``_fire_api_error_abandon``."""
         if on_turn_success is None:
             return
         try:
             await on_turn_success(root_id, batch, channel_meta)
         except Exception:
             self._log.exception(
-                "on_turn_success callback raised for thread %s; "
-                "the turn-success itself stands -- the callback's job "
-                "is purely observational",
+                "on_turn_success callback raised for thread %s",
                 root_id,
             )
 
@@ -1326,11 +1303,6 @@ class PuffoCoreMessageClient:
             # dispatching_ids set has done its job and can be released.
             entry.dispatching_ids = set()
 
-            # PUF-255: turn-success hook. Fires after every successful
-            # fresh-dispatch turn so the worker can clear a previous
-            # ``api_error_abandoned`` state. The consumer stays
-            # worker-state-agnostic; the worker callback decides
-            # whether the success is a recovery or just a normal turn.
             await self._fire_turn_success(
                 on_turn_success=on_turn_success,
                 root_id=root_id,
