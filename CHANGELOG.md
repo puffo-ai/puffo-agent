@@ -43,6 +43,66 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   keeps the IDs so the operator can disambiguate same-named pending
   invites at decision time.
 
+- **PUF-252 bug-1: api-error abandon no longer silently invisible.**
+  Sam's symptom (relayed via Grande): Scout went silent on a DM
+  after a Claude rate-limit fired; the consumer-loop's kick-retry
+  path exhausted + abandoned the batch silently, leaving
+  ``runtime.health == "ok"`` while the actual state was "abandoned"
+  — Sam had to manually restart Scout because no surface anywhere
+  reflected that the agent had given up.
+
+  Root cause: ``_do_api_error_retries`` had three exit points
+  (no-retry-callback short-circuit / mid-loop ``except Exception``
+  raise / normal exhaust at ``MAX_API_ERROR_RETRIES``) and all
+  three just ``return``'d. The ``RuntimeState.health`` enum had no
+  value for "abandoned" — only ``ok`` / ``auth_failed`` / ``unknown``
+  — so even if the worker had wanted to surface the state, there
+  was no slot to write it to.
+
+  Fix: new ``on_api_error_abandon(root_id, batch, channel_meta,
+  attempts)`` callback parameter on ``PuffoCoreMessageClient.listen()``,
+  threaded through ``_consume_queue`` → ``_do_api_error_retries``.
+  Fires exactly once per abandoned batch via the
+  ``_fire_api_error_abandon`` helper at each of the three exit
+  points. ``RuntimeState.health`` extended with a new
+  ``"api_error_abandoned"`` value; ``portal/worker.py`` wires the
+  callback to flip ``runtime.health`` + populate ``runtime.error``
+  with a human-readable summary + ``runtime.save(agent_id)`` so the
+  state persists across daemon restarts.
+
+  ``puffo-agent status`` CLI surfaces the new health state
+  alongside the existing ``[auth_failed]`` tag: rows for
+  abandoned-batch agents render as
+  ``running [api_error_abandoned]`` so operators can see the
+  silent-failure surface from the terminal pre-UI-launch.
+
+- **PUF-252 architectural scoping decision: no auto-recovery, ship
+  state-honesty only.** Per the ``feedback_dedup_triage_policy.md``
+  revision at PUF-249 closure, when user-action via UI exists, the
+  platform doesn't substitute for it. Auto-restart on api-error-
+  abandon would be "storage-shaped defence with time delay" — same
+  rejection criterion as throttling. This release ships the data
+  layer (``runtime.health = "api_error_abandoned"``); the UI
+  affordances on Nova's canonical lane (FB-197 status dot + FB-198
+  restart lever, both in the Operator Action Panel cluster) are
+  the correct recovery surface and ship separately. The
+  ``runtime.error`` copy explicitly cites the user-action path:
+  *"The agent has gone silent on this thread until it is
+  refreshed/restarted."*
+
+  Known follow-up debts deliberately deferred:
+
+  - **PUF-258**: ``runtime.health`` is currently a one-way state
+    machine — nothing in the codebase ever sets ``health = "ok"``,
+    so both ``auth_failed`` and ``api_error_abandoned`` are
+    permanent labels until a process restart resets RuntimeState
+    defaults. Predates PUF-252; out of scope here.
+  - **PUF-253**: ``runtime.error`` is a single-field string;
+    consecutive abandons overwrite each other. UI design input
+    for FB-197/198 needs to decide between append-with-cap, a
+    ``last_abandoned_threads`` list, or accepting the lossy-but-
+    simple single-field model.
+
 ## [0.9.4] — 2026-05-22
 
 ### Added
