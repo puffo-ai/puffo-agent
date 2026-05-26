@@ -514,6 +514,62 @@ def _handle_suppressed_reply(
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
+    @staticmethod
+    def _clear_api_error_abandoned_if_recoverable(
+        runtime: "RuntimeState",
+        agent_id: str,
+        root_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """PUF-255: recovery-side matched-pair for
+        ``on_api_error_abandon``. Called from the
+        ``on_turn_success`` closure on every successful turn exit
+        (fresh dispatch + kick-retry recovery). Clears
+        ``runtime.health = "api_error_abandoned"`` back to
+        ``"ok"`` so puffo-server learns when the agent recovers --
+        closes the bidirectional state-honesty loop PUF-252
+        opened (server learned about breakage but never about
+        healing pre-PUF-255).
+
+        Only clears the ``api_error_abandoned`` state.
+        ``auth_failed`` is owned by PUF-221's credential-refresh
+        lane (recovery there happens via the
+        CredentialRefresher's success-ping, not via a turn
+        completing); leaving that alone keeps the two
+        health-state lifecycles cleanly partitioned.
+
+        No-op when ``runtime.health`` is already ``"ok"`` /
+        ``"unknown"`` -- avoids needless ``runtime.save`` churn
+        on the steady-state hot path.
+
+        **Known granularity mismatch (PUF-253 design input):**
+        ``api_error_abandoned`` is a thread-level event (thread A
+        abandoned its batch) but ``runtime.health`` is an
+        agent-global flag. A successful turn on thread B clears
+        the flag globally even though thread A's batch may
+        still be stuck. Current behaviour is last-write-wins;
+        the per-thread error history that would let the recovery
+        be thread-scoped is tracked separately as PUF-253's
+        design constraint for the eventual ``runtime.error``
+        list shape. UI consumers (FB-197/198) should expect this
+        coarseness until PUF-253 design lands.
+
+        Lifted from the local closure so tests exercise the real
+        function rather than a re-implemented stub -- a future
+        change here actually breaks the tests that pin its
+        contract.
+        """
+        if runtime.health != "api_error_abandoned":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: api-error-recovery on thread %s; "
+            "runtime.health cleared back to ok",
+            agent_id, root_id,
+        )
+
     def __init__(
         self,
         daemon_cfg: DaemonConfig,
@@ -971,35 +1027,8 @@ class Worker:
             batch: list[dict],
             channel_meta: dict,
         ):
-            """PUF-255: recovery-side matched-pair for
-            ``on_api_error_abandon``. Fires on every successful
-            turn exit (fresh dispatch + kick-retry recovery).
-            Clears ``runtime.health = "api_error_abandoned"`` back
-            to ``"ok"`` so puffo-server learns when the agent
-            recovers -- closes the bidirectional state-honesty
-            loop PUF-252 opened (server learned about breakage
-            but never about healing pre-PUF-255).
-
-            Only clears the ``api_error_abandoned`` state.
-            ``auth_failed`` is owned by PUF-221's credential-
-            refresh lane (recovery there happens via the
-            CredentialRefresher's success-ping, not via a turn
-            completing); leaving that alone keeps the two
-            health-state lifecycles cleanly partitioned.
-
-            No-op when ``runtime.health`` is already ``"ok"`` /
-            ``"unknown"`` -- avoids needless ``runtime.save``
-            churn on the steady-state hot path.
-            """
-            if self.runtime.health != "api_error_abandoned":
-                return
-            self.runtime.health = "ok"
-            self.runtime.error = ""
-            self.runtime.save(agent_id)
-            logger.info(
-                "agent %s: api-error-recovery on thread %s; "
-                "runtime.health cleared back to ok",
-                agent_id, root_id,
+            Worker._clear_api_error_abandoned_if_recoverable(
+                self.runtime, agent_id, root_id, logger,
             )
 
         async def heartbeat():
