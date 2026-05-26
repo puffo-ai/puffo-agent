@@ -13,6 +13,7 @@ designer-blocked UI affordance has a signal to render.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -20,6 +21,21 @@ import pytest
 
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.agent.core import AgentAPIError
+
+
+@pytest.fixture(autouse=True)
+def _fast_sleep(monkeypatch):
+    """Monkeypatch ``asyncio.sleep`` for the test's lifetime via
+    pytest's fixture so the patch is per-test and reverts cleanly.
+    Process-global ``asyncio.sleep = ...`` assignment + try/finally
+    (the pre-polish shape) is brittle under pytest-xdist or
+    concurrent event-loop tests."""
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
 
 
 def _make_client(max_retries: int = 3) -> PuffoCoreMessageClient:
@@ -46,10 +62,14 @@ def _make_client(max_retries: int = 3) -> PuffoCoreMessageClient:
 
 def _make_entry():
     """Tiny stand-in for ``_ThreadEntry``. Only ``dispatching_ids``
-    is touched by ``_do_api_error_retries`` (cleared on entry)."""
+    is touched by ``_do_api_error_retries`` (cleared on entry).
+    Initialised in ``__init__`` so each entry owns its own set --
+    a class-level mutable would silently share state across test
+    runs even if today's code rebinds the field."""
 
     class _Entry:
-        dispatching_ids: set[str] = set()
+        def __init__(self):
+            self.dispatching_ids: set[str] = set()
 
     return _Entry()
 
@@ -68,26 +88,15 @@ async def test_abandon_fires_after_max_retries_exhausted_with_all_failing():
     async def on_abandon(root_id, batch, channel_meta, attempts):
         abandon_calls.append((root_id, list(batch), dict(channel_meta), attempts))
 
-    # asyncio.sleep is mocked via monkeypatch to keep the test fast.
-    import asyncio
-    real_sleep = asyncio.sleep
-
-    async def fast_sleep(_seconds):
-        await real_sleep(0)
-
-    asyncio.sleep = fast_sleep  # type: ignore[assignment]
-    try:
-        await client._do_api_error_retries(  # type: ignore[arg-type]
-            root_id="root_x",
-            entry=_make_entry(),  # type: ignore[arg-type]
-            batch=[{"envelope_id": "env_1", "sent_at": 100}],
-            channel_meta={"channel_id": "ch_x"},
-            on_api_error_retry=always_fail,
-            on_api_error_abandon=on_abandon,
-            last_envelope="env_1",
-        )
-    finally:
-        asyncio.sleep = real_sleep  # type: ignore[assignment]
+    await client._do_api_error_retries(  # type: ignore[arg-type]
+        root_id="root_x",
+        entry=_make_entry(),  # type: ignore[arg-type]
+        batch=[{"envelope_id": "env_1", "sent_at": 100}],
+        channel_meta={"channel_id": "ch_x"},
+        on_api_error_retry=always_fail,
+        on_api_error_abandon=on_abandon,
+        last_envelope="env_1",
+    )
 
     assert len(abandon_calls) == 1
     root_id, batch, channel_meta, attempts = abandon_calls[0]
@@ -141,21 +150,15 @@ async def test_abandon_fires_when_internal_raise_short_circuits_loop():
     async def on_abandon(root_id, batch, channel_meta, attempts):
         abandon_calls.append((root_id, attempts))
 
-    import asyncio
-    real_sleep = asyncio.sleep
-    asyncio.sleep = (lambda _s: real_sleep(0))  # type: ignore[assignment]
-    try:
-        await client._do_api_error_retries(  # type: ignore[arg-type]
-            root_id="root_boom",
-            entry=_make_entry(),  # type: ignore[arg-type]
-            batch=[{"envelope_id": "env_1"}],
-            channel_meta={},
-            on_api_error_retry=boom,
-            on_api_error_abandon=on_abandon,
-            last_envelope="env_1",
-        )
-    finally:
-        asyncio.sleep = real_sleep  # type: ignore[assignment]
+    await client._do_api_error_retries(  # type: ignore[arg-type]
+        root_id="root_boom",
+        entry=_make_entry(),  # type: ignore[arg-type]
+        batch=[{"envelope_id": "env_1"}],
+        channel_meta={},
+        on_api_error_retry=boom,
+        on_api_error_abandon=on_abandon,
+        last_envelope="env_1",
+    )
 
     # First attempt raised RuntimeError -> the except-Exception branch
     # fires the abandon callback with attempts=1 then returns.
@@ -183,32 +186,28 @@ async def test_abandon_does_not_fire_when_a_kick_succeeds():
     async def on_abandon(root_id, batch, channel_meta, attempts):
         abandon_calls.append((root_id, attempts))
 
-    import asyncio
-    real_sleep = asyncio.sleep
-    asyncio.sleep = (lambda _s: real_sleep(0))  # type: ignore[assignment]
-    try:
-        await client._do_api_error_retries(  # type: ignore[arg-type]
-            root_id="root_recovered",
-            entry=_make_entry(),  # type: ignore[arg-type]
-            batch=[{"envelope_id": "env_1", "sent_at": 200}],
-            channel_meta={},
-            on_api_error_retry=succeed_on_first_try,
-            on_api_error_abandon=on_abandon,
-            last_envelope="env_1",
-        )
-    finally:
-        asyncio.sleep = real_sleep  # type: ignore[assignment]
+    await client._do_api_error_retries(  # type: ignore[arg-type]
+        root_id="root_recovered",
+        entry=_make_entry(),  # type: ignore[arg-type]
+        batch=[{"envelope_id": "env_1", "sent_at": 200}],
+        channel_meta={},
+        on_api_error_retry=succeed_on_first_try,
+        on_api_error_abandon=on_abandon,
+        last_envelope="env_1",
+    )
 
     assert call_count["n"] == 1
     assert abandon_calls == []  # success path doesn't fire abandon
 
 
 @pytest.mark.asyncio
-async def test_abandon_callback_exception_does_not_propagate():
+async def test_abandon_callback_exception_does_not_propagate(caplog):
     """The callback is observational; if it raises, the abandon
     itself still stands and the caller doesn't see the exception.
     Keeps the worker's bookkeeping from cascading into a listen()
-    crash."""
+    crash. ``caplog`` pins that the swallow is logged via
+    ``log.exception`` -- guards against a future regression that
+    swaps the helper's exception-handling for a silent pass."""
     client = _make_client(max_retries=1)
 
     async def always_fail(root_id, batch, channel_meta):
@@ -217,10 +216,7 @@ async def test_abandon_callback_exception_does_not_propagate():
     async def callback_raises(root_id, batch, channel_meta, attempts):
         raise RuntimeError("callback boom")
 
-    import asyncio
-    real_sleep = asyncio.sleep
-    asyncio.sleep = (lambda _s: real_sleep(0))  # type: ignore[assignment]
-    try:
+    with caplog.at_level(logging.ERROR, logger="test-puf-252"):
         # Should NOT raise -- the helper catches callback exceptions.
         await client._do_api_error_retries(  # type: ignore[arg-type]
             root_id="root_swallow",
@@ -231,8 +227,16 @@ async def test_abandon_callback_exception_does_not_propagate():
             on_api_error_abandon=callback_raises,
             last_envelope="env_1",
         )
-    finally:
-        asyncio.sleep = real_sleep  # type: ignore[assignment]
+
+    # log.exception emits at ERROR with the exception info attached.
+    matching = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and r.exc_info is not None
+    ]
+    assert matching, (
+        "expected log.exception() to fire when the abandon callback "
+        "raised; caplog saw no ERROR record with exc_info"
+    )
 
 
 @pytest.mark.asyncio
@@ -245,20 +249,14 @@ async def test_abandon_callback_omitted_does_not_break_existing_callers():
     async def always_fail(root_id, batch, channel_meta):
         raise AgentAPIError("still rate-limited")
 
-    import asyncio
-    real_sleep = asyncio.sleep
-    asyncio.sleep = (lambda _s: real_sleep(0))  # type: ignore[assignment]
-    try:
-        # Should NOT raise. The pre-PUF-252 signature only took
-        # ``on_api_error_retry``; the new param defaults to None.
-        await client._do_api_error_retries(  # type: ignore[arg-type]
-            root_id="root_noop",
-            entry=_make_entry(),  # type: ignore[arg-type]
-            batch=[{"envelope_id": "env_1"}],
-            channel_meta={},
-            on_api_error_retry=always_fail,
-            on_api_error_abandon=None,
-            last_envelope="env_1",
-        )
-    finally:
-        asyncio.sleep = real_sleep  # type: ignore[assignment]
+    # Should NOT raise. The pre-PUF-252 signature only took
+    # ``on_api_error_retry``; the new param defaults to None.
+    await client._do_api_error_retries(  # type: ignore[arg-type]
+        root_id="root_noop",
+        entry=_make_entry(),  # type: ignore[arg-type]
+        batch=[{"envelope_id": "env_1"}],
+        channel_meta={},
+        on_api_error_retry=always_fail,
+        on_api_error_abandon=None,
+        last_envelope="env_1",
+    )

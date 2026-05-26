@@ -957,8 +957,8 @@ class Worker:
             self.runtime.error = (
                 f"Worker abandoned a batch on thread {root_id} after "
                 f"{attempts} rate-limit kick-retries. The agent has "
-                "gone silent on this thread until a new message "
-                "arrives OR the agent is refreshed/restarted."
+                "gone silent on this thread until it is refreshed/"
+                "restarted."
             )
             self.runtime.save(agent_id)
             logger.warning(
