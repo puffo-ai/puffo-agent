@@ -505,6 +505,7 @@ class PuffoCoreMessageClient:
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
         on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """``on_message`` is the thread-batch callback. Despite the
         legacy parameter name kept for caller compatibility, it's
@@ -519,6 +520,17 @@ class PuffoCoreMessageClient:
         ``batch`` payload (so the agent's transcript doesn't pick up
         a duplicate of the original user input on every retry). When
         omitted, the consumer abandons the batch on first failure.
+
+        PUF-252 bug-1: ``on_api_error_abandon`` is the
+        state-honesty hook fired exactly once when kick-retries
+        have all failed and the batch is being abandoned. The
+        worker uses this to flip ``runtime.health`` +
+        ``runtime.error`` so bug-2's UI affordance has a signal
+        to surface (Sam's "agent went silent without warning"
+        symptom from PUF-252). Invoked as
+        ``on_api_error_abandon(root_id, batch, channel_meta,
+        attempts)``. When omitted, the abandon stays silent (the
+        pre-PUF-252 behaviour).
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -831,7 +843,7 @@ class PuffoCoreMessageClient:
         self._queue_seq = 0
         self._thread_state: dict[str, _ThreadEntry] = {}
         consumer_task = asyncio.ensure_future(
-            self._consume_queue(on_message, on_api_error_retry),
+            self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
         # Fire-and-forget; the WS subscribe below doesn't wait for
@@ -966,6 +978,7 @@ class PuffoCoreMessageClient:
         batch: list[dict],
         channel_meta: dict,
         on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
         last_envelope: str,
     ) -> None:
         """Loop the API-Error kick-retry path until the agent
@@ -1000,6 +1013,13 @@ class PuffoCoreMessageClient:
                 "(last envelope %s); no retry callback wired, "
                 "abandoning batch",
                 root_id, last_envelope,
+            )
+            await self._fire_api_error_abandon(
+                on_api_error_abandon=on_api_error_abandon,
+                root_id=root_id,
+                batch=batch,
+                channel_meta=channel_meta,
+                attempts=0,
             )
             return
 
@@ -1048,6 +1068,13 @@ class PuffoCoreMessageClient:
                     "kick-retry %d/%d for thread %s raised; abandoning",
                     attempt, self.MAX_API_ERROR_RETRIES, root_id,
                 )
+                await self._fire_api_error_abandon(
+                    on_api_error_abandon=on_api_error_abandon,
+                    root_id=root_id,
+                    batch=batch,
+                    channel_meta=channel_meta,
+                    attempts=attempt,
+                )
                 return
         self._log.warning(
             "agent thread %s exhausted %d kick-retries (last envelope %s); "
@@ -1055,11 +1082,47 @@ class PuffoCoreMessageClient:
             "get_channel_history on the next dispatch",
             root_id, self.MAX_API_ERROR_RETRIES, last_envelope,
         )
+        await self._fire_api_error_abandon(
+            on_api_error_abandon=on_api_error_abandon,
+            root_id=root_id,
+            batch=batch,
+            channel_meta=channel_meta,
+            attempts=self.MAX_API_ERROR_RETRIES,
+        )
+
+    async def _fire_api_error_abandon(
+        self,
+        *,
+        on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
+        root_id: str,
+        batch: list[dict],
+        channel_meta: dict,
+        attempts: int,
+    ) -> None:
+        """PUF-252 bug-1: state-honesty hook fired exactly once per
+        abandoned batch. ``attempts`` is the number of kick-retries
+        that actually fired (0 when no retry callback was wired, or
+        an internal raise short-circuited the loop before any
+        attempt completed). The worker uses this to flip
+        ``runtime.health`` so bug-2's UI affordance surfaces the
+        "agent went silent" signal."""
+        if on_api_error_abandon is None:
+            return
+        try:
+            await on_api_error_abandon(root_id, batch, channel_meta, attempts)
+        except Exception:
+            self._log.exception(
+                "on_api_error_abandon callback raised for thread %s; "
+                "the abandon itself stands -- the callback's job is "
+                "purely observational",
+                root_id,
+            )
 
     async def _consume_queue(
         self,
         on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
         on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> None:
         """Drain the priority queue serially. One turn at a time so
         the underlying session keeps a coherent conversation history;
@@ -1167,6 +1230,7 @@ class PuffoCoreMessageClient:
                     batch=batch,
                     channel_meta=channel_meta,
                     on_api_error_retry=on_api_error_retry,
+                    on_api_error_abandon=on_api_error_abandon,
                     last_envelope=last_envelope,
                 )
                 continue

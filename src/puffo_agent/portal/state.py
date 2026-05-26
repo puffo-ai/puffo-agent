@@ -1073,10 +1073,16 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
-    # Claude-side auth health, independent of ``status``. "ok" = last
-    # refresh-ping smoke test passed; "auth_failed" = adapter saw 401 /
-    # authentication_error; "unknown" = no probe yet.
-    health: str = "unknown"  # ok | auth_failed | unknown
+    # Worker-side health, independent of ``status``. Values:
+    #   "ok"                      — last refresh-ping smoke test passed
+    #   "auth_failed"             — adapter saw 401 / authentication_error
+    #   "api_error_abandoned"     — kick-retry exhausted on rate-limit /
+    #                               API-error class, batch silently
+    #                               abandoned. Bug-2 UI affordance reads
+    #                               this to render "agent has gone silent
+    #                               — refresh?" prompt (PUF-252).
+    #   "unknown"                 — no probe yet
+    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> "RuntimeState | None":

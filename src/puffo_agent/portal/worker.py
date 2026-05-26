@@ -927,6 +927,33 @@ class Worker:
                         channel_id, reply, root_id=root_id,
                     )
 
+        async def on_api_error_abandon(
+            root_id: str,
+            batch: list[dict],
+            channel_meta: dict,
+            attempts: int,
+        ):
+            """PUF-252 bug-1: surface the abandoned-batch state on
+            ``runtime`` so bug-2's UI affordance has a signal to render.
+            Pre-PUF-252 the abandon was silent and Sam's Scout
+            appeared ``state=running`` even though the consumer had
+            given up on the pending DM. Now ``runtime.health`` flips
+            to ``api_error_abandoned`` + ``runtime.error`` carries a
+            human-readable summary.
+            """
+            self.runtime.health = "api_error_abandoned"
+            self.runtime.error = (
+                f"Worker abandoned a batch on thread {root_id} after "
+                f"{attempts} rate-limit kick-retries. The agent has "
+                "gone silent on this thread until a new message "
+                "arrives OR the agent is refreshed/restarted."
+            )
+            self.runtime.save(agent_id)
+            logger.warning(
+                "agent %s: api-error-abandon on thread %s (attempts=%d)",
+                agent_id, root_id, attempts,
+            )
+
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
             while not self._stop.is_set():
@@ -969,6 +996,7 @@ class Worker:
                     await client.listen(
                         on_message=on_message_batch,
                         on_api_error_retry=on_api_error_retry,
+                        on_api_error_abandon=on_api_error_abandon,
                     )
                 except asyncio.CancelledError:
                     raise
