@@ -56,7 +56,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from .state import link_host_codex_auth, link_host_credentials
 
@@ -628,6 +628,12 @@ class CredentialRefresher:
             self.host_credentials = backend.host_credentials
         self._refresh_request = asyncio.Event()
         self._agent_homes: set[Path] = set()
+        # PUF-258: per-Worker callbacks fired after a successful refresh
+        # (regular tick OR external-rotation detection) so each Worker
+        # can clear its ``runtime.health == "auth_failed"`` optimistically.
+        # Mirrors the ``register_agent`` shape but operates on the
+        # in-memory Worker reference instead of a disk path.
+        self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
 
     def register_agent(self, agent_home: Path) -> None:
@@ -635,6 +641,37 @@ class CredentialRefresher:
 
     def unregister_agent(self, agent_home: Path) -> None:
         self._agent_homes.discard(Path(agent_home))
+
+    def register_on_refresh_success(self, callback: Callable[[], None]) -> None:
+        """PUF-258: subscribe to refresh-success notifications.
+
+        Fired after every successful refresh OR external-rotation
+        detection so subscribers (Workers) can clear an
+        ``auth_failed`` flag optimistically. Callbacks are sync; any
+        exception is caught + logged so a buggy subscriber doesn't
+        break the refresh loop."""
+        self._on_refresh_success.append(callback)
+
+    def unregister_on_refresh_success(self, callback: Callable[[], None]) -> None:
+        try:
+            self._on_refresh_success.remove(callback)
+        except ValueError:
+            pass
+
+    def _fire_refresh_success(self) -> None:
+        """Dispatch refresh-success to every registered subscriber.
+
+        Callback exceptions are swallowed + logged -- the refresh
+        loop has already done its real work (rotated credentials,
+        synced views); a Worker callback raising here mustn't
+        cascade into the daemon's refresh cadence."""
+        for cb in list(self._on_refresh_success):
+            try:
+                cb()
+            except Exception as exc:
+                logger.warning(
+                    "credential refresh-success callback raised: %s", exc,
+                )
 
     def notify_refresh_needed(self) -> None:
         """In-process trigger from an agent that just saw a 401."""
@@ -721,6 +758,11 @@ class CredentialRefresher:
                 continue
             if rotated:
                 self._sync_views()
+                # PUF-258: external rotation = credentials are fresh
+                # without us calling refresh, so still notify Workers
+                # to clear ``auth_failed`` -- next request sees the
+                # rotated cred via _sync_views above.
+                self._fire_refresh_success()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
         stop_task = asyncio.create_task(stop_event.wait())
@@ -758,7 +800,13 @@ class CredentialRefresher:
         """Single-writer refresh through the backend. The
         ``asyncio.Lock`` is what makes the rotating-RT race
         unwinnable: a second caller can't see an in-flight rotation
-        mid-write."""
+        mid-write.
+
+        PUF-258: on successful refresh fires
+        ``_fire_refresh_success`` so registered Workers clear an
+        ``auth_failed`` flag optimistically. Failure path stays
+        silent (the flag rightly persists until next attempt)."""
+        refreshed = False
         async with self._lock:
             before = self.expires_in_seconds()
             if (
@@ -777,8 +825,11 @@ class CredentialRefresher:
             )
             try:
                 await self.backend.refresh()
+                refreshed = True
             except Exception as exc:
                 logger.warning("backend refresh errored: %s", exc)
+        if refreshed:
+            self._fire_refresh_success()
 
     def _sync_views(self) -> None:
         """Mirror canonical credentials to every registered agent."""

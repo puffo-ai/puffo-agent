@@ -1074,13 +1074,17 @@ class RuntimeState:
     last_event_at: int = 0
     error: str = ""
     # Worker-side health, independent of ``status``. Values:
-    #   "ok"                  — refresh-ping passed, or a turn cleared a
-    #                           prior abandon
-    #   "auth_failed"         — adapter saw 401 / authentication_error;
-    #                           cleared only by the CredentialRefresher
-    #                           success-ping (PUF-221's lane)
+    #   "ok"                  — refresh-ping passed, a turn cleared a
+    #                           prior abandon, or a credential refresh
+    #                           cleared a prior auth_failed
+    #   "auth_failed"         — adapter saw 401 / authentication_error
+    #                           (set in worker._handle_suppressed_reply);
+    #                           cleared by the CredentialRefresher's
+    #                           refresh-success callback (PUF-258 wired
+    #                           the clear; PUF-221 owns the set lane)
     #   "api_error_abandoned" — kick-retry exhausted, batch silently
     #                           abandoned; cleared on next successful turn
+    #                           (PUF-255's on_turn_success lane)
     #   "unknown"             — no probe yet
     health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
 
