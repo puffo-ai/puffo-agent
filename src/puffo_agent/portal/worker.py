@@ -80,6 +80,11 @@ logger = logging.getLogger(__name__)
 RECONNECT_BACKOFF_SECONDS = 5.0
 
 
+def _uses_puffo_core_backend(agent_cfg: AgentConfig) -> bool:
+    backend = (agent_cfg.chat_backend or "puffo-core").strip().lower()
+    return backend in ("", "puffo-core", "puffo_core")
+
+
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     """Construct the adapter for ``runtime.kind``. Raises on unknown
     or misconfigured kinds."""
@@ -107,7 +112,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             max_turns=agent_cfg.runtime.max_turns,
         )
-        if agent_cfg.puffo_core.is_configured():
+        if _uses_puffo_core_backend(agent_cfg) and agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
             pc = agent_cfg.puffo_core
             adapter.mcp_servers_override = puffo_core_stdio_sdk_config(
@@ -169,7 +174,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
         # ``python -m puffo_agent.mcp.puffo_core_server``. The adapter
         # rewrites path-typed env values to container bind-mount paths
         # at config-write time.
-        if agent_cfg.puffo_core.is_configured():
+        if _uses_puffo_core_backend(agent_cfg) and agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core
             adapter.puffo_core_mcp_env = puffo_core_mcp_env(
@@ -214,7 +219,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             permission_mode=agent_cfg.runtime.permission_mode,
             harness=harness,
         )
-        if agent_cfg.puffo_core.is_configured():
+        if _uses_puffo_core_backend(agent_cfg) and agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core
             adapter.puffo_core_mcp_env = puffo_core_mcp_env(
@@ -355,6 +360,42 @@ def _build_puffo_core_client(
         workspace=str(agent_cfg.resolve_workspace_dir()),
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
+    )
+
+
+def _build_message_client(
+    agent_cfg: AgentConfig,
+    agent_id: str,
+    daemon_cfg: "DaemonConfig | None" = None,
+):
+    backend = (agent_cfg.chat_backend or "puffo-core").strip().lower()
+    if backend in ("", "puffo-core", "puffo_core"):
+        return _build_puffo_core_client(agent_cfg, agent_id, daemon_cfg)
+    if backend == "discord":
+        from ..agent.discord_client import DiscordMessageClient
+        from ..agent.message_store import MessageStore
+
+        dc = agent_cfg.discord
+        if not dc.is_configured():
+            raise RuntimeError(
+                f"agent {agent_id!r}: discord backend requires "
+                "discord.bot_token, discord.guild_id, and "
+                "discord.agent_user_id in agent.yml"
+            )
+        return DiscordMessageClient(
+            agent_slug=agent_cfg.id,
+            bot_token=dc.bot_token,
+            guild_id=dc.guild_id,
+            agent_user_id=dc.agent_user_id,
+            bot_user_id=dc.bot_user_id,
+            channel_ids=dc.channel_ids,
+            webhook_url=dc.webhook_url,
+            display_prefix=dc.display_prefix or agent_cfg.display_name or agent_cfg.id,
+            message_store=MessageStore(str(agent_dir(agent_id) / "messages.db")),
+        )
+    raise RuntimeError(
+        f"agent {agent_id!r}: unknown chat_backend {agent_cfg.chat_backend!r} "
+        "(valid: puffo-core, discord)"
     )
 
 
@@ -704,15 +745,20 @@ class Worker:
                 workspace_dir=workspace_path,
                 claude_dir=claude_path,
                 agent_id=agent_id,
+                send_message_tools_post_externally=_uses_puffo_core_backend(
+                    self.agent_cfg,
+                ),
             )
 
-            if not self.agent_cfg.puffo_core.is_configured():
+            if _uses_puffo_core_backend(self.agent_cfg) and (
+                not self.agent_cfg.puffo_core.is_configured()
+            ):
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml "
                     "is incomplete. Required fields: server_url, slug, "
                     "device_id, space_id."
                 )
-            client = _build_puffo_core_client(
+            client = _build_message_client(
                 self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
             )
             self._client = client

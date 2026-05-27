@@ -51,6 +51,7 @@ dependencies = [
 [project.optional-dependencies]
 # pip install puffo-agent[sdk]  — needed for agents with runtime.kind=sdk
 sdk = ["claude-agent-sdk>=0.1.61"]
+discord = ["discord.py>=2.4"]
 # cli-local / cli-docker adapters don't need extra Python deps; they
 # shell out to the `claude` binary (cli-local) or Docker (cli-docker).
 # pip install --editable ".[dev]"  — needed to run the test suite.

@@ -883,6 +883,28 @@ class PuffoCoreConfig:
 
 
 @dataclass
+class DiscordConfig:
+    """Discord transport config.
+
+    One Discord bot token can listen for many agents, but a single
+    process still needs to know which Discord mention maps to this
+    agent. Outbound identity is best-effort: webhook_url gives the
+    transport a per-agent display surface when available; otherwise
+    fallback replies are prefixed with ``display_prefix``.
+    """
+    bot_token: str = ""
+    guild_id: str = ""
+    agent_user_id: str = ""
+    bot_user_id: str = ""
+    channel_ids: list[str] = field(default_factory=list)
+    webhook_url: str = ""
+    display_prefix: str = ""
+
+    def is_configured(self) -> bool:
+        return bool(self.bot_token and self.guild_id and self.agent_user_id)
+
+
+@dataclass
 class RuntimeConfig:
     """Contents of the ``runtime:`` block in agent.yml.
 
@@ -945,7 +967,9 @@ class AgentConfig:
     # omits it.
     role: str = ""
     role_short: str = ""
+    chat_backend: str = "puffo-core"  # puffo-core | discord
     puffo_core: PuffoCoreConfig = field(default_factory=PuffoCoreConfig)
+    discord: DiscordConfig = field(default_factory=DiscordConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     profile: str = "profile.md"       # path relative to agent dir, or absolute
     memory_dir: str = "memory"        # path relative to agent dir, or absolute
@@ -964,6 +988,7 @@ class AgentConfig:
         with path.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         pc = raw.get("puffo_core") or {}
+        dc = raw.get("discord") or {}
         rt = raw.get("runtime") or {}
         triggers = raw.get("triggers") or {}
 
@@ -990,12 +1015,22 @@ class AgentConfig:
             avatar_url=raw.get("avatar_url", ""),
             role=raw.get("role", ""),
             role_short=raw.get("role_short", ""),
+            chat_backend=raw.get("chat_backend", "puffo-core"),
             puffo_core=PuffoCoreConfig(
                 server_url=pc.get("server_url") or DEFAULT_PUFFO_SERVER_URL,
                 slug=pc.get("slug", ""),
                 device_id=pc.get("device_id", ""),
                 space_id=pc.get("space_id", ""),
                 operator_slug=pc.get("operator_slug", ""),
+            ),
+            discord=DiscordConfig(
+                bot_token=dc.get("bot_token", ""),
+                guild_id=str(dc.get("guild_id", "")),
+                agent_user_id=str(dc.get("agent_user_id", "")),
+                bot_user_id=str(dc.get("bot_user_id", "")),
+                channel_ids=[str(v) for v in (dc.get("channel_ids") or [])],
+                webhook_url=dc.get("webhook_url", ""),
+                display_prefix=dc.get("display_prefix", ""),
             ),
             runtime=RuntimeConfig(
                 kind=kind,
@@ -1030,8 +1065,10 @@ class AgentConfig:
             "avatar_url": self.avatar_url,
             "role": self.role,
             "role_short": self.role_short,
+            "chat_backend": self.chat_backend,
             "created_at": self.created_at,
             "puffo_core": asdict(self.puffo_core),
+            "discord": asdict(self.discord),
             "runtime": asdict(self.runtime),
             "profile": self.profile,
             "memory_dir": self.memory_dir,
