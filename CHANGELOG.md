@@ -4,6 +4,30 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.6] — unreleased
+
+### Fixed
+
+- **Codex agent archive/delete failing with ``Permission denied`` on
+  ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
+  exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the
+  lifetime of the subprocess; on Windows, file-handle release can lag
+  the subprocess exit by several hundred milliseconds, so
+  ``_archive_on_flag`` /``_delete_on_flag``'s ``shutil.move`` /
+  ``shutil.rmtree`` firing immediately after ``_stop_worker`` returned
+  saw the ``.lock`` as still-locked and raised
+  ``[Errno 13] Permission denied``. The existing next-tick retry
+  could not recover because the ``.codex/tmp/`` tree is regenerated on
+  every codex start, so each reconciler tick hit the same lock on a
+  freshly-named tmp dir.
+
+  Daemon now pre-cleans ``.codex/tmp/`` via ``_drain_codex_tmp`` (5×
+  500ms retries, falls back to ``shutil.rmtree(ignore_errors=True)``)
+  before the outer move/rmtree walks the agent dir. The tmp dir is
+  ephemeral codex scratch — codex regenerates it on next start, so
+  there's nothing worth archiving inside it. Fix applies to both the
+  WS-cascade archive path and the operator-initiated delete path.
+
 ## [0.9.5] — 2026-05-26
 
 ### Fixed
