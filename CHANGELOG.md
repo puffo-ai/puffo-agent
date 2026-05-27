@@ -8,6 +8,30 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PUF-258: ``runtime.health = "auth_failed"`` no longer sticky after
+  credential refresh-success.** The daemon set the flag in
+  ``_handle_suppressed_reply`` (PUF-221) but nothing cleared it
+  anywhere — once flipped it stayed until process restart, leaving
+  ``audit.log`` dishonest about post-recovery agent state.
+
+  ``CredentialRefresher`` now exposes
+  ``register_on_refresh_success(cb)`` /
+  ``unregister_on_refresh_success(cb)`` and fires after both regular
+  ``_refresh_now`` success AND ``_external_rotation_loop`` detected
+  rotation. Fire happens outside the refresh lock so callbacks can't
+  deadlock the next cycle; gated on
+  ``outcome is RefreshOutcome.REFRESHED`` so PUF-265's UNCHANGED
+  case (exit=0 but token didn't actually rotate) doesn't oscillate
+  ``auth_failed → ok → auth_failed``. Callbacks isolated — a
+  subscriber raising logs at WARNING and the loop continues.
+
+  ``Worker._clear_auth_failed_if_recoverable`` (lifted staticmethod
+  matching PUF-255's pattern) flips ``"auth_failed" → "ok"`` and
+  clears ``runtime.error``. Leaves ``api_error_abandoned`` to
+  PUF-255's ``on_turn_success`` lane (symmetric partition). Optimistic
+  semantics: if the agent's next request still 401s,
+  ``_handle_suppressed_reply`` re-flips on the next leak detection.
+
 - **PUF-264: request-too-large no longer infinite-retries + no longer
   leaks the raw Anthropic API error to chat.** When a user uploaded
   10 PDFs (msg_a42f8cbb), the agent inlined all of them into one

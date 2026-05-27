@@ -288,3 +288,177 @@ async def test_refresh_now_skip_branch_does_not_fire(tmp_path, monkeypatch):
     )
     assert refresh_called["n"] == 0
     assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_external_rotation_loop_fires_on_detected_rotation(
+    tmp_path, monkeypatch,
+):
+    """When ``backend.poll_external_rotation`` returns True (Keychain
+    rotated externally), the loop fires ``_fire_refresh_success`` after
+    syncing views. Pins the second ``_fire_refresh_success`` site so a
+    future regression that drops it from the rotated-branch breaks the
+    test rather than silently regressing the macOS Keychain-rotation
+    path."""
+    _write_creds(tmp_path, expires_in_seconds=600)
+    r = CredentialRefresher(host_home=tmp_path)
+
+    # Shrink the poll interval so wait_for times out promptly. The
+    # constant lives in ``..macos.keychain`` and is imported lazily
+    # inside ``_external_rotation_loop`` -- patch at the module path
+    # the loop reads from.
+    from puffo_agent.macos import keychain as _kc
+    monkeypatch.setattr(_kc, "KEYCHAIN_POLL_INTERVAL_SECONDS", 0.01)
+
+    # Stub poll_external_rotation to return True once then False.
+    poll_calls = {"n": 0}
+
+    async def fake_poll() -> bool:
+        poll_calls["n"] += 1
+        return poll_calls["n"] == 1
+
+    # FileBackend doesn't natively have poll_external_rotation (it's
+    # KeychainBackend-only); attach it for the test via raising=False.
+    monkeypatch.setattr(
+        r.backend, "poll_external_rotation", fake_poll, raising=False,
+    )
+    # Stub _sync_views to a no-op (the disk-mirror logic isn't what
+    # we're pinning here -- the fire-after-sync ordering is).
+    sync_calls = {"n": 0}
+    monkeypatch.setattr(
+        r, "_sync_views", lambda: sync_calls.__setitem__("n", sync_calls["n"] + 1),
+    )
+
+    fired: list[str] = []
+    r.register_on_refresh_success(lambda: fired.append("ok"))
+
+    stop = asyncio.Event()
+    loop_task = asyncio.create_task(r._external_rotation_loop(stop))
+    # Let the loop iterate at least once on the rotated-branch.
+    await asyncio.sleep(0.05)
+    stop.set()
+    try:
+        await asyncio.wait_for(loop_task, timeout=1.0)
+    except asyncio.TimeoutError:
+        loop_task.cancel()
+        try:
+            await loop_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    assert poll_calls["n"] >= 1
+    assert sync_calls["n"] >= 1
+    assert fired == ["ok"]
+
+
+# ── Daemon-side wiring tests (register/unregister roundtrip) ────────────────
+
+
+class _FakeAgentCfg:
+    """Minimal stand-in for ``AgentConfig`` -- daemon's
+    ``_refresher_for`` reads ``runtime.harness`` to route to the
+    claude vs codex refresher."""
+
+    def __init__(self, agent_id: str, harness: str = "claude-code"):
+        self.id = agent_id
+
+        class _R:
+            def __init__(self_inner, h):
+                self_inner.harness = h
+
+        self.runtime = _R(harness)
+
+
+def _make_fake_worker():
+    """Stand-in Worker -- only the ``runtime`` attribute is touched
+    when the bound callback fires. ``_clear_auth_failed_if_recoverable``
+    accepts a fake runtime since it's a staticmethod."""
+    worker = type("FakeWorker", (), {})()
+    worker.runtime = _FakeRuntime(health="auth_failed")
+    worker.runtime.error = "pre-refresh auth error"
+    return worker
+
+
+def _make_daemon_stub(tmp_path):
+    """Build a Daemon-shaped stub by bypassing ``__init__`` (which
+    reads ``Path.home()`` + builds real backends) and stitching in
+    minimal attributes the wiring methods touch."""
+    from puffo_agent.portal.daemon import Daemon
+
+    daemon = Daemon.__new__(Daemon)
+    _write_creds(tmp_path, expires_in_seconds=600)
+    daemon.refresher = CredentialRefresher(host_home=tmp_path)
+    daemon.codex_refresher = CredentialRefresher(host_home=tmp_path)
+    daemon.workers = {}
+    return daemon
+
+
+def test_daemon_register_with_refresher_binds_callback_to_worker_runtime(tmp_path):
+    """``_register_with_refresher`` registers an
+    ``on_refresh_success`` callback that, when fired, clears the
+    Worker's ``runtime.health = "auth_failed"`` flag. Pins the
+    binding so a future refactor that forgets to wire
+    worker.runtime breaks the test."""
+    daemon = _make_daemon_stub(tmp_path)
+    agent_cfg = _FakeAgentCfg("agent-A", harness="claude-code")
+    worker = _make_fake_worker()
+    daemon.workers["agent-A"] = worker
+
+    daemon._register_with_refresher(agent_cfg, worker)
+
+    # Callback stashed on worker for unregister symmetry.
+    assert hasattr(worker, "_refresh_success_callback")
+    # Callback registered on the claude refresher (not codex).
+    assert len(daemon.refresher._on_refresh_success) == 1
+    assert len(daemon.codex_refresher._on_refresh_success) == 0
+
+    # Firing it clears the worker's auth_failed flag.
+    daemon.refresher._fire_refresh_success()
+    assert worker.runtime.health == "ok"
+    assert worker.runtime.error == ""
+
+
+def test_daemon_register_codex_harness_routes_to_codex_refresher(tmp_path):
+    """Codex-harness agents route to ``codex_refresher`` per
+    ``_refresher_for``'s branch. Pins the codex side has independent
+    callback registration -- if a refactor accidentally always uses
+    ``self.refresher``, this breaks."""
+    daemon = _make_daemon_stub(tmp_path)
+    agent_cfg = _FakeAgentCfg("agent-codex-A", harness="codex")
+    worker = _make_fake_worker()
+    daemon.workers["agent-codex-A"] = worker
+
+    daemon._register_with_refresher(agent_cfg, worker)
+
+    assert len(daemon.refresher._on_refresh_success) == 0
+    assert len(daemon.codex_refresher._on_refresh_success) == 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_stop_worker_unregisters_callback_from_both_refreshers(
+    tmp_path,
+):
+    """``_stop_worker`` unregisters the on_refresh_success callback
+    from both claude AND codex refreshers (idempotent on both, same
+    pattern as ``unregister_agent``). This defends the cross-refresher
+    cleanup against a future single-side regression."""
+    daemon = _make_daemon_stub(tmp_path)
+    agent_cfg = _FakeAgentCfg("agent-A", harness="claude-code")
+    worker = _make_fake_worker()
+
+    # Hand-build the worker.stop coroutine so _stop_worker can await it.
+    async def fake_stop():
+        return None
+    worker.stop = fake_stop
+
+    daemon.workers["agent-A"] = worker
+    daemon._register_with_refresher(agent_cfg, worker)
+    assert len(daemon.refresher._on_refresh_success) == 1
+
+    await daemon._stop_worker("agent-A")
+    # Callback removed from claude refresher.
+    assert len(daemon.refresher._on_refresh_success) == 0
+    # Codex refresher unchanged (was already empty, unregister is no-op).
+    assert len(daemon.codex_refresher._on_refresh_success) == 0
+    # Worker popped from registry.
+    assert "agent-A" not in daemon.workers
