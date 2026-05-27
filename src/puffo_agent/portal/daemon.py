@@ -345,12 +345,8 @@ class Daemon:
 
 
 async def _drain_codex_tmp(src: Path) -> None:
-    """Pre-clean codex CLI's ephemeral ``.codex/tmp/`` so a still-held
-    ``.lock`` (Windows: file-handle release lags subprocess exit by
-    a few hundred ms) doesn't block the surrounding shutil.move /
-    shutil.rmtree. Best-effort with brief retries; a surviving lock
-    is left in place and the outer try/except + next reconciler tick
-    handle the eventual failure."""
+    """Windows: codex's .lock in .codex/tmp/ can outlive the subprocess
+    by a few hundred ms; pre-clean so the outer move/rmtree doesn't trip."""
     codex_tmp = src / ".codex" / "tmp"
     if not codex_tmp.exists():
         return
