@@ -358,6 +358,42 @@ def _build_puffo_core_client(
     )
 
 
+def _build_message_client(
+    agent_cfg: AgentConfig,
+    agent_id: str,
+    daemon_cfg: "DaemonConfig | None" = None,
+):
+    backend = (agent_cfg.chat_backend or "puffo-core").strip().lower()
+    if backend in ("", "puffo-core", "puffo_core"):
+        return _build_puffo_core_client(agent_cfg, agent_id, daemon_cfg)
+    if backend == "discord":
+        from ..agent.discord_client import DiscordMessageClient
+        from ..agent.message_store import MessageStore
+
+        dc = agent_cfg.discord
+        if not dc.is_configured():
+            raise RuntimeError(
+                f"agent {agent_id!r}: discord backend requires "
+                "discord.bot_token, discord.guild_id, and "
+                "discord.agent_user_id in agent.yml"
+            )
+        return DiscordMessageClient(
+            agent_slug=agent_cfg.id,
+            bot_token=dc.bot_token,
+            guild_id=dc.guild_id,
+            agent_user_id=dc.agent_user_id,
+            bot_user_id=dc.bot_user_id,
+            channel_ids=dc.channel_ids,
+            webhook_url=dc.webhook_url,
+            display_prefix=dc.display_prefix or agent_cfg.display_name or agent_cfg.id,
+            message_store=MessageStore(str(agent_dir(agent_id) / "messages.db")),
+        )
+    raise RuntimeError(
+        f"agent {agent_id!r}: unknown chat_backend {agent_cfg.chat_backend!r} "
+        "(valid: puffo-core, discord)"
+    )
+
+
 # PUF-214: auth-class patterns — definitive evidence of OAuth /
 # API-key failure. Shared by the leak filter (suppress the leak)
 # and by health-flip detection (`runtime.health=auth_failed`).
@@ -706,13 +742,16 @@ class Worker:
                 agent_id=agent_id,
             )
 
-            if not self.agent_cfg.puffo_core.is_configured():
+            chat_backend = (self.agent_cfg.chat_backend or "puffo-core").strip().lower()
+            if chat_backend in ("", "puffo-core", "puffo_core") and (
+                not self.agent_cfg.puffo_core.is_configured()
+            ):
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml "
                     "is incomplete. Required fields: server_url, slug, "
                     "device_id, space_id."
                 )
-            client = _build_puffo_core_client(
+            client = _build_message_client(
                 self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
             )
             self._client = client
