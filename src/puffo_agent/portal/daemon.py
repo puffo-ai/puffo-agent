@@ -307,6 +307,7 @@ class Daemon:
         src = agent_dir(agent_id)
         if not src.exists():
             return
+        await _drain_codex_tmp(src)
         archived_dir().mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         dest = archived_dir() / f"{agent_id}-ws-{stamp}"
@@ -332,6 +333,7 @@ class Daemon:
         src = agent_dir(agent_id)
         if not src.exists():
             return
+        await _drain_codex_tmp(src)
         try:
             shutil.rmtree(src)
             logger.info("agent %s: deleted", agent_id)
@@ -340,6 +342,25 @@ class Daemon:
                 "agent %s: delete failed: %s (flag still present — will retry next tick)",
                 agent_id, exc,
             )
+
+
+async def _drain_codex_tmp(src: Path) -> None:
+    """Pre-clean codex CLI's ephemeral ``.codex/tmp/`` so a still-held
+    ``.lock`` (Windows: file-handle release lags subprocess exit by
+    a few hundred ms) doesn't block the surrounding shutil.move /
+    shutil.rmtree. Best-effort with brief retries; a surviving lock
+    is left in place and the outer try/except + next reconciler tick
+    handle the eventual failure."""
+    codex_tmp = src / ".codex" / "tmp"
+    if not codex_tmp.exists():
+        return
+    for _ in range(5):
+        try:
+            shutil.rmtree(codex_tmp)
+            return
+        except OSError:
+            await asyncio.sleep(0.5)
+    shutil.rmtree(codex_tmp, ignore_errors=True)
 
 
 async def _log_outdated_version_warning() -> None:
