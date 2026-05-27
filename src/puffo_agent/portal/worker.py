@@ -82,6 +82,11 @@ logger = logging.getLogger(__name__)
 RECONNECT_BACKOFF_SECONDS = 5.0
 
 
+def _uses_puffo_core_backend(agent_cfg: AgentConfig) -> bool:
+    backend = (getattr(agent_cfg, "chat_backend", "") or "puffo-core").strip().lower()
+    return backend in ("", "puffo-core", "puffo_core")
+
+
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     """Construct the adapter for ``runtime.kind``. Raises on unknown
     or misconfigured kinds."""
@@ -109,7 +114,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             max_turns=agent_cfg.runtime.max_turns,
         )
-        if agent_cfg.puffo_core.is_configured():
+        if _uses_puffo_core_backend(agent_cfg) and agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
             pc = agent_cfg.puffo_core
             adapter.mcp_servers_override = puffo_core_stdio_sdk_config(
@@ -184,7 +189,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
         # ``python -m puffo_agent.mcp.puffo_core_server``. The adapter
         # rewrites path-typed env values to container bind-mount paths
         # at config-write time.
-        if agent_cfg.puffo_core.is_configured():
+        if _uses_puffo_core_backend(agent_cfg) and agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core
             adapter.puffo_core_mcp_env = puffo_core_mcp_env(
@@ -236,7 +241,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
         )
-        if agent_cfg.puffo_core.is_configured():
+        if _uses_puffo_core_backend(agent_cfg) and agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core
             adapter.puffo_core_mcp_env = puffo_core_mcp_env(
@@ -1084,10 +1089,12 @@ class Worker:
                 workspace_dir=workspace_path,
                 claude_dir=claude_path,
                 agent_id=agent_id,
+                send_message_tools_post_externally=_uses_puffo_core_backend(
+                    self.agent_cfg,
+                ),
             )
 
-            chat_backend = (self.agent_cfg.chat_backend or "puffo-core").strip().lower()
-            if chat_backend in ("", "puffo-core", "puffo_core") and (
+            if _uses_puffo_core_backend(self.agent_cfg) and (
                 not self.agent_cfg.puffo_core.is_configured()
             ):
                 raise RuntimeError(

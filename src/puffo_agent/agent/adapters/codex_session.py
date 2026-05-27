@@ -1133,6 +1133,7 @@ class CodexSession:
                     turn.send_message_targets.append({
                         "channel": str(args.get("channel", "")),
                         "root_id": str(args.get("root_id", "")),
+                        "text": str(args.get("text", "")),
                     })
             return
 

@@ -53,6 +53,20 @@ def _origin_for_compressed(path: str) -> str | None:
     return base[: -len(marker)] + ".origin" + ext
 
 
+def _format_send_message_fallback(targets: list[dict]) -> str:
+    """Recover text from send_message tool calls when that tool did
+    not post to the active chat transport.
+    """
+    texts = [
+        str(t.get("text") or "").strip()
+        for t in targets
+        if str(t.get("text") or "").strip()
+    ]
+    if len(texts) == 1:
+        return texts[0]
+    return "\n".join(f"- {t}" for t in texts)
+
+
 class PuffoAgent:
     def __init__(
         self,
@@ -62,6 +76,7 @@ class PuffoAgent:
         workspace_dir: str = "",
         claude_dir: str = "",
         agent_id: str = "",
+        send_message_tools_post_externally: bool = True,
     ):
         """Per-agent shell. Owns cross-cutting state (conversation
         log, memory manager) and delegates each turn to an ``Adapter``
@@ -77,6 +92,7 @@ class PuffoAgent:
         self.workspace_dir = workspace_dir
         self.claude_dir = claude_dir
         self.agent_id = agent_id
+        self.send_message_tools_post_externally = send_message_tools_post_externally
         self.logger = agent_logger(__name__, agent_id)
 
         self.memory = MemoryManager(memory_dir)
@@ -243,12 +259,21 @@ class PuffoAgent:
         # failures.
         send_message_called = bool(result.metadata.get("send_message_targets"))
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
-        if send_message_called:
+        if send_message_called and self.send_message_tools_post_externally:
             if result.reply:
                 self._append_assistant(
                     channel_meta.get("channel_name", ""), result.reply,
                 )
             return None
+        if send_message_called and not self.send_message_tools_post_externally:
+            tool_reply = _format_send_message_fallback(
+                result.metadata.get("send_message_targets") or [],
+            )
+            if tool_reply:
+                self._append_assistant(
+                    channel_meta.get("channel_name", ""), tool_reply,
+                )
+                return tool_reply
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
         if "[SILENT]" in joined:
             return None
@@ -297,7 +322,7 @@ class PuffoAgent:
         send_message_called = bool(result.metadata.get("send_message_targets"))
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
 
-        if send_message_called:
+        if send_message_called and self.send_message_tools_post_externally:
             self.logger.debug(
                 f"[mcp-only] [{channel_name}] @{sender}: send_message "
                 "called; skipping shell auto-post"
@@ -305,6 +330,13 @@ class PuffoAgent:
             if result.reply:
                 self._append_assistant(channel_name, result.reply)
             return None
+        if send_message_called and not self.send_message_tools_post_externally:
+            tool_reply = _format_send_message_fallback(
+                result.metadata.get("send_message_targets") or [],
+            )
+            if tool_reply:
+                self._append_assistant(channel_name, tool_reply)
+                return tool_reply
 
         # Substring match: marker position in the assistant text
         # doesn't matter. Real replies go via send_message, so a

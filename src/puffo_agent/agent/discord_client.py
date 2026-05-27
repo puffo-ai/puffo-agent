@@ -408,7 +408,7 @@ class DiscordMessageClient:
         if self._send_func is not None:
             await self._send_func(channel_id, outbound, root_id)
             return
-        if self.webhook_url:
+        if self.webhook_url and _raw_discord_id(channel_id) in self._thread_channel_ids:
             await self._send_via_webhook(outbound, channel_id)
             return
         if self._discord_client is None:
@@ -418,6 +418,16 @@ class DiscordMessageClient:
         channel = self._discord_client.get_channel(raw_channel_id)
         if channel is None:
             channel = await self._discord_client.fetch_channel(raw_channel_id)
+        raw_root_id = _raw_discord_id(root_id) if root_id else ""
+        if raw_root_id and raw_root_id != str(raw_channel_id):
+            try:
+                root_message = await channel.fetch_message(int(raw_root_id))
+                await root_message.reply(outbound, mention_author=False)
+                return
+            except Exception:
+                logger.exception(
+                    "discord fallback reply-to-root failed; posting in channel"
+                )
         await channel.send(outbound)
 
     async def _send_via_webhook(self, text: str, channel_id: str) -> None:

@@ -753,6 +753,7 @@ class ClaudeSession:
                             send_message_targets.append({
                                 "channel": str(tool_input.get("channel", "")),
                                 "root_id": str(tool_input.get("root_id", "")),
+                                "text": str(tool_input.get("text", "")),
                             })
                         if self.audit is not None:
                             self.audit.write(

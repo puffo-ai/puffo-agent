@@ -13,9 +13,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.core import AgentAPIError
 from puffo_agent.agent.discord_client import DiscordMessageClient
+from puffo_agent.agent.adapters.base import Adapter, TurnContext, TurnResult
+from puffo_agent.agent.core import PuffoAgent
 from puffo_agent.agent.message_store import MessageStore
-from puffo_agent.portal.state import AgentConfig, DiscordConfig
-from puffo_agent.portal.worker import _build_message_client
+from puffo_agent.portal.state import (
+    AgentConfig,
+    DaemonConfig,
+    DiscordConfig,
+    PuffoCoreConfig,
+    RuntimeConfig,
+)
+from puffo_agent.portal.worker import _build_message_client, build_adapter
 
 
 def _now_ms() -> int:
@@ -103,6 +111,29 @@ def test_build_message_client_selects_discord_backend():
 
     assert isinstance(client, DiscordMessageClient)
     assert client.channel_ids == {"456"}
+
+
+def test_discord_backend_does_not_register_puffo_core_mcp_tools():
+    cfg = AgentConfig(
+        id="engineer-357c8a5e",
+        chat_backend="discord",
+        puffo_core=PuffoCoreConfig(
+            server_url="http://localhost:3000",
+            slug="engineer-357c8a5e",
+            device_id="dev_1",
+            space_id="sp_1",
+        ),
+        discord=DiscordConfig(
+            bot_token="token",
+            guild_id="123",
+            agent_user_id="999",
+        ),
+        runtime=RuntimeConfig(kind="cli-local", harness="claude-code"),
+    )
+
+    adapter = build_adapter(DaemonConfig(), cfg)
+
+    assert not getattr(adapter, "puffo_core_mcp_env", None)
 
 
 @pytest.mark.asyncio
@@ -214,3 +245,88 @@ async def test_discord_consumer_retries_interrupted_turn_and_marks_processed():
     assert calls == {"fresh": 1, "retry": 1, "success": 1}
     assert await store.get_last_processed_sent_at("discord:message:3000") > 0
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_discord_fallback_replies_to_root_message():
+    store = await _make_store()
+    client = _client(store)
+    fake_channel = FakeOutboundChannel()
+    client._discord_client = FakeDiscordClient(fake_channel)
+
+    await client.send_fallback_message(
+        "discord:channel:456",
+        "done",
+        root_id="discord:message:4000",
+    )
+
+    assert fake_channel.sent == []
+    assert fake_channel.root.replies == [("done", False)]
+    await store.close()
+
+
+class FakeToolAdapter(Adapter):
+    async def run_turn(self, ctx: TurnContext) -> TurnResult:
+        return TurnResult(
+            reply="",
+            metadata={
+                "send_message_targets": [{
+                    "channel": "discord:channel:456",
+                    "root_id": "discord:message:5000",
+                    "text": "tool body",
+                }],
+                "assistant_text_parts": [],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_discord_agent_recovers_send_message_tool_body_as_fallback(tmp_path):
+    agent = PuffoAgent(
+        adapter=FakeToolAdapter(),
+        system_prompt="",
+        memory_dir=str(tmp_path / "memory"),
+        send_message_tools_post_externally=False,
+    )
+
+    reply = await agent.handle_message(
+        channel_id="discord:channel:456",
+        channel_name="general",
+        sender="alice",
+        sender_email="",
+        text="<@999> ship it",
+        post_id="discord:message:5000",
+        root_id="discord:message:5000",
+    )
+
+    assert reply == "tool body"
+
+
+class FakeOutboundRoot:
+    def __init__(self):
+        self.replies = []
+
+    async def reply(self, text, mention_author=False):
+        self.replies.append((text, mention_author))
+
+
+class FakeOutboundChannel:
+    def __init__(self):
+        self.root = FakeOutboundRoot()
+        self.sent = []
+
+    async def fetch_message(self, message_id):
+        assert message_id == 4000
+        return self.root
+
+    async def send(self, text):
+        self.sent.append(text)
+
+
+class FakeDiscordClient:
+    def __init__(self, channel):
+        self.channel = channel
+
+    def get_channel(self, channel_id):
+        assert channel_id == 456
+        return self.channel
