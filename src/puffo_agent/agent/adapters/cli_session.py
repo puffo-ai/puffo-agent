@@ -279,6 +279,7 @@ class ClaudeSession:
             metadata=new_md,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
+            tool_calls=result.tool_calls,
         )
 
     async def _one_turn_with_poison_recovery(

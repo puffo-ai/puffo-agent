@@ -470,7 +470,7 @@ def test_rewrite_if_request_too_large_matches_canonical_anthropic_string(tmp_pat
         "Request ID: req_011CtestabcDEF"
     )
     result = TurnResult(
-        reply=raw, input_tokens=42, output_tokens=0,
+        reply=raw, input_tokens=42, output_tokens=0, tool_calls=3,
         metadata={"some_prior_flag": True},
     )
     out = session._rewrite_if_request_too_large(result)
@@ -478,9 +478,11 @@ def test_rewrite_if_request_too_large_matches_canonical_anthropic_string(tmp_pat
     assert out.metadata.get("request_too_large") == "reactive"
     assert out.metadata.get("original_reply") == raw
     assert out.metadata.get("some_prior_flag") is True
-    # Token counts preserved so cost accounting still reflects the
-    # turn that actually happened.
+    # Token counts + tool_calls preserved so cost accounting + metrics
+    # still reflect the turn that actually happened (per operator
+    # review on PR #53).
     assert out.input_tokens == 42
+    assert out.tool_calls == 3
 
 
 def test_rewrite_if_request_too_large_matches_max_tokens_context_limit(tmp_path):
