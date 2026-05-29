@@ -533,7 +533,7 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
         if rs is not None and rs.health in (
             "in_progress",
             "auth_failed", "api_error_abandoned", "refresh_broken",
-            "unhandled_error",
+            "unhandled_error", "codex_thread_wedged",
         ):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.

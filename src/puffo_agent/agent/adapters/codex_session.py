@@ -37,6 +37,8 @@ moves in one place when we learn the real shape from the field.
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 import json
 import logging
@@ -84,6 +86,27 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # at the worker level. Mostly defensive against a wedged App Server
 # that ACKs the request but never streams.
 TURN_TIMEOUT_SECONDS = 600.0
+
+# PUF-267: how many consecutive non-success turn outcomes
+# (timeout | turn-failed) before clearing ``_conversation_id`` to force
+# a fresh ``thread/start`` on the next ``_ensure_running``. 2 mirrors
+# PUF-265's REFRESH_BROKEN_THRESHOLD — small enough to react fast
+# inside the 4-agent fleet, large enough that a single transient hiccup
+# doesn't drop the conversation prematurely.
+CODEX_THREAD_WEDGED_THRESHOLD = 2
+
+# Layer 3 immediate-rotate signals. Tuple shape (per PR #55 review
+# item 6) so a future "thread is dead" codex surface — context
+# overflow, max-tokens exceeded, model deprecation — adds one regex
+# instead of refactoring the consumer. Mirrors PUF-265 v2's
+# ``_RATE_LIMIT_PATTERNS`` pattern.
+_CODEX_THREAD_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"agent thread limit reached", re.IGNORECASE),
+)
+
+
+def _looks_like_codex_thread_limit(err_text: str) -> bool:
+    return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
 # Tool names of the puffo MCP server's "this counts as posting a
 # reply" family. When the agent invokes one of these and it completes
@@ -199,6 +222,12 @@ class CodexSession:
         # respawn can re-issue ``newConversation`` with current
         # instructions when the conversation id is missing or rotted.
         self.current_instructions: str = ""
+        # PUF-267: consecutive non-success turn outcomes (timeout |
+        # turn-failed). Resets on the next successful turn. When this
+        # hits ``CODEX_THREAD_WEDGED_THRESHOLD`` we clear the
+        # conversation id so the next ``_ensure_running`` starts a
+        # fresh thread instead of resuming the wedged one.
+        self._consecutive_thread_failures: int = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -223,6 +252,11 @@ class CodexSession:
             "agent %s: codex turn/start sending (msg_len=%d, thread=%s)",
             self.agent_id, len(user_message), self._conversation_id,
         )
+        # PUF-267: captured so the outcome-propagation block at the end
+        # can rotate / flip health without re-raising. ``rotated`` is
+        # set inside the timeout / turn-failed branches.
+        turn_failed_exc: BaseException | None = None
+        rotated_in_branch: bool = False
         try:
             # turn/start params per codex-rs/app-server protocol:
             # ``threadId``, ``input`` (array of structured items —
@@ -269,12 +303,36 @@ class CodexSession:
                         )
                     except Exception:
                         pass
+                    # PUF-267 Layer 1+2: bookkeep + maybe rotate.
+                    rotated_in_branch = self._propagate_turn_outcome(
+                        outcome="timeout",
+                    )
                     return TurnResult(
                         reply="",
-                        metadata={"codex_turn_timeout": True},
+                        metadata={
+                            "codex_turn_timeout": True,
+                            "codex_thread_rotated": rotated_in_branch,
+                        },
                     )
+                except RuntimeError as exc:
+                    # PUF-267 Layer 3: turn-failed reaches us when the
+                    # ``turn/failed`` / ``error`` handler in
+                    # ``_dispatch_message`` (see the ``set_exception``
+                    # site around L1004) wraps codex's upstream error
+                    # into a RuntimeError on ``turn.completed``.
+                    # Bookkeep + maybe rotate via
+                    # ``_propagate_turn_outcome`` below; re-raise so the
+                    # worker's existing error path still logs the
+                    # failure.
+                    turn_failed_exc = exc
         finally:
             self._active_turn = None
+
+        if turn_failed_exc is not None:
+            self._propagate_turn_outcome(
+                outcome="turn_failed", err_text=str(turn_failed_exc),
+            )
+            raise turn_failed_exc
 
         reply = "".join(turn.reply_chunks).strip()
         logger.debug(
@@ -284,6 +342,9 @@ class CodexSession:
             len(turn.send_message_targets),
             turn.input_tokens, turn.output_tokens,
         )
+        # PUF-267: reset the failure streak + clear
+        # ``codex_thread_wedged`` health on success.
+        self._propagate_turn_outcome(outcome="success")
         # core.py's reply-routing check: a non-empty
         # ``send_message_targets`` list means "agent already posted via
         # MCP, skip the shell fallback." Mirrors the claude-code adapter
@@ -324,6 +385,134 @@ class CodexSession:
 
     def has_persisted_session(self) -> bool:
         return bool(self._conversation_id)
+
+    # ── PUF-267: thread-wedge propagation ─────────────────────────────────────
+
+    def _propagate_turn_outcome(
+        self,
+        *,
+        outcome: str,
+        err_text: str = "",
+    ) -> bool:
+        """PUF-267: bookkeeping after every turn completes.
+
+        ``outcome`` is one of ``"success"`` / ``"timeout"`` /
+        ``"turn_failed"``. Returns True iff this call rotated the
+        conversation (caller may want to log / metadata-flag the event;
+        the next ``_ensure_running`` will do the actual
+        ``thread/start``).
+
+        Layer 1 (counter): N=``CODEX_THREAD_WEDGED_THRESHOLD``
+        consecutive non-success outcomes → rotate + flip health.
+        Layer 3 (verbatim string): on ``turn_failed`` whose error text
+        matches any ``_CODEX_THREAD_LIMIT_PATTERNS`` entry → rotate
+        immediately without waiting for the counter.
+        Success → reset counter + ALWAYS clear ``codex_thread_wedged``
+        health (the always-clear guards the daemon-restart-with-stale-
+        disk-state bug class PR #52 v1 had — see PUF-265 fold).
+        """
+        if outcome == "success":
+            if self._consecutive_thread_failures > 0:
+                logger.info(
+                    "agent %s: codex turn succeeded after %d non-success "
+                    "tick(s) — clearing codex_thread_wedged health",
+                    self.agent_id, self._consecutive_thread_failures,
+                )
+            # Always clear, even when the in-memory counter is 0 — a
+            # daemon restart between rotation and the next success
+            # would otherwise leave runtime.health stuck on
+            # "codex_thread_wedged" on disk forever.
+            self._clear_codex_thread_wedged_health()
+            self._consecutive_thread_failures = 0
+            return False
+        self._consecutive_thread_failures += 1
+        immediate = (
+            outcome == "turn_failed"
+            and _looks_like_codex_thread_limit(err_text or "")
+        )
+        if immediate or self._consecutive_thread_failures >= CODEX_THREAD_WEDGED_THRESHOLD:
+            reason = "thread-limit verbatim" if immediate else (
+                f"{self._consecutive_thread_failures} consecutive {outcome}"
+            )
+            logger.warning(
+                "agent %s: rotating codex thread (%s); next turn will "
+                "start a fresh conversation",
+                self.agent_id, reason,
+            )
+            self._reset_conversation()
+            self._flip_codex_thread_wedged_health(reason)
+            # Reset the counter so the freshly-rotated thread gets a
+            # fair THRESHOLD-budget on its own — otherwise a broken
+            # App Server would rotate on every single subsequent turn
+            # (counter-thrash).
+            self._consecutive_thread_failures = 0
+            return True
+        return False
+
+    def _reset_conversation(self) -> None:
+        """Clear the persisted ``conversation_id`` so the next
+        ``_ensure_running`` falls through to ``thread/start`` instead
+        of resuming the wedged thread. The codex App Server process
+        itself stays alive — only the per-thread state rotates."""
+        self._conversation_id = ""
+        try:
+            self._save_conversation_id("")
+        except Exception as exc:
+            logger.warning(
+                "agent %s: failed to clear persisted conversation_id: %s",
+                self.agent_id, exc,
+            )
+
+    def _flip_codex_thread_wedged_health(self, reason: str) -> None:
+        """Per-agent ``runtime.health = "codex_thread_wedged"`` flip,
+        with the same precedence semantics as PUF-265's
+        ``_flip_refresh_broken``: stronger downstream signals win."""
+        from ...portal.state import RuntimeState
+        try:
+            rs = RuntimeState.load(self.agent_id)
+        except Exception as exc:
+            logger.warning(
+                "codex_thread_wedged flip: failed to load runtime for "
+                "%s: %s", self.agent_id, exc,
+            )
+            return
+        if rs is None:
+            return
+        if rs.health in ("auth_failed", "api_error_abandoned", "refresh_broken"):
+            return
+        if rs.health == "codex_thread_wedged":
+            return
+        rs.health = "codex_thread_wedged"
+        rs.error = (
+            f"codex thread rotated by daemon ({reason}). Recovery is "
+            "automatic on the next inbound message — no operator action "
+            "required."
+        )
+        try:
+            rs.save(self.agent_id)
+        except Exception as exc:
+            logger.warning(
+                "codex_thread_wedged flip: failed to save runtime for "
+                "%s: %s", self.agent_id, exc,
+            )
+
+    def _clear_codex_thread_wedged_health(self) -> None:
+        from ...portal.state import RuntimeState
+        try:
+            rs = RuntimeState.load(self.agent_id)
+        except Exception:
+            return
+        if rs is None or rs.health != "codex_thread_wedged":
+            return
+        rs.health = "ok"
+        rs.error = ""
+        try:
+            rs.save(self.agent_id)
+        except Exception as exc:
+            logger.warning(
+                "codex_thread_wedged clear: failed to save runtime for "
+                "%s: %s", self.agent_id, exc,
+            )
 
     # ── Internals ─────────────────────────────────────────────────────────────
 

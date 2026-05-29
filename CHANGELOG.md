@@ -271,6 +271,49 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ``refresh_broken`` flip. Operator can also override the constant
   via ``PUFFO_AGENT_REFRESH_MODEL`` env var without a release.
 
+- **PUF-267: codex agents no longer silently wedge after a long-lived
+  thread stops accepting new turns.** ``CodexSession`` reuses the
+  same ``threadId`` for the lifetime of an agent; when the underlying
+  App Server thread becomes unresponsive (verbatim ``"agent thread
+  limit reached"``, repeated ``turn/failed``, or repeated turn
+  timeouts), every subsequent turn previously hit the same wedged
+  thread and the operator saw no diagnostic — the daemon kept
+  ``runtime.health = "ok"`` and the agent appeared idle.
+
+  ``_propagate_turn_outcome`` now bookkeeps every turn outcome
+  (``success`` / ``timeout`` / ``turn_failed``) with three defensive
+  layers mirroring PUF-265's pattern:
+
+  Layer 1 (counter): after
+  ``CODEX_THREAD_WEDGED_THRESHOLD = 2`` consecutive non-success
+  outcomes the daemon clears ``_conversation_id`` both in memory and
+  on disk via ``_reset_conversation``, forcing the next
+  ``_ensure_running`` to ``thread/start`` a fresh conversation. The
+  codex App Server process itself stays alive — only the per-thread
+  state rotates. Counter resets to 0 on rotation so the freshly-
+  rotated thread gets a fair THRESHOLD-budget (no counter-thrash).
+
+  Layer 2 (state honesty): on rotation the per-agent
+  ``runtime.health`` flips to ``"codex_thread_wedged"`` with an
+  operator-visible error explaining that recovery is automatic on the
+  next inbound message. ``portal/cli.py``'s ``agent list`` surfaces
+  ``[codex_thread_wedged]`` alongside the other hard health states.
+  Stronger downstream signals (``auth_failed`` /
+  ``api_error_abandoned`` / ``refresh_broken``) win — the flip never
+  downgrades a higher-severity flag. On a successful turn, the daemon
+  ALWAYS calls ``_clear_codex_thread_wedged_health`` (not gated on
+  the in-memory counter) so a daemon restart between rotation and
+  the next success can't leave runtime.health stuck on the wedged
+  value forever (mirrors the PR #52 v1 stale-state bug class).
+
+  Layer 3 (verbatim string): codex's explicit ``"agent thread limit
+  reached"`` error rotates on the FIRST occurrence without waiting
+  for the counter, case-insensitively. The matcher is a tuple of
+  regex patterns (``_CODEX_THREAD_LIMIT_PATTERNS``) so a future
+  "thread is dead" surface — context overflow, max-tokens exceeded,
+  model deprecation — adds one regex instead of refactoring the
+  consumer.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the
