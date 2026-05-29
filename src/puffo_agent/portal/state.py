@@ -311,6 +311,42 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
         return "no-host-file"
 
 
+def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
+    """PUF-266: parse the host's ``~/.codex/config.toml`` and return
+    its ``[mcp_servers.*]`` entries as ``{name: {command, args, env}}``.
+
+    Mirrors ``sync_host_gemini_mcp_servers``'s host-side read step but
+    targets codex's per-host config instead of gemini's. The returned
+    dict is fed into ``write_codex_mcp_config(extra_servers=...)`` so
+    the per-agent ``$CODEX_HOME/config.toml`` carries the operator's
+    own MCP catalog alongside puffo's. Returns empty when the host
+    file is missing / unreadable / malformed — defensive so a broken
+    host config can't block agent startup.
+    """
+    host_config = host_home / ".codex" / "config.toml"
+    if not host_config.exists():
+        return {}
+    try:
+        import tomllib  # Python 3.11+; pyproject pins >=3.11.
+        with host_config.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return {}
+    raw = data.get("mcp_servers")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        out[name] = {
+            "command": spec.get("command", ""),
+            "args": list(spec.get("args") or []),
+            "env": dict(spec.get("env") or {}),
+        }
+    return out
+
+
 # Provenance markers dropped in skill dirs. Claude Code only loads
 # SKILL.md as a skill's entrypoint, so these siblings are inert.
 HOST_SYNCED_MARKER = "host-synced.md"

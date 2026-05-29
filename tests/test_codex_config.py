@@ -76,3 +76,107 @@ def test_paths_with_quotes_and_backslashes(tmp_path):
     assert puffo["command"] == r"C:\Users\op\AppData\python.exe"
     assert puffo["env"]["WEIRD"] == 'a "quoted" value'
     assert puffo["env"]["WIN_PATH"] == r"C:\Users\op"
+
+
+# ── PUF-266: host MCP merge via extra_servers ────────────────────────────
+
+
+def test_extra_servers_emitted_alongside_puffo(tmp_path):
+    """Host has 2 MCP entries + puffo configured → emitted TOML has all
+    three blocks. Existing host command/args/env preserved verbatim."""
+    dest = tmp_path / "config.toml"
+    extras = {
+        "filesystem": {
+            "command": "/usr/local/bin/mcp-fs",
+            "args": ["--root", "/Users/op/projects"],
+            "env": {"FS_LOG_LEVEL": "info"},
+        },
+        "github": {
+            "command": "npx",
+            "args": ["@modelcontextprotocol/server-github"],
+            "env": {"GITHUB_TOKEN": "ghp_redacted"},
+        },
+    }
+    write_codex_mcp_config(
+        dest,
+        command="/usr/bin/python3",
+        args=["-m", "puffo_agent.mcp.puffo_core_server"],
+        env={"PUFFO_CORE_SLUG": "alice-noun-abcd"},
+        extra_servers=extras,
+    )
+    doc = _read_toml(dest)
+    servers = doc["mcp_servers"]
+    assert set(servers) == {"puffo", "filesystem", "github"}
+    assert servers["filesystem"]["command"] == "/usr/local/bin/mcp-fs"
+    assert servers["filesystem"]["args"] == ["--root", "/Users/op/projects"]
+    assert servers["filesystem"]["env"]["FS_LOG_LEVEL"] == "info"
+    assert servers["github"]["command"] == "npx"
+    assert servers["github"]["env"]["GITHUB_TOKEN"] == "ghp_redacted"
+    # Puffo entry unaffected by the merge.
+    assert servers["puffo"]["command"] == "/usr/bin/python3"
+    assert servers["puffo"]["env"]["PUFFO_CORE_SLUG"] == "alice-noun-abcd"
+
+
+def test_extra_servers_pass_through_when_puffo_unconfigured(tmp_path):
+    """Operator running a codex agent without puffo_core configured
+    still gets the host MCP catalog. Pre-PUF-266 behavior wrote only
+    the auth-pin line; we now mirror host MCPs too."""
+    dest = tmp_path / "config.toml"
+    extras = {
+        "filesystem": {
+            "command": "/usr/local/bin/mcp-fs",
+            "args": [], "env": {},
+        },
+    }
+    write_codex_mcp_config(dest, extra_servers=extras)
+    doc = _read_toml(dest)
+    assert doc["cli_auth_credentials_store"] == "file"
+    servers = doc.get("mcp_servers") or {}
+    assert "filesystem" in servers
+    assert "puffo" not in servers
+
+
+def test_extra_servers_named_puffo_is_shadowed_by_puffo_entry(tmp_path):
+    """If the host already has an entry named ``puffo`` (e.g., operator
+    installed a third-party puffo MCP), the daemon's puffo entry wins.
+    Otherwise we'd have two ``[mcp_servers.puffo]`` blocks which is
+    invalid TOML AND the operator's third-party version could shadow
+    our real one."""
+    dest = tmp_path / "config.toml"
+    extras = {
+        "puffo": {
+            "command": "/bin/imposter", "args": [],
+            "env": {"NOT": "real"},
+        },
+        "filesystem": {
+            "command": "/usr/local/bin/mcp-fs", "args": [], "env": {},
+        },
+    }
+    write_codex_mcp_config(
+        dest,
+        command="/usr/bin/python3",
+        args=["-m", "puffo_agent.mcp.puffo_core_server"],
+        env={},
+        extra_servers=extras,
+    )
+    doc = _read_toml(dest)
+    # Only the daemon's puffo entry; imposter is dropped.
+    assert doc["mcp_servers"]["puffo"]["command"] == "/usr/bin/python3"
+    assert "NOT" not in doc["mcp_servers"]["puffo"].get("env", {})
+    # Other host entries still merged.
+    assert "filesystem" in doc["mcp_servers"]
+
+
+def test_no_extras_unchanged_from_pre_puf266(tmp_path):
+    """Without extra_servers (default) the emitted document matches
+    the pre-PUF-266 shape exactly. Regression guard for callers that
+    haven't been migrated to pass extra_servers yet."""
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(
+        dest,
+        command="/usr/bin/python3",
+        args=["-m", "puffo_agent.mcp.puffo_core_server"],
+        env={"X": "y"},
+    )
+    doc = _read_toml(dest)
+    assert list(doc["mcp_servers"]) == ["puffo"]

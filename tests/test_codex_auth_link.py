@@ -116,3 +116,68 @@ def test_copy_fresh_marker_when_already_in_sync(tmp_path, monkeypatch):
     link_host_codex_auth(host, agent_codex)
     mode = link_host_codex_auth(host, agent_codex)
     assert mode == "copy (fresh)"
+
+
+# ── PUF-266: read_host_codex_mcp_servers ────────────────────────────
+
+
+from puffo_agent.portal.state import read_host_codex_mcp_servers
+
+
+def test_read_host_codex_mcp_servers_returns_empty_when_no_host_config(tmp_path):
+    """No host config.toml → empty dict (defensive: must not raise so
+    a host without codex installed doesn't block codex-agent startup)."""
+    assert read_host_codex_mcp_servers(tmp_path) == {}
+
+
+def test_read_host_codex_mcp_servers_returns_empty_when_malformed(tmp_path):
+    """Malformed TOML → empty dict + no exception leaks. Operator
+    shouldn't have their codex agent fail to start because their host
+    config has a stray bracket."""
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("this is = not [valid toml\n", encoding="utf-8")
+    assert read_host_codex_mcp_servers(tmp_path) == {}
+
+
+def test_read_host_codex_mcp_servers_parses_basic_entries(tmp_path):
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        'cli_auth_credentials_store = "file"\n'
+        '\n'
+        '[mcp_servers.filesystem]\n'
+        'command = "/usr/local/bin/mcp-fs"\n'
+        'args = ["--root", "/Users/op"]\n'
+        '\n'
+        '[mcp_servers.filesystem.env]\n'
+        'FS_LOG_LEVEL = "info"\n'
+        '\n'
+        '[mcp_servers.github]\n'
+        'command = "npx"\n'
+        'args = ["@modelcontextprotocol/server-github"]\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert set(out) == {"filesystem", "github"}
+    assert out["filesystem"]["command"] == "/usr/local/bin/mcp-fs"
+    assert out["filesystem"]["args"] == ["--root", "/Users/op"]
+    assert out["filesystem"]["env"]["FS_LOG_LEVEL"] == "info"
+    assert out["github"]["args"] == ["@modelcontextprotocol/server-github"]
+    # Missing env defaults to {} (not absent / not None).
+    assert out["github"]["env"] == {}
+
+
+def test_read_host_codex_mcp_servers_ignores_top_level_non_mcp(tmp_path):
+    """Top-level keys like cli_auth_credentials_store, models, etc.
+    are ignored — we only return mcp_servers entries."""
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        'cli_auth_credentials_store = "file"\n'
+        'model = "gpt-5-codex"\n'
+        '[mcp_servers.fs]\ncommand = "x"\nargs = []\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert list(out) == ["fs"]

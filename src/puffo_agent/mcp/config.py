@@ -89,6 +89,7 @@ def write_codex_mcp_config(
     command: str | None = None,
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
+    extra_servers: dict[str, dict] | None = None,
 ) -> Path:
     """Serialise the codex per-agent config to ``dest`` as TOML.
 
@@ -103,13 +104,16 @@ def write_codex_mcp_config(
        passing no MCP args still produces a config that locks the
        agent into file-mode auth.
 
-    2. Optionally emit ``[mcp_servers.<name>]`` for the puffo_core
-       stdio MCP server. Phase 0 #5 verifies the ``env`` table is
-       actually honoured per-server (we rely on it for the
-       ``PYTHONUSERBASE`` / ``PUFFO_*`` env vars puffo_core needs).
-       When ``command`` is ``None`` (agent without ``puffo_core``
-       configured), the MCP section is omitted but the auth-store
-       pin still lands.
+    2. Emit ``[mcp_servers.<name>]`` blocks for: (a) the puffo_core
+       stdio MCP server (when ``command`` is provided), and (b)
+       PUF-266: any ``extra_servers`` entries (typically the host's
+       own MCP servers, read from ``~/.codex/config.toml`` by
+       ``read_host_codex_mcp_servers``) so an operator-managed codex
+       agent inherits the same MCP catalog the operator's own codex
+       CLI sees. Each ``extra_servers`` entry is a dict with
+       ``command``, ``args``, ``env`` keys matching the puffo entry
+       shape; the puffo entry takes precedence over any
+       ``puffo``-keyed host entry to avoid duplicates.
 
     We hand-roll the TOML (no stdlib writer in Python 3.11) — the
     schema is bounded enough that a 30-line emitter is simpler than a
@@ -123,23 +127,44 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
+    # PUF-266: emit host-mirrored MCP servers first so the puffo entry
+    # below shadows any same-named host entry deterministically.
+    for name, spec in sorted((extra_servers or {}).items()):
+        if name == MCP_SERVER_NAME:
+            continue  # puffo entry below is authoritative
+        lines += _emit_codex_mcp_block(name, spec)
     if command is not None:
-        lines += [
-            "",
-            f"[mcp_servers.{MCP_SERVER_NAME}]",
-            f'command = "{_toml_escape(command)}"',
-            "args = ["
-            + ", ".join(f'"{_toml_escape(a)}"' for a in (args or []))
-            + "]",
-        ]
+        puffo_spec: dict = {"command": command, "args": list(args or [])}
         if env:
-            lines.append("")
-            lines.append(f"[mcp_servers.{MCP_SERVER_NAME}.env]")
-            for k, v in sorted(env.items()):
-                lines.append(f'{k} = "{_toml_escape(str(v))}"')
+            puffo_spec["env"] = dict(env)
+        lines += _emit_codex_mcp_block(MCP_SERVER_NAME, puffo_spec)
     lines.append("")
     dest.write_text("\n".join(lines), encoding="utf-8")
     return dest
+
+
+def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
+    """Render one ``[mcp_servers.<name>]`` block from a parsed spec
+    dict. ``spec`` is the same shape ``tomllib.loads`` would produce
+    for a single MCP server entry: ``{"command": str, "args": list[str],
+    "env": dict[str, str]}``. Missing keys are tolerated for the
+    optional fields."""
+    out: list[str] = ["", f"[mcp_servers.{name}]"]
+    cmd = str(spec.get("command", ""))
+    out.append(f'command = "{_toml_escape(cmd)}"')
+    args = spec.get("args") or []
+    out.append(
+        "args = ["
+        + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
+        + "]"
+    )
+    env = spec.get("env") or {}
+    if env:
+        out.append("")
+        out.append(f"[mcp_servers.{name}.env]")
+        for k, v in sorted(env.items()):
+            out.append(f'{k} = "{_toml_escape(str(v))}"')
+    return out
 
 
 def _toml_escape(s: str) -> str:
