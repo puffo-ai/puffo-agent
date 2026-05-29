@@ -528,6 +528,14 @@ async def update_runtime(request: web.Request) -> web.Response:
 MAX_ROLE_LEN = 140
 MAX_ROLE_SHORT_LEN = 32
 
+# PUF-208 v2: server-side cap on soul / profile_summary content.
+# Web UI types up to 6000 + supports a .md upload up to 10000; this
+# is the load-bearing storage cap that any caller (web, CLI, future
+# automation) must respect. UTF-8 byte count rather than codepoints
+# so the cap matches what gets written to profile.md and read back
+# off disk — CJK-heavy souls fit about 3000-3300 characters.
+MAX_PROFILE_SUMMARY_BYTES = 10000
+
 
 async def update_profile(request: web.Request) -> web.Response:
     """Patch the agent's display_name + avatar_url + role. Owner-only.
@@ -642,6 +650,15 @@ async def update_profile(request: web.Request) -> web.Response:
 
     new_profile_summary = payload.get("profile_summary")
     if isinstance(new_profile_summary, str):
+        # PUF-208 v2: cap before write so a stale UI / future automation
+        # client can't drop a multi-megabyte soul on disk + into the
+        # next CLAUDE.md sync. UTF-8 byte count matches storage.
+        summary_bytes = len(new_profile_summary.encode("utf-8"))
+        if summary_bytes > MAX_PROFILE_SUMMARY_BYTES:
+            return _bad(
+                f"profile_summary is {summary_bytes} bytes; cap is "
+                f"{MAX_PROFILE_SUMMARY_BYTES}"
+            )
         _update_profile_summary(cfg, new_profile_summary.strip())
 
     # Write agent.yml last so local state reflects what we asked

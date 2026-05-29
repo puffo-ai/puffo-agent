@@ -271,3 +271,98 @@ async def test_read_file_caps_size():
         h = signed_headers(user, "GET", "/v1/agents/files-bot/files/raw?path=big.txt"); h.update(_HOST)
         r = await c.get("/v1/agents/files-bot/files/raw?path=big.txt", headers=h)
         assert r.status == 413
+
+
+# ────────────────────────────────────────────────────────────────────
+# PUF-208 v2: profile_summary byte-cap on PATCH /v1/agents/{id}/profile
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_update_profile_accepts_summary_at_cap():
+    # Exactly MAX_PROFILE_SUMMARY_BYTES (10000) UTF-8 bytes must pass.
+    # The cap is byte-counted so the on-disk profile.md size matches
+    # what the server enforced.
+    from puffo_agent.portal.api.handlers import MAX_PROFILE_SUMMARY_BYTES
+
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "soul-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    summary = "x" * MAX_PROFILE_SUMMARY_BYTES
+    assert len(summary.encode("utf-8")) == MAX_PROFILE_SUMMARY_BYTES
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"profile_summary": summary}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/soul-bot/profile", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/soul-bot/profile", data=body, headers=h)
+        assert r.status == 200, await r.text()
+
+
+async def test_update_profile_rejects_summary_over_cap():
+    # MAX + 1 byte must reject with 400 + a body that fingers the
+    # offending byte count + the configured cap, so the UI can map
+    # the message without re-parsing.
+    from puffo_agent.portal.api.handlers import MAX_PROFILE_SUMMARY_BYTES
+
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "soul-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    summary = "x" * (MAX_PROFILE_SUMMARY_BYTES + 1)
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"profile_summary": summary}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/soul-bot/profile", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/soul-bot/profile", data=body, headers=h)
+        assert r.status == 400, await r.text()
+        body_json = await r.json()
+        assert str(MAX_PROFILE_SUMMARY_BYTES) in body_json["error"]
+        assert str(MAX_PROFILE_SUMMARY_BYTES + 1) in body_json["error"]
+
+
+async def test_update_profile_caps_on_utf8_bytes_not_codepoints():
+    # CJK characters take 3 UTF-8 bytes each. 3334 CJK characters =
+    # 10002 bytes → rejected. (Even though 3334 codepoints is well
+    # under any plausible codepoint cap.)
+    from puffo_agent.portal.api.handlers import MAX_PROFILE_SUMMARY_BYTES
+
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "soul-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    # 3334 × 3 bytes = 10002 (just over the 10000 cap).
+    summary = "字" * 3334
+    assert len(summary.encode("utf-8")) > MAX_PROFILE_SUMMARY_BYTES
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"profile_summary": summary}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/soul-bot/profile", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/soul-bot/profile", data=body, headers=h)
+        assert r.status == 400, await r.text()
