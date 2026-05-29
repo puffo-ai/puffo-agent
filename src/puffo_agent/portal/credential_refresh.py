@@ -840,7 +840,15 @@ class CredentialRefresher:
                     "registered agents",
                     self._consecutive_non_success,
                 )
-                self._clear_refresh_broken()
+            # PR #52 review: always clear on success — not just when the
+            # in-memory streak was non-zero. A daemon restart after the
+            # flip resets the counter to 0 while leaving the disk-state
+            # ``refresh_broken``; without the unconditional clear, the
+            # next successful refresh would never unstick those agents.
+            # ``_clear_refresh_broken`` is idempotent (per-agent guard on
+            # ``rs.health != "refresh_broken"``) so the always-call is
+            # cheap when there's nothing to clear.
+            self._clear_refresh_broken()
             self._consecutive_non_success = 0
             return
         self._consecutive_non_success += 1

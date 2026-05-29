@@ -388,6 +388,31 @@ def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
     assert r._consecutive_non_success == 0
 
 
+def test_refresh_broken_cleared_after_daemon_restart(tmp_path, monkeypatch):
+    """PR #52 review: after a daemon restart the in-memory streak
+    counter starts at 0 while the registered agents' on-disk
+    ``runtime.health`` may still be ``refresh_broken`` from the
+    previous daemon's flip. The next REFRESHED tick MUST clear the
+    disk-state even though ``_consecutive_non_success == 0`` —
+    otherwise agents stay stuck at ``[refresh_broken]`` indefinitely
+    even though refresh has recovered."""
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    # Simulate post-restart state: disk says refresh_broken (left
+    # over from previous daemon's flip); in-memory streak is zero
+    # (fresh refresher instance).
+    rs = RuntimeState.load(aid)
+    rs.health = "refresh_broken"
+    rs.error = "left over from previous daemon"
+    rs.save(aid)
+    assert r._consecutive_non_success == 0
+    # First successful refresh after restart.
+    r._propagate_outcome(RefreshOutcome.REFRESHED)
+    rs = RuntimeState.load(aid)
+    assert rs.health == "ok"
+    assert rs.error == ""
+
+
 def test_refresh_broken_does_not_overwrite_auth_failed(tmp_path, monkeypatch):
     """``auth_failed`` is a stronger downstream signal — refresh_broken
     is the upstream warning that the daemon's refresh mechanism is
