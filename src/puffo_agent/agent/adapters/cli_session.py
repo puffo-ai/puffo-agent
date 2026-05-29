@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +41,37 @@ logger = logging.getLogger(__name__)
 # Cap any single audit field so one huge user message or tool input
 # doesn't bloat the log / the docker-logs stream.
 AUDIT_FIELD_MAX = 2000
+
+
+# PUF-264: byte cap on user_message itself, enforced before we hand
+# the turn to claude. Anthropic's published request-body limit is
+# model-specific (~180-200KB across current Claude models); we cap at
+# 180KB to leave room for system prompt + tool definitions + headers,
+# all of which inflate the on-wire request beyond the user_message
+# byte count we see here. Catches the operator-reported case where a
+# user uploaded 10 PDFs and the agent inlined all of them into one
+# turn; the reactive ``_REQUEST_TOO_LARGE_PATTERN`` below catches the
+# residual cases where user_message alone is fine but the full
+# transcript-plus-system-prompt still trips Anthropic's cap.
+MAX_USER_MESSAGE_BYTES = 180 * 1000
+
+REQUEST_TOO_LARGE_FRIENDLY = (
+    "Your message has too much content. Please reduce attachments "
+    "or split your message and try again."
+)
+
+# PUF-264 reactive catch — verbatim Anthropic API error strings, both
+# extracted from the Claude Code binary (constants ``AQ="Prompt is too
+# long"`` and the parseable ``input length and `max_tokens` exceed
+# context limit`` message). Match in the assembled reply text so the
+# operator gets the friendly error instead of the raw API string, and
+# so the worker's existing leak-suppression infra doesn't accidentally
+# silence what should be a user-facing failure.
+_REQUEST_TOO_LARGE_PATTERN: re.Pattern[str] = re.compile(
+    r"(?:API Error:\s*)?Prompt is too long\b"
+    r"|input length and `max_tokens` exceed context limit",
+    re.IGNORECASE,
+)
 
 
 # Case-insensitive substrings that mark a claude reply as an auth /
@@ -217,6 +249,38 @@ class ClaudeSession:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def _rewrite_if_request_too_large(self, result: TurnResult) -> TurnResult:
+        """PUF-264 reactive catch: when Anthropic surfaces a too-long
+        prompt at the API layer (system prompt + transcript + user
+        message inflate past the cap even when ``user_message`` alone
+        passes the pre-send check), Claude Code emits the verbatim
+        ``API Error: Prompt is too long`` string in the assembled
+        reply. Replace it with the friendly user-facing message + a
+        ``request_too_large=reactive`` metadata flag so the worker
+        treats this as a permanent input-side failure (no retry, no
+        ``api_error_abandoned`` flip — the user just needs to send a
+        smaller message)."""
+        if not result.reply or not _REQUEST_TOO_LARGE_PATTERN.search(result.reply):
+            return result
+        logger.warning(
+            "agent %s: claude reply matched Prompt-is-too-long pattern; "
+            "rewriting to friendly error (raw: %s)",
+            self.agent_id, result.reply[:200],
+        )
+        if self.audit is not None:
+            self.audit.write(
+                "turn.request_too_large_reactive", raw_reply=result.reply,
+            )
+        new_md = dict(result.metadata or {})
+        new_md["request_too_large"] = "reactive"
+        new_md["original_reply"] = result.reply
+        return TurnResult(
+            reply=REQUEST_TOO_LARGE_FRIENDLY,
+            metadata=new_md,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+        )
+
     async def _one_turn_with_poison_recovery(
         self, user_message: str, system_prompt: str,
     ) -> TurnResult:
@@ -270,7 +334,7 @@ class ClaudeSession:
                     user_message, system_prompt,
                 )
                 if not _looks_like_auth_error(result.reply):
-                    return result
+                    return self._rewrite_if_request_too_large(result)
                 last_result = result
                 if self.audit is not None:
                     self.audit.write(
@@ -621,6 +685,31 @@ class ClaudeSession:
 
     async def _one_turn(self, user_message: str) -> TurnResult:
         assert self._proc is not None and self._proc.stdin is not None
+        # PUF-264 proactive pre-send: skip the subprocess round-trip
+        # entirely when user_message alone is already above the cap.
+        # No retry, no auth-failure, no api-error-abandoned — the
+        # operator's user sees the friendly reply and can resend.
+        ums_bytes = len(user_message.encode("utf-8"))
+        if ums_bytes > MAX_USER_MESSAGE_BYTES:
+            logger.warning(
+                "agent %s: user_message=%d bytes > cap %d; short-circuiting "
+                "with friendly reply (no claude turn spawned)",
+                self.agent_id, ums_bytes, MAX_USER_MESSAGE_BYTES,
+            )
+            if self.audit is not None:
+                self.audit.write(
+                    "turn.request_too_large_pre_send",
+                    user_message_bytes=ums_bytes,
+                    cap=MAX_USER_MESSAGE_BYTES,
+                )
+            return TurnResult(
+                reply=REQUEST_TOO_LARGE_FRIENDLY,
+                metadata={
+                    "request_too_large": "pre_send",
+                    "user_message_bytes": ums_bytes,
+                    "cap_bytes": MAX_USER_MESSAGE_BYTES,
+                },
+            )
         if self.audit is not None:
             self.audit.write("turn.input", content=user_message)
         turn_started_at = time.time()

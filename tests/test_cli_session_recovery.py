@@ -15,11 +15,14 @@ from unittest.mock import patch
 import pytest
 
 from puffo_agent.agent.adapters.cli_session import (
+    MAX_USER_MESSAGE_BYTES,
+    REQUEST_TOO_LARGE_FRIENDLY,
     STREAM_READER_LIMIT_BYTES,
     AuditLog,
     ClaudeSession,
     _looks_like_poisoned_session,
 )
+from puffo_agent.agent.adapters.base import TurnResult
 
 
 # ── Fake subprocess helpers ──────────────────────────────────────────────────
@@ -399,3 +402,110 @@ def test_one_turn_normal_reply_keeps_session(tmp_path):
     assert out.metadata.get("poisoned_session") is None
     assert session.session_file.exists()
     assert session._session_id == "sess-healthy"
+
+
+# ── PUF-264: pre-send byte cap + reactive Prompt-is-too-long rewrite ────────
+
+
+def test_one_turn_pre_send_check_short_circuits_oversized_user_message(tmp_path):
+    """user_message above MAX_USER_MESSAGE_BYTES must NOT spawn the
+    claude subprocess. We assert no stdin write happened + the friendly
+    reply landed + metadata flags the case so the worker can audit."""
+    session = _make_session(tmp_path, audit=True)
+
+    async def drive():
+        # _FakeProc with no stdout — if we ever read it the test hangs,
+        # which is the correct failure mode if the pre-send check
+        # regresses.
+        session._proc = _FakeProc(stdout_lines=[])
+        big = "x" * (MAX_USER_MESSAGE_BYTES + 1)
+        return await session._one_turn(big)
+
+    out = asyncio.run(drive())
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "pre_send"
+    assert out.metadata.get("user_message_bytes") == MAX_USER_MESSAGE_BYTES + 1
+    # Crucially: no stdin write happened (subprocess wasn't fed).
+    assert session._proc.stdin.buffer == bytearray()
+    events = _read_audit_events(tmp_path / "audit.log")
+    assert any(
+        e.get("event") == "turn.request_too_large_pre_send"
+        for e in events
+    )
+
+
+def test_one_turn_pre_send_check_passes_messages_at_or_below_cap(tmp_path):
+    """A user_message exactly at the cap must NOT short-circuit — only
+    strictly-over triggers. Pins the boundary."""
+    result_evt = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "usage": {"input_tokens": 5, "output_tokens": 5},
+        "result": "fine",
+    }
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=[
+            (json.dumps(result_evt) + "\n").encode("utf-8"),
+        ])
+        at_cap = "x" * MAX_USER_MESSAGE_BYTES
+        return await session._one_turn(at_cap)
+
+    out = asyncio.run(drive())
+    assert out.metadata.get("request_too_large") is None
+    # The subprocess was actually fed.
+    assert session._proc.stdin.buffer  # non-empty
+
+
+def test_rewrite_if_request_too_large_matches_canonical_anthropic_string(tmp_path):
+    """The exact verbatim ``API Error: Prompt is too long`` message
+    Claude Code surfaces when Anthropic returns the input-too-long
+    error must be detected + replaced with the friendly version. Raw
+    string preserved in metadata for operator forensics."""
+    session = _make_session(tmp_path, audit=True)
+    raw = (
+        "API Error: Prompt is too long\n\n"
+        "Request ID: req_011CtestabcDEF"
+    )
+    result = TurnResult(
+        reply=raw, input_tokens=42, output_tokens=0,
+        metadata={"some_prior_flag": True},
+    )
+    out = session._rewrite_if_request_too_large(result)
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "reactive"
+    assert out.metadata.get("original_reply") == raw
+    assert out.metadata.get("some_prior_flag") is True
+    # Token counts preserved so cost accounting still reflects the
+    # turn that actually happened.
+    assert out.input_tokens == 42
+
+
+def test_rewrite_if_request_too_large_matches_max_tokens_context_limit(tmp_path):
+    """Alternate Anthropic shape (parseable numeric form). Must also
+    trigger the rewrite so an operator never sees the raw API error."""
+    session = _make_session(tmp_path, audit=False)
+    raw = "input length and `max_tokens` exceed context limit: 199000 + 4000 > 200000"
+    result = TurnResult(reply=raw)
+    out = session._rewrite_if_request_too_large(result)
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "reactive"
+
+
+def test_rewrite_if_request_too_large_passes_through_normal_replies(tmp_path):
+    """Regression guard: a normal reply or a turn that mentions
+    'prompt' or 'long' in passing must NOT trigger the rewrite. The
+    regex is anchored on the verbatim Anthropic strings."""
+    session = _make_session(tmp_path, audit=False)
+    cases = [
+        "Sure, here's the answer to your question.",
+        "I will write a long prompt to test edge cases.",
+        "API Error: Request rejected (429)",  # rate-limit, NOT too-long
+        "",
+    ]
+    for raw in cases:
+        result = TurnResult(reply=raw)
+        out = session._rewrite_if_request_too_large(result)
+        assert out is result, f"regex over-matched on: {raw!r}"
