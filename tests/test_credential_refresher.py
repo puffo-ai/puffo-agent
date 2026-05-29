@@ -14,8 +14,10 @@ import pytest
 
 from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (
+    REFRESH_BROKEN_THRESHOLD,
     REFRESH_SAFETY_MARGIN_SECONDS,
     CredentialRefresher,
+    RefreshOutcome,
 )
 
 
@@ -293,3 +295,237 @@ def test_refresh_token_request_flag_round_trip(tmp_path, monkeypatch):
     # flag on next tick after it was already cleared).
     clear_refresh_token_request()
     assert not refresh_token_request_path().exists()
+
+
+# ── PUF-265: outcome dispatch + refresh_broken propagation ─────
+
+
+def _make_agent_runtime(home_root: Path, agent_id: str) -> Path:
+    """Seed an ``agents/<id>/runtime.json`` under ``home_root`` so
+    ``RuntimeState.load(agent_id)`` resolves via ``PUFFO_AGENT_HOME``."""
+    from puffo_agent.portal.state import RuntimeState
+    rs = RuntimeState(status="running", started_at=int(time.time()))
+    # Need PUFFO_AGENT_HOME to be set before save() — the caller's
+    # monkeypatch handles that.
+    rs.save(agent_id)
+    return home_root / "agents" / agent_id / "runtime.json"
+
+
+def _make_refresher_with_agent(
+    tmp_path: Path, monkeypatch, *, agent_id: str = "agent-puf265",
+) -> tuple[CredentialRefresher, str]:
+    """Build a refresher whose registered agent maps to a real
+    runtime.json under ``PUFFO_AGENT_HOME=tmp_path``."""
+    from puffo_agent.portal.state import agent_home_dir
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    # Seed runtime + creds.
+    _write_creds(tmp_path / "host", expires_in_seconds=3600)
+    _make_agent_runtime(tmp_path, agent_id)
+
+    r = CredentialRefresher(host_home=tmp_path / "host")
+    r.register_agent(agent_home_dir(agent_id))
+    return r, agent_id
+
+
+def test_propagate_outcome_refreshed_resets_counter(tmp_path, monkeypatch):
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._consecutive_non_success = 1
+    r._propagate_outcome(RefreshOutcome.REFRESHED)
+    assert r._consecutive_non_success == 0
+
+
+def test_propagate_outcome_unchanged_increments_counter(tmp_path, monkeypatch):
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    assert r._consecutive_non_success == 1
+
+
+def test_propagate_outcome_failed_increments_counter(tmp_path, monkeypatch):
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    assert r._consecutive_non_success == 1
+
+
+def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch):
+    """N consecutive UNCHANGED|FAILED outcomes must flip every
+    registered agent's ``runtime.health`` to ``"refresh_broken"`` with a
+    human-readable ``runtime.error``. Below threshold, health stays
+    untouched."""
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    # 1 non-success: below threshold, no flip.
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    rs = RuntimeState.load(aid)
+    assert rs is not None
+    assert rs.health != "refresh_broken"
+    # 2nd consecutive non-success hits the threshold → flip.
+    assert REFRESH_BROKEN_THRESHOLD == 2
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    rs = RuntimeState.load(aid)
+    assert rs is not None
+    assert rs.health == "refresh_broken"
+    assert "claude /login" in rs.error
+    assert "unchanged" in rs.error
+
+
+def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
+    """A REFRESHED outcome after the flip must clear ``refresh_broken``
+    back to ``"ok"`` AND reset the counter, so the next streak starts
+    fresh."""
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    # Drive the flip.
+    for _ in range(REFRESH_BROKEN_THRESHOLD):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    assert RuntimeState.load(aid).health == "refresh_broken"
+    # Recover.
+    r._propagate_outcome(RefreshOutcome.REFRESHED)
+    rs = RuntimeState.load(aid)
+    assert rs is not None
+    assert rs.health == "ok"
+    assert rs.error == ""
+    assert r._consecutive_non_success == 0
+
+
+def test_refresh_broken_does_not_overwrite_auth_failed(tmp_path, monkeypatch):
+    """``auth_failed`` is a stronger downstream signal — refresh_broken
+    is the upstream warning that the daemon's refresh mechanism is
+    dead. Once any agent has actually been blocked by a 401 and worker
+    flipped it to ``auth_failed``, refresh_broken must NOT downgrade
+    that signal."""
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    # Seed auth_failed on the agent first.
+    rs = RuntimeState.load(aid)
+    rs.health = "auth_failed"
+    rs.error = "401 from a real turn"
+    rs.save(aid)
+    # Drive the would-be flip.
+    for _ in range(REFRESH_BROKEN_THRESHOLD):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    rs = RuntimeState.load(aid)
+    assert rs is not None
+    assert rs.health == "auth_failed", (
+        "refresh_broken should not overwrite auth_failed"
+    )
+    assert rs.error == "401 from a real turn"
+
+
+def test_refresh_broken_does_not_overwrite_api_error_abandoned(
+    tmp_path, monkeypatch,
+):
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    rs = RuntimeState.load(aid)
+    rs.health = "api_error_abandoned"
+    rs.save(aid)
+    for _ in range(REFRESH_BROKEN_THRESHOLD):
+        r._propagate_outcome(RefreshOutcome.FAILED)
+    rs = RuntimeState.load(aid)
+    assert rs.health == "api_error_abandoned"
+
+
+def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch):
+    """Regression for the PUF-265 root cause: the caller at line 779
+    used to do ``await self.backend.refresh()`` without capturing the
+    outcome, so UNCHANGED silently looked like REFRESHED to
+    ``_refresh_now``. This test pins the new contract — outcome MUST
+    feed ``_propagate_outcome`` for the counter + flip to work."""
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+
+    captured: list[RefreshOutcome] = []
+
+    class _FakeBackend:
+        def expires_in_seconds(self):
+            return 60
+        async def refresh(self):
+            return RefreshOutcome.UNCHANGED
+        def sync_to_agent(self, agent_home):
+            pass
+
+    r.backend = _FakeBackend()
+    orig_propagate = r._propagate_outcome
+
+    def spy_propagate(outcome):
+        captured.append(outcome)
+        orig_propagate(outcome)
+
+    r._propagate_outcome = spy_propagate  # type: ignore[method-assign]
+    asyncio.run(r._refresh_now(expires_in=60, by_agent=True))
+    assert captured == [RefreshOutcome.UNCHANGED]
+
+
+def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
+    """A backend that raises during ``refresh()`` must be counted as a
+    non-success outcome (FAILED) so a daemon-side bug or transient
+    subprocess error contributes to the refresh_broken streak instead
+    of being silently swallowed."""
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+
+    captured: list[RefreshOutcome] = []
+
+    class _ExplodingBackend:
+        def expires_in_seconds(self):
+            return 60
+        async def refresh(self):
+            raise RuntimeError("backend exploded")
+        def sync_to_agent(self, agent_home):
+            pass
+
+    r.backend = _ExplodingBackend()
+    orig_propagate = r._propagate_outcome
+
+    def spy_propagate(outcome):
+        captured.append(outcome)
+        orig_propagate(outcome)
+
+    r._propagate_outcome = spy_propagate  # type: ignore[method-assign]
+    asyncio.run(r._refresh_now(expires_in=60, by_agent=True))
+    assert captured == [RefreshOutcome.FAILED]
+
+
+def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, caplog):
+    """The UNCHANGED branch must dump ``stdout`` + ``stderr`` tails
+    (real-fix discrimination prereq: differentiates 2a CLI-stopped-
+    refreshing from 2b Linux-writeback-failure on the next in-the-wild
+    event without needing another roundtrip)."""
+    from puffo_agent.portal.credential_refresh import FileBackend
+    _write_creds(tmp_path, expires_in_seconds=3600)  # advance==no-advance both fine; we force the branch
+    backend = FileBackend(host_home=tmp_path)
+
+    class _Proc:
+        returncode = 0
+        async def communicate(self):
+            return b"hello-out", b"hello-err"
+
+    async def fake_exec(*argv, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    caplog.set_level("ERROR", logger="puffo_agent.portal.credential_refresh")
+    outcome = asyncio.run(backend.refresh())
+    assert outcome is RefreshOutcome.UNCHANGED
+    joined = " ".join(rec.getMessage() for rec in caplog.records)
+    assert "hello-out" in joined
+    assert "hello-err" in joined
+
+
+def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
+    """When N consecutive non-success outcomes hit, every registered
+    agent gets the flip — not just the first one in the set."""
+    from puffo_agent.portal.state import RuntimeState, agent_home_dir
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    _write_creds(tmp_path / "host", expires_in_seconds=3600)
+    _make_agent_runtime(tmp_path, "agent-alpha")
+    _make_agent_runtime(tmp_path, "agent-beta")
+
+    r = CredentialRefresher(host_home=tmp_path / "host")
+    r.register_agent(agent_home_dir("agent-alpha"))
+    r.register_agent(agent_home_dir("agent-beta"))
+
+    for _ in range(REFRESH_BROKEN_THRESHOLD):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+
+    assert RuntimeState.load("agent-alpha").health == "refresh_broken"
+    assert RuntimeState.load("agent-beta").health == "refresh_broken"

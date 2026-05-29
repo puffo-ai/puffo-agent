@@ -68,6 +68,13 @@ REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
+# PUF-265: how many consecutive non-success refresh outcomes
+# (UNCHANGED | FAILED) before flipping registered agents'
+# ``runtime.health`` to ``"refresh_broken"``. 2 = ~4 min of dead refresh
+# at the 120s poll cadence; small enough to surface fast, large enough
+# that a single transient subprocess hiccup doesn't false-positive.
+REFRESH_BROKEN_THRESHOLD = 2
+
 # Codex's OAuth access_token is a JWT — the only authoritative expiry
 # is the ``exp`` claim inside the token. Codex's own ``last_refresh``
 # field uses an ~8-day staleness heuristic that's too coarse for our
@@ -213,12 +220,18 @@ class FileBackend:
             )
             return RefreshOutcome.FAILED
         if before is not None and after is not None and after <= before:
+            # PUF-265: dump stdout/stderr on UNCHANGED so the real-fix
+            # PR can discriminate sub-hypothesis 2a (claude CLI stopped
+            # rotating under --print) from 2b (Linux-specific writeback
+            # path failure) from a single in-the-wild event.
+            err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
             logger.error(
                 "credential refresh exit=0 but expiresAt didn't advance "
-                "(before=%ds, after=%ds) — claude may not be rewriting "
-                "credentials.json on this build; operator may need "
-                "`claude /login` to recover",
-                before, after,
+                "(before=%ds, after=%ds) in %.1fs — claude may not be "
+                "rewriting credentials.json on this build; operator may "
+                "need `claude /login` to recover | stdout: %s | stderr: %s",
+                before, after, elapsed, out_tail, err_tail,
             )
             return RefreshOutcome.UNCHANGED
         logger.info(
@@ -630,6 +643,11 @@ class CredentialRefresher:
         self._agent_homes: set[Path] = set()
         self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
+        # PUF-265: consecutive UNCHANGED|FAILED outcome streak. Resets
+        # on the next REFRESHED outcome. Used to gate the
+        # ``runtime.health="refresh_broken"`` flip so a single
+        # transient hiccup doesn't false-positive registered agents.
+        self._consecutive_non_success = 0
 
     def register_agent(self, agent_home: Path) -> None:
         self._agent_homes.add(Path(agent_home))
@@ -802,8 +820,86 @@ class CredentialRefresher:
             except Exception as exc:
                 logger.warning("backend refresh errored: %s", exc)
                 outcome = RefreshOutcome.FAILED
+            self._propagate_outcome(outcome)
         if outcome is RefreshOutcome.REFRESHED:
             self._fire_refresh_success()
+
+    def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
+        """PUF-265: track consecutive non-success outcomes and surface
+        ``runtime.health="refresh_broken"`` on every registered agent
+        once the streak hits ``REFRESH_BROKEN_THRESHOLD``. Cleared by
+        the next REFRESHED outcome. Does not overwrite ``auth_failed``
+        / ``api_error_abandoned`` — those are stronger downstream
+        signals and the operator's recovery action (``claude /login``
+        then ``agent resume``) is identical."""
+        if outcome is RefreshOutcome.REFRESHED:
+            if self._consecutive_non_success > 0:
+                logger.info(
+                    "credential refresh recovered after %d non-success "
+                    "tick(s) — clearing refresh_broken health on "
+                    "registered agents",
+                    self._consecutive_non_success,
+                )
+                self._clear_refresh_broken()
+            self._consecutive_non_success = 0
+            return
+        self._consecutive_non_success += 1
+        if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
+            self._flip_refresh_broken(outcome)
+
+    def _flip_refresh_broken(self, outcome: RefreshOutcome) -> None:
+        from .state import RuntimeState
+        msg = (
+            f"daemon CredentialRefresher saw {self._consecutive_non_success} "
+            f"consecutive {outcome.value} outcome(s); on-disk token isn't "
+            f"advancing. Run `claude /login` then "
+            f"`puffo-agent agent resume <id>` to recover."
+        )
+        for agent_home in self._agent_homes:
+            agent_id = Path(agent_home).name
+            try:
+                rs = RuntimeState.load(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_broken flip: failed to load runtime for %s: %s",
+                    agent_id, exc,
+                )
+                continue
+            if rs is None:
+                continue
+            if rs.health in ("auth_failed", "api_error_abandoned"):
+                continue
+            if rs.health == "refresh_broken":
+                continue
+            rs.health = "refresh_broken"
+            rs.error = msg
+            try:
+                rs.save(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_broken flip: failed to save runtime for %s: %s",
+                    agent_id, exc,
+                )
+
+    def _clear_refresh_broken(self) -> None:
+        from .state import RuntimeState
+        for agent_home in self._agent_homes:
+            agent_id = Path(agent_home).name
+            try:
+                rs = RuntimeState.load(agent_id)
+            except Exception:
+                continue
+            if rs is None or rs.health != "refresh_broken":
+                continue
+            rs.health = "ok"
+            rs.error = ""
+            try:
+                rs.save(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_broken clear: failed to save runtime for %s: %s",
+                    agent_id, exc,
+                )
 
     def _sync_views(self) -> None:
         """Mirror canonical credentials to every registered agent."""

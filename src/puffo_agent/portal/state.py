@@ -1085,8 +1085,17 @@ class RuntimeState:
     #   "api_error_abandoned" — kick-retry exhausted, batch silently
     #                           abandoned; cleared on next successful turn
     #                           (PUF-255's on_turn_success lane)
+    #   "refresh_broken"      — PUF-265: daemon's CredentialRefresher
+    #                           saw N consecutive UNCHANGED/FAILED
+    #                           outcomes; soft upstream signal that the
+    #                           on-disk token isn't advancing, ahead of
+    #                           the eventual 401 → ``auth_failed`` flip.
+    #                           Cleared by the next REFRESHED tick. Does
+    #                           NOT overwrite ``auth_failed`` /
+    #                           ``api_error_abandoned`` (those are
+    #                           stronger downstream signals).
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
+    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | refresh_broken | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> "RuntimeState | None":
