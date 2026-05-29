@@ -74,7 +74,17 @@ async def _pair(client, user):
     assert r.status == 200, await r.text()
 
 
-def _seed_agent(home: str, agent_id: str, slug: str, server_url: str) -> str:
+def _seed_agent(
+    home: str,
+    agent_id: str,
+    slug: str,
+    server_url: str,
+    *,
+    state: str = "paused",
+) -> str:
+    # PUF-263 made paused the canonical export state — default the
+    # seed accordingly so the export tests don't all need to flip
+    # state by hand. Pass ``state="running"`` to test the 409 path.
     import yaml
 
     root = Ed25519KeyPair.generate()
@@ -88,7 +98,7 @@ def _seed_agent(home: str, agent_id: str, slug: str, server_url: str) -> str:
     (adir / "keys").mkdir(exist_ok=True)
     (adir / "profile.md").write_text("# profile\n", encoding="utf-8")
     cfg = {
-        "id": agent_id, "state": "running", "display_name": agent_id,
+        "id": agent_id, "state": state, "display_name": agent_id,
         "puffo_core": {
             "server_url": server_url, "slug": slug,
             "device_id": old_device_id, "space_id": "sp_test",
@@ -162,6 +172,54 @@ async def test_bridge_export_rejects_invalid_input(bridge_client):
     h["content-type"] = "application/json"
     r = await bridge_client.post("/v1/agents/export", data=body, headers=h)
     assert r.status == 400
+
+
+# ── PUF-263: paused-only export ─────────────────────────────────────
+
+
+async def test_bridge_export_rejects_running_agent(bridge_client):
+    # Operator spec (msg_9d0aaa27 item 1a): only paused agents can be
+    # exported. A running agent may be mid-write (memory updates, cli
+    # session refresh) so the snapshot would be inconsistent. Return
+    # 409 with a reason the UI can map to "Pause the agent first."
+    user = make_user()
+    await _pair(bridge_client, user)
+    _seed_agent(
+        os.environ["PUFFO_AGENT_HOME"],
+        "alpha",
+        "alpha-bot",
+        "http://unused",
+        state="running",
+    )
+    body = json.dumps({"agent_ids": ["alpha"], "password": "hunter2"}).encode("utf-8")
+    h = signed_headers(user, "POST", "/v1/agents/export", body)
+    h.update(_HOST)
+    h["content-type"] = "application/json"
+    r = await bridge_client.post("/v1/agents/export", data=body, headers=h)
+    assert r.status == 409, await r.text()
+    body_json = await r.json()
+    assert "running" in body_json["error"]
+    assert "alpha" in body_json["error"]
+
+
+async def test_bridge_export_rejects_whole_batch_if_any_running(bridge_client):
+    # Multi-agent migration use case: a single non-paused agent in the
+    # batch fails the whole export. Preserves "either everything in
+    # the bundle is a consistent snapshot, or nothing is."
+    user = make_user()
+    await _pair(bridge_client, user)
+    home = os.environ["PUFFO_AGENT_HOME"]
+    _seed_agent(home, "alpha", "alpha-bot", "http://unused")  # paused (default)
+    _seed_agent(home, "beta", "beta-bot", "http://unused", state="running")
+    body = json.dumps({"agent_ids": ["alpha", "beta"], "password": "hunter2"}).encode("utf-8")
+    h = signed_headers(user, "POST", "/v1/agents/export", body)
+    h.update(_HOST)
+    h["content-type"] = "application/json"
+    r = await bridge_client.post("/v1/agents/export", data=body, headers=h)
+    assert r.status == 409, await r.text()
+    # The 409 fingers the offending agent, not the paused one.
+    body_json = await r.json()
+    assert "beta" in body_json["error"]
 
 
 async def test_bridge_import_roundtrip(bridge_client, mock_puffo_server):
