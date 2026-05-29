@@ -8,6 +8,51 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PUF-264: request-too-large no longer infinite-retries + no longer
+  leaks the raw Anthropic API error to chat.** When a user uploaded
+  10 PDFs (msg_a42f8cbb), the agent inlined all of them into one
+  Claude call; Anthropic returned its ``request-too-large`` error, the
+  daemon's auth-retry path retried the same payload, hit the same
+  error, exhausted, and surfaced the verbatim CLI error string to the
+  user. A daemon restart wouldn't help — the next prompt re-inlines
+  the same attachments.
+
+  Two-layer defense in ``cli_session.py``:
+
+  1. **Proactive pre-send byte cap.** ``_one_turn`` short-circuits
+     before spawning the claude subprocess when
+     ``len(user_message.encode("utf-8")) > MAX_USER_MESSAGE_BYTES``
+     (180 KB; under-budget for Anthropic's ~200 KB request-body cap
+     with headroom for system prompt + tool definitions + headers).
+     Returns the friendly user-facing reply with metadata
+     ``request_too_large=pre_send`` and audit event
+     ``turn.request_too_large_pre_send``. No API spend, no retry, no
+     ``runtime.health`` flip — the user resends a smaller message.
+     Byte-based check (not character-based) so 60k CJK chars × 3 bytes
+     trip the cap even though the char count is below it.
+
+  2. **Reactive regex catch.** ``_rewrite_if_request_too_large`` (via
+     the new ``_looks_like_request_too_large`` predicate, mirroring
+     ``_looks_like_auth_error`` / ``_looks_like_poisoned_session``)
+     rewrites three verbatim Anthropic surfaces to the friendly
+     reply: ``"Prompt is too long"`` (Claude Code binary constant
+     ``AQ``), ``"input length and `max_tokens` exceed context limit"``
+     (parseable numeric form), and ``"size error: request too large,
+     try with a smaller file"`` (file-attachment surface; matches
+     both ASCII ``:`` ``,`` and the fullwidth ``：`` ``，`` Anthropic
+     emits on some localised builds). Fires AFTER the auth-retry loop
+     so a real auth failure still gets retried — only when the reply
+     is unambiguously a too-long error do we rewrite. Token counts +
+     ``tool_calls`` survive the rewrite for cost accounting; raw API
+     error preserved in ``metadata.original_reply`` for operator
+     forensics; audit event ``turn.request_too_large_reactive``.
+
+  Operator-visible: the user sees a short ASCII reply
+  (``"Your message has too much content. Please reduce attachments
+  or split your message and try again."``) instead of a 5-minute hang
+  + raw API error. No ``api_error_abandoned`` flip — request-too-large
+  is a permanent input-side failure class, not a transient.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the

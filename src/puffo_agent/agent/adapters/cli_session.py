@@ -60,16 +60,21 @@ REQUEST_TOO_LARGE_FRIENDLY = (
     "or split your message and try again."
 )
 
-# PUF-264 reactive catch — verbatim Anthropic API error strings, both
-# extracted from the Claude Code binary (constants ``AQ="Prompt is too
-# long"`` and the parseable ``input length and `max_tokens` exceed
-# context limit`` message). Match in the assembled reply text so the
-# operator gets the friendly error instead of the raw API string, and
-# so the worker's existing leak-suppression infra doesn't accidentally
-# silence what should be a user-facing failure.
+# PUF-264 reactive catch — verbatim Anthropic API error strings:
+#   * ``Prompt is too long`` — Claude Code binary constant AQ
+#   * ``input length and `max_tokens` exceed context limit`` —
+#     parseable numeric form
+#   * ``size error: request too large, try with a smaller file`` —
+#     file-attachment surface; accept both ASCII and fullwidth ``：``
+#     ``，`` because the CLI's localised builds emit either.
+# Match in the assembled reply text so the operator gets the friendly
+# error instead of the raw API string, and so the worker's existing
+# leak-suppression infra doesn't accidentally silence what should be
+# a user-facing failure.
 _REQUEST_TOO_LARGE_PATTERN: re.Pattern[str] = re.compile(
     r"(?:API Error:\s*)?Prompt is too long\b"
-    r"|input length and `max_tokens` exceed context limit",
+    r"|input length and `max_tokens` exceed context limit"
+    r"|size error\s*[:：]\s*request too large",
     re.IGNORECASE,
 )
 
@@ -128,6 +133,12 @@ def _looks_like_poisoned_session(text: str) -> bool:
         return False
     low = text.lower()
     return any(marker in low for marker in _POISONED_SESSION_MARKERS)
+
+
+def _looks_like_request_too_large(text: str) -> bool:
+    if not text:
+        return False
+    return _REQUEST_TOO_LARGE_PATTERN.search(text) is not None
 
 
 class AuditLog:
@@ -250,17 +261,11 @@ class ClaudeSession:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def _rewrite_if_request_too_large(self, result: TurnResult) -> TurnResult:
-        """PUF-264 reactive catch: when Anthropic surfaces a too-long
-        prompt at the API layer (system prompt + transcript + user
-        message inflate past the cap even when ``user_message`` alone
-        passes the pre-send check), Claude Code emits the verbatim
-        ``API Error: Prompt is too long`` string in the assembled
-        reply. Replace it with the friendly user-facing message + a
-        ``request_too_large=reactive`` metadata flag so the worker
-        treats this as a permanent input-side failure (no retry, no
-        ``api_error_abandoned`` flip — the user just needs to send a
-        smaller message)."""
-        if not result.reply or not _REQUEST_TOO_LARGE_PATTERN.search(result.reply):
+        """PUF-264 reactive catch: rewrite a verbatim Anthropic too-long
+        API error into the friendly user-facing message. No retry — the
+        user just needs to send a smaller message; a same-payload retry
+        would hit the same cap."""
+        if not _looks_like_request_too_large(result.reply):
             return result
         logger.warning(
             "agent %s: claude reply matched Prompt-is-too-long pattern; "
