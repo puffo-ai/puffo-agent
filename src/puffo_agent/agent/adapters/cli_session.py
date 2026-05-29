@@ -43,16 +43,8 @@ logger = logging.getLogger(__name__)
 AUDIT_FIELD_MAX = 2000
 
 
-# PUF-264: byte cap on user_message itself, enforced before we hand
-# the turn to claude. Anthropic's published request-body limit is
-# model-specific (~180-200KB across current Claude models); we cap at
-# 180KB to leave room for system prompt + tool definitions + headers,
-# all of which inflate the on-wire request beyond the user_message
-# byte count we see here. Catches the operator-reported case where a
-# user uploaded 10 PDFs and the agent inlined all of them into one
-# turn; the reactive ``_REQUEST_TOO_LARGE_PATTERN`` below catches the
-# residual cases where user_message alone is fine but the full
-# transcript-plus-system-prompt still trips Anthropic's cap.
+# 180KB leaves ~20KB headroom under Anthropic's ~200KB request cap
+# for system prompt + tools + headers.
 MAX_USER_MESSAGE_BYTES = 180 * 1000
 
 REQUEST_TOO_LARGE_FRIENDLY = (
@@ -60,17 +52,7 @@ REQUEST_TOO_LARGE_FRIENDLY = (
     "or split your message and try again."
 )
 
-# PUF-264 reactive catch — verbatim Anthropic API error strings:
-#   * ``Prompt is too long`` — Claude Code binary constant AQ
-#   * ``input length and `max_tokens` exceed context limit`` —
-#     parseable numeric form
-#   * ``size error: request too large, try with a smaller file`` —
-#     file-attachment surface; accept both ASCII and fullwidth ``：``
-#     ``，`` because the CLI's localised builds emit either.
-# Match in the assembled reply text so the operator gets the friendly
-# error instead of the raw API string, and so the worker's existing
-# leak-suppression infra doesn't accidentally silence what should be
-# a user-facing failure.
+# Fullwidth `：` `，` because some localised Claude Code builds emit them.
 _REQUEST_TOO_LARGE_PATTERN: re.Pattern[str] = re.compile(
     r"(?:API Error:\s*)?Prompt is too long\b"
     r"|input length and `max_tokens` exceed context limit"
@@ -261,10 +243,6 @@ class ClaudeSession:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def _rewrite_if_request_too_large(self, result: TurnResult) -> TurnResult:
-        """PUF-264 reactive catch: rewrite a verbatim Anthropic too-long
-        API error into the friendly user-facing message. No retry — the
-        user just needs to send a smaller message; a same-payload retry
-        would hit the same cap."""
         if not _looks_like_request_too_large(result.reply):
             return result
         logger.warning(
@@ -691,10 +669,6 @@ class ClaudeSession:
 
     async def _one_turn(self, user_message: str) -> TurnResult:
         assert self._proc is not None and self._proc.stdin is not None
-        # PUF-264 proactive pre-send: skip the subprocess round-trip
-        # entirely when user_message alone is already above the cap.
-        # No retry, no auth-failure, no api-error-abandoned — the
-        # operator's user sees the friendly reply and can resend.
         ums_bytes = len(user_message.encode("utf-8"))
         if ums_bytes > MAX_USER_MESSAGE_BYTES:
             logger.warning(

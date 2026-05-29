@@ -409,15 +409,9 @@ def test_one_turn_normal_reply_keeps_session(tmp_path):
 
 
 def test_one_turn_pre_send_check_short_circuits_oversized_user_message(tmp_path):
-    """user_message above MAX_USER_MESSAGE_BYTES must NOT spawn the
-    claude subprocess. We assert no stdin write happened + the friendly
-    reply landed + metadata flags the case so the worker can audit."""
     session = _make_session(tmp_path, audit=True)
 
     async def drive():
-        # _FakeProc with no stdout — if we ever read it the test hangs,
-        # which is the correct failure mode if the pre-send check
-        # regresses.
         session._proc = _FakeProc(stdout_lines=[])
         big = "x" * (MAX_USER_MESSAGE_BYTES + 1)
         return await session._one_turn(big)
@@ -426,18 +420,12 @@ def test_one_turn_pre_send_check_short_circuits_oversized_user_message(tmp_path)
     assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
     assert out.metadata.get("request_too_large") == "pre_send"
     assert out.metadata.get("user_message_bytes") == MAX_USER_MESSAGE_BYTES + 1
-    # Crucially: no stdin write happened (subprocess wasn't fed).
     assert session._proc.stdin.buffer == bytearray()
     events = _read_audit_events(tmp_path / "audit.log")
-    assert any(
-        e.get("event") == "turn.request_too_large_pre_send"
-        for e in events
-    )
+    assert any(e.get("event") == "turn.request_too_large_pre_send" for e in events)
 
 
 def test_one_turn_pre_send_check_passes_messages_at_or_below_cap(tmp_path):
-    """A user_message exactly at the cap must NOT short-circuit — only
-    strictly-over triggers. Pins the boundary."""
     result_evt = {
         "type": "result",
         "subtype": "success",
@@ -456,20 +444,12 @@ def test_one_turn_pre_send_check_passes_messages_at_or_below_cap(tmp_path):
 
     out = asyncio.run(drive())
     assert out.metadata.get("request_too_large") is None
-    # The subprocess was actually fed.
-    assert session._proc.stdin.buffer  # non-empty
+    assert session._proc.stdin.buffer
 
 
 def test_rewrite_if_request_too_large_matches_canonical_anthropic_string(tmp_path):
-    """The exact verbatim ``API Error: Prompt is too long`` message
-    Claude Code surfaces when Anthropic returns the input-too-long
-    error must be detected + replaced with the friendly version. Raw
-    string preserved in metadata for operator forensics."""
     session = _make_session(tmp_path, audit=True)
-    raw = (
-        "API Error: Prompt is too long\n\n"
-        "Request ID: req_011CtestabcDEF"
-    )
+    raw = "API Error: Prompt is too long\n\nRequest ID: req_011CtestabcDEF"
     result = TurnResult(
         reply=raw, input_tokens=42, output_tokens=0, tool_calls=3,
         metadata={"some_prior_flag": True},
@@ -479,30 +459,19 @@ def test_rewrite_if_request_too_large_matches_canonical_anthropic_string(tmp_pat
     assert out.metadata.get("request_too_large") == "reactive"
     assert out.metadata.get("original_reply") == raw
     assert out.metadata.get("some_prior_flag") is True
-    # Token counts + tool_calls preserved so cost accounting + metrics
-    # still reflect the turn that actually happened (per operator
-    # review on PR #53).
     assert out.input_tokens == 42
     assert out.tool_calls == 3
 
 
 def test_rewrite_if_request_too_large_matches_max_tokens_context_limit(tmp_path):
-    """Alternate Anthropic shape (parseable numeric form). Must also
-    trigger the rewrite so an operator never sees the raw API error."""
     session = _make_session(tmp_path, audit=False)
     raw = "input length and `max_tokens` exceed context limit: 199000 + 4000 > 200000"
-    result = TurnResult(reply=raw)
-    out = session._rewrite_if_request_too_large(result)
+    out = session._rewrite_if_request_too_large(TurnResult(reply=raw))
     assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
     assert out.metadata.get("request_too_large") == "reactive"
 
 
 def test_rewrite_if_request_too_large_matches_size_error_attachment_form(tmp_path):
-    """Third Anthropic surface: the file-attachment path emits
-    ``size error: request too large, try with a smaller file``.
-    Some localised CLI builds use fullwidth ``：`` / ``，`` — both
-    must trigger the rewrite so the operator sees the friendly copy
-    instead of the raw CLI surface."""
     session = _make_session(tmp_path, audit=False)
     for raw in (
         "size error: request too large, try with a smaller file",
@@ -514,14 +483,11 @@ def test_rewrite_if_request_too_large_matches_size_error_attachment_form(tmp_pat
 
 
 def test_rewrite_if_request_too_large_passes_through_normal_replies(tmp_path):
-    """Regression guard: a normal reply or a turn that mentions
-    'prompt' or 'long' in passing must NOT trigger the rewrite. The
-    regex is anchored on the verbatim Anthropic strings."""
     session = _make_session(tmp_path, audit=False)
     cases = [
         "Sure, here's the answer to your question.",
         "I will write a long prompt to test edge cases.",
-        "API Error: Request rejected (429)",  # rate-limit, NOT too-long
+        "API Error: Request rejected (429)",
         "",
     ]
     for raw in cases:
@@ -531,9 +497,6 @@ def test_rewrite_if_request_too_large_passes_through_normal_replies(tmp_path):
 
 
 def test_looks_like_request_too_large_predicate():
-    """Source-of-truth test for the regex behavior. Mirrors
-    ``test_looks_like_poisoned_session_matches_image_dimension_error``
-    — the predicate is the single point a downstream caller relies on."""
     assert _looks_like_request_too_large("API Error: Prompt is too long")
     assert _looks_like_request_too_large(
         "API Error: Prompt is too long\n\nRequest ID: req_011CtestabcDEF"
@@ -541,41 +504,26 @@ def test_looks_like_request_too_large_predicate():
     assert _looks_like_request_too_large(
         "input length and `max_tokens` exceed context limit: 199000 + 4000 > 200000"
     )
-    # Third surface: file-attachment path. Both ASCII and fullwidth
-    # punctuation forms must match.
     assert _looks_like_request_too_large(
         "size error: request too large, try with a smaller file"
     )
     assert _looks_like_request_too_large(
         "size error： request too large，try with a smaller file"
     )
-    # Case-insensitive (Anthropic's casing is stable but the binary
-    # has surfaced it in mixed shapes historically).
     assert _looks_like_request_too_large("api error: PROMPT IS TOO LONG")
     assert _looks_like_request_too_large("SIZE ERROR: REQUEST TOO LARGE, try later")
-    # Word boundary on "long" — "longer" / "longish" must not match.
     assert not _looks_like_request_too_large("Prompt is too longer than usual")
-    # Different API error class — rate-limit shape must not over-match.
     assert not _looks_like_request_too_large("API Error: Request rejected (429)")
-    # The phrase "request too large" without the size-error prefix
-    # must NOT trigger — covers the assistant casually referencing the
-    # error class in prose.
     assert not _looks_like_request_too_large(
         "Your previous request too large for the queue was retried."
     )
-    # Empty / no marker.
     assert not _looks_like_request_too_large("")
     assert not _looks_like_request_too_large("Sure, here's the answer.")
 
 
 def test_one_turn_pre_send_check_counts_utf8_bytes_not_chars(tmp_path):
-    """3-byte UTF-8 chars (CJK, emoji etc.) hit the cap at ~60k chars,
-    not 180k chars. Pins ``encode("utf-8")`` semantics so a future
-    refactor can't silently swap it for ``len(str)`` and let attachment
-    payloads through."""
     session = _make_session(tmp_path, audit=False)
     big_cjk = "好" * (MAX_USER_MESSAGE_BYTES // 3 + 1)
-    # The two guards that motivate the byte-based check.
     assert len(big_cjk) < MAX_USER_MESSAGE_BYTES
     assert len(big_cjk.encode("utf-8")) > MAX_USER_MESSAGE_BYTES
 
@@ -589,10 +537,6 @@ def test_one_turn_pre_send_check_counts_utf8_bytes_not_chars(tmp_path):
 
 
 def test_one_turn_pre_send_check_does_not_emit_turn_input_audit(tmp_path):
-    """A short-circuited pre-send must NOT write ``turn.input`` to the
-    audit log — no turn actually reached claude, and a misleading
-    ``turn.input`` entry would confuse operator forensics about whether
-    the payload was actually sent."""
     session = _make_session(tmp_path, audit=True)
 
     async def drive():
@@ -603,22 +547,11 @@ def test_one_turn_pre_send_check_does_not_emit_turn_input_audit(tmp_path):
     asyncio.run(drive())
     events = _read_audit_events(tmp_path / "audit.log")
     assert any(e.get("event") == "turn.request_too_large_pre_send" for e in events)
-    assert not any(e.get("event") == "turn.input" for e in events), (
-        "pre-send short-circuit must skip turn.input audit (no turn happened)"
-    )
+    assert not any(e.get("event") == "turn.input" for e in events)
 
 
 def test_run_turn_rewrites_canonical_too_long_reply(tmp_path):
-    """End-to-end wiring through ``run_turn``: a real claude reply
-    carrying the verbatim Anthropic error must come out as the friendly
-    string + ``request_too_large=reactive`` metadata. Pins the call to
-    ``_rewrite_if_request_too_large`` at the non-auth-error return path
-    — a refactor that drops the call would let the raw API error leak
-    to the user without breaking the unit tests."""
-    too_long = (
-        "API Error: Prompt is too long\n\n"
-        "Request ID: req_011CtestabcDEF"
-    )
+    too_long = "API Error: Prompt is too long\n\nRequest ID: req_011CtestabcDEF"
     lines = [
         (json.dumps({
             "type": "assistant",
@@ -642,24 +575,14 @@ def test_run_turn_rewrites_canonical_too_long_reply(tmp_path):
     assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
     assert out.metadata.get("request_too_large") == "reactive"
     assert out.metadata.get("original_reply") == too_long
-    # Token counts read from the result event survive the rewrite.
     assert out.input_tokens == 100
     events = _read_audit_events(tmp_path / "audit.log")
-    assert any(
-        e.get("event") == "turn.request_too_large_reactive"
-        for e in events
-    )
+    assert any(e.get("event") == "turn.request_too_large_reactive" for e in events)
 
 
 def test_run_turn_oversized_message_returns_friendly_without_burning_retries(
     tmp_path, monkeypatch,
 ):
-    """End-to-end pre-send path through ``run_turn``: an oversized
-    message must short-circuit on the FIRST attempt with the friendly
-    reply + ``pre_send`` metadata, NOT bleed into the auth-retry budget
-    (which would waste ~45s sleeping while the user already has a
-    correct answer). Pins the cheap-failure contract for the operator
-    side."""
     session = _make_session(tmp_path, audit=True)
     sleep_calls: list[float] = []
 
@@ -678,23 +601,12 @@ def test_run_turn_oversized_message_returns_friendly_without_burning_retries(
     out = asyncio.run(drive())
     assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
     assert out.metadata.get("request_too_large") == "pre_send"
-    # No retry sleeps — the friendly reply isn't an auth error, so the
-    # loop returns on the first attempt with zero backoff calls.
     assert sleep_calls == []
 
 
 def test_run_turn_auth_error_takes_precedence_over_too_large_rewrite(
     tmp_path, monkeypatch,
 ):
-    """A reply that matches BOTH ``_looks_like_auth_error`` AND
-    ``_looks_like_request_too_large`` must take the auth-retry path
-    (exhausts retries → empty reply + ``auth_failed=True``) rather than
-    short-circuit through the too-large rewrite. Pins the order of the
-    two checks at ``run_turn``'s return site — swapping them would let
-    a real auth failure be silently rewritten to the user-facing
-    friendly message."""
-    # Real Anthropic surfaces don't combine these, but the wiring is
-    # what's under test, not the surface.
     combined = "API Error: 401 Invalid API key. Prompt is too long."
     lines_template = [
         (json.dumps({
@@ -708,8 +620,6 @@ def test_run_turn_auth_error_takes_precedence_over_too_large_rewrite(
         }) + "\n").encode("utf-8"),
     ]
 
-    # Skip the AUTH_RETRY_BACKOFFS_SECONDS waits so the test takes ms
-    # not ~45s.
     async def no_sleep(_secs):
         return None
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
@@ -723,10 +633,6 @@ def test_run_turn_auth_error_takes_precedence_over_too_large_rewrite(
             return await session.run_turn("hello", "sysprompt")
 
     out = asyncio.run(drive())
-    # Auth-error path won: empty reply (shell suppresses post) +
-    # auth_failed metadata for the worker to flip runtime.health.
     assert out.reply == ""
     assert out.metadata.get("auth_failed") is True
-    # If too-large rewrite had taken precedence the reply would be the
-    # friendly string and request_too_large would be set.
     assert out.metadata.get("request_too_large") is None
