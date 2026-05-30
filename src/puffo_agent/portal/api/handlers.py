@@ -1541,6 +1541,29 @@ async def create_agent(request: web.Request) -> web.Response:
     if not validation.ok:
         return _create_reject(f"runtime: {validation.error}")
 
+    # PUF-268: operator-picked skill + MCP template ids. Each entry
+    # is a string template id from puffo-server's
+    # ``/v2/skill-templates`` / ``/v2/mcp-templates`` catalogs. The
+    # daemon resolves them to install metadata at spawn time
+    # (post-host-sync dedupe gate in ``local_cli._verify``). Missing-
+    # from-catalog logs a warning at spawn but doesn't block create —
+    # the operator may have removed a template between picker render
+    # and submit.
+    desired_skills = payload.get("desired_skills") or []
+    desired_mcps = payload.get("desired_mcps") or []
+    if not isinstance(desired_skills, list) or not all(
+        isinstance(s, str) and s for s in desired_skills
+    ):
+        return _create_reject(
+            "desired_skills must be a list of non-empty template-id strings",
+        )
+    if not isinstance(desired_mcps, list) or not all(
+        isinstance(s, str) and s for s in desired_mcps
+    ):
+        return _create_reject(
+            "desired_mcps must be a list of non-empty template-id strings",
+        )
+
     # On any failure tear the half-built dir down so the reconcile
     # loop doesn't keep retrying a half-provisioned agent.
     target = agent_dir(agent_id)
@@ -1565,6 +1588,8 @@ async def create_agent(request: web.Request) -> web.Response:
             memory_dir="memory",
             workspace_dir="workspace",
             triggers=TriggerRules(on_mention=True, on_dm=True),
+            desired_skills=list(desired_skills),
+            desired_mcps=list(desired_mcps),
             created_at=int(now_ms() / 1000),
         )
         cfg.save()

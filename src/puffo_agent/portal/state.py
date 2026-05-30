@@ -998,6 +998,14 @@ class AgentConfig:
     # project-level convention (.claude/CLAUDE.md, .claude/skills/) is
     # found automatically. Not user-configurable; owned by the adapter.
     triggers: TriggerRules = field(default_factory=TriggerRules)
+    # PUF-268: operator-picked skill + MCP template ids the daemon
+    # installs at spawn time AFTER host-sync (de-duped against
+    # whatever the operator's host already provides). Names are
+    # template ``id``s from puffo-server's ``/v2/skill-templates`` +
+    # ``/v2/mcp-templates`` catalogs. Empty lists are the default
+    # (back-compat with agents created before this field existed).
+    desired_skills: list[str] = field(default_factory=list)
+    desired_mcps: list[str] = field(default_factory=list)
     created_at: int = 0
 
     @classmethod
@@ -1061,6 +1069,8 @@ class AgentConfig:
                 on_mention=bool(triggers.get("on_mention", True)),
                 on_dm=bool(triggers.get("on_dm", True)),
             ),
+            desired_skills=list(raw.get("desired_skills") or []),
+            desired_mcps=list(raw.get("desired_mcps") or []),
             created_at=int(raw.get("created_at", 0)),
         )
 
@@ -1081,6 +1091,8 @@ class AgentConfig:
             "memory_dir": self.memory_dir,
             "workspace_dir": self.workspace_dir,
             "triggers": asdict(self.triggers),
+            "desired_skills": list(self.desired_skills),
+            "desired_mcps": list(self.desired_mcps),
         }
         _atomic_write_yaml(path, data)
 
