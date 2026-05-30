@@ -22,6 +22,8 @@ from puffo_agent.portal.credential_refresh import (
     CredentialRefresher,
     FileBackend,
     RefreshOutcome,
+    _build_probe_cmd,
+    _looks_like_model_not_found,
     _looks_like_rate_limit,
 )
 
@@ -771,3 +773,140 @@ def test_propagate_outcome_rate_limited_does_not_crash_without_event_loop(
     assert r._rate_limit_retry_task is None
     # Streak counter still advanced.
     assert r._consecutive_non_success == 1
+
+
+# ── model_not_found fallback latch ──────────────────────────────────────
+
+
+def test_looks_like_model_not_found_matches_canonical_signatures():
+    canonicals = [
+        '{"type":"not_found_error","message":"model: claude-haiku-4-5"}',
+        "API Error: model not found",
+        "API Error: model_not_found",
+        "Invalid model 'claude-haiku-4-5'",
+        "Model 'claude-haiku-4-5' does not exist",
+        "Model claude-haiku-4-5 is not available",
+    ]
+    for s in canonicals:
+        assert _looks_like_model_not_found("", s), f"missed canonical: {s!r}"
+    # Generic "not found" elsewhere (e.g. message 404) must NOT match.
+    benign = [
+        "404 not found",
+        "Message not found",
+        "API Error: Request rejected (429)",  # rate-limit, not model
+        "rate_limit_error",
+        "",
+    ]
+    for s in benign:
+        assert not _looks_like_model_not_found("", s), f"false positive: {s!r}"
+
+
+def test_build_probe_cmd_includes_model_by_default(monkeypatch):
+    monkeypatch.setattr(credential_refresh, "_probe_model_disabled", False)
+    cmd = _build_probe_cmd()
+    assert "--model" in cmd
+    assert cmd[cmd.index("--model") + 1] == REFRESH_PROBE_MODEL
+
+
+def test_build_probe_cmd_drops_model_when_latched(monkeypatch):
+    monkeypatch.setattr(credential_refresh, "_probe_model_disabled", True)
+    cmd = _build_probe_cmd()
+    assert "--model" not in cmd
+    # Other args unaffected.
+    assert "--dangerously-skip-permissions" in cmd
+    assert "--print" in cmd
+
+
+def test_filebackend_model_not_found_stderr_latches_probe(tmp_path, monkeypatch):
+    # The first model_not_found in stderr must (a) set the module latch
+    # so subsequent probes drop --model, AND (b) still classify the
+    # outcome as FAILED (counts toward streak; next tick uses default
+    # and should succeed, resetting the streak).
+    monkeypatch.setattr(credential_refresh, "_probe_model_disabled", False)
+    _write_creds(tmp_path, expires_in_seconds=5 * 60)
+    backend = FileBackend(host_home=tmp_path)
+
+    class _Proc:
+        returncode = 1
+        async def communicate(self):
+            return (
+                b"",
+                b'API Error: {"type":"not_found_error","message":"model: claude-haiku-4-5 not found"}\n',
+            )
+
+    async def fake_exec(*argv, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    outcome = asyncio.run(backend.refresh())
+    assert outcome is RefreshOutcome.FAILED
+    assert credential_refresh._probe_model_disabled is True
+
+
+def test_rate_limit_stderr_does_not_latch_probe(tmp_path, monkeypatch):
+    # A rate-limit response must NOT latch model-disabled — the model
+    # is fine, just throttled.
+    monkeypatch.setattr(credential_refresh, "_probe_model_disabled", False)
+    _write_creds(tmp_path, expires_in_seconds=5 * 60)
+    backend = FileBackend(host_home=tmp_path)
+
+    class _Proc:
+        returncode = 1
+        async def communicate(self):
+            return b"", b"API Error: Request rejected (429)\n"
+
+    async def fake_exec(*argv, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    asyncio.run(backend.refresh())
+    assert credential_refresh._probe_model_disabled is False
+
+
+def test_probe_uses_default_model_after_latch_persists_across_calls(
+    tmp_path, monkeypatch,
+):
+    # End-to-end through _tick: after the latch trips on call 1, call 2's
+    # subprocess argv must not include --model.
+    monkeypatch.setattr(credential_refresh, "_probe_model_disabled", False)
+    _write_creds(tmp_path, expires_in_seconds=5 * 60)
+    r = CredentialRefresher(host_home=tmp_path)
+
+    call_count = {"n": 0}
+    spawned_argvs: list = []
+
+    class _ProcLatch:
+        returncode = 1
+        async def communicate(self):
+            return b"", b"API Error: invalid model\n"
+
+    class _ProcOk:
+        returncode = 0
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*argv, **kwargs):
+        spawned_argvs.append(list(argv))
+        call_count["n"] += 1
+        return _ProcLatch() if call_count["n"] == 1 else _ProcOk()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    asyncio.run(r._tick())
+    asyncio.run(r._tick())
+    assert len(spawned_argvs) == 2
+    assert "--model" in spawned_argvs[0]
+    assert "--model" not in spawned_argvs[1]
+
+
+def test_refresh_probe_model_honors_env_var_override(monkeypatch):
+    # Reload the module with the env var set so the module-level
+    # constant picks it up. Verifies the operator escape hatch works.
+    import importlib
+    monkeypatch.setenv("PUFFO_AGENT_REFRESH_MODEL", "claude-sonnet-4-6-fake")
+    reloaded = importlib.reload(credential_refresh)
+    try:
+        assert reloaded.REFRESH_PROBE_MODEL == "claude-sonnet-4-6-fake"
+    finally:
+        # Restore the original module state for downstream tests.
+        monkeypatch.delenv("PUFFO_AGENT_REFRESH_MODEL", raising=False)
+        importlib.reload(credential_refresh)

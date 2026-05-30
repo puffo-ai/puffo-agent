@@ -75,7 +75,15 @@ REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 REFRESH_BROKEN_THRESHOLD = 2
 
 # Haiku to dodge per-model rate-limit windows on operator's Opus/Sonnet.
-REFRESH_PROBE_MODEL = "claude-haiku-4-5"
+# Override via env or auto-disable on model_not_found (see _probe_model_disabled).
+REFRESH_PROBE_MODEL = os.environ.get(
+    "PUFFO_AGENT_REFRESH_MODEL", "claude-haiku-4-5",
+)
+
+# Module-level latch: set True on the first ``model_not_found`` response,
+# then probes drop ``--model`` and use claude's default. Daemon restart
+# resets — fine, the worst case is one extra failed tick before re-latching.
+_probe_model_disabled = False
 
 # 5-15s randomised so fleet retries don't synchronise post rate-limit.
 RATE_LIMIT_FAST_RETRY_MIN_SECONDS = 5.0
@@ -92,16 +100,65 @@ _RATE_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bRepeated 529 Overloaded errors\b", re.IGNORECASE),
 )
 
+# Anthropic surfaces for "model not found / not available". Anchored on
+# the word ``model`` so we don't latch on generic "not_found" (e.g. a
+# 404 from a different endpoint should not disable the probe model).
+_MODEL_NOT_FOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'"type"\s*:\s*"not_found_error".*?\bmodel\b', re.IGNORECASE),
+    re.compile(r"\bmodel[_ -]+not[_ -]found\b", re.IGNORECASE),
+    re.compile(r"\binvalid[_ -]model\b", re.IGNORECASE),
+    re.compile(r"\bmodel\b.*?\b(?:does not exist|is not available|unknown)\b", re.IGNORECASE),
+)
+
 
 def _looks_like_rate_limit(out_tail: str, err_tail: str) -> bool:
     combined = f"{out_tail}\n{err_tail}"
     return any(p.search(combined) for p in _RATE_LIMIT_PATTERNS)
 
 
+def _looks_like_model_not_found(out_tail: str, err_tail: str) -> bool:
+    combined = f"{out_tail}\n{err_tail}"
+    return any(p.search(combined) for p in _MODEL_NOT_FOUND_PATTERNS)
+
+
+def _build_probe_cmd() -> list[str]:
+    # Drops --model after the latch trips (model_not_found in stderr).
+    # Shared by FileBackend + KeychainBackend.
+    cmd = ["claude", "--dangerously-skip-permissions"]
+    if not _probe_model_disabled:
+        cmd.extend(["--model", REFRESH_PROBE_MODEL])
+    cmd.extend([
+        "--print", "--max-turns", "1",
+        "--output-format", "stream-json", "--verbose",
+        "ok",
+    ])
+    return cmd
+
+
+def _maybe_disable_probe_model(out_tail: str, err_tail: str) -> None:
+    global _probe_model_disabled
+    if _probe_model_disabled:
+        return
+    if not _looks_like_model_not_found(out_tail, err_tail):
+        return
+    _probe_model_disabled = True
+    logger.warning(
+        "credential refresh probe: model %r not available — falling back "
+        "to claude's default for subsequent probes. Update "
+        "REFRESH_PROBE_MODEL (or set PUFFO_AGENT_REFRESH_MODEL env) to a "
+        "current cheap model when convenient.",
+        REFRESH_PROBE_MODEL,
+    )
+
+
 def _classify_failed_refresh(
     out_tail: str, err_tail: str, *, rc: int, elapsed: float, log_prefix: str,
 ) -> RefreshOutcome:
     # Shared rc!=0 classification used by FileBackend + KeychainBackend.
+    # Model-not-found check first: it's a permanent (per-daemon-life)
+    # state change, so it should latch even when the response also
+    # happens to look rate-limit-shaped.
+    _maybe_disable_probe_model(out_tail, err_tail)
     if _looks_like_rate_limit(out_tail, err_tail):
         logger.warning(
             "%s rate-limited rc=%d in %.1fs | stdout: %s | stderr: %s",
@@ -216,13 +273,7 @@ class FileBackend:
     async def refresh(self) -> RefreshOutcome:
         before = self.expires_in_seconds()
         env = {**os.environ, "HOME": str(self.host_home)}
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--model", REFRESH_PROBE_MODEL,
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-            "ok",
-        ]
+        cmd = _build_probe_cmd()
         started = time.time()
         try:
             # cwd=host_home so claude's project-resolution doesn't
@@ -503,13 +554,7 @@ class KeychainBackend:
         # UX) instead of wherever the daemon was launched from.
         host_home = Path.home()
         env = {**os.environ, "HOME": str(host_home)}
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--model", REFRESH_PROBE_MODEL,
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-            "ok",
-        ]
+        cmd = _build_probe_cmd()
         started = time.time()
         try:
             proc = await asyncio.create_subprocess_exec(

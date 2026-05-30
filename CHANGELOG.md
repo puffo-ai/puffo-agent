@@ -117,6 +117,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   instead of parking on the natural 120s poll. Back-to-back
   rate-limit hits coalesce into one pending retry task.
 
+  Model deprecation defence: a hardcoded ``REFRESH_PROBE_MODEL``
+  would silently break the day Anthropic retires Haiku 4.5. A
+  ``_probe_model_disabled`` module-level latch detects four
+  ``model_not_found`` surfaces in the probe stderr/stdout
+  (``"type":"not_found_error"`` + ``model`` / ``model not found`` /
+  ``model_not_found`` / ``invalid model`` / ``model X does not exist
+  | is not available | unknown``) and on first hit drops ``--model``
+  from subsequent probes, letting claude pick its current default.
+  The first tick after a deprecation counts as FAILED (streak=1),
+  the next tick succeeds with the default and resets — no spurious
+  ``refresh_broken`` flip. Operator can also override the constant
+  via ``PUFFO_AGENT_REFRESH_MODEL`` env var without a release.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the
