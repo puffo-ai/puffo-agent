@@ -366,3 +366,35 @@ async def test_update_profile_caps_on_utf8_bytes_not_codepoints():
         h["content-type"] = "application/json"
         r = await c.patch("/v1/agents/soul-bot/profile", data=body, headers=h)
         assert r.status == 400, await r.text()
+
+
+async def test_update_profile_caps_post_strip():
+    # PR #51 review item 2: the cap must check the same payload that
+    # storage writes. A user sending MAX + 20 bytes of content where
+    # the leading/trailing whitespace strips to exactly MAX bytes
+    # must be accepted — pre-fix, this was 400'd because the cap ran
+    # on the RAW payload while storage ran on the STRIPPED payload.
+    from puffo_agent.portal.api.handlers import MAX_PROFILE_SUMMARY_BYTES
+
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "soul-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    # Pad with whitespace so strip() lands exactly at the cap.
+    summary = " " * 10 + ("x" * MAX_PROFILE_SUMMARY_BYTES) + " " * 10
+    assert len(summary.encode("utf-8")) == MAX_PROFILE_SUMMARY_BYTES + 20
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"profile_summary": summary}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/soul-bot/profile", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/soul-bot/profile", data=body, headers=h)
+        assert r.status == 200, await r.text()

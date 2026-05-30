@@ -652,14 +652,19 @@ async def update_profile(request: web.Request) -> web.Response:
     if isinstance(new_profile_summary, str):
         # PUF-208 v2: cap before write so a stale UI / future automation
         # client can't drop a multi-megabyte soul on disk + into the
-        # next CLAUDE.md sync. UTF-8 byte count matches storage.
-        summary_bytes = len(new_profile_summary.encode("utf-8"))
+        # next CLAUDE.md sync. UTF-8 byte count matches storage. Cap
+        # the STRIPPED payload so the gate sees what storage actually
+        # writes — otherwise 10010 bytes of content surrounded by
+        # whitespace (strips to 9990) would 400 even though the disk
+        # write would have landed under the cap.
+        stripped_summary = new_profile_summary.strip()
+        summary_bytes = len(stripped_summary.encode("utf-8"))
         if summary_bytes > MAX_PROFILE_SUMMARY_BYTES:
             return _bad(
                 f"profile_summary is {summary_bytes} bytes; cap is "
                 f"{MAX_PROFILE_SUMMARY_BYTES}"
             )
-        _update_profile_summary(cfg, new_profile_summary.strip())
+        _update_profile_summary(cfg, stripped_summary)
 
     # Write agent.yml last so local state reflects what we asked
     # the server for, even if the sync warned.
