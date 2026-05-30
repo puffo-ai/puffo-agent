@@ -550,30 +550,9 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """PUF-258: clear ``runtime.health = "auth_failed"`` back to
-        ``"ok"`` after the daemon's CredentialRefresher reports a
-        successful refresh (or detects external rotation). Mirrors
-        PUF-255's recovery-clear pattern but at the refresh-success
-        event boundary instead of the turn-success boundary.
-
-        Only clears the ``auth_failed`` state.
-        ``api_error_abandoned`` is owned by PUF-255's
-        ``on_turn_success`` lane (recovery there happens via a
-        successful turn, not a credential refresh); leaving that
-        alone keeps the two health-state lifecycles cleanly
-        partitioned.
-
-        No-op when ``runtime.health`` is already ``"ok"`` /
-        ``"unknown"`` -- avoids needless ``runtime.save`` churn on
-        the steady-state hot path.
-
-        Optimistic-clear semantics: if the refresh succeeds but the
-        agent's next request still 401s (e.g., upstream revocation
-        beyond the refresh's scope), ``_handle_suppressed_reply``
-        re-flips ``runtime.health`` back to ``auth_failed`` on the
-        next leak detection. Same shape as PUF-255's optimistic
-        clear-on-turn-success.
-        """
+        # Symmetric to _clear_api_error_abandoned_if_recoverable but
+        # fired on refresh-success (not turn-success). Optimistic: if
+        # the next request still 401s, _handle_suppressed_reply re-sets.
         if runtime.health != "auth_failed":
             return
         runtime.health = "ok"

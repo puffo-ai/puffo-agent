@@ -628,11 +628,6 @@ class CredentialRefresher:
             self.host_credentials = backend.host_credentials
         self._refresh_request = asyncio.Event()
         self._agent_homes: set[Path] = set()
-        # PUF-258: per-Worker callbacks fired after a successful refresh
-        # (regular tick OR external-rotation detection) so each Worker
-        # can clear its ``runtime.health == "auth_failed"`` optimistically.
-        # Mirrors the ``register_agent`` shape but operates on the
-        # in-memory Worker reference instead of a disk path.
         self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
 
@@ -643,13 +638,6 @@ class CredentialRefresher:
         self._agent_homes.discard(Path(agent_home))
 
     def register_on_refresh_success(self, callback: Callable[[], None]) -> None:
-        """PUF-258: subscribe to refresh-success notifications.
-
-        Fired after every successful refresh OR external-rotation
-        detection so subscribers (Workers) can clear an
-        ``auth_failed`` flag optimistically. Callbacks are sync; any
-        exception is caught + logged so a buggy subscriber doesn't
-        break the refresh loop."""
         self._on_refresh_success.append(callback)
 
     def unregister_on_refresh_success(self, callback: Callable[[], None]) -> None:
@@ -659,12 +647,7 @@ class CredentialRefresher:
             pass
 
     def _fire_refresh_success(self) -> None:
-        """Dispatch refresh-success to every registered subscriber.
-
-        Callback exceptions are swallowed + logged -- the refresh
-        loop has already done its real work (rotated credentials,
-        synced views); a Worker callback raising here mustn't
-        cascade into the daemon's refresh cadence."""
+        # list(...) defensive copy: callback may (un)register during dispatch.
         for cb in list(self._on_refresh_success):
             try:
                 cb()
@@ -758,10 +741,6 @@ class CredentialRefresher:
                 continue
             if rotated:
                 self._sync_views()
-                # PUF-258: external rotation = credentials are fresh
-                # without us calling refresh, so still notify Workers
-                # to clear ``auth_failed`` -- next request sees the
-                # rotated cred via _sync_views above.
                 self._fire_refresh_success()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
@@ -797,17 +776,10 @@ class CredentialRefresher:
     async def _refresh_now(
         self, *, expires_in: int | None, by_agent: bool,
     ) -> None:
-        """Single-writer refresh through the backend. The
-        ``asyncio.Lock`` is what makes the rotating-RT race
-        unwinnable: a second caller can't see an in-flight rotation
-        mid-write.
-
-        Fire ``_fire_refresh_success`` only when the backend reports
-        ``RefreshOutcome.REFRESHED`` (PR #48 review): UNCHANGED /
-        FAILED outcomes mean the on-disk token didn't actually
-        rotate, so optimistically clearing ``auth_failed`` on those
-        would oscillate ``auth_failed → ok → auth_failed`` every
-        poll cycle until the underlying refresh recovers."""
+        """Single-writer refresh through the backend; the lock makes
+        the rotating-RT race unwinnable."""
+        # Fire only on REFRESHED: UNCHANGED / FAILED leave the on-disk
+        # token unchanged, so clearing auth_failed would oscillate.
         outcome: RefreshOutcome | None = None
         async with self._lock:
             before = self.expires_in_seconds()

@@ -263,10 +263,6 @@ class Daemon:
     ) -> None:
         refresher = self._refresher_for(agent_cfg)
         refresher.register_agent(agent_home_dir(agent_cfg.id))
-        # PUF-258: subscribe to refresh-success so the Worker can clear
-        # ``runtime.health = "auth_failed"`` optimistically when the
-        # daemon finishes a credential rotation. Callback identity is
-        # stashed on the worker so ``_stop_worker`` can unregister it.
         agent_id = agent_cfg.id
 
         def on_refresh_success() -> None:
@@ -275,6 +271,7 @@ class Daemon:
             )
 
         refresher.register_on_refresh_success(on_refresh_success)
+        # Stash callback identity for _stop_worker's unregister.
         worker._refresh_success_callback = on_refresh_success
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
@@ -302,9 +299,6 @@ class Daemon:
             home = agent_home_dir(agent_id)
             self.refresher.unregister_agent(home)
             self.codex_refresher.unregister_agent(home)
-            # PUF-258: unregister the refresh-success callback from
-            # whichever refresher was registered with. Same
-            # idempotent-on-both pattern as ``unregister_agent``.
             cb = getattr(worker, "_refresh_success_callback", None)
             if cb is not None:
                 self.refresher.unregister_on_refresh_success(cb)
