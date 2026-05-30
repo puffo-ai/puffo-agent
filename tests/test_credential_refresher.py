@@ -301,12 +301,8 @@ def test_refresh_token_request_flag_round_trip(tmp_path, monkeypatch):
 
 
 def _make_agent_runtime(home_root: Path, agent_id: str) -> Path:
-    """Seed an ``agents/<id>/runtime.json`` under ``home_root`` so
-    ``RuntimeState.load(agent_id)`` resolves via ``PUFFO_AGENT_HOME``."""
     from puffo_agent.portal.state import RuntimeState
     rs = RuntimeState(status="running", started_at=int(time.time()))
-    # Need PUFFO_AGENT_HOME to be set before save() — the caller's
-    # monkeypatch handles that.
     rs.save(agent_id)
     return home_root / "agents" / agent_id / "runtime.json"
 
@@ -314,12 +310,9 @@ def _make_agent_runtime(home_root: Path, agent_id: str) -> Path:
 def _make_refresher_with_agent(
     tmp_path: Path, monkeypatch, *, agent_id: str = "agent-puf265",
 ) -> tuple[CredentialRefresher, str]:
-    """Build a refresher whose registered agent maps to a real
-    runtime.json under ``PUFFO_AGENT_HOME=tmp_path``."""
     from puffo_agent.portal.state import agent_home_dir
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    # Seed runtime + creds.
     _write_creds(tmp_path / "host", expires_in_seconds=3600)
     _make_agent_runtime(tmp_path, agent_id)
 
@@ -348,18 +341,12 @@ def test_propagate_outcome_failed_increments_counter(tmp_path, monkeypatch):
 
 
 def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch):
-    """N consecutive UNCHANGED|FAILED outcomes must flip every
-    registered agent's ``runtime.health`` to ``"refresh_broken"`` with a
-    human-readable ``runtime.error``. Below threshold, health stays
-    untouched."""
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    # 1 non-success: below threshold, no flip.
     r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health != "refresh_broken"
-    # 2nd consecutive non-success hits the threshold → flip.
     assert REFRESH_BROKEN_THRESHOLD == 2
     r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
@@ -370,16 +357,11 @@ def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch)
 
 
 def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
-    """A REFRESHED outcome after the flip must clear ``refresh_broken``
-    back to ``"ok"`` AND reset the counter, so the next streak starts
-    fresh."""
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    # Drive the flip.
     for _ in range(REFRESH_BROKEN_THRESHOLD):
         r._propagate_outcome(RefreshOutcome.UNCHANGED)
     assert RuntimeState.load(aid).health == "refresh_broken"
-    # Recover.
     r._propagate_outcome(RefreshOutcome.REFRESHED)
     rs = RuntimeState.load(aid)
     assert rs is not None
@@ -389,24 +371,13 @@ def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
 
 
 def test_refresh_broken_cleared_after_daemon_restart(tmp_path, monkeypatch):
-    """PR #52 review: after a daemon restart the in-memory streak
-    counter starts at 0 while the registered agents' on-disk
-    ``runtime.health`` may still be ``refresh_broken`` from the
-    previous daemon's flip. The next REFRESHED tick MUST clear the
-    disk-state even though ``_consecutive_non_success == 0`` —
-    otherwise agents stay stuck at ``[refresh_broken]`` indefinitely
-    even though refresh has recovered."""
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    # Simulate post-restart state: disk says refresh_broken (left
-    # over from previous daemon's flip); in-memory streak is zero
-    # (fresh refresher instance).
     rs = RuntimeState.load(aid)
     rs.health = "refresh_broken"
     rs.error = "left over from previous daemon"
     rs.save(aid)
     assert r._consecutive_non_success == 0
-    # First successful refresh after restart.
     r._propagate_outcome(RefreshOutcome.REFRESHED)
     rs = RuntimeState.load(aid)
     assert rs.health == "ok"
@@ -414,26 +385,17 @@ def test_refresh_broken_cleared_after_daemon_restart(tmp_path, monkeypatch):
 
 
 def test_refresh_broken_does_not_overwrite_auth_failed(tmp_path, monkeypatch):
-    """``auth_failed`` is a stronger downstream signal — refresh_broken
-    is the upstream warning that the daemon's refresh mechanism is
-    dead. Once any agent has actually been blocked by a 401 and worker
-    flipped it to ``auth_failed``, refresh_broken must NOT downgrade
-    that signal."""
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    # Seed auth_failed on the agent first.
     rs = RuntimeState.load(aid)
     rs.health = "auth_failed"
     rs.error = "401 from a real turn"
     rs.save(aid)
-    # Drive the would-be flip.
     for _ in range(REFRESH_BROKEN_THRESHOLD):
         r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
-    assert rs.health == "auth_failed", (
-        "refresh_broken should not overwrite auth_failed"
-    )
+    assert rs.health == "auth_failed"
     assert rs.error == "401 from a real turn"
 
 
@@ -452,11 +414,6 @@ def test_refresh_broken_does_not_overwrite_api_error_abandoned(
 
 
 def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch):
-    """Regression for the PUF-265 root cause: the caller at line 779
-    used to do ``await self.backend.refresh()`` without capturing the
-    outcome, so UNCHANGED silently looked like REFRESHED to
-    ``_refresh_now``. This test pins the new contract — outcome MUST
-    feed ``_propagate_outcome`` for the counter + flip to work."""
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
 
     captured: list[RefreshOutcome] = []
@@ -482,10 +439,6 @@ def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch)
 
 
 def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
-    """A backend that raises during ``refresh()`` must be counted as a
-    non-success outcome (FAILED) so a daemon-side bug or transient
-    subprocess error contributes to the refresh_broken streak instead
-    of being silently swallowed."""
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
 
     captured: list[RefreshOutcome] = []
@@ -511,12 +464,8 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
 
 
 def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, caplog):
-    """The UNCHANGED branch must dump ``stdout`` + ``stderr`` tails
-    (real-fix discrimination prereq: differentiates 2a CLI-stopped-
-    refreshing from 2b Linux-writeback-failure on the next in-the-wild
-    event without needing another roundtrip)."""
     from puffo_agent.portal.credential_refresh import FileBackend
-    _write_creds(tmp_path, expires_in_seconds=3600)  # advance==no-advance both fine; we force the branch
+    _write_creds(tmp_path, expires_in_seconds=3600)
     backend = FileBackend(host_home=tmp_path)
 
     class _Proc:
@@ -537,8 +486,6 @@ def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, cap
 
 
 def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
-    """When N consecutive non-success outcomes hit, every registered
-    agent gets the flip — not just the first one in the set."""
     from puffo_agent.portal.state import RuntimeState, agent_home_dir
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
     _write_creds(tmp_path / "host", expires_in_seconds=3600)
@@ -554,3 +501,74 @@ def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
 
     assert RuntimeState.load("agent-alpha").health == "refresh_broken"
     assert RuntimeState.load("agent-beta").health == "refresh_broken"
+
+
+def test_refresh_broken_flip_is_idempotent_past_threshold(tmp_path, monkeypatch):
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    rs_after_flip = RuntimeState.load(aid)
+    assert rs_after_flip.health == "refresh_broken"
+    initial_error = rs_after_flip.error
+    # Drive 3 more non-success ticks. In-memory counter climbs but the
+    # already-refresh_broken agent's disk state must not be re-written
+    # (avoids log spam + redundant disk writes once flipped).
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    rs_later = RuntimeState.load(aid)
+    assert rs_later.health == "refresh_broken"
+    # Error message still reports "saw 2 consecutive ..." not 5 — the
+    # inner-loop guard `health == "refresh_broken": continue` blocked
+    # the re-write.
+    assert rs_later.error == initial_error
+    assert r._consecutive_non_success == 5
+
+
+def test_refresh_broken_does_not_touch_unregistered_agents(tmp_path, monkeypatch):
+    from puffo_agent.portal.state import RuntimeState, agent_home_dir
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    _write_creds(tmp_path / "host", expires_in_seconds=3600)
+    _make_agent_runtime(tmp_path, "agent-stays")
+    _make_agent_runtime(tmp_path, "agent-leaves")
+
+    r = CredentialRefresher(host_home=tmp_path / "host")
+    r.register_agent(agent_home_dir("agent-stays"))
+    r.register_agent(agent_home_dir("agent-leaves"))
+    r.unregister_agent(agent_home_dir("agent-leaves"))
+
+    for _ in range(REFRESH_BROKEN_THRESHOLD):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+
+    assert RuntimeState.load("agent-stays").health == "refresh_broken"
+    assert RuntimeState.load("agent-leaves").health != "refresh_broken"
+
+
+def test_refreshed_outcome_does_not_lift_unrelated_health_to_ok(
+    tmp_path, monkeypatch,
+):
+    # _clear_refresh_broken runs on every REFRESHED. An agent currently
+    # at "unknown" (no probe yet) must NOT be silently lifted to "ok" —
+    # the inner-loop guard `health != "refresh_broken": continue` is
+    # what prevents that.
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    rs_before = RuntimeState.load(aid)
+    assert rs_before.health == "unknown"
+    r._propagate_outcome(RefreshOutcome.REFRESHED)
+    rs_after = RuntimeState.load(aid)
+    assert rs_after.health == "unknown"
+    assert rs_after.error == ""
+
+
+def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch):
+    from puffo_agent.portal.state import RuntimeState
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    rs = RuntimeState.load(aid)
+    assert rs.health == "refresh_broken"
+    # The flip message reports the LATEST outcome class — UNCHANGED
+    # then FAILED → "failed", not "unchanged".
+    assert "failed" in rs.error

@@ -68,11 +68,8 @@ REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
-# PUF-265: how many consecutive non-success refresh outcomes
-# (UNCHANGED | FAILED) before flipping registered agents'
-# ``runtime.health`` to ``"refresh_broken"``. 2 = ~4 min of dead refresh
-# at the 120s poll cadence; small enough to surface fast, large enough
-# that a single transient subprocess hiccup doesn't false-positive.
+# 2 ticks ≈ 4 min @ 120s poll: surfaces fast, doesn't false-positive on
+# a single transient subprocess hiccup.
 REFRESH_BROKEN_THRESHOLD = 2
 
 # Codex's OAuth access_token is a JWT — the only authoritative expiry
@@ -220,10 +217,6 @@ class FileBackend:
             )
             return RefreshOutcome.FAILED
         if before is not None and after is not None and after <= before:
-            # PUF-265: dump stdout/stderr on UNCHANGED so the real-fix
-            # PR can discriminate sub-hypothesis 2a (claude CLI stopped
-            # rotating under --print) from 2b (Linux-specific writeback
-            # path failure) from a single in-the-wild event.
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
             logger.error(
@@ -643,10 +636,6 @@ class CredentialRefresher:
         self._agent_homes: set[Path] = set()
         self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
-        # PUF-265: consecutive UNCHANGED|FAILED outcome streak. Resets
-        # on the next REFRESHED outcome. Used to gate the
-        # ``runtime.health="refresh_broken"`` flip so a single
-        # transient hiccup doesn't false-positive registered agents.
         self._consecutive_non_success = 0
 
     def register_agent(self, agent_home: Path) -> None:
@@ -825,13 +814,6 @@ class CredentialRefresher:
             self._fire_refresh_success()
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
-        """PUF-265: track consecutive non-success outcomes and surface
-        ``runtime.health="refresh_broken"`` on every registered agent
-        once the streak hits ``REFRESH_BROKEN_THRESHOLD``. Cleared by
-        the next REFRESHED outcome. Does not overwrite ``auth_failed``
-        / ``api_error_abandoned`` — those are stronger downstream
-        signals and the operator's recovery action (``claude /login``
-        then ``agent resume``) is identical."""
         if outcome is RefreshOutcome.REFRESHED:
             if self._consecutive_non_success > 0:
                 logger.info(
@@ -840,14 +822,10 @@ class CredentialRefresher:
                     "registered agents",
                     self._consecutive_non_success,
                 )
-            # PR #52 review: always clear on success — not just when the
-            # in-memory streak was non-zero. A daemon restart after the
-            # flip resets the counter to 0 while leaving the disk-state
-            # ``refresh_broken``; without the unconditional clear, the
-            # next successful refresh would never unstick those agents.
-            # ``_clear_refresh_broken`` is idempotent (per-agent guard on
-            # ``rs.health != "refresh_broken"``) so the always-call is
-            # cheap when there's nothing to clear.
+            # Always clear: a daemon restart resets the in-memory counter
+            # to 0 while leaving on-disk ``refresh_broken`` from the
+            # previous instance — without the unconditional call those
+            # agents stay stuck. _clear_refresh_broken is idempotent.
             self._clear_refresh_broken()
             self._consecutive_non_success = 0
             return
@@ -875,9 +853,9 @@ class CredentialRefresher:
                 continue
             if rs is None:
                 continue
-            if rs.health in ("auth_failed", "api_error_abandoned"):
-                continue
-            if rs.health == "refresh_broken":
+            if rs.health in (
+                "auth_failed", "api_error_abandoned", "refresh_broken",
+            ):
                 continue
             rs.health = "refresh_broken"
             rs.error = msg
