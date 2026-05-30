@@ -343,11 +343,13 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
         cmd = spec.get("command")
         if not isinstance(cmd, str) or not cmd:
             continue
-        out[name] = {
-            "command": cmd,
-            "args": list(spec.get("args") or []),
-            "env": dict(spec.get("env") or {}),
-        }
+        # args / env are defensively typed: a hostile host config with
+        # ``args = "x"`` would otherwise split into chars via list(str).
+        raw_args = spec.get("args")
+        args = list(raw_args) if isinstance(raw_args, list) else []
+        raw_env = spec.get("env")
+        env = dict(raw_env) if isinstance(raw_env, dict) else {}
+        out[name] = {"command": cmd, "args": args, "env": env}
     return out
 
 

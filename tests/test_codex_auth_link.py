@@ -249,3 +249,35 @@ def test_read_host_codex_mcp_servers_drops_non_dict_spec(tmp_path):
     )
     out = read_host_codex_mcp_servers(tmp_path)
     assert set(out) == {"ok"}
+
+
+def test_read_host_codex_mcp_servers_coerces_non_list_args_to_empty(tmp_path):
+    # `args = "string"` is parseable TOML but semantically wrong. Without
+    # the isinstance(raw_args, list) guard, `list(str)` would split into
+    # chars and the per-agent config would emit a nonsense argv.
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        '[mcp_servers.weird]\n'
+        'command = "/bin/x"\n'
+        'args = "not_a_list"\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert out["weird"]["args"] == []
+
+
+def test_read_host_codex_mcp_servers_coerces_non_dict_env_to_empty(tmp_path):
+    # `env = "string"` would crash dict(str) without the
+    # isinstance(raw_env, dict) guard.
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        '[mcp_servers.weird]\n'
+        'command = "/bin/x"\n'
+        'args = []\n'
+        'env = "not_a_table"\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert out["weird"]["env"] == {}
