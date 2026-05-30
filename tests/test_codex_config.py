@@ -1,9 +1,4 @@
-"""Phase 4 tests — codex config.toml writer.
-
-Tomllib is stdlib in Python 3.11+ so we round-trip what we wrote to
-make sure the hand-rolled emitter actually produces valid TOML and
-preserves every field codex looks at (command / args / env).
-"""
+"""Phase 4 tests — codex config.toml writer."""
 
 from __future__ import annotations
 
@@ -14,7 +9,11 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.mcp.config import write_codex_mcp_config
+from puffo_agent.mcp.config import (
+    _toml_escape,
+    _toml_key,
+    write_codex_mcp_config,
+)
 
 
 def _read_toml(path: Path) -> dict:
@@ -82,8 +81,6 @@ def test_paths_with_quotes_and_backslashes(tmp_path):
 
 
 def test_extra_servers_emitted_alongside_puffo(tmp_path):
-    """Host has 2 MCP entries + puffo configured → emitted TOML has all
-    three blocks. Existing host command/args/env preserved verbatim."""
     dest = tmp_path / "config.toml"
     extras = {
         "filesystem": {
@@ -118,9 +115,7 @@ def test_extra_servers_emitted_alongside_puffo(tmp_path):
 
 
 def test_extra_servers_pass_through_when_puffo_unconfigured(tmp_path):
-    """Operator running a codex agent without puffo_core configured
-    still gets the host MCP catalog. Pre-PUF-266 behavior wrote only
-    the auth-pin line; we now mirror host MCPs too."""
+    # Codex agent without puffo_core still inherits the host catalog.
     dest = tmp_path / "config.toml"
     extras = {
         "filesystem": {
@@ -137,11 +132,8 @@ def test_extra_servers_pass_through_when_puffo_unconfigured(tmp_path):
 
 
 def test_extra_servers_named_puffo_is_shadowed_by_puffo_entry(tmp_path):
-    """If the host already has an entry named ``puffo`` (e.g., operator
-    installed a third-party puffo MCP), the daemon's puffo entry wins.
-    Otherwise we'd have two ``[mcp_servers.puffo]`` blocks which is
-    invalid TOML AND the operator's third-party version could shadow
-    our real one."""
+    # Daemon's puffo entry wins over a host-side `[mcp_servers.puffo]`
+    # — duplicate TOML keys would be invalid + host could shadow ours.
     dest = tmp_path / "config.toml"
     extras = {
         "puffo": {
@@ -168,9 +160,7 @@ def test_extra_servers_named_puffo_is_shadowed_by_puffo_entry(tmp_path):
 
 
 def test_no_extras_unchanged_from_pre_puf266(tmp_path):
-    """Without extra_servers (default) the emitted document matches
-    the pre-PUF-266 shape exactly. Regression guard for callers that
-    haven't been migrated to pass extra_servers yet."""
+    # Default-args regression guard for callers not yet migrated.
     dest = tmp_path / "config.toml"
     write_codex_mcp_config(
         dest,
@@ -182,13 +172,36 @@ def test_no_extras_unchanged_from_pre_puf266(tmp_path):
     assert list(doc["mcp_servers"]) == ["puffo"]
 
 
-# ── PR #54 review item 4b: TOML-key escape for non-bare-charset names ──
+# ── _toml_key / _toml_escape unit-level coverage ──
+
+
+def test_toml_key_bare_charset():
+    # Pin the bare-key acceptance set.
+    for name in ("filesystem", "fs-1", "fs_1", "FS", "abc123", "_x", "-x"):
+        assert _toml_key(name) == name, f"bare-key rejected: {name!r}"
+
+
+def test_toml_key_non_bare_quoted():
+    # Anything outside [A-Za-z0-9_-] must be wrapped + escape-applied.
+    assert _toml_key("my.server") == '"my.server"'
+    assert _toml_key("name with spaces") == '"name with spaces"'
+    assert _toml_key('quoted"name') == '"quoted\\"name"'
+    assert _toml_key("back\\slash") == '"back\\\\slash"'
+
+
+def test_toml_escape_metacharacters():
+    # Only backslash + double-quote are escaped; others passthrough.
+    assert _toml_escape("plain") == "plain"
+    assert _toml_escape('a"b') == 'a\\"b'
+    assert _toml_escape("a\\b") == "a\\\\b"
+    assert _toml_escape("\\\"") == '\\\\\\"'  # backslash then quote
+    # Unicode + non-ASCII passes through unmodified.
+    assert _toml_escape("café") == "café"
 
 
 def test_extra_servers_with_dot_in_name_quotes_the_key(tmp_path):
-    """A host entry named ``my.server`` MUST emit
-    ``[mcp_servers."my.server"]`` (quoted basic-string key), not
-    ``[mcp_servers.my.server]`` which TOML parses as nested tables."""
+    # `my.server` must NOT parse as nested tables (TOML would otherwise
+    # create `mcp_servers.my.server` accidentally).
     dest = tmp_path / "config.toml"
     write_codex_mcp_config(
         dest,
@@ -200,20 +213,12 @@ def test_extra_servers_with_dot_in_name_quotes_the_key(tmp_path):
     )
     doc = _read_toml(dest)
     servers = doc.get("mcp_servers") or {}
-    assert "my.server" in servers, (
-        "key with `.` got misparsed as nested tables — _toml_key "
-        "didn't quote-escape"
-    )
-    assert "my" not in servers, (
-        "TOML was emitted bare, creating accidental nested tables"
-    )
+    assert "my.server" in servers
+    assert "my" not in servers
     assert servers["my.server"]["command"] == "/bin/x"
 
 
 def test_extra_servers_with_bare_name_left_unquoted(tmp_path):
-    """Conversely, a bare-charset name (``[A-Za-z0-9_-]+``) must emit
-    without surrounding quotes — cosmetic but matches operator-written
-    config style."""
     dest = tmp_path / "config.toml"
     write_codex_mcp_config(
         dest,
@@ -224,3 +229,21 @@ def test_extra_servers_with_bare_name_left_unquoted(tmp_path):
     raw = dest.read_text(encoding="utf-8")
     assert "[mcp_servers.filesystem-1]" in raw
     assert '[mcp_servers."filesystem-1"]' not in raw
+
+
+def test_env_keys_with_dots_are_quoted(tmp_path):
+    # Symmetry: env keys go through _toml_key too, so weird names like
+    # `MY.VAR` don't become nested tables inside the env subtable.
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(
+        dest,
+        extra_servers={
+            "fs": {
+                "command": "/bin/x",
+                "args": [],
+                "env": {"MY.VAR": "value"},
+            },
+        },
+    )
+    doc = _read_toml(dest)
+    assert doc["mcp_servers"]["fs"]["env"]["MY.VAR"] == "value"

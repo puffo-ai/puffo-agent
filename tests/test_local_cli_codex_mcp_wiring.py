@@ -1,10 +1,6 @@
-"""PUF-266 PR #54 review item 1: integration test that pins
-``_ensure_codex_session`` reads host MCPs via
-``read_host_codex_mcp_servers`` and forwards them through
-``write_codex_mcp_config(extra_servers=...)``. The unit-level isolation
-tests (``test_codex_config.py`` + ``test_codex_auth_link.py``) cover
-each side; this one defends against a future refactor that drops the
-``extra_servers=host_mcps`` parameter without breaking either side."""
+"""PUF-266 wiring integration: _ensure_codex_session reads host MCPs
+and forwards them to write_codex_mcp_config. Unit tests cover each side
+in isolation; this defends the wiring between them."""
 
 from __future__ import annotations
 
@@ -26,10 +22,6 @@ def _make_adapter(
     *,
     puffo_core_env: dict | None = None,
 ) -> LocalCLIAdapter:
-    """Build a cli-local adapter configured for codex without spawning
-    the subprocess. Caller takes the adapter through
-    ``_ensure_codex_session`` and inspects the config.toml that
-    ``write_codex_mcp_config`` lands on disk."""
     agent_id = "agent-puf266-wiring"
     adapter = LocalCLIAdapter(
         agent_id=agent_id,
@@ -56,11 +48,8 @@ def _seed_host_codex_config(host_home: Path, body: str) -> Path:
 def test_ensure_codex_session_merges_host_mcps_into_config_toml(
     tmp_path, monkeypatch,
 ):
-    """``_ensure_codex_session`` must read the host's
-    ``~/.codex/config.toml`` MCP servers and pass them through to the
-    per-agent ``config.toml`` write. Wiring guard: future refactor that
-    drops the ``extra_servers=host_mcps`` parameter would silently
-    regress the operator-host-MCP merge — this test breaks loudly."""
+    # Pins wiring: future refactor dropping extra_servers=host_mcps
+    # would silently regress operator-host-MCP merge.
     host_home = tmp_path / "host"
     host_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
@@ -76,11 +65,8 @@ def test_ensure_codex_session_merges_host_mcps_into_config_toml(
         'FS_LOG_LEVEL = "info"\n',
     )
 
-    # PUF-266 wired through agent_id "agent-puf266-wiring"; the helper
-    # writes config.toml then tries to spawn codex. The spawn fails
-    # (no codex binary in test env / no host auth.json) BEFORE the
-    # session is returned — but the config.toml IS already on disk
-    # by then, which is what we're verifying.
+    # _ensure_codex_session writes config.toml THEN tries to spawn
+    # codex; spawn fails in test env but the file is already on disk.
     adapter = _make_adapter(
         tmp_path,
         puffo_core_env={
@@ -96,14 +82,10 @@ def test_ensure_codex_session_merges_host_mcps_into_config_toml(
 
     doc = tomllib.loads(config_toml.read_text(encoding="utf-8"))
     servers = doc.get("mcp_servers") or {}
-    assert "filesystem" in servers, (
-        "host MCP entry didn't make it into the per-agent config.toml — "
-        "_ensure_codex_session may have dropped extra_servers=host_mcps"
-    )
+    assert "filesystem" in servers
     assert servers["filesystem"]["command"] == "/usr/local/bin/mcp-fs"
     assert servers["filesystem"]["args"] == ["--root", "/Users/op"]
     assert servers["filesystem"]["env"]["FS_LOG_LEVEL"] == "info"
-    # Puffo entry lands alongside.
     assert "puffo" in servers
     assert servers["puffo"]["env"]["PUFFO_CORE_SLUG"] == "alice"
 
@@ -111,10 +93,6 @@ def test_ensure_codex_session_merges_host_mcps_into_config_toml(
 def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
     tmp_path, monkeypatch,
 ):
-    """PR #54 review item 2: operator-set ``$CODEX_HOME`` must be read
-    instead of ``~/.codex``. Without this, an operator who keeps their
-    codex config at a non-default location silently gets an empty host
-    MCP catalog merged into agents."""
     host_home = tmp_path / "host"
     custom_codex = tmp_path / "custom-codex"
     host_home.mkdir()
@@ -122,7 +100,7 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
     monkeypatch.setenv("CODEX_HOME", str(custom_codex))
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
 
-    # Seed the CUSTOM location, NOT the default ~/.codex.
+    # Seed CUSTOM location, NOT default ~/.codex.
     custom_codex.mkdir()
     (custom_codex / "config.toml").write_text(
         '[mcp_servers.fs_custom]\n'
@@ -130,8 +108,7 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
         'args = []\n',
         encoding="utf-8",
     )
-    # Also seed the DEFAULT location with a marker MCP so a regression
-    # back to the hardcoded path shows up clearly in the assertion.
+    # Also seed default with a marker so hardcoded-path regression is visible.
     (host_home / ".codex").mkdir()
     (host_home / ".codex" / "config.toml").write_text(
         '[mcp_servers.fs_default_should_be_ignored]\n'
@@ -147,7 +124,5 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
     codex_home = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / adapter.agent_id / ".codex"
     doc = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
     servers = doc.get("mcp_servers") or {}
-    assert "fs_custom" in servers, "$CODEX_HOME override not honoured"
-    assert "fs_default_should_be_ignored" not in servers, (
-        "default ~/.codex was read even though $CODEX_HOME was set"
-    )
+    assert "fs_custom" in servers
+    assert "fs_default_should_be_ignored" not in servers

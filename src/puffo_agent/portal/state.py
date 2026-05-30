@@ -312,32 +312,26 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
 
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
-    """Parse the host's codex ``config.toml`` and return the
-    ``[mcp_servers.*]`` entries as ``{name: {command, args, env}}``.
+    """Return host codex ``[mcp_servers.*]`` as ``{name: {command, args, env}}``.
 
-    Honours ``$CODEX_HOME`` per PR #54 review — operators can override
-    the default location (``~/.codex/``) and we'd otherwise silently
-    read an empty catalog. Returns empty on missing / unreadable /
-    malformed file so a broken host config can't block agent startup.
-
-    Only ``command`` / ``args`` / ``env`` are surfaced. Any other
-    fields the operator has on a ``[mcp_servers.X]`` block in codex's
-    own config (e.g. cwd / disabled / startup_timeout_sec) are dropped
-    silently — the merged per-agent ``config.toml`` is a subset.
-    Widen the spec dict here + ``_emit_codex_mcp_block`` together if
-    a future codex schema field becomes load-bearing.
+    Honours ``$CODEX_HOME``. Returns ``{}`` on missing / unreadable /
+    malformed file (defensive: a broken host config can't block agent
+    startup). Drops entries with empty/non-string ``command``. Spec
+    surface is ``command/args/env`` only — widen here + in
+    ``_emit_codex_mcp_block`` together if codex grows a load-bearing
+    field (cwd / disabled / startup_timeout_sec / …).
     """
+    import tomllib
     codex_home_env = os.environ.get("CODEX_HOME")
     codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
     host_config = codex_home / "config.toml"
     if not host_config.exists():
         return {}
     try:
-        import tomllib  # Python 3.11+; pyproject pins >=3.11.
         with host_config.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, ValueError):
-        # tomllib.TOMLDecodeError is a ValueError subclass.
+        # tomllib.TOMLDecodeError ⊂ ValueError.
         return {}
     raw = data.get("mcp_servers")
     if not isinstance(raw, dict):
@@ -347,9 +341,6 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
         if not isinstance(spec, dict):
             continue
         cmd = spec.get("command")
-        # Skip malformed entries with no real command — propagating
-        # them would land as ``command = ""`` in the per-agent TOML
-        # and codex would crash trying to spawn an empty argv.
         if not isinstance(cmd, str) or not cmd:
             continue
         out[name] = {

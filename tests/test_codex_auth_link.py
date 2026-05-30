@@ -125,15 +125,10 @@ from puffo_agent.portal.state import read_host_codex_mcp_servers
 
 
 def test_read_host_codex_mcp_servers_returns_empty_when_no_host_config(tmp_path):
-    """No host config.toml → empty dict (defensive: must not raise so
-    a host without codex installed doesn't block codex-agent startup)."""
     assert read_host_codex_mcp_servers(tmp_path) == {}
 
 
 def test_read_host_codex_mcp_servers_returns_empty_when_malformed(tmp_path):
-    """Malformed TOML → empty dict + no exception leaks. Operator
-    shouldn't have their codex agent fail to start because their host
-    config has a stray bracket."""
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text("this is = not [valid toml\n", encoding="utf-8")
@@ -169,8 +164,6 @@ def test_read_host_codex_mcp_servers_parses_basic_entries(tmp_path):
 
 
 def test_read_host_codex_mcp_servers_ignores_top_level_non_mcp(tmp_path):
-    """Top-level keys like cli_auth_credentials_store, models, etc.
-    are ignored — we only return mcp_servers entries."""
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
@@ -183,14 +176,9 @@ def test_read_host_codex_mcp_servers_ignores_top_level_non_mcp(tmp_path):
     assert list(out) == ["fs"]
 
 
-# ── PR #54 review item 4a: skip malformed host entries (no command) ──
-
-
 def test_read_host_codex_mcp_servers_skips_entries_with_no_command(tmp_path):
-    """A host entry missing ``command`` (or with empty/non-string
-    command) MUST be skipped rather than passed through as
-    ``command = ""`` — otherwise codex would crash trying to spawn an
-    empty argv on the agent's per-spawn config.toml."""
+    # PR #54 review item 4a: empty/missing command would land as
+    # `command = ""` in per-agent TOML and crash codex on empty argv.
     cfg = tmp_path / ".codex" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text(
@@ -201,34 +189,27 @@ def test_read_host_codex_mcp_servers_skips_entries_with_no_command(tmp_path):
         'command = ""\n'
         'args = []\n'
         '\n'
+        '[mcp_servers.non_string_cmd]\n'
+        'command = 42\n'
+        'args = []\n'
+        '\n'
         '[mcp_servers.ok_entry]\n'
         'command = "/bin/x"\n'
         'args = []\n',
         encoding="utf-8",
     )
     out = read_host_codex_mcp_servers(tmp_path)
-    assert set(out) == {"ok_entry"}, (
-        "missing/empty-command entries leaked through — codex would "
-        "crash spawning an empty argv"
-    )
-
-
-# ── PR #54 review item 2: $CODEX_HOME env override ──
+    assert set(out) == {"ok_entry"}
 
 
 def test_read_host_codex_mcp_servers_honors_CODEX_HOME_env(tmp_path, monkeypatch):
-    """Operator's ``$CODEX_HOME`` must override the default
-    ``host_home / ".codex"`` lookup — otherwise an operator with a
-    non-default codex location silently gets an empty host MCP catalog."""
     custom_codex = tmp_path / "custom-codex-home"
     custom_codex.mkdir()
     (custom_codex / "config.toml").write_text(
         '[mcp_servers.fs]\ncommand = "/bin/fs"\nargs = []\n',
         encoding="utf-8",
     )
-    # ALSO seed the default location so a regression to the hardcoded
-    # path surfaces clearly (the assertion below would NOT see "fs"
-    # in that case).
+    # Also seed default location so a hardcoded-path regression surfaces.
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "config.toml").write_text(
         '[mcp_servers.fs_default]\ncommand = "/bin/no"\nargs = []\n',
@@ -237,15 +218,12 @@ def test_read_host_codex_mcp_servers_honors_CODEX_HOME_env(tmp_path, monkeypatch
 
     monkeypatch.setenv("CODEX_HOME", str(custom_codex))
     out = read_host_codex_mcp_servers(tmp_path)
-    assert set(out) == {"fs"}, "CODEX_HOME override ignored"
+    assert set(out) == {"fs"}
 
 
 def test_read_host_codex_mcp_servers_defaults_when_CODEX_HOME_unset(
     tmp_path, monkeypatch,
 ):
-    """Without ``$CODEX_HOME``, the default ``host_home / ".codex"``
-    lookup is preserved — regression guard for the new env-override
-    branch."""
     monkeypatch.delenv("CODEX_HOME", raising=False)
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "config.toml").write_text(
@@ -254,3 +232,20 @@ def test_read_host_codex_mcp_servers_defaults_when_CODEX_HOME_unset(
     )
     out = read_host_codex_mcp_servers(tmp_path)
     assert set(out) == {"fs"}
+
+
+def test_read_host_codex_mcp_servers_drops_non_dict_spec(tmp_path):
+    # A non-table mcp_servers entry (e.g. accidentally a string) must
+    # be skipped, not raise. Pins the `isinstance(spec, dict)` guard.
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        '[mcp_servers]\n'
+        'broken_entry = "not_a_table"\n'
+        '\n'
+        '[mcp_servers.ok]\n'
+        'command = "/bin/x"\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert set(out) == {"ok"}
