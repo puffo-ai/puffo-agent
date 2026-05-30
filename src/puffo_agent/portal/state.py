@@ -311,6 +311,48 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
         return "no-host-file"
 
 
+def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
+    """Return host codex ``[mcp_servers.*]`` as ``{name: {command, args, env}}``.
+
+    Honours ``$CODEX_HOME``. Returns ``{}`` on missing / unreadable /
+    malformed file (defensive: a broken host config can't block agent
+    startup). Drops entries with empty/non-string ``command``. Spec
+    surface is ``command/args/env`` only — widen here + in
+    ``_emit_codex_mcp_block`` together if codex grows a load-bearing
+    field (cwd / disabled / startup_timeout_sec / …).
+    """
+    import tomllib
+    codex_home_env = os.environ.get("CODEX_HOME")
+    codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
+    host_config = codex_home / "config.toml"
+    if not host_config.exists():
+        return {}
+    try:
+        with host_config.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        # tomllib.TOMLDecodeError ⊂ ValueError.
+        return {}
+    raw = data.get("mcp_servers")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        cmd = spec.get("command")
+        if not isinstance(cmd, str) or not cmd:
+            continue
+        # args / env are defensively typed: a hostile host config with
+        # ``args = "x"`` would otherwise split into chars via list(str).
+        raw_args = spec.get("args")
+        args = list(raw_args) if isinstance(raw_args, list) else []
+        raw_env = spec.get("env")
+        env = dict(raw_env) if isinstance(raw_env, dict) else {}
+        out[name] = {"command": cmd, "args": args, "env": env}
+    return out
+
+
 # Provenance markers dropped in skill dirs. Claude Code only loads
 # SKILL.md as a skill's entrypoint, so these siblings are inert.
 HOST_SYNCED_MARKER = "host-synced.md"

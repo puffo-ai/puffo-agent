@@ -8,6 +8,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PUF-266: codex agents now inherit the operator's host MCP catalog.**
+  ``write_codex_mcp_config`` used to overwrite the per-agent
+  ``$CODEX_HOME/config.toml`` with only the puffo_core stdio entry, so
+  any MCP server the operator had installed for their own codex CLI
+  (filesystem, github, etc.) was invisible to spawned agents.
+
+  New ``read_host_codex_mcp_servers(host_home)`` parses the host's
+  ``[mcp_servers.*]`` blocks (honouring ``$CODEX_HOME`` override) and
+  ``_ensure_codex_session`` forwards them via the new
+  ``extra_servers`` param. The puffo entry shadows any same-named host
+  entry to avoid duplicate-key TOML. Malformed entries (missing /
+  empty / non-string ``command``) are skipped — they'd otherwise land
+  as ``command = ""`` and crash codex on the empty argv. Server names
+  containing TOML-significant chars (``my.server``) are emitted as
+  quoted basic-string keys via ``_toml_key`` so they don't get
+  misparsed as nested tables. Spec surface is ``{command, args, env}``
+  only — any other codex MCP-server fields (cwd / disabled /
+  startup_timeout_sec) drop silently; widen here +
+  ``_emit_codex_mcp_block`` together if a future codex schema field
+  becomes load-bearing.
+
 - **PUF-258: ``runtime.health = "auth_failed"`` no longer sticky after
   credential refresh-success.** The daemon set the flag in
   ``_handle_suppressed_reply`` (PUF-221) but nothing cleared it
