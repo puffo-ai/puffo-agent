@@ -71,33 +71,18 @@ REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
 
 # 2 ticks ≈ 4 min @ 120s poll: surfaces fast, doesn't false-positive on
-# a single transient subprocess hiccup. RATE_LIMITED also contributes.
+# a single transient subprocess hiccup.
 REFRESH_BROKEN_THRESHOLD = 2
 
-# PUF-265 v2: refresh probe model. The refresh subprocess just needs
-# to make ANY successful API call so Anthropic's auth layer rotates
-# the OAuth token; the model doesn't matter for the rotation itself.
-# Defaulting to the cheapest current model (Haiku 4.5) instead of the
-# operator's interactive default (typically Opus) makes the probe
-# (a) cheaper per call, and (b) less likely to hit per-model rate
-# limits during high-usage windows.
+# Haiku to dodge per-model rate-limit windows on operator's Opus/Sonnet.
 REFRESH_PROBE_MODEL = "claude-haiku-4-5"
 
-# PUF-265 v2: when the refresh probe fails specifically because
-# Anthropic rate-limited us, the normal 120s poll wait is wasteful —
-# rate limits typically clear in seconds, not minutes. Wake the
-# refresher loop after a short randomised delay so we re-try sooner
-# without hammering. Window is small (5-15s) so we don't synchronise
-# multiple post-rate-limit retries across the fleet.
+# 5-15s randomised so fleet retries don't synchronise post rate-limit.
 RATE_LIMIT_FAST_RETRY_MIN_SECONDS = 5.0
 RATE_LIMIT_FAST_RETRY_MAX_SECONDS = 15.0
 
-# Patterns matched against the refresh subprocess's stderr+stdout
-# tails. Verbatim canonical Anthropic rate-limit signals + the
-# Claude Code wrapper's most-common surfaces. Anchored / unambiguous
-# tokens only — avoid generic "429" / "limit" which would false-
-# positive on legitimate model output (Haiku probe replies are short
-# but not infallibly clean).
+# Anchored tokens only — avoid generic "429" / "limit" which would false-
+# positive on legitimate Haiku output.
 _RATE_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
     re.compile(r"\bServer is temporarily limiting requests\b", re.IGNORECASE),
@@ -109,15 +94,25 @@ _RATE_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _looks_like_rate_limit(out_tail: str, err_tail: str) -> bool:
-    """True iff the refresh subprocess output matches one of the
-    canonical Anthropic rate-limit signatures. Drives the fast-retry
-    path so a transient rate-limit doesn't park the refresher on a
-    full 120s wait."""
     combined = f"{out_tail}\n{err_tail}"
-    for pattern in _RATE_LIMIT_PATTERNS:
-        if pattern.search(combined):
-            return True
-    return False
+    return any(p.search(combined) for p in _RATE_LIMIT_PATTERNS)
+
+
+def _classify_failed_refresh(
+    out_tail: str, err_tail: str, *, rc: int, elapsed: float, log_prefix: str,
+) -> RefreshOutcome:
+    # Shared rc!=0 classification used by FileBackend + KeychainBackend.
+    if _looks_like_rate_limit(out_tail, err_tail):
+        logger.warning(
+            "%s rate-limited rc=%d in %.1fs | stdout: %s | stderr: %s",
+            log_prefix, rc, elapsed, out_tail, err_tail,
+        )
+        return RefreshOutcome.RATE_LIMITED
+    logger.warning(
+        "%s rc=%d in %.1fs | stdout: %s | stderr: %s",
+        log_prefix, rc, elapsed, out_tail, err_tail,
+    )
+    return RefreshOutcome.FAILED
 
 # Codex's OAuth access_token is a JWT — the only authoritative expiry
 # is the ``exp`` claim inside the token. Codex's own ``last_refresh``
@@ -153,15 +148,8 @@ class RefreshOutcome(enum.Enum):
     REFRESHED = "refreshed"
     UNCHANGED = "unchanged"
     FAILED = "failed"
-    # PUF-265 v2: ``FAILED`` whose stderr/stdout matches a canonical
-    # Anthropic rate-limit signature. Counts toward the
-    # ``refresh_broken`` streak the same as ``FAILED`` (the refresh
-    # really didn't happen) but additionally schedules a fast retry
-    # via ``RATE_LIMIT_FAST_RETRY_{MIN,MAX}_SECONDS`` rather than
-    # parking on the full ``REFRESH_POLL_SECONDS`` wait — rate limits
-    # typically clear in seconds, and the refresher waking back up
-    # within 5-15s rather than 2 min materially shrinks the
-    # operator-observable outage when a momentary throttle clears.
+    # Counts toward refresh_broken streak like FAILED but additionally
+    # schedules a fast retry (RATE_LIMIT_FAST_RETRY_{MIN,MAX}_SECONDS).
     RATE_LIMITED = "rate_limited"
 
 
@@ -228,12 +216,6 @@ class FileBackend:
     async def refresh(self) -> RefreshOutcome:
         before = self.expires_in_seconds()
         env = {**os.environ, "HOME": str(self.host_home)}
-        # PUF-265 v2: ``--model`` pins the probe to the cheapest current
-        # Claude (Haiku 4.5) so it doesn't fight per-model rate limits on
-        # the operator's interactive default (Opus / Sonnet) during
-        # high-usage windows. Any successful response refreshes the
-        # OAuth token regardless of model — model choice is a probe-cost
-        # decision, not a correctness one.
         cmd = [
             "claude", "--dangerously-skip-permissions",
             "--model", REFRESH_PROBE_MODEL,
@@ -275,18 +257,10 @@ class FileBackend:
         if proc.returncode != 0:
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
-            if _looks_like_rate_limit(out_tail, err_tail):
-                logger.warning(
-                    "credential refresh rate-limited rc=%d in %.1fs | "
-                    "stdout: %s | stderr: %s",
-                    proc.returncode, elapsed, out_tail, err_tail,
-                )
-                return RefreshOutcome.RATE_LIMITED
-            logger.warning(
-                "credential refresh rc=%d in %.1fs | stdout: %s | stderr: %s",
-                proc.returncode, elapsed, out_tail, err_tail,
+            return _classify_failed_refresh(
+                out_tail, err_tail, rc=proc.returncode, elapsed=elapsed,
+                log_prefix="credential refresh",
             )
-            return RefreshOutcome.FAILED
         if before is not None and after is not None and after <= before:
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
@@ -529,8 +503,6 @@ class KeychainBackend:
         # UX) instead of wherever the daemon was launched from.
         host_home = Path.home()
         env = {**os.environ, "HOME": str(host_home)}
-        # PUF-265 v2: same model-pin rationale as ``FileBackend.refresh``
-        # — Haiku to dodge per-model rate-limit windows on Opus/Sonnet.
         cmd = [
             "claude", "--dangerously-skip-permissions",
             "--model", REFRESH_PROBE_MODEL,
@@ -567,18 +539,10 @@ class KeychainBackend:
         if proc.returncode != 0:
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
-            if _looks_like_rate_limit(out_tail, err_tail):
-                logger.warning(
-                    "claude credential refresh rate-limited rc=%d in %.1fs "
-                    "| stdout: %s | stderr: %s",
-                    proc.returncode, elapsed, out_tail, err_tail,
-                )
-                return RefreshOutcome.RATE_LIMITED
-            logger.warning(
-                "claude credential refresh rc=%d in %.1fs | stdout: %s | stderr: %s",
-                proc.returncode, elapsed, out_tail, err_tail,
+            return _classify_failed_refresh(
+                out_tail, err_tail, rc=proc.returncode, elapsed=elapsed,
+                log_prefix="claude credential refresh",
             )
-            return RefreshOutcome.FAILED
 
         # Pull the post-refresh blob straight from Keychain — that's
         # where claude wrote it. Then sync our cache so agent fan-out
@@ -718,8 +682,6 @@ class CredentialRefresher:
         self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
         self._consecutive_non_success = 0
-        # In-flight fast-retry task spawned on a RATE_LIMITED outcome.
-        # Tracked so back-to-back hits coalesce (no pile-up).
         self._rate_limit_retry_task: asyncio.Task | None = None
 
     def register_agent(self, agent_home: Path) -> None:
@@ -898,9 +860,6 @@ class CredentialRefresher:
             self._fire_refresh_success()
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
-        # RATE_LIMITED counts toward the refresh_broken streak (same
-        # as FAILED) AND schedules a fast retry so the loop doesn't
-        # park on the full 120s wait when the throttle clears.
         if outcome is RefreshOutcome.REFRESHED:
             if self._consecutive_non_success > 0:
                 logger.info(
@@ -923,11 +882,7 @@ class CredentialRefresher:
             self._schedule_rate_limit_retry()
 
     def _schedule_rate_limit_retry(self) -> None:
-        """Spawn a background task that pings ``_refresh_request`` after
-        a randomised ``[5, 15]`` s delay so the next refresh attempt
-        fires before the natural 120s poll deadline. Multiple
-        concurrent rate-limit hits coalesce into one pending retry —
-        we don't pile up tasks if every poll keeps hitting the limit."""
+        # Coalesce: back-to-back rate-limit hits share one pending retry.
         existing = self._rate_limit_retry_task
         if existing is not None and not existing.done():
             return
@@ -952,9 +907,7 @@ class CredentialRefresher:
         try:
             self._rate_limit_retry_task = asyncio.create_task(coro)
         except RuntimeError:
-            # No running loop yet — happens in some unit-test paths.
-            # Close the coroutine cleanly (no "never awaited" warning)
-            # and rely on the natural poll to pick the retry up.
+            # No running loop (sync test path) — fall back to natural poll.
             coro.close()
             self._rate_limit_retry_task = None
 

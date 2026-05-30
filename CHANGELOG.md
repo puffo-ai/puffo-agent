@@ -102,6 +102,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   (400 chars each) at ERROR level for forensic discrimination of the
   underlying root cause.
 
+  v2 hardening (post-2026-05-29 09:08 UTC Anthropic-side rate-limit
+  incident): the refresh probe is now pinned to ``claude-haiku-4-5``
+  via ``--model`` (Haiku has higher per-model limits than the
+  operator's interactive Opus/Sonnet default, so the probe stops
+  fighting model-specific rate windows). A new
+  ``RefreshOutcome.RATE_LIMITED`` variant is returned when the
+  probe's stderr/stdout matches a canonical Anthropic rate-limit
+  signature (six anchored patterns: 429 / "temporarily limiting
+  requests" / ``rate_limit_error`` / 5h-quota / 529 overloaded).
+  RATE_LIMITED counts toward the refresh_broken streak (same as
+  FAILED — the rotation really didn't happen) AND schedules a
+  randomised ``[5, 15]`` s fast retry via ``_refresh_request.set()``
+  instead of parking on the natural 120s poll. Back-to-back
+  rate-limit hits coalesce into one pending retry task.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the

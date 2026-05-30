@@ -583,9 +583,6 @@ def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch)
 
 
 def test_refresh_probe_passes_model_flag(tmp_path, monkeypatch):
-    """The refresh subprocess must be invoked with
-    ``--model claude-haiku-4-5`` so it doesn't fight per-model rate
-    limits on the operator's interactive default (Opus / Sonnet)."""
     _write_creds(tmp_path, expires_in_seconds=5 * 60)
     r = CredentialRefresher(host_home=tmp_path)
 
@@ -609,8 +606,6 @@ def test_refresh_probe_passes_model_flag(tmp_path, monkeypatch):
 
 
 def test_looks_like_rate_limit_matches_canonical_signatures():
-    """Each canonical Anthropic rate-limit string must match the
-    detector; benign strings must NOT."""
     canonicals = [
         "API Error: Request rejected (429)",
         "Server is temporarily limiting requests, please wait a moment...",
@@ -633,12 +628,15 @@ def test_looks_like_rate_limit_matches_canonical_signatures():
         assert not _looks_like_rate_limit("", s)
 
 
+def test_looks_like_rate_limit_is_case_insensitive():
+    # All patterns use re.IGNORECASE — pin so a future "drop the flag"
+    # refactor breaks the test (Anthropic surfaces casing varies).
+    assert _looks_like_rate_limit("", "API ERROR: REQUEST REJECTED (429)")
+    assert _looks_like_rate_limit("", "Rate_Limit_Error")
+    assert _looks_like_rate_limit("", "server is TEMPORARILY limiting requests")
+
+
 def test_filebackend_returns_rate_limited_on_canonical_stderr(tmp_path, monkeypatch):
-    """When the claude subprocess fails AND its stderr matches a
-    canonical rate-limit pattern, ``FileBackend.refresh`` must return
-    ``RefreshOutcome.RATE_LIMITED`` (not generic ``FAILED``) so the
-    refresher can schedule a fast retry instead of parking on the
-    120s poll wait."""
     _write_creds(tmp_path, expires_in_seconds=5 * 60)
     backend = FileBackend(host_home=tmp_path)
 
@@ -656,9 +654,6 @@ def test_filebackend_returns_rate_limited_on_canonical_stderr(tmp_path, monkeypa
 
 
 def test_filebackend_returns_failed_on_non_rate_limit_stderr(tmp_path, monkeypatch):
-    """A non-zero exit whose stderr does NOT match the rate-limit
-    patterns must remain ``FAILED`` — distinguishes transient throttle
-    from real refresh breakage."""
     _write_creds(tmp_path, expires_in_seconds=5 * 60)
     backend = FileBackend(host_home=tmp_path)
 
@@ -675,9 +670,27 @@ def test_filebackend_returns_failed_on_non_rate_limit_stderr(tmp_path, monkeypat
     assert outcome is RefreshOutcome.FAILED
 
 
+def test_filebackend_rate_limit_pattern_matches_in_stdout_too(tmp_path, monkeypatch):
+    # _classify_failed_refresh joins stdout+stderr — make sure the
+    # detector doesn't only check stderr (claude can emit the rate-limit
+    # error as an assistant text block on stdout, not stderr).
+    _write_creds(tmp_path, expires_in_seconds=5 * 60)
+    backend = FileBackend(host_home=tmp_path)
+
+    class _Proc:
+        returncode = 1
+        async def communicate(self):
+            return b'{"type":"rate_limit_error"}\n', b""
+
+    async def fake_exec(*argv, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    outcome = asyncio.run(backend.refresh())
+    assert outcome is RefreshOutcome.RATE_LIMITED
+
+
 def test_propagate_outcome_rate_limited_counts_toward_streak(tmp_path, monkeypatch):
-    """``RATE_LIMITED`` counts toward the ``refresh_broken`` streak
-    the same as ``FAILED`` — the refresh really didn't happen."""
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
     assert r._consecutive_non_success == 1
@@ -686,11 +699,7 @@ def test_propagate_outcome_rate_limited_counts_toward_streak(tmp_path, monkeypat
 
 
 def test_propagate_outcome_rate_limited_schedules_fast_retry(tmp_path, monkeypatch):
-    """``RATE_LIMITED`` must spawn a background task that pings
-    ``_refresh_request`` within the ``[5, 15]`` s window so the next
-    refresh attempt fires sooner than the natural 120s poll."""
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    # Patch the delay to zero so the test doesn't sleep.
     monkeypatch.setattr(credential_refresh, "RATE_LIMIT_FAST_RETRY_MIN_SECONDS", 0.0)
     monkeypatch.setattr(credential_refresh, "RATE_LIMIT_FAST_RETRY_MAX_SECONDS", 0.0)
 
@@ -698,7 +707,6 @@ def test_propagate_outcome_rate_limited_schedules_fast_retry(tmp_path, monkeypat
         assert not r._refresh_request.is_set()
         r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
         assert r._rate_limit_retry_task is not None
-        # Give the spawned task a chance to wake the request event.
         await asyncio.sleep(0.05)
         assert r._refresh_request.is_set()
 
@@ -706,12 +714,7 @@ def test_propagate_outcome_rate_limited_schedules_fast_retry(tmp_path, monkeypat
 
 
 def test_rate_limit_retry_tasks_coalesce(tmp_path, monkeypatch):
-    """Back-to-back ``RATE_LIMITED`` outcomes must NOT pile up multiple
-    pending retry tasks — the second hit while the first task is in
-    flight is a no-op."""
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    # Big delay so the first task stays in flight while we fire the
-    # second outcome.
     monkeypatch.setattr(credential_refresh, "RATE_LIMIT_FAST_RETRY_MIN_SECONDS", 5.0)
     monkeypatch.setattr(credential_refresh, "RATE_LIMIT_FAST_RETRY_MAX_SECONDS", 5.0)
 
@@ -719,7 +722,6 @@ def test_rate_limit_retry_tasks_coalesce(tmp_path, monkeypatch):
         r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
         task1 = r._rate_limit_retry_task
         assert task1 is not None
-        # Second outcome while first task still pending.
         r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
         task2 = r._rate_limit_retry_task
         assert task2 is task1, "expected coalesce; got a new task"
@@ -732,9 +734,40 @@ def test_rate_limit_retry_tasks_coalesce(tmp_path, monkeypatch):
     asyncio.run(go())
 
 
+def test_rate_limit_retry_reschedules_after_first_task_done(tmp_path, monkeypatch):
+    # Once the first retry task completes, a subsequent RATE_LIMITED
+    # outcome must spawn a NEW task (not be permanently blocked).
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(credential_refresh, "RATE_LIMIT_FAST_RETRY_MIN_SECONDS", 0.0)
+    monkeypatch.setattr(credential_refresh, "RATE_LIMIT_FAST_RETRY_MAX_SECONDS", 0.0)
+
+    async def go():
+        r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
+        task1 = r._rate_limit_retry_task
+        await asyncio.sleep(0.05)
+        assert task1.done()
+        r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
+        task2 = r._rate_limit_retry_task
+        assert task2 is not task1, "expected new task after first completed"
+
+    asyncio.run(go())
+
+
 def test_refreshed_outcome_does_not_schedule_fast_retry(tmp_path, monkeypatch):
-    """A REFRESHED outcome (success) must NOT spawn a fast-retry task
-    — fast retry is rate-limit-specific."""
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     r._propagate_outcome(RefreshOutcome.REFRESHED)
     assert r._rate_limit_retry_task is None
+
+
+def test_propagate_outcome_rate_limited_does_not_crash_without_event_loop(
+    tmp_path, monkeypatch,
+):
+    # The _schedule_rate_limit_retry's RuntimeError fallback path: in
+    # a sync test (no running loop) the create_task call would raise.
+    # The function must catch it and leave _rate_limit_retry_task=None
+    # rather than propagate.
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
+    assert r._rate_limit_retry_task is None
+    # Streak counter still advanced.
+    assert r._consecutive_non_success == 1
