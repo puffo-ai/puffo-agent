@@ -180,3 +180,47 @@ def test_no_extras_unchanged_from_pre_puf266(tmp_path):
     )
     doc = _read_toml(dest)
     assert list(doc["mcp_servers"]) == ["puffo"]
+
+
+# ── PR #54 review item 4b: TOML-key escape for non-bare-charset names ──
+
+
+def test_extra_servers_with_dot_in_name_quotes_the_key(tmp_path):
+    """A host entry named ``my.server`` MUST emit
+    ``[mcp_servers."my.server"]`` (quoted basic-string key), not
+    ``[mcp_servers.my.server]`` which TOML parses as nested tables."""
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(
+        dest,
+        extra_servers={
+            "my.server": {
+                "command": "/bin/x", "args": [], "env": {},
+            },
+        },
+    )
+    doc = _read_toml(dest)
+    servers = doc.get("mcp_servers") or {}
+    assert "my.server" in servers, (
+        "key with `.` got misparsed as nested tables — _toml_key "
+        "didn't quote-escape"
+    )
+    assert "my" not in servers, (
+        "TOML was emitted bare, creating accidental nested tables"
+    )
+    assert servers["my.server"]["command"] == "/bin/x"
+
+
+def test_extra_servers_with_bare_name_left_unquoted(tmp_path):
+    """Conversely, a bare-charset name (``[A-Za-z0-9_-]+``) must emit
+    without surrounding quotes — cosmetic but matches operator-written
+    config style."""
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(
+        dest,
+        extra_servers={
+            "filesystem-1": {"command": "/bin/x", "args": [], "env": {}},
+        },
+    )
+    raw = dest.read_text(encoding="utf-8")
+    assert "[mcp_servers.filesystem-1]" in raw
+    assert '[mcp_servers."filesystem-1"]' not in raw

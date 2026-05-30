@@ -148,8 +148,12 @@ def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
     dict. ``spec`` is the same shape ``tomllib.loads`` would produce
     for a single MCP server entry: ``{"command": str, "args": list[str],
     "env": dict[str, str]}``. Missing keys are tolerated for the
-    optional fields."""
-    out: list[str] = ["", f"[mcp_servers.{name}]"]
+    optional fields. ``name`` is quoted per ``_toml_key`` if it
+    contains characters TOML treats as path separators (dots, etc.)
+    so an operator MCP named ``my.server`` doesn't accidentally emit
+    a nested table ``mcp_servers.my.server``."""
+    key = _toml_key(name)
+    out: list[str] = ["", f"[mcp_servers.{key}]"]
     cmd = str(spec.get("command", ""))
     out.append(f'command = "{_toml_escape(cmd)}"')
     args = spec.get("args") or []
@@ -161,10 +165,21 @@ def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
     env = spec.get("env") or {}
     if env:
         out.append("")
-        out.append(f"[mcp_servers.{name}.env]")
+        out.append(f"[mcp_servers.{key}.env]")
         for k, v in sorted(env.items()):
             out.append(f'{k} = "{_toml_escape(str(v))}"')
     return out
+
+
+def _toml_key(name: str) -> str:
+    """Return ``name`` as a bare TOML key when it matches the TOML
+    bare-key charset (``[A-Za-z0-9_-]+``); otherwise wrap as a TOML
+    basic-string key. Prevents an MCP server named ``my.server`` from
+    being misparsed as ``mcp_servers.my.server`` nested tables."""
+    import re
+    if re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        return name
+    return f'"{_toml_escape(name)}"'
 
 
 def _toml_escape(s: str) -> str:

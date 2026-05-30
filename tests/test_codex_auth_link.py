@@ -181,3 +181,76 @@ def test_read_host_codex_mcp_servers_ignores_top_level_non_mcp(tmp_path):
     )
     out = read_host_codex_mcp_servers(tmp_path)
     assert list(out) == ["fs"]
+
+
+# ── PR #54 review item 4a: skip malformed host entries (no command) ──
+
+
+def test_read_host_codex_mcp_servers_skips_entries_with_no_command(tmp_path):
+    """A host entry missing ``command`` (or with empty/non-string
+    command) MUST be skipped rather than passed through as
+    ``command = ""`` — otherwise codex would crash trying to spawn an
+    empty argv on the agent's per-spawn config.toml."""
+    cfg = tmp_path / ".codex" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        '[mcp_servers.missing_cmd]\n'
+        'args = ["x"]\n'
+        '\n'
+        '[mcp_servers.empty_cmd]\n'
+        'command = ""\n'
+        'args = []\n'
+        '\n'
+        '[mcp_servers.ok_entry]\n'
+        'command = "/bin/x"\n'
+        'args = []\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert set(out) == {"ok_entry"}, (
+        "missing/empty-command entries leaked through — codex would "
+        "crash spawning an empty argv"
+    )
+
+
+# ── PR #54 review item 2: $CODEX_HOME env override ──
+
+
+def test_read_host_codex_mcp_servers_honors_CODEX_HOME_env(tmp_path, monkeypatch):
+    """Operator's ``$CODEX_HOME`` must override the default
+    ``host_home / ".codex"`` lookup — otherwise an operator with a
+    non-default codex location silently gets an empty host MCP catalog."""
+    custom_codex = tmp_path / "custom-codex-home"
+    custom_codex.mkdir()
+    (custom_codex / "config.toml").write_text(
+        '[mcp_servers.fs]\ncommand = "/bin/fs"\nargs = []\n',
+        encoding="utf-8",
+    )
+    # ALSO seed the default location so a regression to the hardcoded
+    # path surfaces clearly (the assertion below would NOT see "fs"
+    # in that case).
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        '[mcp_servers.fs_default]\ncommand = "/bin/no"\nargs = []\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("CODEX_HOME", str(custom_codex))
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert set(out) == {"fs"}, "CODEX_HOME override ignored"
+
+
+def test_read_host_codex_mcp_servers_defaults_when_CODEX_HOME_unset(
+    tmp_path, monkeypatch,
+):
+    """Without ``$CODEX_HOME``, the default ``host_home / ".codex"``
+    lookup is preserved — regression guard for the new env-override
+    branch."""
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "config.toml").write_text(
+        '[mcp_servers.fs]\ncommand = "/bin/fs"\nargs = []\n',
+        encoding="utf-8",
+    )
+    out = read_host_codex_mcp_servers(tmp_path)
+    assert set(out) == {"fs"}
