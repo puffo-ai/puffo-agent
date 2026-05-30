@@ -26,6 +26,7 @@ import pytest
 from puffo_agent.portal.credential_refresh import (
     REFRESH_SAFETY_MARGIN_SECONDS,
     CredentialRefresher,
+    RefreshOutcome,
 )
 from puffo_agent.portal.worker import Worker
 
@@ -226,10 +227,13 @@ async def test_refresh_now_fires_on_success(tmp_path, monkeypatch):
 
     refresh_called = {"n": 0}
 
-    async def fake_refresh() -> None:
+    async def fake_refresh() -> RefreshOutcome:
         refresh_called["n"] += 1
-        # Simulate the backend writing a fresh expiry.
+        # Simulate the backend writing a fresh expiry + reporting
+        # the canonical REFRESHED outcome (per PR #48 review:
+        # callbacks fire ONLY on this outcome, not on UNCHANGED).
         _write_creds(tmp_path, expires_in_seconds=3600)
+        return RefreshOutcome.REFRESHED
 
     monkeypatch.setattr(r.backend, "refresh", fake_refresh)
 
@@ -239,6 +243,48 @@ async def test_refresh_now_fires_on_success(tmp_path, monkeypatch):
     await r._refresh_now(expires_in=10, by_agent=True)
     assert refresh_called["n"] == 1
     assert fired == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_now_does_not_fire_on_unchanged(tmp_path, monkeypatch):
+    """PR #48 review: UNCHANGED outcome (the PUF-265 case where claude
+    exited 0 but expiresAt didn't advance) must NOT fire refresh-success
+    callbacks -- credentials didn't actually rotate, so optimistically
+    clearing auth_failed would oscillate auth_failed -> ok -> auth_failed
+    every poll cycle until the underlying refresh recovers."""
+    _write_creds(tmp_path, expires_in_seconds=10)
+    r = CredentialRefresher(host_home=tmp_path)
+
+    async def unchanged_refresh() -> RefreshOutcome:
+        return RefreshOutcome.UNCHANGED
+
+    monkeypatch.setattr(r.backend, "refresh", unchanged_refresh)
+
+    fired: list[str] = []
+    r.register_on_refresh_success(lambda: fired.append("ok"))
+
+    await r._refresh_now(expires_in=10, by_agent=True)
+    assert fired == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_now_does_not_fire_on_failed_outcome(tmp_path, monkeypatch):
+    """Same shape as the exception path but at the outcome level:
+    a backend that returns FAILED (rc!=0 from the subprocess) must
+    NOT trigger callbacks."""
+    _write_creds(tmp_path, expires_in_seconds=10)
+    r = CredentialRefresher(host_home=tmp_path)
+
+    async def failed_refresh() -> RefreshOutcome:
+        return RefreshOutcome.FAILED
+
+    monkeypatch.setattr(r.backend, "refresh", failed_refresh)
+
+    fired: list[str] = []
+    r.register_on_refresh_success(lambda: fired.append("ok"))
+
+    await r._refresh_now(expires_in=10, by_agent=True)
+    assert fired == []
 
 
 @pytest.mark.asyncio

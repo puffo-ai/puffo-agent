@@ -802,11 +802,13 @@ class CredentialRefresher:
         unwinnable: a second caller can't see an in-flight rotation
         mid-write.
 
-        PUF-258: on successful refresh fires
-        ``_fire_refresh_success`` so registered Workers clear an
-        ``auth_failed`` flag optimistically. Failure path stays
-        silent (the flag rightly persists until next attempt)."""
-        refreshed = False
+        Fire ``_fire_refresh_success`` only when the backend reports
+        ``RefreshOutcome.REFRESHED`` (PR #48 review): UNCHANGED /
+        FAILED outcomes mean the on-disk token didn't actually
+        rotate, so optimistically clearing ``auth_failed`` on those
+        would oscillate ``auth_failed → ok → auth_failed`` every
+        poll cycle until the underlying refresh recovers."""
+        outcome: RefreshOutcome | None = None
         async with self._lock:
             before = self.expires_in_seconds()
             if (
@@ -824,11 +826,11 @@ class CredentialRefresher:
                 expires_in, by_agent,
             )
             try:
-                await self.backend.refresh()
-                refreshed = True
+                outcome = await self.backend.refresh()
             except Exception as exc:
                 logger.warning("backend refresh errored: %s", exc)
-        if refreshed:
+                outcome = RefreshOutcome.FAILED
+        if outcome is RefreshOutcome.REFRESHED:
             self._fire_refresh_success()
 
     def _sync_views(self) -> None:
