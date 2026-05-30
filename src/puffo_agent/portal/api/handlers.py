@@ -1713,8 +1713,13 @@ async def agents_export(request: web.Request) -> web.Response:
     # would be inconsistent. The web-side UI gates the button on
     # cfg.state too, so this is the second line of defence + the
     # canonical guard for any future caller.
-    from ..state import AgentConfig
-
+    #
+    # NOTE: there is a small TOCTOU window between this guard and
+    # ``exp.pack`` below — if the agent gets resumed mid-pack the
+    # snapshot is partially-inconsistent. Acceptable for P0 because
+    # the only resume paths are operator-driven (visible) or the
+    # reconcile loop (which respects the paused-by-operator flag).
+    # Tighten with a per-agent lock if a regression surfaces.
     for aid in raw_ids:
         try:
             cfg = AgentConfig.load(aid)

@@ -8,6 +8,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PUF-263: ``/v1/agents/export`` enforces paused-only.** A running
+  agent may be mid-write (memory updates, ``cli_session.json``
+  refresh, in-flight skill state) so a snapshot would be inconsistent
+  and could either silently lose data or restore into a broken state
+  on the other side. ``agents_export`` now loads each requested
+  agent's ``AgentConfig`` and returns 409 (new ``_conflict`` helper)
+  when ``cfg.state != "paused"``. Whole-batch reject — a single
+  non-paused agent in a multi-agent bundle fails the request,
+  preserving "either everything in the bundle is a consistent
+  snapshot, or nothing is." Unknown agent ids return 404 with the
+  offending id fingered in the body. Paired with the web client's
+  Export button (gated on paused) so the 409 only fires on a race
+  where the agent flipped between gate and submit.
+
+  Known limit: there is a small TOCTOU window between the paused
+  guard and ``exp.pack`` — if the agent gets resumed mid-pack the
+  snapshot is partially-inconsistent. Acceptable for P0 because the
+  only resume paths are operator-driven (visible) or the reconcile
+  loop (which respects the paused-by-operator flag). Tighten with a
+  per-agent lock if a regression surfaces.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the

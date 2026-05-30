@@ -222,6 +222,23 @@ async def test_bridge_export_rejects_whole_batch_if_any_running(bridge_client):
     assert "beta" in body_json["error"]
 
 
+async def test_bridge_export_unknown_agent_returns_404(bridge_client):
+    # PR #50 review item 3: a refactor that drops the FileNotFoundError
+    # branch would silently regress to a 500 stack-trace at the user.
+    # Defend the contract: unknown agent id → 404 with the offending id
+    # fingered in the body.
+    user = make_user()
+    await _pair(bridge_client, user)
+    body = json.dumps({"agent_ids": ["does_not_exist"], "password": "hunter2"}).encode("utf-8")
+    h = signed_headers(user, "POST", "/v1/agents/export", body)
+    h.update(_HOST)
+    h["content-type"] = "application/json"
+    r = await bridge_client.post("/v1/agents/export", data=body, headers=h)
+    assert r.status == 404, await r.text()
+    body_json = await r.json()
+    assert "does_not_exist" in body_json["error"]
+
+
 async def test_bridge_import_roundtrip(bridge_client, mock_puffo_server):
     user = make_user()
     await _pair(bridge_client, user)
