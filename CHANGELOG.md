@@ -4,6 +4,36 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] — 2026-06-01
+
+### Added
+
+- **Desktop UI (PySide6).** ``puffo-agent start --ui`` opens a Qt
+  window beside the daemon: contacts-app sidebar with avatar / name /
+  role / status / harness · model, ``Show all agents`` toggle,
+  ``Import agent`` flow, three-pane workspace per selected agent
+  (editable Info / Skills / MCP on the left, Messages / Logs / Files
+  on the right). Home tab summarises detected CLIs (Claude Code,
+  Codex, Hermes), agent counts, and the daemon log. Window close
+  writes ``stop.sentinel`` so shutdown stays graceful. ``start``
+  without ``--ui`` keeps the headless behaviour.
+
+- **On-disk display-name + avatar cache
+  (``~/.puffo-agent/cache/``).** Workers persist ``/spaces`` /
+  ``/spaces/<id>/channels`` / ``/identities/profiles`` results into
+  ``profiles/`` / ``spaces/`` / ``channels/`` JSON-per-key directories
+  and signed-fetch avatar blobs into ``avatars/<sha256(url)><ext>``.
+  Lets the UI render names + portraits without a worker round-trip or
+  HPKE signing in the renderer process.
+
+### Changed
+
+- **WS client logs prefix the agent slug.** ``WS connected /
+  disconnected`` and the unexpected-error path now carry ``[<slug>]``
+  so multi-agent daemons are filterable per agent. The disconnect
+  branch also surfaces the exception type + message instead of
+  swallowing it.
+
 ## [0.9.6] — 2026-06-01
 
 ### Fixed

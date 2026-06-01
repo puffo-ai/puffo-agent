@@ -1,14 +1,8 @@
-"""Run ``run_daemon()`` on a non-daemon background thread.
+"""Background thread hosting ``run_daemon()`` so Qt can own the main thread.
 
-Qt owns the main thread (mac strict). The asyncio daemon lives here.
-Stop is routed through the file sentinel so we don't need to refactor
-``run_daemon`` to expose the ``Daemon`` instance — the reconcile loop
-picks it up within ~2s.
-
-Thread is non-daemon: when the user closes the window, Qt's ``exec()``
-returns, but the Python interpreter waits for this thread, which the
-daemon's ``os._exit(0)`` ultimately terminates after worker cleanup.
-"""
+Stop is routed through the file sentinel — the reconcile loop picks
+it up within ~2s. Kept non-daemon so Python waits for the daemon's
+``os._exit(0)`` after worker teardown."""
 from __future__ import annotations
 
 import asyncio
@@ -41,13 +35,9 @@ class DaemonThread(threading.Thread):
                 pass
 
     def request_stop(self) -> bool:
-        """Schedule daemon shutdown via the stop sentinel.
-
-        Returns ``True`` when the sentinel was written (caller should
-        keep the window up and wait for ``os._exit``). Returns
-        ``False`` when we don't own the daemon — caller should close
-        immediately because nothing will terminate the process.
-        """
+        """Write the stop sentinel iff we own the daemon. Returns True
+        when written (caller should wait for ``os._exit``), False when
+        another daemon owns the PID file."""
         if self._stop_requested:
             return True
         self._stop_requested = True

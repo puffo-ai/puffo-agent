@@ -1,10 +1,4 @@
-"""Entry point for ``puffo-agent start`` in UI mode.
-
-Hosts the asyncio daemon on a background thread and runs Qt on the
-main thread. Closing the window writes the stop sentinel; the daemon
-finishes worker cleanup and calls ``os._exit(0)``, terminating the
-whole process.
-"""
+"""Entry point for ``puffo-agent start --ui``."""
 from __future__ import annotations
 
 import logging
@@ -15,9 +9,8 @@ from .log_buffer import install_log_buffer
 
 
 def launch() -> int:
-    # basicConfig first: install_log_buffer adds a handler, which makes
-    # basicConfig a no-op (root keeps its default WARNING level and
-    # drops every INFO record the daemon emits).
+    # basicConfig must run before install_log_buffer attaches a handler,
+    # otherwise root stays at WARNING and INFO records drop.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -26,6 +19,7 @@ def launch() -> int:
 
     from PySide6.QtWidgets import QApplication
     from .main_window import MainWindow
+    from .style import APP_STYLESHEET
 
     daemon_thread = DaemonThread()
     daemon_thread.start()
@@ -33,6 +27,7 @@ def launch() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Puffo Agent")
     app.setQuitOnLastWindowClosed(True)
+    app.setStyleSheet(APP_STYLESHEET)
 
     window = MainWindow(daemon_thread=daemon_thread, log_buffer=log_buffer)
     window.show()

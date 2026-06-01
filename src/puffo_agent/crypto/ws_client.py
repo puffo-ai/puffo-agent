@@ -156,7 +156,7 @@ class PuffoCoreWsClient:
         async with websockets.connect(self.ws_url) as ws:
             self._ws = ws
             self.session_id = await self._handshake(ws)
-            logger.info("WS connected, session=%s", self.session_id)
+            logger.info("[%s] WS connected, session=%s", self.slug, self.session_id)
             await self._catchup()
             await self._listen_loop()
 
@@ -172,16 +172,19 @@ class PuffoCoreWsClient:
                 ConnectionError,
                 OSError,
                 asyncio.TimeoutError,
-            ):
+            ) as exc:
                 if not self._running:
                     break
-                logger.warning("WS disconnected, reconnecting in %ds", backoff)
+                logger.warning(
+                    "[%s] WS disconnected (%s: %s), reconnecting in %ds",
+                    self.slug, type(exc).__name__, exc, backoff,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except Exception:
                 if not self._running:
                     break
-                logger.exception("WS unexpected error, reconnecting in %ds", backoff)
+                logger.exception("[%s] WS unexpected error, reconnecting in %ds", self.slug, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
         self._ws = None

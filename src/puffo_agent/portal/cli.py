@@ -237,14 +237,14 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    if getattr(args, "headless", False):
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        )
-        return asyncio.run(run_daemon())
-    from .ui.launcher import launch
-    return launch()
+    if getattr(args, "ui", False):
+        from .ui.launcher import launch
+        return launch()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    return asyncio.run(run_daemon())
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1271,12 +1271,12 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_config)
     start = sub.add_parser(
         "start",
-        help="Run the daemon (opens the Qt UI by default; --headless skips it)",
+        help="Run the daemon in the foreground (add --ui to launch the Qt desktop window)",
     )
     start.add_argument(
-        "--headless",
+        "--ui",
         action="store_true",
-        help="Run the daemon without the desktop UI (server / CI / CLI mode).",
+        help="Launch the PySide6 desktop window alongside the daemon.",
     )
     start.set_defaults(func=cmd_start)
     stop = sub.add_parser(
