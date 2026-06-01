@@ -286,6 +286,33 @@ async def test_import_revoke_failure_leaves_pending(mock_server):
     assert AgentConfig.load("alpha").state == "running"
 
 
+async def test_import_new_subkey_failure_is_soft(mock_server, monkeypatch):
+    # Server may reject the new-device subkey with a 401 chain-validation
+    # error in the moment right after enrol; the worker rotates a fresh
+    # subkey on its first request, so the import must still land the
+    # agent on disk + flip to running.
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import AgentConfig
+
+    server, _state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    blob, _info = _build_bundle(url)
+
+    async def _boom(**_kwargs):
+        raise RuntimeError("/devices/subkeys 401: chain validation failed")
+
+    monkeypatch.setattr(imp, "_register_new_device_subkey", _boom)
+
+    report = await imp.import_bundle(blob, password="hunter2")
+    assert report.failed == 0
+    assert report.imported == 1
+    cfg = AgentConfig.load("alpha")
+    assert cfg.state == "running"
+    # No session was persisted — worker will rotate on first request.
+    session_path = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / "alpha" / "keys" / "alpha-bot.session.json"
+    assert not session_path.exists()
+
+
 async def test_revoke_pending_succeeds_on_retry(mock_server):
     from puffo_agent.portal import import_agents as imp
 

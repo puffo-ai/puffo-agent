@@ -150,6 +150,8 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
 
     new_device_id = _device_id_from_pk(new_signing.public_key_bytes())
 
+    new_subkey: Ed25519KeyPair | None = None
+    new_subkey_cert: dict | None = None
     try:
         new_subkey, new_subkey_cert = await _register_new_device_subkey(
             server_url=server_url,
@@ -158,10 +160,11 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
             new_signing_key=new_signing,
         )
     except Exception as exc:
-        _cleanup_staging(agent_id)
-        return AgentImportResult(
-            agent_id=agent_id, status="failed", detail=f"subkey registration failed: {exc}",
-        )
+        # Best-effort: if the server rejects the subkey (chain
+        # validation lag etc.), the worker rotates one on its first
+        # request anyway. Skip persisting a session and let the
+        # revoke step take its own retry.
+        logger.warning("import: agent=%s new subkey registration failed: %s", agent_id, exc)
 
     _write_new_identity(
         stage_dir, old_identity, new_signing, new_kem, new_device_id,
@@ -169,6 +172,7 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
     )
     _commit_staging(agent_id, stage_dir)
 
+    preregistered = (new_subkey, new_subkey_cert) if new_subkey and new_subkey_cert else None
     revoke_ok = False
     revoke_err = ""
     try:
@@ -181,7 +185,7 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
                 decode_secret(old_identity.root_secret_key)
             ),
             old_device_id=old_identity.device_id,
-            preregistered_subkey=(new_subkey, new_subkey_cert),
+            preregistered_subkey=preregistered,
         )
         revoke_ok = True
     except Exception as exc:
