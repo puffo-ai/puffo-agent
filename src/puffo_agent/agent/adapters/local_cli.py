@@ -34,6 +34,7 @@ from ...portal.state import (
     home_dir,
     link_host_codex_auth,
     link_host_credentials,
+    read_host_codex_mcp_servers,
     seed_claude_home,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
@@ -290,21 +291,34 @@ class LocalCLIAdapter(Adapter):
         # Always write config.toml — pins ``cli_auth_credentials_store``
         # to "file" so codex uses ``$CODEX_HOME/auth.json`` (not macOS
         # Keychain) and our symlink/refresh model works. MCP section
-        # only when puffo_core is configured.
+        # only when puffo_core is configured. PUF-266: host's own MCP
+        # entries from ``~/.codex/config.toml`` are merged in so the
+        # agent inherits the operator's codex MCP catalog (the puffo
+        # entry below shadows any same-named host entry).
+        host_mcps = read_host_codex_mcp_servers(Path.home())
         if self.puffo_core_mcp_env:
             write_codex_mcp_config(
                 codex_home / "config.toml",
                 command=default_python_executable(),
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
                 env=self.puffo_core_mcp_env,
+                extra_servers=host_mcps,
             )
         else:
-            write_codex_mcp_config(codex_home / "config.toml")
+            write_codex_mcp_config(
+                codex_home / "config.toml",
+                extra_servers=host_mcps,
+            )
             logger.warning(
                 "agent %s: codex MCP tools unavailable — puffo_core is "
                 "not configured. populate `puffo_core:` in agent.yml to "
                 "enable send_message / list_channels / etc.",
                 self.agent_id,
+            )
+        if host_mcps:
+            logger.info(
+                "agent %s: merged %d host MCP server(s) into codex config: %s",
+                self.agent_id, len(host_mcps), sorted(host_mcps),
             )
 
         env = {

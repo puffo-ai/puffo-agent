@@ -311,6 +311,48 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
         return "no-host-file"
 
 
+def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
+    """Return host codex ``[mcp_servers.*]`` as ``{name: {command, args, env}}``.
+
+    Honours ``$CODEX_HOME``. Returns ``{}`` on missing / unreadable /
+    malformed file (defensive: a broken host config can't block agent
+    startup). Drops entries with empty/non-string ``command``. Spec
+    surface is ``command/args/env`` only — widen here + in
+    ``_emit_codex_mcp_block`` together if codex grows a load-bearing
+    field (cwd / disabled / startup_timeout_sec / …).
+    """
+    import tomllib
+    codex_home_env = os.environ.get("CODEX_HOME")
+    codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
+    host_config = codex_home / "config.toml"
+    if not host_config.exists():
+        return {}
+    try:
+        with host_config.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        # tomllib.TOMLDecodeError ⊂ ValueError.
+        return {}
+    raw = data.get("mcp_servers")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, spec in raw.items():
+        if not isinstance(spec, dict):
+            continue
+        cmd = spec.get("command")
+        if not isinstance(cmd, str) or not cmd:
+            continue
+        # args / env are defensively typed: a hostile host config with
+        # ``args = "x"`` would otherwise split into chars via list(str).
+        raw_args = spec.get("args")
+        args = list(raw_args) if isinstance(raw_args, list) else []
+        raw_env = spec.get("env")
+        env = dict(raw_env) if isinstance(raw_env, dict) else {}
+        out[name] = {"command": cmd, "args": args, "env": env}
+    return out
+
+
 # Provenance markers dropped in skill dirs. Claude Code only loads
 # SKILL.md as a skill's entrypoint, so these siblings are inert.
 HOST_SYNCED_MARKER = "host-synced.md"
@@ -1074,15 +1116,23 @@ class RuntimeState:
     last_event_at: int = 0
     error: str = ""
     # Worker-side health, independent of ``status``. Values:
-    #   "ok"                  — refresh-ping passed, or a turn cleared a
-    #                           prior abandon
-    #   "auth_failed"         — adapter saw 401 / authentication_error;
-    #                           cleared only by the CredentialRefresher
-    #                           success-ping (PUF-221's lane)
+    #   "ok"                  — refresh-ping passed, a turn cleared a
+    #                           prior abandon, or a credential refresh
+    #                           cleared a prior auth_failed
+    #   "auth_failed"         — adapter saw 401 / authentication_error
+    #                           (set in worker._handle_suppressed_reply);
+    #                           cleared by the CredentialRefresher's
+    #                           refresh-success callback (PUF-258 wired
+    #                           the clear; PUF-221 owns the set lane)
     #   "api_error_abandoned" — kick-retry exhausted, batch silently
     #                           abandoned; cleared on next successful turn
+    #                           (PUF-255's on_turn_success lane)
+    #   "refresh_broken"      — daemon saw N consecutive non-success
+    #                           refresh outcomes; cleared by next
+    #                           REFRESHED. Does not overwrite the two
+    #                           stronger downstream signals above.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | unknown
+    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | refresh_broken | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> "RuntimeState | None":

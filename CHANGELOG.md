@@ -48,6 +48,149 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   fresh install. A yaml write failure on the state flip leaves the
   agent paused but otherwise functional.
 
+- **PUF-266: codex agents now inherit the operator's host MCP catalog.**
+  ``write_codex_mcp_config`` used to overwrite the per-agent
+  ``$CODEX_HOME/config.toml`` with only the puffo_core stdio entry, so
+  any MCP server the operator had installed for their own codex CLI
+  (filesystem, github, etc.) was invisible to spawned agents.
+
+  New ``read_host_codex_mcp_servers(host_home)`` parses the host's
+  ``[mcp_servers.*]`` blocks (honouring ``$CODEX_HOME`` override) and
+  ``_ensure_codex_session`` forwards them via the new
+  ``extra_servers`` param. The puffo entry shadows any same-named host
+  entry to avoid duplicate-key TOML. Malformed entries (missing /
+  empty / non-string ``command``) are skipped — they'd otherwise land
+  as ``command = ""`` and crash codex on the empty argv. Server names
+  containing TOML-significant chars (``my.server``) are emitted as
+  quoted basic-string keys via ``_toml_key`` so they don't get
+  misparsed as nested tables. Spec surface is ``{command, args, env}``
+  only — any other codex MCP-server fields (cwd / disabled /
+  startup_timeout_sec) drop silently; widen here +
+  ``_emit_codex_mcp_block`` together if a future codex schema field
+  becomes load-bearing.
+
+- **PUF-258: ``runtime.health = "auth_failed"`` no longer sticky after
+  credential refresh-success.** The daemon set the flag in
+  ``_handle_suppressed_reply`` (PUF-221) but nothing cleared it
+  anywhere — once flipped it stayed until process restart, leaving
+  ``audit.log`` dishonest about post-recovery agent state.
+
+  ``CredentialRefresher`` now exposes
+  ``register_on_refresh_success(cb)`` /
+  ``unregister_on_refresh_success(cb)`` and fires after both regular
+  ``_refresh_now`` success AND ``_external_rotation_loop`` detected
+  rotation. Fire happens outside the refresh lock so callbacks can't
+  deadlock the next cycle; gated on
+  ``outcome is RefreshOutcome.REFRESHED`` so PUF-265's UNCHANGED
+  case (exit=0 but token didn't actually rotate) doesn't oscillate
+  ``auth_failed → ok → auth_failed``. Callbacks isolated — a
+  subscriber raising logs at WARNING and the loop continues.
+
+  ``Worker._clear_auth_failed_if_recoverable`` (lifted staticmethod
+  matching PUF-255's pattern) flips ``"auth_failed" → "ok"`` and
+  clears ``runtime.error``. Leaves ``api_error_abandoned`` to
+  PUF-255's ``on_turn_success`` lane (symmetric partition). Optimistic
+  semantics: if the agent's next request still 401s,
+  ``_handle_suppressed_reply`` re-flips on the next leak detection.
+
+- **PUF-264: request-too-large no longer infinite-retries + no longer
+  leaks the raw Anthropic API error to chat.** When a user uploaded
+  10 PDFs (msg_a42f8cbb), the agent inlined all of them into one
+  Claude call; Anthropic returned its ``request-too-large`` error, the
+  daemon's auth-retry path retried the same payload, hit the same
+  error, exhausted, and surfaced the verbatim CLI error string to the
+  user. A daemon restart wouldn't help — the next prompt re-inlines
+  the same attachments.
+
+  Two-layer defense in ``cli_session.py``:
+
+  1. **Proactive pre-send byte cap.** ``_one_turn`` short-circuits
+     before spawning the claude subprocess when
+     ``len(user_message.encode("utf-8")) > MAX_USER_MESSAGE_BYTES``
+     (180 KB; under-budget for Anthropic's ~200 KB request-body cap
+     with headroom for system prompt + tool definitions + headers).
+     Returns the friendly user-facing reply with metadata
+     ``request_too_large=pre_send`` and audit event
+     ``turn.request_too_large_pre_send``. No API spend, no retry, no
+     ``runtime.health`` flip — the user resends a smaller message.
+     Byte-based check (not character-based) so 60k CJK chars × 3 bytes
+     trip the cap even though the char count is below it.
+
+  2. **Reactive regex catch.** ``_rewrite_if_request_too_large`` (via
+     the new ``_looks_like_request_too_large`` predicate, mirroring
+     ``_looks_like_auth_error`` / ``_looks_like_poisoned_session``)
+     rewrites three verbatim Anthropic surfaces to the friendly
+     reply: ``"Prompt is too long"`` (Claude Code binary constant
+     ``AQ``), ``"input length and `max_tokens` exceed context limit"``
+     (parseable numeric form), and ``"size error: request too large,
+     try with a smaller file"`` (file-attachment surface; matches
+     both ASCII ``:`` ``,`` and the fullwidth ``：`` ``，`` Anthropic
+     emits on some localised builds). Fires AFTER the auth-retry loop
+     so a real auth failure still gets retried — only when the reply
+     is unambiguously a too-long error do we rewrite. Token counts +
+     ``tool_calls`` survive the rewrite for cost accounting; raw API
+     error preserved in ``metadata.original_reply`` for operator
+     forensics; audit event ``turn.request_too_large_reactive``.
+
+  Operator-visible: the user sees a short ASCII reply
+  (``"Your message has too much content. Please reduce attachments
+  or split your message and try again."``) instead of a 5-minute hang
+  + raw API error. No ``api_error_abandoned`` flip — request-too-large
+  is a permanent input-side failure class, not a transient.
+
+- **PUF-265: ``CredentialRefresher`` no longer silently runs on a dead
+  refresh mechanism.** ``_refresh_now`` used to call
+  ``await self.backend.refresh()`` without capturing the returned
+  ``RefreshOutcome``, so the "claude exited 0 but expiresAt didn't
+  advance" case (UNCHANGED) fell through unnoticed. The daemon went
+  back to its 2-minute poll loop, ``runtime.health`` stayed
+  ``"unknown"`` fleet-wide, and operators only noticed once individual
+  agents 401'd hours later.
+
+  ``_refresh_now`` now captures the outcome (exception → ``FAILED``)
+  and feeds ``_propagate_outcome``, which tracks a consecutive
+  non-success streak. After ``REFRESH_BROKEN_THRESHOLD = 2`` ticks
+  (~4 min @ 120s poll), every registered agent's ``runtime.health``
+  flips to ``"refresh_broken"`` with an operator-actionable error
+  (``"Run `claude /login` then `puffo-agent agent resume <id>`"``).
+  Cleared unconditionally on the next REFRESHED tick — daemon
+  restarts can still unstick agents stuck on the previous instance's
+  flipped state. Does not overwrite ``"auth_failed"`` /
+  ``"api_error_abandoned"`` (stronger downstream signals; same
+  operator recovery). ``agent list`` surfaces ``[refresh_broken]``.
+
+  ``FileBackend``'s UNCHANGED branch dumps stdout + stderr tails
+  (400 chars each) at ERROR level for forensic discrimination of the
+  underlying root cause.
+
+  v2 hardening (post-2026-05-29 09:08 UTC Anthropic-side rate-limit
+  incident): the refresh probe is now pinned to ``claude-haiku-4-5``
+  via ``--model`` (Haiku has higher per-model limits than the
+  operator's interactive Opus/Sonnet default, so the probe stops
+  fighting model-specific rate windows). A new
+  ``RefreshOutcome.RATE_LIMITED`` variant is returned when the
+  probe's stderr/stdout matches a canonical Anthropic rate-limit
+  signature (six anchored patterns: 429 / "temporarily limiting
+  requests" / ``rate_limit_error`` / 5h-quota / 529 overloaded).
+  RATE_LIMITED counts toward the refresh_broken streak (same as
+  FAILED — the rotation really didn't happen) AND schedules a
+  randomised ``[5, 15]`` s fast retry via ``_refresh_request.set()``
+  instead of parking on the natural 120s poll. Back-to-back
+  rate-limit hits coalesce into one pending retry task.
+
+  Model deprecation defence: a hardcoded ``REFRESH_PROBE_MODEL``
+  would silently break the day Anthropic retires Haiku 4.5. A
+  ``_probe_model_disabled`` module-level latch detects four
+  ``model_not_found`` surfaces in the probe stderr/stdout
+  (``"type":"not_found_error"`` + ``model`` / ``model not found`` /
+  ``model_not_found`` / ``invalid model`` / ``model X does not exist
+  | is not available | unknown``) and on first hit drops ``--model``
+  from subsequent probes, letting claude pick its current default.
+  The first tick after a deprecation counts as FAILED (streak=1),
+  the next tick succeeds with the default and resets — no spurious
+  ``refresh_broken`` flip. Operator can also override the constant
+  via ``PUFFO_AGENT_REFRESH_MODEL`` env var without a release.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the

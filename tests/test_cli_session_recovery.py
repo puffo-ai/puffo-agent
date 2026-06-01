@@ -15,11 +15,15 @@ from unittest.mock import patch
 import pytest
 
 from puffo_agent.agent.adapters.cli_session import (
+    MAX_USER_MESSAGE_BYTES,
+    REQUEST_TOO_LARGE_FRIENDLY,
     STREAM_READER_LIMIT_BYTES,
     AuditLog,
     ClaudeSession,
     _looks_like_poisoned_session,
+    _looks_like_request_too_large,
 )
+from puffo_agent.agent.adapters.base import TurnResult
 
 
 # ── Fake subprocess helpers ──────────────────────────────────────────────────
@@ -399,3 +403,236 @@ def test_one_turn_normal_reply_keeps_session(tmp_path):
     assert out.metadata.get("poisoned_session") is None
     assert session.session_file.exists()
     assert session._session_id == "sess-healthy"
+
+
+# ── PUF-264: pre-send byte cap + reactive Prompt-is-too-long rewrite ────────
+
+
+def test_one_turn_pre_send_check_short_circuits_oversized_user_message(tmp_path):
+    session = _make_session(tmp_path, audit=True)
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=[])
+        big = "x" * (MAX_USER_MESSAGE_BYTES + 1)
+        return await session._one_turn(big)
+
+    out = asyncio.run(drive())
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "pre_send"
+    assert out.metadata.get("user_message_bytes") == MAX_USER_MESSAGE_BYTES + 1
+    assert session._proc.stdin.buffer == bytearray()
+    events = _read_audit_events(tmp_path / "audit.log")
+    assert any(e.get("event") == "turn.request_too_large_pre_send" for e in events)
+
+
+def test_one_turn_pre_send_check_passes_messages_at_or_below_cap(tmp_path):
+    result_evt = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "usage": {"input_tokens": 5, "output_tokens": 5},
+        "result": "fine",
+    }
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=[
+            (json.dumps(result_evt) + "\n").encode("utf-8"),
+        ])
+        at_cap = "x" * MAX_USER_MESSAGE_BYTES
+        return await session._one_turn(at_cap)
+
+    out = asyncio.run(drive())
+    assert out.metadata.get("request_too_large") is None
+    assert session._proc.stdin.buffer
+
+
+def test_rewrite_if_request_too_large_matches_canonical_anthropic_string(tmp_path):
+    session = _make_session(tmp_path, audit=True)
+    raw = "API Error: Prompt is too long\n\nRequest ID: req_011CtestabcDEF"
+    result = TurnResult(
+        reply=raw, input_tokens=42, output_tokens=0, tool_calls=3,
+        metadata={"some_prior_flag": True},
+    )
+    out = session._rewrite_if_request_too_large(result)
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "reactive"
+    assert out.metadata.get("original_reply") == raw
+    assert out.metadata.get("some_prior_flag") is True
+    assert out.input_tokens == 42
+    assert out.tool_calls == 3
+
+
+def test_rewrite_if_request_too_large_matches_max_tokens_context_limit(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    raw = "input length and `max_tokens` exceed context limit: 199000 + 4000 > 200000"
+    out = session._rewrite_if_request_too_large(TurnResult(reply=raw))
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "reactive"
+
+
+def test_rewrite_if_request_too_large_matches_size_error_attachment_form(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    for raw in (
+        "size error: request too large, try with a smaller file",
+        "size error： request too large，try with a smaller file",
+    ):
+        out = session._rewrite_if_request_too_large(TurnResult(reply=raw))
+        assert out.reply == REQUEST_TOO_LARGE_FRIENDLY, raw
+        assert out.metadata.get("request_too_large") == "reactive"
+
+
+def test_rewrite_if_request_too_large_passes_through_normal_replies(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    cases = [
+        "Sure, here's the answer to your question.",
+        "I will write a long prompt to test edge cases.",
+        "API Error: Request rejected (429)",
+        "",
+    ]
+    for raw in cases:
+        result = TurnResult(reply=raw)
+        out = session._rewrite_if_request_too_large(result)
+        assert out is result, f"regex over-matched on: {raw!r}"
+
+
+def test_looks_like_request_too_large_predicate():
+    assert _looks_like_request_too_large("API Error: Prompt is too long")
+    assert _looks_like_request_too_large(
+        "API Error: Prompt is too long\n\nRequest ID: req_011CtestabcDEF"
+    )
+    assert _looks_like_request_too_large(
+        "input length and `max_tokens` exceed context limit: 199000 + 4000 > 200000"
+    )
+    assert _looks_like_request_too_large(
+        "size error: request too large, try with a smaller file"
+    )
+    assert _looks_like_request_too_large(
+        "size error： request too large，try with a smaller file"
+    )
+    assert _looks_like_request_too_large("api error: PROMPT IS TOO LONG")
+    assert _looks_like_request_too_large("SIZE ERROR: REQUEST TOO LARGE, try later")
+    assert not _looks_like_request_too_large("Prompt is too longer than usual")
+    assert not _looks_like_request_too_large("API Error: Request rejected (429)")
+    assert not _looks_like_request_too_large(
+        "Your previous request too large for the queue was retried."
+    )
+    assert not _looks_like_request_too_large("")
+    assert not _looks_like_request_too_large("Sure, here's the answer.")
+
+
+def test_one_turn_pre_send_check_counts_utf8_bytes_not_chars(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    big_cjk = "好" * (MAX_USER_MESSAGE_BYTES // 3 + 1)
+    assert len(big_cjk) < MAX_USER_MESSAGE_BYTES
+    assert len(big_cjk.encode("utf-8")) > MAX_USER_MESSAGE_BYTES
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=[])
+        return await session._one_turn(big_cjk)
+
+    out = asyncio.run(drive())
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "pre_send"
+
+
+def test_one_turn_pre_send_check_does_not_emit_turn_input_audit(tmp_path):
+    session = _make_session(tmp_path, audit=True)
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=[])
+        big = "x" * (MAX_USER_MESSAGE_BYTES + 1)
+        return await session._one_turn(big)
+
+    asyncio.run(drive())
+    events = _read_audit_events(tmp_path / "audit.log")
+    assert any(e.get("event") == "turn.request_too_large_pre_send" for e in events)
+    assert not any(e.get("event") == "turn.input" for e in events)
+
+
+def test_run_turn_rewrites_canonical_too_long_reply(tmp_path):
+    too_long = "API Error: Prompt is too long\n\nRequest ID: req_011CtestabcDEF"
+    lines = [
+        (json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": too_long}]},
+        }) + "\n").encode("utf-8"),
+        (json.dumps({
+            "type": "result", "subtype": "success",
+            "session_id": "sess-too-long",
+            "usage": {"input_tokens": 100, "output_tokens": 0},
+        }) + "\n").encode("utf-8"),
+    ]
+    session = _make_session(tmp_path, audit=True)
+
+    async def drive():
+        async def fake_ensure(_system_prompt):
+            session._proc = _FakeProc(stdout_lines=list(lines))
+        with patch.object(session, "_ensure_running", side_effect=fake_ensure):
+            return await session.run_turn("hello", "sysprompt")
+
+    out = asyncio.run(drive())
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "reactive"
+    assert out.metadata.get("original_reply") == too_long
+    assert out.input_tokens == 100
+    events = _read_audit_events(tmp_path / "audit.log")
+    assert any(e.get("event") == "turn.request_too_large_reactive" for e in events)
+
+
+def test_run_turn_oversized_message_returns_friendly_without_burning_retries(
+    tmp_path, monkeypatch,
+):
+    session = _make_session(tmp_path, audit=True)
+    sleep_calls: list[float] = []
+
+    async def track_sleep(secs):
+        sleep_calls.append(secs)
+        return None
+    monkeypatch.setattr(asyncio, "sleep", track_sleep)
+
+    async def drive():
+        async def fake_ensure(_system_prompt):
+            session._proc = _FakeProc(stdout_lines=[])
+        with patch.object(session, "_ensure_running", side_effect=fake_ensure):
+            big = "x" * (MAX_USER_MESSAGE_BYTES + 1)
+            return await session.run_turn(big, "sysprompt")
+
+    out = asyncio.run(drive())
+    assert out.reply == REQUEST_TOO_LARGE_FRIENDLY
+    assert out.metadata.get("request_too_large") == "pre_send"
+    assert sleep_calls == []
+
+
+def test_run_turn_auth_error_takes_precedence_over_too_large_rewrite(
+    tmp_path, monkeypatch,
+):
+    combined = "API Error: 401 Invalid API key. Prompt is too long."
+    lines_template = [
+        (json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": combined}]},
+        }) + "\n").encode("utf-8"),
+        (json.dumps({
+            "type": "result", "subtype": "success",
+            "session_id": "sess-x",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }) + "\n").encode("utf-8"),
+    ]
+
+    async def no_sleep(_secs):
+        return None
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        async def fake_ensure(_system_prompt):
+            session._proc = _FakeProc(stdout_lines=list(lines_template))
+        with patch.object(session, "_ensure_running", side_effect=fake_ensure):
+            return await session.run_turn("hello", "sysprompt")
+
+    out = asyncio.run(drive())
+    assert out.reply == ""
+    assert out.metadata.get("auth_failed") is True
+    assert out.metadata.get("request_too_large") is None

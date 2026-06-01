@@ -53,10 +53,12 @@ import enum
 import json
 import logging
 import os
+import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
 
 from .state import link_host_codex_auth, link_host_credentials
 
@@ -67,6 +69,107 @@ logger = logging.getLogger(__name__)
 REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
+
+# 2 ticks ≈ 4 min @ 120s poll: surfaces fast, doesn't false-positive on
+# a single transient subprocess hiccup.
+REFRESH_BROKEN_THRESHOLD = 2
+
+# Haiku to dodge per-model rate-limit windows on operator's Opus/Sonnet.
+# Override via env or auto-disable on model_not_found (see _probe_model_disabled).
+REFRESH_PROBE_MODEL = os.environ.get(
+    "PUFFO_AGENT_REFRESH_MODEL", "claude-haiku-4-5",
+)
+
+# Module-level latch: set True on the first ``model_not_found`` response,
+# then probes drop ``--model`` and use claude's default. Daemon restart
+# resets — fine, the worst case is one extra failed tick before re-latching.
+_probe_model_disabled = False
+
+# 5-15s randomised so fleet retries don't synchronise post rate-limit.
+RATE_LIMIT_FAST_RETRY_MIN_SECONDS = 5.0
+RATE_LIMIT_FAST_RETRY_MAX_SECONDS = 15.0
+
+# Anchored tokens only — avoid generic "429" / "limit" which would false-
+# positive on legitimate Haiku output.
+_RATE_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
+    re.compile(r"\bServer is temporarily limiting requests\b", re.IGNORECASE),
+    re.compile(r"\brate[_ -]limit[_ -]error\b", re.IGNORECASE),
+    re.compile(r'"type"\s*:\s*"rate_limit_error"', re.IGNORECASE),
+    re.compile(r"\bYou've hit your\b.*?\blimit\b", re.IGNORECASE),
+    re.compile(r"\bRepeated 529 Overloaded errors\b", re.IGNORECASE),
+)
+
+# Anthropic surfaces for "model not found / not available". Anchored on
+# the word ``model`` so we don't latch on generic "not_found" (e.g. a
+# 404 from a different endpoint should not disable the probe model).
+_MODEL_NOT_FOUND_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r'"type"\s*:\s*"not_found_error".*?\bmodel\b', re.IGNORECASE),
+    re.compile(r"\bmodel[_ -]+not[_ -]found\b", re.IGNORECASE),
+    re.compile(r"\binvalid[_ -]model\b", re.IGNORECASE),
+    re.compile(r"\bmodel\b.*?\b(?:does not exist|is not available|unknown)\b", re.IGNORECASE),
+)
+
+
+def _looks_like_rate_limit(out_tail: str, err_tail: str) -> bool:
+    combined = f"{out_tail}\n{err_tail}"
+    return any(p.search(combined) for p in _RATE_LIMIT_PATTERNS)
+
+
+def _looks_like_model_not_found(out_tail: str, err_tail: str) -> bool:
+    combined = f"{out_tail}\n{err_tail}"
+    return any(p.search(combined) for p in _MODEL_NOT_FOUND_PATTERNS)
+
+
+def _build_probe_cmd() -> list[str]:
+    # Drops --model after the latch trips (model_not_found in stderr).
+    # Shared by FileBackend + KeychainBackend.
+    cmd = ["claude", "--dangerously-skip-permissions"]
+    if not _probe_model_disabled:
+        cmd.extend(["--model", REFRESH_PROBE_MODEL])
+    cmd.extend([
+        "--print", "--max-turns", "1",
+        "--output-format", "stream-json", "--verbose",
+        "ok",
+    ])
+    return cmd
+
+
+def _maybe_disable_probe_model(out_tail: str, err_tail: str) -> None:
+    global _probe_model_disabled
+    if _probe_model_disabled:
+        return
+    if not _looks_like_model_not_found(out_tail, err_tail):
+        return
+    _probe_model_disabled = True
+    logger.warning(
+        "credential refresh probe: model %r not available — falling back "
+        "to claude's default for subsequent probes. Update "
+        "REFRESH_PROBE_MODEL (or set PUFFO_AGENT_REFRESH_MODEL env) to a "
+        "current cheap model when convenient.",
+        REFRESH_PROBE_MODEL,
+    )
+
+
+def _classify_failed_refresh(
+    out_tail: str, err_tail: str, *, rc: int, elapsed: float, log_prefix: str,
+) -> RefreshOutcome:
+    # Shared rc!=0 classification used by FileBackend + KeychainBackend.
+    # Model-not-found check first: it's a permanent (per-daemon-life)
+    # state change, so it should latch even when the response also
+    # happens to look rate-limit-shaped.
+    _maybe_disable_probe_model(out_tail, err_tail)
+    if _looks_like_rate_limit(out_tail, err_tail):
+        logger.warning(
+            "%s rate-limited rc=%d in %.1fs | stdout: %s | stderr: %s",
+            log_prefix, rc, elapsed, out_tail, err_tail,
+        )
+        return RefreshOutcome.RATE_LIMITED
+    logger.warning(
+        "%s rc=%d in %.1fs | stdout: %s | stderr: %s",
+        log_prefix, rc, elapsed, out_tail, err_tail,
+    )
+    return RefreshOutcome.FAILED
 
 # Codex's OAuth access_token is a JWT — the only authoritative expiry
 # is the ``exp`` claim inside the token. Codex's own ``last_refresh``
@@ -102,6 +205,9 @@ class RefreshOutcome(enum.Enum):
     REFRESHED = "refreshed"
     UNCHANGED = "unchanged"
     FAILED = "failed"
+    # Counts toward refresh_broken streak like FAILED but additionally
+    # schedules a fast retry (RATE_LIMIT_FAST_RETRY_{MIN,MAX}_SECONDS).
+    RATE_LIMITED = "rate_limited"
 
 
 class CredentialBackend(Protocol):
@@ -167,12 +273,7 @@ class FileBackend:
     async def refresh(self) -> RefreshOutcome:
         before = self.expires_in_seconds()
         env = {**os.environ, "HOME": str(self.host_home)}
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-            "ok",
-        ]
+        cmd = _build_probe_cmd()
         started = time.time()
         try:
             # cwd=host_home so claude's project-resolution doesn't
@@ -207,18 +308,19 @@ class FileBackend:
         if proc.returncode != 0:
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
-            logger.warning(
-                "credential refresh rc=%d in %.1fs | stdout: %s | stderr: %s",
-                proc.returncode, elapsed, out_tail, err_tail,
+            return _classify_failed_refresh(
+                out_tail, err_tail, rc=proc.returncode, elapsed=elapsed,
+                log_prefix="credential refresh",
             )
-            return RefreshOutcome.FAILED
         if before is not None and after is not None and after <= before:
+            err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
+            out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
             logger.error(
                 "credential refresh exit=0 but expiresAt didn't advance "
-                "(before=%ds, after=%ds) — claude may not be rewriting "
-                "credentials.json on this build; operator may need "
-                "`claude /login` to recover",
-                before, after,
+                "(before=%ds, after=%ds) in %.1fs — claude may not be "
+                "rewriting credentials.json on this build; operator may "
+                "need `claude /login` to recover | stdout: %s | stderr: %s",
+                before, after, elapsed, out_tail, err_tail,
             )
             return RefreshOutcome.UNCHANGED
         logger.info(
@@ -452,12 +554,7 @@ class KeychainBackend:
         # UX) instead of wherever the daemon was launched from.
         host_home = Path.home()
         env = {**os.environ, "HOME": str(host_home)}
-        cmd = [
-            "claude", "--dangerously-skip-permissions",
-            "--print", "--max-turns", "1",
-            "--output-format", "stream-json", "--verbose",
-            "ok",
-        ]
+        cmd = _build_probe_cmd()
         started = time.time()
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -487,11 +584,10 @@ class KeychainBackend:
         if proc.returncode != 0:
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
-            logger.warning(
-                "claude credential refresh rc=%d in %.1fs | stdout: %s | stderr: %s",
-                proc.returncode, elapsed, out_tail, err_tail,
+            return _classify_failed_refresh(
+                out_tail, err_tail, rc=proc.returncode, elapsed=elapsed,
+                log_prefix="claude credential refresh",
             )
-            return RefreshOutcome.FAILED
 
         # Pull the post-refresh blob straight from Keychain — that's
         # where claude wrote it. Then sync our cache so agent fan-out
@@ -628,13 +724,35 @@ class CredentialRefresher:
             self.host_credentials = backend.host_credentials
         self._refresh_request = asyncio.Event()
         self._agent_homes: set[Path] = set()
+        self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
+        self._consecutive_non_success = 0
+        self._rate_limit_retry_task: asyncio.Task | None = None
 
     def register_agent(self, agent_home: Path) -> None:
         self._agent_homes.add(Path(agent_home))
 
     def unregister_agent(self, agent_home: Path) -> None:
         self._agent_homes.discard(Path(agent_home))
+
+    def register_on_refresh_success(self, callback: Callable[[], None]) -> None:
+        self._on_refresh_success.append(callback)
+
+    def unregister_on_refresh_success(self, callback: Callable[[], None]) -> None:
+        try:
+            self._on_refresh_success.remove(callback)
+        except ValueError:
+            pass
+
+    def _fire_refresh_success(self) -> None:
+        # list(...) defensive copy: callback may (un)register during dispatch.
+        for cb in list(self._on_refresh_success):
+            try:
+                cb()
+            except Exception as exc:
+                logger.warning(
+                    "credential refresh-success callback raised: %s", exc,
+                )
 
     def notify_refresh_needed(self) -> None:
         """In-process trigger from an agent that just saw a 401."""
@@ -721,6 +839,7 @@ class CredentialRefresher:
                 continue
             if rotated:
                 self._sync_views()
+                self._fire_refresh_success()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
         stop_task = asyncio.create_task(stop_event.wait())
@@ -755,10 +874,11 @@ class CredentialRefresher:
     async def _refresh_now(
         self, *, expires_in: int | None, by_agent: bool,
     ) -> None:
-        """Single-writer refresh through the backend. The
-        ``asyncio.Lock`` is what makes the rotating-RT race
-        unwinnable: a second caller can't see an in-flight rotation
-        mid-write."""
+        """Single-writer refresh through the backend; the lock makes
+        the rotating-RT race unwinnable."""
+        # Fire only on REFRESHED: UNCHANGED / FAILED leave the on-disk
+        # token unchanged, so clearing auth_failed would oscillate.
+        outcome: RefreshOutcome | None = None
         async with self._lock:
             before = self.expires_in_seconds()
             if (
@@ -776,9 +896,119 @@ class CredentialRefresher:
                 expires_in, by_agent,
             )
             try:
-                await self.backend.refresh()
+                outcome = await self.backend.refresh()
             except Exception as exc:
                 logger.warning("backend refresh errored: %s", exc)
+                outcome = RefreshOutcome.FAILED
+            self._propagate_outcome(outcome)
+        if outcome is RefreshOutcome.REFRESHED:
+            self._fire_refresh_success()
+
+    def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
+        if outcome is RefreshOutcome.REFRESHED:
+            if self._consecutive_non_success > 0:
+                logger.info(
+                    "credential refresh recovered after %d non-success "
+                    "tick(s) — clearing refresh_broken health on "
+                    "registered agents",
+                    self._consecutive_non_success,
+                )
+            # Always clear: a daemon restart resets the in-memory counter
+            # to 0 while leaving on-disk ``refresh_broken`` from the
+            # previous instance — without the unconditional call those
+            # agents stay stuck. _clear_refresh_broken is idempotent.
+            self._clear_refresh_broken()
+            self._consecutive_non_success = 0
+            return
+        self._consecutive_non_success += 1
+        if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
+            self._flip_refresh_broken(outcome)
+        if outcome is RefreshOutcome.RATE_LIMITED:
+            self._schedule_rate_limit_retry()
+
+    def _schedule_rate_limit_retry(self) -> None:
+        # Coalesce: back-to-back rate-limit hits share one pending retry.
+        existing = self._rate_limit_retry_task
+        if existing is not None and not existing.done():
+            return
+        delay = random.uniform(
+            RATE_LIMIT_FAST_RETRY_MIN_SECONDS,
+            RATE_LIMIT_FAST_RETRY_MAX_SECONDS,
+        )
+        logger.info(
+            "credential refresh rate-limited — scheduling fast retry "
+            "in %.1fs (vs. %ds natural poll)",
+            delay, REFRESH_POLL_SECONDS,
+        )
+
+        async def _retry() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            self._refresh_request.set()
+
+        coro = _retry()
+        try:
+            self._rate_limit_retry_task = asyncio.create_task(coro)
+        except RuntimeError:
+            # No running loop (sync test path) — fall back to natural poll.
+            coro.close()
+            self._rate_limit_retry_task = None
+
+    def _flip_refresh_broken(self, outcome: RefreshOutcome) -> None:
+        from .state import RuntimeState
+        msg = (
+            f"daemon CredentialRefresher saw {self._consecutive_non_success} "
+            f"consecutive {outcome.value} outcome(s); on-disk token isn't "
+            f"advancing. Run `claude /login` then "
+            f"`puffo-agent agent resume <id>` to recover."
+        )
+        for agent_home in self._agent_homes:
+            agent_id = Path(agent_home).name
+            try:
+                rs = RuntimeState.load(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_broken flip: failed to load runtime for %s: %s",
+                    agent_id, exc,
+                )
+                continue
+            if rs is None:
+                continue
+            if rs.health in (
+                "auth_failed", "api_error_abandoned", "refresh_broken",
+            ):
+                continue
+            rs.health = "refresh_broken"
+            rs.error = msg
+            try:
+                rs.save(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_broken flip: failed to save runtime for %s: %s",
+                    agent_id, exc,
+                )
+
+    def _clear_refresh_broken(self) -> None:
+        from .state import RuntimeState
+        for agent_home in self._agent_homes:
+            agent_id = Path(agent_home).name
+            try:
+                rs = RuntimeState.load(agent_id)
+            except Exception:
+                continue
+            if rs is None or rs.health != "refresh_broken":
+                continue
+            rs.health = "ok"
+            rs.error = ""
+            try:
+                rs.save(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh_broken clear: failed to save runtime for %s: %s",
+                    agent_id, exc,
+                )
 
     def _sync_views(self) -> None:
         """Mirror canonical credentials to every registered agent."""

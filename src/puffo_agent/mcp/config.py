@@ -13,12 +13,15 @@ that form.
 from __future__ import annotations
 
 import json
+import re
 import site
 import sys
 from pathlib import Path
 
 
 MCP_SERVER_NAME = "puffo"
+
+_TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 
 PUFFO_CORE_TOOL_NAMES = (
@@ -89,31 +92,19 @@ def write_codex_mcp_config(
     command: str | None = None,
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
+    extra_servers: dict[str, dict] | None = None,
 ) -> Path:
-    """Serialise the codex per-agent config to ``dest`` as TOML.
+    """Serialise the per-agent codex config.toml.
 
-    Two responsibilities folded into one file:
+    Always emits ``cli_auth_credentials_store = "file"`` so codex
+    reads/writes ``$CODEX_HOME/auth.json`` instead of macOS Keychain
+    (the daemon's ``CodexFileBackend`` + ``link_host_codex_auth``
+    only work in file-mode auth).
 
-    1. Pin ``cli_auth_credentials_store = "file"`` at the top level so
-       each per-agent codex reads + writes ``$CODEX_HOME/auth.json``
-       instead of falling back to its platform default (``auto`` →
-       macOS Keychain). The daemon's ``CodexFileBackend`` refresh
-       path and ``link_host_codex_auth`` symlink propagation only
-       work when file is the canonical store. Always emitted —
-       passing no MCP args still produces a config that locks the
-       agent into file-mode auth.
-
-    2. Optionally emit ``[mcp_servers.<name>]`` for the puffo_core
-       stdio MCP server. Phase 0 #5 verifies the ``env`` table is
-       actually honoured per-server (we rely on it for the
-       ``PYTHONUSERBASE`` / ``PUFFO_*`` env vars puffo_core needs).
-       When ``command`` is ``None`` (agent without ``puffo_core``
-       configured), the MCP section is omitted but the auth-store
-       pin still lands.
-
-    We hand-roll the TOML (no stdlib writer in Python 3.11) — the
-    schema is bounded enough that a 30-line emitter is simpler than a
-    dependency.
+    Emits ``[mcp_servers.<name>]`` for the puffo_core stdio server
+    (when ``command`` is given) + every ``extra_servers`` entry (host
+    MCPs read by ``read_host_codex_mcp_servers``). The puffo entry
+    shadows any ``puffo``-keyed host entry to avoid duplicate keys.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -123,32 +114,56 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
+    # Host extras first so the puffo entry below shadows any duplicate.
+    for name, spec in sorted((extra_servers or {}).items()):
+        if name == MCP_SERVER_NAME:
+            continue
+        lines += _emit_codex_mcp_block(name, spec)
     if command is not None:
-        lines += [
-            "",
-            f"[mcp_servers.{MCP_SERVER_NAME}]",
-            f'command = "{_toml_escape(command)}"',
-            "args = ["
-            + ", ".join(f'"{_toml_escape(a)}"' for a in (args or []))
-            + "]",
-        ]
+        puffo_spec: dict = {"command": command, "args": list(args or [])}
         if env:
-            lines.append("")
-            lines.append(f"[mcp_servers.{MCP_SERVER_NAME}.env]")
-            for k, v in sorted(env.items()):
-                lines.append(f'{k} = "{_toml_escape(str(v))}"')
+            puffo_spec["env"] = dict(env)
+        lines += _emit_codex_mcp_block(MCP_SERVER_NAME, puffo_spec)
     lines.append("")
     dest.write_text("\n".join(lines), encoding="utf-8")
     return dest
 
 
+def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
+    # spec is tomllib-shaped: {command, args?, env?}. Missing optional
+    # fields tolerated. Name + env keys quoted via _toml_key when they
+    # contain TOML-significant chars (dots, etc.) so `my.server` doesn't
+    # become a nested table.
+    key = _toml_key(name)
+    out: list[str] = ["", f"[mcp_servers.{key}]"]
+    cmd = str(spec.get("command", ""))
+    out.append(f'command = "{_toml_escape(cmd)}"')
+    args = spec.get("args") or []
+    out.append(
+        "args = ["
+        + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
+        + "]"
+    )
+    env = spec.get("env") or {}
+    if env:
+        out.append("")
+        out.append(f"[mcp_servers.{key}.env]")
+        for k, v in sorted(env.items()):
+            out.append(f'{_toml_key(k)} = "{_toml_escape(str(v))}"')
+    return out
+
+
+def _toml_key(name: str) -> str:
+    # Bare key if it matches the TOML bare-key charset; otherwise quote
+    # as basic-string key (prevents dots from creating nested tables).
+    if _TOML_BARE_KEY.fullmatch(name):
+        return name
+    return f'"{_toml_escape(name)}"'
+
+
 def _toml_escape(s: str) -> str:
-    """Escape a string for embedding in a TOML basic string. Covers
-    backslash + double-quote — the only two metacharacters in TOML
-    basic strings that we care about for path / arg / env values.
-    Newlines / control chars are intentionally NOT escaped because
-    legitimate inputs never contain them.
-    """
+    # Only backslash + double-quote need escaping in basic strings for
+    # the path / arg / env shapes we emit. Newlines aren't expected.
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
