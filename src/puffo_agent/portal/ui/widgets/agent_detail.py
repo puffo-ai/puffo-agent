@@ -56,6 +56,57 @@ def _provider_for_harness(harness: str) -> str:
     return ""
 
 
+# (host-dirname, mcp filename or None) per harness. ``None`` means the
+# harness has no skill / mcp convention this UI knows how to surface.
+_HARNESS_SKILL_DIRNAME = {
+    "claude-code": ".claude",
+    "codex":       ".codex",
+    "gemini-cli":  ".gemini",
+}
+
+
+def _scan_mcp_servers(
+    agent_root: Path, home: Path, harness: str,
+) -> list[tuple[str, str, dict]]:
+    """``[(scope, name, config_dict), ...]`` for the agent's own harness."""
+    import json as _json
+    import tomllib as _tomllib
+
+    out: list[tuple[str, str, dict]] = []
+    if harness == "claude-code":
+        json_sources = [
+            ("agent",           agent_root / ".claude.json"),
+            ("host",            home / ".claude.json"),
+            ("agent workspace", agent_root / "workspace" / ".mcp.json"),
+        ]
+        for scope, path in json_sources:
+            if not path.is_file():
+                continue
+            try:
+                data = _json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            servers = data.get("mcpServers") or {}
+            for name in sorted(servers.keys()):
+                out.append((scope, name, servers[name] or {}))
+    elif harness == "codex":
+        toml_sources = [
+            ("agent", agent_root / ".codex" / "config.toml"),
+            ("host",  home / ".codex" / "config.toml"),
+        ]
+        for scope, path in toml_sources:
+            if not path.is_file():
+                continue
+            try:
+                data = _tomllib.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            servers = data.get("mcp_servers") or {}
+            for name in sorted(servers.keys()):
+                out.append((scope, name, servers[name] or {}))
+    return out
+
+
 _DEFAULT_MODELS = {
     "claude-code": ["", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
     "hermes":      ["", "claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5", "gpt-5.4"],
@@ -214,17 +265,29 @@ class AgentDetail(QWidget):
 
     def _build_mcp_tab(self) -> QWidget:
         wrap = QWidget()
-        layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(8, 8, 8, 8)
-        self._mcp_hint = QLabel(
-            "MCP servers visible to this agent — host-installed, "
-            "agent-installed (workspace/.mcp.json), or plugin-provided."
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+        hint = QLabel(
+            "MCP servers configured for the agent's harness "
+            "(command, args, env from the matching config file)."
         )
-        self._mcp_hint.setStyleSheet("color: #6b7280;")
-        self._mcp_hint.setWordWrap(True)
-        layout.addWidget(self._mcp_hint)
+        hint.setStyleSheet("color: #6b7280;")
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+
+        split = QSplitter(Qt.Horizontal)
+        split.setChildrenCollapsible(False)
         self._mcp_list = QListWidget()
-        layout.addWidget(self._mcp_list, stretch=1)
+        self._mcp_list.itemSelectionChanged.connect(self._on_mcp_selected)
+        split.addWidget(self._mcp_list)
+        self._mcp_detail = QTextEdit()
+        self._mcp_detail.setReadOnly(True)
+        self._mcp_detail.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        self._mcp_detail.setPlainText("(select an MCP server to see its command + env)")
+        split.addWidget(self._mcp_detail)
+        split.setSizes([220, 380])
+        outer.addWidget(split, stretch=1)
         return wrap
 
     @staticmethod
@@ -468,27 +531,38 @@ class AgentDetail(QWidget):
     def _populate_skills(self, cfg: AgentConfig) -> None:
         self._skills_list.clear()
         self._skill_detail.setPlainText("(select a skill to see its SKILL.md)")
-        try:
-            from ....mcp.host_tools import _list_skills
-        except ImportError:
-            self._skills_list.addItem(QListWidgetItem("(skill lister unavailable)"))
-            return
-        try:
-            entries = _list_skills(cfg.resolve_workspace_dir(), Path.home())
-        except Exception as exc:
-            self._skills_list.addItem(QListWidgetItem(f"(failed: {exc})"))
-            return
-        if not entries:
-            self._skills_list.addItem(QListWidgetItem("(no skills installed)"))
-            return
-        workspace = cfg.resolve_workspace_dir()
+        from ...state import agent_dir
+        agent_root = agent_dir(cfg.id)
         home = Path.home()
-        for scope, name in entries:
-            item = QListWidgetItem(f"[{scope}] {name}")
-            base = workspace if scope == "agent" else home
-            skill_md = base / ".claude" / "skills" / name / "SKILL.md"
-            item.setData(Qt.UserRole, str(skill_md))
-            self._skills_list.addItem(item)
+        # Only show the dirs the agent's own harness can actually load.
+        # Mixing harnesses would confuse the operator (a codex agent
+        # never reads .claude/skills/).
+        skill_dirname = _HARNESS_SKILL_DIRNAME.get(cfg.runtime.harness)
+        if skill_dirname is None:
+            self._skills_list.addItem(
+                QListWidgetItem(f"(harness {cfg.runtime.harness!r} has no skill convention)")
+            )
+            return
+        search = [
+            ("agent", agent_root / skill_dirname / "skills"),
+            ("host",  home / skill_dirname / "skills"),
+        ]
+        any_found = False
+        for scope, root in search:
+            if not root.is_dir():
+                continue
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir():
+                    continue
+                skill_md = entry / "SKILL.md"
+                if not skill_md.exists():
+                    continue
+                item = QListWidgetItem(f"[{scope}] {entry.name}")
+                item.setData(Qt.UserRole, str(skill_md))
+                self._skills_list.addItem(item)
+                any_found = True
+        if not any_found:
+            self._skills_list.addItem(QListWidgetItem("(no skills installed)"))
 
     def _on_skill_selected(self) -> None:
         items = self._skills_list.selectedItems()
@@ -507,24 +581,30 @@ class AgentDetail(QWidget):
 
     def _populate_mcp(self, cfg: AgentConfig) -> None:
         self._mcp_list.clear()
-        try:
-            from ....mcp.host_tools import _list_mcp_servers
-        except ImportError:
-            self._mcp_list.addItem(QListWidgetItem("(mcp lister unavailable)"))
-            return
-        try:
-            entries = _list_mcp_servers(cfg.resolve_workspace_dir(), Path.home())
-        except Exception as exc:
-            self._mcp_list.addItem(QListWidgetItem(f"(failed: {exc})"))
-            return
-        if not entries:
+        self._mcp_detail.setPlainText("(select an MCP server to see its command + env)")
+        from ...state import agent_dir
+        agent_root = agent_dir(cfg.id)
+        home = Path.home()
+        any_found = False
+        for scope, name, config in _scan_mcp_servers(
+            agent_root, home, cfg.runtime.harness,
+        ):
+            item = QListWidgetItem(f"[{scope}] {name}")
+            import json as _json
+            item.setData(Qt.UserRole, _json.dumps(config, indent=2))
+            self._mcp_list.addItem(item)
+            any_found = True
+        if not any_found:
             self._mcp_list.addItem(QListWidgetItem("(no MCP servers configured)"))
+
+    def _on_mcp_selected(self) -> None:
+        items = self._mcp_list.selectedItems()
+        if not items:
+            self._mcp_detail.setPlainText("(select an MCP server to see its command + env)")
             return
-        for scope, name, source in entries:
-            label = f"[{scope}] {name}"
-            if source:
-                label += f"  ({source})"
-            self._mcp_list.addItem(QListWidgetItem(label))
+        payload = items[0].data(Qt.UserRole)
+        if isinstance(payload, str):
+            self._mcp_detail.setPlainText(payload)
 
     @staticmethod
     def _set_combo(combo: QComboBox, value: str, *, by_data: bool = False) -> None:

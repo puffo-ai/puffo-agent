@@ -17,7 +17,9 @@ def launch() -> int:
     )
     log_buffer = install_log_buffer(maxlen=500)
 
+    from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication
+    from .assets import logo_path
     from .main_window import MainWindow
     from .style import APP_STYLESHEET
 
@@ -26,6 +28,7 @@ def launch() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("Puffo Agent")
+    app.setWindowIcon(QIcon(str(logo_path())))
     app.setQuitOnLastWindowClosed(True)
     app.setStyleSheet(APP_STYLESHEET)
 

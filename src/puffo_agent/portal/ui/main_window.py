@@ -22,6 +22,7 @@ from .widgets.agent_list import AgentList
 from .widgets.agent_workspace import AgentWorkspace
 from .widgets.avatar import AvatarCache
 from .widgets.home_view import HomeView
+from .widgets.log_view import LogView
 from .widgets.rail import Rail
 
 
@@ -74,11 +75,24 @@ class MainWindow(QMainWindow):
         self._sections = QStackedWidget()
         self._sections.addWidget(self._build_home_section())     # 0
         self._sections.addWidget(self._build_agents_section())   # 1
+        self._sections.addWidget(self._build_logs_section())     # 2
         root_layout.addWidget(self._sections, stretch=1)
 
     def _build_home_section(self) -> QWidget:
-        self._home = HomeView(self._log_buffer.snapshot)
+        self._home = HomeView()
         return self._home
+
+    def _build_logs_section(self) -> QWidget:
+        wrap = QWidget()
+        layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        title = QLabel("System log")
+        title.setStyleSheet("font-size: 14pt; font-weight: 600; color: #1f2937;")
+        layout.addWidget(title)
+        self._system_log = LogView(self._log_buffer.snapshot)
+        layout.addWidget(self._system_log, stretch=1)
+        return wrap
 
     def _build_agents_section(self) -> QWidget:
         splitter = QSplitter(Qt.Horizontal)
@@ -127,7 +141,9 @@ class MainWindow(QMainWindow):
 
     def _on_section_changed(self, section: str) -> None:
         self._section = section
-        self._sections.setCurrentIndex(0 if section == "home" else 1)
+        self._sections.setCurrentIndex(
+            {"home": 0, "agents": 1, "logs": 2}.get(section, 0)
+        )
 
     def _on_agent_selected(self, agent_id: Optional[str]) -> None:
         self._selected_id = agent_id
@@ -147,6 +163,9 @@ class MainWindow(QMainWindow):
     def _tick(self) -> None:
         if self._section == "home":
             self._home.poll()
+            return
+        if self._section == "logs":
+            self._system_log.poll()
             return
         self._agent_list.refresh()
         if self._selected_id is None:

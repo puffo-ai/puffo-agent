@@ -75,3 +75,6 @@ puffo-agent = "puffo_agent.portal.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"puffo_agent.portal.ui.assets" = ["*.png"]

@@ -12,7 +12,7 @@ from typing import Callable, Optional
 import asyncio
 import threading
 
-from PySide6.QtCore import QObject, QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -137,11 +137,12 @@ class _Row(QWidget):
         else:
             pm = initial_pixmap(summary.display_name, summary.slug or summary.id, 40)
         self._avatar_label.setPixmap(pm)
-        self._name_label.setText(summary.display_name)
-        role_short = summary.role_short or "—"
+        name = summary.display_name
+        if summary.role_short:
+            name = f"{name} ({summary.role_short})"
+        self._name_label.setText(name)
         runtime_blurb_parts = [p for p in (summary.harness, summary.model) if p]
-        runtime_blurb = " · ".join(runtime_blurb_parts) if runtime_blurb_parts else "—"
-        self._sub_label.setText(f"{role_short}   <i>{runtime_blurb}</i>")
+        self._sub_label.setText(" · ".join(runtime_blurb_parts) or "—")
         self._dot.setStyleSheet(
             f"color: {_STATUS_COLOUR.get(summary.status, '#9aa0a6')}; font-size: 14pt;"
         )
