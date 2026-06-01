@@ -483,7 +483,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         "next: register a puffo-core identity for this agent with "
         "`puffo-cli agent register`, then fill the puffo_core: block in "
         f"{agent_yml_path(agent_id)} (slug, device_id, space_id; "
-        "server_url defaults to https://api.puffo.ai)."
+        "server_url defaults to https://chat.puffo.ai/relay)."
     )
     if not is_daemon_alive():
         print("daemon is not running — run `puffo-agent start` to activate.")
