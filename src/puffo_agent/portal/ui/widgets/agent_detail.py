@@ -334,8 +334,8 @@ class AgentDetail(QWidget):
             return
         target, _filter = QFileDialog.getSaveFileName(
             self, "Save encrypted export",
-            f"{self._agent_id}.puffo-agent",
-            "Puffo Agent Export (*.puffo-agent)",
+            f"{self._agent_id}.puffoagent",
+            "Puffo Agent Export (*.puffoagent)",
         )
         if not target:
             return

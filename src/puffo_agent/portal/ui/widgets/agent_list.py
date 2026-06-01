@@ -271,7 +271,7 @@ class AgentList(QWidget):
         path, _filter = QFileDialog.getOpenFileName(
             self, "Import agent archive",
             "",
-            "Puffo Agent Export (*.puffo-agent);;All files (*)",
+            "Puffo Agent Export (*.puffoagent);;All files (*)",
         )
         if not path:
             return
