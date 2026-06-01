@@ -528,7 +528,9 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
         # Surface non-ok health alongside lifecycle status so the
         # operator can see at a glance which agents need
         # re-auth or refresh/restart.
-        if rs is not None and rs.health in ("auth_failed", "api_error_abandoned"):
+        if rs is not None and rs.health in (
+            "auth_failed", "api_error_abandoned", "refresh_broken",
+        ):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.
         display = (ac.display_name or aid)

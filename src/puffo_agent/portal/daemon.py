@@ -222,7 +222,7 @@ class Daemon:
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
                     )
                     self.workers[agent_id] = worker
-                    self._register_with_refresher(agent_cfg)
+                    self._register_with_refresher(agent_cfg, worker)
                     worker.start()
                     # Serialise heavy startup: ``adapter.warm()`` reads
                     # the persisted session into Node's heap, so N
@@ -238,7 +238,7 @@ class Daemon:
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
                     )
                     self.workers[agent_id] = worker
-                    self._register_with_refresher(agent_cfg)
+                    self._register_with_refresher(agent_cfg, worker)
                     worker.start()
                     await worker.wait_warm(timeout=self._warm_serialise_timeout)
                 else:
@@ -258,10 +258,21 @@ class Daemon:
             return self.codex_refresher
         return self.refresher
 
-    def _register_with_refresher(self, agent_cfg: AgentConfig) -> None:
-        self._refresher_for(agent_cfg).register_agent(
-            agent_home_dir(agent_cfg.id),
-        )
+    def _register_with_refresher(
+        self, agent_cfg: AgentConfig, worker: Worker,
+    ) -> None:
+        refresher = self._refresher_for(agent_cfg)
+        refresher.register_agent(agent_home_dir(agent_cfg.id))
+        agent_id = agent_cfg.id
+
+        def on_refresh_success() -> None:
+            Worker._clear_auth_failed_if_recoverable(
+                worker.runtime, agent_id, logger,
+            )
+
+        refresher.register_on_refresh_success(on_refresh_success)
+        # Stash callback identity for _stop_worker's unregister.
+        worker._refresh_success_callback = on_refresh_success
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         return self._refresher_for(agent_cfg).notify_refresh_needed
@@ -288,6 +299,10 @@ class Daemon:
             home = agent_home_dir(agent_id)
             self.refresher.unregister_agent(home)
             self.codex_refresher.unregister_agent(home)
+            cb = getattr(worker, "_refresh_success_callback", None)
+            if cb is not None:
+                self.refresher.unregister_on_refresh_success(cb)
+                self.codex_refresher.unregister_on_refresh_success(cb)
             await worker.stop()
 
     async def _stop_all_workers(self) -> None:

@@ -1699,6 +1699,10 @@ def _not_found(msg: str) -> web.Response:
     return web.json_response({"error": msg}, status=404)
 
 
+def _conflict(msg: str) -> web.Response:
+    return web.json_response({"error": msg}, status=409)
+
+
 # ────────────────────────────────────────────────────────────────────
 # /v1/agents/export, /v1/agents/import, /v1/agents/{id}/revoke-pending
 # Multi-agent migration. See ``portal/export.py`` and
@@ -1725,6 +1729,18 @@ async def agents_export(request: web.Request) -> web.Response:
     for aid in raw_ids:
         if not is_valid_agent_id(aid):
             return _bad(f"invalid agent id: {aid!r}")
+
+    # Paused-only — running agents may be mid-write (cli_session, memory).
+    # Small TOCTOU between this guard and exp.pack is accepted; see CHANGELOG.
+    for aid in raw_ids:
+        try:
+            cfg = AgentConfig.load(aid)
+        except FileNotFoundError:
+            return _not_found(f"agent not found: {aid}")
+        if cfg.state != "paused":
+            return _conflict(
+                f"agent {aid} is {cfg.state!r}; pause it before exporting"
+            )
 
     try:
         blob = exp.pack(raw_ids, password, exported_by_slug=request.get("paired_slug", ""))

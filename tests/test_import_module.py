@@ -203,17 +203,24 @@ async def test_import_happy_path(mock_server):
     assert result.new_device_id != info["old_device_id"]
     assert result.old_device_id == info["old_device_id"]
 
-    # Bundle decrypted onto disk + agent.yml device_id rewritten.
     cfg = AgentConfig.load("alpha")
     assert cfg.puffo_core.device_id == result.new_device_id
     assert cfg.puffo_core.slug == "alpha-bot"
+    assert cfg.state == "running"
 
-    # Server saw the expected sequence (subkey x2, init, complete, revoke).
+    # 2 subkey POSTs (old for enroll, new persisted as session); revoke reuses the new one.
     paths = [p for _, p in state["calls"]]
     assert paths.count("/devices/subkeys") == 2
     assert "/devices/enroll/init" in paths
     assert any(p.startswith("/devices/enroll/") and p.endswith("/complete") for p in paths)
     assert any(p.endswith("/revoke") for p in paths)
+
+    session_path = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / "alpha" / "keys" / "alpha-bot.session.json"
+    assert session_path.exists()
+    sess = json.loads(session_path.read_text(encoding="utf-8"))
+    assert sess["slug"] == "alpha-bot"
+    assert sess["subkey_id"] and sess["subkey_secret_key"]
+    assert sess["expires_at"] > int(time.time() * 1000)
 
 
 async def test_import_skips_existing(mock_server):
@@ -252,6 +259,7 @@ async def test_import_enrollment_failure_cleans_staging(mock_server):
 
 async def test_import_revoke_failure_leaves_pending(mock_server):
     from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import AgentConfig
 
     server, state = mock_server
     state["fail"] = {"revoke"}  # matches by substring in path
@@ -267,6 +275,31 @@ async def test_import_revoke_failure_leaves_pending(mock_server):
     assert pending.exists()
     payload = json.loads(pending.read_text(encoding="utf-8"))
     assert payload["old_device_id"] == info["old_device_id"]
+    # Revoke is best-effort — new device works, state still flips to running.
+    assert AgentConfig.load("alpha").state == "running"
+
+
+async def test_import_new_subkey_failure_is_soft(mock_server, monkeypatch):
+    # Subkey reg may 401 (chain validation lag after enrol) — must still land + flip to running.
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import AgentConfig
+
+    server, _state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    blob, _info = _build_bundle(url)
+
+    async def _boom(**_kwargs):
+        raise RuntimeError("/devices/subkeys 401: chain validation failed")
+
+    monkeypatch.setattr(imp, "_register_new_device_subkey", _boom)
+
+    report = await imp.import_bundle(blob, password="hunter2")
+    assert report.failed == 0
+    assert report.imported == 1
+    cfg = AgentConfig.load("alpha")
+    assert cfg.state == "running"
+    session_path = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / "alpha" / "keys" / "alpha-bot.session.json"
+    assert not session_path.exists()
 
 
 async def test_revoke_pending_succeeds_on_retry(mock_server):

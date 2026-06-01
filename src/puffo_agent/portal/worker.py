@@ -544,6 +544,26 @@ class Worker:
             agent_id, root_id,
         )
 
+    @staticmethod
+    def _clear_auth_failed_if_recoverable(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        # Symmetric to _clear_api_error_abandoned_if_recoverable but
+        # fired on refresh-success (not turn-success). Optimistic: if
+        # the next request still 401s, _handle_suppressed_reply re-sets.
+        if runtime.health != "auth_failed":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: credential-refresh-success; "
+            "runtime.health cleared from auth_failed back to ok",
+            agent_id,
+        )
+
     def __init__(
         self,
         daemon_cfg: DaemonConfig,
