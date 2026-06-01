@@ -905,7 +905,9 @@ class TriggerRules:
 
 ## Default puffo-core server. Override per-agent via
 ## ``puffo_core.server_url`` for self-hosted relays or local dev.
-DEFAULT_PUFFO_SERVER_URL = "https://api.puffo.ai"
+## ``api.puffo.ai`` is platform-internal only; client traffic goes
+## through the public ``chat.puffo.ai/relay`` edge.
+DEFAULT_PUFFO_SERVER_URL = "https://chat.puffo.ai/relay"
 
 
 @dataclass
