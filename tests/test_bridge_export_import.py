@@ -82,9 +82,7 @@ def _seed_agent(
     *,
     state: str = "paused",
 ) -> str:
-    # PUF-263 made paused the canonical export state — default the
-    # seed accordingly so the export tests don't all need to flip
-    # state by hand. Pass ``state="running"`` to test the 409 path.
+    # Default ``paused`` matches the export gate. Pass state="running" to test 409.
     import yaml
 
     root = Ed25519KeyPair.generate()
@@ -174,14 +172,7 @@ async def test_bridge_export_rejects_invalid_input(bridge_client):
     assert r.status == 400
 
 
-# ── PUF-263: paused-only export ─────────────────────────────────────
-
-
 async def test_bridge_export_rejects_running_agent(bridge_client):
-    # Operator spec (msg_9d0aaa27 item 1a): only paused agents can be
-    # exported. A running agent may be mid-write (memory updates, cli
-    # session refresh) so the snapshot would be inconsistent. Return
-    # 409 with a reason the UI can map to "Pause the agent first."
     user = make_user()
     await _pair(bridge_client, user)
     _seed_agent(
@@ -203,9 +194,6 @@ async def test_bridge_export_rejects_running_agent(bridge_client):
 
 
 async def test_bridge_export_rejects_whole_batch_if_any_running(bridge_client):
-    # Multi-agent migration use case: a single non-paused agent in the
-    # batch fails the whole export. Preserves "either everything in
-    # the bundle is a consistent snapshot, or nothing is."
     user = make_user()
     await _pair(bridge_client, user)
     home = os.environ["PUFFO_AGENT_HOME"]
@@ -223,10 +211,6 @@ async def test_bridge_export_rejects_whole_batch_if_any_running(bridge_client):
 
 
 async def test_bridge_export_unknown_agent_returns_404(bridge_client):
-    # PR #50 review item 3: a refactor that drops the FileNotFoundError
-    # branch would silently regress to a 500 stack-trace at the user.
-    # Defend the contract: unknown agent id → 404 with the offending id
-    # fingered in the body.
     user = make_user()
     await _pair(bridge_client, user)
     body = json.dumps({"agent_ids": ["does_not_exist"], "password": "hunter2"}).encode("utf-8")

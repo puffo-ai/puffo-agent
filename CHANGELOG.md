@@ -36,13 +36,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   first request without an extra ``/devices/subkeys`` round-trip.
   ``_revoke_old_device`` reuses that pre-registered subkey instead
   of POSTing a fresh one, so total server traffic is unchanged
-  (old subkey for enrol + new subkey for revoke). After a successful
+  (old subkey for enrol + new subkey for revoke). After
   ``_commit_staging`` — whether revoke succeeded cleanly or got
-  shelved as ``pending_revoke.json`` — the imported ``agent.yml`` is
-  patched from ``state: paused`` (inherited from the export gate) to
-  ``state: running`` so the operator doesn't have to click Resume on
-  the new machine. State flip is best-effort: a yaml write failure
-  is logged and the agent stays paused but otherwise functional.
+  shelved as ``pending_revoke.json`` — ``AgentConfig.save`` patches
+  ``state: paused`` (inherited from the export gate) to ``running``
+  so the operator doesn't have to click Resume on the new machine.
+  Subkey registration and the state flip are both best-effort: a
+  401 on ``/devices/subkeys`` (chain-validation lag right after
+  enrol) is logged and the import proceeds without persisting a
+  session — the worker rotates one on first request, same as a
+  fresh install. A yaml write failure on the state flip leaves the
+  agent paused but otherwise functional.
 
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an

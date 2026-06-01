@@ -206,21 +206,15 @@ async def test_import_happy_path(mock_server):
     cfg = AgentConfig.load("alpha")
     assert cfg.puffo_core.device_id == result.new_device_id
     assert cfg.puffo_core.slug == "alpha-bot"
-    # Successful import flips state from paused (export gate) to running
-    # so the operator doesn't have to click Resume on the new machine.
     assert cfg.state == "running"
 
-    # Server sequence: old subkey (for enroll), enroll init+complete,
-    # new subkey (persisted as session), revoke. The revoke reuses the
-    # pre-registered new subkey instead of POSTing a fresh one.
+    # 2 subkey POSTs (old for enroll, new persisted as session); revoke reuses the new one.
     paths = [p for _, p in state["calls"]]
     assert paths.count("/devices/subkeys") == 2
     assert "/devices/enroll/init" in paths
     assert any(p.startswith("/devices/enroll/") and p.endswith("/complete") for p in paths)
     assert any(p.endswith("/revoke") for p in paths)
 
-    # New device's subkey persisted as a session so the worker doesn't
-    # have to rotate on first request.
     session_path = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / "alpha" / "keys" / "alpha-bot.session.json"
     assert session_path.exists()
     sess = json.loads(session_path.read_text(encoding="utf-8"))
@@ -281,16 +275,12 @@ async def test_import_revoke_failure_leaves_pending(mock_server):
     assert pending.exists()
     payload = json.loads(pending.read_text(encoding="utf-8"))
     assert payload["old_device_id"] == info["old_device_id"]
-    # Revoke is best-effort: the new device works, so we still flip
-    # the agent to running. revoke_pending cleans up the old key later.
+    # Revoke is best-effort — new device works, state still flips to running.
     assert AgentConfig.load("alpha").state == "running"
 
 
 async def test_import_new_subkey_failure_is_soft(mock_server, monkeypatch):
-    # Server may reject the new-device subkey with a 401 chain-validation
-    # error in the moment right after enrol; the worker rotates a fresh
-    # subkey on its first request, so the import must still land the
-    # agent on disk + flip to running.
+    # Subkey reg may 401 (chain validation lag after enrol) — must still land + flip to running.
     from puffo_agent.portal import import_agents as imp
     from puffo_agent.portal.state import AgentConfig
 
@@ -308,7 +298,6 @@ async def test_import_new_subkey_failure_is_soft(mock_server, monkeypatch):
     assert report.imported == 1
     cfg = AgentConfig.load("alpha")
     assert cfg.state == "running"
-    # No session was persisted — worker will rotate on first request.
     session_path = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / "alpha" / "keys" / "alpha-bot.session.json"
     assert not session_path.exists()
 

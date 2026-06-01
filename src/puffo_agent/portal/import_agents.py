@@ -160,10 +160,7 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
             new_signing_key=new_signing,
         )
     except Exception as exc:
-        # Best-effort: if the server rejects the subkey (chain
-        # validation lag etc.), the worker rotates one on its first
-        # request anyway. Skip persisting a session and let the
-        # revoke step take its own retry.
+        # Best-effort: worker self-rotates a subkey on first request if none was persisted.
         logger.warning("import: agent=%s new subkey registration failed: %s", agent_id, exc)
 
     _write_new_identity(
@@ -295,12 +292,11 @@ async def _register_new_device_subkey(
 
 
 def _set_state_running(agent_id: str) -> None:
-    import yaml
+    from .state import AgentConfig
 
-    yml_path = agent_yml_path(agent_id)
-    raw = yaml.safe_load(yml_path.read_text(encoding="utf-8")) or {}
-    raw["state"] = "running"
-    yml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    cfg = AgentConfig.load(agent_id)
+    cfg.state = "running"
+    cfg.save()
 
 
 def _patch_agent_yml_device_id(yml_path: Path, new_device_id: str) -> None:
