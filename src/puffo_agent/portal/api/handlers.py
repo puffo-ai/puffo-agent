@@ -528,6 +528,14 @@ async def update_runtime(request: web.Request) -> web.Response:
 MAX_ROLE_LEN = 140
 MAX_ROLE_SHORT_LEN = 32
 
+# PUF-208 v2: server-side cap on soul / profile_summary content.
+# Web UI types up to 6000 + supports a .md upload up to 10000; this
+# is the load-bearing storage cap that any caller (web, CLI, future
+# automation) must respect. UTF-8 byte count rather than codepoints
+# so the cap matches what gets written to profile.md and read back
+# off disk — CJK-heavy souls fit about 3000-3300 characters.
+MAX_PROFILE_SUMMARY_BYTES = 10000
+
 
 async def update_profile(request: web.Request) -> web.Response:
     """Patch the agent's display_name + avatar_url + role. Owner-only.
@@ -642,7 +650,21 @@ async def update_profile(request: web.Request) -> web.Response:
 
     new_profile_summary = payload.get("profile_summary")
     if isinstance(new_profile_summary, str):
-        _update_profile_summary(cfg, new_profile_summary.strip())
+        # PUF-208 v2: cap before write so a stale UI / future automation
+        # client can't drop a multi-megabyte soul on disk + into the
+        # next CLAUDE.md sync. UTF-8 byte count matches storage. Cap
+        # the STRIPPED payload so the gate sees what storage actually
+        # writes — otherwise 10010 bytes of content surrounded by
+        # whitespace (strips to 9990) would 400 even though the disk
+        # write would have landed under the cap.
+        stripped_summary = new_profile_summary.strip()
+        summary_bytes = len(stripped_summary.encode("utf-8"))
+        if summary_bytes > MAX_PROFILE_SUMMARY_BYTES:
+            return _bad(
+                f"profile_summary is {summary_bytes} bytes; cap is "
+                f"{MAX_PROFILE_SUMMARY_BYTES}"
+            )
+        _update_profile_summary(cfg, stripped_summary)
 
     # Write agent.yml last so local state reflects what we asked
     # the server for, even if the sync warned.
@@ -1677,6 +1699,10 @@ def _not_found(msg: str) -> web.Response:
     return web.json_response({"error": msg}, status=404)
 
 
+def _conflict(msg: str) -> web.Response:
+    return web.json_response({"error": msg}, status=409)
+
+
 # ────────────────────────────────────────────────────────────────────
 # /v1/agents/export, /v1/agents/import, /v1/agents/{id}/revoke-pending
 # Multi-agent migration. See ``portal/export.py`` and
@@ -1703,6 +1729,18 @@ async def agents_export(request: web.Request) -> web.Response:
     for aid in raw_ids:
         if not is_valid_agent_id(aid):
             return _bad(f"invalid agent id: {aid!r}")
+
+    # Paused-only — running agents may be mid-write (cli_session, memory).
+    # Small TOCTOU between this guard and exp.pack is accepted; see CHANGELOG.
+    for aid in raw_ids:
+        try:
+            cfg = AgentConfig.load(aid)
+        except FileNotFoundError:
+            return _not_found(f"agent not found: {aid}")
+        if cfg.state != "paused":
+            return _conflict(
+                f"agent {aid} is {cfg.state!r}; pause it before exporting"
+            )
 
     try:
         blob = exp.pack(raw_ids, password, exported_by_slug=request.get("paired_slug", ""))

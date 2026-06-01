@@ -4,9 +4,63 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.9.6] — unreleased
+## [0.9.6] — 2026-06-01
 
 ### Fixed
+
+- **PUF-208 v2: ``profile_summary`` capped at 10000 UTF-8 bytes on
+  the bridge.** The web client shares one 10000-byte ceiling across
+  textarea typing, ``soul.md`` upload, and Edit; the daemon-side
+  ``MAX_PROFILE_SUMMARY_BYTES`` is the load-bearing storage cap, so
+  any caller (web, CLI, future automation) is 400'd if the
+  post-strip payload exceeds it. Byte count rather than codepoints
+  so the cap matches what gets written to ``profile.md`` and read
+  back off disk; CJK-heavy souls fit ~3000-3300 characters. Out of
+  scope per operator spec: the ``create_agent`` write path — capping
+  it would need to parse the full ``profile.md`` payload to isolate
+  the soul section, so a stale UI / CLI hitting ``create_agent``
+  with a 50KB ``profile`` field still bypasses this cap on first-
+  create. Acknowledged gap.
+
+- **PUF-263: ``/v1/agents/export`` enforces paused-only.** A running
+  agent may be mid-write (memory updates, ``cli_session.json``
+  refresh, in-flight skill state) so a snapshot would be inconsistent
+  and could either silently lose data or restore into a broken state
+  on the other side. ``agents_export`` now loads each requested
+  agent's ``AgentConfig`` and returns 409 (new ``_conflict`` helper)
+  when ``cfg.state != "paused"``. Whole-batch reject — a single
+  non-paused agent in a multi-agent bundle fails the request,
+  preserving "either everything in the bundle is a consistent
+  snapshot, or nothing is." Unknown agent ids return 404 with the
+  offending id fingered in the body. Paired with the web client's
+  Export button (gated on paused) so the 409 only fires on a race
+  where the agent flipped between gate and submit.
+
+  Known limit: there is a small TOCTOU window between the paused
+  guard and ``exp.pack`` — if the agent gets resumed mid-pack the
+  snapshot is partially-inconsistent. Acceptable for P0 because the
+  only resume paths are operator-driven (visible) or the reconcile
+  loop (which respects the paused-by-operator flag). Tighten with a
+  per-agent lock if a regression surfaces.
+
+- **PUF-263: import flow now self-contained, lands the agent in
+  running state.** ``import_bundle`` registers the new device's
+  subkey immediately after enrol and persists it as a session under
+  ``keys/<slug>.session.json`` so the agent worker can sign its
+  first request without an extra ``/devices/subkeys`` round-trip.
+  ``_revoke_old_device`` reuses that pre-registered subkey instead
+  of POSTing a fresh one, so total server traffic is unchanged
+  (old subkey for enrol + new subkey for revoke). After
+  ``_commit_staging`` — whether revoke succeeded cleanly or got
+  shelved as ``pending_revoke.json`` — ``AgentConfig.save`` patches
+  ``state: paused`` (inherited from the export gate) to ``running``
+  so the operator doesn't have to click Resume on the new machine.
+  Subkey registration and the state flip are both best-effort: a
+  401 on ``/devices/subkeys`` (chain-validation lag right after
+  enrol) is logged and the import proceeds without persisting a
+  session — the worker rotates one on first request, same as a
+  fresh install. A yaml write failure on the state flip leaves the
+  agent paused but otherwise functional.
 
 - **PUF-266: codex agents now inherit the operator's host MCP catalog.**
   ``write_codex_mcp_config`` used to overwrite the per-agent
