@@ -150,8 +150,20 @@ class AgentDetail(QWidget):
         super().__init__(parent)
         self._agent_id: Optional[str] = None
         self._cfg: Optional[AgentConfig] = None
+        self._initial_snapshot: Optional[tuple] = None
         self._build()
         self._avatar_uploaded.connect(self._on_avatar_uploaded)
+        for w, sig in (
+            (self._display_name, "textChanged"),
+            (self._role,         "textChanged"),
+            (self._role_short,   "textChanged"),
+            (self._soul,         "textChanged"),
+            (self._runtime_kind, "currentTextChanged"),
+            (self._harness,      "currentTextChanged"),
+            (self._model,        "currentTextChanged"),
+        ):
+            getattr(w, sig).connect(self._check_dirty)
+        self._check_dirty()
 
     # Construction ──────────────────────────────────────────────────
 
@@ -337,6 +349,8 @@ class AgentDetail(QWidget):
         self._agent_id = agent_id
         if agent_id is None:
             self._cfg = None
+            self._initial_snapshot = None
+            self._check_dirty()
             return
         self._reload_from_disk()
 
@@ -366,6 +380,27 @@ class AgentDetail(QWidget):
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
         self._update_action_buttons()
+        self._initial_snapshot = self._snapshot()
+        self._check_dirty()
+
+    def _snapshot(self) -> tuple:
+        return (
+            self._display_name.text(),
+            self._role.text(),
+            self._role_short.text(),
+            self._soul.toPlainText(),
+            self._runtime_kind.currentText(),
+            self._harness.currentText(),
+            self._model.currentData() or "",
+        )
+
+    def _check_dirty(self) -> None:
+        dirty = (
+            self._initial_snapshot is not None
+            and self._snapshot() != self._initial_snapshot
+        )
+        self._save_btn.setEnabled(dirty)
+        self._revert_btn.setEnabled(dirty)
 
     def _update_action_buttons(self) -> None:
         has = self._cfg is not None
@@ -641,6 +676,7 @@ class AgentDetail(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Save", f"failed to persist: {exc}")
             return
+        self._reload_from_disk()
         self.saved.emit(self._agent_id)
 
     # Skills + MCP ──────────────────────────────────────────────────
