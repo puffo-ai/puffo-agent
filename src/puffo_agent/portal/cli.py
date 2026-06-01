@@ -237,6 +237,9 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    if getattr(args, "ui", False):
+        from .ui.launcher import launch
+        return launch()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1266,7 +1269,16 @@ def build_parser() -> argparse.ArgumentParser:
             "The daemon runs fine without this — agents can carry their own keys."
         ),
     ).set_defaults(func=cmd_config)
-    sub.add_parser("start", help="Run the daemon in the foreground").set_defaults(func=cmd_start)
+    start = sub.add_parser(
+        "start",
+        help="Run the daemon in the foreground (add --ui to launch the Qt desktop window)",
+    )
+    start.add_argument(
+        "--ui",
+        action="store_true",
+        help="Launch the PySide6 desktop window alongside the daemon.",
+    )
+    start.set_defaults(func=cmd_start)
     stop = sub.add_parser(
         "stop",
         help=(

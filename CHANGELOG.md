@@ -4,6 +4,54 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] — 2026-06-01
+
+### Added
+
+- **Desktop UI (PySide6).** ``puffo-agent start --ui`` opens a Qt
+  window beside the daemon. A vertical rail switches between three
+  sections — **Home** (bundled puffo-logo title, an ``Open Puffo``
+  button that opens chat.puffo.ai/chat, AI tool cards for Claude Code
+  / Codex / Hermes-coming-soon, a Local-bridge pairing card that
+  links to chat.puffo.ai/chat/agents when unpaired, and a version
+  footer), **Agents** (contacts-app sidebar with avatar / name /
+  role_short / status / harness · model, ``Show all`` toggle,
+  ``Import agent`` flow, per-agent three-pane workspace), and
+  **Logs** (the daemon's process-wide log). Window close writes
+  ``stop.sentinel`` for graceful shutdown. Default ``start`` stays
+  headless.
+
+- **In-UI agent editing.** Info tab supports avatar change
+  (round-tripped through signed ``/blobs/upload`` then verified via
+  signed GET before the preview lands), display_name / role / role
+  short / soul (``# Soul`` section of profile.md) / runtime kind /
+  harness / model (curated dropdown per harness). Pause/Resume,
+  Refresh session (drops ``cli_session.json`` and restarts the
+  worker), Archive, and Export sit in the top action bar.
+  Skills + MCP tabs scan only the harness the agent actually uses
+  (``.claude/``, ``.codex/``, etc.) and show a detail pane per entry.
+
+- **On-disk display-name + avatar cache
+  (``~/.puffo-agent/cache/``).** Workers persist ``/spaces`` /
+  ``/spaces/<id>/channels`` / ``/identities/profiles`` results into
+  ``profiles/`` / ``spaces/`` / ``channels/`` JSON-per-key directories
+  and signed-fetch avatar blobs into ``avatars/<sha256(url)><ext>``.
+  Lets the UI render names + portraits without a worker round-trip or
+  HPKE signing in the renderer process. ``puffo-logo.png`` ships in
+  the package under ``puffo_agent/portal/ui/assets/``.
+
+### Changed
+
+- **WS client logs prefix the agent slug.** ``WS connected /
+  disconnected`` and the unexpected-error path now carry ``[<slug>]``
+  so multi-agent daemons are filterable per agent. The disconnect
+  branch also surfaces the exception type + message instead of
+  swallowing it.
+
+- **Export bundle suffix is ``.puffoagent``** (no hyphen) — matches
+  the wire format. UI Import + Export file dialogs use the same
+  extension so the round-trip lines up.
+
 ## [0.9.6] — 2026-06-01
 
 ### Fixed

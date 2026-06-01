@@ -25,6 +25,7 @@ from ..crypto.message import (
 )
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
+from . import disk_cache
 from ._invite_strings import format_invite_error
 from .core import AgentAPIError
 from .events import random_nonce, sign_event
@@ -1960,6 +1961,9 @@ class PuffoCoreMessageClient:
                 slug, exc,
             )
         self._profile_cache[slug] = (name, avatar_url, now)
+        disk_cache.persist_profile(slug, name, avatar_url)
+        if avatar_url:
+            asyncio.create_task(self._fetch_and_cache_avatar(avatar_url))
         return (name, avatar_url)
 
     async def _validate_incoming_parent_id(
@@ -2031,6 +2035,7 @@ class PuffoCoreMessageClient:
             name = (entry.get("name") or "").strip()
             if sid and name:
                 self._space_name_cache.setdefault(sid, name)
+                disk_cache.persist_space(sid, name)
         space_ids = [
             e.get("space_id") or ""
             for e in space_entries
@@ -2082,6 +2087,7 @@ class PuffoCoreMessageClient:
             self._channel_space.setdefault(cid, space_id)
             if name:
                 self._channel_name_cache.setdefault(cid, name)
+                disk_cache.persist_channel(cid, name, space_id)
             try:
                 await self.store.mark_channel_space(cid, space_id)
             except Exception:
@@ -2107,6 +2113,29 @@ class PuffoCoreMessageClient:
                 name = (entry.get("display_name") or "").strip()
                 avatar_url = (entry.get("avatar_url") or "").strip()
                 self._profile_cache[slug] = (name, avatar_url, now)
+                disk_cache.persist_profile(slug, name, avatar_url)
+                if avatar_url:
+                    asyncio.create_task(self._fetch_and_cache_avatar(avatar_url))
+
+    async def _fetch_and_cache_avatar(self, avatar_url: str) -> None:
+        """Signed GET on the blob; the UI falls back to its initial
+        circle if this never lands."""
+        if not avatar_url:
+            return
+        cache_path = disk_cache.avatar_cache_path(avatar_url)
+        if cache_path.exists():
+            return
+        base = self.http.server_url.rstrip("/")
+        if not avatar_url.startswith(base + "/"):
+            # Foreign host — signing key wouldn't be honoured there.
+            return
+        path = avatar_url[len(base):]
+        try:
+            data = await self.http.get_bytes(path)
+        except Exception as exc:
+            self._log.debug("avatar fetch failed for %s: %s", avatar_url, exc)
+            return
+        disk_cache.write_avatar_bytes(avatar_url, data)
 
     async def _get_space_members(self, space_id: str) -> dict[str, str]:
         """``slug -> identity_type`` for ``space_id``. Cached per
@@ -2148,6 +2177,8 @@ class PuffoCoreMessageClient:
                 name = (entry.get("name") or "").strip() or space_id
                 break
         self._space_name_cache[space_id] = name
+        if name and name != space_id:
+            disk_cache.persist_space(space_id, name)
         return name
 
     async def _resolve_channel_name(
@@ -2187,6 +2218,8 @@ class PuffoCoreMessageClient:
         except Exception:
             pass
         self._channel_name_cache[channel_id] = name
+        if name and name != channel_id:
+            disk_cache.persist_channel(channel_id, name, space_id)
         return name
 
     async def _accept_invite(
