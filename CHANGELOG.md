@@ -29,6 +29,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   loop (which respects the paused-by-operator flag). Tighten with a
   per-agent lock if a regression surfaces.
 
+- **PUF-263: import flow now self-contained, lands the agent in
+  running state.** ``import_bundle`` registers the new device's
+  subkey immediately after enrol and persists it as a session under
+  ``keys/<slug>.session.json`` so the agent worker can sign its
+  first request without an extra ``/devices/subkeys`` round-trip.
+  ``_revoke_old_device`` reuses that pre-registered subkey instead
+  of POSTing a fresh one, so total server traffic is unchanged
+  (old subkey for enrol + new subkey for revoke). After a successful
+  ``_commit_staging`` — whether revoke succeeded cleanly or got
+  shelved as ``pending_revoke.json`` — the imported ``agent.yml`` is
+  patched from ``state: paused`` (inherited from the export gate) to
+  ``state: running`` so the operator doesn't have to click Resume on
+  the new machine. State flip is best-effort: a yaml write failure
+  is logged and the agent stays paused but otherwise functional.
+
 - **Codex agent archive/delete failing with ``Permission denied`` on
   ``.codex/tmp/.../.lock`` (Windows).** The codex CLI holds an
   exclusive file lock on ``.codex/tmp/arg0/codex-<id>/.lock`` for the

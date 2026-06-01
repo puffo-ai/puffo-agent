@@ -203,17 +203,30 @@ async def test_import_happy_path(mock_server):
     assert result.new_device_id != info["old_device_id"]
     assert result.old_device_id == info["old_device_id"]
 
-    # Bundle decrypted onto disk + agent.yml device_id rewritten.
     cfg = AgentConfig.load("alpha")
     assert cfg.puffo_core.device_id == result.new_device_id
     assert cfg.puffo_core.slug == "alpha-bot"
+    # Successful import flips state from paused (export gate) to running
+    # so the operator doesn't have to click Resume on the new machine.
+    assert cfg.state == "running"
 
-    # Server saw the expected sequence (subkey x2, init, complete, revoke).
+    # Server sequence: old subkey (for enroll), enroll init+complete,
+    # new subkey (persisted as session), revoke. The revoke reuses the
+    # pre-registered new subkey instead of POSTing a fresh one.
     paths = [p for _, p in state["calls"]]
     assert paths.count("/devices/subkeys") == 2
     assert "/devices/enroll/init" in paths
     assert any(p.startswith("/devices/enroll/") and p.endswith("/complete") for p in paths)
     assert any(p.endswith("/revoke") for p in paths)
+
+    # New device's subkey persisted as a session so the worker doesn't
+    # have to rotate on first request.
+    session_path = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / "alpha" / "keys" / "alpha-bot.session.json"
+    assert session_path.exists()
+    sess = json.loads(session_path.read_text(encoding="utf-8"))
+    assert sess["slug"] == "alpha-bot"
+    assert sess["subkey_id"] and sess["subkey_secret_key"]
+    assert sess["expires_at"] > int(time.time() * 1000)
 
 
 async def test_import_skips_existing(mock_server):
@@ -252,6 +265,7 @@ async def test_import_enrollment_failure_cleans_staging(mock_server):
 
 async def test_import_revoke_failure_leaves_pending(mock_server):
     from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import AgentConfig
 
     server, state = mock_server
     state["fail"] = {"revoke"}  # matches by substring in path
@@ -267,6 +281,9 @@ async def test_import_revoke_failure_leaves_pending(mock_server):
     assert pending.exists()
     payload = json.loads(pending.read_text(encoding="utf-8"))
     assert payload["old_device_id"] == info["old_device_id"]
+    # Revoke is best-effort: the new device works, so we still flip
+    # the agent to running. revoke_pending cleans up the old key later.
+    assert AgentConfig.load("alpha").state == "running"
 
 
 async def test_revoke_pending_succeeds_on_retry(mock_server):

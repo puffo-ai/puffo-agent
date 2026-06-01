@@ -149,7 +149,24 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
         )
 
     new_device_id = _device_id_from_pk(new_signing.public_key_bytes())
-    _write_new_identity(stage_dir, old_identity, new_signing, new_kem, new_device_id)
+
+    try:
+        new_subkey, new_subkey_cert = await _register_new_device_subkey(
+            server_url=server_url,
+            slug=old_identity.slug,
+            new_device_id=new_device_id,
+            new_signing_key=new_signing,
+        )
+    except Exception as exc:
+        _cleanup_staging(agent_id)
+        return AgentImportResult(
+            agent_id=agent_id, status="failed", detail=f"subkey registration failed: {exc}",
+        )
+
+    _write_new_identity(
+        stage_dir, old_identity, new_signing, new_kem, new_device_id,
+        new_subkey=new_subkey, new_subkey_cert=new_subkey_cert,
+    )
     _commit_staging(agent_id, stage_dir)
 
     revoke_ok = False
@@ -164,6 +181,7 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
                 decode_secret(old_identity.root_secret_key)
             ),
             old_device_id=old_identity.device_id,
+            preregistered_subkey=(new_subkey, new_subkey_cert),
         )
         revoke_ok = True
     except Exception as exc:
@@ -173,6 +191,11 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
             "import: agent=%s old device revoke failed: %s (left pending_revoke.json)",
             agent_id, revoke_err,
         )
+
+    try:
+        _set_state_running(agent_id)
+    except Exception as exc:
+        logger.warning("import: agent=%s could not flip state to running: %s", agent_id, exc)
 
     return AgentImportResult(
         agent_id=agent_id,
@@ -216,6 +239,9 @@ def _write_new_identity(
     new_signing: Ed25519KeyPair,
     new_kem: KemKeyPair,
     new_device_id: str,
+    *,
+    new_subkey: Ed25519KeyPair | None = None,
+    new_subkey_cert: dict | None = None,
 ) -> None:
     new_identity = StoredIdentity(
         slug=old_identity.slug,
@@ -235,7 +261,42 @@ def _write_new_identity(
     out_path = keys_dir / f"{old_identity.slug}.json"
     out_path.write_text(json.dumps(new_identity.to_dict(), indent=2), encoding="utf-8")
 
+    if new_subkey is not None and new_subkey_cert is not None:
+        session_path = keys_dir / f"{old_identity.slug}.session.json"
+        session_path.write_text(json.dumps({
+            "slug": old_identity.slug,
+            "subkey_id": new_subkey_cert["subkey_id"],
+            "subkey_secret_key": encode_secret(new_subkey.secret_bytes()),
+            "expires_at": new_subkey_cert["expires_at"],
+        }, indent=2), encoding="utf-8")
+
     _patch_agent_yml_device_id(stage_dir / "agent.yml", new_device_id)
+
+
+async def _register_new_device_subkey(
+    *,
+    server_url: str,
+    slug: str,
+    new_device_id: str,
+    new_signing_key: Ed25519KeyPair,
+) -> tuple[Ed25519KeyPair, dict]:
+    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        return await _register_subkey_via_device(
+            session,
+            server_url=server_url,
+            slug=slug,
+            device_id=new_device_id,
+            device_signing_key=new_signing_key,
+        )
+
+
+def _set_state_running(agent_id: str) -> None:
+    import yaml
+
+    yml_path = agent_yml_path(agent_id)
+    raw = yaml.safe_load(yml_path.read_text(encoding="utf-8")) or {}
+    raw["state"] = "running"
+    yml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
 
 def _patch_agent_yml_device_id(yml_path: Path, new_device_id: str) -> None:
@@ -406,16 +467,20 @@ async def _revoke_old_device(
     new_signing_key: Ed25519KeyPair,
     root_signing_key: Ed25519KeyPair,
     old_device_id: str,
+    preregistered_subkey: tuple[Ed25519KeyPair, dict] | None = None,
 ) -> None:
     revocation = create_device_revocation(root_signing_key, old_device_id)
     async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
-        new_subkey, new_subkey_cert = await _register_subkey_via_device(
-            session,
-            server_url=server_url,
-            slug=slug,
-            device_id=new_device_id,
-            device_signing_key=new_signing_key,
-        )
+        if preregistered_subkey is not None:
+            new_subkey, new_subkey_cert = preregistered_subkey
+        else:
+            new_subkey, new_subkey_cert = await _register_subkey_via_device(
+                session,
+                server_url=server_url,
+                slug=slug,
+                device_id=new_device_id,
+                device_signing_key=new_signing_key,
+            )
         await _signed_post(
             session,
             server_url=server_url,
