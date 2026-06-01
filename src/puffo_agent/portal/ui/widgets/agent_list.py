@@ -192,7 +192,7 @@ class AgentList(QWidget):
         h_layout.setContentsMargins(10, 6, 10, 6)
         # Default-on running filter; checkbox is the escape hatch
         # that surfaces paused / errored / stopped rows.
-        self._show_all_toggle = QCheckBox("Show all agents")
+        self._show_all_toggle = QCheckBox("Show all")
         self._show_all_toggle.setChecked(False)
         self._show_all_toggle.toggled.connect(self._on_show_all_toggled)
         h_layout.addWidget(self._show_all_toggle)

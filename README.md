@@ -82,6 +82,7 @@ setups.
 
 ```bash
 puffo-agent start         # foreground daemon
+puffo-agent start --ui    # foreground daemon + PySide6 desktop window
 puffo-agent status        # is it alive? which agents are running?
 puffo-agent stop          # graceful shutdown from any terminal
 ```

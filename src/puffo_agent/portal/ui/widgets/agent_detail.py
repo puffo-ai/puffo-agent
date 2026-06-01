@@ -4,7 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import asyncio
+import threading
+
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -27,13 +31,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ....agent import disk_cache
 from ... import export
 from ...api.handlers import (
+    MAX_AVATAR_BYTES,
     MAX_PROFILE_SUMMARY_BYTES,
     MAX_ROLE_LEN,
     MAX_ROLE_SHORT_LEN,
     _profile_summary,
     _update_profile_summary,
+    _upload_avatar_via_agent_keystore,
 )
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
@@ -46,6 +53,7 @@ from ...state import (
     restart_flag_path,
 )
 from ..names import resolve_display_name
+from .avatar import initial_pixmap
 
 
 def _provider_for_harness(harness: str) -> str:
@@ -54,6 +62,24 @@ def _provider_for_harness(harness: str) -> str:
     if providers and len(providers) == 1:
         return next(iter(providers))
     return ""
+
+
+async def _verify_avatar_blob(cfg: AgentConfig, url: str) -> bytes:
+    """Signed GET on the freshly-uploaded blob URL so the caller can
+    byte-compare against the original payload."""
+    from ....crypto.http_client import PuffoCoreHttpClient
+    from ....crypto.keystore import KeyStore
+
+    base = cfg.puffo_core.server_url.rstrip("/")
+    if not url.startswith(base + "/"):
+        raise RuntimeError(f"blob URL {url!r} is not under {base!r}")
+    path = url[len(base):]
+    ks = KeyStore.for_agent(cfg.id)
+    http = PuffoCoreHttpClient(cfg.puffo_core.server_url, ks, cfg.puffo_core.slug)
+    try:
+        return await http.get_bytes(path)
+    finally:
+        await http.close()
 
 
 # (host-dirname, mcp filename or None) per harness. ``None`` means the
@@ -110,7 +136,6 @@ def _scan_mcp_servers(
 _DEFAULT_MODELS = {
     "claude-code": ["", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
     "hermes":      ["", "claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5", "gpt-5.4"],
-    "gemini-cli":  ["", "gemini-2.5-pro", "gemini-2.5-flash"],
     "codex":       ["", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
 }
 
@@ -118,13 +143,15 @@ _DEFAULT_MODELS = {
 class AgentDetail(QWidget):
     """Tabbed info pane bound to a single agent id."""
 
-    saved = Signal(str)  # agent_id of the row that just persisted
+    saved = Signal(str)
+    _avatar_uploaded = Signal(str, str)  # (new_url, error_message)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._agent_id: Optional[str] = None
         self._cfg: Optional[AgentConfig] = None
         self._build()
+        self._avatar_uploaded.connect(self._on_avatar_uploaded)
 
     # Construction ──────────────────────────────────────────────────
 
@@ -174,6 +201,16 @@ class AgentDetail(QWidget):
         layout = QFormLayout(body)
         layout.setLabelAlignment(Qt.AlignRight)
 
+        avatar_row = QHBoxLayout()
+        self._avatar_preview = QLabel()
+        self._avatar_preview.setFixedSize(64, 64)
+        avatar_row.addWidget(self._avatar_preview)
+        self._avatar_btn = QPushButton("Change…")
+        self._avatar_btn.clicked.connect(self._on_change_avatar)
+        avatar_row.addWidget(self._avatar_btn)
+        avatar_row.addStretch(1)
+        layout.addRow("Avatar", self._wrap(avatar_row))
+
         self._slug = QLineEdit()
         self._slug.setReadOnly(True)
         self._slug.setStyleSheet("color: #6b7280; background: #f7f7f7;")
@@ -213,14 +250,12 @@ class AgentDetail(QWidget):
         layout.addRow("Runtime", self._runtime_kind)
 
         self._harness = QComboBox()
-        for h in ("claude-code", "codex", "gemini-cli"):
+        for h in ("claude-code", "codex"):
             self._harness.addItem(h)
         self._harness.currentTextChanged.connect(self._on_harness_changed)
         layout.addRow("Harness", self._harness)
 
         self._model = QComboBox()
-        self._model.setEditable(True)
-        self._model.setPlaceholderText("(daemon default)")
         layout.addRow("Model", self._model)
 
         actions = QHBoxLayout()
@@ -314,6 +349,7 @@ class AgentDetail(QWidget):
             QMessageBox.warning(self, "load", f"could not load agent.yml: {exc}")
             return
         cfg = self._cfg
+        self._paint_avatar(cfg)
         self._slug.setText(cfg.puffo_core.slug)
         owner_slug = cfg.puffo_core.operator_slug
         owner_name = resolve_display_name(owner_slug)
@@ -422,6 +458,86 @@ class AgentDetail(QWidget):
             return
         QMessageBox.information(self, "Export", f"Wrote {len(blob)} bytes to {target}")
 
+    def _paint_avatar(self, cfg: AgentConfig) -> None:
+        size = self._avatar_preview.size().width()
+        url = cfg.avatar_url
+        pm = None
+        if url:
+            cached = disk_cache.avatar_cache_path(url)
+            if cached.exists():
+                pm = QPixmap(str(cached))
+        if pm is None or pm.isNull():
+            pm = initial_pixmap(cfg.display_name, cfg.puffo_core.slug or cfg.id, size=size)
+        else:
+            pm = pm.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._avatar_preview.setPixmap(pm)
+
+    def _on_change_avatar(self) -> None:
+        if not self._cfg:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Pick an image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.webp);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            data = open(path, "rb").read()
+        except OSError as exc:
+            QMessageBox.warning(self, "Avatar", str(exc))
+            return
+        if len(data) > MAX_AVATAR_BYTES:
+            QMessageBox.warning(
+                self, "Avatar",
+                f"Image is {len(data)} bytes; cap is {MAX_AVATAR_BYTES}.",
+            )
+            return
+        cfg = self._cfg
+        self._avatar_btn.setEnabled(False)
+        self._avatar_btn.setText("Uploading…")
+
+        def worker() -> None:
+            try:
+                url = asyncio.run(_upload_avatar_via_agent_keystore(cfg, data))
+                if not url:
+                    self._avatar_uploaded.emit("", "upload returned empty url")
+                    return
+                # Round-trip the blob back via a signed GET; mismatch
+                # means the server stored something other than what we
+                # sent (truncation, content-encoding, wrong blob_id).
+                roundtrip = asyncio.run(_verify_avatar_blob(cfg, url))
+                if roundtrip != data:
+                    self._avatar_uploaded.emit(
+                        "",
+                        f"verify failed: round-tripped {len(roundtrip)} bytes, "
+                        f"expected {len(data)}",
+                    )
+                    return
+                disk_cache.write_avatar_bytes(url, data)
+                self._avatar_uploaded.emit(url, "")
+            except Exception as exc:
+                self._avatar_uploaded.emit("", f"{type(exc).__name__}: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_avatar_uploaded(self, url: str, error: str) -> None:
+        self._avatar_btn.setEnabled(True)
+        self._avatar_btn.setText("Change…")
+        if error or not url:
+            QMessageBox.warning(self, "Avatar", error or "upload returned empty url")
+            return
+        if not self._cfg:
+            return
+        self._cfg.avatar_url = url
+        try:
+            self._cfg.save()
+        except OSError as exc:
+            QMessageBox.warning(self, "Avatar", f"could not save agent.yml: {exc}")
+            return
+        self._paint_avatar(self._cfg)
+        self.saved.emit(self._agent_id or "")
+
     def _on_archive(self) -> None:
         if not self._agent_id:
             return
@@ -465,13 +581,16 @@ class AgentDetail(QWidget):
     def _populate_model_combo(self, harness: str, current: str) -> None:
         self._model.blockSignals(True)
         self._model.clear()
-        for m in _DEFAULT_MODELS.get(harness, [""]):
+        models = list(_DEFAULT_MODELS.get(harness, [""]))
+        # Preserve a user-saved model that isn't in the curated list
+        # so editing other fields doesn't silently flip them to default.
+        if current and current not in models:
+            models.append(current)
+        for m in models:
             self._model.addItem(m or "(daemon default)", m)
         idx = self._model.findData(current)
         if idx >= 0:
             self._model.setCurrentIndex(idx)
-        else:
-            self._model.setEditText(current)
         self._model.blockSignals(False)
 
     def _on_revert(self) -> None:
@@ -485,9 +604,7 @@ class AgentDetail(QWidget):
         runtime_kind = self._runtime_kind.currentText()
         harness = self._harness.currentText() if harness_applies(runtime_kind) else cfg.runtime.harness
         provider = _provider_for_harness(harness) or cfg.runtime.provider
-        model = (self._model.currentData()
-                 if self._model.currentData() is not None
-                 else self._model.currentText()).strip()
+        model = (self._model.currentData() or "").strip()
 
         result = validate_triple(runtime_kind, provider, harness)
         if not result.ok:

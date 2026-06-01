@@ -9,14 +9,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Desktop UI (PySide6).** ``puffo-agent start --ui`` opens a Qt
-  window beside the daemon: contacts-app sidebar with avatar / name /
-  role / status / harness · model, ``Show all agents`` toggle,
-  ``Import agent`` flow, three-pane workspace per selected agent
-  (editable Info / Skills / MCP on the left, Messages / Logs / Files
-  on the right). Home tab summarises detected CLIs (Claude Code,
-  Codex, Hermes), agent counts, and the daemon log. Window close
-  writes ``stop.sentinel`` so shutdown stays graceful. ``start``
-  without ``--ui`` keeps the headless behaviour.
+  window beside the daemon. A vertical rail switches between three
+  sections — **Home** (bundled puffo-logo title, an ``Open Puffo``
+  button that opens chat.puffo.ai/chat, AI tool cards for Claude Code
+  / Codex / Hermes-coming-soon, a Local-bridge pairing card that
+  links to chat.puffo.ai/chat/agents when unpaired, and a version
+  footer), **Agents** (contacts-app sidebar with avatar / name /
+  role_short / status / harness · model, ``Show all`` toggle,
+  ``Import agent`` flow, per-agent three-pane workspace), and
+  **Logs** (the daemon's process-wide log). Window close writes
+  ``stop.sentinel`` for graceful shutdown. Default ``start`` stays
+  headless.
+
+- **In-UI agent editing.** Info tab supports avatar change
+  (round-tripped through signed ``/blobs/upload`` then verified via
+  signed GET before the preview lands), display_name / role / role
+  short / soul (``# Soul`` section of profile.md) / runtime kind /
+  harness / model (curated dropdown per harness). Pause/Resume,
+  Refresh session (drops ``cli_session.json`` and restarts the
+  worker), Archive, and Export sit in the top action bar.
+  Skills + MCP tabs scan only the harness the agent actually uses
+  (``.claude/``, ``.codex/``, etc.) and show a detail pane per entry.
 
 - **On-disk display-name + avatar cache
   (``~/.puffo-agent/cache/``).** Workers persist ``/spaces`` /
@@ -24,7 +37,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ``profiles/`` / ``spaces/`` / ``channels/`` JSON-per-key directories
   and signed-fetch avatar blobs into ``avatars/<sha256(url)><ext>``.
   Lets the UI render names + portraits without a worker round-trip or
-  HPKE signing in the renderer process.
+  HPKE signing in the renderer process. ``puffo-logo.png`` ships in
+  the package under ``puffo_agent/portal/ui/assets/``.
 
 ### Changed
 
@@ -33,6 +47,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   so multi-agent daemons are filterable per agent. The disconnect
   branch also surfaces the exception type + message instead of
   swallowing it.
+
+- **Export bundle suffix is ``.puffoagent``** (no hyphen) — matches
+  the wire format. UI Import + Export file dialogs use the same
+  extension so the round-trip lines up.
 
 ## [0.9.6] — 2026-06-01
 
