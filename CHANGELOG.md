@@ -8,6 +8,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **PUF-208 v2: ``profile_summary`` capped at 10000 UTF-8 bytes on
+  the bridge.** The web client shares one 10000-byte ceiling across
+  textarea typing, ``soul.md`` upload, and Edit; the daemon-side
+  ``MAX_PROFILE_SUMMARY_BYTES`` is the load-bearing storage cap, so
+  any caller (web, CLI, future automation) is 400'd if the
+  post-strip payload exceeds it. Byte count rather than codepoints
+  so the cap matches what gets written to ``profile.md`` and read
+  back off disk; CJK-heavy souls fit ~3000-3300 characters. Out of
+  scope per operator spec: the ``create_agent`` write path — capping
+  it would need to parse the full ``profile.md`` payload to isolate
+  the soul section, so a stale UI / CLI hitting ``create_agent``
+  with a 50KB ``profile`` field still bypasses this cap on first-
+  create. Acknowledged gap.
+
 - **PUF-263: ``/v1/agents/export`` enforces paused-only.** A running
   agent may be mid-write (memory updates, ``cli_session.json``
   refresh, in-flight skill state) so a snapshot would be inconsistent
