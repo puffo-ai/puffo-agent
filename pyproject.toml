@@ -44,6 +44,7 @@ dependencies = [
     "pyhpke>=0.6",
     "openai>=1.30",
     "psutil>=5.9",
+    "pyside6>=6.7",
     "pyyaml>=6.0",
     "websockets>=12.0",
 ]

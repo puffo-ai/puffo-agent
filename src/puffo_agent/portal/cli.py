@@ -237,11 +237,14 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    return asyncio.run(run_daemon())
+    if getattr(args, "headless", False):
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+        return asyncio.run(run_daemon())
+    from .ui.launcher import launch
+    return launch()
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1266,7 +1269,16 @@ def build_parser() -> argparse.ArgumentParser:
             "The daemon runs fine without this — agents can carry their own keys."
         ),
     ).set_defaults(func=cmd_config)
-    sub.add_parser("start", help="Run the daemon in the foreground").set_defaults(func=cmd_start)
+    start = sub.add_parser(
+        "start",
+        help="Run the daemon (opens the Qt UI by default; --headless skips it)",
+    )
+    start.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the daemon without the desktop UI (server / CI / CLI mode).",
+    )
+    start.set_defaults(func=cmd_start)
     stop = sub.add_parser(
         "stop",
         help=(
