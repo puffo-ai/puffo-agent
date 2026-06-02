@@ -1121,6 +1121,15 @@ class RuntimeState:
     #   "ok"                  — refresh-ping passed, a turn cleared a
     #                           prior abandon, or a credential refresh
     #                           cleared a prior auth_failed
+    #   "in_progress"         — a turn is mid-flight. PUF-270:
+    #                           ``worker.on_message_batch`` flips here
+    #                           UNCONDITIONALLY at batch-top (overrides
+    #                           any sticky red) and resolves to "ok" on
+    #                           success / give-up-red on abandon /
+    #                           leaves as "in_progress" on retry. Lets
+    #                           the UI show the agent is actually alive
+    #                           even while a recent failure left a
+    #                           sticky red value on disk.
     #   "auth_failed"         — adapter saw 401 / authentication_error
     #                           (set in worker._handle_suppressed_reply);
     #                           cleared by the CredentialRefresher's
@@ -1134,7 +1143,7 @@ class RuntimeState:
     #                           REFRESHED. Does not overwrite the two
     #                           stronger downstream signals above.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | refresh_broken | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> "RuntimeState | None":

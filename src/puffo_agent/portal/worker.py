@@ -564,6 +564,58 @@ class Worker:
             agent_id,
         )
 
+    @staticmethod
+    def _flip_health_in_progress(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """PUF-270: flip ``runtime.health`` to ``in_progress`` at the
+        top of every ``on_message_batch``. Overrides any sticky red
+        (auth_failed / api_error_abandoned / refresh_broken) so the UI
+        can show the agent is actually alive while a turn is mid-
+        flight. Idempotent — no-op when already ``in_progress``.
+
+        Override-all-reds shape was Stage-3 picked per operator's
+        rule 1 ("before agent starts processing any message"). The
+        false-positive concern (auth_failed → in_progress right
+        before the API call 401s again) is self-correcting because
+        ``_handle_suppressed_reply`` re-flips back to auth_failed
+        within the same turn.
+        """
+        if runtime.health == "in_progress":
+            return
+        runtime.health = "in_progress"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: runtime.health flipped to in_progress at "
+            "begin_turn",
+            agent_id,
+        )
+
+    @staticmethod
+    def _resolve_health_on_success(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """PUF-270: after a successful turn, transition
+        ``in_progress`` → ``ok``. Only fires when the flip lane set
+        the in_progress value — leaves any externally-set state
+        (e.g., a give-up red set inside the turn) untouched.
+        """
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: turn succeeded; runtime.health resolved "
+            "from in_progress to ok",
+            agent_id,
+        )
+
     def __init__(
         self,
         daemon_cfg: DaemonConfig,
@@ -850,6 +902,15 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
+            # PUF-270: flip to in_progress before the agent visibly
+            # starts work. Resolved in the finally below.
+            try:
+                Worker._flip_health_in_progress(self.runtime, agent_id, logger)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: _flip_health_in_progress failed: %s",
+                    agent_id, exc,
+                )
             # Server-side processing-run + status transitions.
             # Reporter swallows network errors so a flaky status push
             # never blocks the actual reply.
@@ -906,6 +967,21 @@ class Worker:
                             "error_text": turn_error,
                         })
                     await reporter.end_turn_batch(runs)
+                # PUF-270 resolve: on success, in_progress → ok. On
+                # failure we leave the current state — category-
+                # specific paths may have set a give-up red, or the
+                # consumer-loop will re-enqueue and the next begin
+                # flips back to in_progress.
+                if turn_succeeded:
+                    try:
+                        Worker._resolve_health_on_success(
+                            self.runtime, agent_id, logger,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "agent %s: _resolve_health_on_success failed: %s",
+                            agent_id, exc,
+                        )
                 # Clear turn context so post-turn background work
                 # doesn't inherit a stale channel/root. Hook
                 # fails-open when the file is absent.
@@ -1042,7 +1118,17 @@ class Worker:
         # Server-side status reporter: own heartbeat task; begin_turn /
         # end_turn fire inline from on_message via this closure. Falls
         # back to a no-op when the client has no http client (tests).
-        reporter = StatusReporter(client.http) if hasattr(client, "http") else None
+        # PUF-270: hand the reporter a lazy provider so each heartbeat
+        # carries the freshest ``runtime.health`` alongside the per-turn
+        # ``status``.
+        reporter = (
+            StatusReporter(
+                client.http,
+                runtime_health_provider=lambda: self.runtime.health,
+            )
+            if hasattr(client, "http")
+            else None
+        )
         if reporter is None:  # pragma: no cover — defensive
             class _NoopReporter:
                 async def begin_turn(self, _mid):
