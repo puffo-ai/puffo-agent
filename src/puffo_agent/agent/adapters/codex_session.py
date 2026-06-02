@@ -87,19 +87,10 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # that ACKs the request but never streams.
 TURN_TIMEOUT_SECONDS = 600.0
 
-# PUF-267: how many consecutive non-success turn outcomes
-# (timeout | turn-failed) before clearing ``_conversation_id`` to force
-# a fresh ``thread/start`` on the next ``_ensure_running``. 2 mirrors
-# PUF-265's REFRESH_BROKEN_THRESHOLD — small enough to react fast
-# inside the 4-agent fleet, large enough that a single transient hiccup
-# doesn't drop the conversation prematurely.
+# Reacts fast in a small fleet, absorbs single transient hiccups.
 CODEX_THREAD_WEDGED_THRESHOLD = 2
 
-# Layer 3 immediate-rotate signals. Tuple shape (per PR #55 review
-# item 6) so a future "thread is dead" codex surface — context
-# overflow, max-tokens exceeded, model deprecation — adds one regex
-# instead of refactoring the consumer. Mirrors PUF-265 v2's
-# ``_RATE_LIMIT_PATTERNS`` pattern.
+# Tuple shape so a future "thread is dead" surface adds one line.
 _CODEX_THREAD_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"agent thread limit reached", re.IGNORECASE),
 )
@@ -222,11 +213,8 @@ class CodexSession:
         # respawn can re-issue ``newConversation`` with current
         # instructions when the conversation id is missing or rotted.
         self.current_instructions: str = ""
-        # PUF-267: consecutive non-success turn outcomes (timeout |
-        # turn-failed). Resets on the next successful turn. When this
-        # hits ``CODEX_THREAD_WEDGED_THRESHOLD`` we clear the
-        # conversation id so the next ``_ensure_running`` starts a
-        # fresh thread instead of resuming the wedged one.
+        # Resets on next success; hits THRESHOLD → rotate (drop the
+        # persisted conversation id; next _ensure_running starts fresh).
         self._consecutive_thread_failures: int = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -252,9 +240,6 @@ class CodexSession:
             "agent %s: codex turn/start sending (msg_len=%d, thread=%s)",
             self.agent_id, len(user_message), self._conversation_id,
         )
-        # PUF-267: captured so the outcome-propagation block at the end
-        # can rotate / flip health without re-raising. ``rotated`` is
-        # set inside the timeout / turn-failed branches.
         turn_failed_exc: BaseException | None = None
         rotated_in_branch: bool = False
         try:
@@ -303,7 +288,6 @@ class CodexSession:
                         )
                     except Exception:
                         pass
-                    # PUF-267 Layer 1+2: bookkeep + maybe rotate.
                     rotated_in_branch = self._propagate_turn_outcome(
                         outcome="timeout",
                     )
@@ -315,15 +299,8 @@ class CodexSession:
                         },
                     )
                 except RuntimeError as exc:
-                    # PUF-267 Layer 3: turn-failed reaches us when the
-                    # ``turn/failed`` / ``error`` handler in
-                    # ``_dispatch_message`` (see the ``set_exception``
-                    # site around L1004) wraps codex's upstream error
-                    # into a RuntimeError on ``turn.completed``.
-                    # Bookkeep + maybe rotate via
-                    # ``_propagate_turn_outcome`` below; re-raise so the
-                    # worker's existing error path still logs the
-                    # failure.
+                    # Captured for propagation in the finally; re-raised
+                    # below so the worker's error path still logs.
                     turn_failed_exc = exc
         finally:
             self._active_turn = None
@@ -342,8 +319,6 @@ class CodexSession:
             len(turn.send_message_targets),
             turn.input_tokens, turn.output_tokens,
         )
-        # PUF-267: reset the failure streak + clear
-        # ``codex_thread_wedged`` health on success.
         self._propagate_turn_outcome(outcome="success")
         # core.py's reply-routing check: a non-empty
         # ``send_message_targets`` list means "agent already posted via
@@ -394,22 +369,12 @@ class CodexSession:
         outcome: str,
         err_text: str = "",
     ) -> bool:
-        """PUF-267: bookkeeping after every turn completes.
+        """``outcome`` ∈ ``{"success", "timeout", "turn_failed"}``.
+        Returns True iff this call rotated the conversation.
 
-        ``outcome`` is one of ``"success"`` / ``"timeout"`` /
-        ``"turn_failed"``. Returns True iff this call rotated the
-        conversation (caller may want to log / metadata-flag the event;
-        the next ``_ensure_running`` will do the actual
-        ``thread/start``).
-
-        Layer 1 (counter): N=``CODEX_THREAD_WEDGED_THRESHOLD``
-        consecutive non-success outcomes → rotate + flip health.
-        Layer 3 (verbatim string): on ``turn_failed`` whose error text
-        matches any ``_CODEX_THREAD_LIMIT_PATTERNS`` entry → rotate
-        immediately without waiting for the counter.
-        Success → reset counter + ALWAYS clear ``codex_thread_wedged``
-        health (the always-clear guards the daemon-restart-with-stale-
-        disk-state bug class PR #52 v1 had — see PUF-265 fold).
+        Counter THRESHOLD non-successes OR a verbatim thread-limit
+        error rotates. Success always clears the disk wedged flag —
+        guards the daemon-restart-with-stale-disk path.
         """
         if outcome == "success":
             if self._consecutive_thread_failures > 0:
@@ -464,9 +429,14 @@ class CodexSession:
             )
 
     def _flip_codex_thread_wedged_health(self, reason: str) -> None:
-        """Per-agent ``runtime.health = "codex_thread_wedged"`` flip,
-        with the same precedence semantics as PUF-265's
-        ``_flip_refresh_broken``: stronger downstream signals win."""
+        """Per-agent ``runtime.health = "codex_thread_wedged"`` flip.
+        Stronger downstream signals (auth/api-abandon/refresh-broken)
+        win. ``in_progress`` / ``unhandled_error`` are deliberately NOT
+        in the precedence tuple — ``codex_thread_wedged`` carries more
+        operator-actionable detail than either (names the rotation
+        cause + auto-recovery), so overwriting both is the right
+        direction.
+        """
         from ...portal.state import RuntimeState
         try:
             rs = RuntimeState.load(self.agent_id)

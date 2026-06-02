@@ -290,6 +290,52 @@ def test_codex_thread_wedged_cleared_after_daemon_restart(env_home):
     assert rs.error == ""
 
 
+def test_chain_with_puf270_worker_flip_resolve_clears_wedged(env_home):
+    """PR #55 round-2 review item 2: walk the production chain after
+    PUF-270 landed — worker's ``_flip_health_in_progress`` overwrites
+    any disk ``codex_thread_wedged`` with ``in_progress`` BEFORE
+    codex's ``_propagate_turn_outcome("success")`` runs, so codex's
+    own clear lane is a no-op. The worker's finally
+    ``_resolve_health_on_success`` then resolves ``in_progress → ok``.
+
+    Without this test the codex-side clear's defensiveness on
+    daemon-restart-with-stale-disk is the only path exercised; this
+    pins the live ordering of the two clear lanes.
+    """
+    from puffo_agent.portal.state import RuntimeState
+    from puffo_agent.portal.worker import Worker
+    import logging
+
+    aid = "codex-puf267-puf270-chain"
+    _seed_runtime(env_home, aid, health="codex_thread_wedged")
+    log = logging.getLogger("test-puf267-chain")
+    s = _make_session(env_home, agent_id=aid)
+
+    # T0: pre-turn disk state is the leftover red from a prior wedge.
+    rs = RuntimeState.load(aid)
+    assert rs is not None and rs.health == "codex_thread_wedged"
+
+    # T1: worker's PUF-270 flip — overrides the leftover red.
+    Worker._flip_health_in_progress(rs, aid, log)
+    assert rs.health == "in_progress"
+
+    # T2: handle_message_batch (codex) succeeds — codex's clear lane
+    # tries to clear ``codex_thread_wedged`` but health is now
+    # ``in_progress`` so its guard at L505 early-returns. No-op.
+    rotated = s._propagate_turn_outcome(outcome="success")
+    assert rotated is False
+    # Reload — codex didn't touch in_progress.
+    on_disk = RuntimeState.load(aid)
+    assert on_disk is not None and on_disk.health == "in_progress"
+
+    # T3: worker's finally resolves ``in_progress → ok``.
+    Worker._resolve_health_on_success(rs, aid, log)
+    final = RuntimeState.load(aid)
+    assert final is not None
+    assert final.health == "ok"
+    assert final.error == ""
+
+
 def test_counter_resets_after_rotation_to_avoid_thrash(env_home):
     """Operator-prescribed (PR #55 review item 2): after rotation fires
     the counter must reset to 0 so the freshly-rotated thread gets a
