@@ -52,70 +52,60 @@ _DESIRED_INSTALLED_BODY = (
 )
 
 
-async def fetch_skill_template(
-    http: PuffoCoreHttpClient, template_id: str,
+async def _fetch_template(
+    http: PuffoCoreHttpClient,
+    kind: str,
+    template_id: str,
 ) -> dict[str, Any] | None:
-    """Return the skill template body or None on 404 / fetch error."""
+    """Fetch one catalog template (``kind`` ∈ ``{"skill", "mcp"}``).
+
+    Returns the parsed body, or None on 404 / HTTP error / network
+    error / non-object body. Each failure surface is logged once with
+    ``kind`` + ``template_id`` so operators can tell missing-from-
+    catalog from upstream-server-error at a glance.
+    """
+    path = f"/v2/{kind}-templates/{template_id}"
     try:
-        data = await http.get(f"/v2/skill-templates/{template_id}")
+        data = await http.get(path)
     except HttpError as exc:
         if exc.status == 404:
             logger.warning(
-                "desired skill %r missing from catalog (404) — skipping",
-                template_id,
+                "desired %s %r missing from catalog (404) — skipping",
+                kind, template_id,
             )
             return None
         logger.warning(
-            "desired skill %r fetch failed (HTTP %d): %s — skipping",
-            template_id, exc.status, exc.body[:200],
+            "desired %s %r fetch failed (HTTP %d): %s — skipping",
+            kind, template_id, exc.status, exc.body[:200],
         )
         return None
     except Exception as exc:
         logger.warning(
-            "desired skill %r fetch failed: %s — skipping",
-            template_id, exc,
+            "desired %s %r fetch failed: %s — skipping",
+            kind, template_id, exc,
         )
         return None
     if not isinstance(data, dict):
         logger.warning(
-            "desired skill %r: server returned non-object body — skipping",
-            template_id,
+            "desired %s %r: server returned non-object body — skipping",
+            kind, template_id,
         )
         return None
     return data
+
+
+async def fetch_skill_template(
+    http: PuffoCoreHttpClient, template_id: str,
+) -> dict[str, Any] | None:
+    """Return the skill template body or None on 404 / fetch error."""
+    return await _fetch_template(http, "skill", template_id)
 
 
 async def fetch_mcp_template(
     http: PuffoCoreHttpClient, template_id: str,
 ) -> dict[str, Any] | None:
     """Return the MCP template body or None on 404 / fetch error."""
-    try:
-        data = await http.get(f"/v2/mcp-templates/{template_id}")
-    except HttpError as exc:
-        if exc.status == 404:
-            logger.warning(
-                "desired mcp %r missing from catalog (404) — skipping",
-                template_id,
-            )
-            return None
-        logger.warning(
-            "desired mcp %r fetch failed (HTTP %d): %s — skipping",
-            template_id, exc.status, exc.body[:200],
-        )
-        return None
-    except Exception as exc:
-        logger.warning(
-            "desired mcp %r fetch failed: %s — skipping",
-            template_id, exc,
-        )
-        return None
-    if not isinstance(data, dict):
-        logger.warning(
-            "desired mcp %r: server returned non-object body — skipping",
-            template_id,
-        )
-        return None
-    return data
+    return await _fetch_template(http, "mcp", template_id)
 
 
 def write_desired_skill(
@@ -186,9 +176,11 @@ def install_claude_mcp(
 ) -> str:
     """Merge a desired MCP into ``<agent_home>/.claude.json#mcpServers``.
 
-    Returns one of ``"installed"`` / ``"already-present"``. Pre-existing
-    entries (host-sync, prior desired-install) are left untouched so
-    operator-side overrides win.
+    Returns one of ``"installed"`` / ``"already-present"`` /
+    ``"invalid"`` / ``"skipped"``. Pre-existing entries (host-sync,
+    prior desired-install) are left untouched so operator-side
+    overrides win; an unreadable or non-object ``.claude.json``
+    returns ``"skipped"`` instead of silently resetting the file.
     """
     if not _MCP_ID_RE.match(template_id):
         logger.warning(
@@ -202,8 +194,25 @@ def install_claude_mcp(
             raw = claude_json.read_text(encoding="utf-8")
             if raw.strip():
                 data = json.loads(raw)
-        except (OSError, ValueError):
-            data = {}
+        except (OSError, ValueError) as exc:
+            # Bail rather than reset: an unreadable .claude.json may
+            # be a transient corruption during host-sync write, or a
+            # legitimate user-authored file we can't parse. Resetting
+            # to ``{}`` and rewriting would silently drop the user's
+            # ``userID`` / history / etc. Mirrors host-sync's same
+            # decision in state.py::sync_host_mcp_servers.
+            logger.warning(
+                "desired mcp %r: cannot read .claude.json (%s) — "
+                "skipping to avoid clobbering operator-authored state",
+                template_id, exc,
+            )
+            return "skipped"
+    if not isinstance(data, dict):
+        logger.warning(
+            "desired mcp %r: .claude.json is not a JSON object — skipping",
+            template_id,
+        )
+        return "skipped"
     servers = dict(data.get("mcpServers") or {})
     if template_id in servers:
         return "already-present"

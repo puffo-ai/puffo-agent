@@ -189,6 +189,33 @@ def test_install_claude_mcp_rejects_invalid_id(tmp_path):
     assert install_claude_mcp(tmp_path, "../bad", {"type": "stdio", "command": "x"}) == "invalid"
 
 
+# Operator review #58 §8: malformed ``.claude.json`` must NOT silently
+# reset (which would clobber userID / history / etc). Bail with a
+# warning so the user-authored file is preserved.
+def test_install_claude_mcp_malformed_existing_file_skips_without_reset(tmp_path, caplog):
+    cj = tmp_path / ".claude.json"
+    cj.write_text("{ this is not valid json", encoding="utf-8")
+    spec = {"type": "stdio", "command": "B", "args": [], "env": {}}
+    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
+        result = install_claude_mcp(tmp_path, "fs", spec)
+    assert result == "skipped"
+    # File content untouched — the broken bytes are still there.
+    assert cj.read_text(encoding="utf-8") == "{ this is not valid json"
+    assert any("cannot read .claude.json" in r.getMessage() for r in caplog.records)
+
+
+def test_install_claude_mcp_non_object_root_skips(tmp_path):
+    """``.claude.json`` is a JSON array (somehow). We can't merge into
+    it, so bail rather than reset to ``{}`` and clobber whatever the
+    user actually wanted."""
+    cj = tmp_path / ".claude.json"
+    cj.write_text("[1, 2, 3]", encoding="utf-8")
+    spec = {"type": "stdio", "command": "B", "args": [], "env": {}}
+    result = install_claude_mcp(tmp_path, "fs", spec)
+    assert result == "skipped"
+    assert cj.read_text(encoding="utf-8") == "[1, 2, 3]"
+
+
 # ── install_desired (orchestration) ─────────────────────────────────────────
 
 
@@ -437,6 +464,75 @@ def test_install_desired_non_404_http_error_logs_and_continues(tmp_path, caplog)
     assert "ok" in data["mcpServers"]
     assert "broken" not in data["mcpServers"]
     assert any("HTTP 500" in r.message for r in caplog.records)
+
+
+# Operator review #58 §8: pin the three-transport happy path so a
+# future ``normalize_mcp_spec`` refactor can't accidentally lose
+# ordering or per-transport handling.
+def test_install_desired_mixed_stdio_sse_http_all_install_under_claude(tmp_path):
+    http = FakeHttp({
+        "/v2/mcp-templates/fs": {
+            "id": "fs", "type": "stdio", "command": "fs-mcp",
+            "args": [], "env": {},
+        },
+        "/v2/mcp-templates/remote-sse": {
+            "id": "remote-sse", "type": "sse",
+            "url": "https://relay.example/sse",
+        },
+        "/v2/mcp-templates/remote-http": {
+            "id": "remote-http", "type": "http",
+            "url": "https://relay.example/http",
+        },
+    })
+    _run(install_desired(
+        http=http, agent_home=tmp_path, agent_id="a1",
+        harness_name="claude-code",
+        desired_skills=[],
+        desired_mcps=["fs", "remote-sse", "remote-http"],
+    ))
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    servers = data["mcpServers"]
+    assert set(servers.keys()) == {"fs", "remote-sse", "remote-http"}
+    assert servers["fs"]["type"] == "stdio" and servers["fs"]["command"] == "fs-mcp"
+    assert servers["remote-sse"]["type"] == "sse" and servers["remote-sse"]["url"] == "https://relay.example/sse"
+    assert servers["remote-http"]["type"] == "http" and servers["remote-http"]["url"] == "https://relay.example/http"
+    assert "command" not in servers["remote-sse"]
+    assert "command" not in servers["remote-http"]
+
+
+# Operator review #58 §8: skill + MCP fetch failures coexist and
+# DON'T tangle (independent logging + independent continuation).
+def test_install_desired_skill_404_and_mcp_500_both_log_and_keep_going(tmp_path, caplog):
+    http = FakeHttp({
+        "/v2/skill-templates/ghost": HttpError(404, "nope"),
+        "/v2/skill-templates/git-pr-flow": {
+            "id": "git-pr-flow",
+            "body": "---\nname: Git PR\n---\n\nbody\n",
+        },
+        "/v2/mcp-templates/broken": HttpError(500, "boom"),
+        "/v2/mcp-templates/fs": {
+            "id": "fs", "type": "stdio", "command": "fs-mcp",
+        },
+    })
+    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
+        _run(install_desired(
+            http=http, agent_home=tmp_path, agent_id="a1",
+            harness_name="claude-code",
+            desired_skills=["ghost", "git-pr-flow"],
+            desired_mcps=["broken", "fs"],
+        ))
+    # Healthy artifacts landed.
+    assert (tmp_path / ".claude" / "skills" / "git-pr-flow" / "SKILL.md").exists()
+    data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+    assert "fs" in data["mcpServers"]
+    # Failed artifacts didn't.
+    assert not (tmp_path / ".claude" / "skills" / "ghost").exists()
+    assert "broken" not in data["mcpServers"]
+    # Both failures logged independently — the skill 404 mentions
+    # "skill" and the mcp 500 mentions "mcp" / "HTTP 500".
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("skill 'ghost'" in m and "404" in m for m in messages)
+    assert any("mcp 'broken'" in m and "HTTP 500" in m for m in messages)
 
 
 # ── LocalCLIAdapter wiring ──────────────────────────────────────────────────
