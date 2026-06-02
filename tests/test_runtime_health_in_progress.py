@@ -127,6 +127,142 @@ def test_resolve_on_success_leaves_ok_alone(tmp_path, monkeypatch):
     assert rs.health == "ok"
 
 
+# PR #59 round-1 review item #5: simulate the in-turn flow
+# (flip → in-turn red set → resolve sees red and skips), not just
+# the bare "seed direct red" path the parametrized test above covers.
+@pytest.mark.parametrize(
+    "in_turn_red",
+    ["auth_failed", "api_error_abandoned", "refresh_broken"],
+)
+def test_resolve_skips_when_in_turn_path_wrote_red(
+    tmp_path, monkeypatch, in_turn_red,
+):
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="ok")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+    Worker._flip_health_in_progress(rs, agent_id, _LOG)
+    assert rs.health == "in_progress"
+    # In-turn category-specific path writes its give-up red directly,
+    # bypassing the resolve lane (matches the live worker.py paths).
+    rs.health = in_turn_red
+    Worker._resolve_health_on_success(rs, agent_id, _LOG)
+    assert rs.health == in_turn_red
+
+
+# ── _fallback_unknown_if_stuck_in_progress (PR #59 Blocker 2) ────
+
+
+def test_fallback_unknown_fires_when_swallowed_exception_left_in_progress(
+    tmp_path, monkeypatch,
+):
+    """Mirrors the live shape: ``handle_message_batch`` raised a non-
+    AgentAPIError that the worker swallows. Finally branch must
+    backstop in_progress → unknown."""
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+    Worker._fallback_unknown_if_stuck_in_progress(
+        rs, agent_id, "KeyError: 'missing-key'", _LOG,
+    )
+    assert rs.health == "unknown"
+    assert "KeyError" in rs.error
+    # Persisted.
+    on_disk = RuntimeState.load(agent_id)
+    assert on_disk is not None and on_disk.health == "unknown"
+
+
+def test_fallback_unknown_leaves_category_red_untouched(tmp_path, monkeypatch):
+    """If an in-turn give-up red was already written, the backstop
+    must NOT overwrite it (category red carries better detail than
+    'unknown')."""
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="api_error_abandoned")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+    Worker._fallback_unknown_if_stuck_in_progress(
+        rs, agent_id, "anything", _LOG,
+    )
+    assert rs.health == "api_error_abandoned"
+
+
+def test_fallback_unknown_default_error_when_caller_passes_none(
+    tmp_path, monkeypatch,
+):
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+    Worker._fallback_unknown_if_stuck_in_progress(rs, agent_id, None, _LOG)
+    assert rs.health == "unknown"
+    assert rs.error  # populated even when caller had no error text
+
+
+# ── chain integration tests (PR #59 Blocker 1 + Blocker 2) ───────
+
+
+def test_chain_agent_api_error_then_retry_success_resolves_to_ok(
+    tmp_path, monkeypatch,
+):
+    """Blocker 1 chain: AgentAPIError raise leaves in_progress
+    intact (turn_will_retry → backstop skipped), consumer kick-retry
+    succeeds → on_turn_success fires → resolve clears to ok.
+
+    Walks the helper sequence the live worker now invokes; without
+    the round-1 fix the chain would terminate with in_progress on
+    disk forever.
+    """
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="ok")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+
+    # T0: on_message_batch flips to in_progress.
+    Worker._flip_health_in_progress(rs, agent_id, _LOG)
+    assert rs.health == "in_progress"
+
+    # T1: handle_message_batch raises AgentAPIError → finally's
+    # success branch is skipped. turn_will_retry=True, so the
+    # backstop also skips. in_progress survives.
+    # (Simulated by reading the on-disk value after a no-op.)
+    on_disk = RuntimeState.load(agent_id)
+    assert on_disk is not None and on_disk.health == "in_progress"
+
+    # T2: consumer kicks the retry; it succeeds; on_turn_success
+    # fires the same helper pair the worker installed in this PR.
+    Worker._clear_api_error_abandoned_if_recoverable(
+        rs, agent_id, "root_x", _LOG,
+    )
+    Worker._resolve_health_on_success(rs, agent_id, _LOG)
+
+    assert rs.health == "ok"
+    on_disk = RuntimeState.load(agent_id)
+    assert on_disk is not None and on_disk.health == "ok"
+
+
+def test_chain_non_api_error_swallow_falls_back_to_unknown(
+    tmp_path, monkeypatch,
+):
+    """Blocker 2 chain: non-AgentAPIError swallow (e.g., KeyError)
+    means turn_succeeded=False AND turn_will_retry=False. Without the
+    backstop, in_progress would persist until daemon restart. With
+    the backstop, the finally lands at unknown + populated error.
+    """
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="ok")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+
+    Worker._flip_health_in_progress(rs, agent_id, _LOG)
+    assert rs.health == "in_progress"
+
+    # Simulate the swallowed-exception finally landing on the
+    # backstop branch.
+    Worker._fallback_unknown_if_stuck_in_progress(
+        rs, agent_id, "KeyError: 'thread_root_id'", _LOG,
+    )
+
+    assert rs.health == "unknown"
+    assert "KeyError" in rs.error
+    on_disk = RuntimeState.load(agent_id)
+    assert on_disk is not None and on_disk.health == "unknown"
+
+
 # ── StatusReporter heartbeat shape ───────────────────────────────
 
 

@@ -570,18 +570,10 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """PUF-270: flip ``runtime.health`` to ``in_progress`` at the
-        top of every ``on_message_batch``. Overrides any sticky red
-        (auth_failed / api_error_abandoned / refresh_broken) so the UI
-        can show the agent is actually alive while a turn is mid-
-        flight. Idempotent — no-op when already ``in_progress``.
-
-        Override-all-reds shape was Stage-3 picked per operator's
-        rule 1 ("before agent starts processing any message"). The
-        false-positive concern (auth_failed → in_progress right
-        before the API call 401s again) is self-correcting because
-        ``_handle_suppressed_reply`` re-flips back to auth_failed
-        within the same turn.
+        """PUF-270: at every batch-top, override any sticky red with
+        ``in_progress``. False-positives (auth_failed → in_progress
+        right before the API 401s again) self-correct in-turn via
+        ``_handle_suppressed_reply``. Idempotent.
         """
         if runtime.health == "in_progress":
             return
@@ -614,6 +606,37 @@ class Worker:
             "agent %s: turn succeeded; runtime.health resolved "
             "from in_progress to ok",
             agent_id,
+        )
+
+    @staticmethod
+    def _fallback_unknown_if_stuck_in_progress(
+        runtime: "RuntimeState",
+        agent_id: str,
+        turn_error: str | None,
+        log: logging.Logger,
+    ) -> None:
+        """PUF-270 backstop: a turn that didn't succeed AND won't be
+        re-enqueued (non-AgentAPIError swallow) would otherwise leave
+        ``runtime.health == "in_progress"`` until daemon restart.
+        Fall back to ``unknown`` + populated ``error`` so the UI shows
+        an honest state instead of "still working" forever.
+
+        No-op when a category-specific give-up red (auth_failed /
+        api_error_abandoned / refresh_broken) was already written
+        in-turn — those carry better detail than ``unknown``.
+        """
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "unknown"
+        runtime.error = turn_error or (
+            "turn did not succeed; no category-specific health "
+            "value was written"
+        )
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: turn did not succeed and no category-specific "
+            "red was set; runtime.health fell back to unknown (%s)",
+            agent_id, runtime.error,
         )
 
     def __init__(
@@ -902,8 +925,7 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
-            # PUF-270: flip to in_progress before the agent visibly
-            # starts work. Resolved in the finally below.
+            # PUF-270: flip to in_progress; resolved in the finally.
             try:
                 Worker._flip_health_in_progress(self.runtime, agent_id, logger)
             except Exception as exc:  # noqa: BLE001
@@ -920,6 +942,7 @@ class Worker:
                 else None
             )
             turn_succeeded = True
+            turn_will_retry = False
             turn_error: str | None = None
             try:
                 reply = await puffo.handle_message_batch(
@@ -934,6 +957,7 @@ class Worker:
                 logger.warning("agent %s: api-error retry: %s", agent_id, exc)
                 reply = None
                 turn_succeeded = False
+                turn_will_retry = True
                 turn_error = "API Error"
                 raise
             except Exception as exc:
@@ -967,11 +991,12 @@ class Worker:
                             "error_text": turn_error,
                         })
                     await reporter.end_turn_batch(runs)
-                # PUF-270 resolve: on success, in_progress → ok. On
-                # failure we leave the current state — category-
-                # specific paths may have set a give-up red, or the
-                # consumer-loop will re-enqueue and the next begin
-                # flips back to in_progress.
+                # PUF-270: success → resolve in_progress → ok. Failed
+                # but will retry (AgentAPIError) → leave in_progress;
+                # consumer re-enqueues and next begin overrides anyway.
+                # Failed and won't retry (non-AgentAPIError swallow) →
+                # backstop to unknown so the UI doesn't render
+                # "still working" forever.
                 if turn_succeeded:
                     try:
                         Worker._resolve_health_on_success(
@@ -980,6 +1005,16 @@ class Worker:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "agent %s: _resolve_health_on_success failed: %s",
+                            agent_id, exc,
+                        )
+                elif not turn_will_retry:
+                    try:
+                        Worker._fallback_unknown_if_stuck_in_progress(
+                            self.runtime, agent_id, turn_error, logger,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "agent %s: in_progress backstop failed: %s",
                             agent_id, exc,
                         )
                 # Clear turn context so post-turn background work
@@ -1099,6 +1134,13 @@ class Worker:
         ):
             Worker._clear_api_error_abandoned_if_recoverable(
                 self.runtime, agent_id, root_id, logger,
+            )
+            # PUF-270: an AgentAPIError-then-retry-success lands here
+            # without going back through on_message_batch's finally, so
+            # in_progress would otherwise stick. Idempotent on the
+            # clean-first-try path (resolve already ran in the finally).
+            Worker._resolve_health_on_success(
+                self.runtime, agent_id, logger,
             )
 
         async def heartbeat():
