@@ -213,6 +213,11 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             owner_username=operator,
             permission_mode=agent_cfg.runtime.permission_mode,
             harness=harness,
+            desired_skills=agent_cfg.desired_skills,
+            desired_mcps=agent_cfg.desired_mcps,
+            puffo_core_server_url=agent_cfg.puffo_core.server_url,
+            puffo_core_slug=agent_cfg.puffo_core.slug,
+            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env

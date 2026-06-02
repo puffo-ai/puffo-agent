@@ -45,6 +45,7 @@ from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
+from .desired_install import install_desired
 from .hermes_helpers import (
     HERMES_NO_RESUME_SIGNATURE,
     hermes_model_id,
@@ -141,6 +142,17 @@ class LocalCLIAdapter(Adapter):
         owner_username: str = "",
         permission_mode: str = "default",
         harness=None,
+        # PUF-268: spawn-time install of operator-picked templates.
+        # All four are optional so legacy tests + the chat-local /
+        # docker callsites that don't ship desired-lists keep working
+        # unchanged. ``puffo_core_*`` are required for the HTTP fetch
+        # to authenticate; when any is empty the install pass is
+        # skipped with a debug log and the agent spawns as before.
+        desired_skills: list[str] | None = None,
+        desired_mcps: list[str] | None = None,
+        puffo_core_server_url: str = "",
+        puffo_core_slug: str = "",
+        puffo_core_keys_dir: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
@@ -154,6 +166,15 @@ class LocalCLIAdapter(Adapter):
         self.agent_home_dir = Path(agent_home_dir)
         self.owner_username = owner_username
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
+        self.desired_skills = list(desired_skills or [])
+        self.desired_mcps = list(desired_mcps or [])
+        self.puffo_core_server_url = puffo_core_server_url
+        self.puffo_core_slug = puffo_core_slug
+        self.puffo_core_keys_dir = puffo_core_keys_dir
+        # Cached desired-stdio MCPs the codex session_init merges
+        # into config.toml on the next ``_ensure_codex_session``.
+        self._desired_codex_extras: dict[str, dict] = {}
+        self._desired_installed = False
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
@@ -184,6 +205,7 @@ class LocalCLIAdapter(Adapter):
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         self._verify()
+        await self._install_desired()
         user_message = ctx.messages[-1]["content"] if ctx.messages else ""
         if self.harness.name() == "codex":
             session = self._ensure_codex_session()
@@ -200,6 +222,7 @@ class LocalCLIAdapter(Adapter):
         ctx: TurnContext,
     ) -> TurnResult:
         self._verify()
+        await self._install_desired()
         if self.harness.name() == "codex":
             # codex has no equivalent of claude-code's cheap "resume
             # kick" — the App Server doesn't expose a resume-with-
@@ -226,6 +249,7 @@ class LocalCLIAdapter(Adapter):
         to avoid paying for permanently-idle bots.
         """
         self._verify()
+        await self._install_desired()
         if self.harness.name() == "codex":
             session = self._ensure_codex_session()
             if not session.has_persisted_session():
@@ -296,18 +320,24 @@ class LocalCLIAdapter(Adapter):
         # agent inherits the operator's codex MCP catalog (the puffo
         # entry below shadows any same-named host entry).
         host_mcps = read_host_codex_mcp_servers(Path.home())
+        # PUF-268: fold operator-picked stdio MCPs in alongside host
+        # MCPs. Host wins on collision so the operator's local
+        # override beats the catalog default; same precedence as
+        # claude's ``sync_host_mcp_servers``.
+        merged_extras: dict[str, dict] = dict(self._desired_codex_extras)
+        merged_extras.update(host_mcps)
         if self.puffo_core_mcp_env:
             write_codex_mcp_config(
                 codex_home / "config.toml",
                 command=default_python_executable(),
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
                 env=self.puffo_core_mcp_env,
-                extra_servers=host_mcps,
+                extra_servers=merged_extras,
             )
         else:
             write_codex_mcp_config(
                 codex_home / "config.toml",
-                extra_servers=host_mcps,
+                extra_servers=merged_extras,
             )
             logger.warning(
                 "agent %s: codex MCP tools unavailable — puffo_core is "
@@ -977,6 +1007,63 @@ class LocalCLIAdapter(Adapter):
 
         self._log_host_runtime_banner()
         self._verified = True
+
+    async def _install_desired(self) -> None:
+        """Spawn-time install of operator-picked skill + MCP templates
+        (PUF-268). Runs once per LocalCLIAdapter instance, after the
+        sync ``_verify`` block — so host-sync wins on collisions and
+        catalog fetch never blocks host-sync errors.
+
+        Skips silently when no desired entries are configured OR when
+        the puffo_core HTTP plumbing is incomplete (legacy callers,
+        chat-only style configs). Fetch errors are logged + tolerated
+        per ticket: a missing template doesn't fail spawn.
+        """
+        if self._desired_installed:
+            return
+        self._desired_installed = True
+        if not self.desired_skills and not self.desired_mcps:
+            return
+        if not (
+            self.puffo_core_server_url
+            and self.puffo_core_slug
+            and self.puffo_core_keys_dir
+        ):
+            logger.warning(
+                "agent %s: desired_skills/desired_mcps configured but "
+                "puffo_core wiring is incomplete — skipping spawn-time "
+                "install (server_url=%r slug=%r keys_dir=%r)",
+                self.agent_id,
+                self.puffo_core_server_url,
+                self.puffo_core_slug,
+                self.puffo_core_keys_dir,
+            )
+            return
+        from ...crypto.http_client import PuffoCoreHttpClient
+        from ...crypto.keystore import KeyStore
+        ks = KeyStore(self.puffo_core_keys_dir)
+        http = PuffoCoreHttpClient(
+            self.puffo_core_server_url, ks, self.puffo_core_slug,
+        )
+        try:
+            codex_extras = await install_desired(
+                http=http,
+                agent_home=self.agent_home_dir,
+                agent_id=self.agent_id,
+                harness_name=self.harness.name(),
+                desired_skills=self.desired_skills,
+                desired_mcps=self.desired_mcps,
+            )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: desired install pass crashed: %s — "
+                "continuing spawn", self.agent_id, exc,
+            )
+            codex_extras = {}
+        finally:
+            await http.close()
+        if codex_extras:
+            self._desired_codex_extras = codex_extras
 
     def _log_host_runtime_banner(self) -> None:
         """One-time startup banner. INFO when tool calls proxy to
