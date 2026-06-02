@@ -149,49 +149,47 @@ def test_resolve_skips_when_in_turn_path_wrote_red(
     assert rs.health == in_turn_red
 
 
-# ── _fallback_unknown_if_stuck_in_progress (PR #59 Blocker 2) ────
+# ── _fallback_unhandled_error_if_stuck_in_progress (PR #59 Blocker 2) ────
 
 
-def test_fallback_unknown_fires_when_swallowed_exception_left_in_progress(
+def test_fallback_unhandled_error_fires_when_swallowed_exception_left_in_progress(
     tmp_path, monkeypatch,
 ):
     """Mirrors the live shape: ``handle_message_batch`` raised a non-
     AgentAPIError that the worker swallows. Finally branch must
-    backstop in_progress → unknown."""
+    backstop in_progress → unhandled_error."""
     agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
     rs = RuntimeState.load(agent_id)
     assert rs is not None
-    Worker._fallback_unknown_if_stuck_in_progress(
+    Worker._fallback_unhandled_error_if_stuck_in_progress(
         rs, agent_id, "KeyError: 'missing-key'", _LOG,
     )
-    assert rs.health == "unknown"
+    assert rs.health == "unhandled_error"
     assert "KeyError" in rs.error
-    # Persisted.
     on_disk = RuntimeState.load(agent_id)
-    assert on_disk is not None and on_disk.health == "unknown"
+    assert on_disk is not None and on_disk.health == "unhandled_error"
 
 
-def test_fallback_unknown_leaves_category_red_untouched(tmp_path, monkeypatch):
+def test_fallback_unhandled_error_leaves_category_red_untouched(tmp_path, monkeypatch):
     """If an in-turn give-up red was already written, the backstop
-    must NOT overwrite it (category red carries better detail than
-    'unknown')."""
+    must NOT overwrite it (category red carries better detail)."""
     agent_id = _seed_runtime(tmp_path, monkeypatch, health="api_error_abandoned")
     rs = RuntimeState.load(agent_id)
     assert rs is not None
-    Worker._fallback_unknown_if_stuck_in_progress(
+    Worker._fallback_unhandled_error_if_stuck_in_progress(
         rs, agent_id, "anything", _LOG,
     )
     assert rs.health == "api_error_abandoned"
 
 
-def test_fallback_unknown_default_error_when_caller_passes_none(
+def test_fallback_unhandled_error_default_error_when_caller_passes_none(
     tmp_path, monkeypatch,
 ):
     agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
     rs = RuntimeState.load(agent_id)
     assert rs is not None
-    Worker._fallback_unknown_if_stuck_in_progress(rs, agent_id, None, _LOG)
-    assert rs.health == "unknown"
+    Worker._fallback_unhandled_error_if_stuck_in_progress(rs, agent_id, None, _LOG)
+    assert rs.health == "unhandled_error"
     assert rs.error  # populated even when caller had no error text
 
 
@@ -236,13 +234,13 @@ def test_chain_agent_api_error_then_retry_success_resolves_to_ok(
     assert on_disk is not None and on_disk.health == "ok"
 
 
-def test_chain_non_api_error_swallow_falls_back_to_unknown(
+def test_chain_non_api_error_swallow_falls_back_to_unhandled_error(
     tmp_path, monkeypatch,
 ):
     """Blocker 2 chain: non-AgentAPIError swallow (e.g., KeyError)
     means turn_succeeded=False AND turn_will_retry=False. Without the
     backstop, in_progress would persist until daemon restart. With
-    the backstop, the finally lands at unknown + populated error.
+    the backstop, the finally lands at unhandled_error + populated error.
     """
     agent_id = _seed_runtime(tmp_path, monkeypatch, health="ok")
     rs = RuntimeState.load(agent_id)
@@ -251,16 +249,14 @@ def test_chain_non_api_error_swallow_falls_back_to_unknown(
     Worker._flip_health_in_progress(rs, agent_id, _LOG)
     assert rs.health == "in_progress"
 
-    # Simulate the swallowed-exception finally landing on the
-    # backstop branch.
-    Worker._fallback_unknown_if_stuck_in_progress(
+    Worker._fallback_unhandled_error_if_stuck_in_progress(
         rs, agent_id, "KeyError: 'thread_root_id'", _LOG,
     )
 
-    assert rs.health == "unknown"
+    assert rs.health == "unhandled_error"
     assert "KeyError" in rs.error
     on_disk = RuntimeState.load(agent_id)
-    assert on_disk is not None and on_disk.health == "unknown"
+    assert on_disk is not None and on_disk.health == "unhandled_error"
 
 
 # ── StatusReporter heartbeat shape ───────────────────────────────
@@ -326,27 +322,24 @@ async def test_heartbeat_provider_exception_does_not_break_heartbeat():
     assert body == {"status": "idle"}
 
 
-# ── CLI surfaced-health includes in_progress ─────────────────────
+# ── CLI surfaced-health includes new values ──────────────────────
 
 
-def test_cli_surfaced_health_tuple_includes_in_progress():
-    """Sanity-check that the tuple in cli.py adds in_progress to the
-    list of values that get the ``[<health>]`` suffix in ``agent
-    list``. Source-string check rather than running the CLI subcommand
-    because the CLI does heavy daemon/runtime initialization."""
+def test_cli_surfaced_health_tuple_includes_new_values():
+    """Source-string check on cli.py's cmd_agent_list tuple (running
+    the CLI does heavy daemon init). Pins the new PUF-270 values."""
     cli_path = (
         Path(__file__).parent.parent
         / "src" / "puffo_agent" / "portal" / "cli.py"
     )
     text = cli_path.read_text(encoding="utf-8")
-    # The surfaced-health tuple lives in cmd_agent_list. Locate the
-    # tuple by anchor + assert in_progress is a member.
-    assert '"in_progress"' in text, (
-        "in_progress must be in cli.py surfaced-health tuple so the "
-        "operator can see at a glance the agent is alive mid-turn"
-    )
-    # Defensive: the legacy reds must still surface — no regression.
-    for legacy in ("auth_failed", "api_error_abandoned", "refresh_broken"):
-        assert f'"{legacy}"' in text, (
-            f"surfaced-health tuple lost {legacy!r}"
+    for required in (
+        "in_progress",
+        "unhandled_error",
+        "auth_failed",
+        "api_error_abandoned",
+        "refresh_broken",
+    ):
+        assert f'"{required}"' in text, (
+            f"surfaced-health tuple missing {required!r}"
         )

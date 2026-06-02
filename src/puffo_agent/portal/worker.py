@@ -570,21 +570,16 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """PUF-270: at every batch-top, override any sticky red with
-        ``in_progress``. False-positives (auth_failed → in_progress
-        right before the API 401s again) self-correct in-turn via
-        ``_handle_suppressed_reply``. Idempotent.
+        """Override any sticky red with ``in_progress`` at batch-top.
+        False-positives (auth_failed → in_progress just before the API
+        401s again) self-correct in-turn via ``_handle_suppressed_reply``.
         """
         if runtime.health == "in_progress":
             return
         runtime.health = "in_progress"
         runtime.error = ""
         runtime.save(agent_id)
-        log.info(
-            "agent %s: runtime.health flipped to in_progress at "
-            "begin_turn",
-            agent_id,
-        )
+        log.info("agent %s: runtime.health → in_progress", agent_id)
 
     @staticmethod
     def _resolve_health_on_success(
@@ -592,50 +587,35 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """PUF-270: after a successful turn, transition
-        ``in_progress`` → ``ok``. Only fires when the flip lane set
-        the in_progress value — leaves any externally-set state
-        (e.g., a give-up red set inside the turn) untouched.
+        """Transition ``in_progress`` → ``ok`` after a successful turn.
+        Skips any in-turn-written red so give-up signals survive.
         """
         if runtime.health != "in_progress":
             return
         runtime.health = "ok"
         runtime.error = ""
         runtime.save(agent_id)
-        log.info(
-            "agent %s: turn succeeded; runtime.health resolved "
-            "from in_progress to ok",
-            agent_id,
-        )
+        log.info("agent %s: runtime.health in_progress → ok", agent_id)
 
     @staticmethod
-    def _fallback_unknown_if_stuck_in_progress(
+    def _fallback_unhandled_error_if_stuck_in_progress(
         runtime: "RuntimeState",
         agent_id: str,
         turn_error: str | None,
         log: logging.Logger,
     ) -> None:
-        """PUF-270 backstop: a turn that didn't succeed AND won't be
-        re-enqueued (non-AgentAPIError swallow) would otherwise leave
-        ``runtime.health == "in_progress"`` until daemon restart.
-        Fall back to ``unknown`` + populated ``error`` so the UI shows
-        an honest state instead of "still working" forever.
-
-        No-op when a category-specific give-up red (auth_failed /
-        api_error_abandoned / refresh_broken) was already written
-        in-turn — those carry better detail than ``unknown``.
+        """Backstop when a non-AgentAPIError swallow leaves the agent
+        flagged ``in_progress`` with no retry path. Routes to a new red
+        (``unhandled_error``) — distinct from ``unknown`` (= not probed
+        yet) so the CLI / heartbeat can surface it as actionable.
         """
         if runtime.health != "in_progress":
             return
-        runtime.health = "unknown"
-        runtime.error = turn_error or (
-            "turn did not succeed; no category-specific health "
-            "value was written"
-        )
+        runtime.health = "unhandled_error"
+        runtime.error = turn_error or "turn raised; no category red set"
         runtime.save(agent_id)
         log.warning(
-            "agent %s: turn did not succeed and no category-specific "
-            "red was set; runtime.health fell back to unknown (%s)",
+            "agent %s: runtime.health → unhandled_error (%s)",
             agent_id, runtime.error,
         )
 
@@ -925,7 +905,6 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
-            # PUF-270: flip to in_progress; resolved in the finally.
             try:
                 Worker._flip_health_in_progress(self.runtime, agent_id, logger)
             except Exception as exc:  # noqa: BLE001
@@ -991,12 +970,9 @@ class Worker:
                             "error_text": turn_error,
                         })
                     await reporter.end_turn_batch(runs)
-                # PUF-270: success → resolve in_progress → ok. Failed
-                # but will retry (AgentAPIError) → leave in_progress;
-                # consumer re-enqueues and next begin overrides anyway.
-                # Failed and won't retry (non-AgentAPIError swallow) →
-                # backstop to unknown so the UI doesn't render
-                # "still working" forever.
+                # Success → ok. AgentAPIError → leave in_progress for
+                # the next batch's flip to override. Other swallow →
+                # unhandled_error backstop (no retry will re-flip).
                 if turn_succeeded:
                     try:
                         Worker._resolve_health_on_success(
@@ -1009,7 +985,7 @@ class Worker:
                         )
                 elif not turn_will_retry:
                     try:
-                        Worker._fallback_unknown_if_stuck_in_progress(
+                        Worker._fallback_unhandled_error_if_stuck_in_progress(
                             self.runtime, agent_id, turn_error, logger,
                         )
                     except Exception as exc:  # noqa: BLE001
@@ -1135,10 +1111,8 @@ class Worker:
             Worker._clear_api_error_abandoned_if_recoverable(
                 self.runtime, agent_id, root_id, logger,
             )
-            # PUF-270: an AgentAPIError-then-retry-success lands here
-            # without going back through on_message_batch's finally, so
-            # in_progress would otherwise stick. Idempotent on the
-            # clean-first-try path (resolve already ran in the finally).
+            # AgentAPIError-then-retry-success skips on_message_batch's
+            # finally; resolve here so in_progress doesn't stick.
             Worker._resolve_health_on_success(
                 self.runtime, agent_id, logger,
             )
@@ -1160,9 +1134,7 @@ class Worker:
         # Server-side status reporter: own heartbeat task; begin_turn /
         # end_turn fire inline from on_message via this closure. Falls
         # back to a no-op when the client has no http client (tests).
-        # PUF-270: hand the reporter a lazy provider so each heartbeat
-        # carries the freshest ``runtime.health`` alongside the per-turn
-        # ``status``.
+        # Lazy provider so each heartbeat reads live runtime.health.
         reporter = (
             StatusReporter(
                 client.http,

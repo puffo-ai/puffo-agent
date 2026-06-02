@@ -529,13 +529,11 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
             else:
                 uptime = "—"
         # Surface non-ok health alongside lifecycle status so the
-        # operator can see at a glance which agents need
-        # re-auth or refresh/restart. ``in_progress`` (PUF-270) also
-        # surfaces so the operator can confirm a sticky-red agent is
-        # actually alive while a turn is mid-flight.
+        # operator can see at a glance which agents need attention.
         if rs is not None and rs.health in (
             "in_progress",
             "auth_failed", "api_error_abandoned", "refresh_broken",
+            "unhandled_error",
         ):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.

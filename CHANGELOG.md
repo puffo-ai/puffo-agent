@@ -52,6 +52,24 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the wire format. UI Import + Export file dialogs use the same
   extension so the round-trip lines up.
 
+- **PUF-270: ``runtime.health = "in_progress"`` overrides sticky reds
+  while a turn is mid-flight.** Operators reported agents with a stale
+  ``auth_failed`` / ``api_error_abandoned`` / ``refresh_broken`` on
+  disk looking dead in ``puffoagent agent list`` even when actively
+  processing a new message. ``on_message_batch`` now flips
+  ``runtime.health`` to ``in_progress`` at the top of every batch and
+  resolves to ``ok`` on success; in-turn category reds (set inside
+  the turn body) still survive the resolve. The
+  ``AgentAPIError → consumer kick-retry → on_turn_success`` chain
+  also resolves cleanly. Non-AgentAPIError exceptions that escape the
+  handler fall back to a new red ``unhandled_error`` (distinct from
+  ``unknown`` = not probed yet) so the CLI surfaces them as
+  actionable. The heartbeat carries both per-turn ``status`` and
+  persistent ``health`` so the server can render the alive-vs-red
+  discrimination. ``CredentialRefresher`` skips agents in
+  ``in_progress`` / ``unhandled_error`` to avoid clobbering them with
+  ``refresh_broken``.
+
 ## [0.9.6] — 2026-06-01
 
 ### Fixed
