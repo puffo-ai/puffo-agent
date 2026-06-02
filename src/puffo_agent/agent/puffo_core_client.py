@@ -421,10 +421,17 @@ class PuffoCoreMessageClient:
         workspace: str = "",
         max_inline_chars: int = 4000,
         segment_chars: int = 2000,
+        agent_created_at: int = 0,
     ):
         self.slug = slug
         self.device_id = device_id
         self.space_id = space_id
+        # PUF-272: agent.yml ``created_at`` (Unix seconds). Drives the
+        # two-phase invite-poll cadence in ``_invite_poll_loop`` —
+        # 10s while the agent is in its first 5 minutes, 30s after.
+        # Default 0 (legacy pre-``created_at`` agents) keeps the
+        # legacy steady 30s to avoid a fleet-wide surprise burst.
+        self._agent_created_at = int(agent_created_at)
         # Operator's slug — used to DM them on non-auto-acceptable
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
@@ -1315,17 +1322,51 @@ class PuffoCoreMessageClient:
         """Poll ``/invites`` to catch invites the WS can't reach (the
         server only fans events to existing space members, which the
         invitee isn't yet).
+
+        PUF-272: cadence is age-of-agent two-phase — 10s for the
+        first 5 minutes after the agent was created, then 30s. The
+        fast phase smooths the "just created the agent and invited
+        it" onboarding moment when user attention is high; steady
+        30s after that keeps the long-term server load flat.
+        Legacy agents with ``created_at == 0`` skip the fast phase
+        and stay on 30s from the start.
         """
-        INTERVAL = 30
+        FAST_INTERVAL = 10
+        STEADY_INTERVAL = 30
+        FAST_PHASE_SECONDS = 300
+
         # Brief grace period so first-poll output doesn't interleave
         # with the WS handshake log on startup.
         try:
             await asyncio.sleep(2)
             while True:
                 await self._poll_pending_invites()
-                await asyncio.sleep(INTERVAL)
+                interval = self._next_invite_poll_interval(
+                    fast=FAST_INTERVAL,
+                    steady=STEADY_INTERVAL,
+                    fast_phase_seconds=FAST_PHASE_SECONDS,
+                )
+                await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
+
+    def _next_invite_poll_interval(
+        self,
+        *,
+        fast: int,
+        steady: int,
+        fast_phase_seconds: int,
+    ) -> int:
+        """Pick the next ``_invite_poll_loop`` sleep based on agent age.
+
+        Returns ``fast`` if the agent is younger than
+        ``fast_phase_seconds`` and ``steady`` otherwise. Legacy agents
+        (``created_at == 0``) always get ``steady``.
+        """
+        if self._agent_created_at <= 0:
+            return steady
+        age = time.time() - self._agent_created_at
+        return fast if age < fast_phase_seconds else steady
 
     async def _handle_event(self, scope: str, event: dict) -> None:
         """WS event router for space + channel invites.
