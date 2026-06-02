@@ -570,10 +570,7 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """Override any sticky red with ``in_progress`` at batch-top.
-        False-positives (auth_failed → in_progress just before the API
-        401s again) self-correct in-turn via ``_handle_suppressed_reply``.
-        """
+        """Override any sticky red with ``in_progress`` at batch-top."""
         if runtime.health == "in_progress":
             return
         runtime.health = "in_progress"
@@ -587,9 +584,7 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """Transition ``in_progress`` → ``ok`` after a successful turn.
-        Skips any in-turn-written red so give-up signals survive.
-        """
+        """Transition ``in_progress`` → ``ok``; skip any in-turn red."""
         if runtime.health != "in_progress":
             return
         runtime.health = "ok"
@@ -604,10 +599,9 @@ class Worker:
         turn_error: str | None,
         log: logging.Logger,
     ) -> None:
-        """Backstop when a non-AgentAPIError swallow leaves the agent
-        flagged ``in_progress`` with no retry path. Routes to a new red
-        (``unhandled_error``) — distinct from ``unknown`` (= not probed
-        yet) so the CLI / heartbeat can surface it as actionable.
+        """``in_progress`` → ``unhandled_error`` when a non-retry-able
+        exception left the flip stuck. Distinct from ``unknown`` so the
+        CLI / heartbeat can surface it.
         """
         if runtime.health != "in_progress":
             return
@@ -970,9 +964,7 @@ class Worker:
                             "error_text": turn_error,
                         })
                     await reporter.end_turn_batch(runs)
-                # Success → ok. AgentAPIError → leave in_progress for
-                # the next batch's flip to override. Other swallow →
-                # unhandled_error backstop (no retry will re-flip).
+                # AgentAPIError leaves in_progress for next batch's flip.
                 if turn_succeeded:
                     try:
                         Worker._resolve_health_on_success(
@@ -1111,8 +1103,7 @@ class Worker:
             Worker._clear_api_error_abandoned_if_recoverable(
                 self.runtime, agent_id, root_id, logger,
             )
-            # AgentAPIError-then-retry-success skips on_message_batch's
-            # finally; resolve here so in_progress doesn't stick.
+            # retry-success path bypasses on_message_batch's finally.
             Worker._resolve_health_on_success(
                 self.runtime, agent_id, logger,
             )

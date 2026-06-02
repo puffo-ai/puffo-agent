@@ -1122,7 +1122,7 @@ class RuntimeState:
     #                           prior abandon, or a credential refresh
     #                           cleared a prior auth_failed
     #   "in_progress"         — turn mid-flight; overrides any sticky
-    #                           red so the UI reads alive (PUF-270)
+    #                           red so the UI reads alive
     #   "auth_failed"         — adapter saw 401 / authentication_error
     #                           (set in worker._handle_suppressed_reply);
     #                           cleared by the CredentialRefresher's
@@ -1136,8 +1136,8 @@ class RuntimeState:
     #                           REFRESHED. Does not overwrite the two
     #                           stronger downstream signals above.
     #   "unhandled_error"     — non-AgentAPIError raised in the turn and
-    #                           no category red was set (PUF-270 backstop);
-    #                           cleared by next successful turn
+    #                           no category red was set; cleared by
+    #                           next successful turn
     #   "unknown"             — no probe yet
     health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | unknown
 

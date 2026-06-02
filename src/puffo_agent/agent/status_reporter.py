@@ -52,10 +52,7 @@ class StatusReporter:
         self._interval = max(10.0, heartbeat_interval_s)
         self._current_status: str = "idle"
         self._current_message_id: str | None = None
-        # PUF-270: lazy provider so the heartbeat reads the freshest
-        # ``runtime.health`` at send-time, not at construction-time.
-        # ``None`` keeps the legacy single-stream wire shape for
-        # callers that don't carry a runtime (tests, no-op fallback).
+        # None keeps the legacy single-stream wire shape.
         self._runtime_health_provider = runtime_health_provider
         self._stop = asyncio.Event()
 
@@ -201,10 +198,6 @@ class StatusReporter:
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
-        # PUF-270: carry persistent ``runtime.health`` alongside the
-        # per-turn ``status`` so the server can render the alive-vs-
-        # red discrimination without relying on either stream alone.
-        # Provider failures are swallowed — heartbeat best-effort.
         if self._runtime_health_provider is not None:
             try:
                 body["health"] = self._runtime_health_provider()
