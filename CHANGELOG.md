@@ -90,6 +90,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   path. ``_CODEX_THREAD_LIMIT_PATTERNS`` is a tuple so a future
   "thread is dead" surface adds one regex.
 
+- **PUF-272: invite-poll cadence is two-phase for the first 5 minutes
+  of an agent's life.** ``_invite_poll_loop`` previously ticked every
+  30s for the agent's whole lifetime, which left a freshly created
+  agent waiting up to 30s for the first inviter ACK during the
+  high-attention moment right after ``puffoagent agent create``. The
+  loop now ticks at 10s while ``time.time() - AgentConfig.created_at <
+  300`` and at 30s after — wall-clock based, so a daemon restart of
+  a young agent re-enters the fast phase (agent age, not worker
+  uptime). Legacy agents written before ``AgentConfig.created_at``
+  (``created_at == 0``) stay on 30s from the start so the rollout
+  doesn't burst-spike server load.
+
 ## [0.9.6] — 2026-06-01
 
 ### Fixed

@@ -355,6 +355,7 @@ def _build_puffo_core_client(
         workspace=str(agent_cfg.resolve_workspace_dir()),
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
+        agent_created_at=agent_cfg.created_at,
     )
 
 
