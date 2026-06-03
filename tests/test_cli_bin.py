@@ -130,3 +130,73 @@ def test_hermes_bundle_paths_per_platform(platform_value, want_substr, monkeypat
     assert paths, f"no candidates for platform {platform_value!r}"
     first = paths[0].as_posix() if platform_value != "win32" else str(paths[0])
     assert want_substr in first
+
+
+# ── credential presence (UI 3-state status) ──────────────────────────
+
+
+def test_codex_has_credentials_true_when_auth_file_exists(tmp_path):
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
+    assert cli_bin.codex_has_credentials(home=tmp_path) is True
+
+
+def test_codex_has_credentials_false_when_dir_missing(tmp_path):
+    assert cli_bin.codex_has_credentials(home=tmp_path) is False
+
+
+def test_codex_has_credentials_false_when_file_missing_but_dir_exists(tmp_path):
+    (tmp_path / ".codex").mkdir()
+    assert cli_bin.codex_has_credentials(home=tmp_path) is False
+
+
+def test_claude_has_credentials_true_when_file_exists(tmp_path):
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text("{}", encoding="utf-8")
+    assert cli_bin.claude_has_credentials(home=tmp_path) is True
+
+
+def test_claude_has_credentials_false_when_file_missing(tmp_path, monkeypatch):
+    # On macOS we'd also probe Keychain; force the platform off so the
+    # test runs identically across CI envs.
+    monkeypatch.setattr("puffo_agent.agent.cli_bin.sys.platform", "linux")
+    assert cli_bin.claude_has_credentials(home=tmp_path) is False
+
+
+def test_claude_has_credentials_macos_falls_back_to_keychain(tmp_path, monkeypatch):
+    """When the file is missing on macOS, the Keychain probe (``security
+    find-generic-password``) decides. rc=0 → True, rc!=0 → False."""
+    import subprocess as _sp
+
+    monkeypatch.setattr("puffo_agent.agent.cli_bin.sys.platform", "darwin")
+
+    class _RC:
+        def __init__(self, code):
+            self.returncode = code
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.subprocess.run",
+        lambda *a, **kw: _RC(0),
+    )
+    assert cli_bin.claude_has_credentials(home=tmp_path) is True
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.subprocess.run",
+        lambda *a, **kw: _RC(44),
+    )
+    assert cli_bin.claude_has_credentials(home=tmp_path) is False
+
+
+def test_claude_has_credentials_keychain_probe_failure_treated_as_false(
+    tmp_path, monkeypatch,
+):
+    """Timeout / subprocess error must NOT raise into the UI poll."""
+    import subprocess as _sp
+
+    monkeypatch.setattr("puffo_agent.agent.cli_bin.sys.platform", "darwin")
+
+    def boom(*_a, **_kw):
+        raise _sp.TimeoutExpired(cmd="security", timeout=2)
+
+    monkeypatch.setattr("puffo_agent.agent.cli_bin.subprocess.run", boom)
+    assert cli_bin.claude_has_credentials(home=tmp_path) is False
