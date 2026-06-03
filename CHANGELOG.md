@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.10.0] — 2026-06-01
+## [0.10.0] — 2026-06-03
 
 ### Added
 
