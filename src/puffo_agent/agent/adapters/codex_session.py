@@ -654,18 +654,32 @@ class CodexSession:
         proc = self._proc
         self._proc = None
         if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                proc.kill()
+            # Stage 1: close stdin → codex App Server reads EOF, runs Rust
+            # Drop for its sqlite (logs_*.sqlite) + tmp file handles, and
+            # exits on its own. Skips the Windows TerminateProcess path
+            # that would leave file handles lingering for the kernel to
+            # clean up async (breaks archive/delete with WinError 32).
+            if proc.stdin is not None and not proc.stdin.is_closing():
                 try:
-                    await proc.wait()
+                    proc.stdin.close()
                 except Exception:
                     pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                # Stage 2: codex ignored EOF; force terminate.
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    try:
+                        await proc.wait()
+                    except Exception:
+                        pass
         for task in (self._reader_task, self._stderr_task):
             if task is not None and not task.done():
                 task.cancel()
