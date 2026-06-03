@@ -327,7 +327,7 @@ class Daemon:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         dest = archived_dir() / f"{agent_id}-ws-{stamp}"
         try:
-            shutil.move(str(src), str(dest))
+            await _retry_on_oserror(lambda: shutil.move(str(src), str(dest)))
             logger.info("agent %s: archived to %s", agent_id, dest)
         except OSError as exc:
             logger.error(
@@ -350,7 +350,7 @@ class Daemon:
             return
         await _drain_codex_tmp(src)
         try:
-            shutil.rmtree(src)
+            await _retry_on_oserror(lambda: shutil.rmtree(src))
             logger.info("agent %s: deleted", agent_id)
         except OSError as exc:
             logger.error(
@@ -372,6 +372,21 @@ async def _drain_codex_tmp(src: Path) -> None:
         except OSError:
             await asyncio.sleep(0.5)
     shutil.rmtree(codex_tmp, ignore_errors=True)
+
+
+async def _retry_on_oserror(fn, *, attempts: int = 5, delay: float = 0.5) -> None:
+    """Windows: codex App Server's .codex/logs_*.sqlite (WAL mode) holds
+    handles a few hundred ms past subprocess termination; same for any
+    other transient post-stop locks. Retry the caller's fs op until
+    Windows releases. Raises the last OSError on final attempt."""
+    for i in range(attempts):
+        try:
+            fn()
+            return
+        except OSError:
+            if i + 1 == attempts:
+                raise
+            await asyncio.sleep(delay)
 
 
 async def _log_outdated_version_warning() -> None:
