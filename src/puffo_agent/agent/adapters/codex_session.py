@@ -361,7 +361,7 @@ class CodexSession:
     def has_persisted_session(self) -> bool:
         return bool(self._conversation_id)
 
-    # ── PUF-267: thread-wedge propagation ─────────────────────────────────────
+    # ── thread-wedge propagation ──────────────────────────────────────────────
 
     def _propagate_turn_outcome(
         self,
@@ -369,24 +369,14 @@ class CodexSession:
         outcome: str,
         err_text: str = "",
     ) -> bool:
-        """``outcome`` ∈ ``{"success", "timeout", "turn_failed"}``.
-        Returns True iff this call rotated the conversation.
-
-        Counter THRESHOLD non-successes OR a verbatim thread-limit
-        error rotates. Success always clears the disk wedged flag —
-        guards the daemon-restart-with-stale-disk path.
-        """
+        """Returns True iff this call rotated the conversation."""
         if outcome == "success":
             if self._consecutive_thread_failures > 0:
                 logger.info(
-                    "agent %s: codex turn succeeded after %d non-success "
-                    "tick(s) — clearing codex_thread_wedged health",
+                    "agent %s: codex turn succeeded after %d non-success tick(s)",
                     self.agent_id, self._consecutive_thread_failures,
                 )
-            # Always clear, even when the in-memory counter is 0 — a
-            # daemon restart between rotation and the next success
-            # would otherwise leave runtime.health stuck on
-            # "codex_thread_wedged" on disk forever.
+            # Unconditional clear guards the daemon-restart-with-stale-disk path.
             self._clear_codex_thread_wedged_health()
             self._consecutive_thread_failures = 0
             return False
@@ -400,25 +390,18 @@ class CodexSession:
                 f"{self._consecutive_thread_failures} consecutive {outcome}"
             )
             logger.warning(
-                "agent %s: rotating codex thread (%s); next turn will "
-                "start a fresh conversation",
-                self.agent_id, reason,
+                "agent %s: rotating codex thread (%s)", self.agent_id, reason,
             )
             self._reset_conversation()
             self._flip_codex_thread_wedged_health(reason)
-            # Reset the counter so the freshly-rotated thread gets a
-            # fair THRESHOLD-budget on its own — otherwise a broken
-            # App Server would rotate on every single subsequent turn
-            # (counter-thrash).
+            # Reset so the fresh thread gets its own THRESHOLD budget.
             self._consecutive_thread_failures = 0
             return True
         return False
 
     def _reset_conversation(self) -> None:
-        """Clear the persisted ``conversation_id`` so the next
-        ``_ensure_running`` falls through to ``thread/start`` instead
-        of resuming the wedged thread. The codex App Server process
-        itself stays alive — only the per-thread state rotates."""
+        """Drop ``conversation_id`` so the next ``_ensure_running`` calls
+        ``thread/start``. App Server process stays alive."""
         self._conversation_id = ""
         try:
             self._save_conversation_id("")
@@ -429,14 +412,8 @@ class CodexSession:
             )
 
     def _flip_codex_thread_wedged_health(self, reason: str) -> None:
-        """Per-agent ``runtime.health = "codex_thread_wedged"`` flip.
-        Stronger downstream signals (auth/api-abandon/refresh-broken)
-        win. ``in_progress`` / ``unhandled_error`` are deliberately NOT
-        in the precedence tuple — ``codex_thread_wedged`` carries more
-        operator-actionable detail than either (names the rotation
-        cause + auto-recovery), so overwriting both is the right
-        direction.
-        """
+        """``in_progress`` / ``unhandled_error`` are intentionally NOT
+        protected — codex_thread_wedged carries more actionable detail."""
         from ...portal.state import RuntimeState
         try:
             rs = RuntimeState.load(self.agent_id)
