@@ -70,6 +70,26 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ``in_progress`` / ``unhandled_error`` to avoid clobbering them with
   ``refresh_broken``.
 
+- **PUF-267: codex agents auto-rotate the underlying thread instead of
+  silently wedging.** ``CodexSession`` previously reused one
+  ``threadId`` for the agent's life; when codex returned
+  ``"agent thread limit reached"`` or the thread silently stopped
+  streaming (repeated ``turn/failed`` / turn timeouts), every
+  subsequent turn hit the same dead thread while ``runtime.health``
+  stayed ``ok``. New ``_propagate_turn_outcome`` runs after each turn:
+  ``CODEX_THREAD_WEDGED_THRESHOLD = 2`` consecutive non-success
+  outcomes OR the verbatim thread-limit error clears
+  ``_conversation_id`` (in-memory + on-disk) so the next
+  ``_ensure_running`` starts a fresh thread, and the per-agent
+  ``runtime.health`` flips to ``codex_thread_wedged`` (surfaced in
+  ``agent list``). Recovery is automatic on the next inbound message.
+  ``auth_failed`` / ``api_error_abandoned`` / ``refresh_broken`` are
+  not overwritten; ``in_progress`` and ``unhandled_error`` are (the
+  codex-specific value carries more operator-actionable detail).
+  Always-clear-on-success guards the daemon-restart-with-stale-disk
+  path. ``_CODEX_THREAD_LIMIT_PATTERNS`` is a tuple so a future
+  "thread is dead" surface adds one regex.
+
 ## [0.9.6] — 2026-06-01
 
 ### Fixed
