@@ -6,6 +6,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -58,6 +59,17 @@ class MainWindow(QMainWindow):
         self._timer.timeout.connect(self._tick)
         self._timer.start()
         self._tick()
+
+        # Watchdog: the daemon thread exits either from our own
+        # closeEvent (operator clicked X) or from an external
+        # ``puffo-agent stop`` writing the sentinel. Either way the
+        # Qt event loop has no other reason to quit — without this
+        # the process lingers and ``puffo-agent stop`` times out
+        # waiting for the PID to go away.
+        self._daemon_watchdog = QTimer(self)
+        self._daemon_watchdog.setInterval(500)
+        self._daemon_watchdog.timeout.connect(self._check_daemon_alive)
+        self._daemon_watchdog.start()
 
     # UI construction ───────────────────────────────────────────────
 
@@ -174,6 +186,16 @@ class MainWindow(QMainWindow):
             self._workspace.poll()
 
     # Shutdown ──────────────────────────────────────────────────────
+
+    def _check_daemon_alive(self) -> None:
+        """If the daemon thread has exited (operator close, external
+        ``puffo-agent stop``, or an unhandled crash inside the thread),
+        tear down the Qt event loop so the OS process actually exits.
+        """
+        if self._daemon_thread.is_alive():
+            return
+        self._daemon_watchdog.stop()
+        QApplication.instance().quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if not self._stop_requested:
