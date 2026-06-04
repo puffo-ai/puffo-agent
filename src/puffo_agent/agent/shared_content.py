@@ -161,7 +161,6 @@ codex.
   **Force-refreshes** from puffo-server every call and refreshes the
   daemon's profile cache. Use when the operator mentions someone
   renamed themselves or you see a stale name in the prompt.
-- `fetch_channel_files(channel, limit=20)` — not yet implemented.
 
 **Self-management (claude-code only):**
 - `reload_system_prompt()` — rebuild system prompt from disk +
@@ -488,29 +487,6 @@ slugs typically follow the `<basename>-<4hex>` pattern (e.g.
 """
 
 
-DEFAULT_SKILL_FETCH_CHANNEL_FILES = """\
-# Skill: fetch_channel_files (not yet implemented)
-
-Back-fill file attachments from the last N posts in a channel into
-your workspace.
-
-**Tool:** `mcp__puffo__fetch_channel_files`
-
-**Status:** the puffo-core blob *query* endpoint is still a
-server-side stub. Calling this tool today returns
-`"(fetch_channel_files: blob query API not yet implemented)"`.
-Note that `mcp__puffo__send_message_with_attachments` IS
-implemented — only the back-fill / search-by-channel flow is
-pending.
-
-**Today's workaround:** the daemon already saves any incoming
-attachment to ``<workspace>/.puffo/inbox/<envelope_id>/`` as the
-turn arrives, so files from messages you've already received are
-on disk. If you need a file from a message you missed, ask the
-operator to forward it.
-"""
-
-
 DEFAULT_SKILL_GET_POST = """\
 # Skill: get_post
 
@@ -620,7 +596,6 @@ DEFAULT_SKILLS: dict[str, str] = {
     "permissions.md": DEFAULT_SKILL_PERMISSIONS,
     "channel-history.md": DEFAULT_SKILL_CHANNEL_HISTORY,
     "channel-members.md": DEFAULT_SKILL_CHANNEL_MEMBERS,
-    "fetch-channel-files.md": DEFAULT_SKILL_FETCH_CHANNEL_FILES,
     "get-post.md": DEFAULT_SKILL_GET_POST,
     "get-user-info.md": DEFAULT_SKILL_GET_USER_INFO,
     "reload-system-prompt.md": DEFAULT_SKILL_RELOAD,

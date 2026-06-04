@@ -1038,10 +1038,3 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"{validate_note}"
         )
 
-    @mcp.tool()
-    async def fetch_channel_files(channel: str, limit: int = 20) -> str:
-        """Back-fill file attachments from recent channel history.
-
-        Note: blob query API integration is pending.
-        """
-        return "(fetch_channel_files: blob query API not yet implemented)"

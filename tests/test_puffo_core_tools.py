@@ -834,14 +834,6 @@ async def test_send_message_with_attachments_requires_workspace():
     assert "workspace" in str(exc_info.value).lower()
 
 
-@pytest.mark.asyncio
-async def test_fetch_channel_files_stub():
-    cfg, _, _ = _setup()
-    mcp = _build_tools(cfg)
-    result = await _call(mcp, "fetch_channel_files", {"channel": "ch_1"})
-    assert "not yet implemented" in result
-
-
 # PUF-200: _resolve_root_id
 
 
@@ -1223,7 +1215,6 @@ async def test_core_tools_registered():
         "list_spaces", "list_channels_in_all_spaces",
         "list_channels_in_space", "list_channel_members",
         "get_user_info", "get_post", "send_message_with_attachments",
-        "fetch_channel_files",
     }
     assert expected.issubset(tool_names)
 
