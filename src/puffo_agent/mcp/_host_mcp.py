@@ -76,46 +76,20 @@ def _spec_from_template(template: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _build_operator_dm_body(
-    *,
-    name: str,
-    display_name: str,
-    description: str,
-    spec: dict[str, Any],
-    operator_note: str = "",
-) -> str:
-    """Operator-facing DM body — describes what was just installed on
-    their host and what env / OAuth they need to populate.
+def _build_operator_dm_body(*, name: str, display_name: str) -> str:
+    """Minimal DM body — one bold-stamped line confirming the install.
 
-    ``name`` is the mcpServers[<name>] key on host. ``display_name``
-    is what to show the operator in prose (may match name, or come
-    from the catalog row, or be a friendlier label the agent passed
-    in via the operator_note).
+    Operator's host file is their source of truth for what to populate
+    next (env keys, OAuth, etc.); piling those details into the DM
+    just clones what they already see when they open ~/.claude.json.
+    If the agent has extra context to share (setup docs URL, gotchas)
+    it sends a follow-up message itself — keep the tool's auto-DM
+    boring and predictable.
     """
-    env_map = spec.get("env") or {}
-    missing = [k for k, v in env_map.items() if not str(v)]
-    parts = [
-        f"I just installed {display_name} into your host ~/.claude.json "
-        f"as mcpServers[{name!r}].",
-    ]
-    if description:
-        parts.append(description)
-    if operator_note:
-        parts.append(operator_note)
-    if missing:
-        env_lines = "\n".join(f"  - {k}" for k in missing)
-        parts.append(f"This MCP needs you to populate these env values:\n{env_lines}")
-        parts.append(
-            "Complete the OAuth or paste the API key(s) on your host "
-            "(the MCP package's own setup flow), then ping me back."
-        )
-    else:
-        parts.append("No env setup is required — let me know when you're ready.")
-    parts.append(
-        f"Once host is ready I'll sync it into my own config and "
-        f"refresh — no further action needed from you."
+    return (
+        f"I just installed **{display_name}** into your host "
+        f"~/.claude.json as mcpServers[{name!r}]."
     )
-    return "\n\n".join(parts)
 
 
 _VALID_TRANSPORTS = {"stdio", "sse", "http"}
@@ -212,7 +186,6 @@ async def _install_host_mcp_impl(
     name: str,
     spec: dict[str, Any] | None = None,
     template_id: str = "",
-    operator_note: str = "",
 ) -> str:
     if not cfg.host_home:
         raise RuntimeError(
@@ -229,7 +202,6 @@ async def _install_host_mcp_impl(
         )
 
     display_name = name
-    description = ""
     if template_id:
         # Catalog form: fetch + normalize. Failure here is pre-side
         # effect so just surface to the agent.
@@ -256,7 +228,6 @@ async def _install_host_mcp_impl(
             )
         spec_to_write = normalized
         display_name = str(template.get("name") or name)
-        description = str(template.get("description") or "")
     else:
         # Adhoc form: agent supplied the spec inline (e.g. transcribed
         # from an MCP package's own README). Validate shape only.
@@ -291,13 +262,7 @@ async def _install_host_mcp_impl(
             f"~/.claude.json: {exc}"
         ) from exc
 
-    dm_body = _build_operator_dm_body(
-        name=name,
-        display_name=display_name,
-        description=description,
-        spec=spec_to_write,
-        operator_note=operator_note,
-    )
+    dm_body = _build_operator_dm_body(name=name, display_name=display_name)
 
     # Host write succeeded — try the auto-DM. On failure, return the
     # body so the agent can retry via send_message. operator_slug is

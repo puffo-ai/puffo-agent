@@ -1054,12 +1054,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         name: str,
         spec: Optional[dict] = None,
         template_id: str = "",
-        operator_note: str = "",
     ) -> str:
         """Lay down an MCP server spec into the operator's host
         ``~/.claude.json`` so they can complete OAuth / paste API keys
-        on their own claude session, then auto-DM them the setup
-        steps. Pair with ``sync_host_mcp`` once they confirm.
+        on their own claude session, then auto-DM them a one-line
+        install confirmation. Pair with ``sync_host_mcp`` once they
+        confirm. If you have setup-context to share (docs URL, env
+        keys to populate, gotchas) send a separate follow-up message
+        — the auto-DM is intentionally minimal.
 
         ``name``: the key the entry registers under
             (``mcpServers[<name>]`` on host).
@@ -1079,9 +1081,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
           Set ``env`` values to empty strings for placeholders the
           operator needs to populate.
 
-        ``operator_note``: optional extra context appended to the DM
-            (e.g. a link to the MCP's auth docs).
-
         Behaviour:
           - host already has the entry → file untouched, no DM, tells
             you to skip to ``sync_host_mcp``.
@@ -1094,7 +1093,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         """
         return await _install_host_mcp_impl(
             cfg, name=name, spec=spec, template_id=template_id,
-            operator_note=operator_note,
         )
 
     @mcp.tool()

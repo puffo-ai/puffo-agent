@@ -650,7 +650,6 @@ install_host_mcp(
         "args": ["-y", "@coinbase/cdp-mcp"],
         "env": {"CDP_API_KEY_NAME": "", "CDP_API_KEY_SECRET": ""},
     },
-    operator_note="Setup docs: https://docs.cdp.coinbase.com/.../cdp-docs-mcp",
 )
 ```
 
@@ -659,8 +658,14 @@ tool validates the shape (`type` ∈ {stdio, sse, http}, required
 fields per transport) and refuses malformed specs before touching
 disk.
 
-Either form auto-DMs the operator the setup steps once the host
-write succeeds — you don't manually `send_message`.
+Either form auto-DMs the operator a one-line confirmation
+("I just installed **X** into your host ~/.claude.json as
+mcpServers['X']") once the host write succeeds. If you have
+setup-context to share (docs URL, env keys they need to populate,
+gotchas) follow the install call with your own
+``mcp__puffo__send_message`` — the auto-DM is intentionally
+minimal so the operator can read their own .claude.json as the
+source of truth.
 
 Read the tool's return value carefully — it reports the real
 outcome:
