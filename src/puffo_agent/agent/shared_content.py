@@ -139,8 +139,9 @@ ships.
 
 `mcp__puffo__send_message` is your primary reply mechanism (see
 "How to reply"). Other tools read context or manage yourself.
-Skill docs: `.claude/skills/` on claude-code; inline above on
-codex.
+On claude-code the per-tool how-to docs auto-load as project skills
+from `.claude/skills/<name>/SKILL.md`; on codex the bullet list
+below is the authoritative reference.
 
 **Write:**
 - `send_message(channel, text, is_visible_to_human, root_id="")`
@@ -589,17 +590,64 @@ reach for `refresh` after `install_skill` / `install_mcp_server`.
 """
 
 
-DEFAULT_SKILLS: dict[str, str] = {
-    "send-message.md": DEFAULT_SKILL_SEND_MESSAGE,
-    "send-message-with-attachments.md": DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
-    "attachments.md": DEFAULT_SKILL_ATTACHMENTS,
-    "permissions.md": DEFAULT_SKILL_PERMISSIONS,
-    "channel-history.md": DEFAULT_SKILL_CHANNEL_HISTORY,
-    "channel-members.md": DEFAULT_SKILL_CHANNEL_MEMBERS,
-    "get-post.md": DEFAULT_SKILL_GET_POST,
-    "get-user-info.md": DEFAULT_SKILL_GET_USER_INFO,
-    "reload-system-prompt.md": DEFAULT_SKILL_RELOAD,
+# Each entry: skill id → (one-line description, body).
+# The description goes into the YAML frontmatter Claude Code reads
+# for skill discovery; the body is everything below the frontmatter.
+DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
+    "send-message": (
+        "Reply to a Puffo.ai channel or DM via the puffo MCP toolkit.",
+        DEFAULT_SKILL_SEND_MESSAGE,
+    ),
+    "send-message-with-attachments": (
+        "Send files from your workspace to a Puffo.ai channel or DM.",
+        DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
+    ),
+    "attachments": (
+        "Read inbound file attachments saved under .puffo/inbox/.",
+        DEFAULT_SKILL_ATTACHMENTS,
+    ),
+    "permissions": (
+        "Decide is_visible_to_human and pick the right channel/DM.",
+        DEFAULT_SKILL_PERMISSIONS,
+    ),
+    "channel-history": (
+        "Read recent posts and threads from a Puffo.ai channel.",
+        DEFAULT_SKILL_CHANNEL_HISTORY,
+    ),
+    "channel-members": (
+        "List a channel's member slugs + roles.",
+        DEFAULT_SKILL_CHANNEL_MEMBERS,
+    ),
+    "get-post": (
+        "Fetch one envelope by id from the daemon's local store.",
+        DEFAULT_SKILL_GET_POST,
+    ),
+    "get-user-info": (
+        "Look up a user's slug, display_name, and avatar_url.",
+        DEFAULT_SKILL_GET_USER_INFO,
+    ),
+    "reload-system-prompt": (
+        "Rebuild your system prompt from disk after editing profile/memory.",
+        DEFAULT_SKILL_RELOAD,
+    ),
 }
+
+_MANAGED_MARKER = ".puffo-managed"
+_MANAGED_MARKER_BODY = (
+    "This skill is mirrored from the puffo-agent install on every "
+    "worker start. Edits to SKILL.md here are overwritten; edit "
+    "the source under ~/.puffo-agent/shared/skills/<id>/SKILL.md\n"
+)
+
+
+def _skill_body_with_frontmatter(skill_id: str, description: str, body: str) -> str:
+    """Prepend the YAML frontmatter Claude Code needs for skill
+    discovery. Idempotent — bodies that already start with a `---`
+    block are left untouched.
+    """
+    if body.lstrip().startswith("---"):
+        return body
+    return f"---\nname: {skill_id}\ndescription: {description}\n---\n\n{body}"
 
 
 def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
@@ -607,11 +655,20 @@ def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
     content baked into this install. Single source of truth for both
     ``ensure_shared_primer`` (seed-if-missing) and
     ``reseed_shared_primer`` (force back to this version).
+
+    Skills live at ``skills/<id>/SKILL.md`` (the Claude Code skill
+    convention) with a frontmatter-stamped body; each skill dir also
+    carries a sentinel marker so ``sync_shared_skills`` can prune
+    stale managed entries from agent workspaces.
     """
     yield shared_dir / "CLAUDE.md", DEFAULT_SHARED_CLAUDE_MD
     yield shared_dir / "README.md", DEFAULT_SHARED_README
-    for name, body in DEFAULT_SKILLS.items():
-        yield shared_dir / "skills" / name, body
+    for skill_id, (description, body) in DEFAULT_SKILLS.items():
+        skill_dir = shared_dir / "skills" / skill_id
+        yield skill_dir / "SKILL.md", _skill_body_with_frontmatter(
+            skill_id, description, body,
+        )
+        yield skill_dir / _MANAGED_MARKER, _MANAGED_MARKER_BODY
 
 
 def ensure_shared_primer(shared_dir: Path) -> None:
@@ -671,20 +728,59 @@ def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
 
 
 def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
-    """Mirror ``shared/skills/*.md`` into ``<workspace>/.claude/skills/``
-    so Claude Code and SDK project-scope lookup discover them. Always
-    overwrites so shared edits propagate on the next worker restart.
+    """Mirror ``shared/skills/<id>/SKILL.md`` into
+    ``<workspace>/.claude/skills/<id>/SKILL.md`` so Claude Code's
+    project-scope skill discovery picks them up. Always overwrites
+    managed skills so shared edits propagate on next worker restart.
+
+    Prunes stale entries: any flat ``<workspace>/.claude/skills/*.md``
+    (legacy layout from before SKILL.md subdirs) plus any subdir
+    carrying our ``.puffo-managed`` marker whose id isn't in the
+    current ``DEFAULT_SKILLS``. Operator-authored subdirs without the
+    marker are left alone.
     """
-    src = shared_dir / "skills"
-    if not src.is_dir():
+    import shutil
+    src_root = shared_dir / "skills"
+    dst_root = workspace_dir / ".claude" / "skills"
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. Legacy flat .md files written by the pre-SKILL.md layout.
+    for path in dst_root.glob("*.md"):
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    # 2. Stale managed subdirs (skill removed/renamed in code).
+    current_ids = set(DEFAULT_SKILLS.keys())
+    for entry in dst_root.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name in current_ids:
+            continue
+        if (entry / _MANAGED_MARKER).exists():
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                pass
+
+    # 3. Mirror current managed skills.
+    if not src_root.is_dir():
         return
-    dst = workspace_dir / ".claude" / "skills"
-    dst.mkdir(parents=True, exist_ok=True)
-    for path in src.glob("*.md"):
+    for skill_id in current_ids:
+        src_skill = src_root / skill_id / "SKILL.md"
+        if not src_skill.exists():
+            continue
+        dst_skill_dir = dst_root / skill_id
+        dst_skill_dir.mkdir(parents=True, exist_ok=True)
         try:
-            (dst / path.name).write_text(
-                path.read_text(encoding="utf-8"),
+            (dst_skill_dir / "SKILL.md").write_text(
+                src_skill.read_text(encoding="utf-8"),
                 encoding="utf-8",
+            )
+            (dst_skill_dir / _MANAGED_MARKER).write_text(
+                _MANAGED_MARKER_BODY, encoding="utf-8",
             )
         except OSError:
             # Non-fatal — skills are a nice-to-have.
