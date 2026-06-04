@@ -629,36 +629,32 @@ the resulting populated config into your own agent on demand.
 ### Step 1 — `install_host_mcp("<template_id>")`
 
 Writes the catalog spec into `<operator_home>/.claude.json#mcpServers
-[<id>]` with placeholder env values. Returns a structured message
-addressed to your operator with the env keys they need to populate
-(or the OAuth steps the MCP package documents).
+[<id>]` with placeholder env values AND auto-DMs the operator with
+the setup instructions (env vars / OAuth steps from the catalog
+description). You don't need to call `send_message` yourself — the
+tool does it.
 
-If the host already has the entry → tool returns "already installed,
-skip to sync_host_mcp"; jump to Step 3.
+Read the tool's return value carefully — it reports the real outcome:
 
-### Step 2 — DM the operator with the install steps
+- "Installed … AND DM'd @<operator>" — both side effects landed; wait
+  for the operator's ping, then jump to Step 2.
+- "already registered in host's ~/.claude.json — left untouched" —
+  no DM was sent (operator already configured it); jump to Step 2.
+- "Installed … BUT sending the setup-instructions DM … failed" —
+  host write landed but DM didn't. Retry by sending the message
+  body the tool returned via `mcp__puffo__send_message` yourself.
+- Tool raised an error before "Installed" — nothing was written and
+  no DM was sent; surface the error to the operator.
 
-Take the tool's return text verbatim and send it via:
+### Step 2 — `sync_host_mcp("<template_id>")`
 
-```
-mcp__puffo__send_message(
-    channel="@<operator-slug>",
-    text=<install_host_mcp's return value>,
-    is_visible_to_human=True,
-)
-```
+Once the operator pings you back saying host setup is done, call
+this. It copies the populated entry (now carrying OAuth tokens / API
+keys) from `<operator_home>/.claude.json` into your own
+`<agent>/.claude.json`. The transfer is verbatim — what host has is
+what you get.
 
-They'll run the OAuth / paste the keys on their host's own claude
-session, then ping you back when done.
-
-### Step 3 — `sync_host_mcp("<template_id>")`
-
-Copies the populated entry (now carrying OAuth tokens / API keys
-the operator just set up) from `<operator_home>/.claude.json` into
-your own `<agent>/.claude.json`. The transfer is verbatim — what host
-has is what you get.
-
-### Step 4 — `refresh()`
+### Step 3 — `refresh()`
 
 Respawns your claude subprocess so it re-discovers the new MCP
 server. After this, calls to the MCP's tools should succeed.
@@ -671,11 +667,11 @@ server. After this, calls to the MCP's tools should succeed.
 - `install_host_mcp` → "unsupported transport" — the catalog row
   needs fixing on the server side; not something you can patch.
 - `sync_host_mcp` → "no entry for '<id>' in host's ~/.claude.json"
-  — operator hasn't finished Step 2 yet (or hasn't completed install
-  on host). Re-DM them.
+  — the operator hasn't finished setup yet (or skipped install).
+  Re-DM them via `send_message`.
 - After `refresh()`, MCP calls still fail with auth — the host entry
-  may still have empty env. Tell the operator and re-run Step 2 →
-  Step 3.
+  may still have empty env. Ask the operator to populate it and run
+  `sync_host_mcp` + `refresh()` again.
 """
 
 
