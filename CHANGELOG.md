@@ -4,6 +4,96 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] — 2026-06-04
+
+### Added
+
+- **PUF-268 PR-B: desired skill + MCP template install at spawn time
+  (cli-local only).** ``AgentConfig`` gains
+  ``desired_skills: list[str]`` + ``desired_mcps: list[str]`` round-
+  tripped through the v1 bridge ``create_agent`` /
+  ``import_agent_bundle`` payloads. ``local_cli._verify()`` runs a new
+  install pass that signs ``GET /v2/skill-templates/<id>`` +
+  ``GET /v2/mcp-templates/<id>`` through ``PuffoCoreHttpClient`` (no
+  new HTTP layer), writes each skill to
+  ``<agent_home>/.claude/skills/<id>/SKILL.md`` and each MCP entry into
+  ``<agent_home>/.claude.json#mcpServers[<id>]``. Per-harness routing:
+  claude installs both surfaces; codex skips skills with WARNING (no
+  skill model) and only installs stdio MCPs via PUF-266's
+  ``_emit_codex_mcp_block`` (sse / http rows skipped with WARNING).
+  Idempotent — existing entries are left untouched so host-sync or a
+  prior install owns them. Per-skill provenance marker
+  ``desired-installed.md`` distinguishes catalog installs from host-
+  synced / agent-installed surfaces so the host-sync pruner leaves
+  them alone. Template-id 404 or fetch failure → WARNING and spawn
+  continues. cli-docker + sdk + agent-core ``provisionAgentCore`` /
+  ``agentCore.createAgent`` paths silently drop the picks — flagged
+  follow-up.
+
+- **``install_host_mcp`` + ``sync_host_mcp`` puffo-core MCP tools
+  (cli-local only).** New runtime-callable tools so an agent that
+  needs a credential-bearing MCP (Gmail, Coinbase CDP docs, etc.) can
+  seed the operator's host ``~/.claude.json`` and then mirror the
+  populated entry back into its own ``.claude.json``.
+  ``install_host_mcp`` accepts either ``template_id`` (look up the
+  catalog) or an inline ``spec`` dict (transcribed from an MCP
+  package's README — supports ``stdio`` / ``sse`` / ``http``). On a
+  successful host write the daemon auto-DMs the operator a one-line
+  bold-stamped notice (``I just installed **<display_name>** into
+  your host ~/.claude.json as mcpServers[<id>]``); already-present
+  guard short-circuits without writing or DM'ing; DM failure surfaces
+  a retry payload to the agent. ``sync_host_mcp(template_id)`` copies
+  the populated host entry into the agent's per-agent
+  ``.claude.json`` so a follow-up ``refresh()`` picks it up. Plumbed
+  via ``PUFFO_HOST_HOME`` + ``PUFFO_OPERATOR_SLUG`` env injected from
+  the daemon's worker into the MCP subprocess.
+
+- **``use-host-mcp`` shared skill.** New entry in ``DEFAULT_SKILLS``
+  documenting the install → operator-acks → sync → refresh workflow
+  with both catalog and adhoc-spec examples (Coinbase CDP docs MCP).
+
+### Fixed
+
+- **Shared skills laid out as ``<id>/SKILL.md`` not flat ``<id>.md``.**
+  Claude Code's skill discovery wants a directory per skill with a
+  ``SKILL.md`` carrying YAML frontmatter. The previous flat layout was
+  silently dropped, so default skills appeared in the agent UI but
+  weren't loaded. ``shared_content`` now writes the subdir layout and
+  drops a ``.puffo-managed`` sentinel for prune-on-rename. Stale flat
+  ``.md`` siblings are removed on every daemon start.
+
+- **Shared skills also mirrored into codex's ``.agents/skills/``.**
+  Codex looks for skills at ``<HOME>/.agents/skills/<id>/SKILL.md``
+  (per ``developers.openai.com/codex/skills``). Same bodies, separate
+  tree; primer ``DEFAULT_SHARED_CLAUDE_MD`` model list corrected to
+  ``claude-opus-4-7`` / ``claude-sonnet-4-6`` / ``claude-haiku-4-5``.
+
+- **UI Skills tab scans every harness location.** Previously read only
+  ``<agent>/.claude/skills/``, missing the plugin tree
+  (``<HOME>/.claude/plugins/<plugin>/skills/``), workspace
+  (``<workspace>/.claude/skills/``), and codex's
+  ``<HOME>/.agents/skills/``. Now lists each scope as its own group so
+  operators can see exactly where each skill came from.
+
+- **UI MCP tab surfaces puffo's per-agent MCP.** puffo registers
+  itself at ``<agent>/mcp-config.json`` and is loaded via
+  ``--mcp-config`` rather than ``.claude.json``, so it was invisible
+  in the UI. Now shown under a ``[puffo]`` scope alongside the
+  ``.claude.json#mcpServers`` rows.
+
+- **``puffo-agent stop`` actually exits the process under ``--ui``.**
+  External ``puffo-agent stop`` writes the sentinel and the daemon
+  thread tears down, but the Qt event loop has no other reason to
+  quit so the OS process lingered and the ``stop`` command timed out
+  after 60s. ``MainWindow`` now runs a 500ms watchdog that calls
+  ``QApplication.quit()`` as soon as the daemon thread exits — covers
+  external-stop, window-close, and unhandled-crash exit paths
+  uniformly.
+
+- **Removed misleading ``fetch_channel_files`` MCP tool stub.** It
+  never wired up to anything but its presence in the tool list led
+  agents to call it; dropping the stub now so agents pick a real path.
+
 ## [0.10.0] — 2026-06-01
 
 ### Added
