@@ -100,7 +100,10 @@ def _scan_mcp_servers(
 
     out: list[tuple[str, str, dict]] = []
     if harness == "claude-code":
+        # Daemon-managed puffo MCP — registered via --mcp-config to
+        # claude-cli, so it never appears in .claude.json.
         json_sources = [
+            ("puffo",           agent_root / "mcp-config.json"),
             ("agent",           agent_root / ".claude.json"),
             ("host",            home / ".claude.json"),
             ("agent workspace", agent_root / "workspace" / ".mcp.json"),
