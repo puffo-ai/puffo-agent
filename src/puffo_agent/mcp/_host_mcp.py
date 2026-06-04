@@ -216,18 +216,11 @@ async def _install_host_mcp_impl(
 
     dm_body = _build_operator_dm_body(template, template_id, spec)
 
-    # No operator_slug → can't DM, hand the body back so the agent
-    # can find the operator some other way.
-    if not cfg.operator_slug:
-        return (
-            f"Installed {template_id!r} into host's ~/.claude.json. "
-            f"No operator_slug is configured on this MCP runtime, so "
-            f"I couldn't DM the setup steps automatically. Forward "
-            f"this to the operator yourself:\n\n---\n{dm_body}\n---"
-        )
-
     # Host write succeeded — try the auto-DM. On failure, return the
-    # body so the agent can retry via send_message.
+    # body so the agent can retry via send_message. operator_slug is
+    # set by the daemon at pairing time and is required at this point;
+    # if it ever isn't, the DM send below will fail and the retry
+    # branch surfaces a clear error.
     try:
         envelope_id = await _send_dm_to_operator(
             cfg, cfg.operator_slug, dm_body,
