@@ -600,22 +600,18 @@ DEFAULT_SKILL_USE_HOST_MCP = """\
 # Skill: use-host-mcp
 
 Use this when an MCP server you need requires credentials (OAuth
-tokens, API keys) the per-agent template can't carry — for example a
-`desired_mcp` that lists `GMAIL_REFRESH_TOKEN` or
-`GOOGLE_CALENDAR_CREDENTIALS_PATH` in its env with empty values, and
-calls to it fail at auth time.
+tokens, API keys) you can't provide yourself. Common cases:
 
-The workflow puts the operator in the loop exactly once (their OAuth
-runs in their own browser session on their host), then lets you pull
-the resulting populated config into your own agent on demand.
+1. A `desired_mcp` you were configured with has empty env values
+   (e.g. `GMAIL_REFRESH_TOKEN`, `CDP_API_KEY`) and calls to it fail
+   at auth time.
+2. The operator asked for capability X and you found an MCP package
+   for it on the web (Coinbase CDP MCP, GitHub MCP, a vendor's
+   docs page) that's NOT in puffo-server's catalog.
 
-## When to use
-
-- A `desired_mcp` you were configured with fails because its env
-  values are empty placeholders.
-- You need an MCP that exists in the puffo-server catalog (so
-  ``install_host_mcp`` can fetch its spec by template_id) but isn't
-  yet registered on your operator's host.
+Either way the path is the same: lay the spec down on host, the
+operator completes auth there, then you pull the populated config
+into your own agent.
 
 ## When NOT to use
 
@@ -626,31 +622,65 @@ the resulting populated config into your own agent on demand.
 
 ## Workflow
 
-### Step 1 — `install_host_mcp("<template_id>")`
+### Step 1 — `install_host_mcp(...)`
 
-Writes the catalog spec into `<operator_home>/.claude.json#mcpServers
-[<id>]` with placeholder env values AND auto-DMs the operator with
-the setup instructions (env vars / OAuth steps from the catalog
-description). You don't need to call `send_message` yourself — the
-tool does it.
+Two forms, pick whichever fits how you found the MCP:
 
-Read the tool's return value carefully — it reports the real outcome:
+**A. Catalog-driven** (operator-curated, ``desired_mcp`` lineage):
 
-- "Installed … AND DM'd @<operator>" — both side effects landed; wait
-  for the operator's ping, then jump to Step 2.
-- "already registered in host's ~/.claude.json — left untouched" —
-  no DM was sent (operator already configured it); jump to Step 2.
-- "Installed … BUT sending the setup-instructions DM … failed" —
-  host write landed but DM didn't. Retry by sending the message
-  body the tool returned via `mcp__puffo__send_message` yourself.
+```
+install_host_mcp(
+    name="gmail-read",
+    template_id="gmail-read",
+)
+```
+
+Looks up the spec from `/v2/mcp-templates/<template_id>` on
+puffo-server. `name` is the key under `mcpServers[<name>]` on host
+(usually matches `template_id`).
+
+**B. Adhoc** (transcribed from an MCP package's own README):
+
+```
+install_host_mcp(
+    name="coinbase-cdp",
+    spec={
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@coinbase/cdp-mcp"],
+        "env": {"CDP_API_KEY_NAME": "", "CDP_API_KEY_SECRET": ""},
+    },
+    operator_note="Setup docs: https://docs.cdp.coinbase.com/.../cdp-docs-mcp",
+)
+```
+
+Use empty strings for env values the operator needs to populate. The
+tool validates the shape (`type` ∈ {stdio, sse, http}, required
+fields per transport) and refuses malformed specs before touching
+disk.
+
+Either form auto-DMs the operator the setup steps once the host
+write succeeds — you don't manually `send_message`.
+
+Read the tool's return value carefully — it reports the real
+outcome:
+
+- "Installed `<name>` … AND DM'd @<operator>" — both side effects
+  landed; wait for the operator's ping, then jump to Step 2.
+- "`<name>` is already registered" — no DM was sent (operator already
+  configured it). Skip to Step 2.
+- "Installed `<name>` … BUT sending … DM … failed" — host write
+  landed but DM didn't. Retry by sending the message body the tool
+  returned via `mcp__puffo__send_message` yourself.
 - Tool raised an error before "Installed" — nothing was written and
-  no DM was sent; surface the error to the operator.
+  no DM was sent. Surface the error to the operator.
 
-### Step 2 — `sync_host_mcp("<template_id>")`
+### Step 2 — `sync_host_mcp("<name>")`
 
 Once the operator pings you back saying host setup is done, call
-this. It copies the populated entry (now carrying OAuth tokens / API
-keys) from `<operator_home>/.claude.json` into your own
+this with the **same `name`** you passed to `install_host_mcp`. It
+copies the populated entry (now carrying OAuth tokens / API keys)
+from `<operator_home>/.claude.json` into your own
 `<agent>/.claude.json`. The transfer is verbatim — what host has is
 what you get.
 
@@ -662,11 +692,16 @@ server. After this, calls to the MCP's tools should succeed.
 ## Errors
 
 - `install_host_mcp` → "catalog fetch failed for '<id>'" — the
-  template_id isn't in `/v2/mcp-templates/` on puffo-server; ask the
-  operator to seed it.
-- `install_host_mcp` → "unsupported transport" — the catalog row
-  needs fixing on the server side; not something you can patch.
-- `sync_host_mcp` → "no entry for '<id>' in host's ~/.claude.json"
+  `template_id` isn't in `/v2/mcp-templates/` on puffo-server; switch
+  to the adhoc form with `spec=...`, or ask the operator to seed the
+  catalog.
+- `install_host_mcp` → "spec.type must be one of [...]" / "spec.command
+  is required for stdio transport" / etc. — your adhoc spec is
+  malformed. Re-read the MCP's docs and pass `spec` with the right
+  shape.
+- `install_host_mcp` → "pass exactly one of `template_id` or `spec`"
+  — you set both or neither. Pick a form.
+- `sync_host_mcp` → "no entry for '<name>' in host's ~/.claude.json"
   — the operator hasn't finished setup yet (or skipped install).
   Re-DM them via `send_message`.
 - After `refresh()`, MCP calls still fail with auth — the host entry

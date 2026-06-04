@@ -77,21 +77,31 @@ def _spec_from_template(template: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _build_operator_dm_body(
-    template: dict[str, Any], template_id: str, spec: dict[str, Any],
+    *,
+    name: str,
+    display_name: str,
+    description: str,
+    spec: dict[str, Any],
+    operator_note: str = "",
 ) -> str:
     """Operator-facing DM body — describes what was just installed on
     their host and what env / OAuth they need to populate.
+
+    ``name`` is the mcpServers[<name>] key on host. ``display_name``
+    is what to show the operator in prose (may match name, or come
+    from the catalog row, or be a friendlier label the agent passed
+    in via the operator_note).
     """
-    name = template.get("name") or template_id
-    description = template.get("description") or ""
     env_map = spec.get("env") or {}
     missing = [k for k, v in env_map.items() if not str(v)]
     parts = [
-        f"I just installed {name} into your host ~/.claude.json as "
-        f"mcpServers[{template_id!r}].",
+        f"I just installed {display_name} into your host ~/.claude.json "
+        f"as mcpServers[{name!r}].",
     ]
     if description:
         parts.append(description)
+    if operator_note:
+        parts.append(operator_note)
     if missing:
         env_lines = "\n".join(f"  - {k}" for k in missing)
         parts.append(f"This MCP needs you to populate these env values:\n{env_lines}")
@@ -106,6 +116,52 @@ def _build_operator_dm_body(
         f"refresh — no further action needed from you."
     )
     return "\n\n".join(parts)
+
+
+_VALID_TRANSPORTS = {"stdio", "sse", "http"}
+
+
+def _validate_adhoc_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Coerce an agent-supplied spec into the on-disk
+    mcpServers[<id>] shape. Raises with a clear message on shape
+    issues so the agent sees what's wrong.
+    """
+    transport = str(spec.get("type") or "stdio").lower()
+    if transport not in _VALID_TRANSPORTS:
+        raise RuntimeError(
+            f"install_host_mcp: spec.type must be one of "
+            f"{sorted(_VALID_TRANSPORTS)}, got {transport!r}"
+        )
+    args_raw = spec.get("args") or []
+    env_raw = spec.get("env") or {}
+    if not isinstance(args_raw, list):
+        raise RuntimeError("install_host_mcp: spec.args must be a list of strings")
+    if not isinstance(env_raw, dict):
+        raise RuntimeError(
+            "install_host_mcp: spec.env must be an object mapping env "
+            "var name to string value (use empty string for placeholders)"
+        )
+    args_list = [str(a) for a in args_raw]
+    env_map = {str(k): str(v) for k, v in env_raw.items()}
+    if transport == "stdio":
+        command = spec.get("command")
+        if not isinstance(command, str) or not command:
+            raise RuntimeError(
+                "install_host_mcp: spec.command is required for stdio "
+                "transport"
+            )
+        return {
+            "type": "stdio",
+            "command": command,
+            "args": args_list,
+            "env": env_map,
+        }
+    url = spec.get("url")
+    if not isinstance(url, str) or not url:
+        raise RuntimeError(
+            f"install_host_mcp: spec.url is required for {transport!r} transport"
+        )
+    return {"type": transport, "url": url, "env": env_map}
 
 
 async def _send_dm_to_operator(
@@ -152,38 +208,59 @@ async def _send_dm_to_operator(
 
 
 async def _install_host_mcp_impl(
-    cfg: "PuffoCoreToolsConfig", template_id: str,
+    cfg: "PuffoCoreToolsConfig",
+    name: str,
+    spec: dict[str, Any] | None = None,
+    template_id: str = "",
+    operator_note: str = "",
 ) -> str:
     if not cfg.host_home:
         raise RuntimeError(
             "install_host_mcp unavailable — PUFFO_HOST_HOME not set "
             "on this MCP runtime (only cli-local supports host writes)."
         )
-    if not template_id or not isinstance(template_id, str):
-        raise RuntimeError("install_host_mcp: template_id is required")
+    if not name or not isinstance(name, str):
+        raise RuntimeError("install_host_mcp: name is required")
+    if bool(template_id) == bool(spec):
+        raise RuntimeError(
+            "install_host_mcp: pass exactly one of `template_id` (look "
+            "up from puffo-server catalog) or `spec` (inline MCP "
+            "config dict from the MCP's own docs)"
+        )
 
-    # Catalog fetch — failure here is before any side effect, so just
-    # surface to the agent as a tool error.
-    try:
-        template = await cfg.http_client.get(
-            f"/v2/mcp-templates/{template_id}"
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"install_host_mcp: catalog fetch failed for "
-            f"{template_id!r}: {exc}"
-        ) from exc
-    if not isinstance(template, dict):
-        raise RuntimeError(
-            f"install_host_mcp: catalog returned a non-object body "
-            f"for {template_id!r}"
-        )
-    spec = _spec_from_template(template)
-    if spec is None:
-        raise RuntimeError(
-            f"install_host_mcp: catalog entry for {template_id!r} has "
-            f"an unsupported transport or is missing a required field"
-        )
+    display_name = name
+    description = ""
+    if template_id:
+        # Catalog form: fetch + normalize. Failure here is pre-side
+        # effect so just surface to the agent.
+        try:
+            template = await cfg.http_client.get(
+                f"/v2/mcp-templates/{template_id}"
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"install_host_mcp: catalog fetch failed for "
+                f"{template_id!r}: {exc}"
+            ) from exc
+        if not isinstance(template, dict):
+            raise RuntimeError(
+                f"install_host_mcp: catalog returned a non-object body "
+                f"for {template_id!r}"
+            )
+        normalized = _spec_from_template(template)
+        if normalized is None:
+            raise RuntimeError(
+                f"install_host_mcp: catalog entry for {template_id!r} "
+                f"has an unsupported transport or is missing a "
+                f"required field"
+            )
+        spec_to_write = normalized
+        display_name = str(template.get("name") or name)
+        description = str(template.get("description") or "")
+    else:
+        # Adhoc form: agent supplied the spec inline (e.g. transcribed
+        # from an MCP package's own README). Validate shape only.
+        spec_to_write = _validate_adhoc_spec(spec or {})
 
     # Already-present guard. Host file is the source of truth — if it
     # has the entry we don't touch it AND we don't DM (operator
@@ -193,18 +270,18 @@ async def _install_host_mcp_impl(
     servers = data.get("mcpServers")
     if not isinstance(servers, dict):
         servers = {}
-    if template_id in servers:
+    if name in servers:
         return (
-            f"{template_id!r} is already registered in the host's "
+            f"{name!r} is already registered in the host's "
             f"~/.claude.json — left untouched. Call "
-            f"sync_host_mcp({template_id!r}) to pull the operator's "
+            f"sync_host_mcp({name!r}) to pull the operator's "
             f"populated entry into your own config."
         )
 
-    # Side effect: write the catalog spec to host's .claude.json. On
+    # Side effect: write the spec to host's .claude.json. On
     # failure, bail before attempting the DM — the operator has
     # nothing to act on if the file didn't change.
-    servers[template_id] = spec
+    servers[name] = spec_to_write
     data["mcpServers"] = servers
     try:
         _atomic_write_claude_json(host_claude_json, data)
@@ -214,7 +291,13 @@ async def _install_host_mcp_impl(
             f"~/.claude.json: {exc}"
         ) from exc
 
-    dm_body = _build_operator_dm_body(template, template_id, spec)
+    dm_body = _build_operator_dm_body(
+        name=name,
+        display_name=display_name,
+        description=description,
+        spec=spec_to_write,
+        operator_note=operator_note,
+    )
 
     # Host write succeeded — try the auto-DM. On failure, return the
     # body so the agent can retry via send_message. operator_slug is
@@ -227,7 +310,7 @@ async def _install_host_mcp_impl(
         )
     except Exception as exc:
         return (
-            f"Installed {template_id!r} into host's ~/.claude.json, "
+            f"Installed {name!r} into host's ~/.claude.json, "
             f"BUT sending the setup-instructions DM to "
             f"@{cfg.operator_slug} failed ({exc}). Retry by sending "
             f"this yourself:\n\n"
@@ -236,10 +319,10 @@ async def _install_host_mcp_impl(
         )
 
     return (
-        f"Installed {template_id!r} into host's ~/.claude.json AND "
+        f"Installed {name!r} into host's ~/.claude.json AND "
         f"DM'd @{cfg.operator_slug} the setup steps (envelope_id "
         f"{envelope_id}). They'll ping you when host setup is done; "
-        f"call sync_host_mcp({template_id!r}) then refresh()."
+        f"call sync_host_mcp({name!r}) then refresh()."
     )
 
 
