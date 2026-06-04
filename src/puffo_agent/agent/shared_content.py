@@ -167,8 +167,8 @@ below is the authoritative reference.
 - `reload_system_prompt()` — rebuild system prompt from disk +
   restart subprocess after editing profile/memory/CLAUDE.md.
 - `refresh(model=None)` — respawn subprocess; optional model switch.
-  Valid models: `claude-opus-4-7`, `claude-opus-4-6-1m` (1M
-  context), `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`.
+  Valid models: `claude-opus-4-7`, `claude-sonnet-4-6`,
+  `claude-haiku-4-5`.
 
 Use write tools with intent — proactive messages surprise people.
 Read tools are cheap.
@@ -727,24 +727,17 @@ def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
     return results
 
 
-def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
-    """Mirror ``shared/skills/<id>/SKILL.md`` into
-    ``<workspace>/.claude/skills/<id>/SKILL.md`` so Claude Code's
-    project-scope skill discovery picks them up. Always overwrites
-    managed skills so shared edits propagate on next worker restart.
-
-    Prunes stale entries: any flat ``<workspace>/.claude/skills/*.md``
-    (legacy layout from before SKILL.md subdirs) plus any subdir
-    carrying our ``.puffo-managed`` marker whose id isn't in the
-    current ``DEFAULT_SKILLS``. Operator-authored subdirs without the
-    marker are left alone.
+def _sync_shared_skills_to(src_root: Path, dst_root: Path) -> None:
+    """Mirror ``<src_root>/<id>/SKILL.md`` → ``<dst_root>/<id>/SKILL.md``
+    + stamp ``.puffo-managed`` marker. Prunes legacy flat ``*.md``
+    files at the top of ``dst_root`` plus any subdir carrying our
+    marker whose id isn't in ``DEFAULT_SKILLS``. Operator-authored
+    subdirs without the marker are untouched.
     """
     import shutil
-    src_root = shared_dir / "skills"
-    dst_root = workspace_dir / ".claude" / "skills"
     dst_root.mkdir(parents=True, exist_ok=True)
 
-    # 1. Legacy flat .md files written by the pre-SKILL.md layout.
+    # 1. Legacy flat .md files from the pre-SKILL.md layout.
     for path in dst_root.glob("*.md"):
         if path.is_file():
             try:
@@ -785,6 +778,31 @@ def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
         except OSError:
             # Non-fatal — skills are a nice-to-have.
             continue
+
+
+def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
+    """Mirror shared skills into the agent's workspace at the path
+    Claude Code's project-scope discovery walks
+    (``.claude/skills/<id>/SKILL.md``).
+    """
+    _sync_shared_skills_to(
+        shared_dir / "skills",
+        workspace_dir / ".claude" / "skills",
+    )
+
+
+def sync_shared_skills_codex(shared_dir: Path, workspace_dir: Path) -> None:
+    """Same as ``sync_shared_skills`` but for codex's project-scope
+    discovery path (``.agents/skills/<id>/SKILL.md``). Codex walks the
+    cwd → repo-root chain looking for this layout, then user-scope
+    ``$HOME/.agents/skills/``. We write project-scope so it parallels
+    Claude Code's setup. Frontmatter shape is identical between the
+    two CLIs, so the same SKILL.md bodies work in both.
+    """
+    _sync_shared_skills_to(
+        shared_dir / "skills",
+        workspace_dir / ".agents" / "skills",
+    )
 
 
 def read_shared_primer(shared_dir: Path) -> str:
@@ -887,11 +905,12 @@ def rebuild_agent_codex_md(
 
     Same content shape as ``rebuild_agent_claude_md`` (shared primer +
     agent profile + memory snapshot), targeting codex's instruction-
-    file path. codex has no equivalent of Claude Code's ``.skills/``
-    layout, so we skip the skills sync step — the primer carries the
-    same operator-facing platform guidance regardless of harness.
+    file path. Skill bodies mirror into ``workspace/.agents/skills/``
+    where codex's project-scope discovery walks; the SKILL.md +
+    frontmatter shape is identical to Claude Code's.
     """
     ensure_shared_primer(shared_dir)
+    sync_shared_skills_codex(shared_dir, workspace_dir)
     primer = read_shared_primer(shared_dir)
     try:
         profile_text = profile_path.read_text(encoding="utf-8")
