@@ -187,6 +187,11 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 data_service_url="http://host.docker.internal:63386",
                 runtime_kind="cli-docker",
                 harness=agent_cfg.runtime.harness,
+                # cli-docker doesn't get a host_home — the container
+                # has no path-bind to the operator's ~/.claude.json
+                # without an extra mount, and install_host_mcp is a
+                # claude-code (cli-local) flow today.
+                operator_slug=pc.operator_slug,
             )
         return adapter
 
@@ -232,6 +237,8 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 agent_id=agent_cfg.id,
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
+                host_home=str(Path.home()),
+                operator_slug=pc.operator_slug,
             )
         return adapter
 

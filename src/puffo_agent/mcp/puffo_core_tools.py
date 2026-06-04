@@ -28,6 +28,7 @@ from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
 from ..crypto.primitives import Ed25519KeyPair
 from .data_client import DataClient, DataNotFound
+from ._host_mcp import _install_host_mcp_impl, _sync_host_mcp_impl
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,16 @@ class PuffoCoreToolsConfig:
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,
     # no absolutes).
     workspace: Optional[str] = None
+    # Real operator home — install_host_mcp / sync_host_mcp read and
+    # write ``<host_home>/.claude.json``. Distinct from the agent's
+    # overridden HOME under cli-local.
+    host_home: Optional[str] = None
+    # Per-agent home root — sync_host_mcp writes the synced entry
+    # into ``<agent_home>/.claude.json``.
+    agent_home: Optional[str] = None
+    # Operator's puffo slug — the agent DMs them with install
+    # instructions after install_host_mcp succeeds.
+    operator_slug: Optional[str] = None
 
 
 async def _fetch_device_keys(
@@ -1037,4 +1048,36 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"{root_note}"
             f"{validate_note}"
         )
+
+    @mcp.tool()
+    async def install_host_mcp(template_id: str) -> str:
+        """Lay down a catalog MCP spec into the operator's host
+        ``~/.claude.json`` so they can complete OAuth / paste API keys
+        on their own claude session. Use this when a ``desired_mcp``
+        you need has empty env values and won't auth.
+
+        Returns the operator-facing setup steps. DM the result to your
+        operator (``@<operator-slug>``) so they can run the OAuth flow
+        on host, then call ``sync_host_mcp(template_id)`` once they
+        confirm.
+
+        NOT EXISTS-guarded: if the host already has an entry for this
+        id, the file is untouched and the tool tells you to skip to
+        sync_host_mcp.
+        """
+        return await _install_host_mcp_impl(cfg, template_id)
+
+    @mcp.tool()
+    async def sync_host_mcp(template_id: str) -> str:
+        """Copy the operator's ``~/.claude.json#mcpServers[<id>]``
+        entry into your own ``<agent>/.claude.json``. Pair with
+        ``install_host_mcp`` once the operator finishes OAuth on host,
+        then call ``refresh()`` so claude respawns and picks up the
+        new MCP.
+
+        If the host config doesn't have the entry yet, returns an
+        error asking you to call ``install_host_mcp`` first (and
+        relay the result to the operator).
+        """
+        return await _sync_host_mcp_impl(cfg, template_id)
 

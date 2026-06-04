@@ -169,6 +169,12 @@ below is the authoritative reference.
 - `refresh(model=None)` — respawn subprocess; optional model switch.
   Valid models: `claude-opus-4-7`, `claude-sonnet-4-6`,
   `claude-haiku-4-5`.
+- `install_host_mcp(template_id)` — lay a catalog MCP spec into the
+  operator's host `~/.claude.json` so they can complete OAuth there.
+  Pair with `sync_host_mcp` once they confirm. See the
+  `use-host-mcp` skill.
+- `sync_host_mcp(template_id)` — copy the operator's populated entry
+  from host into your own `.claude.json`. Pair with `refresh()`.
 
 Use write tools with intent — proactive messages surprise people.
 Read tools are cheap.
@@ -590,6 +596,89 @@ reach for `refresh` after `install_skill` / `install_mcp_server`.
 """
 
 
+DEFAULT_SKILL_USE_HOST_MCP = """\
+# Skill: use-host-mcp
+
+Use this when an MCP server you need requires credentials (OAuth
+tokens, API keys) the per-agent template can't carry — for example a
+`desired_mcp` that lists `GMAIL_REFRESH_TOKEN` or
+`GOOGLE_CALENDAR_CREDENTIALS_PATH` in its env with empty values, and
+calls to it fail at auth time.
+
+The workflow puts the operator in the loop exactly once (their OAuth
+runs in their own browser session on their host), then lets you pull
+the resulting populated config into your own agent on demand.
+
+## When to use
+
+- A `desired_mcp` you were configured with fails because its env
+  values are empty placeholders.
+- You need an MCP that exists in the puffo-server catalog (so
+  ``install_host_mcp`` can fetch its spec by template_id) but isn't
+  yet registered on your operator's host.
+
+## When NOT to use
+
+- The MCP has no env requirements — desired_install already wrote it
+  into your `.claude.json`; just call `refresh()` and try it.
+- The credential is already on host — skip Step 1 and go straight to
+  `sync_host_mcp`.
+
+## Workflow
+
+### Step 1 — `install_host_mcp("<template_id>")`
+
+Writes the catalog spec into `<operator_home>/.claude.json#mcpServers
+[<id>]` with placeholder env values. Returns a structured message
+addressed to your operator with the env keys they need to populate
+(or the OAuth steps the MCP package documents).
+
+If the host already has the entry → tool returns "already installed,
+skip to sync_host_mcp"; jump to Step 3.
+
+### Step 2 — DM the operator with the install steps
+
+Take the tool's return text verbatim and send it via:
+
+```
+mcp__puffo__send_message(
+    channel="@<operator-slug>",
+    text=<install_host_mcp's return value>,
+    is_visible_to_human=True,
+)
+```
+
+They'll run the OAuth / paste the keys on their host's own claude
+session, then ping you back when done.
+
+### Step 3 — `sync_host_mcp("<template_id>")`
+
+Copies the populated entry (now carrying OAuth tokens / API keys
+the operator just set up) from `<operator_home>/.claude.json` into
+your own `<agent>/.claude.json`. The transfer is verbatim — what host
+has is what you get.
+
+### Step 4 — `refresh()`
+
+Respawns your claude subprocess so it re-discovers the new MCP
+server. After this, calls to the MCP's tools should succeed.
+
+## Errors
+
+- `install_host_mcp` → "catalog fetch failed for '<id>'" — the
+  template_id isn't in `/v2/mcp-templates/` on puffo-server; ask the
+  operator to seed it.
+- `install_host_mcp` → "unsupported transport" — the catalog row
+  needs fixing on the server side; not something you can patch.
+- `sync_host_mcp` → "no entry for '<id>' in host's ~/.claude.json"
+  — operator hasn't finished Step 2 yet (or hasn't completed install
+  on host). Re-DM them.
+- After `refresh()`, MCP calls still fail with auth — the host entry
+  may still have empty env. Tell the operator and re-run Step 2 →
+  Step 3.
+"""
+
+
 # Each entry: skill id → (one-line description, body).
 # The description goes into the YAML frontmatter Claude Code reads
 # for skill discovery; the body is everything below the frontmatter.
@@ -629,6 +718,11 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "reload-system-prompt": (
         "Rebuild your system prompt from disk after editing profile/memory.",
         DEFAULT_SKILL_RELOAD,
+    ),
+    "use-host-mcp": (
+        "Bring an MCP that needs operator-side OAuth/credentials from "
+        "host into your own agent config.",
+        DEFAULT_SKILL_USE_HOST_MCP,
     ),
 }
 

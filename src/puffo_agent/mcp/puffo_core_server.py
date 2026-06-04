@@ -188,6 +188,12 @@ def build_server(
     # reader/writer regardless of where the MCP runs.
     data = DataClient(data_service_url, agent_id)
 
+    # Derive agent_home from workspace: workspace lives at
+    # ``<agent_home>/workspace``. Keep an explicit env override as a
+    # fallback for any future layout where workspace isn't a child.
+    agent_home = os.environ.get("PUFFO_AGENT_HOME", "") or str(
+        Path(workspace).parent
+    )
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
         device_id=device_id,
@@ -196,6 +202,9 @@ def build_server(
         data_client=data,
         space_id=space_id,
         workspace=workspace,
+        host_home=os.environ.get("PUFFO_HOST_HOME", "") or None,
+        agent_home=agent_home,
+        operator_slug=os.environ.get("PUFFO_OPERATOR_SLUG", "") or None,
     )
 
     mcp = FastMCP("puffo-core")

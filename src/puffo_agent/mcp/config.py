@@ -44,6 +44,8 @@ PUFFO_CORE_TOOL_NAMES = (
     "install_mcp_server",
     "uninstall_mcp_server",
     "list_mcp_servers",
+    "install_host_mcp",
+    "sync_host_mcp",
     "refresh",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(
@@ -225,6 +227,8 @@ def puffo_core_mcp_env(
     data_service_url: str = "http://127.0.0.1:63386",
     runtime_kind: str = "",
     harness: str = "",
+    host_home: str = "",
+    operator_slug: str = "",
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess.
 
@@ -256,6 +260,14 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
+    if host_home:
+        # The spawned MCP runs under the agent's HOME override
+        # (~/.puffo-agent/agents/<id>/), so it can't reach the real
+        # operator home via Path.home(). install_host_mcp / sync_host_mcp
+        # take this path to read+write the operator's ~/.claude.json.
+        env["PUFFO_HOST_HOME"] = host_home
+    if operator_slug:
+        env["PUFFO_OPERATOR_SLUG"] = operator_slug
     return env
 
 
