@@ -437,6 +437,66 @@ def test_list_mcp_servers_handles_multiple_versions(tmp_path):
     ]
 
 
+# ── codex harness routing ────────────────────────────────────────────────────
+
+
+def test_list_mcp_servers_codex_reads_config_toml(tmp_path):
+    """When harness=codex the listing pulls from
+    ``<home>/.codex/config.toml`` — NOT ``.claude.json``. That's the
+    file codex's CLI actually reads at boot, so it's the only honest
+    answer for ""what can my agent call right now?""."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True)
+    # Seed the wrong tree first — codex listing must IGNORE this.
+    home.mkdir()
+    (home / ".claude.json").write_text(
+        '{"mcpServers": {"red-herring": {"command": "x"}}}',
+        encoding="utf-8",
+    )
+    # The actual codex config — what should surface.
+    codex_dir = home / ".codex"
+    codex_dir.mkdir()
+    (codex_dir / "config.toml").write_text(
+        '[mcp_servers.coinbase-cdp]\n'
+        'command = "npx"\n'
+        'args = ["mcp-remote", "https://docs.cdp.coinbase.com/mcp"]\n'
+        '\n'
+        '[mcp_servers.puffo]\n'
+        'command = "python"\n'
+        'args = ["-m", "puffo_agent.mcp.puffo_core_server"]\n',
+        encoding="utf-8",
+    )
+    entries = _list_mcp_servers(workspace, home, harness="codex")
+    assert entries == [
+        ("system", "coinbase-cdp", ""),
+        ("system", "puffo", ""),
+    ]
+
+
+def test_list_mcp_servers_codex_empty_when_no_config_toml(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True)
+    assert _list_mcp_servers(workspace, home, harness="codex") == []
+
+
+def test_list_mcp_servers_default_harness_keeps_claude_behavior(tmp_path):
+    """Existing claude-code callers (harness omitted / empty string)
+    keep reading .claude.json — no regression."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    workspace.mkdir(parents=True)
+    home.mkdir()
+    (home / ".claude.json").write_text(
+        '{"mcpServers": {"gh": {"command": "x"}}}',
+        encoding="utf-8",
+    )
+    entries = _list_mcp_servers(workspace, home)
+    assert entries == [("system", "gh", "")]
+
+
 # ── refresh.flag ─────────────────────────────────────────────────────────────
 
 

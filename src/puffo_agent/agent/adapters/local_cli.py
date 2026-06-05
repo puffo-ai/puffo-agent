@@ -276,18 +276,25 @@ class LocalCLIAdapter(Adapter):
         await session.warm(system_prompt)
 
     async def reload(self, new_system_prompt: str) -> None:
-        """Drop cached runtime state so the next turn re-reads the
-        on-disk instructions (CLAUDE.md for claude-code, AGENTS.md for
-        codex). For claude-code we close the long-lived subprocess;
-        for codex we update the in-memory ``current_instructions``
-        which the next ``sendUserTurn`` carries through (and the
-        rewritten AGENTS.md catches new conversations on resume).
+        """Drop cached runtime state so the next turn re-reads
+        everything from disk — instructions (CLAUDE.md / AGENTS.md),
+        skills, AND config (.claude.json / .codex/config.toml).
+
+        For codex we drop the ``CodexSession`` cache entirely (not
+        just tear down its subprocess) so the next ``run_turn``
+        runs ``_ensure_codex_session`` again — that's where the host
+        ``~/.codex/config.toml`` → agent ``<agent_home>/.codex/
+        config.toml`` merge happens. Without dropping the cache the
+        merge would be skipped (the existing CodexSession returns
+        early at the ``is not None`` guard) and codex would respawn
+        reading the same stale agent config.
         """
         if self._session is not None:
             await self._session.aclose()
             self._session = None
         if self._codex_session is not None:
-            await self._codex_session.reload(new_system_prompt)
+            await self._codex_session.aclose()
+            self._codex_session = None
 
     async def aclose(self) -> None:
         if self._session is not None:

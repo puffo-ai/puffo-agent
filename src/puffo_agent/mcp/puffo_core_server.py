@@ -162,7 +162,7 @@ def _register_local_tools(
             registered the server (and ``claude /plugin uninstall``
             the right one if needed).
         """
-        entries = _list_mcp_servers(Path(workspace), Path.home())
+        entries = _list_mcp_servers(Path(workspace), Path.home(), harness)
         if not entries:
             return "(no MCP servers registered)"
         lines: list[str] = []

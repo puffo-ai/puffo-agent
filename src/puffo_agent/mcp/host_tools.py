@@ -285,22 +285,32 @@ def _uninstall_mcp_server(workspace: Path, name: str) -> Path:
 
 
 def _list_mcp_servers(
-    workspace: Path, home: Path,
+    workspace: Path, home: Path, harness: str = "",
 ) -> list[tuple[str, str, str]]:
     """Return ``[(scope, name, source), ...]`` for every MCP server
     the agent's runtime can reach.
 
-    Three scopes:
-      * ``"system"`` — user-installed via ``claude mcp add``, lives
+    Reads the file the agent's CLI actually loads at boot — codex
+    and claude-code store MCP config at different paths in different
+    shapes, so a harness-blind read would surface entries the agent
+    can't call (the historical bug: a codex agent listing the
+    operator's ``~/.claude.json#mcpServers`` as "system" even though
+    none of those were ever loaded into its codex session).
+
+    Three scopes apply to claude-code:
+      * ``"system"`` — installed via ``claude mcp add``, lives
         in ``<home>/.claude.json#mcpServers``. ``source`` is ``""``.
       * ``"agent"``  — project-scope, installed by the agent via
         ``install_mcp_server``, lives in
         ``<workspace>/.mcp.json#mcpServers``. ``source`` is ``""``.
       * ``"plugin"`` — provided by a ``claude /plugin install``-ed
-        plugin under ``<home>/.claude/plugins/cache/<plugin>/
-        <version>/.mcp.json``. ``source`` is the
-        ``"<plugin>/<version>"`` label so the operator can tell
-        which plugin owns it.
+        plugin; ``source`` is ``"<plugin>/<version>"``.
+
+    Codex has just one source: the merged
+    ``<home>/.codex/config.toml#[mcp_servers.*]`` (operator's
+    ``~/.codex/config.toml`` host MCPs + puffo-core +
+    desired_install MCPs all merged on every worker start). All
+    entries surface as ``"system"`` ; no plugin / project layering.
 
     Pre-existing 0.7.8 callers expected a 2-tuple — every callsite
     in this repo was updated in lockstep when this scope was
@@ -309,6 +319,10 @@ def _list_mcp_servers(
     that file, keep listing the rest).
     """
     out: list[tuple[str, str, str]] = []
+    if harness == "codex":
+        for name in sorted(_codex_mcp_server_names(home)):
+            out.append(("system", name, ""))
+        return out
     try:
         sys_data = _read_json_or_empty(_system_claude_json_path(home))
     except RuntimeError:
@@ -324,6 +338,31 @@ def _list_mcp_servers(
     for source, name in _plugin_mcp_entries(home):
         out.append(("plugin", name, source))
     return out
+
+
+def _codex_mcp_server_names(home: Path) -> list[str]:
+    """Names of every ``[mcp_servers.<name>]`` entry in the codex
+    config the agent's CLI is reading. Honours ``$CODEX_HOME``
+    (codex's own override). Returns ``[]`` on missing / unreadable /
+    malformed file — same defensive handling as
+    ``state.read_host_codex_mcp_servers``."""
+    import tomllib
+    codex_home_env = os.environ.get("CODEX_HOME")
+    codex_home = (
+        Path(codex_home_env) if codex_home_env else home / ".codex"
+    )
+    config_path = codex_home / "config.toml"
+    if not config_path.is_file():
+        return []
+    try:
+        with config_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        return []
+    raw = data.get("mcp_servers")
+    if not isinstance(raw, dict):
+        return []
+    return [name for name in raw.keys() if isinstance(name, str)]
 
 
 def _write_refresh_flag(workspace: Path, model: Optional[str]) -> Path:
