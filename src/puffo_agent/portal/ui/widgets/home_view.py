@@ -60,10 +60,16 @@ def _card() -> tuple[QFrame, QVBoxLayout]:
 class _CliCard(QFrame):
     """One card per CLI tool; the path hides behind a small triangle."""
 
-    def __init__(self, label: str, resolver: Callable[[], Optional[str]]) -> None:
+    def __init__(
+        self,
+        label: str,
+        resolver: Callable[[], Optional[str]],
+        cred_check: Optional[Callable[[], bool]] = None,
+    ) -> None:
         super().__init__()
         self.setObjectName("card")
         self._resolver = resolver
+        self._cred_check = cred_check
         self._coming_soon = False
 
         layout = QVBoxLayout(self)
@@ -130,18 +136,33 @@ class _CliCard(QFrame):
             path = self._resolver()
         except Exception:
             path = None
-        if path:
+        if not path:
+            self._dot.setStyleSheet("font-size: 14pt; color: #ef4444;")
+            self._status_label.setText("not installed")
+            self._status_label.setStyleSheet("color: #9ca3af; font-size: 9pt;")
+            self._path_label.setText("(not on PATH and no env override)")
+            return
+        # Installed — discriminate logged-in vs needs-login when a
+        # cred_check is supplied (cards without one are treated as ready).
+        has_cred = True
+        if self._cred_check is not None:
+            try:
+                has_cred = self._cred_check()
+            except Exception:
+                has_cred = False
+        if has_cred:
             self._dot.setStyleSheet("font-size: 14pt; color: #22c55e;")
-            self._status_label.setText("installed")
+            self._status_label.setText("ready")
             self._status_label.setStyleSheet(
                 "color: #16a34a; font-size: 9pt; font-weight: 500;"
             )
-            self._path_label.setText(path)
         else:
-            self._dot.setStyleSheet("font-size: 14pt; color: #ef4444;")
-            self._status_label.setText("not found")
-            self._status_label.setStyleSheet("color: #9ca3af; font-size: 9pt;")
-            self._path_label.setText("(not on PATH and no env override)")
+            self._dot.setStyleSheet("font-size: 14pt; color: #f59e0b;")
+            self._status_label.setText("need log in")
+            self._status_label.setStyleSheet(
+                "color: #d97706; font-size: 9pt; font-weight: 500;"
+            )
+        self._path_label.setText(path)
 
     def _on_toggled(self, checked: bool) -> None:
         self._toggle.setText("▾" if checked else "▸")
@@ -198,16 +219,21 @@ class HomeView(QWidget):
         outer.addWidget(bridge_card)
 
         # AI tool cards
-        from ....agent.cli_bin import resolve_claude_bin, resolve_codex_bin
-        cli_specs: list[tuple[str, Callable[[], Optional[str]]]] = [
-            ("Claude Code", resolve_claude_bin),
-            ("Codex",       resolve_codex_bin),
+        from ....agent.cli_bin import (
+            claude_has_credentials,
+            codex_has_credentials,
+            resolve_claude_bin,
+            resolve_codex_bin,
+        )
+        cli_specs: list[tuple[str, Callable[[], Optional[str]], Optional[Callable[[], bool]]]] = [
+            ("Claude Code", resolve_claude_bin, claude_has_credentials),
+            ("Codex",       resolve_codex_bin,  codex_has_credentials),
         ]
         cli_grid = QHBoxLayout()
         cli_grid.setSpacing(12)
         self._cli_cards: list[_CliCard] = []
-        for label, resolver in cli_specs:
-            card = _CliCard(label, resolver)
+        for label, resolver, cred_check in cli_specs:
+            card = _CliCard(label, resolver, cred_check)
             self._cli_cards.append(card)
             cli_grid.addWidget(card, stretch=1)
         hermes_card = _CliCard("Hermes", lambda: None)

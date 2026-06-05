@@ -363,6 +363,7 @@ def _build_puffo_core_client(
         workspace=str(agent_cfg.resolve_workspace_dir()),
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
+        agent_created_at=agent_cfg.created_at,
     )
 
 
@@ -570,6 +571,55 @@ class Worker:
             "agent %s: credential-refresh-success; "
             "runtime.health cleared from auth_failed back to ok",
             agent_id,
+        )
+
+    @staticmethod
+    def _flip_health_in_progress(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """Override any sticky red with ``in_progress`` at batch-top."""
+        if runtime.health == "in_progress":
+            return
+        runtime.health = "in_progress"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info("agent %s: runtime.health → in_progress", agent_id)
+
+    @staticmethod
+    def _resolve_health_on_success(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """Transition ``in_progress`` → ``ok``; skip any in-turn red."""
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info("agent %s: runtime.health in_progress → ok", agent_id)
+
+    @staticmethod
+    def _fallback_unhandled_error_if_stuck_in_progress(
+        runtime: "RuntimeState",
+        agent_id: str,
+        turn_error: str | None,
+        log: logging.Logger,
+    ) -> None:
+        """``in_progress`` → ``unhandled_error`` when a non-retry-able
+        exception left the flip stuck. Distinct from ``unknown`` so the
+        CLI / heartbeat can surface it.
+        """
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "unhandled_error"
+        runtime.error = turn_error or "turn raised; no category red set"
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: runtime.health → unhandled_error (%s)",
+            agent_id, runtime.error,
         )
 
     def __init__(
@@ -878,6 +928,13 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
+            try:
+                Worker._flip_health_in_progress(self.runtime, agent_id, logger)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: _flip_health_in_progress failed: %s",
+                    agent_id, exc,
+                )
             # Server-side processing-run + status transitions.
             # Reporter swallows network errors so a flaky status push
             # never blocks the actual reply.
@@ -887,6 +944,7 @@ class Worker:
                 else None
             )
             turn_succeeded = True
+            turn_will_retry = False
             turn_error: str | None = None
             try:
                 reply = await puffo.handle_message_batch(
@@ -901,6 +959,7 @@ class Worker:
                 logger.warning("agent %s: api-error retry: %s", agent_id, exc)
                 reply = None
                 turn_succeeded = False
+                turn_will_retry = True
                 turn_error = "API Error"
                 raise
             except Exception as exc:
@@ -934,6 +993,27 @@ class Worker:
                             "error_text": turn_error,
                         })
                     await reporter.end_turn_batch(runs)
+                # AgentAPIError leaves in_progress for next batch's flip.
+                if turn_succeeded:
+                    try:
+                        Worker._resolve_health_on_success(
+                            self.runtime, agent_id, logger,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "agent %s: _resolve_health_on_success failed: %s",
+                            agent_id, exc,
+                        )
+                elif not turn_will_retry:
+                    try:
+                        Worker._fallback_unhandled_error_if_stuck_in_progress(
+                            self.runtime, agent_id, turn_error, logger,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "agent %s: in_progress backstop failed: %s",
+                            agent_id, exc,
+                        )
                 # Clear turn context so post-turn background work
                 # doesn't inherit a stale channel/root. Hook
                 # fails-open when the file is absent.
@@ -1052,6 +1132,10 @@ class Worker:
             Worker._clear_api_error_abandoned_if_recoverable(
                 self.runtime, agent_id, root_id, logger,
             )
+            # retry-success path bypasses on_message_batch's finally.
+            Worker._resolve_health_on_success(
+                self.runtime, agent_id, logger,
+            )
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
@@ -1070,7 +1154,15 @@ class Worker:
         # Server-side status reporter: own heartbeat task; begin_turn /
         # end_turn fire inline from on_message via this closure. Falls
         # back to a no-op when the client has no http client (tests).
-        reporter = StatusReporter(client.http) if hasattr(client, "http") else None
+        # Lazy provider so each heartbeat reads live runtime.health.
+        reporter = (
+            StatusReporter(
+                client.http,
+                runtime_health_provider=lambda: self.runtime.health,
+            )
+            if hasattr(client, "http")
+            else None
+        )
         if reporter is None:  # pragma: no cover — defensive
             class _NoopReporter:
                 async def begin_turn(self, _mid):

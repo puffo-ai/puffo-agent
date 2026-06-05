@@ -100,7 +100,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   never wired up to anything but its presence in the tool list led
   agents to call it; dropping the stub now so agents pick a real path.
 
-## [0.10.0] — 2026-06-01
+## [0.10.0] — 2026-06-03
 
 ### Added
 
@@ -147,6 +147,56 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 - **Export bundle suffix is ``.puffoagent``** (no hyphen) — matches
   the wire format. UI Import + Export file dialogs use the same
   extension so the round-trip lines up.
+
+- **PUF-270: ``runtime.health = "in_progress"`` overrides sticky reds
+  while a turn is mid-flight.** Operators reported agents with a stale
+  ``auth_failed`` / ``api_error_abandoned`` / ``refresh_broken`` on
+  disk looking dead in ``puffoagent agent list`` even when actively
+  processing a new message. ``on_message_batch`` now flips
+  ``runtime.health`` to ``in_progress`` at the top of every batch and
+  resolves to ``ok`` on success; in-turn category reds (set inside
+  the turn body) still survive the resolve. The
+  ``AgentAPIError → consumer kick-retry → on_turn_success`` chain
+  also resolves cleanly. Non-AgentAPIError exceptions that escape the
+  handler fall back to a new red ``unhandled_error`` (distinct from
+  ``unknown`` = not probed yet) so the CLI surfaces them as
+  actionable. The heartbeat carries both per-turn ``status`` and
+  persistent ``health`` so the server can render the alive-vs-red
+  discrimination. ``CredentialRefresher`` skips agents in
+  ``in_progress`` / ``unhandled_error`` to avoid clobbering them with
+  ``refresh_broken``.
+
+- **PUF-267: codex agents auto-rotate the underlying thread instead of
+  silently wedging.** ``CodexSession`` previously reused one
+  ``threadId`` for the agent's life; when codex returned
+  ``"agent thread limit reached"`` or the thread silently stopped
+  streaming (repeated ``turn/failed`` / turn timeouts), every
+  subsequent turn hit the same dead thread while ``runtime.health``
+  stayed ``ok``. New ``_propagate_turn_outcome`` runs after each turn:
+  ``CODEX_THREAD_WEDGED_THRESHOLD = 2`` consecutive non-success
+  outcomes OR the verbatim thread-limit error clears
+  ``_conversation_id`` (in-memory + on-disk) so the next
+  ``_ensure_running`` starts a fresh thread, and the per-agent
+  ``runtime.health`` flips to ``codex_thread_wedged`` (surfaced in
+  ``agent list``). Recovery is automatic on the next inbound message.
+  ``auth_failed`` / ``api_error_abandoned`` / ``refresh_broken`` are
+  not overwritten; ``in_progress`` and ``unhandled_error`` are (the
+  codex-specific value carries more operator-actionable detail).
+  Always-clear-on-success guards the daemon-restart-with-stale-disk
+  path. ``_CODEX_THREAD_LIMIT_PATTERNS`` is a tuple so a future
+  "thread is dead" surface adds one regex.
+
+- **PUF-272: invite-poll cadence is two-phase for the first 5 minutes
+  of an agent's life.** ``_invite_poll_loop`` previously ticked every
+  30s for the agent's whole lifetime, which left a freshly created
+  agent waiting up to 30s for the first inviter ACK during the
+  high-attention moment right after ``puffoagent agent create``. The
+  loop now ticks at 10s while ``time.time() - AgentConfig.created_at <
+  300`` and at 30s after — wall-clock based, so a daemon restart of
+  a young agent re-enters the fast phase (agent age, not worker
+  uptime). Legacy agents written before ``AgentConfig.created_at``
+  (``created_at == 0``) stay on 30s from the start so the rollout
+  doesn't burst-spike server load.
 
 ## [0.9.6] — 2026-06-01
 

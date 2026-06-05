@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable, Optional
 
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 
@@ -46,11 +46,14 @@ class StatusReporter:
         http: PuffoCoreHttpClient,
         *,
         heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
+        runtime_health_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         self._http = http
         self._interval = max(10.0, heartbeat_interval_s)
         self._current_status: str = "idle"
         self._current_message_id: str | None = None
+        # None keeps the legacy single-stream wire shape.
+        self._runtime_health_provider = runtime_health_provider
         self._stop = asyncio.Event()
 
     async def run_heartbeat_loop(self) -> None:
@@ -195,6 +198,11 @@ class StatusReporter:
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
+        if self._runtime_health_provider is not None:
+            try:
+                body["health"] = self._runtime_health_provider()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("runtime_health_provider raised (%s)", exc)
         try:
             await self._http.post("/agents/me/heartbeat", body)
         except HttpError as exc:

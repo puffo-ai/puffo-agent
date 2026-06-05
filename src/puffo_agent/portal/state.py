@@ -1153,6 +1153,8 @@ class RuntimeState:
     #   "ok"                  — refresh-ping passed, a turn cleared a
     #                           prior abandon, or a credential refresh
     #                           cleared a prior auth_failed
+    #   "in_progress"         — turn mid-flight; overrides any sticky
+    #                           red so the UI reads alive
     #   "auth_failed"         — adapter saw 401 / authentication_error
     #                           (set in worker._handle_suppressed_reply);
     #                           cleared by the CredentialRefresher's
@@ -1165,8 +1167,18 @@ class RuntimeState:
     #                           refresh outcomes; cleared by next
     #                           REFRESHED. Does not overwrite the two
     #                           stronger downstream signals above.
+    #   "unhandled_error"     — non-AgentAPIError raised in the turn and
+    #                           no category red was set; cleared by
+    #                           next successful turn
+    #   "codex_thread_wedged" — codex thread rotated after N consecutive
+    #                           turn timeouts/failures OR the verbatim
+    #                           "agent thread limit reached" error.
+    #                           Auto-recovers on next inbound message;
+    #                           cleared on next successful turn. Does
+    #                           NOT overwrite the stronger downstream
+    #                           signals above.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | auth_failed | api_error_abandoned | refresh_broken | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> "RuntimeState | None":

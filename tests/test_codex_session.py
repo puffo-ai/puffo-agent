@@ -30,6 +30,7 @@ import json
 import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -535,3 +536,69 @@ def test_reload_tears_down_process_for_respawn(tmp_path):
     # Returncode populates synchronously after _teardown_locked
     # awaits the proc's exit.
     assert proc_before.returncode is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Teardown — stdin close → graceful exit (no TerminateProcess)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+_GRACEFUL_TEARDOWN_SCRIPT = '''\
+import sys
+
+absorb_initialize()
+msg = r()  # thread/start
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        sys.exit(0)
+'''
+
+
+def test_aclose_closes_stdin_and_subprocess_self_exits(tmp_path):
+    """aclose must close stdin so the subprocess sees EOF and Drops its
+    own resources, NOT bypass via TerminateProcess."""
+    fake = _write_fake(tmp_path, _GRACEFUL_TEARDOWN_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-teardown-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        await cs.aclose()
+
+    asyncio.run(_run())
+
+
+def test_aclose_falls_back_to_terminate_if_subprocess_ignores_eof(tmp_path):
+    """Misbehaving server that ignores EOF must not pin the archive
+    path; aclose escalates within bounded time."""
+    fake = _write_fake(tmp_path, '''\
+import time
+
+absorb_initialize()
+msg = r()  # thread/start
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+while True:
+    time.sleep(0.5)
+''')
+    cs = CodexSession(
+        agent_id="alice-teardown-stubborn-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        t0 = time.monotonic()
+        await cs.aclose()
+        return time.monotonic() - t0
+
+    # 10s graceful + 3s terminate window + slack for slow CI.
+    elapsed = asyncio.run(_run())
+    assert elapsed < 20.0, f"aclose hung for {elapsed:.1f}s"

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -137,3 +138,31 @@ def _hermes_bundle_paths() -> list[Path]:
 
 def _expand(*paths: str) -> list[Path]:
     return [Path(os.path.expandvars(p)).expanduser() for p in paths]
+
+
+# ── Credential presence (UI status discrimination) ───────────────────
+
+
+def claude_has_credentials(home: Path | None = None) -> bool:
+    """True if Claude OAuth credentials exist on this host. On macOS
+    the canonical store is the ``Claude Code-credentials`` Keychain
+    entry; on Linux/Windows it's ``~/.claude/.credentials.json``."""
+    h = home if home is not None else Path.home()
+    if (h / ".claude" / ".credentials.json").exists():
+        return True
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+                capture_output=True, timeout=2,
+            )
+            return r.returncode == 0
+        except Exception:
+            return False
+    return False
+
+
+def codex_has_credentials(home: Path | None = None) -> bool:
+    """True if Codex OAuth credentials exist at ``~/.codex/auth.json``."""
+    h = home if home is not None else Path.home()
+    return (h / ".codex" / "auth.json").exists()
