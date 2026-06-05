@@ -776,6 +776,21 @@ class DataServiceConfig:
 
 
 @dataclass
+class RpcServiceConfig:
+    """Loopback HTTP service the puffo-core MCP subprocess calls
+    when an agent triggers an op that requires daemon mediation
+    (today: install_host_mcp / sync_host_mcp — touching operator's
+    ``~/.claude.json``, which cli-docker can't reach in-process
+    and which we keep single-writer for cli-local too). cli-docker
+    reaches us via ``host.docker.internal:<port>`` — Docker Desktop
+    routes that back to the host loopback, so ``127.0.0.1`` bind
+    works for both runtimes. See ``portal/rpc_service.py``."""
+    enabled: bool = True
+    bind_host: str = "127.0.0.1"
+    port: int = 63385
+
+
+@dataclass
 class BridgeConfig:
     """Local HTTP API for the puffo web/desktop client. Loopback only;
     auth uses the same ed25519 request-signing scheme as puffo-server.
@@ -832,6 +847,9 @@ class DaemonConfig:
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
     )
+    rpc_service: "RpcServiceConfig" = field(
+        default_factory=lambda: RpcServiceConfig(),
+    )
 
     @classmethod
     def load(cls) -> "DaemonConfig":
@@ -874,6 +892,13 @@ class DaemonConfig:
             bind_host=str(d.get("bind_host", ds_defaults.bind_host)),
             port=int(d.get("port", ds_defaults.port)),
         )
+        r = raw.get("rpc_service") or {}
+        rs_defaults = RpcServiceConfig()
+        cfg.rpc_service = RpcServiceConfig(
+            enabled=bool(r.get("enabled", rs_defaults.enabled)),
+            bind_host=str(r.get("bind_host", rs_defaults.bind_host)),
+            port=int(r.get("port", rs_defaults.port)),
+        )
         return cfg
 
     def save(self) -> None:
@@ -893,6 +918,7 @@ class DaemonConfig:
             "google": asdict(self.google),
             "bridge": asdict(self.bridge),
             "data_service": asdict(self.data_service),
+            "rpc_service": asdict(self.rpc_service),
         }
         _atomic_write_yaml(path, data)
 

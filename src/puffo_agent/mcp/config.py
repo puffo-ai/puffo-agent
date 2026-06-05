@@ -225,18 +225,19 @@ def puffo_core_mcp_env(
     workspace: str,
     agent_id: str = "",
     data_service_url: str = "http://127.0.0.1:63386",
+    rpc_url: str = "http://127.0.0.1:63385",
     runtime_kind: str = "",
     harness: str = "",
-    host_home: str = "",
-    operator_slug: str = "",
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess.
 
-    ``data_service_url`` defaults to the daemon's loopback data
-    service (port 63386). cli-docker rewrites it to
-    ``http://host.docker.internal:63386`` so the container can
-    reach the host loopback. The MCP never opens ``messages.db``
-    directly — the daemon is the sole owner.
+    ``data_service_url`` / ``rpc_url`` default to the daemon's
+    loopback ports (data-service 63386, rpc-service 63385).
+    cli-docker rewrites both to ``host.docker.internal:<port>`` so
+    the container can reach the host loopback. The MCP never
+    opens ``messages.db`` directly and never touches the
+    operator's ``~/.claude.json`` directly — the daemon is the
+    sole owner of both.
     """
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
@@ -245,6 +246,7 @@ def puffo_core_mcp_env(
         "PUFFO_CORE_KEYSTORE_DIR": keystore_dir,
         "PUFFO_WORKSPACE": workspace,
         "PUFFO_DATA_SERVICE_URL": data_service_url,
+        "PUFFO_RPC_URL": rpc_url,
         # See ``_python_user_base_env`` — pins user-site to the
         # daemon's real base so the per-agent HOME override the
         # cli-local adapter applies doesn't hide ``mcp`` from the
@@ -260,14 +262,6 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
-    if host_home:
-        # The spawned MCP runs under the agent's HOME override
-        # (~/.puffo-agent/agents/<id>/), so it can't reach the real
-        # operator home via Path.home(). install_host_mcp / sync_host_mcp
-        # take this path to read+write the operator's ~/.claude.json.
-        env["PUFFO_HOST_HOME"] = host_home
-    if operator_slug:
-        env["PUFFO_OPERATOR_SLUG"] = operator_slug
     return env
 
 

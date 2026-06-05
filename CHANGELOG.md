@@ -31,10 +31,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   follow-up.
 
 - **``install_host_mcp`` + ``sync_host_mcp`` puffo-core MCP tools
-  (cli-local only).** New runtime-callable tools so an agent that
-  needs a credential-bearing MCP (Gmail, Coinbase CDP docs, etc.) can
-  seed the operator's host ``~/.claude.json`` and then mirror the
-  populated entry back into its own ``.claude.json``.
+  (cli-local + cli-docker).** New runtime-callable tools so an agent
+  that needs a credential-bearing MCP (Gmail, Coinbase CDP docs,
+  etc.) can seed the operator's host ``~/.claude.json`` and then
+  mirror the populated entry back into its own ``.claude.json``.
   ``install_host_mcp`` accepts either ``template_id`` (look up the
   catalog) or an inline ``spec`` dict (transcribed from an MCP
   package's README — supports ``stdio`` / ``sse`` / ``http``). On a
@@ -45,8 +45,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   a retry payload to the agent. ``sync_host_mcp(template_id)`` copies
   the populated host entry into the agent's per-agent
   ``.claude.json`` so a follow-up ``refresh()`` picks it up. Plumbed
-  via ``PUFFO_HOST_HOME`` + ``PUFFO_OPERATOR_SLUG`` env injected from
-  the daemon's worker into the MCP subprocess.
+  Both tools route through a new loopback HTTP service —
+  ``portal.rpc_service`` on port 63385 — so the daemon (not the MCP
+  subprocess) is the sole writer to operator's ``~/.claude.json``,
+  and cli-docker reaches the same handler via Docker's
+  ``host.docker.internal`` alias. One install/sync code path covers
+  both runtimes; no per-runtime fork inside the tool body. Envs
+  injected: ``PUFFO_RPC_URL`` (added) — ``PUFFO_HOST_HOME`` /
+  ``PUFFO_OPERATOR_SLUG`` no longer needed and removed.
 
 - **``use-host-mcp`` shared skill.** New entry in ``DEFAULT_SKILLS``
   documenting the install → operator-acks → sync → refresh workflow

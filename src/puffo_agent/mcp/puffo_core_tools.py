@@ -28,7 +28,7 @@ from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
 from ..crypto.primitives import Ed25519KeyPair
 from .data_client import DataClient, DataNotFound
-from ._host_mcp import _install_host_mcp_impl, _sync_host_mcp_impl
+from ._host_mcp import PuffoRpcClient
 
 logger = logging.getLogger(__name__)
 
@@ -82,16 +82,12 @@ class PuffoCoreToolsConfig:
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,
     # no absolutes).
     workspace: Optional[str] = None
-    # Real operator home — install_host_mcp / sync_host_mcp read and
-    # write ``<host_home>/.claude.json``. Distinct from the agent's
-    # overridden HOME under cli-local.
-    host_home: Optional[str] = None
-    # Per-agent home root — sync_host_mcp writes the synced entry
-    # into ``<agent_home>/.claude.json``.
-    agent_home: Optional[str] = None
-    # Operator's puffo slug — the agent DMs them with install
-    # instructions after install_host_mcp succeeds.
-    operator_slug: Optional[str] = None
+    # Loopback RPC client to the daemon's ``rpc_service`` —
+    # ``install_host_mcp`` and ``sync_host_mcp`` tool bodies POST
+    # through it instead of touching the operator's filesystem
+    # in-process. ``None`` when ``PUFFO_RPC_URL`` isn't set, in
+    # which case the tool bodies surface a clear error to the agent.
+    rpc_client: Optional[PuffoRpcClient] = None
 
 
 async def _fetch_device_keys(
@@ -1091,8 +1087,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
           - host write succeeds + DM fails → returns the prebuilt body
             so you can retry via ``send_message`` yourself.
         """
-        return await _install_host_mcp_impl(
-            cfg, name=name, spec=spec, template_id=template_id,
+        if cfg.rpc_client is None:
+            raise RuntimeError(
+                "install_host_mcp unavailable — PUFFO_RPC_URL not set "
+                "on this MCP runtime, so the puffo-agent daemon's "
+                "rpc_service isn't reachable."
+            )
+        return await cfg.rpc_client.install_mcp(
+            name=name, template_id=template_id, spec=spec,
         )
 
     @mcp.tool()
@@ -1107,5 +1109,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         error asking you to call ``install_host_mcp`` first (and
         relay the result to the operator).
         """
-        return await _sync_host_mcp_impl(cfg, template_id)
+        if cfg.rpc_client is None:
+            raise RuntimeError(
+                "sync_host_mcp unavailable — PUFFO_RPC_URL not set "
+                "on this MCP runtime, so the puffo-agent daemon's "
+                "rpc_service isn't reachable."
+            )
+        return await cfg.rpc_client.sync_mcp(template_id=template_id)
 
