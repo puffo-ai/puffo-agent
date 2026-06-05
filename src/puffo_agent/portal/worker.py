@@ -22,6 +22,8 @@ from typing import Callable, Optional
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
+from .runtime_matrix import RUNTIME_WS_LOCAL
+from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
     looks_like_managed_claude_md,
     rebuild_agent_claude_md,
@@ -620,9 +622,13 @@ class Worker:
         agent_cfg: AgentConfig,
         *,
         notify_refresh_needed: Optional[Callable[[], None]] = None,
+        ws_local_hub=None,
     ):
         self.daemon_cfg = daemon_cfg
         self.agent_cfg = agent_cfg
+        # Set for ws-local agents; the Worker idles and registers an
+        # attach point instead of running a harness consumer.
+        self._ws_local_hub = ws_local_hub
         # PUF-221: daemon-owned CredentialRefresher hook. Fired from
         # the auth-class leak branch in _handle_suppressed_reply so a
         # 401 surfacing in a reply short-circuits the daemon's 2-min
@@ -722,7 +728,59 @@ class Worker:
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
+    async def _run_ws_local(self) -> None:
+        """ws-local agents run no harness consumer. Build the client,
+        register an attach point, and idle — the bridge's /v1/ws-local
+        route brings the agent online when a tool connects."""
+        agent_id = self.agent_cfg.id
+        try:
+            if not self.agent_cfg.puffo_core.is_configured():
+                raise RuntimeError(
+                    f"agent {agent_id!r}: puffo_core block in agent.yml is incomplete"
+                )
+            client = _build_puffo_core_client(
+                self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
+            )
+            self._client = client
+            reporter = StatusReporter(
+                client.http,
+                runtime_health_provider=lambda: self.runtime.health,
+            )
+            point = AttachPoint(
+                slug=self.agent_cfg.puffo_core.slug,
+                agent_id=agent_id,
+                agent_cfg=self.agent_cfg,
+                client=client,
+                reporter=reporter,
+                ack_timeout_s=180.0,
+                ping_interval_s=30.0,
+            )
+        except Exception as e:
+            logger.error("agent %s: ws-local init failed: %s", agent_id, e, exc_info=True)
+            self.runtime.status = "error"
+            self.runtime.error = str(e)
+            self.runtime.save(agent_id)
+            self._warm_done.set()
+            return
+
+        self.runtime.status = "running"
+        self.runtime.save(agent_id)
+        self._warm_done.set()
+        if self._ws_local_hub is not None:
+            self._ws_local_hub.register(point)
+        logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
+        try:
+            await self._stop.wait()
+        finally:
+            if self._ws_local_hub is not None:
+                self._ws_local_hub.unregister(point)
+            self.runtime.status = "stopped"
+            self.runtime.save(agent_id)
+
     async def _run(self) -> None:
+        if (self.agent_cfg.runtime.kind or "") == RUNTIME_WS_LOCAL:
+            await self._run_ws_local()
+            return
         agent_id = self.agent_cfg.id
         try:
             self._adapter = build_adapter(self.daemon_cfg, self.agent_cfg)

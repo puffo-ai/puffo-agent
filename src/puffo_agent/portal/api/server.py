@@ -12,6 +12,7 @@ import logging
 from aiohttp import web
 
 from ..state import BridgeConfig
+from ..ws_local.route import WS_LOCAL_PATH, handle_ws_local
 from .auth import make_auth_middleware
 from .cors import make_cors_middleware
 from . import handlers as h
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 BRIDGE_MAX_REQUEST_BYTES = 64 * 1024 * 1024
 
 
-def build_app(cfg: BridgeConfig) -> web.Application:
+def build_app(cfg: BridgeConfig, ws_local_hub=None) -> web.Application:
     app = web.Application(
         middlewares=[
             make_cors_middleware(cfg),
@@ -34,6 +35,9 @@ def build_app(cfg: BridgeConfig) -> web.Application:
         ],
         client_max_size=BRIDGE_MAX_REQUEST_BYTES,
     )
+    # ws-local tools attach here; None when no ws-local agent is loaded.
+    app["ws_local_hub"] = ws_local_hub
+    app.router.add_get(WS_LOCAL_PATH, handle_ws_local)
     app.router.add_get("/v1/info", h.info)
     app.router.add_post("/v1/pair", h.pair)
     app.router.add_delete("/v1/pairing", h.disconnect)
@@ -58,13 +62,13 @@ def build_app(cfg: BridgeConfig) -> web.Application:
     return app
 
 
-async def start_api_server(cfg: BridgeConfig) -> web.AppRunner | None:
+async def start_api_server(cfg: BridgeConfig, ws_local_hub=None) -> web.AppRunner | None:
     """Start the bridge HTTP server. Returns the runner for cleanup,
     or None when disabled in daemon.yml."""
     if not cfg.enabled:
         logger.info("bridge: disabled in daemon.yml; not starting")
         return None
-    app = build_app(cfg)
+    app = build_app(cfg, ws_local_hub=ws_local_hub)
     # Route aiohttp access log through the daemon logger.
     access_logger = logging.getLogger("puffo_agent.portal.api.access")
     runner = web.AppRunner(

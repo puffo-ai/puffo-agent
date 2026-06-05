@@ -20,6 +20,7 @@ from pathlib import Path
 
 from ..macos.keychain import CredentialCache, is_macos
 from .api import start_api_server, stop_api_server
+from .ws_local.hub import WsLocalHub
 from .credential_refresh import (
     CodexFileBackend,
     CredentialRefresher,
@@ -57,6 +58,9 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
+        # Shared attach registry: ws-local Workers register here; the
+        # bridge's /v1/ws-local route serves tools against it.
+        self.ws_local_hub = WsLocalHub()
         self._stop = asyncio.Event()
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
@@ -97,7 +101,9 @@ class Daemon:
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
-        api_runner = await start_api_server(self.daemon_cfg.bridge)
+        api_runner = await start_api_server(
+            self.daemon_cfg.bridge, ws_local_hub=self.ws_local_hub,
+        )
         # Wire the data-service profile-cache writer to find the
         # right worker by agent_id. ``Worker.set_profile_cache`` is a
         # no-op before warm() finishes, so a race during partial
@@ -220,6 +226,7 @@ class Daemon:
                         self.daemon_cfg,
                         agent_cfg,
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                        ws_local_hub=self.ws_local_hub,
                     )
                     self.workers[agent_id] = worker
                     self._register_with_refresher(agent_cfg, worker)
@@ -236,6 +243,7 @@ class Daemon:
                         self.daemon_cfg,
                         agent_cfg,
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                        ws_local_hub=self.ws_local_hub,
                     )
                     self.workers[agent_id] = worker
                     self._register_with_refresher(agent_cfg, worker)

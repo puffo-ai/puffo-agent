@@ -27,6 +27,7 @@ from puffo_agent.portal.runtime_matrix import (
     RUNTIME_CLI_LOCAL,
     RUNTIME_CLI_SANDBOX,
     RUNTIME_SDK_LOCAL,
+    RUNTIME_WS_LOCAL,
     VALID_HARNESSES,
     VALID_PROVIDERS,
     VALID_RUNTIMES,
@@ -165,6 +166,31 @@ def test_validate_triple_ignores_harness_for_non_cli_runtimes():
         assert result.ok, f"{runtime} should ignore harness field"
 
 
+# ── ws-local ─────────────────────────────────────────────────────────────────
+
+
+def test_ws_local_is_valid_runtime():
+    assert RUNTIME_WS_LOCAL in VALID_RUNTIMES
+    assert RUNTIME_WS_LOCAL not in RESERVED_RUNTIMES
+
+
+@pytest.mark.parametrize("provider,harness", [
+    (PROVIDER_ANTHROPIC, ""),
+    (PROVIDER_OPENAI, ""),
+    ("", ""),
+    # No internal harness → the field is inert and any value validates.
+    (PROVIDER_ANTHROPIC, "lanchain"),
+])
+def test_validate_triple_accepts_ws_local_ignoring_harness(provider, harness):
+    result = validate_triple(RUNTIME_WS_LOCAL, provider, harness)
+    assert result.ok, result.error
+
+
+def test_ws_local_has_no_harness():
+    assert harness_applies(RUNTIME_WS_LOCAL) is False
+    assert resolve_effective_harness(RUNTIME_WS_LOCAL, PROVIDER_ANTHROPIC, "x") == ""
+
+
 # ── harness_applies ──────────────────────────────────────────────────────────
 
 
@@ -173,6 +199,7 @@ def test_harness_applies_only_for_cli_runtimes():
     assert harness_applies(RUNTIME_CLI_DOCKER) is True
     assert harness_applies(RUNTIME_CHAT_LOCAL) is False
     assert harness_applies(RUNTIME_SDK_LOCAL) is False
+    assert harness_applies(RUNTIME_WS_LOCAL) is False
 
 
 # ── default resolvers ────────────────────────────────────────────────────────
