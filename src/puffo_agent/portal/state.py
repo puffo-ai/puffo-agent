@@ -312,14 +312,16 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
 
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
-    """Return host codex ``[mcp_servers.*]`` as ``{name: {command, args, env}}``.
+    """Return host codex ``[mcp_servers.*]`` as a per-name spec dict.
 
+    Two transports recognised:
+      - stdio: ``{command, args, env}`` — entry has ``command``.
+      - http / sse: ``{type, url, env}`` — entry has ``type ∈ (http, sse)``
+        + ``url``.
     Honours ``$CODEX_HOME``. Returns ``{}`` on missing / unreadable /
-    malformed file (defensive: a broken host config can't block agent
-    startup). Drops entries with empty/non-string ``command``. Spec
-    surface is ``command/args/env`` only — widen here + in
-    ``_emit_codex_mcp_block`` together if codex grows a load-bearing
-    field (cwd / disabled / startup_timeout_sec / …).
+    malformed file (defensive: a broken host config can't block
+    agent startup). Drops entries that don't fit either shape so a
+    typo can't poison the worker's re-merge pass.
     """
     import tomllib
     codex_home_env = os.environ.get("CODEX_HOME")
@@ -340,15 +342,21 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
     for name, spec in raw.items():
         if not isinstance(spec, dict):
             continue
+        # env is shared across transports; defensive typing so a
+        # hostile host config with ``env = "x"`` can't poison the
+        # re-merge.
+        raw_env = spec.get("env")
+        env = dict(raw_env) if isinstance(raw_env, dict) else {}
+        transport = str(spec.get("type") or "").lower()
+        url = spec.get("url")
+        if transport in ("http", "sse") and isinstance(url, str) and url:
+            out[name] = {"type": transport, "url": url, "env": env}
+            continue
         cmd = spec.get("command")
         if not isinstance(cmd, str) or not cmd:
             continue
-        # args / env are defensively typed: a hostile host config with
-        # ``args = "x"`` would otherwise split into chars via list(str).
         raw_args = spec.get("args")
         args = list(raw_args) if isinstance(raw_args, list) else []
-        raw_env = spec.get("env")
-        env = dict(raw_env) if isinstance(raw_env, dict) else {}
         out[name] = {"command": cmd, "args": args, "env": env}
     return out
 

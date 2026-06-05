@@ -399,16 +399,12 @@ async def install(
     else:
         spec_to_write = _validate_adhoc_spec(spec or {})
 
-    # codex only knows stdio — sse / http would land in TOML the
-    # codex CLI can't parse, so fail loud here rather than write a
-    # nonsense block to the operator's config.
-    if ctx.harness == "codex" and spec_to_write["type"] != "stdio":
-        raise RuntimeError(
-            f"install_host_mcp: codex agents only support stdio MCPs; "
-            f"got transport {spec_to_write['type']!r}. "
-            f"sse / http MCPs would need a claude-code harness."
-        )
-
+    # codex's config.toml accepts all three transports (stdio via
+    # command/args/env, http / sse via type + url + env). If a given
+    # codex CLI version actually rejects an entry at startup the
+    # operator surfaces the failure — we keep the write side honest
+    # to the spec we have. ``_emit_codex_mcp_block`` picks the shape
+    # from spec.type so no extra branching needed here.
     if ctx.harness == "codex":
         host_path = _codex_host_config_path(ctx.host_home)
         existing = _read_codex_mcp_servers(host_path)

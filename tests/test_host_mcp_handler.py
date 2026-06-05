@@ -225,13 +225,30 @@ async def test_install_unsupported_harness_rejects_upfront(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_install_codex_rejects_http_transport(tmp_path):
+async def test_install_codex_appends_http_toml_block(tmp_path, monkeypatch):
+    """codex + http MCP: handler writes a ``[mcp_servers.<name>]``
+    block carrying ``type = "http"`` + ``url`` (no command / args).
+    Whether codex's own CLI actually accepts http MCPs is its concern
+    — our job is to write a spec-conformant block, not to gate."""
     ctx = _ctx(tmp_path, harness="codex")
-    with pytest.raises(RuntimeError, match="codex agents only support stdio"):
-        await host_mcp_handler.install(
-            ctx, name="x",
-            spec={"type": "http", "url": "https://x.example/mcp"},
-        )
+    monkeypatch.setattr(
+        host_mcp_handler, "_send_dm_to_operator",
+        AsyncMock(return_value="env_http_ok"),
+    )
+    msg = await host_mcp_handler.install(
+        ctx, name="coinbase-cdp-docs",
+        spec={
+            "type": "http",
+            "url": "https://docs.cdp.coinbase.com/mcp",
+            "env": {},
+        },
+    )
+    out = _read_host_codex(ctx.host_home)
+    assert "[mcp_servers.coinbase-cdp-docs]" in out
+    assert 'type = "http"' in out
+    assert 'url = "https://docs.cdp.coinbase.com/mcp"' in out
+    assert "command" not in out
+    assert "env_http_ok" in msg
 
 
 @pytest.mark.asyncio

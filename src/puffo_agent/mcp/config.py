@@ -131,20 +131,35 @@ def write_codex_mcp_config(
 
 
 def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
-    # spec is tomllib-shaped: {command, args?, env?}. Missing optional
-    # fields tolerated. Name + env keys quoted via _toml_key when they
-    # contain TOML-significant chars (dots, etc.) so `my.server` doesn't
-    # become a nested table.
+    """Emit a ``[mcp_servers.<name>]`` block in codex config.toml shape.
+
+    Two transports supported (selected by which key the spec carries —
+    ``command`` → stdio, ``url`` → http / sse). Explicit ``type`` is
+    emitted only for http / sse so existing stdio entries round-trip
+    byte-for-byte through worker restarts. Name + env keys quoted via
+    ``_toml_key`` when they contain TOML-significant chars (dots,
+    etc.) so ``my.server`` doesn't become a nested table.
+
+    Whether codex's CLI actually parses http / sse entries is a codex
+    concern — we keep the file shape correct on our side; if codex
+    rejects the entry the operator + agent get a clear runtime error.
+    """
     key = _toml_key(name)
     out: list[str] = ["", f"[mcp_servers.{key}]"]
-    cmd = str(spec.get("command", ""))
-    out.append(f'command = "{_toml_escape(cmd)}"')
-    args = spec.get("args") or []
-    out.append(
-        "args = ["
-        + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
-        + "]"
-    )
+    transport = str(spec.get("type") or "").lower()
+    url = spec.get("url")
+    if transport in ("http", "sse") and isinstance(url, str) and url:
+        out.append(f'type = "{transport}"')
+        out.append(f'url = "{_toml_escape(url)}"')
+    else:
+        cmd = str(spec.get("command", ""))
+        out.append(f'command = "{_toml_escape(cmd)}"')
+        args = spec.get("args") or []
+        out.append(
+            "args = ["
+            + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
+            + "]"
+        )
     env = spec.get("env") or {}
     if env:
         out.append("")
