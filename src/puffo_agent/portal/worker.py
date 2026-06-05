@@ -128,6 +128,17 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     # ~/.claude/.credentials.json (set up by `claude login`); no
     # api_key is threaded through. Model overrides still flow.
     if kind == "cli-docker":
+        # The desired-skills / desired-mcps install path is cli-local
+        # only today (PUF-268). Failing fast here makes the gap
+        # operator-visible — picks were otherwise silently dropped
+        # at adapter-construction. PUF-273 item (b).
+        if agent_cfg.desired_skills or agent_cfg.desired_mcps:
+            raise RuntimeError(
+                f"agent {agent_cfg.id!r}: desired_skills / desired_mcps "
+                "are not supported on the cli-docker runtime yet. Either "
+                "clear them from agent.yml or switch runtime.kind to "
+                "cli-local."
+            )
         from ..agent.adapters.docker_cli import DockerCLIAdapter
         from ..agent.harness import build_harness
         harness = build_harness(agent_cfg.runtime.harness)

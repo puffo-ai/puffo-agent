@@ -129,6 +129,48 @@ def write_desired_skill(
     )
 
 
+def prune_stale_desired_skills(
+    skills_root: Path, current_desired: list[str],
+) -> int:
+    """Remove skill dirs that only carry the desired-installed marker
+    for ids no longer in the current desired list. host-synced and
+    agent-installed entries are left alone — those lifecycles are
+    owned elsewhere. Returns the count of dirs removed.
+
+    Idempotent; spawn-time `_install_desired` calls this after the
+    install loop so a freshly-installed skill is never pruned in the
+    same pass. PUF-273 item (a).
+    """
+    if not skills_root.is_dir():
+        return 0
+    current_set = set(current_desired)
+    pruned = 0
+    import shutil
+    for entry in skills_root.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name in current_set:
+            continue
+        if not (entry / DESIRED_INSTALLED_MARKER).exists():
+            continue
+        # Stronger provenance wins — host-sync or agent-install
+        # signals the skill should stay even after operator drops it
+        # from the desired list.
+        if (entry / "agent-installed.md").exists():
+            continue
+        if (entry / "host-synced.md").exists():
+            continue
+        try:
+            shutil.rmtree(entry)
+            pruned += 1
+        except OSError as exc:
+            logger.warning(
+                "desired-install prune %r: rmtree failed: %s — skipping",
+                entry.name, exc,
+            )
+    return pruned
+
+
 def write_desired_skill_codex(
     workspace_dir: Path, template_id: str, body: str,
 ) -> str:
@@ -253,6 +295,20 @@ async def install_desired(
     Returns ``codex_extra_servers`` — a ``{id: spec}`` map for codex to
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
     """
+    # hermes is one-shot per turn and has no skills / MCP surface; the
+    # picker still happily accepts ids for an hermes agent today, so
+    # bail explicitly rather than silently writing into ``.claude/``
+    # for an agent that won't read from it. Mirrors the hermes
+    # short-circuits at local_cli.py:205 / 227 / 255 (PUF-273 item c).
+    if harness_name == "hermes":
+        if desired_skills or desired_mcps:
+            logger.info(
+                "agent %s: hermes harness — skipping %d desired_skills + "
+                "%d desired_mcps (no skills/MCP surface in hermes v1)",
+                agent_id, len(desired_skills), len(desired_mcps),
+            )
+        return {}
+
     is_codex = harness_name == "codex"
 
     for sid in desired_skills:
@@ -274,6 +330,20 @@ async def install_desired(
                 "agent %s: desired skill %r already present — left untouched",
                 agent_id, sid,
             )
+
+    # Prune skill dirs whose only provenance is a now-stale
+    # desired-installed marker. Runs after the install loop so
+    # freshly-added ids in the current list aren't candidates.
+    skills_root = (
+        workspace_dir / ".agents" / "skills" if is_codex
+        else agent_home / ".claude" / "skills"
+    )
+    pruned = prune_stale_desired_skills(skills_root, desired_skills)
+    if pruned:
+        logger.info(
+            "agent %s: pruned %d stale desired-installed skill dir(s)",
+            agent_id, pruned,
+        )
 
     codex_extras: dict[str, dict[str, Any]] = {}
     for mid in desired_mcps:
