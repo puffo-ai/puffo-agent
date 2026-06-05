@@ -15,7 +15,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from aiohttp import web
 
@@ -62,6 +62,23 @@ MAX_AVATAR_LABEL = "4 MiB"
 # ────────────────────────────────────────────────────────────────────
 
 
+def _cli_tool_status(
+    resolver: Callable[[], str | None],
+    cred_check: Callable[[], bool],
+) -> str:
+    """Returns ``not_installed`` | ``need_login`` | ``ready``."""
+    try:
+        path = resolver()
+    except Exception:
+        path = None
+    if not path:
+        return "not_installed"
+    try:
+        return "ready" if cred_check() else "need_login"
+    except Exception:
+        return "need_login"
+
+
 async def info(_request: web.Request) -> web.Response:
     """Public discovery endpoint. No auth."""
     pairing = load_pairing()
@@ -70,6 +87,12 @@ async def info(_request: web.Request) -> web.Response:
         daemon_version = version("puffo-agent")
     except Exception:
         daemon_version = "unknown"
+    from ...agent.cli_bin import (
+        claude_has_credentials,
+        codex_has_credentials,
+        resolve_claude_bin,
+        resolve_codex_bin,
+    )
     return web.json_response({
         "service": "puffo-agent-bridge",
         "version": "v1",
@@ -79,6 +102,10 @@ async def info(_request: web.Request) -> web.Response:
         "paired": pairing is not None,
         "paired_slug": pairing.slug if pairing else None,
         "paired_device_id": pairing.device_id if pairing else None,
+        "cli_tools": {
+            "claude-code": _cli_tool_status(resolve_claude_bin, claude_has_credentials),
+            "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
+        },
     })
 
 
