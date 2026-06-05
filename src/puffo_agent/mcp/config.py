@@ -290,6 +290,19 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
+    # Codex spawns the puffo MCP subprocess with ONLY the env vars
+    # declared in ``[mcp_servers.puffo.env]`` — neither codex's own
+    # ``CODEX_HOME`` nor the operator's ``HOME``/``USERPROFILE`` are
+    # inherited. Without ``CODEX_HOME``, the puffo MCP's
+    # ``_list_mcp_servers`` falls back to ``Path.home()/.codex`` =
+    # the operator's host config (which has 2 entries), not the
+    # agent's per-agent ``<agent_home>/.codex/config.toml`` (which
+    # has the full merged set). Pin it explicitly here. Workspace
+    # lives at ``<agent_home>/workspace`` so its parent IS the
+    # agent_home.
+    if harness == "codex" and workspace:
+        from pathlib import Path as _Path
+        env["CODEX_HOME"] = str(_Path(workspace).parent / ".codex")
     return env
 
 
