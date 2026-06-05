@@ -82,11 +82,8 @@ class PuffoCoreToolsConfig:
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,
     # no absolutes).
     workspace: Optional[str] = None
-    # Loopback RPC client to the daemon's ``rpc_service`` —
-    # ``install_host_mcp`` and ``sync_host_mcp`` tool bodies POST
-    # through it instead of touching the operator's filesystem
-    # in-process. ``None`` when ``PUFFO_RPC_URL`` isn't set, in
-    # which case the tool bodies surface a clear error to the agent.
+    # None when PUFFO_RPC_URL isn't set; install/sync tools surface
+    # a clear error rather than touching operator files in-process.
     rpc_client: Optional[PuffoRpcClient] = None
 
 

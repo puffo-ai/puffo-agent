@@ -630,16 +630,8 @@ class Worker:
             self._client.set_profile(slug, display_name, avatar_url)
 
     def host_mcp_context(self):
-        """Build a ``HostMcpContext`` (host_mcp_handler.HostMcpContext)
-        from this worker's live state — slug, keystore, http_client,
-        operator_slug, harness, plus the host paths the daemon
-        process can see directly. Returns None until ``warm()`` has
-        built the message client (the rpc-service shim surfaces that
-        as a 404 to the calling MCP, which retries on the next tool
-        call). The whole client wiring is here rather than in worker
-        so the resolver stays sync (resolver is called from the
-        rpc-service request handler and shouldn't await). ``harness``
-        defaults to ``claude-code`` to match ``build_harness``."""
+        """Build a ``HostMcpContext`` from this worker's live state.
+        Returns None until ``warm()`` has built the message client."""
         client = self._client
         if client is None:
             return None

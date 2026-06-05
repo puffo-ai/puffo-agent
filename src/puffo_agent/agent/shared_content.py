@@ -14,24 +14,14 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-# Codex publishes MCP tools using bare names — its tool router
-# dispatches on the unprefixed name. Claude Code namespaces every
-# MCP tool as ``mcp__<server>__<name>`` to avoid collisions across
-# servers. Our shared primer + skill bodies are written in the
-# claude-code convention (load-bearing for claude-code agents), so
-# the codex variants must strip the ``mcp__puffo__`` prefix before
-# being written to disk — otherwise the LLM generates calls like
-# ``mcp__puffo__send_message`` that codex's router rejects with
-# ``unsupported call``. Bug surfaced via codex stderr +
-# ``mcpServerStatus/list`` diagnostic — see PUF-268 PR-B history.
+# codex's MCP router dispatches on bare names; claude-code namespaces
+# them as ``mcp__<server>__<name>``. Primers/skills are written in
+# the claude-code convention, so the codex variants must strip the
+# prefix or codex rejects with "unsupported call".
 _MCP_PUFFO_PREFIX_RE = re.compile(r"\bmcp__puffo__")
 
 
 def _strip_puffo_mcp_prefix_for_codex(text: str) -> str:
-    """Drop the ``mcp__puffo__`` prefix from every tool reference so
-    the codex LLM sees the names codex's tool router actually
-    dispatches on. Safe — the prefix appears nowhere else in the
-    primer / skill bodies."""
     return _MCP_PUFFO_PREFIX_RE.sub("", text)
 
 
@@ -793,26 +783,15 @@ _MANAGED_MARKER_BODY = (
 
 
 def _skill_body_with_frontmatter(skill_id: str, description: str, body: str) -> str:
-    """Prepend the YAML frontmatter Claude Code needs for skill
-    discovery. Idempotent — bodies that already start with a `---`
-    block are left untouched.
-    """
+    """Prepend YAML frontmatter. Idempotent — bodies already starting with ``---`` pass through."""
     if body.lstrip().startswith("---"):
         return body
     return f"---\nname: {skill_id}\ndescription: {description}\n---\n\n{body}"
 
 
 def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
-    """The shared-primer files the daemon owns, paired with the
-    content baked into this install. Single source of truth for both
-    ``ensure_shared_primer`` (seed-if-missing) and
-    ``reseed_shared_primer`` (force back to this version).
-
-    Skills live at ``skills/<id>/SKILL.md`` (the Claude Code skill
-    convention) with a frontmatter-stamped body; each skill dir also
-    carries a sentinel marker so ``sync_shared_skills`` can prune
-    stale managed entries from agent workspaces.
-    """
+    """Single source of truth for ``ensure_shared_primer`` (seed-if-missing)
+    and ``reseed_shared_primer`` (force back to this version)."""
     yield shared_dir / "CLAUDE.md", DEFAULT_SHARED_CLAUDE_MD
     yield shared_dir / "README.md", DEFAULT_SHARED_README
     for skill_id, (description, body) in DEFAULT_SKILLS.items():
@@ -885,16 +864,10 @@ def _sync_shared_skills_to(
     *,
     body_transform=None,
 ) -> None:
-    """Mirror ``<src_root>/<id>/SKILL.md`` → ``<dst_root>/<id>/SKILL.md``
-    + stamp ``.puffo-managed`` marker. Prunes legacy flat ``*.md``
-    files at the top of ``dst_root`` plus any subdir carrying our
-    marker whose id isn't in ``DEFAULT_SKILLS``. Operator-authored
-    subdirs without the marker are untouched.
-
-    ``body_transform``: optional ``(text) -> text`` applied to each
-    SKILL.md body before writing — used by the codex variant to
-    strip the ``mcp__puffo__`` prefix from tool references.
-    """
+    """Mirror managed skills into ``dst_root``. Prunes legacy flat
+    ``*.md`` and any subdir carrying our marker whose id isn't in
+    ``DEFAULT_SKILLS``; operator-authored subdirs (no marker) are
+    untouched. ``body_transform`` is applied per SKILL.md before write."""
     import shutil
     dst_root.mkdir(parents=True, exist_ok=True)
 
@@ -953,18 +926,9 @@ def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
 
 
 def sync_shared_skills_codex(shared_dir: Path, workspace_dir: Path) -> None:
-    """Same as ``sync_shared_skills`` but for codex's project-scope
-    discovery path (``.agents/skills/<id>/SKILL.md``). Codex walks the
-    cwd → repo-root chain looking for this layout, then user-scope
-    ``$HOME/.agents/skills/``. We write project-scope so it parallels
-    Claude Code's setup. Frontmatter shape is identical between the
-    two CLIs.
-
-    Body transform strips ``mcp__puffo__`` from every tool reference
-    — codex publishes MCP tools under bare names, so leaving the
-    prefix in the skill body makes the LLM generate calls codex's
-    router rejects as ``unsupported``.
-    """
+    """Mirror into codex's project-scope discovery path
+    (``.agents/skills/<id>/SKILL.md``). Strips ``mcp__puffo__`` prefix
+    so tool references match codex's bare-name router."""
     _sync_shared_skills_to(
         shared_dir / "skills",
         workspace_dir / ".agents" / "skills",

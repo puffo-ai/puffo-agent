@@ -142,12 +142,6 @@ class LocalCLIAdapter(Adapter):
         owner_username: str = "",
         permission_mode: str = "default",
         harness=None,
-        # PUF-268: spawn-time install of operator-picked templates.
-        # All four are optional so legacy tests + the chat-local /
-        # docker callsites that don't ship desired-lists keep working
-        # unchanged. ``puffo_core_*`` are required for the HTTP fetch
-        # to authenticate; when any is empty the install pass is
-        # skipped with a debug log and the agent spawns as before.
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
         puffo_core_server_url: str = "",
@@ -171,8 +165,6 @@ class LocalCLIAdapter(Adapter):
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
-        # Cached desired-stdio MCPs the codex session_init merges
-        # into config.toml on the next ``_ensure_codex_session``.
         self._desired_codex_extras: dict[str, dict] = {}
         self._desired_installed = False
         if harness is None:
@@ -276,19 +268,10 @@ class LocalCLIAdapter(Adapter):
         await session.warm(system_prompt)
 
     async def reload(self, new_system_prompt: str) -> None:
-        """Drop cached runtime state so the next turn re-reads
-        everything from disk — instructions (CLAUDE.md / AGENTS.md),
-        skills, AND config (.claude.json / .codex/config.toml).
-
-        For codex we drop the ``CodexSession`` cache entirely (not
-        just tear down its subprocess) so the next ``run_turn``
-        runs ``_ensure_codex_session`` again — that's where the host
-        ``~/.codex/config.toml`` → agent ``<agent_home>/.codex/
-        config.toml`` merge happens. Without dropping the cache the
-        merge would be skipped (the existing CodexSession returns
-        early at the ``is not None`` guard) and codex would respawn
-        reading the same stale agent config.
-        """
+        """Drop cached runtime state so the next turn re-reads everything from disk
+        — instructions, skills, and config. For codex we drop the session cache
+        entirely so the next ``_ensure_codex_session`` re-runs the host→agent
+        config.toml merge."""
         if self._session is not None:
             await self._session.aclose()
             self._session = None
@@ -327,10 +310,9 @@ class LocalCLIAdapter(Adapter):
         # agent inherits the operator's codex MCP catalog (the puffo
         # entry below shadows any same-named host entry).
         host_mcps = read_host_codex_mcp_servers(Path.home())
-        # PUF-268: fold operator-picked stdio MCPs in alongside host
-        # MCPs. Host wins on collision so the operator's local
-        # override beats the catalog default; same precedence as
-        # claude's ``sync_host_mcp_servers``.
+        # Host wins on collision so the operator's local override
+        # beats the catalog default — same precedence as claude's
+        # sync_host_mcp_servers.
         merged_extras: dict[str, dict] = dict(self._desired_codex_extras)
         merged_extras.update(host_mcps)
         if self.puffo_core_mcp_env:
@@ -1016,16 +998,9 @@ class LocalCLIAdapter(Adapter):
         self._verified = True
 
     async def _install_desired(self) -> None:
-        """Spawn-time install of operator-picked skill + MCP templates
-        (PUF-268). Runs once per LocalCLIAdapter instance, after the
-        sync ``_verify`` block — so host-sync wins on collisions and
-        catalog fetch never blocks host-sync errors.
-
-        Skips silently when no desired entries are configured OR when
-        the puffo_core HTTP plumbing is incomplete (legacy callers,
-        chat-only style configs). Fetch errors are logged + tolerated
-        per ticket: a missing template doesn't fail spawn.
-        """
+        """Spawn-time install of operator-picked skill + MCP templates.
+        Runs once per adapter instance after ``_verify`` so host-sync
+        wins on collisions. Fetch errors are logged + tolerated."""
         if self._desired_installed:
             return
         self._desired_installed = True

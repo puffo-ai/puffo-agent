@@ -191,16 +191,10 @@ def build_server(
 ) -> FastMCP:
     ks = KeyStore(keystore_dir)
     http = PuffoCoreHttpClient(server_url, ks, slug)
-    # Read-only client for the daemon's data service. The MCP never
-    # opens the agent's SQLite directly — the daemon is the sole
-    # reader/writer regardless of where the MCP runs.
     data = DataClient(data_service_url, agent_id)
 
-    # RPC client for host-touching MCP tools. The daemon runs the
-    # rpc_service on loopback (cli-local → 127.0.0.1; cli-docker →
-    # host.docker.internal). When the env is missing we leave it
-    # None and the tools surface a clear error instead of crashing
-    # at startup — keeps unrelated MCP tools alive.
+    # None when PUFFO_RPC_URL is unset; tools surface a clear error
+    # instead of crashing the whole MCP at startup.
     rpc_url = os.environ.get("PUFFO_RPC_URL", "")
     rpc_client = (
         PuffoRpcClient(rpc_url, agent_id) if rpc_url else None

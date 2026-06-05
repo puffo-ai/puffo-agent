@@ -100,14 +100,7 @@ class Daemon:
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
         api_runner = await start_api_server(self.daemon_cfg.bridge)
-        # Wire the data-service profile-cache writer to find the
-        # right worker by agent_id. ``Worker.set_profile_cache`` is a
-        # no-op before warm() finishes, so a race during partial
-        # startup is safe.
         set_profile_setter(self._set_worker_profile_cache)
-        # Same pattern for rpc-service: maps ``agent_id`` →
-        # ``HostMcpContext`` from the running worker. Returns None when
-        # the worker is gone / pre-warm; the route surfaces 404.
         set_rpc_resolver(self._resolve_host_mcp_context)
         data_runner = await start_data_service(self.daemon_cfg.data_service)
         rpc_runner = await start_rpc_service(self.daemon_cfg.rpc_service)
@@ -301,11 +294,7 @@ class Daemon:
         worker.set_profile_cache(slug, display_name, avatar_url)
 
     def _resolve_host_mcp_context(self, agent_id: str) -> "HostMcpContext | None":
-        """Rpc-service shim — look up the warm worker for ``agent_id``
-        and pull out the bits the host_mcp_handler needs (slug,
-        keystore, http_client, operator_slug). Returns None when the
-        worker isn't running or hasn't finished ``warm()`` yet — the
-        rpc route surfaces that as a 404 to the MCP wrapper."""
+        """Rpc-service shim. Returns None when the worker isn't warm yet."""
         worker = self.workers.get(agent_id)
         if worker is None:
             return None

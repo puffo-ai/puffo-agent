@@ -1,20 +1,6 @@
-"""Daemon-side implementation of ``install_host_mcp`` /
-``sync_host_mcp``.
-
-The two MCP tools call into here via the data service (loopback
-HTTP). Lives on the daemon process so:
-
-  - cli-docker agents work too — the operator's ``~/.claude.json``
-    isn't bind-mounted into the container, but the daemon runs on
-    host and can read+write it directly.
-  - host writes happen in one process — no two-writer races on the
-    operator's config file when multiple agents drive installs.
-  - DM signing reuses each agent's already-warm keystore + http
-    client; no extra credential plumbing into MCP subprocesses.
-
-The MCP-side wrapper in ``mcp.puffo_core_tools`` is now a thin RPC
-that POSTs to the data service routes registered below.
-"""
+"""Daemon-side ``install_host_mcp`` / ``sync_host_mcp``. Runs on the
+daemon (not the MCP subprocess) so cli-docker agents can reach the
+operator's host config and concurrent installs don't race on it."""
 
 from __future__ import annotations
 
@@ -41,24 +27,15 @@ _VALID_TRANSPORTS = {"stdio", "sse", "http"}
 
 @dataclass
 class HostMcpContext:
-    """Per-agent dispatch context the daemon assembles when a data
-    service host-mcp request arrives. All fields come from the
-    running ``PuffoCoreMessageClient`` for that agent plus the
-    operator's real ``Path.home()`` (the daemon process itself).
-
-    ``harness`` decides which host config the install lands in —
-    ``claude-code`` → operator's ``~/.claude.json`` (JSON); ``codex``
-    → operator's ``~/.codex/config.toml`` (TOML, ``[mcp_servers.<name>]``
-    block, stdio transport only). Other harnesses (hermes,
-    gemini-cli) currently raise — they don't load MCPs from a
-    standard config file the way claude-code / codex do.
-    """
+    """Per-agent dispatch context. ``harness`` routes to the correct
+    operator config: ``claude-code`` → ``~/.claude.json``, ``codex``
+    → ``~/.codex/config.toml``. Other harnesses raise."""
     agent_id: str
-    slug: str               # agent's own puffo slug
+    slug: str
     operator_slug: str
-    host_home: Path         # operator's real ~/
-    agent_home: Path        # ~/.puffo-agent/agents/<agent_id>/
-    harness: str            # "claude-code" | "codex" | "hermes" | "gemini-cli"
+    host_home: Path
+    agent_home: Path
+    harness: str
     keystore: KeyStore
     http_client: PuffoCoreHttpClient
 
@@ -67,9 +44,7 @@ class HostMcpContext:
 
 
 def _read_claude_json(path: Path) -> dict[str, Any]:
-    """Best-effort read. Returns ``{}`` on missing / unreadable /
-    non-object body — never raises so callers can decide whether
-    "nothing there yet" or "leave it alone" is the right answer."""
+    """Best-effort read. Returns ``{}`` on missing / unreadable / non-object; never raises."""
     if not path.is_file():
         return {}
     try:
@@ -99,9 +74,7 @@ def _atomic_write_claude_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _codex_host_config_path(host_home: Path) -> Path:
-    """Resolve operator's codex config path. Honours ``$CODEX_HOME``
-    (codex's own override) so we land in the same file the operator's
-    host ``codex`` CLI reads. Falls back to ``<host_home>/.codex/``."""
+    """Honours ``$CODEX_HOME`` so we land in the same file the operator's codex CLI reads."""
     codex_home_env = os.environ.get("CODEX_HOME")
     codex_home = (
         Path(codex_home_env) if codex_home_env
@@ -111,36 +84,26 @@ def _codex_host_config_path(host_home: Path) -> Path:
 
 
 def _agent_codex_config_path(agent_home: Path) -> Path:
-    """Agent-side codex config path. Always under the per-agent
-    home, never via ``$CODEX_HOME`` (which is the operator's
-    override)."""
     return agent_home / ".codex" / "config.toml"
 
 
 def _read_codex_mcp_servers(path: Path) -> dict[str, dict]:
-    """Return the ``[mcp_servers.*]`` table as a plain dict. Returns
-    ``{}`` on missing / unreadable / non-object — same defensive
-    handling as ``_read_claude_json``."""
+    """Return the ``[mcp_servers.*]`` table; ``{}`` on missing / unreadable / non-object."""
     if not path.is_file():
         return {}
     try:
         with path.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, ValueError):
-        # tomllib.TOMLDecodeError ⊂ ValueError.
         return {}
     raw = data.get("mcp_servers")
     return raw if isinstance(raw, dict) else {}
 
 
 def _append_codex_mcp_block(path: Path, name: str, spec: dict[str, Any]) -> None:
-    """Append a single ``[mcp_servers.<name>]`` block to ``path``,
-    creating the file (and parent dirs) if missing. We deliberately
-    do NOT regenerate the whole file: operator's other config (auth
-    settings, model preferences, comments) must round-trip intact.
-    Caller guarantees the entry isn't already present (via
-    ``_read_codex_mcp_servers``).
-    """
+    """Append a single block to ``path``. Never regenerates the whole
+    file — operator's other config (auth, models, comments) must
+    round-trip intact. Caller guarantees the entry isn't already present."""
     path.parent.mkdir(parents=True, exist_ok=True)
     block_lines = _emit_codex_mcp_block(name, spec)
     block_text = "\n".join(block_lines).rstrip("\n") + "\n"
@@ -157,10 +120,7 @@ def _append_codex_mcp_block(path: Path, name: str, spec: dict[str, Any]) -> None
 
 
 def _spec_from_template(template: dict[str, Any]) -> dict[str, Any] | None:
-    """Coerce a catalog ``mcp_template`` row into the
-    ``mcpServers[<id>]`` shape Claude Code reads. Mirrors
-    ``desired_install.normalize_mcp_spec`` for the same wire shape.
-    """
+    """Coerce a catalog row into the ``mcpServers[<id>]`` shape."""
     transport = str(template.get("type") or "").lower()
     args = template.get("args") or []
     env = template.get("env") or {}
@@ -188,9 +148,7 @@ def _spec_from_template(template: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _validate_adhoc_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    """Coerce an agent-supplied spec into the on-disk mcpServers[<id>]
-    shape. Raises with a clear message on shape issues so the agent
-    sees what's wrong."""
+    """Coerce an agent-supplied spec into the on-disk shape. Raises with a clear message."""
     transport = str(spec.get("type") or "stdio").lower()
     if transport not in _VALID_TRANSPORTS:
         raise RuntimeError(
@@ -235,12 +193,7 @@ def _validate_adhoc_spec(spec: dict[str, Any]) -> dict[str, Any]:
 def _build_operator_dm_body(
     *, name: str, display_name: str, host_path: str = "~/.claude.json",
 ) -> str:
-    """Minimal DM body — one bold-stamped line confirming the
-    install. Operator's host file is their source of truth for what
-    to populate next; the agent sends a follow-up itself for
-    setup-context (docs URLs, env hints) so this stays predictable.
-    ``host_path`` switches between ``~/.claude.json`` (claude) and
-    ``~/.codex/config.toml`` (codex)."""
+    """One-line install confirmation. The agent sends docs/env hints separately."""
     return (
         f"I just installed **{display_name}** into your host "
         f"{host_path} as {name!r}."
@@ -250,11 +203,7 @@ def _build_operator_dm_body(
 async def _fetch_device_keys(
     http_client: PuffoCoreHttpClient, slugs: list[str],
 ) -> list[RecipientDevice]:
-    """Paginate ``/certs/sync?slugs=...`` and collect
-    ``(device_id, kem_pk)`` for every returned device_cert. Same
-    shape as ``mcp.puffo_core_tools._fetch_device_keys`` but pulled
-    onto the daemon side so DM send doesn't reach back into the MCP
-    module."""
+    """Paginate ``/certs/sync?slugs=...`` and collect ``(device_id, kem_pk)`` per device_cert."""
     if not slugs:
         return []
     slugs_param = ",".join(slugs)
@@ -331,11 +280,7 @@ _SUPPORTED_HARNESSES = {"claude-code", "codex"}
 
 
 def _require_supported_harness(ctx: HostMcpContext, tool: str) -> None:
-    """``install_host_mcp`` + ``sync_host_mcp`` are wired to two
-    config files today — claude-code's ``~/.claude.json`` and codex's
-    ``~/.codex/config.toml``. hermes / gemini-cli don't load MCPs
-    from a standard well-known config, so we reject up front instead
-    of writing to the wrong file."""
+    """Only claude-code + codex have a well-known host config to write into."""
     if ctx.harness not in _SUPPORTED_HARNESSES:
         raise RuntimeError(
             f"{tool}: harness {ctx.harness!r} is not supported "
@@ -350,12 +295,7 @@ async def install(
     template_id: str = "",
     spec: dict[str, Any] | None = None,
 ) -> str:
-    """Run an install against the operator's host config and DM
-    them. The target file depends on harness:
-      - ``claude-code`` → ``<host>/.claude.json``  (JSON mcpServers[<name>])
-      - ``codex``       → ``<host>/.codex/config.toml`` (TOML [mcp_servers.<name>], stdio only)
-    Returns the message body the rpc service hands back to the
-    calling agent's MCP tool."""
+    """Install into the operator's host config and DM them."""
     _require_supported_harness(ctx, "install_host_mcp")
     if not ctx.operator_slug:
         raise RuntimeError(
@@ -399,12 +339,6 @@ async def install(
     else:
         spec_to_write = _validate_adhoc_spec(spec or {})
 
-    # codex's config.toml accepts all three transports (stdio via
-    # command/args/env, http / sse via type + url + env). If a given
-    # codex CLI version actually rejects an entry at startup the
-    # operator surfaces the failure — we keep the write side honest
-    # to the spec we have. ``_emit_codex_mcp_block`` picks the shape
-    # from spec.type so no extra branching needed here.
     if ctx.harness == "codex":
         host_path = _codex_host_config_path(ctx.host_home)
         existing = _read_codex_mcp_servers(host_path)
@@ -471,20 +405,10 @@ async def install(
 
 
 async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
-    """Mirror the operator's host MCP entry into the agent's own
-    config so the next ``refresh()`` picks it up.
-
-    Behaviour by harness:
-      - ``claude-code``: copy host's ``mcpServers[<id>]`` → agent's
-        ``<agent_home>/.claude.json``. cli-docker bind-mounts that
-        file into the container so claude sees it on refresh.
-      - ``codex``: just verify host has the entry. The worker's
-        startup code already re-reads the host's
-        ``~/.codex/config.toml`` via ``read_host_codex_mcp_servers``
-        and regenerates the agent's ``<agent_home>/.codex/config.toml``
-        every time it spins up — ``refresh()`` triggers that path,
-        so an explicit agent-side write here would just get
-        overwritten with the same content."""
+    """Mirror the operator's host MCP entry into the agent's config.
+    Codex skips the agent-side write — the worker re-merges host's
+    ``~/.codex/config.toml`` on every restart, so refresh() already
+    picks it up."""
     _require_supported_harness(ctx, "sync_host_mcp")
     if not template_id or not isinstance(template_id, str):
         raise RuntimeError("sync_host_mcp: template_id is required")

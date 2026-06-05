@@ -302,17 +302,7 @@ class CodexSession:
 
     async def reload(self, new_system_prompt: str) -> None:
         """Tear the codex App Server process down so the next turn
-        re-spawns it. Forces a re-read of ``config.toml`` —
-        necessary for new MCP entries (``[mcp_servers.<name>]``) and
-        skill changes (codex reads ``AGENTS.md`` + scans
-        ``~/.agents/skills/`` at boot, not per turn).
-
-        ``new_system_prompt`` is stashed for the next turn's
-        ``sendUserTurn`` — the App Server honours per-turn
-        ``instructions`` so we don't need to also persist it to
-        AGENTS.md here (the worker writes that out of band before
-        flag-watch fires).
-        """
+        re-spawns it and re-reads config.toml + AGENTS.md."""
         self.current_instructions = new_system_prompt
         async with self._lock:
             await self._teardown_locked()

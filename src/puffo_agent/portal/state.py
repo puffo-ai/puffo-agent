@@ -313,16 +313,8 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
     """Return host codex ``[mcp_servers.*]`` as a per-name spec dict.
-
-    Two transports recognised:
-      - stdio: ``{command, args, env}`` — entry has ``command``.
-      - http / sse: ``{type, url, env}`` — entry has ``type ∈ (http, sse)``
-        + ``url``.
-    Honours ``$CODEX_HOME``. Returns ``{}`` on missing / unreadable /
-    malformed file (defensive: a broken host config can't block
-    agent startup). Drops entries that don't fit either shape so a
-    typo can't poison the worker's re-merge pass.
-    """
+    Honours ``$CODEX_HOME``; ``{}`` on missing / unreadable / malformed.
+    Drops entries that match neither stdio nor http/sse shape."""
     import tomllib
     codex_home_env = os.environ.get("CODEX_HOME")
     codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
@@ -333,7 +325,6 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
         with host_config.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, ValueError):
-        # tomllib.TOMLDecodeError ⊂ ValueError.
         return {}
     raw = data.get("mcp_servers")
     if not isinstance(raw, dict):
@@ -342,16 +333,10 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
     for name, spec in raw.items():
         if not isinstance(spec, dict):
             continue
-        # env is shared across transports; defensive typing so a
-        # hostile host config with ``env = "x"`` can't poison the
-        # re-merge.
         raw_env = spec.get("env")
         env = dict(raw_env) if isinstance(raw_env, dict) else {}
         url = spec.get("url")
         if isinstance(url, str) and url:
-            # codex's HTTP transport: ``url`` is the only required
-            # key; ``bearer_token_env_var`` + ``http_headers`` are
-            # optional pass-through.
             entry: dict = {"url": url, "env": env}
             bearer = spec.get("bearer_token_env_var")
             if isinstance(bearer, str) and bearer:
@@ -796,14 +781,8 @@ class DataServiceConfig:
 
 @dataclass
 class RpcServiceConfig:
-    """Loopback HTTP service the puffo-core MCP subprocess calls
-    when an agent triggers an op that requires daemon mediation
-    (today: install_host_mcp / sync_host_mcp — touching operator's
-    ``~/.claude.json``, which cli-docker can't reach in-process
-    and which we keep single-writer for cli-local too). cli-docker
-    reaches us via ``host.docker.internal:<port>`` — Docker Desktop
-    routes that back to the host loopback, so ``127.0.0.1`` bind
-    works for both runtimes. See ``portal/rpc_service.py``."""
+    """Loopback RPC the MCP calls for daemon-mediated ops (install/sync host MCP).
+    See ``portal/rpc_service.py``."""
     enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63385
@@ -1043,12 +1022,8 @@ class AgentConfig:
     # project-level convention (.claude/CLAUDE.md, .claude/skills/) is
     # found automatically. Not user-configurable; owned by the adapter.
     triggers: TriggerRules = field(default_factory=TriggerRules)
-    # PUF-268: operator-picked skill + MCP template ids the daemon
-    # installs at spawn time AFTER host-sync (de-duped against
-    # whatever the operator's host already provides). Names are
-    # template ``id``s from puffo-server's ``/v2/skill-templates`` +
-    # ``/v2/mcp-templates`` catalogs. Empty lists are the default
-    # (back-compat with agents created before this field existed).
+    # Operator-picked template ids installed at spawn AFTER host-sync,
+    # de-duped against whatever host already provides.
     desired_skills: list[str] = field(default_factory=list)
     desired_mcps: list[str] = field(default_factory=list)
     created_at: int = 0

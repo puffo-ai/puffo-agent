@@ -131,24 +131,9 @@ def write_codex_mcp_config(
 
 
 def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
-    """Emit a ``[mcp_servers.<name>]`` block in codex config.toml shape.
-
-    Per ``developers.openai.com/codex/mcp`` codex supports two
-    transports — selected by which key the spec carries:
-
-      - stdio: ``command`` + optional ``args`` + optional ``env``.
-      - streamable HTTP: ``url`` (required) + optional
-        ``bearer_token_env_var`` + optional ``http_headers``. No
-        ``type`` field — codex auto-detects from the presence of
-        ``url``. (We also accept ``type: "http"`` / ``type: "sse"``
-        in the input spec but DO NOT emit it; codex doesn't
-        recognise the key and would either error or silently drop
-        the entry.)
-
-    Name + env keys quoted via ``_toml_key`` when they contain
-    TOML-significant chars (dots, etc.) so ``my.server`` doesn't
-    become a nested table.
-    """
+    """Emit a ``[mcp_servers.<name>]`` block. codex selects transport
+    by which key is present (``url`` → http, ``command`` → stdio).
+    Never emit ``type`` — codex doesn't recognise it."""
     key = _toml_key(name)
     out: list[str] = ["", f"[mcp_servers.{key}]"]
     url = spec.get("url")
@@ -257,16 +242,10 @@ def puffo_core_mcp_env(
     runtime_kind: str = "",
     harness: str = "",
 ) -> dict[str, str]:
-    """Env dict for the puffo-core MCP subprocess.
-
-    ``data_service_url`` / ``rpc_url`` default to the daemon's
-    loopback ports (data-service 63386, rpc-service 63385).
-    cli-docker rewrites both to ``host.docker.internal:<port>`` so
-    the container can reach the host loopback. The MCP never
-    opens ``messages.db`` directly and never touches the
-    operator's ``~/.claude.json`` directly — the daemon is the
-    sole owner of both.
-    """
+    """Env dict for the puffo-core MCP subprocess. The MCP never
+    touches ``messages.db`` or ``~/.claude.json`` directly — the
+    daemon owns both. cli-docker rewrites the loopback URLs to
+    ``host.docker.internal``."""
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -275,11 +254,6 @@ def puffo_core_mcp_env(
         "PUFFO_WORKSPACE": workspace,
         "PUFFO_DATA_SERVICE_URL": data_service_url,
         "PUFFO_RPC_URL": rpc_url,
-        # See ``_python_user_base_env`` — pins user-site to the
-        # daemon's real base so the per-agent HOME override the
-        # cli-local adapter applies doesn't hide ``mcp`` from the
-        # spawned MCP subprocess. Skipped for cli-docker where the
-        # container has its own Python tree.
         **_python_user_base_env(runtime_kind),
     }
     if agent_id:
@@ -290,16 +264,9 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
-    # Codex spawns the puffo MCP subprocess with ONLY the env vars
-    # declared in ``[mcp_servers.puffo.env]`` — neither codex's own
-    # ``CODEX_HOME`` nor the operator's ``HOME``/``USERPROFILE`` are
-    # inherited. Without ``CODEX_HOME``, the puffo MCP's
-    # ``_list_mcp_servers`` falls back to ``Path.home()/.codex`` =
-    # the operator's host config (which has 2 entries), not the
-    # agent's per-agent ``<agent_home>/.codex/config.toml`` (which
-    # has the full merged set). Pin it explicitly here. Workspace
-    # lives at ``<agent_home>/workspace`` so its parent IS the
-    # agent_home.
+    # codex only forwards [mcp_servers.puffo.env] to the subprocess,
+    # so CODEX_HOME must be pinned explicitly or list_mcp_servers
+    # would read the operator's host config instead of the agent's.
     if harness == "codex" and workspace:
         from pathlib import Path as _Path
         env["CODEX_HOME"] = str(_Path(workspace).parent / ".codex")

@@ -287,37 +287,11 @@ def _uninstall_mcp_server(workspace: Path, name: str) -> Path:
 def _list_mcp_servers(
     workspace: Path, home: Path, harness: str = "",
 ) -> list[tuple[str, str, str]]:
-    """Return ``[(scope, name, source), ...]`` for every MCP server
-    the agent's runtime can reach.
-
-    Reads the file the agent's CLI actually loads at boot — codex
-    and claude-code store MCP config at different paths in different
-    shapes, so a harness-blind read would surface entries the agent
-    can't call (the historical bug: a codex agent listing the
-    operator's ``~/.claude.json#mcpServers`` as "system" even though
-    none of those were ever loaded into its codex session).
-
-    Three scopes apply to claude-code:
-      * ``"system"`` — installed via ``claude mcp add``, lives
-        in ``<home>/.claude.json#mcpServers``. ``source`` is ``""``.
-      * ``"agent"``  — project-scope, installed by the agent via
-        ``install_mcp_server``, lives in
-        ``<workspace>/.mcp.json#mcpServers``. ``source`` is ``""``.
-      * ``"plugin"`` — provided by a ``claude /plugin install``-ed
-        plugin; ``source`` is ``"<plugin>/<version>"``.
-
-    Codex has just one source: the merged
-    ``<home>/.codex/config.toml#[mcp_servers.*]`` (operator's
-    ``~/.codex/config.toml`` host MCPs + puffo-core +
-    desired_install MCPs all merged on every worker start). All
-    entries surface as ``"system"`` ; no plugin / project layering.
-
-    Pre-existing 0.7.8 callers expected a 2-tuple — every callsite
-    in this repo was updated in lockstep when this scope was
-    added; downstream code that destructures should switch to
-    3-tuple. Malformed configs in any scope are tolerated (skip
-    that file, keep listing the rest).
-    """
+    """Return ``[(scope, name, source), ...]``. Reads the file the
+    agent's CLI actually loads at boot: codex → merged
+    ``~/.codex/config.toml`` (all entries "system"); claude-code →
+    system (``~/.claude.json``), agent (``.mcp.json``), plugin scopes.
+    Malformed configs in any scope are skipped, not raised."""
     out: list[tuple[str, str, str]] = []
     if harness == "codex":
         for name in sorted(_codex_mcp_server_names(home)):
@@ -341,11 +315,8 @@ def _list_mcp_servers(
 
 
 def _codex_mcp_server_names(home: Path) -> list[str]:
-    """Names of every ``[mcp_servers.<name>]`` entry in the codex
-    config the agent's CLI is reading. Honours ``$CODEX_HOME``
-    (codex's own override). Returns ``[]`` on missing / unreadable /
-    malformed file — same defensive handling as
-    ``state.read_host_codex_mcp_servers``."""
+    """Names of every ``[mcp_servers.*]`` entry. Honours ``$CODEX_HOME``.
+    ``[]`` on missing / unreadable / malformed."""
     import tomllib
     codex_home_env = os.environ.get("CODEX_HOME")
     codex_home = (
