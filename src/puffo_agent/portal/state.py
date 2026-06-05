@@ -347,10 +347,21 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
         # re-merge.
         raw_env = spec.get("env")
         env = dict(raw_env) if isinstance(raw_env, dict) else {}
-        transport = str(spec.get("type") or "").lower()
         url = spec.get("url")
-        if transport in ("http", "sse") and isinstance(url, str) and url:
-            out[name] = {"type": transport, "url": url, "env": env}
+        if isinstance(url, str) and url:
+            # codex's HTTP transport: ``url`` is the only required
+            # key; ``bearer_token_env_var`` + ``http_headers`` are
+            # optional pass-through.
+            entry: dict = {"url": url, "env": env}
+            bearer = spec.get("bearer_token_env_var")
+            if isinstance(bearer, str) and bearer:
+                entry["bearer_token_env_var"] = bearer
+            headers = spec.get("http_headers")
+            if isinstance(headers, dict) and headers:
+                entry["http_headers"] = {
+                    str(k): str(v) for k, v in headers.items()
+                }
+            out[name] = entry
             continue
         cmd = spec.get("command")
         if not isinstance(cmd, str) or not cmd:

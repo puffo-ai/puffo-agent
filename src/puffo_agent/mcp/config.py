@@ -133,24 +133,37 @@ def write_codex_mcp_config(
 def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
     """Emit a ``[mcp_servers.<name>]`` block in codex config.toml shape.
 
-    Two transports supported (selected by which key the spec carries —
-    ``command`` → stdio, ``url`` → http / sse). Explicit ``type`` is
-    emitted only for http / sse so existing stdio entries round-trip
-    byte-for-byte through worker restarts. Name + env keys quoted via
-    ``_toml_key`` when they contain TOML-significant chars (dots,
-    etc.) so ``my.server`` doesn't become a nested table.
+    Per ``developers.openai.com/codex/mcp`` codex supports two
+    transports — selected by which key the spec carries:
 
-    Whether codex's CLI actually parses http / sse entries is a codex
-    concern — we keep the file shape correct on our side; if codex
-    rejects the entry the operator + agent get a clear runtime error.
+      - stdio: ``command`` + optional ``args`` + optional ``env``.
+      - streamable HTTP: ``url`` (required) + optional
+        ``bearer_token_env_var`` + optional ``http_headers``. No
+        ``type`` field — codex auto-detects from the presence of
+        ``url``. (We also accept ``type: "http"`` / ``type: "sse"``
+        in the input spec but DO NOT emit it; codex doesn't
+        recognise the key and would either error or silently drop
+        the entry.)
+
+    Name + env keys quoted via ``_toml_key`` when they contain
+    TOML-significant chars (dots, etc.) so ``my.server`` doesn't
+    become a nested table.
     """
     key = _toml_key(name)
     out: list[str] = ["", f"[mcp_servers.{key}]"]
-    transport = str(spec.get("type") or "").lower()
     url = spec.get("url")
-    if transport in ("http", "sse") and isinstance(url, str) and url:
-        out.append(f'type = "{transport}"')
+    if isinstance(url, str) and url:
         out.append(f'url = "{_toml_escape(url)}"')
+        bearer = spec.get("bearer_token_env_var")
+        if isinstance(bearer, str) and bearer:
+            out.append(f'bearer_token_env_var = "{_toml_escape(bearer)}"')
+        headers = spec.get("http_headers")
+        if isinstance(headers, dict) and headers:
+            inline = ", ".join(
+                f'"{_toml_escape(str(k))}" = "{_toml_escape(str(v))}"'
+                for k, v in sorted(headers.items())
+            )
+            out.append(f'http_headers = {{ {inline} }}')
     else:
         cmd = str(spec.get("command", ""))
         out.append(f'command = "{_toml_escape(cmd)}"')

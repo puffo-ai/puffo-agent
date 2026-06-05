@@ -245,8 +245,11 @@ async def test_install_codex_appends_http_toml_block(tmp_path, monkeypatch):
     )
     out = _read_host_codex(ctx.host_home)
     assert "[mcp_servers.coinbase-cdp-docs]" in out
-    assert 'type = "http"' in out
+    # codex's HTTP transport is keyed off the presence of ``url`` —
+    # NO ``type`` field (codex doesn't recognise it; emitting it
+    # causes the entry to be silently dropped).
     assert 'url = "https://docs.cdp.coinbase.com/mcp"' in out
+    assert "type" not in out
     assert "command" not in out
     assert "env_http_ok" in msg
 
