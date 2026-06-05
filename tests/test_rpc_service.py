@@ -20,6 +20,7 @@ def _stub_ctx(agent_id: str = "agent_test") -> HostMcpContext:
         operator_slug="op-test",
         host_home=Any,   # handlers are stubbed in these tests
         agent_home=Any,
+        harness="claude-code",
         keystore=None,
         http_client=None,
     )

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
 from ..crypto.primitives import Ed25519KeyPair
+from ..mcp.config import _emit_codex_mcp_block
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +45,20 @@ class HostMcpContext:
     service host-mcp request arrives. All fields come from the
     running ``PuffoCoreMessageClient`` for that agent plus the
     operator's real ``Path.home()`` (the daemon process itself).
+
+    ``harness`` decides which host config the install lands in —
+    ``claude-code`` → operator's ``~/.claude.json`` (JSON); ``codex``
+    → operator's ``~/.codex/config.toml`` (TOML, ``[mcp_servers.<name>]``
+    block, stdio transport only). Other harnesses (hermes,
+    gemini-cli) currently raise — they don't load MCPs from a
+    standard config file the way claude-code / codex do.
     """
     agent_id: str
     slug: str               # agent's own puffo slug
     operator_slug: str
     host_home: Path         # operator's real ~/
     agent_home: Path        # ~/.puffo-agent/agents/<agent_id>/
+    harness: str            # "claude-code" | "codex" | "hermes" | "gemini-cli"
     keystore: KeyStore
     http_client: PuffoCoreHttpClient
 
@@ -82,6 +93,64 @@ def _atomic_write_claude_json(path: Path, data: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+# ── codex config.toml helpers ──────────────────────────────────────
+
+
+def _codex_host_config_path(host_home: Path) -> Path:
+    """Resolve operator's codex config path. Honours ``$CODEX_HOME``
+    (codex's own override) so we land in the same file the operator's
+    host ``codex`` CLI reads. Falls back to ``<host_home>/.codex/``."""
+    codex_home_env = os.environ.get("CODEX_HOME")
+    codex_home = (
+        Path(codex_home_env) if codex_home_env
+        else host_home / ".codex"
+    )
+    return codex_home / "config.toml"
+
+
+def _agent_codex_config_path(agent_home: Path) -> Path:
+    """Agent-side codex config path. Always under the per-agent
+    home, never via ``$CODEX_HOME`` (which is the operator's
+    override)."""
+    return agent_home / ".codex" / "config.toml"
+
+
+def _read_codex_mcp_servers(path: Path) -> dict[str, dict]:
+    """Return the ``[mcp_servers.*]`` table as a plain dict. Returns
+    ``{}`` on missing / unreadable / non-object — same defensive
+    handling as ``_read_claude_json``."""
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        # tomllib.TOMLDecodeError ⊂ ValueError.
+        return {}
+    raw = data.get("mcp_servers")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _append_codex_mcp_block(path: Path, name: str, spec: dict[str, Any]) -> None:
+    """Append a single ``[mcp_servers.<name>]`` block to ``path``,
+    creating the file (and parent dirs) if missing. We deliberately
+    do NOT regenerate the whole file: operator's other config (auth
+    settings, model preferences, comments) must round-trip intact.
+    Caller guarantees the entry isn't already present (via
+    ``_read_codex_mcp_servers``).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    block_lines = _emit_codex_mcp_block(name, spec)
+    block_text = "\n".join(block_lines).rstrip("\n") + "\n"
+    if path.exists():
+        existing = path.read_text(encoding="utf-8")
+        if existing and not existing.endswith("\n"):
+            existing += "\n"
+        path.write_text(existing + block_text, encoding="utf-8")
+    else:
+        path.write_text(block_text, encoding="utf-8")
 
 
 # ── catalog + adhoc spec normalisation ─────────────────────────────
@@ -163,15 +232,18 @@ def _validate_adhoc_spec(spec: dict[str, Any]) -> dict[str, Any]:
 # ── DM body + send ─────────────────────────────────────────────────
 
 
-def _build_operator_dm_body(*, name: str, display_name: str) -> str:
+def _build_operator_dm_body(
+    *, name: str, display_name: str, host_path: str = "~/.claude.json",
+) -> str:
     """Minimal DM body — one bold-stamped line confirming the
     install. Operator's host file is their source of truth for what
     to populate next; the agent sends a follow-up itself for
     setup-context (docs URLs, env hints) so this stays predictable.
-    """
+    ``host_path`` switches between ``~/.claude.json`` (claude) and
+    ``~/.codex/config.toml`` (codex)."""
     return (
         f"I just installed **{display_name}** into your host "
-        f"~/.claude.json as mcpServers[{name!r}]."
+        f"{host_path} as {name!r}."
     )
 
 
@@ -255,6 +327,22 @@ async def _send_dm_to_operator(
 # ── handler entry points ───────────────────────────────────────────
 
 
+_SUPPORTED_HARNESSES = {"claude-code", "codex"}
+
+
+def _require_supported_harness(ctx: HostMcpContext, tool: str) -> None:
+    """``install_host_mcp`` + ``sync_host_mcp`` are wired to two
+    config files today — claude-code's ``~/.claude.json`` and codex's
+    ``~/.codex/config.toml``. hermes / gemini-cli don't load MCPs
+    from a standard well-known config, so we reject up front instead
+    of writing to the wrong file."""
+    if ctx.harness not in _SUPPORTED_HARNESSES:
+        raise RuntimeError(
+            f"{tool}: harness {ctx.harness!r} is not supported "
+            f"(supported: {sorted(_SUPPORTED_HARNESSES)})"
+        )
+
+
 async def install(
     ctx: HostMcpContext,
     *,
@@ -262,9 +350,13 @@ async def install(
     template_id: str = "",
     spec: dict[str, Any] | None = None,
 ) -> str:
-    """Run an install against the operator's host ``~/.claude.json``
-    and DM them. Returns the message body the data service hands
-    back to the calling agent."""
+    """Run an install against the operator's host config and DM
+    them. The target file depends on harness:
+      - ``claude-code`` → ``<host>/.claude.json``  (JSON mcpServers[<name>])
+      - ``codex``       → ``<host>/.codex/config.toml`` (TOML [mcp_servers.<name>], stdio only)
+    Returns the message body the rpc service hands back to the
+    calling agent's MCP tool."""
+    _require_supported_harness(ctx, "install_host_mcp")
     if not ctx.operator_slug:
         raise RuntimeError(
             "install_host_mcp: agent has no operator_slug bound — "
@@ -307,35 +399,66 @@ async def install(
     else:
         spec_to_write = _validate_adhoc_spec(spec or {})
 
-    host_claude_json = ctx.host_home / ".claude.json"
-    data = _read_claude_json(host_claude_json)
-    servers = data.get("mcpServers")
-    if not isinstance(servers, dict):
-        servers = {}
-    if name in servers:
-        return (
-            f"{name!r} is already registered in the host's "
-            f"~/.claude.json — left untouched. Call "
-            f"sync_host_mcp({name!r}) to pull the operator's "
-            f"populated entry into your own config."
+    # codex only knows stdio — sse / http would land in TOML the
+    # codex CLI can't parse, so fail loud here rather than write a
+    # nonsense block to the operator's config.
+    if ctx.harness == "codex" and spec_to_write["type"] != "stdio":
+        raise RuntimeError(
+            f"install_host_mcp: codex agents only support stdio MCPs; "
+            f"got transport {spec_to_write['type']!r}. "
+            f"sse / http MCPs would need a claude-code harness."
         )
 
-    servers[name] = spec_to_write
-    data["mcpServers"] = servers
-    try:
-        _atomic_write_claude_json(host_claude_json, data)
-    except OSError as exc:
-        raise RuntimeError(
-            f"install_host_mcp: failed to write host's "
-            f"~/.claude.json: {exc}"
-        ) from exc
+    if ctx.harness == "codex":
+        host_path = _codex_host_config_path(ctx.host_home)
+        existing = _read_codex_mcp_servers(host_path)
+        if name in existing:
+            return (
+                f"{name!r} is already registered in the host's "
+                f"~/.codex/config.toml — left untouched. Call "
+                f"sync_host_mcp({name!r}) to pick up the operator's "
+                f"populated entry."
+            )
+        try:
+            _append_codex_mcp_block(host_path, name, spec_to_write)
+        except OSError as exc:
+            raise RuntimeError(
+                f"install_host_mcp: failed to write host's "
+                f"~/.codex/config.toml: {exc}"
+            ) from exc
+        host_path_label = "~/.codex/config.toml"
+    else:
+        host_path = ctx.host_home / ".claude.json"
+        data = _read_claude_json(host_path)
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            servers = {}
+        if name in servers:
+            return (
+                f"{name!r} is already registered in the host's "
+                f"~/.claude.json — left untouched. Call "
+                f"sync_host_mcp({name!r}) to pull the operator's "
+                f"populated entry into your own config."
+            )
+        servers[name] = spec_to_write
+        data["mcpServers"] = servers
+        try:
+            _atomic_write_claude_json(host_path, data)
+        except OSError as exc:
+            raise RuntimeError(
+                f"install_host_mcp: failed to write host's "
+                f"~/.claude.json: {exc}"
+            ) from exc
+        host_path_label = "~/.claude.json"
 
-    dm_body = _build_operator_dm_body(name=name, display_name=display_name)
+    dm_body = _build_operator_dm_body(
+        name=name, display_name=display_name, host_path=host_path_label,
+    )
     try:
         envelope_id = await _send_dm_to_operator(ctx, dm_body)
     except Exception as exc:
         return (
-            f"Installed {name!r} into host's ~/.claude.json, "
+            f"Installed {name!r} into host's {host_path_label}, "
             f"BUT sending the setup-instructions DM to "
             f"@{ctx.operator_slug} failed ({exc}). Retry by sending "
             f"this yourself:\n\n"
@@ -344,7 +467,7 @@ async def install(
         )
 
     return (
-        f"Installed {name!r} into host's ~/.claude.json AND "
+        f"Installed {name!r} into host's {host_path_label} AND "
         f"DM'd @{ctx.operator_slug} the setup steps (envelope_id "
         f"{envelope_id}). They'll ping you when host setup is done; "
         f"call sync_host_mcp({name!r}) then refresh()."
@@ -352,12 +475,40 @@ async def install(
 
 
 async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
-    """Mirror the operator's host ``mcpServers[<id>]`` into the
-    agent's ``<agent_home>/.claude.json``. For cli-docker the agent
-    home is bind-mounted into the container, so the container's
-    claude sees the update on the next ``refresh()``."""
+    """Mirror the operator's host MCP entry into the agent's own
+    config so the next ``refresh()`` picks it up.
+
+    Behaviour by harness:
+      - ``claude-code``: copy host's ``mcpServers[<id>]`` → agent's
+        ``<agent_home>/.claude.json``. cli-docker bind-mounts that
+        file into the container so claude sees it on refresh.
+      - ``codex``: just verify host has the entry. The worker's
+        startup code already re-reads the host's
+        ``~/.codex/config.toml`` via ``read_host_codex_mcp_servers``
+        and regenerates the agent's ``<agent_home>/.codex/config.toml``
+        every time it spins up — ``refresh()`` triggers that path,
+        so an explicit agent-side write here would just get
+        overwritten with the same content."""
+    _require_supported_harness(ctx, "sync_host_mcp")
     if not template_id or not isinstance(template_id, str):
         raise RuntimeError("sync_host_mcp: template_id is required")
+
+    if ctx.harness == "codex":
+        host_path = _codex_host_config_path(ctx.host_home)
+        host_servers = _read_codex_mcp_servers(host_path)
+        if template_id not in host_servers:
+            return (
+                f"sync_host_mcp: no entry for {template_id!r} in the "
+                f"host's ~/.codex/config.toml. Call "
+                f"install_host_mcp({template_id!r}) first and DM the "
+                f"operator the setup steps."
+            )
+        return (
+            f"Verified host's ~/.codex/config.toml has {template_id!r}. "
+            f"Call refresh() — your codex worker re-merges the host's "
+            f"mcp_servers into your own config on every restart, so "
+            f"the new entry will be live immediately."
+        )
 
     host_claude_json = ctx.host_home / ".claude.json"
     host_data = _read_claude_json(host_claude_json)

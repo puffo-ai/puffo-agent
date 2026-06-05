@@ -14,9 +14,16 @@ from puffo_agent.portal import host_mcp_handler
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
 
 
-def _ctx(tmp_path: Path, *, http_get=None, http_post=None) -> HostMcpContext:
+def _ctx(
+    tmp_path: Path,
+    *,
+    http_get=None,
+    http_post=None,
+    harness: str = "claude-code",
+) -> HostMcpContext:
     """Minimal context wired with mocks for the two HTTP surfaces
-    install / sync touch (catalog GET + DM POST)."""
+    install / sync touch (catalog GET + DM POST). ``harness`` selects
+    which host file the install lands in."""
     host_home = tmp_path / "operator-home"
     host_home.mkdir()
     agent_home = tmp_path / "agent-home"
@@ -41,6 +48,7 @@ def _ctx(tmp_path: Path, *, http_get=None, http_post=None) -> HostMcpContext:
         operator_slug="op-test",
         host_home=host_home,
         agent_home=agent_home,
+        harness=harness,
         keystore=keystore,
         http_client=http,
     )
@@ -195,3 +203,120 @@ async def test_sync_copies_host_entry_to_agent(tmp_path):
     )
     assert agent_data["mcpServers"]["gmail-read"] == entry
     assert "refresh()" in msg
+
+
+# ── codex harness path ─────────────────────────────────────────────
+
+
+def _read_host_codex(host_home: Path) -> str:
+    return (host_home / ".codex" / "config.toml").read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_install_unsupported_harness_rejects_upfront(tmp_path):
+    """hermes / gemini-cli don't have a known MCP config file we can
+    write to. Fail fast rather than land in the wrong file."""
+    ctx = _ctx(tmp_path, harness="hermes")
+    with pytest.raises(RuntimeError, match="harness 'hermes' is not supported"):
+        await host_mcp_handler.install(
+            ctx, name="x",
+            spec={"type": "stdio", "command": "node", "args": [], "env": {}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_install_codex_rejects_http_transport(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    with pytest.raises(RuntimeError, match="codex agents only support stdio"):
+        await host_mcp_handler.install(
+            ctx, name="x",
+            spec={"type": "http", "url": "https://x.example/mcp"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_install_codex_appends_toml_block(tmp_path, monkeypatch):
+    """Happy path on codex: adhoc spec → toml block appended to
+    operator's ~/.codex/config.toml → operator DM'd."""
+    ctx = _ctx(tmp_path, harness="codex")
+    monkeypatch.setattr(
+        host_mcp_handler, "_send_dm_to_operator",
+        AsyncMock(return_value="env_codex_ok"),
+    )
+    # Pre-existing host config with operator's own scalar key — must
+    # round-trip intact (we append, not regenerate).
+    host_codex = ctx.host_home / ".codex" / "config.toml"
+    host_codex.parent.mkdir(parents=True, exist_ok=True)
+    host_codex.write_text(
+        'model_provider = "openai"\n', encoding="utf-8",
+    )
+
+    msg = await host_mcp_handler.install(
+        ctx, name="coinbase-cdp-docs",
+        spec={
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@coinbase/cdp-docs-mcp"],
+            "env": {},
+        },
+    )
+
+    out = _read_host_codex(ctx.host_home)
+    # Operator's pre-existing scalar still there.
+    assert 'model_provider = "openai"' in out
+    # New block appended.
+    assert "[mcp_servers.coinbase-cdp-docs]" in out
+    assert 'command = "npx"' in out
+    assert "env_codex_ok" in msg
+    assert "~/.codex/config.toml" in msg
+
+
+@pytest.mark.asyncio
+async def test_install_codex_already_present_short_circuits(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    host_codex = ctx.host_home / ".codex" / "config.toml"
+    host_codex.parent.mkdir(parents=True, exist_ok=True)
+    host_codex.write_text(
+        '[mcp_servers.gmail-read]\ncommand = "node"\nargs = []\n',
+        encoding="utf-8",
+    )
+    before = host_codex.read_text(encoding="utf-8")
+
+    msg = await host_mcp_handler.install(
+        ctx, name="gmail-read",
+        spec={"type": "stdio", "command": "node", "args": [], "env": {}},
+    )
+
+    assert "already registered" in msg
+    # File untouched.
+    assert host_codex.read_text(encoding="utf-8") == before
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_validates_host_entry_present(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    msg = await host_mcp_handler.sync(ctx, template_id="gmail-read")
+    assert "no entry" in msg
+    assert "install_host_mcp" in msg
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_does_not_write_agent_file(tmp_path):
+    """Codex sync verifies host has the entry and points the agent
+    at refresh() — the worker's restart code does the re-merge.
+    Agent-side write would just get overwritten with the same
+    content on the next restart, so we skip it."""
+    ctx = _ctx(tmp_path, harness="codex")
+    host_codex = ctx.host_home / ".codex" / "config.toml"
+    host_codex.parent.mkdir(parents=True, exist_ok=True)
+    host_codex.write_text(
+        '[mcp_servers.gmail-read]\ncommand = "node"\nargs = []\n',
+        encoding="utf-8",
+    )
+
+    msg = await host_mcp_handler.sync(ctx, template_id="gmail-read")
+
+    assert "refresh()" in msg
+    assert "re-merges" in msg
+    # No file under agent_home/.codex was touched.
+    assert not (ctx.agent_home / ".codex").exists()

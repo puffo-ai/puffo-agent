@@ -632,24 +632,27 @@ class Worker:
     def host_mcp_context(self):
         """Build a ``HostMcpContext`` (host_mcp_handler.HostMcpContext)
         from this worker's live state — slug, keystore, http_client,
-        operator_slug, plus the host paths the daemon process can see
-        directly. Returns None until ``warm()`` has built the message
-        client (the rpc-service shim surfaces that as a 404 to the
-        calling MCP, which retries on the next tool call). The whole
-        client wiring is here rather than in worker so the resolver
-        stays sync (resolver is called from the data-service request
-        handler and shouldn't await)."""
+        operator_slug, harness, plus the host paths the daemon
+        process can see directly. Returns None until ``warm()`` has
+        built the message client (the rpc-service shim surfaces that
+        as a 404 to the calling MCP, which retries on the next tool
+        call). The whole client wiring is here rather than in worker
+        so the resolver stays sync (resolver is called from the
+        rpc-service request handler and shouldn't await). ``harness``
+        defaults to ``claude-code`` to match ``build_harness``."""
         client = self._client
         if client is None:
             return None
         from .host_mcp_handler import HostMcpContext
         from .state import agent_home_dir
+        harness = self.agent_cfg.runtime.harness or "claude-code"
         return HostMcpContext(
             agent_id=self.agent_cfg.id,
             slug=client.slug,
             operator_slug=client.operator_slug,
             host_home=Path.home(),
             agent_home=agent_home_dir(self.agent_cfg.id),
+            harness=harness,
             keystore=client.keystore,
             http_client=client.http,
         )
