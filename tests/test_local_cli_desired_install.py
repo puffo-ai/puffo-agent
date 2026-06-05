@@ -233,6 +233,7 @@ def test_install_desired_skill_happy_path(tmp_path):
     extras = _run(install_desired(
         http=http,
         agent_home=tmp_path,
+        workspace_dir=tmp_path,
         agent_id="a1",
         harness_name="claude-code",
         desired_skills=["git-pr-flow"],
@@ -250,7 +251,7 @@ def test_install_desired_mcp_stdio_claude_path(tmp_path):
         },
     })
     _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="claude-code", desired_skills=[], desired_mcps=["fs"],
     ))
     data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
@@ -265,7 +266,7 @@ def test_install_desired_mcp_stdio_codex_path_returns_extras_no_disk_write(tmp_p
         },
     })
     extras = _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="codex", desired_skills=[], desired_mcps=["fs"],
     ))
     assert extras == {"fs": {"command": "npx", "args": ["-y"], "env": {}}}
@@ -280,7 +281,7 @@ def test_install_desired_mcp_sse_claude_writes_url(tmp_path):
         },
     })
     _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="claude-code", desired_skills=[], desired_mcps=["remote"],
     ))
     data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
@@ -295,7 +296,7 @@ def test_install_desired_mcp_http_claude_writes_url(tmp_path):
         },
     })
     _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="claude-code", desired_skills=[], desired_mcps=["github"],
     ))
     data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
@@ -303,34 +304,32 @@ def test_install_desired_mcp_http_claude_writes_url(tmp_path):
     assert data["mcpServers"]["github"]["url"] == "https://api.github.com/mcp"
 
 
-def test_install_desired_mcp_sse_codex_skipped_with_warning(tmp_path, caplog):
+def test_install_desired_mcp_sse_codex_returns_extras(tmp_path):
     http = FakeHttp({
         "/v2/mcp-templates/remote": {
             "id": "remote", "type": "sse", "url": "https://example.com/sse",
         },
     })
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
-        extras = _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
-            harness_name="codex", desired_skills=[], desired_mcps=["remote"],
-        ))
-    assert extras == {}
-    assert any("stdio-only" in r.message for r in caplog.records)
+    extras = _run(install_desired(
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
+        harness_name="codex", desired_skills=[], desired_mcps=["remote"],
+    ))
+    assert extras == {"remote": {"url": "https://example.com/sse", "env": {}}}
+    assert not (tmp_path / ".claude.json").exists()
 
 
-def test_install_desired_mcp_http_codex_skipped_with_warning(tmp_path, caplog):
+def test_install_desired_mcp_http_codex_returns_extras(tmp_path):
     http = FakeHttp({
         "/v2/mcp-templates/github": {
             "id": "github", "type": "http", "url": "https://api.github.com/mcp",
         },
     })
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
-        extras = _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
-            harness_name="codex", desired_skills=[], desired_mcps=["github"],
-        ))
-    assert extras == {}
-    assert any("stdio-only" in r.message for r in caplog.records)
+    extras = _run(install_desired(
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
+        harness_name="codex", desired_skills=[], desired_mcps=["github"],
+    ))
+    assert extras == {"github": {"url": "https://api.github.com/mcp", "env": {}}}
+    assert not (tmp_path / ".claude.json").exists()
 
 
 def test_install_desired_404_logs_warning_and_continues(tmp_path, caplog):
@@ -342,7 +341,7 @@ def test_install_desired_404_logs_warning_and_continues(tmp_path, caplog):
     })
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
         _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
+            http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
             harness_name="claude-code",
             desired_skills=[],
             desired_mcps=["missing", "exists"],
@@ -359,7 +358,7 @@ def test_install_desired_404_on_skill_logs_and_continues(tmp_path, caplog):
     })
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
         _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
+            http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
             harness_name="claude-code",
             desired_skills=["missing", "ok"], desired_mcps=[],
         ))
@@ -367,22 +366,26 @@ def test_install_desired_404_on_skill_logs_and_continues(tmp_path, caplog):
     assert not (tmp_path / ".claude" / "skills" / "missing").exists()
 
 
-def test_install_desired_codex_skills_skipped_with_one_warning(tmp_path, caplog):
+def test_install_desired_codex_skills_install_to_agents_dir(tmp_path):
     http = FakeHttp({
-        # would resolve if asked, but for codex we never even fetch.
-        "/v2/skill-templates/s1": {"id": "s1", "body": "body"},
+        "/v2/skill-templates/s1": {
+            "id": "s1",
+            "body": "---\nname: S1\n---\n\ncall `mcp__puffo__send_message`\n",
+        },
     })
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
-        extras = _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
-            harness_name="codex",
-            desired_skills=["s1", "s2"], desired_mcps=[],
-        ))
+    extras = _run(install_desired(
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
+        harness_name="codex",
+        desired_skills=["s1"], desired_mcps=[],
+    ))
     assert extras == {}
-    skips = [r for r in caplog.records if "no skills surface" in r.message]
-    assert len(skips) == 1
-    # Crucially, NO HTTP call was made for the skills (codex shortcuts):
-    assert all("skill-templates" not in p for p in http.calls)
+    skill_md = tmp_path / ".agents" / "skills" / "s1" / "SKILL.md"
+    assert skill_md.exists()
+    # codex's tool router uses bare names — prefix stripped on disk.
+    assert "mcp__puffo__" not in skill_md.read_text(encoding="utf-8")
+    assert "send_message" in skill_md.read_text(encoding="utf-8")
+    # claude-code path NOT written.
+    assert not (tmp_path / ".claude" / "skills" / "s1").exists()
 
 
 def test_install_desired_dedupes_existing_skill_dir(tmp_path):
@@ -395,7 +398,7 @@ def test_install_desired_dedupes_existing_skill_dir(tmp_path):
         },
     })
     _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="claude-code",
         desired_skills=["git-pr-flow"], desired_mcps=[],
     ))
@@ -411,7 +414,7 @@ def test_install_desired_dedupes_existing_mcp_entry(tmp_path):
         },
     })
     _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="claude-code",
         desired_skills=[], desired_mcps=["fs"],
     ))
@@ -425,7 +428,7 @@ def test_install_desired_skill_with_invalid_body_skipped(tmp_path, caplog):
     })
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
         _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
+            http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
             harness_name="claude-code",
             desired_skills=["bad-body"], desired_mcps=[],
         ))
@@ -441,7 +444,7 @@ def test_install_desired_unsupported_transport_skipped(tmp_path, caplog):
     })
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
         _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
+            http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
             harness_name="claude-code",
             desired_skills=[], desired_mcps=["weird"],
         ))
@@ -456,7 +459,7 @@ def test_install_desired_non_404_http_error_logs_and_continues(tmp_path, caplog)
     })
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
         _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
+            http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
             harness_name="claude-code",
             desired_skills=[], desired_mcps=["broken", "ok"],
         ))
@@ -485,7 +488,7 @@ def test_install_desired_mixed_stdio_sse_http_all_install_under_claude(tmp_path)
         },
     })
     _run(install_desired(
-        http=http, agent_home=tmp_path, agent_id="a1",
+        http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
         harness_name="claude-code",
         desired_skills=[],
         desired_mcps=["fs", "remote-sse", "remote-http"],
@@ -516,7 +519,7 @@ def test_install_desired_skill_404_and_mcp_500_both_log_and_keep_going(tmp_path,
     })
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
         _run(install_desired(
-            http=http, agent_home=tmp_path, agent_id="a1",
+            http=http, agent_home=tmp_path, workspace_dir=tmp_path, agent_id="a1",
             harness_name="claude-code",
             desired_skills=["ghost", "git-pr-flow"],
             desired_mcps=["broken", "fs"],

@@ -1031,6 +1031,7 @@ class LocalCLIAdapter(Adapter):
             codex_extras = await install_desired(
                 http=http,
                 agent_home=self.agent_home_dir,
+                workspace_dir=Path(self.workspace_dir),
                 agent_id=self.agent_id,
                 harness_name=self.harness.name(),
                 desired_skills=self.desired_skills,
