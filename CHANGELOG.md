@@ -4,9 +4,16 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.11.0] — 2026-06-04
+## [0.11.0] — 2026-06-05
 
 ### Added
+
+- **Per-CLI ready state on ``GET /v1/info``.** New ``cli_tools``
+  object reports ``not_installed`` / ``need_login`` / ``ready`` for
+  both ``claude-code`` and ``codex`` so the web My Agents card and
+  the agent-create provider picker can mirror the Qt HomeView's
+  status detection without re-implementing binary + credential
+  checks browser-side.
 
 - **PUF-268 PR-B: desired skill + MCP template install at spawn time
   (cli-local only).** ``AgentConfig`` gains
