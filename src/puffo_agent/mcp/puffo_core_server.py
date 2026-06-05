@@ -71,13 +71,20 @@ def _register_local_tools(
 
     @mcp.tool()
     async def refresh(model: Optional[str] = None) -> str:
-        """Respawn your claude subprocess so it re-discovers skills,
-        MCP servers, and optionally switches to a new model."""
-        _require_claude_code("refresh")
+        """Respawn your CLI subprocess (claude-code or codex) so it
+        re-discovers skills, MCP servers, and optionally switches to
+        a new model. Not available under hermes / gemini-cli — both
+        run one-shot per turn with no long-lived subprocess to
+        respawn."""
+        if harness and harness not in ("claude-code", "codex"):
+            raise RuntimeError(
+                f"refresh is only supported under the claude-code "
+                f"and codex harnesses (this agent is using {harness!r})."
+            )
         _write_refresh_flag(Path(workspace), model)
         tail = f" (model override: {model!r})" if model is not None else ""
         return (
-            "refresh requested — your claude subprocess will respawn "
+            "refresh requested — your CLI subprocess will respawn "
             "before your next message" + tail + "."
         )
 
