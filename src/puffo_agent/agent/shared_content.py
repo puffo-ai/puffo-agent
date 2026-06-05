@@ -9,8 +9,30 @@ combines primer + profile + memory snapshot into the per-agent prompt.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
+
+
+# Codex publishes MCP tools using bare names — its tool router
+# dispatches on the unprefixed name. Claude Code namespaces every
+# MCP tool as ``mcp__<server>__<name>`` to avoid collisions across
+# servers. Our shared primer + skill bodies are written in the
+# claude-code convention (load-bearing for claude-code agents), so
+# the codex variants must strip the ``mcp__puffo__`` prefix before
+# being written to disk — otherwise the LLM generates calls like
+# ``mcp__puffo__send_message`` that codex's router rejects with
+# ``unsupported call``. Bug surfaced via codex stderr +
+# ``mcpServerStatus/list`` diagnostic — see PUF-268 PR-B history.
+_MCP_PUFFO_PREFIX_RE = re.compile(r"\bmcp__puffo__")
+
+
+def _strip_puffo_mcp_prefix_for_codex(text: str) -> str:
+    """Drop the ``mcp__puffo__`` prefix from every tool reference so
+    the codex LLM sees the names codex's tool router actually
+    dispatches on. Safe — the prefix appears nowhere else in the
+    primer / skill bodies."""
+    return _MCP_PUFFO_PREFIX_RE.sub("", text)
 
 
 DEFAULT_SHARED_CLAUDE_MD = """\
@@ -857,12 +879,21 @@ def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
     return results
 
 
-def _sync_shared_skills_to(src_root: Path, dst_root: Path) -> None:
+def _sync_shared_skills_to(
+    src_root: Path,
+    dst_root: Path,
+    *,
+    body_transform=None,
+) -> None:
     """Mirror ``<src_root>/<id>/SKILL.md`` → ``<dst_root>/<id>/SKILL.md``
     + stamp ``.puffo-managed`` marker. Prunes legacy flat ``*.md``
     files at the top of ``dst_root`` plus any subdir carrying our
     marker whose id isn't in ``DEFAULT_SKILLS``. Operator-authored
     subdirs without the marker are untouched.
+
+    ``body_transform``: optional ``(text) -> text`` applied to each
+    SKILL.md body before writing — used by the codex variant to
+    strip the ``mcp__puffo__`` prefix from tool references.
     """
     import shutil
     dst_root.mkdir(parents=True, exist_ok=True)
@@ -898,10 +929,10 @@ def _sync_shared_skills_to(src_root: Path, dst_root: Path) -> None:
         dst_skill_dir = dst_root / skill_id
         dst_skill_dir.mkdir(parents=True, exist_ok=True)
         try:
-            (dst_skill_dir / "SKILL.md").write_text(
-                src_skill.read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
+            body = src_skill.read_text(encoding="utf-8")
+            if body_transform is not None:
+                body = body_transform(body)
+            (dst_skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
             (dst_skill_dir / _MANAGED_MARKER).write_text(
                 _MANAGED_MARKER_BODY, encoding="utf-8",
             )
@@ -927,11 +958,17 @@ def sync_shared_skills_codex(shared_dir: Path, workspace_dir: Path) -> None:
     cwd → repo-root chain looking for this layout, then user-scope
     ``$HOME/.agents/skills/``. We write project-scope so it parallels
     Claude Code's setup. Frontmatter shape is identical between the
-    two CLIs, so the same SKILL.md bodies work in both.
+    two CLIs.
+
+    Body transform strips ``mcp__puffo__`` from every tool reference
+    — codex publishes MCP tools under bare names, so leaving the
+    prefix in the skill body makes the LLM generate calls codex's
+    router rejects as ``unsupported``.
     """
     _sync_shared_skills_to(
         shared_dir / "skills",
         workspace_dir / ".agents" / "skills",
+        body_transform=_strip_puffo_mcp_prefix_for_codex,
     )
 
 
@@ -1041,7 +1078,7 @@ def rebuild_agent_codex_md(
     """
     ensure_shared_primer(shared_dir)
     sync_shared_skills_codex(shared_dir, workspace_dir)
-    primer = read_shared_primer(shared_dir)
+    primer = _strip_puffo_mcp_prefix_for_codex(read_shared_primer(shared_dir))
     try:
         profile_text = profile_path.read_text(encoding="utf-8")
     except OSError:

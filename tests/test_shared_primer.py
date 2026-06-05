@@ -4,7 +4,9 @@ from pathlib import Path
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
     rebuild_agent_claude_md,
+    rebuild_agent_codex_md,
     reseed_shared_primer,
+    sync_shared_skills_codex,
 )
 from puffo_agent.portal.cli import build_parser
 
@@ -87,6 +89,67 @@ def test_rebuild_agent_claude_md_assembles_primer_profile_memory():
     # Written to both user-level dirs.
     assert (claude_user / "CLAUDE.md").read_text(encoding="utf-8") == out
     assert (gemini_user / "GEMINI.md").read_text(encoding="utf-8") == out
+
+
+# ── codex variants strip mcp__puffo__ prefix ───────────────────────
+
+
+def test_rebuild_agent_codex_md_strips_mcp_puffo_prefix():
+    """Codex's tool router dispatches MCP tools under bare names —
+    the LLM must NOT see ``mcp__puffo__`` in its instructions or it
+    will generate calls the router rejects with ``unsupported``."""
+    root = _tmp()
+    shared = root / "shared"
+    profile = root / "profile.md"
+    profile.write_text("# Soul\nI am codex.", encoding="utf-8")
+    memory = root / "memory"
+    memory.mkdir()
+    workspace = root / "workspace"
+    workspace.mkdir()
+    codex_user = root / ".codex"
+
+    out = rebuild_agent_codex_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        codex_user_dir=codex_user,
+    )
+
+    # Primer originally references the prefix; codex variant must
+    # not.
+    assert "mcp__puffo__" not in out
+    # Bare tool names still present so the LLM sees what to call.
+    assert "send_message" in out
+    # File written.
+    assert (codex_user / "AGENTS.md").read_text(encoding="utf-8") == out
+
+
+def test_sync_shared_skills_codex_strips_prefix_in_skill_bodies():
+    """Skill bodies mirror the same convention as the primer —
+    codex needs them prefix-free."""
+    root = _tmp()
+    shared = root / "shared"
+    workspace = root / "workspace"
+    workspace.mkdir()
+
+    # Reseed populates shared/skills/<id>/SKILL.md with the
+    # DEFAULT_SKILLS bodies (which include mcp__puffo__ refs).
+    reseed_shared_primer(shared)
+
+    sync_shared_skills_codex(shared, workspace)
+
+    skills_root = workspace / ".agents" / "skills"
+    assert skills_root.is_dir(), "skills dir should be created"
+    found_skill_md = False
+    for skill_md in skills_root.glob("*/SKILL.md"):
+        found_skill_md = True
+        body = skill_md.read_text(encoding="utf-8")
+        assert "mcp__puffo__" not in body, (
+            f"{skill_md} still carries mcp__puffo__ prefix — codex "
+            f"router would reject calls generated against it"
+        )
+    assert found_skill_md, "no SKILL.md files materialised"
 
 
 # ── agent reset-primer CLI ──────────────────────────────────────────
