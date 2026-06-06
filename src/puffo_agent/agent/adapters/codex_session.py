@@ -337,22 +337,11 @@ class CodexSession:
         )
 
     async def reload(self, new_system_prompt: str) -> None:
-        """Update the in-memory ``current_instructions`` snapshot.
-
-        If the App Server honours per-turn ``instructions`` (Phase 0
-        #1), this is sufficient — the next ``sendUserTurn`` carries
-        the new prompt with no thread restart. If the server ignores
-        it, we degrade to "respawn on next warm" by clearing the
-        process state. History is lost in that fallback; the v1
-        trade-off is documented in this module's docstring.
-        """
-        if new_system_prompt == self.current_instructions:
-            return
+        """Tear the codex App Server process down so the next turn
+        re-spawns it and re-reads config.toml + AGENTS.md."""
         self.current_instructions = new_system_prompt
-        # Conservative for alpha: don't tear down the process here.
-        # ``run_turn`` will pass ``instructions`` per turn; if that's
-        # silently ignored, the user notices and we lift to "respawn
-        # on reload" in 0.10.0a2.
+        async with self._lock:
+            await self._teardown_locked()
 
     async def aclose(self) -> None:
         async with self._lock:

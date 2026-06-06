@@ -312,15 +312,9 @@ def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
 
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
-    """Return host codex ``[mcp_servers.*]`` as ``{name: {command, args, env}}``.
-
-    Honours ``$CODEX_HOME``. Returns ``{}`` on missing / unreadable /
-    malformed file (defensive: a broken host config can't block agent
-    startup). Drops entries with empty/non-string ``command``. Spec
-    surface is ``command/args/env`` only — widen here + in
-    ``_emit_codex_mcp_block`` together if codex grows a load-bearing
-    field (cwd / disabled / startup_timeout_sec / …).
-    """
+    """Return host codex ``[mcp_servers.*]`` as a per-name spec dict.
+    Honours ``$CODEX_HOME``; ``{}`` on missing / unreadable / malformed.
+    Drops entries that match neither stdio nor http/sse shape."""
     import tomllib
     codex_home_env = os.environ.get("CODEX_HOME")
     codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
@@ -331,7 +325,6 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
         with host_config.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, ValueError):
-        # tomllib.TOMLDecodeError ⊂ ValueError.
         return {}
     raw = data.get("mcp_servers")
     if not isinstance(raw, dict):
@@ -340,15 +333,26 @@ def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
     for name, spec in raw.items():
         if not isinstance(spec, dict):
             continue
+        raw_env = spec.get("env")
+        env = dict(raw_env) if isinstance(raw_env, dict) else {}
+        url = spec.get("url")
+        if isinstance(url, str) and url:
+            entry: dict = {"url": url, "env": env}
+            bearer = spec.get("bearer_token_env_var")
+            if isinstance(bearer, str) and bearer:
+                entry["bearer_token_env_var"] = bearer
+            headers = spec.get("http_headers")
+            if isinstance(headers, dict) and headers:
+                entry["http_headers"] = {
+                    str(k): str(v) for k, v in headers.items()
+                }
+            out[name] = entry
+            continue
         cmd = spec.get("command")
         if not isinstance(cmd, str) or not cmd:
             continue
-        # args / env are defensively typed: a hostile host config with
-        # ``args = "x"`` would otherwise split into chars via list(str).
         raw_args = spec.get("args")
         args = list(raw_args) if isinstance(raw_args, list) else []
-        raw_env = spec.get("env")
-        env = dict(raw_env) if isinstance(raw_env, dict) else {}
         out[name] = {"command": cmd, "args": args, "env": env}
     return out
 
@@ -776,6 +780,15 @@ class DataServiceConfig:
 
 
 @dataclass
+class RpcServiceConfig:
+    """Loopback RPC the MCP calls for daemon-mediated ops (install/sync host MCP).
+    See ``portal/rpc_service.py``."""
+    enabled: bool = True
+    bind_host: str = "127.0.0.1"
+    port: int = 63385
+
+
+@dataclass
 class BridgeConfig:
     """Local HTTP API for the puffo web/desktop client. Loopback only;
     auth uses the same ed25519 request-signing scheme as puffo-server.
@@ -832,6 +845,9 @@ class DaemonConfig:
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
     )
+    rpc_service: "RpcServiceConfig" = field(
+        default_factory=lambda: RpcServiceConfig(),
+    )
 
     @classmethod
     def load(cls) -> "DaemonConfig":
@@ -874,6 +890,13 @@ class DaemonConfig:
             bind_host=str(d.get("bind_host", ds_defaults.bind_host)),
             port=int(d.get("port", ds_defaults.port)),
         )
+        r = raw.get("rpc_service") or {}
+        rs_defaults = RpcServiceConfig()
+        cfg.rpc_service = RpcServiceConfig(
+            enabled=bool(r.get("enabled", rs_defaults.enabled)),
+            bind_host=str(r.get("bind_host", rs_defaults.bind_host)),
+            port=int(r.get("port", rs_defaults.port)),
+        )
         return cfg
 
     def save(self) -> None:
@@ -893,6 +916,7 @@ class DaemonConfig:
             "google": asdict(self.google),
             "bridge": asdict(self.bridge),
             "data_service": asdict(self.data_service),
+            "rpc_service": asdict(self.rpc_service),
         }
         _atomic_write_yaml(path, data)
 
@@ -998,6 +1022,10 @@ class AgentConfig:
     # project-level convention (.claude/CLAUDE.md, .claude/skills/) is
     # found automatically. Not user-configurable; owned by the adapter.
     triggers: TriggerRules = field(default_factory=TriggerRules)
+    # Operator-picked template ids installed at spawn AFTER host-sync,
+    # de-duped against whatever host already provides.
+    desired_skills: list[str] = field(default_factory=list)
+    desired_mcps: list[str] = field(default_factory=list)
     created_at: int = 0
 
     @classmethod
@@ -1061,6 +1089,8 @@ class AgentConfig:
                 on_mention=bool(triggers.get("on_mention", True)),
                 on_dm=bool(triggers.get("on_dm", True)),
             ),
+            desired_skills=list(raw.get("desired_skills") or []),
+            desired_mcps=list(raw.get("desired_mcps") or []),
             created_at=int(raw.get("created_at", 0)),
         )
 
@@ -1081,6 +1111,8 @@ class AgentConfig:
             "memory_dir": self.memory_dir,
             "workspace_dir": self.workspace_dir,
             "triggers": asdict(self.triggers),
+            "desired_skills": list(self.desired_skills),
+            "desired_mcps": list(self.desired_mcps),
         }
         _atomic_write_yaml(path, data)
 

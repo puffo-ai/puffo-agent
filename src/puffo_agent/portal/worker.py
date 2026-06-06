@@ -185,8 +185,9 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
                 # MCP runs inside the container; reach the host's
-                # 127.0.0.1 data service via Docker's host alias.
-                data_service_url="http://host.docker.internal:63386",
+                # 127.0.0.1 data + rpc services via Docker's host alias.
+                data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
+                rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-docker",
                 harness=agent_cfg.runtime.harness,
             )
@@ -215,6 +216,11 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             owner_username=operator,
             permission_mode=agent_cfg.runtime.permission_mode,
             harness=harness,
+            desired_skills=agent_cfg.desired_skills,
+            desired_mcps=agent_cfg.desired_mcps,
+            puffo_core_server_url=agent_cfg.puffo_core.server_url,
+            puffo_core_slug=agent_cfg.puffo_core.slug,
+            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
@@ -227,6 +233,8 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
+                data_service_url=f"http://127.0.0.1:{daemon_cfg.data_service.port}",
+                rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
             )
@@ -676,6 +684,26 @@ class Worker:
         constructed (warm() hasn't completed yet)."""
         if self._client is not None:
             self._client.set_profile(slug, display_name, avatar_url)
+
+    def host_mcp_context(self):
+        """Build a ``HostMcpContext`` from this worker's live state.
+        Returns None until ``warm()`` has built the message client."""
+        client = self._client
+        if client is None:
+            return None
+        from .host_mcp_handler import HostMcpContext
+        from .state import agent_home_dir
+        harness = self.agent_cfg.runtime.harness or "claude-code"
+        return HostMcpContext(
+            agent_id=self.agent_cfg.id,
+            slug=client.slug,
+            operator_slug=client.operator_slug,
+            host_home=Path.home(),
+            agent_home=agent_home_dir(self.agent_cfg.id),
+            harness=harness,
+            keystore=client.keystore,
+            http_client=client.http,
+        )
 
     async def stop(self) -> None:
         self._stop.set()

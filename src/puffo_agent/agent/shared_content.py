@@ -9,8 +9,20 @@ combines primer + profile + memory snapshot into the per-agent prompt.
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterator
 from pathlib import Path
+
+
+# codex's MCP router dispatches on bare names; claude-code namespaces
+# them as ``mcp__<server>__<name>``. Primers/skills are written in
+# the claude-code convention, so the codex variants must strip the
+# prefix or codex rejects with "unsupported call".
+_MCP_PUFFO_PREFIX_RE = re.compile(r"\bmcp__puffo__")
+
+
+def _strip_puffo_mcp_prefix_for_codex(text: str) -> str:
+    return _MCP_PUFFO_PREFIX_RE.sub("", text)
 
 
 DEFAULT_SHARED_CLAUDE_MD = """\
@@ -139,8 +151,9 @@ ships.
 
 `mcp__puffo__send_message` is your primary reply mechanism (see
 "How to reply"). Other tools read context or manage yourself.
-Skill docs: `.claude/skills/` on claude-code; inline above on
-codex.
+On claude-code the per-tool how-to docs auto-load as project skills
+from `.claude/skills/<name>/SKILL.md`; on codex the bullet list
+below is the authoritative reference.
 
 **Write:**
 - `send_message(channel, text, is_visible_to_human, root_id="")`
@@ -161,14 +174,19 @@ codex.
   **Force-refreshes** from puffo-server every call and refreshes the
   daemon's profile cache. Use when the operator mentions someone
   renamed themselves or you see a stale name in the prompt.
-- `fetch_channel_files(channel, limit=20)` — not yet implemented.
 
 **Self-management (claude-code only):**
 - `reload_system_prompt()` — rebuild system prompt from disk +
   restart subprocess after editing profile/memory/CLAUDE.md.
 - `refresh(model=None)` — respawn subprocess; optional model switch.
-  Valid models: `claude-opus-4-7`, `claude-opus-4-6-1m` (1M
-  context), `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`.
+  Valid models: `claude-opus-4-7`, `claude-sonnet-4-6`,
+  `claude-haiku-4-5`.
+- `install_host_mcp(template_id)` — lay a catalog MCP spec into the
+  operator's host `~/.claude.json` so they can complete OAuth there.
+  Pair with `sync_host_mcp` once they confirm. See the
+  `use-host-mcp` skill.
+- `sync_host_mcp(template_id)` — copy the operator's populated entry
+  from host into your own `.claude.json`. Pair with `refresh()`.
 
 Use write tools with intent — proactive messages surprise people.
 Read tools are cheap.
@@ -488,29 +506,6 @@ slugs typically follow the `<basename>-<4hex>` pattern (e.g.
 """
 
 
-DEFAULT_SKILL_FETCH_CHANNEL_FILES = """\
-# Skill: fetch_channel_files (not yet implemented)
-
-Back-fill file attachments from the last N posts in a channel into
-your workspace.
-
-**Tool:** `mcp__puffo__fetch_channel_files`
-
-**Status:** the puffo-core blob *query* endpoint is still a
-server-side stub. Calling this tool today returns
-`"(fetch_channel_files: blob query API not yet implemented)"`.
-Note that `mcp__puffo__send_message_with_attachments` IS
-implemented — only the back-fill / search-by-channel flow is
-pending.
-
-**Today's workaround:** the daemon already saves any incoming
-attachment to ``<workspace>/.puffo/inbox/<envelope_id>/`` as the
-turn arrives, so files from messages you've already received are
-on disk. If you need a file from a message you missed, ask the
-operator to forward it.
-"""
-
-
 DEFAULT_SKILL_GET_POST = """\
 # Skill: get_post
 
@@ -613,30 +608,198 @@ reach for `refresh` after `install_skill` / `install_mcp_server`.
 """
 
 
-DEFAULT_SKILLS: dict[str, str] = {
-    "send-message.md": DEFAULT_SKILL_SEND_MESSAGE,
-    "send-message-with-attachments.md": DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
-    "attachments.md": DEFAULT_SKILL_ATTACHMENTS,
-    "permissions.md": DEFAULT_SKILL_PERMISSIONS,
-    "channel-history.md": DEFAULT_SKILL_CHANNEL_HISTORY,
-    "channel-members.md": DEFAULT_SKILL_CHANNEL_MEMBERS,
-    "fetch-channel-files.md": DEFAULT_SKILL_FETCH_CHANNEL_FILES,
-    "get-post.md": DEFAULT_SKILL_GET_POST,
-    "get-user-info.md": DEFAULT_SKILL_GET_USER_INFO,
-    "reload-system-prompt.md": DEFAULT_SKILL_RELOAD,
+DEFAULT_SKILL_USE_HOST_MCP = """\
+# Skill: use-host-mcp
+
+Use this when an MCP server you need requires credentials (OAuth
+tokens, API keys) you can't provide yourself. Common cases:
+
+1. A `desired_mcp` you were configured with has empty env values
+   (e.g. `GMAIL_REFRESH_TOKEN`, `CDP_API_KEY`) and calls to it fail
+   at auth time.
+2. The operator asked for capability X and you found an MCP package
+   for it on the web (Coinbase CDP MCP, GitHub MCP, a vendor's
+   docs page) that's NOT in puffo-server's catalog.
+
+Either way the path is the same: lay the spec down on host, the
+operator completes auth there, then you pull the populated config
+into your own agent.
+
+## When NOT to use
+
+- The MCP has no env requirements — desired_install already wrote it
+  into your `.claude.json`; just call `refresh()` and try it.
+- The credential is already on host — skip Step 1 and go straight to
+  `sync_host_mcp`.
+
+## Workflow
+
+### Step 1 — `install_host_mcp(...)`
+
+Two forms, pick whichever fits how you found the MCP:
+
+**A. Catalog-driven** (operator-curated, ``desired_mcp`` lineage):
+
+```
+install_host_mcp(
+    name="gmail-read",
+    template_id="gmail-read",
+)
+```
+
+Looks up the spec from `/v2/mcp-templates/<template_id>` on
+puffo-server. `name` is the key under `mcpServers[<name>]` on host
+(usually matches `template_id`).
+
+**B. Adhoc** (transcribed from an MCP package's own README):
+
+```
+install_host_mcp(
+    name="coinbase-cdp",
+    spec={
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@coinbase/cdp-mcp"],
+        "env": {"CDP_API_KEY_NAME": "", "CDP_API_KEY_SECRET": ""},
+    },
+)
+```
+
+Use empty strings for env values the operator needs to populate. The
+tool validates the shape (`type` ∈ {stdio, sse, http}, required
+fields per transport) and refuses malformed specs before touching
+disk.
+
+Either form auto-DMs the operator a one-line confirmation
+("I just installed **X** into your host ~/.claude.json as
+mcpServers['X']") once the host write succeeds. If you have
+setup-context to share (docs URL, env keys they need to populate,
+gotchas) follow the install call with your own
+``mcp__puffo__send_message`` — the auto-DM is intentionally
+minimal so the operator can read their own .claude.json as the
+source of truth.
+
+Read the tool's return value carefully — it reports the real
+outcome:
+
+- "Installed `<name>` … AND DM'd @<operator>" — both side effects
+  landed; wait for the operator's ping, then jump to Step 2.
+- "`<name>` is already registered" — no DM was sent (operator already
+  configured it). Skip to Step 2.
+- "Installed `<name>` … BUT sending … DM … failed" — host write
+  landed but DM didn't. Retry by sending the message body the tool
+  returned via `mcp__puffo__send_message` yourself.
+- Tool raised an error before "Installed" — nothing was written and
+  no DM was sent. Surface the error to the operator.
+
+### Step 2 — `sync_host_mcp("<name>")`
+
+Once the operator pings you back saying host setup is done, call
+this with the **same `name`** you passed to `install_host_mcp`. It
+copies the populated entry (now carrying OAuth tokens / API keys)
+from `<operator_home>/.claude.json` into your own
+`<agent>/.claude.json`. The transfer is verbatim — what host has is
+what you get.
+
+### Step 3 — `refresh()`
+
+Respawns your claude subprocess so it re-discovers the new MCP
+server. After this, calls to the MCP's tools should succeed.
+
+## Errors
+
+- `install_host_mcp` → "catalog fetch failed for '<id>'" — the
+  `template_id` isn't in `/v2/mcp-templates/` on puffo-server; switch
+  to the adhoc form with `spec=...`, or ask the operator to seed the
+  catalog.
+- `install_host_mcp` → "spec.type must be one of [...]" / "spec.command
+  is required for stdio transport" / etc. — your adhoc spec is
+  malformed. Re-read the MCP's docs and pass `spec` with the right
+  shape.
+- `install_host_mcp` → "pass exactly one of `template_id` or `spec`"
+  — you set both or neither. Pick a form.
+- `sync_host_mcp` → "no entry for '<name>' in host's ~/.claude.json"
+  — the operator hasn't finished setup yet (or skipped install).
+  Re-DM them via `send_message`.
+- After `refresh()`, MCP calls still fail with auth — the host entry
+  may still have empty env. Ask the operator to populate it and run
+  `sync_host_mcp` + `refresh()` again.
+"""
+
+
+# Each entry: skill id → (one-line description, body).
+# The description goes into the YAML frontmatter Claude Code reads
+# for skill discovery; the body is everything below the frontmatter.
+DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
+    "send-message": (
+        "Reply to a Puffo.ai channel or DM via the puffo MCP toolkit.",
+        DEFAULT_SKILL_SEND_MESSAGE,
+    ),
+    "send-message-with-attachments": (
+        "Send files from your workspace to a Puffo.ai channel or DM.",
+        DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
+    ),
+    "attachments": (
+        "Read inbound file attachments saved under .puffo/inbox/.",
+        DEFAULT_SKILL_ATTACHMENTS,
+    ),
+    "permissions": (
+        "Decide is_visible_to_human and pick the right channel/DM.",
+        DEFAULT_SKILL_PERMISSIONS,
+    ),
+    "channel-history": (
+        "Read recent posts and threads from a Puffo.ai channel.",
+        DEFAULT_SKILL_CHANNEL_HISTORY,
+    ),
+    "channel-members": (
+        "List a channel's member slugs + roles.",
+        DEFAULT_SKILL_CHANNEL_MEMBERS,
+    ),
+    "get-post": (
+        "Fetch one envelope by id from the daemon's local store.",
+        DEFAULT_SKILL_GET_POST,
+    ),
+    "get-user-info": (
+        "Look up a user's slug, display_name, and avatar_url.",
+        DEFAULT_SKILL_GET_USER_INFO,
+    ),
+    "reload-system-prompt": (
+        "Rebuild your system prompt from disk after editing profile/memory.",
+        DEFAULT_SKILL_RELOAD,
+    ),
+    "use-host-mcp": (
+        "Bring an MCP that needs operator-side OAuth/credentials from "
+        "host into your own agent config.",
+        DEFAULT_SKILL_USE_HOST_MCP,
+    ),
 }
+
+_MANAGED_MARKER = ".puffo-managed"
+_MANAGED_MARKER_BODY = (
+    "This skill is mirrored from the puffo-agent install on every "
+    "worker start. Edits to SKILL.md here are overwritten; edit "
+    "the source under ~/.puffo-agent/shared/skills/<id>/SKILL.md\n"
+)
+
+
+def _skill_body_with_frontmatter(skill_id: str, description: str, body: str) -> str:
+    """Prepend YAML frontmatter. Idempotent — bodies already starting with ``---`` pass through."""
+    if body.lstrip().startswith("---"):
+        return body
+    return f"---\nname: {skill_id}\ndescription: {description}\n---\n\n{body}"
 
 
 def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
-    """The shared-primer files the daemon owns, paired with the
-    content baked into this install. Single source of truth for both
-    ``ensure_shared_primer`` (seed-if-missing) and
-    ``reseed_shared_primer`` (force back to this version).
-    """
+    """Single source of truth for ``ensure_shared_primer`` (seed-if-missing)
+    and ``reseed_shared_primer`` (force back to this version)."""
     yield shared_dir / "CLAUDE.md", DEFAULT_SHARED_CLAUDE_MD
     yield shared_dir / "README.md", DEFAULT_SHARED_README
-    for name, body in DEFAULT_SKILLS.items():
-        yield shared_dir / "skills" / name, body
+    for skill_id, (description, body) in DEFAULT_SKILLS.items():
+        skill_dir = shared_dir / "skills" / skill_id
+        yield skill_dir / "SKILL.md", _skill_body_with_frontmatter(
+            skill_id, description, body,
+        )
+        yield skill_dir / _MANAGED_MARKER, _MANAGED_MARKER_BODY
 
 
 def ensure_shared_primer(shared_dir: Path) -> None:
@@ -695,25 +858,82 @@ def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
     return results
 
 
-def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
-    """Mirror ``shared/skills/*.md`` into ``<workspace>/.claude/skills/``
-    so Claude Code and SDK project-scope lookup discover them. Always
-    overwrites so shared edits propagate on the next worker restart.
-    """
-    src = shared_dir / "skills"
-    if not src.is_dir():
+def _sync_shared_skills_to(
+    src_root: Path,
+    dst_root: Path,
+    *,
+    body_transform=None,
+) -> None:
+    """Mirror managed skills into ``dst_root``. Prunes legacy flat
+    ``*.md`` and any subdir carrying our marker whose id isn't in
+    ``DEFAULT_SKILLS``; operator-authored subdirs (no marker) are
+    untouched. ``body_transform`` is applied per SKILL.md before write."""
+    import shutil
+    dst_root.mkdir(parents=True, exist_ok=True)
+
+    # 1. Legacy flat .md files from the pre-SKILL.md layout.
+    for path in dst_root.glob("*.md"):
+        if path.is_file():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    # 2. Stale managed subdirs (skill removed/renamed in code).
+    current_ids = set(DEFAULT_SKILLS.keys())
+    for entry in dst_root.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name in current_ids:
+            continue
+        if (entry / _MANAGED_MARKER).exists():
+            try:
+                shutil.rmtree(entry)
+            except OSError:
+                pass
+
+    # 3. Mirror current managed skills.
+    if not src_root.is_dir():
         return
-    dst = workspace_dir / ".claude" / "skills"
-    dst.mkdir(parents=True, exist_ok=True)
-    for path in src.glob("*.md"):
+    for skill_id in current_ids:
+        src_skill = src_root / skill_id / "SKILL.md"
+        if not src_skill.exists():
+            continue
+        dst_skill_dir = dst_root / skill_id
+        dst_skill_dir.mkdir(parents=True, exist_ok=True)
         try:
-            (dst / path.name).write_text(
-                path.read_text(encoding="utf-8"),
-                encoding="utf-8",
+            body = src_skill.read_text(encoding="utf-8")
+            if body_transform is not None:
+                body = body_transform(body)
+            (dst_skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
+            (dst_skill_dir / _MANAGED_MARKER).write_text(
+                _MANAGED_MARKER_BODY, encoding="utf-8",
             )
         except OSError:
             # Non-fatal — skills are a nice-to-have.
             continue
+
+
+def sync_shared_skills(shared_dir: Path, workspace_dir: Path) -> None:
+    """Mirror shared skills into the agent's workspace at the path
+    Claude Code's project-scope discovery walks
+    (``.claude/skills/<id>/SKILL.md``).
+    """
+    _sync_shared_skills_to(
+        shared_dir / "skills",
+        workspace_dir / ".claude" / "skills",
+    )
+
+
+def sync_shared_skills_codex(shared_dir: Path, workspace_dir: Path) -> None:
+    """Mirror into codex's project-scope discovery path
+    (``.agents/skills/<id>/SKILL.md``). Strips ``mcp__puffo__`` prefix
+    so tool references match codex's bare-name router."""
+    _sync_shared_skills_to(
+        shared_dir / "skills",
+        workspace_dir / ".agents" / "skills",
+        body_transform=_strip_puffo_mcp_prefix_for_codex,
+    )
 
 
 def read_shared_primer(shared_dir: Path) -> str:
@@ -816,12 +1036,13 @@ def rebuild_agent_codex_md(
 
     Same content shape as ``rebuild_agent_claude_md`` (shared primer +
     agent profile + memory snapshot), targeting codex's instruction-
-    file path. codex has no equivalent of Claude Code's ``.skills/``
-    layout, so we skip the skills sync step — the primer carries the
-    same operator-facing platform guidance regardless of harness.
+    file path. Skill bodies mirror into ``workspace/.agents/skills/``
+    where codex's project-scope discovery walks; the SKILL.md +
+    frontmatter shape is identical to Claude Code's.
     """
     ensure_shared_primer(shared_dir)
-    primer = read_shared_primer(shared_dir)
+    sync_shared_skills_codex(shared_dir, workspace_dir)
+    primer = _strip_puffo_mcp_prefix_for_codex(read_shared_primer(shared_dir))
     try:
         profile_text = profile_path.read_text(encoding="utf-8")
     except OSError:

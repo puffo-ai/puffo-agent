@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore
 from .data_client import DataClient
+from ._host_mcp import PuffoRpcClient
 from .host_tools import (
     _install_mcp_server,
     _install_skill,
@@ -70,13 +71,20 @@ def _register_local_tools(
 
     @mcp.tool()
     async def refresh(model: Optional[str] = None) -> str:
-        """Respawn your claude subprocess so it re-discovers skills,
-        MCP servers, and optionally switches to a new model."""
-        _require_claude_code("refresh")
+        """Respawn your CLI subprocess (claude-code or codex) so it
+        re-discovers skills, MCP servers, and optionally switches to
+        a new model. Not available under hermes / gemini-cli — both
+        run one-shot per turn with no long-lived subprocess to
+        respawn."""
+        if harness and harness not in ("claude-code", "codex"):
+            raise RuntimeError(
+                f"refresh is only supported under the claude-code "
+                f"and codex harnesses (this agent is using {harness!r})."
+            )
         _write_refresh_flag(Path(workspace), model)
         tail = f" (model override: {model!r})" if model is not None else ""
         return (
-            "refresh requested — your claude subprocess will respawn "
+            "refresh requested — your CLI subprocess will respawn "
             "before your next message" + tail + "."
         )
 
@@ -154,7 +162,7 @@ def _register_local_tools(
             registered the server (and ``claude /plugin uninstall``
             the right one if needed).
         """
-        entries = _list_mcp_servers(Path(workspace), Path.home())
+        entries = _list_mcp_servers(Path(workspace), Path.home(), harness)
         if not entries:
             return "(no MCP servers registered)"
         lines: list[str] = []
@@ -183,10 +191,14 @@ def build_server(
 ) -> FastMCP:
     ks = KeyStore(keystore_dir)
     http = PuffoCoreHttpClient(server_url, ks, slug)
-    # Read-only client for the daemon's data service. The MCP never
-    # opens the agent's SQLite directly — the daemon is the sole
-    # reader/writer regardless of where the MCP runs.
     data = DataClient(data_service_url, agent_id)
+
+    # None when PUFFO_RPC_URL is unset; tools surface a clear error
+    # instead of crashing the whole MCP at startup.
+    rpc_url = os.environ.get("PUFFO_RPC_URL", "")
+    rpc_client = (
+        PuffoRpcClient(rpc_url, agent_id) if rpc_url else None
+    )
 
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
@@ -196,6 +208,7 @@ def build_server(
         data_client=data,
         space_id=space_id,
         workspace=workspace,
+        rpc_client=rpc_client,
     )
 
     mcp = FastMCP("puffo-core")

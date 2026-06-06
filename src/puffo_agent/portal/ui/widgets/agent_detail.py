@@ -100,7 +100,10 @@ def _scan_mcp_servers(
 
     out: list[tuple[str, str, dict]] = []
     if harness == "claude-code":
+        # Daemon-managed puffo MCP — registered via --mcp-config to
+        # claude-cli, so it never appears in .claude.json.
         json_sources = [
+            ("puffo",           agent_root / "mcp-config.json"),
             ("agent",           agent_root / ".claude.json"),
             ("host",            home / ".claude.json"),
             ("agent workspace", agent_root / "workspace" / ".mcp.json"),
@@ -289,8 +292,12 @@ class AgentDetail(QWidget):
         outer.setContentsMargins(8, 8, 8, 8)
         outer.setSpacing(6)
         hint = QLabel(
-            "Skills installed under <code>workspace/.claude/skills/</code> "
-            "(agent-scope) and <code>~/.claude/skills/</code> (system-scope)."
+            "Skills the running harness can load — user-scope "
+            "(<code>&lt;agent&gt;/.claude/skills/</code>), project-scope "
+            "(<code>workspace/.claude/skills/</code> for claude-code, "
+            "<code>workspace/.agents/skills/</code> for codex), plus per-"
+            "plugin <code>plugins/&lt;plugin&gt;/skills/&lt;name&gt;/SKILL.md</code>, "
+            "and the operator's host-scope source."
         )
         hint.setStyleSheet("color: #6b7280;")
         hint.setWordWrap(True)
@@ -705,22 +712,36 @@ class AgentDetail(QWidget):
         self._skill_detail.setPlainText("(select a skill to see its SKILL.md)")
         from ...state import agent_dir
         agent_root = agent_dir(cfg.id)
+        workspace = cfg.resolve_workspace_dir()
         home = Path.home()
-        # Only show the dirs the agent's own harness can actually load.
-        # Mixing harnesses would confuse the operator (a codex agent
-        # never reads .claude/skills/).
-        skill_dirname = _HARNESS_SKILL_DIRNAME.get(cfg.runtime.harness)
-        if skill_dirname is None:
+        harness = cfg.runtime.harness
+
+        # Every SKILL.md the running harness can actually load, grouped
+        # by where it came from. Each scope is a (label, root) pair —
+        # root holds top-level ``<name>/SKILL.md`` subdirs; plugin
+        # scopes are enumerated separately below.
+        scopes: list[tuple[str, Path]] = []
+        plugin_roots: list[Path] = []
+        if harness == "claude-code":
+            scopes.append(("agent",     agent_root / ".claude" / "skills"))
+            scopes.append(("workspace", workspace  / ".claude" / "skills"))
+            scopes.append(("host",      home       / ".claude" / "skills"))
+            plugin_roots.append(agent_root / ".claude" / "plugins")
+        elif harness == "codex":
+            scopes.append(("workspace", workspace  / ".agents" / "skills"))
+            scopes.append(("host",      home       / ".agents" / "skills"))
+        elif harness == "gemini-cli":
+            scopes.append(("agent", agent_root / ".gemini" / "skills"))
+            scopes.append(("host",  home       / ".gemini" / "skills"))
+        else:
             self._skills_list.addItem(
-                QListWidgetItem(f"(harness {cfg.runtime.harness!r} has no skill convention)")
+                QListWidgetItem(f"(harness {harness!r} has no skill convention)")
             )
             return
-        search = [
-            ("agent", agent_root / skill_dirname / "skills"),
-            ("host",  home / skill_dirname / "skills"),
-        ]
+
         any_found = False
-        for scope, root in search:
+
+        for scope_label, root in scopes:
             if not root.is_dir():
                 continue
             for entry in sorted(root.iterdir()):
@@ -729,10 +750,27 @@ class AgentDetail(QWidget):
                 skill_md = entry / "SKILL.md"
                 if not skill_md.exists():
                     continue
-                item = QListWidgetItem(f"[{scope}] {entry.name}")
+                item = QListWidgetItem(f"[{scope_label}] {entry.name}")
                 item.setData(Qt.UserRole, str(skill_md))
                 self._skills_list.addItem(item)
                 any_found = True
+
+        # Plugin scope: per-plugin ``skills/<name>/SKILL.md`` is the
+        # convention Claude Code's plugin system loads. The marketplace
+        # tree nests several levels deep so we rglob and label with
+        # the immediate plugin dir.
+        for plugins_root in plugin_roots:
+            if not plugins_root.is_dir():
+                continue
+            for skill_md in sorted(plugins_root.rglob("skills/*/SKILL.md")):
+                plugin_dir = skill_md.parent.parent.parent  # <plugin>/skills/<name>/SKILL.md
+                plugin_name = plugin_dir.name
+                skill_name = skill_md.parent.name
+                item = QListWidgetItem(f"[plugin:{plugin_name}] {skill_name}")
+                item.setData(Qt.UserRole, str(skill_md))
+                self._skills_list.addItem(item)
+                any_found = True
+
         if not any_found:
             self._skills_list.addItem(QListWidgetItem("(no skills installed)"))
 

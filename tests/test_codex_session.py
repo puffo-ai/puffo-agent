@@ -503,7 +503,11 @@ while True:
 '''
 
 
-def test_reload_hot_swaps_instructions(tmp_path):
+def test_reload_tears_down_process_for_respawn(tmp_path):
+    """reload() must tear the app-server process down so the next
+    turn respawns it with a fresh ``config.toml`` read. Without that,
+    new MCP entries (``install_host_mcp`` → ``sync_host_mcp`` flow)
+    never reach the running codex thread."""
     fake = _write_fake(tmp_path, RELOAD_SCRIPT)
     session_file = tmp_path / "codex_session.json"
     cs = CodexSession(
@@ -515,15 +519,23 @@ def test_reload_hot_swaps_instructions(tmp_path):
 
     async def _run():
         await cs.warm("v1")
-        r1 = await cs.run_turn("first", "v1")
+        assert cs._proc is not None
+        proc_before = cs._proc
         await cs.reload("v2")
-        r2 = await cs.run_turn("second", "v2")
+        # After reload the app-server process is gone — the next
+        # run_turn will spawn a fresh one.
+        assert cs._proc is None
+        # current_instructions snapshot still flips so the next
+        # sendUserTurn carries the v2 prompt without an extra
+        # round-trip.
+        assert cs.current_instructions == "v2"
         await cs.aclose()
-        return r1.reply, r2.reply
+        return proc_before
 
-    r1, r2 = asyncio.run(_run())
-    assert r1 == "turn1"
-    assert r2 == "turn2"
+    proc_before = asyncio.run(_run())
+    # Returncode populates synchronously after _teardown_locked
+    # awaits the proc's exit.
+    assert proc_before.returncode is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

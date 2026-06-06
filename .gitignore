@@ -28,6 +28,7 @@ config.yml
 # Scratch / debugging artifacts dropped during local troubleshooting
 # (paste-in log captures, quick exports, etc.). Never tracked.
 tmp/
+.scratch/
 
 # Runtime state the daemon writes under ~/.puffo-agent, not in-tree,
 # but keep these patterns defensive in case someone launches from

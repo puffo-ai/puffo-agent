@@ -28,6 +28,8 @@ from .credential_refresh import (
     KeychainBackend,
 )
 from .data_service import set_profile_setter, start_data_service, stop_data_service
+from .host_mcp_handler import HostMcpContext
+from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -104,12 +106,10 @@ class Daemon:
         api_runner = await start_api_server(
             self.daemon_cfg.bridge, ws_local_hub=self.ws_local_hub,
         )
-        # Wire the data-service profile-cache writer to find the
-        # right worker by agent_id. ``Worker.set_profile_cache`` is a
-        # no-op before warm() finishes, so a race during partial
-        # startup is safe.
         set_profile_setter(self._set_worker_profile_cache)
+        set_rpc_resolver(self._resolve_host_mcp_context)
         data_runner = await start_data_service(self.daemon_cfg.data_service)
+        rpc_runner = await start_rpc_service(self.daemon_cfg.rpc_service)
         refresher_task = asyncio.ensure_future(
             self.refresher.run_loop(self._stop)
         )
@@ -156,7 +156,9 @@ class Daemon:
                     pass
             await stop_api_server(api_runner)
             set_profile_setter(None)
+            set_rpc_resolver(None)
             await stop_data_service(data_runner)
+            await stop_rpc_service(rpc_runner)
             clear_daemon_pid()
             clear_stop_request()
             logger.info("puffo-agent portal stopped")
@@ -298,6 +300,13 @@ class Daemon:
         if worker is None:
             return
         worker.set_profile_cache(slug, display_name, avatar_url)
+
+    def _resolve_host_mcp_context(self, agent_id: str) -> "HostMcpContext | None":
+        """Rpc-service shim. Returns None when the worker isn't warm yet."""
+        worker = self.workers.get(agent_id)
+        if worker is None:
+            return None
+        return worker.host_mcp_context()
 
     async def _stop_worker(self, agent_id: str) -> None:
         worker = self.workers.pop(agent_id, None)

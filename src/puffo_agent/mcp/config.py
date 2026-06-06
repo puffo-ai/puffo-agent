@@ -33,7 +33,6 @@ PUFFO_CORE_TOOL_NAMES = (
     "list_channel_members",
     "get_channel_history",
     "get_thread_history",
-    "fetch_channel_files",
     "get_post",
     "get_post_segment",
     "get_user_info",
@@ -45,6 +44,8 @@ PUFFO_CORE_TOOL_NAMES = (
     "install_mcp_server",
     "uninstall_mcp_server",
     "list_mcp_servers",
+    "install_host_mcp",
+    "sync_host_mcp",
     "refresh",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(
@@ -130,20 +131,33 @@ def write_codex_mcp_config(
 
 
 def _emit_codex_mcp_block(name: str, spec: dict) -> list[str]:
-    # spec is tomllib-shaped: {command, args?, env?}. Missing optional
-    # fields tolerated. Name + env keys quoted via _toml_key when they
-    # contain TOML-significant chars (dots, etc.) so `my.server` doesn't
-    # become a nested table.
+    """Emit a ``[mcp_servers.<name>]`` block. codex selects transport
+    by which key is present (``url`` → http, ``command`` → stdio).
+    Never emit ``type`` — codex doesn't recognise it."""
     key = _toml_key(name)
     out: list[str] = ["", f"[mcp_servers.{key}]"]
-    cmd = str(spec.get("command", ""))
-    out.append(f'command = "{_toml_escape(cmd)}"')
-    args = spec.get("args") or []
-    out.append(
-        "args = ["
-        + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
-        + "]"
-    )
+    url = spec.get("url")
+    if isinstance(url, str) and url:
+        out.append(f'url = "{_toml_escape(url)}"')
+        bearer = spec.get("bearer_token_env_var")
+        if isinstance(bearer, str) and bearer:
+            out.append(f'bearer_token_env_var = "{_toml_escape(bearer)}"')
+        headers = spec.get("http_headers")
+        if isinstance(headers, dict) and headers:
+            inline = ", ".join(
+                f'"{_toml_escape(str(k))}" = "{_toml_escape(str(v))}"'
+                for k, v in sorted(headers.items())
+            )
+            out.append(f'http_headers = {{ {inline} }}')
+    else:
+        cmd = str(spec.get("command", ""))
+        out.append(f'command = "{_toml_escape(cmd)}"')
+        args = spec.get("args") or []
+        out.append(
+            "args = ["
+            + ", ".join(f'"{_toml_escape(str(a))}"' for a in args)
+            + "]"
+        )
     env = spec.get("env") or {}
     if env:
         out.append("")
@@ -224,17 +238,14 @@ def puffo_core_mcp_env(
     workspace: str,
     agent_id: str = "",
     data_service_url: str = "http://127.0.0.1:63386",
+    rpc_url: str = "http://127.0.0.1:63385",
     runtime_kind: str = "",
     harness: str = "",
 ) -> dict[str, str]:
-    """Env dict for the puffo-core MCP subprocess.
-
-    ``data_service_url`` defaults to the daemon's loopback data
-    service (port 63386). cli-docker rewrites it to
-    ``http://host.docker.internal:63386`` so the container can
-    reach the host loopback. The MCP never opens ``messages.db``
-    directly — the daemon is the sole owner.
-    """
+    """Env dict for the puffo-core MCP subprocess. The MCP never
+    touches ``messages.db`` or ``~/.claude.json`` directly — the
+    daemon owns both. cli-docker rewrites the loopback URLs to
+    ``host.docker.internal``."""
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -242,11 +253,7 @@ def puffo_core_mcp_env(
         "PUFFO_CORE_KEYSTORE_DIR": keystore_dir,
         "PUFFO_WORKSPACE": workspace,
         "PUFFO_DATA_SERVICE_URL": data_service_url,
-        # See ``_python_user_base_env`` — pins user-site to the
-        # daemon's real base so the per-agent HOME override the
-        # cli-local adapter applies doesn't hide ``mcp`` from the
-        # spawned MCP subprocess. Skipped for cli-docker where the
-        # container has its own Python tree.
+        "PUFFO_RPC_URL": rpc_url,
         **_python_user_base_env(runtime_kind),
     }
     if agent_id:
@@ -257,6 +264,12 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
+    # codex only forwards [mcp_servers.puffo.env] to the subprocess,
+    # so CODEX_HOME must be pinned explicitly or list_mcp_servers
+    # would read the operator's host config instead of the agent's.
+    if harness == "codex" and workspace:
+        from pathlib import Path as _Path
+        env["CODEX_HOME"] = str(_Path(workspace).parent / ".codex")
     return env
 
 

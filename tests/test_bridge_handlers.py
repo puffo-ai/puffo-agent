@@ -54,6 +54,29 @@ async def test_info_no_auth(client):
     assert j["paired"] is False
 
 
+async def test_info_carries_cli_tools_status(client, monkeypatch):
+    from puffo_agent.portal.api import handlers
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_claude_bin", lambda: "/bin/claude",
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.claude_has_credentials", lambda: True,
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_codex_bin", lambda: None,
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.codex_has_credentials", lambda: False,
+    )
+    _ = handlers  # silence unused-import warning for the patch scope
+    r = await client.get("/v1/info", headers=_HOST)
+    j = await r.json()
+    assert j["cli_tools"] == {
+        "claude-code": "ready",
+        "codex": "not_installed",
+    }
+
+
 async def test_info_reflects_pairing_state(client):
     user = make_user()
     await _pair(client, user)
