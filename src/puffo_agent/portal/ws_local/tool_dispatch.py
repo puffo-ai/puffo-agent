@@ -1,16 +1,10 @@
 """ws-local ``tool_call`` dispatch.
 
-The existing ``mcp.puffo_core_tools.register_core_tools`` registers
-every tool via a ``@mcp.tool()`` decorator that just stashes the
-async function on the FastMCP server — the decorator does not
-transform the function itself. We exploit that: feed
-``register_core_tools`` a stand-in that captures handlers by name,
-then expose the subset ws-local clients are allowed to call.
-
-Only the six message-shaped tools are surfaced. Tools that depend on
-a harness subprocess (``refresh``, ``reload_system_prompt``) or
-operator host config (``install_host_mcp``, ``sync_host_mcp``) make
-no sense for an external AI hold the WS — they're filtered here.
+Reuses ``mcp.puffo_core_tools.register_core_tools`` by feeding it a
+FastMCP stand-in that captures handlers by name. ws-local exposes
+only the six message-shaped tools — subprocess-bound ones
+(``refresh``, ``reload_system_prompt``, ``install_host_mcp``,
+``sync_host_mcp``) are filtered out.
 """
 
 from __future__ import annotations
@@ -34,9 +28,9 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
 
 @dataclass
 class _CapturedRegistration:
-    """Pretends to be a FastMCP server. ``.tool()`` is the only
-    decorator we exercise; everything else is a permissive no-op so
-    ``register_core_tools`` doesn't crash if it grows new attributes."""
+    """FastMCP stand-in: ``.tool()`` stashes handlers, other
+    registration methods (``resource``, ``prompt``) are passthrough
+    no-ops so future FastMCP additions don't crash the capture."""
 
     handlers: dict[str, WsLocalTool]
 
@@ -46,9 +40,6 @@ class _CapturedRegistration:
             return fn
         return _decorate
 
-    # FastMCP exposes more registration methods (e.g. ``resource``);
-    # stub them out so unrelated future additions don't crash the
-    # capture. Each returns a passthrough decorator.
     def resource(self, *args: Any, **kwargs: Any):
         def _passthrough(fn):
             return fn
@@ -65,11 +56,8 @@ def build_dispatch(
     allowed: frozenset[str] = WS_LOCAL_ALLOWED_TOOLS,
 ) -> dict[str, WsLocalTool]:
     """Return ``{tool_name: async_handler}`` for the ws-local-allowed
-    subset, sourced from the real ``puffo_core_tools`` implementations.
-
-    Each call yields a fresh capture so the closures bind the right
-    ``cfg`` for that attach session.
-    """
+    subset. Each call yields a fresh capture so the closures bind to
+    the supplied ``cfg``."""
     from ...mcp.puffo_core_tools import register_core_tools
 
     captured = _CapturedRegistration(handlers={})

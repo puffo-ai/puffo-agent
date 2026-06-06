@@ -115,6 +115,167 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_tool_call_command_forwards_and_emits_result(tmp_path: Path):
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"x")
+    received: list[dict] = []
+    server_done = asyncio.Event()
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                break
+            frame = json.loads(msg.data)
+            received.append(frame)
+            if frame["type"] == "connect":
+                await ws.send_str(json.dumps({
+                    "type": "connected", "session_id": "s", "agent": {},
+                }))
+            elif frame["type"] == "tool_call":
+                await ws.send_str(json.dumps({
+                    "type": "tool_result",
+                    "command_id": frame["command_id"],
+                    "ok": True,
+                    "result": "posted ok",
+                }))
+                await ws.close()
+        server_done.set()
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        session_dir = tmp_path / "session"
+        task = asyncio.create_task(run_attach(
+            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+        ))
+        commands_path = session_dir / "commands.ndjson"
+        for _ in range(50):
+            if commands_path.exists():
+                break
+            await asyncio.sleep(0.05)
+        with commands_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "type": "tool_call", "command_id": "c1",
+                "tool": "send_message",
+                "params": {"channel": "ch_x", "text": "hi"},
+            }) + "\n")
+        await asyncio.wait_for(server_done.wait(), timeout=2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+
+        tc = next(f for f in received if f["type"] == "tool_call")
+        assert tc["command_id"] == "c1"
+        assert tc["tool"] == "send_message"
+        assert tc["params"] == {"channel": "ch_x", "text": "hi"}
+
+        events = (session_dir / "events.ndjson").read_text(encoding="utf-8")
+        results = [json.loads(l) for l in events.splitlines() if l]
+        assert any(
+            e.get("type") == "tool_result" and e.get("command_id") == "c1" and e.get("ok") is True
+            for e in results
+        )
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_rejects_non_object_params(tmp_path: Path):
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"x")
+    received: list[dict] = []
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                break
+            frame = json.loads(msg.data)
+            received.append(frame)
+            if frame["type"] == "connect":
+                await ws.send_str(json.dumps({
+                    "type": "connected", "session_id": "s", "agent": {},
+                }))
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        session_dir = tmp_path / "session"
+        task = asyncio.create_task(run_attach(
+            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+        ))
+        commands_path = session_dir / "commands.ndjson"
+        for _ in range(50):
+            if commands_path.exists():
+                break
+            await asyncio.sleep(0.05)
+        with commands_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "type": "tool_call", "command_id": "c1",
+                "tool": "send_message", "params": ["not", "an", "object"],
+            }) + "\n")
+            fh.write(json.dumps({"type": "detach"}) + "\n")
+        await asyncio.wait_for(task, timeout=2.0)
+
+        # Server should never see the malformed tool_call — only connect.
+        assert [f["type"] for f in received] == ["connect"]
+        events = (session_dir / "events.ndjson").read_text(encoding="utf-8")
+        assert "tool_call.params must be an object" in events
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_bom_prefixed_command_lines_are_accepted(tmp_path: Path):
+    """PowerShell ``Add-Content -Encoding UTF8`` writes BOM on every
+    append on Windows; the client must strip it before json.loads."""
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"x")
+    received: list[dict] = []
+    server_done = asyncio.Event()
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                break
+            frame = json.loads(msg.data)
+            received.append(frame)
+            if frame["type"] == "connect":
+                await ws.send_str(json.dumps({
+                    "type": "connected", "session_id": "s", "agent": {},
+                }))
+            elif frame["type"] == "ack":
+                await ws.close()
+        server_done.set()
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        session_dir = tmp_path / "session"
+        task = asyncio.create_task(run_attach(
+            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+        ))
+        commands_path = session_dir / "commands.ndjson"
+        for _ in range(50):
+            if commands_path.exists():
+                break
+            await asyncio.sleep(0.05)
+        # PowerShell-style: BOM as bytes, then a valid JSON ack line.
+        with commands_path.open("ab") as fh:
+            fh.write(b"\xef\xbb\xbf" + json.dumps({
+                "type": "ack", "bundle_id": "b1",
+            }).encode("utf-8") + b"\n")
+        await asyncio.wait_for(server_done.wait(), timeout=2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+        assert any(f["type"] == "ack" and f["bundle_id"] == "b1" for f in received)
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_end_command_is_forwarded(tmp_path: Path):
     bundle_path = tmp_path / "agent.puffoagent"
     bundle_path.write_bytes(b"x")

@@ -410,6 +410,15 @@ class AgentDetail(QWidget):
                 "runtime / harness / model don't apply."
                 if is_ws_local else ""
             )
+        # Skills + MCP are harness conventions (~/.claude, ~/.codex, …).
+        # ws-local agents run no harness, so both tabs become inert.
+        for tab_idx in (1, 2):
+            self._tabs.setTabEnabled(tab_idx, not is_ws_local)
+            self._tabs.setTabToolTip(
+                tab_idx,
+                "ws-local agents run no harness — Skills + MCP don't apply."
+                if is_ws_local else "",
+            )
         self._update_action_buttons()
         self._initial_snapshot = self._snapshot()
         self._check_dirty()

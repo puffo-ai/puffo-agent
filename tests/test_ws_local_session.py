@@ -227,6 +227,61 @@ async def test_reply_frame_relayed_to_sender():
 
 
 @pytest.mark.asyncio
+async def test_tool_call_unknown_tool_emits_error_result():
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    sess = _make_session(t, q, r, acked=[], replies=[])
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    t.feed({"type": "tool_call", "command_id": "c1", "tool": "made_up", "params": {}})
+    t.feed_close()
+    await task
+    results = [f for f in t.sent if f["type"] == "tool_result"]
+    assert results and results[0] == {
+        "type": "tool_result", "command_id": "c1", "ok": False,
+        "error": "unknown tool: 'made_up'",
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_call_handler_exception_surfaces_as_error_result():
+    async def boom(**_kw):
+        raise RuntimeError("kaboom")
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    sess = _make_session(t, q, r, acked=[], replies=[],
+                        tool_dispatch={"send_message": boom})
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    t.feed({"type": "tool_call", "command_id": "c2",
+            "tool": "send_message", "params": {"x": 1}})
+    t.feed_close()
+    await task
+    results = [f for f in t.sent if f["type"] == "tool_result"]
+    assert results and results[0]["ok"] is False and results[0]["error"] == "kaboom"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_handler_result_is_returned():
+    seen: dict = {}
+    async def echo(**params):
+        seen.update(params)
+        return "echoed"
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    sess = _make_session(t, q, r, acked=[], replies=[],
+                        tool_dispatch={"send_message": echo})
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    t.feed({"type": "tool_call", "command_id": "c3",
+            "tool": "send_message",
+            "params": {"channel": "ch_x", "text": "hi", "extra": True}})
+    t.feed_close()
+    await task
+    results = [f for f in t.sent if f["type"] == "tool_result"]
+    assert results[0]["ok"] is True
+    assert results[0]["result"] == "echoed"
+    assert seen == {"channel": "ch_x", "text": "hi", "extra": True}
+
+
+@pytest.mark.asyncio
 async def test_ping_gets_pong():
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
     sess = _make_session(t, q, r, acked=[], replies=[])

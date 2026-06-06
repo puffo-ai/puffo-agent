@@ -37,29 +37,23 @@ class Connect:
 
 @dataclass(frozen=True)
 class Ack:
-    """Optional "I've started" signal. Idempotent: a duplicate ack
-    or an ack landing after ``End`` is a no-op. The daemon may use
-    it to flip the agent's external status from idle to working."""
+    """Optional "I've started" signal — daemon flips status to
+    working_on. Idempotent."""
 
     bundle_id: str
 
 
 @dataclass(frozen=True)
 class End:
-    """Terminates work on a bundle: the daemon closes the turn,
-    advances the cursor, and pumps the next bundle. Idempotent —
-    duplicate ``End`` is a no-op. An agent that decides not to reply
-    can send ``End`` directly without a preceding ``Ack``."""
+    """Closes the turn + advances the cursor. Idempotent. May be sent
+    without a prior ``Ack`` (agent decides not to reply)."""
 
     bundle_id: str
 
 
 @dataclass(frozen=True)
 class ToolCall:
-    """RPC-style call to one of the ``WS_LOCAL_ALLOWED_TOOLS``. The
-    daemon dispatches to the matching ``puffo_core_tools`` handler and
-    returns a ``ToolResult`` keyed on ``command_id``. ``params`` is a
-    flat dict matching the tool's keyword args."""
+    """RPC-style call to one of the ``WS_LOCAL_ALLOWED_TOOLS``."""
 
     command_id: str
     tool: str
