@@ -135,8 +135,12 @@ async def run_attach(
                         fh.seek(last_offset)
                         chunk = fh.read(size - last_offset)
                     last_offset = size
-                    for line in chunk.decode("utf-8", errors="replace").splitlines():
-                        line = line.strip()
+                    for line in chunk.decode("utf-8-sig", errors="replace").splitlines():
+                        # ``utf-8-sig`` strips a leading BOM if any tool
+                        # appended one (PowerShell ``Add-Content -Encoding
+                        # UTF8`` does this on Windows). lstrip handles a
+                        # mid-file BOM emitted by a per-line writer.
+                        line = line.lstrip("﻿").strip()
                         if not line:
                             continue
                         try:
