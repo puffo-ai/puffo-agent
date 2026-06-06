@@ -379,6 +379,16 @@ class AgentDetail(QWidget):
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
+        # ws-local agents bring their own brain — runtime / harness / model
+        # have no daemon-side meaning, so lock the dropdowns.
+        is_ws_local = (cfg.runtime.kind or "") == "ws-local"
+        for w in (self._runtime_kind, self._harness, self._model):
+            w.setEnabled(not is_ws_local)
+            w.setToolTip(
+                "ws-local agents bring their own AI tool — daemon-side "
+                "runtime / harness / model don't apply."
+                if is_ws_local else ""
+            )
         self._update_action_buttons()
         self._initial_snapshot = self._snapshot()
         self._check_dirty()
@@ -406,9 +416,18 @@ class AgentDetail(QWidget):
         has = self._cfg is not None
         state = self._cfg.state if self._cfg else ""
         is_running = state == "running"
+        is_ws_local = bool(self._cfg) and (self._cfg.runtime.kind or "") == "ws-local"
         self._pause_resume_btn.setEnabled(has and state in {"running", "paused"})
         self._pause_resume_btn.setText("Pause" if is_running else "Resume")
-        self._refresh_btn.setEnabled(has)
+        # ws-local has no harness subprocess to drop a session for — there's
+        # nothing to refresh. The attach client is the agent's "session".
+        self._refresh_btn.setEnabled(has and not is_ws_local)
+        self._refresh_btn.setToolTip(
+            "ws-local agents have no harness session to refresh — the attach "
+            "client is the agent's session."
+            if is_ws_local
+            else "Drop cli_session.json + restart the worker for a fresh LLM context."
+        )
         self._archive_btn.setEnabled(has)
         self._export_btn.setEnabled(has and state == "paused")
         self._export_btn.setToolTip(
