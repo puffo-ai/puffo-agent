@@ -293,6 +293,21 @@ def cmd_version(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Run the reference ws-local attach client."""
+    import asyncio
+    from pathlib import Path
+    from .ws_local.ws_local_client import run_attach
+
+    session_dir = Path(args.session_dir) if args.session_dir else None
+    return asyncio.run(run_attach(
+        Path(args.bundle),
+        args.passcode,
+        bridge_url=args.bridge_url,
+        session_dir=session_dir,
+    ))
+
+
 def cmd_check_update(args: argparse.Namespace) -> int:
     """Compare installed version against the latest GitHub release.
     Never runs pip — Windows locks the running ``.exe``, and the
@@ -1590,6 +1605,35 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         help="Print bind address, allowed origins, and pairing status",
     ).set_defaults(func=cmd_api_status)
+
+    attach = sub.add_parser(
+        "ws-local",
+        help=(
+            "Reference ws-local client: hold a WebSocket session to the "
+            "daemon on behalf of a .puffoagent bundle so an external AI "
+            "tool can drive the agent through files on disk."
+        ),
+    )
+    attach.add_argument("bundle", help="Path to the .puffoagent export blob")
+    attach.add_argument(
+        "--passcode",
+        required=True,
+        help="Passcode that decrypts the bundle (matches the create-agent UI).",
+    )
+    attach.add_argument(
+        "--bridge-url",
+        default="http://127.0.0.1:63387",
+        help="Bridge HTTP base URL (default: %(default)s).",
+    )
+    attach.add_argument(
+        "--session-dir",
+        default="",
+        help=(
+            "Pre-create the session work-dir at this path. "
+            "Default: a random ``puffo-attach-XXXX`` under the system temp dir."
+        ),
+    )
+    attach.set_defaults(func=cmd_attach)
 
     # macOS Keychain integration probes (no-op on Linux/Windows).
     from .diagnostic import register_test_subcommands
