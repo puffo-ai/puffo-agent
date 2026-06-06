@@ -51,6 +51,8 @@ async def test_info_no_auth(client):
     assert r.status == 200
     j = await r.json()
     assert j["service"] == "puffo-agent-bridge"
+    assert j["runtime"] == "puffo-agent"
+    assert isinstance(j["daemon_version"], str) and j["daemon_version"]
     assert j["paired"] is False
 
 

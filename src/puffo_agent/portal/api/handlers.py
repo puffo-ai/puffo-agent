@@ -97,6 +97,7 @@ async def info(_request: web.Request) -> web.Response:
     return web.json_response({
         "service": "puffo-agent-bridge",
         "version": "v1",
+        "runtime": "puffo-agent",
         "daemon_version": daemon_version,
         "pid": os.getpid(),
         "agent_count": len(discover_agents()),
