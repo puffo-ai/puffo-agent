@@ -26,6 +26,7 @@ from typing import Any, Awaitable, Callable, Optional, Protocol
 from .bundles import Bundle, BundleQueue
 from .protocol import (
     Ack,
+    End,
     Ping,
     Pong,
     ProtocolError,
@@ -142,6 +143,8 @@ class WsLocalSession:
     async def _dispatch(self, frame: Any) -> None:
         if isinstance(frame, Ack):
             await self._on_ack(frame.bundle_id)
+        elif isinstance(frame, End):
+            await self._on_end(frame.bundle_id)
         elif isinstance(frame, ToolCall):
             await self._run_tool_call(frame)
         elif isinstance(frame, Ping):
@@ -178,8 +181,10 @@ class WsLocalSession:
         bundle = self._queue.next_to_send()
         if bundle is None:
             return
-        first = bundle.envelope_ids()[0] if bundle.messages else ""
-        self._inflight_run_id = await self._reporter.begin_turn(first) if first else None
+        # Status stays whatever the daemon left it at — ``begin_turn``
+        # is now driven by the tool's ``ack`` so the operator's UI
+        # only flips to "working on…" after the AI signals it has
+        # started, not just because a bundle was queued.
         await self._transport.send(encode(SendBundle(
             bundle_id=bundle.bundle_id,
             root_id=bundle.root_id,
@@ -188,11 +193,37 @@ class WsLocalSession:
         )))
 
     async def _on_ack(self, bundle_id: str) -> None:
+        """Tool signals 'I've started'. Optional and idempotent: an
+        ack against an already-ended bundle, a duplicate ack, or an
+        ack against a still-queued (not-yet-sent) bundle are all
+        no-ops. The only side-effect is flipping the per-turn status
+        to working_on the first time it lands."""
+        inflight = self._queue.inflight
+        if inflight is None or inflight.bundle_id != bundle_id:
+            return
+        if self._inflight_run_id is not None:
+            return  # duplicate ack
+        first = inflight.envelope_ids()[0] if inflight.messages else ""
+        if first:
+            self._inflight_run_id = await self._reporter.begin_turn(first)
+
+    async def _on_end(self, bundle_id: str) -> None:
+        """Tool signals 'I'm done with this bundle'. Closes the turn,
+        advances the cursor, and pumps the next bundle. Idempotent:
+        a duplicate end or an end against an already-rolled-back
+        bundle is a no-op. May be called without a prior ack — in
+        that case ``begin_turn`` runs inline so the per-turn record
+        is still complete."""
         bundle = self._queue.ack(bundle_id)
         if bundle is None:
-            # Stale/unknown id: double-ack or an ack landing after the
-            # bundle already rolled back. Must not advance anything.
             return
+        # Skipped-ack path: still mint a run_id so end_turn_batch has
+        # something to anchor the run to. Mirrors the prior behaviour
+        # where ``_pump`` always called begin_turn.
+        if self._inflight_run_id is None:
+            first = bundle.envelope_ids()[0] if bundle.messages else ""
+            if first:
+                self._inflight_run_id = await self._reporter.begin_turn(first)
         await self._reporter.end_turn_batch(self._runs_for(bundle))
         await self._on_acked(bundle)
         self._inflight_run_id = None

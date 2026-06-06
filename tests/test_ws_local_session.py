@@ -108,19 +108,55 @@ def _counter_queue() -> BundleQueue:
 
 
 @pytest.mark.asyncio
-async def test_bundle_then_ack_advances_cursor_and_status():
+async def test_bundle_send_does_not_call_begin_turn():
+    """Status stays unchanged until the tool acks. ``_pump`` no longer
+    fires ``begin_turn`` so the operator's UI only flips to working_on
+    after the AI signals it has started, not just because the daemon
+    queued the bundle."""
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
-    acked, replies = [], []
-    sess = _make_session(t, q, r, acked=acked, replies=replies)
-
+    sess = _make_session(t, q, r, acked=[], replies=[])
     task = asyncio.ensure_future(sess.run())
-    await asyncio.sleep(0)  # run parks on recv (handshake already done)
+    await asyncio.sleep(0)
     await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
 
     assert t.sent_types() == ["bundle"]
-    assert r.begun == ["a"]  # yellow dot on the first message
+    assert r.begun == []
+    t.feed_close()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_ack_flips_status_without_advancing():
+    """Ack mints the run_id but does NOT close the turn or advance
+    the cursor — that's reserved for ``end``."""
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    acked = []
+    sess = _make_session(t, q, r, acked=acked, replies=[])
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
 
     t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed_close()
+    await task
+
+    assert r.begun == ["a"]
+    assert r.batches == []
+    assert acked == []
+    assert q.has_inflight is False  # rolled back on close, not advanced
+
+
+@pytest.mark.asyncio
+async def test_end_advances_cursor_and_closes_turn():
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    acked = []
+    sess = _make_session(t, q, r, acked=acked, replies=[])
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
+
+    t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
     t.feed_close()
     await task
 
@@ -128,6 +164,27 @@ async def test_bundle_then_ack_advances_cursor_and_status():
     assert r.batches == [[{"run_id": "run_a", "message_id": "a", "succeeded": True}]]
     assert not q.has_inflight
     assert t.closed
+
+
+@pytest.mark.asyncio
+async def test_end_without_ack_still_advances():
+    """Skipping ack is valid — an agent that decides not to reply can
+    jump straight to ``end``. The session mints a run_id inline so
+    the turn record stays complete."""
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    acked = []
+    sess = _make_session(t, q, r, acked=acked, replies=[])
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
+
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
+    t.feed_close()
+    await task
+
+    assert r.begun == ["a"]
+    assert len(r.batches) == 1
+    assert len(acked) == 1
 
 
 @pytest.mark.asyncio
@@ -141,12 +198,13 @@ async def test_multi_message_bundle_runs_first_from_begin_turn():
     await sess.deliver_batch("r1", [_msg("a"), _msg("b")], {"channel_id": "c"})
 
     t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
     t.feed_close()
     await task
 
     runs = r.batches[0]
     assert [x["message_id"] for x in runs] == ["a", "b"]
-    assert runs[0]["run_id"] == "run_a"      # reuses begin_turn id
+    assert runs[0]["run_id"] == "run_a"      # reuses begin_turn id from ack
     assert runs[1]["run_id"] == "run_x"      # fresh id for the rest
 
 
@@ -199,15 +257,15 @@ async def test_malformed_frame_ignored_then_continues():
 
 
 @pytest.mark.asyncio
-async def test_double_ack_advances_only_once():
+async def test_double_end_advances_only_once():
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
     acked, replies = [], []
     sess = _make_session(t, q, r, acked=acked, replies=replies)
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
     await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
-    t.feed({"type": "ack", "bundle_id": "bdl_1"})
-    t.feed({"type": "ack", "bundle_id": "bdl_1"})  # duplicate
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})  # duplicate end
     t.feed_close()
     await task
     assert len(acked) == 1
@@ -215,22 +273,52 @@ async def test_double_ack_advances_only_once():
 
 
 @pytest.mark.asyncio
-async def test_unknown_ack_id_is_ignored():
+async def test_double_ack_is_idempotent():
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    sess = _make_session(t, q, r, acked=[], replies=[])
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
+    t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed({"type": "ack", "bundle_id": "bdl_1"})  # duplicate ack
+    t.feed_close()
+    await task
+    # Only one begin_turn — duplicate ack didn't re-mint a run_id.
+    assert r.begun == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_ack_after_end_is_noop():
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    acked = []
+    sess = _make_session(t, q, r, acked=acked, replies=[])
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
+    t.feed({"type": "ack", "bundle_id": "bdl_1"})  # stale ack after end
+    t.feed_close()
+    await task
+    assert len(acked) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_end_id_is_ignored():
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
     acked, replies = [], []
     sess = _make_session(t, q, r, acked=acked, replies=replies)
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
     await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
-    t.feed({"type": "ack", "bundle_id": "bdl_nope"})
+    t.feed({"type": "end", "bundle_id": "bdl_nope"})
     t.feed_close()
     await task
     assert acked == []
-    assert q.has_inflight is False  # rolled back on close, not acked
+    assert q.has_inflight is False  # rolled back on close, not advanced
 
 
 @pytest.mark.asyncio
-async def test_successor_sent_only_after_first_acked():
+async def test_successor_sent_only_after_first_ended():
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
     acked, replies = [], []
     sess = _make_session(t, q, r, acked=acked, replies=replies)
@@ -243,9 +331,9 @@ async def test_successor_sent_only_after_first_acked():
     bundles = [f for f in t.sent if f["type"] == "bundle"]
     assert len(bundles) == 1 and bundles[0]["messages"][0]["envelope_id"] == "a"
 
-    # Ack the first → successor (bdl_2) goes out; ack it too, then close.
-    t.feed({"type": "ack", "bundle_id": "bdl_1"})
-    t.feed({"type": "ack", "bundle_id": "bdl_2"})
+    # End the first → successor (bdl_2) goes out; end it too, then close.
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_2"})
     t.feed_close()
     await task
 
@@ -277,7 +365,7 @@ async def test_runs_skip_messages_without_envelope_id():
     await sess.deliver_batch(
         "r1", [{"envelope_id": "", "text": "noid"}, _msg("b")], {"channel_id": "c"},
     )
-    t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
     t.feed_close()
     await task
     # Empty-id message carries no server row → excluded from runs.

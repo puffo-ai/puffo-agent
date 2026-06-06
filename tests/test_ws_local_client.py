@@ -115,6 +115,50 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_end_command_is_forwarded(tmp_path: Path):
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"x")
+    received: list[dict] = []
+    server_done = asyncio.Event()
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                break
+            frame = json.loads(msg.data)
+            received.append(frame)
+            if frame["type"] == "connect":
+                await ws.send_str(json.dumps({
+                    "type": "connected", "session_id": "s", "agent": {},
+                }))
+            elif frame["type"] == "end":
+                await ws.close()
+        server_done.set()
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        session_dir = tmp_path / "session"
+        task = asyncio.create_task(run_attach(
+            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+        ))
+        commands_path = session_dir / "commands.ndjson"
+        for _ in range(50):
+            if commands_path.exists():
+                break
+            await asyncio.sleep(0.05)
+        with commands_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "end", "bundle_id": "b1"}) + "\n")
+        await asyncio.wait_for(server_done.wait(), timeout=2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+        assert any(f["type"] == "end" and f["bundle_id"] == "b1" for f in received)
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_detach_command_closes_ws_and_exits(tmp_path: Path):
     bundle_path = tmp_path / "agent.puffoagent"
     bundle_path.write_bytes(b"x")

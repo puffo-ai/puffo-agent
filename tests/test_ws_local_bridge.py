@@ -101,7 +101,7 @@ async def test_dispatch_returns_after_ack():
     assert not dispatch.done(), "must block until ack"
     assert t.bundles()[0]["bundle_id"] == "bdl_1"
 
-    t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
     await dispatch  # returns cleanly → consumer advances cursor
 
     t.feed_close()
@@ -155,7 +155,7 @@ async def test_reply_during_dispatch_relayed():
     await asyncio.sleep(0)
     t.feed({"type": "tool_call", "command_id": "cmd_1", "tool": "send_message",
             "params": {"channel": "c", "target_root_id": "r1", "text": "hi"}})
-    t.feed({"type": "ack", "bundle_id": "bdl_1"})
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
     await dispatch
     assert replies == [("c", "r1", "hi")]
     t.feed_close()

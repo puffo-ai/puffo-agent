@@ -15,6 +15,7 @@ from puffo_agent.portal.ws_local.protocol import (
     Ack,
     Connect,
     Connected,
+    End,
     Error,
     Ping,
     Pong,
@@ -82,6 +83,10 @@ def test_decode_connect():
 
 def test_decode_ack():
     assert decode_inbound(json.dumps({"type": "ack", "bundle_id": "b"})) == Ack("b")
+
+
+def test_decode_end():
+    assert decode_inbound(json.dumps({"type": "end", "bundle_id": "b"})) == End("b")
 
 
 def test_decode_tool_call_round_trip():

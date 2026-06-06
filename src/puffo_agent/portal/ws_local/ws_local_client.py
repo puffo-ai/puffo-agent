@@ -154,6 +154,11 @@ async def run_attach(
                                 "type": "ack",
                                 "bundle_id": str(cmd.get("bundle_id", "")),
                             }))
+                        elif ctype == "end":
+                            await ws.send_str(json.dumps({
+                                "type": "end",
+                                "bundle_id": str(cmd.get("bundle_id", "")),
+                            }))
                         elif ctype == "tool_call":
                             params = cmd.get("params") or {}
                             if not isinstance(params, dict):

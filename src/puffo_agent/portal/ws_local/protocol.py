@@ -37,6 +37,20 @@ class Connect:
 
 @dataclass(frozen=True)
 class Ack:
+    """Optional "I've started" signal. Idempotent: a duplicate ack
+    or an ack landing after ``End`` is a no-op. The daemon may use
+    it to flip the agent's external status from idle to working."""
+
+    bundle_id: str
+
+
+@dataclass(frozen=True)
+class End:
+    """Terminates work on a bundle: the daemon closes the turn,
+    advances the cursor, and pumps the next bundle. Idempotent —
+    duplicate ``End`` is a no-op. An agent that decides not to reply
+    can send ``End`` directly without a preceding ``Ack``."""
+
     bundle_id: str
 
 
@@ -143,7 +157,7 @@ def encode(frame: _Outbound) -> str:
     raise ProtocolError(f"cannot encode {type(frame).__name__}")
 
 
-_Inbound = Connect | Ack | ToolCall | Ping | Pong
+_Inbound = Connect | Ack | End | ToolCall | Ping | Pong
 
 
 def decode_inbound(raw: str) -> _Inbound:
@@ -158,6 +172,8 @@ def decode_inbound(raw: str) -> _Inbound:
         return Connect(bundle=_req(msg, "bundle"), password=_req(msg, "password"))
     if kind == "ack":
         return Ack(bundle_id=_req(msg, "bundle_id"))
+    if kind == "end":
+        return End(bundle_id=_req(msg, "bundle_id"))
     if kind == "tool_call":
         raw_params = msg.get("params")
         if raw_params is None:
