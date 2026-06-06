@@ -19,8 +19,9 @@ from puffo_agent.portal.ws_local.protocol import (
     Ping,
     Pong,
     ProtocolError,
-    ReplyOut,
     SendBundle,
+    ToolCall,
+    ToolResult,
     decode_inbound,
     encode,
 )
@@ -83,16 +84,42 @@ def test_decode_ack():
     assert decode_inbound(json.dumps({"type": "ack", "bundle_id": "b"})) == Ack("b")
 
 
-def test_decode_reply_with_and_without_root():
-    full = decode_inbound(json.dumps({
-        "type": "reply", "channel_id": "c", "target_root_id": "r", "text": "hello",
+def test_decode_tool_call_round_trip():
+    frame = decode_inbound(json.dumps({
+        "type": "tool_call",
+        "command_id": "cmd_1",
+        "tool": "send_message",
+        "params": {"channel": "ch_1", "text": "hi", "is_visible_to_human": True},
     }))
-    assert full == ReplyOut("c", "r", "hello")
-    # target_root_id optional → empty means top-level.
-    bare = decode_inbound(json.dumps({
-        "type": "reply", "channel_id": "c", "text": "hello",
+    assert frame == ToolCall(
+        command_id="cmd_1",
+        tool="send_message",
+        params={"channel": "ch_1", "text": "hi", "is_visible_to_human": True},
+    )
+
+
+def test_decode_tool_call_defaults_params_to_empty_dict():
+    frame = decode_inbound(json.dumps({
+        "type": "tool_call", "command_id": "cmd_2", "tool": "noop",
     }))
-    assert bare == ReplyOut("c", "", "hello")
+    assert frame == ToolCall(command_id="cmd_2", tool="noop", params={})
+
+
+def test_decode_tool_call_rejects_non_object_params():
+    with pytest.raises(ProtocolError):
+        decode_inbound(json.dumps({
+            "type": "tool_call", "command_id": "x", "tool": "y", "params": [],
+        }))
+
+
+def test_encode_tool_result_ok_carries_result():
+    body = json.loads(encode(ToolResult(command_id="cmd_1", ok=True, result="done")))
+    assert body == {"type": "tool_result", "command_id": "cmd_1", "ok": True, "result": "done"}
+
+
+def test_encode_tool_result_error_carries_reason():
+    body = json.loads(encode(ToolResult(command_id="cmd_1", ok=False, error="nope")))
+    assert body == {"type": "tool_result", "command_id": "cmd_1", "ok": False, "error": "nope"}
 
 
 def test_decode_ping_pong():

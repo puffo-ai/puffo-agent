@@ -150,12 +150,17 @@ async def run_attach(
                                 "type": "ack",
                                 "bundle_id": str(cmd.get("bundle_id", "")),
                             }))
-                        elif ctype == "reply":
+                        elif ctype == "tool_call":
+                            params = cmd.get("params") or {}
+                            if not isinstance(params, dict):
+                                emit_event({"type": "error",
+                                            "reason": "tool_call.params must be an object"})
+                                continue
                             await ws.send_str(json.dumps({
-                                "type": "reply",
-                                "channel_id": str(cmd.get("channel_id", "")),
-                                "target_root_id": str(cmd.get("target_root_id", "")),
-                                "text": str(cmd.get("text", "")),
+                                "type": "tool_call",
+                                "command_id": str(cmd.get("command_id", "")),
+                                "tool": str(cmd.get("tool", "")),
+                                "params": params,
                             }))
                         elif ctype == "detach":
                             stop.set()

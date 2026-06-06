@@ -6,7 +6,7 @@ with a fake transport and a fake clock:
 
   transport     .send(str) / .recv()->str|None / .close()
   reporter      .begin_turn(mid)->run_id / .end_turn_batch(runs)
-  reply_sender  (channel_id, target_root_id, text) -> awaitable
+  tool_dispatch {name: handler}  # WS_LOCAL_ALLOWED_TOOLS subset
   on_acked      (Bundle) -> awaitable   # advance server cursor
 
 Liveness is connection-level (point 2): if no inbound frame arrives
@@ -29,8 +29,9 @@ from .protocol import (
     Ping,
     Pong,
     ProtocolError,
-    ReplyOut,
     SendBundle,
+    ToolCall,
+    ToolResult,
     decode_inbound,
     encode,
 )
@@ -58,7 +59,7 @@ class WsLocalSession:
         transport: Transport,
         queue: BundleQueue,
         reporter: Reporter,
-        reply_sender: Callable[[str, str, str], Awaitable[None]],
+        tool_dispatch: dict[str, Callable[..., Awaitable[Any]]],
         on_acked: Callable[[Bundle], Awaitable[None]],
         now: Callable[[], float],
         ack_timeout_s: float,
@@ -72,7 +73,7 @@ class WsLocalSession:
         self._transport = transport
         self._queue = queue
         self._reporter = reporter
-        self._reply_sender = reply_sender
+        self._tool_dispatch = tool_dispatch
         self._on_acked = on_acked
         self._on_dead = on_dead
         self._now = now
@@ -141,12 +142,35 @@ class WsLocalSession:
     async def _dispatch(self, frame: Any) -> None:
         if isinstance(frame, Ack):
             await self._on_ack(frame.bundle_id)
-        elif isinstance(frame, ReplyOut):
-            await self._reply_sender(frame.channel_id, frame.target_root_id, frame.text)
+        elif isinstance(frame, ToolCall):
+            await self._run_tool_call(frame)
         elif isinstance(frame, Ping):
             await self._transport.send(encode(Pong()))
         elif isinstance(frame, Pong):
             pass
+
+    async def _run_tool_call(self, call: ToolCall) -> None:
+        handler = self._tool_dispatch.get(call.tool)
+        if handler is None:
+            await self._transport.send(encode(ToolResult(
+                command_id=call.command_id, ok=False,
+                error=f"unknown tool: {call.tool!r}",
+            )))
+            return
+        try:
+            result = await handler(**call.params)
+        except Exception as exc:
+            logger.warning(
+                "ws-local %s: tool %s raised: %s",
+                self.slug, call.tool, exc,
+            )
+            await self._transport.send(encode(ToolResult(
+                command_id=call.command_id, ok=False, error=str(exc),
+            )))
+            return
+        await self._transport.send(encode(ToolResult(
+            command_id=call.command_id, ok=True, result=result,
+        )))
 
     async def _pump(self) -> None:
         if not self._alive or self._queue.has_inflight:

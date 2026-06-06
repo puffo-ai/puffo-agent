@@ -60,9 +60,11 @@ async def _never(_d):
 def _session(transport, bridge, *, replies=None):
     seq = itertools.count(1)
 
-    async def reply_sender(channel_id, target_root_id, text):
+    async def send_message(channel: str = "", text: str = "",
+                           target_root_id: str = "", **_kw):
         if replies is not None:
-            replies.append((channel_id, target_root_id, text))
+            replies.append((channel, target_root_id, text))
+        return "ok"
 
     return WsLocalSession(
         slug="alice",
@@ -70,7 +72,7 @@ def _session(transport, bridge, *, replies=None):
         transport=transport,
         queue=BundleQueue(make_id=lambda: f"bdl_{next(seq)}"),
         reporter=FakeReporter(),
-        reply_sender=reply_sender,
+        tool_dispatch={"send_message": send_message},
         on_acked=bridge.on_acked,
         on_dead=bridge.on_dead,
         now=lambda: 0.0,
@@ -151,7 +153,8 @@ async def test_reply_during_dispatch_relayed():
         bridge.dispatch(sess, "r1", [_msg("a")], {"channel_id": "c"})
     )
     await asyncio.sleep(0)
-    t.feed({"type": "reply", "channel_id": "c", "target_root_id": "r1", "text": "hi"})
+    t.feed({"type": "tool_call", "command_id": "cmd_1", "tool": "send_message",
+            "params": {"channel": "c", "target_root_id": "r1", "text": "hi"}})
     t.feed({"type": "ack", "bundle_id": "bdl_1"})
     await dispatch
     assert replies == [("c", "r1", "hi")]

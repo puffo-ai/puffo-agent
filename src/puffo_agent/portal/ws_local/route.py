@@ -23,11 +23,28 @@ from .aiohttp_transport import AiohttpTransport
 from .auth import authenticate_bundle
 from .bundles import BundleQueue
 from .endpoint import serve_connection
-from .hub import WsLocalHub
+from .hub import AttachPoint, WsLocalHub
+from .in_process_data_client import InProcessDataClient
 from .protocol import Error, encode
 from .session import Transport, WsLocalSession
+from .tool_dispatch import build_dispatch as _build_dispatch
 
 logger = logging.getLogger(__name__)
+
+
+def _build_tool_dispatch(point: AttachPoint):
+    from ...mcp.puffo_core_tools import PuffoCoreToolsConfig
+    client = point.client
+    cfg = PuffoCoreToolsConfig(
+        slug=client.slug,
+        device_id=client.device_id,
+        keystore=client.keystore,
+        http_client=client.http,
+        data_client=InProcessDataClient(client.store, client),
+        space_id=getattr(client, "space_id", None),
+        workspace=getattr(client, "workspace", None),
+    )
+    return _build_dispatch(cfg)
 
 WS_LOCAL_PATH = "/v1/ws-local"
 
@@ -66,17 +83,13 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
 
     def make_session(authed, session_id, t, bridge) -> WsLocalSession:
         point = hub.get(authed.slug)
-
-        async def reply_sender(channel_id, target_root_id, text):
-            await point.client.send_fallback_message(channel_id, text, target_root_id)
-
         return WsLocalSession(
             slug=authed.slug,
             session_id=session_id,
             transport=t,
             queue=BundleQueue(),
             reporter=point.reporter,
-            reply_sender=reply_sender,
+            tool_dispatch=_build_tool_dispatch(point),
             on_acked=bridge.on_acked,
             on_dead=bridge.on_dead,
             now=time.monotonic,

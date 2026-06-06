@@ -70,12 +70,18 @@ def _msg(eid: str) -> dict:
 
 def _make_session(transport, queue, reporter, *, acked, replies,
                   now=lambda: 0.0, ack_timeout_s=5.0, ping_interval_s=10.0,
-                  sleep=_never):
+                  sleep=_never, tool_dispatch=None):
     async def on_acked(bundle):
         acked.append(bundle)
 
-    async def reply_sender(channel_id, target_root_id, text):
-        replies.append((channel_id, target_root_id, text))
+    if tool_dispatch is None:
+        async def _send_message(channel: str = "", text: str = "",
+                                target_root_id: str = "",
+                                is_visible_to_human: bool = True,
+                                root_id: str = ""):
+            replies.append((channel, root_id or target_root_id, text))
+            return "ok"
+        tool_dispatch = {"send_message": _send_message}
 
     return WsLocalSession(
         slug="alice",
@@ -83,7 +89,7 @@ def _make_session(transport, queue, reporter, *, acked, replies,
         transport=transport,
         queue=queue,
         reporter=reporter,
-        reply_sender=reply_sender,
+        tool_dispatch=tool_dispatch,
         on_acked=on_acked,
         now=now,
         ack_timeout_s=ack_timeout_s,
@@ -155,7 +161,8 @@ async def test_reply_frame_relayed_to_sender():
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
 
-    t.feed({"type": "reply", "channel_id": "c", "target_root_id": "r1", "text": "hi"})
+    t.feed({"type": "tool_call", "command_id": "cmd_1", "tool": "send_message",
+            "params": {"channel": "c", "target_root_id": "r1", "text": "hi"}})
     t.feed_close()
     await task
     assert replies == [("c", "r1", "hi")]
@@ -181,7 +188,8 @@ async def test_malformed_frame_ignored_then_continues():
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
     t._inbound.put_nowait("{bad json")          # ignored
-    t.feed({"type": "reply", "channel_id": "c", "text": "ok"})
+    t.feed({"type": "tool_call", "command_id": "cmd_2", "tool": "send_message",
+            "params": {"channel": "c", "text": "ok"}})
     t.feed_close()
     await task
     assert replies == [("c", "", "ok")]

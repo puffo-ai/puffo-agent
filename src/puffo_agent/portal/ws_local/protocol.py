@@ -41,13 +41,15 @@ class Ack:
 
 
 @dataclass(frozen=True)
-class ReplyOut:
-    """A reply the tool wants posted. ``target_root_id`` empty means
-    "top-level in the channel"."""
+class ToolCall:
+    """RPC-style call to one of the ``WS_LOCAL_ALLOWED_TOOLS``. The
+    daemon dispatches to the matching ``puffo_core_tools`` handler and
+    returns a ``ToolResult`` keyed on ``command_id``. ``params`` is a
+    flat dict matching the tool's keyword args."""
 
-    channel_id: str
-    target_root_id: str
-    text: str
+    command_id: str
+    tool: str
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 # ── daemon → tool ─────────────────────────────────────────────────────────────
@@ -78,6 +80,18 @@ class SendBundle:
     messages: list[dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ToolResult:
+    """Response to a ``ToolCall``. ``ok=True`` ⇒ ``result`` carries the
+    tool's return value (string for puffo_core_tools); ``ok=False`` ⇒
+    ``error`` carries a one-line reason."""
+
+    command_id: str
+    ok: bool
+    result: Any = None
+    error: str = ""
+
+
 # ── bidirectional ─────────────────────────────────────────────────────────────
 
 
@@ -91,7 +105,7 @@ class Pong:
     pass
 
 
-_Outbound = Connected | Error | SendBundle | Ping | Pong
+_Outbound = Connected | Error | SendBundle | ToolResult | Ping | Pong
 
 
 def encode(frame: _Outbound) -> str:
@@ -111,6 +125,17 @@ def encode(frame: _Outbound) -> str:
             "channel_meta": frame.channel_meta,
             "messages": frame.messages,
         })
+    if isinstance(frame, ToolResult):
+        body: dict[str, Any] = {
+            "type": "tool_result",
+            "command_id": frame.command_id,
+            "ok": frame.ok,
+        }
+        if frame.ok:
+            body["result"] = frame.result
+        else:
+            body["error"] = frame.error
+        return json.dumps(body)
     if isinstance(frame, Ping):
         return json.dumps({"type": "ping"})
     if isinstance(frame, Pong):
@@ -118,7 +143,7 @@ def encode(frame: _Outbound) -> str:
     raise ProtocolError(f"cannot encode {type(frame).__name__}")
 
 
-_Inbound = Connect | Ack | ReplyOut | Ping | Pong
+_Inbound = Connect | Ack | ToolCall | Ping | Pong
 
 
 def decode_inbound(raw: str) -> _Inbound:
@@ -133,11 +158,18 @@ def decode_inbound(raw: str) -> _Inbound:
         return Connect(bundle=_req(msg, "bundle"), password=_req(msg, "password"))
     if kind == "ack":
         return Ack(bundle_id=_req(msg, "bundle_id"))
-    if kind == "reply":
-        return ReplyOut(
-            channel_id=_req(msg, "channel_id"),
-            target_root_id=str(msg.get("target_root_id", "")),
-            text=_req(msg, "text"),
+    if kind == "tool_call":
+        raw_params = msg.get("params")
+        if raw_params is None:
+            params: dict[str, Any] = {}
+        elif isinstance(raw_params, dict):
+            params = raw_params
+        else:
+            raise ProtocolError("tool_call.params must be an object")
+        return ToolCall(
+            command_id=_req(msg, "command_id"),
+            tool=_req(msg, "tool"),
+            params=params,
         )
     if kind == "ping":
         return Ping()
