@@ -10,6 +10,7 @@ are allowed.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -96,6 +97,7 @@ async def info(_request: web.Request) -> web.Response:
     return web.json_response({
         "service": "puffo-agent-bridge",
         "version": "v1",
+        "runtime": "puffo-agent",
         "daemon_version": daemon_version,
         "pid": os.getpid(),
         "agent_count": len(discover_agents()),
@@ -1656,10 +1658,33 @@ async def create_agent(request: web.Request) -> web.Response:
                 agent_id, exc,
             )
 
-    return web.json_response({
+    response_body: dict[str, Any] = {
         "agent_id": agent_id,
         "agent_dir": str(target),
-    }, status=201)
+    }
+
+    # ws-local: passcode doubles as the ``.puffoagent`` export password
+    # so the web can round-trip create + export in one call. Pack
+    # failure is logged + surfaced via ``bundle_error``; the agent
+    # stays on disk and the operator can retry via /v1/agents/export.
+    from ..runtime_matrix import RUNTIME_WS_LOCAL
+    passcode = (payload.get("passcode") or "").strip()
+    if runtime.kind == RUNTIME_WS_LOCAL and passcode:
+        try:
+            from .. import export as exp
+            bundle_bytes = exp.pack(
+                [agent_id], passcode,
+                exported_by_slug=request.get("paired_slug", ""),
+            )
+            response_body["bundle_base64"] = base64.b64encode(bundle_bytes).decode("ascii")
+        except Exception as exc:
+            logger.warning(
+                "bridge: ws-local bundle pack failed for agent=%s: %s",
+                agent_id, exc,
+            )
+            response_body["bundle_error"] = str(exc)
+
+    return web.json_response(response_body, status=201)
 
 
 def _write_keystore(

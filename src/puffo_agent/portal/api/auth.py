@@ -24,8 +24,10 @@ from .pairing import load_pairing
 logger = logging.getLogger(__name__)
 
 
-# /v1/info is public discovery; /v1/pair handles its own crypto.
-PUBLIC_PATHS = {"/v1/info"}
+# /v1/info is public discovery; /v1/pair handles its own crypto;
+# /v1/ws-local authenticates by ``.puffoagent`` decryption in its own
+# handshake.
+PUBLIC_PATHS = {"/v1/info", "/v1/ws-local"}
 PAIR_PATH = "/v1/pair"
 
 

@@ -258,10 +258,14 @@ class AgentDetail(QWidget):
         self._soul.setMinimumHeight(160)
         layout.addRow("Soul", self._soul)
 
-        # Only the CLI runtimes are surfaced; provider is derived from harness.
+        # CLI runtimes + ws-local are surfaced. provider is derived from
+        # harness for the CLI kinds; ws-local has no harness/model on the
+        # daemon side so the dropdowns get locked in ``set_agent`` for
+        # those agents.
         self._runtime_kind = QComboBox()
         self._runtime_kind.addItem("cli-local")
         self._runtime_kind.addItem("cli-docker")
+        self._runtime_kind.addItem("ws-local")
         layout.addRow("Runtime", self._runtime_kind)
 
         self._harness = QComboBox()
@@ -386,6 +390,35 @@ class AgentDetail(QWidget):
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
+        # ws-local agents bring their own brain — runtime / harness / model
+        # have no daemon-side meaning, so lock the dropdowns and grey them
+        # out explicitly. PySide's platform style on Windows leaves a
+        # disabled QComboBox visually indistinguishable from an enabled one
+        # in some themes, so the stylesheet does the work.
+        is_ws_local = (cfg.runtime.kind or "") == "ws-local"
+        disabled_qss = (
+            "QComboBox:disabled {"
+            " color: #9ca3af; background-color: #f3f4f6;"
+            " border: 1px solid #e5e7eb;"
+            "}"
+        )
+        for w in (self._runtime_kind, self._harness, self._model):
+            w.setEnabled(not is_ws_local)
+            w.setStyleSheet(disabled_qss if is_ws_local else "")
+            w.setToolTip(
+                "ws-local agents bring their own AI tool — daemon-side "
+                "runtime / harness / model don't apply."
+                if is_ws_local else ""
+            )
+        # Skills + MCP are harness conventions (~/.claude, ~/.codex, …).
+        # ws-local agents run no harness, so both tabs become inert.
+        for tab_idx in (1, 2):
+            self._tabs.setTabEnabled(tab_idx, not is_ws_local)
+            self._tabs.setTabToolTip(
+                tab_idx,
+                "ws-local agents run no harness — Skills + MCP don't apply."
+                if is_ws_local else "",
+            )
         self._update_action_buttons()
         self._initial_snapshot = self._snapshot()
         self._check_dirty()
@@ -413,9 +446,18 @@ class AgentDetail(QWidget):
         has = self._cfg is not None
         state = self._cfg.state if self._cfg else ""
         is_running = state == "running"
+        is_ws_local = bool(self._cfg) and (self._cfg.runtime.kind or "") == "ws-local"
         self._pause_resume_btn.setEnabled(has and state in {"running", "paused"})
         self._pause_resume_btn.setText("Pause" if is_running else "Resume")
-        self._refresh_btn.setEnabled(has)
+        # ws-local has no harness subprocess to drop a session for — there's
+        # nothing to refresh. The attach client is the agent's "session".
+        self._refresh_btn.setEnabled(has and not is_ws_local)
+        self._refresh_btn.setToolTip(
+            "ws-local agents have no harness session to refresh — the attach "
+            "client is the agent's session."
+            if is_ws_local
+            else "Drop cli_session.json + restart the worker for a fresh LLM context."
+        )
         self._archive_btn.setEnabled(has)
         self._export_btn.setEnabled(has and state == "paused")
         self._export_btn.setToolTip(

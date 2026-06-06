@@ -21,6 +21,7 @@ RUNTIME_CHAT_LOCAL  = "chat-local"
 RUNTIME_SDK_LOCAL   = "sdk-local"
 RUNTIME_CLI_LOCAL   = "cli-local"
 RUNTIME_CLI_DOCKER  = "cli-docker"
+RUNTIME_WS_LOCAL    = "ws-local"  # external tool consumes over localhost WS
 RUNTIME_CLI_SANDBOX = "cli-sandbox"  # reserved; not yet implemented
 
 VALID_RUNTIMES: frozenset[str] = frozenset({
@@ -28,6 +29,7 @@ VALID_RUNTIMES: frozenset[str] = frozenset({
     RUNTIME_SDK_LOCAL,
     RUNTIME_CLI_LOCAL,
     RUNTIME_CLI_DOCKER,
+    RUNTIME_WS_LOCAL,
 })
 
 RESERVED_RUNTIMES: frozenset[str] = frozenset({
@@ -89,11 +91,15 @@ def harness_applies(runtime: str) -> bool:
 
 # Default provider when agent.yml omits the field. Matches
 # ``DaemonConfig.default_provider``.
+# ws-local has no internal engine — the external tool brings its own
+# model — so provider/harness are inert; the entry keeps the map
+# exhaustive over VALID_RUNTIMES.
 DEFAULT_PROVIDER_FOR_RUNTIME: dict[str, str] = {
     RUNTIME_CHAT_LOCAL: PROVIDER_ANTHROPIC,
     RUNTIME_SDK_LOCAL:  PROVIDER_ANTHROPIC,
     RUNTIME_CLI_LOCAL:  PROVIDER_ANTHROPIC,
     RUNTIME_CLI_DOCKER: PROVIDER_ANTHROPIC,
+    RUNTIME_WS_LOCAL:   PROVIDER_ANTHROPIC,
 }
 
 DEFAULT_HARNESS_FOR_PROVIDER: dict[str, str] = {
@@ -211,7 +217,8 @@ def resolve_effective_harness(runtime: str, provider: str, harness: str) -> str:
 __all__ = [
     # runtime constants
     "RUNTIME_CHAT_LOCAL", "RUNTIME_SDK_LOCAL",
-    "RUNTIME_CLI_LOCAL", "RUNTIME_CLI_DOCKER", "RUNTIME_CLI_SANDBOX",
+    "RUNTIME_CLI_LOCAL", "RUNTIME_CLI_DOCKER", "RUNTIME_WS_LOCAL",
+    "RUNTIME_CLI_SANDBOX",
     # provider constants
     "PROVIDER_ANTHROPIC", "PROVIDER_OPENAI", "PROVIDER_GOOGLE",
     # harness constants

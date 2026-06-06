@@ -4,6 +4,70 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] — 2026-06-06
+
+### Added
+
+- **``ws-local`` runtime kind.** Daemon owns identity + crypto but
+  runs no LLM; an external AI tool attaches over loopback WebSocket
+  (``GET /v1/ws-local``) and acts as the agent's brain. Bundle +
+  passcode handshake binds the WS to one agent slug for the life of
+  the session — no ``--slug`` switch, so a misbehaving tool can't
+  speak as a different agent mid-session.
+
+- **Reference attach client ``puffo-agent ws-local``** (entry-point
+  in ``puffo_agent.portal.cli``). Authenticates with
+  ``<bundle> --passcode <code>``, prints ``SESSION_DIR=<path>`` on
+  the first stdout line, and exposes the wire as three files for
+  the external AI to read/append: ``events.ndjson`` (inbound
+  bundles + tool_results), ``commands.ndjson`` (outbound
+  ``tool_call`` / ``ack`` / ``end`` / ``detach``), ``status``
+  (snapshot). Tolerates UTF-8 BOM on appended lines (Windows
+  PowerShell ``Add-Content -Encoding UTF8``).
+
+- **AI-side documentation: ``skills/use-puffo-agent-ws-local/SKILL.md``**
+  walks an external AI through the bundle handshake, the single-
+  bundle-in-flight discipline, the ack/end split, and the six
+  exposed puffo MCP tools. Recommended: copy into your tool's
+  skills directory so it follows the protocol without per-session
+  prompting.
+
+- **``GET /v1/info`` returns ``runtime: "puffo-agent"``** so the web
+  client's runtime-detection branch can identify the daemon kind
+  positively instead of inferring from the absence of agent-core
+  fields. ``daemon_version`` was already present.
+
+### Changed
+
+- **ws-local bundle delivery splits ``ack`` into two frames.**
+  ``ack`` flips the operator-facing status to ``working_on`` (the
+  daemon's ``begin_turn``). ``end`` is what closes the turn,
+  advances the server cursor, and pumps the next bundle. Both are
+  idempotent; ``end`` may be sent without a prior ``ack`` (skip-
+  reply case) and the daemon mints the turn-start inline.
+
+- **Six puffo MCP tools dispatch directly over ws-local.** A FastMCP
+  stand-in captures handlers from ``register_core_tools`` without
+  forking the implementations, exposing ``send_message``,
+  ``send_message_with_attachments``, ``get_user_info``,
+  ``get_post``, ``get_channel_history``, ``list_channel_members``
+  as ``tool_call`` RPC keyed on a caller-minted ``command_id``.
+  Subprocess-bound tools (``refresh``, ``reload_system_prompt``,
+  ``install_host_mcp``, ``sync_host_mcp``) are intentionally not
+  exposed; calling them returns ``unknown tool``. An
+  ``InProcessDataClient`` swaps the MCP-side HTTP data client for
+  direct ``MessageStore`` reads so the dispatch never round-trips
+  out of the daemon.
+
+- **Qt agent-detail pane locks ws-local agents to the surface that
+  has meaning.** ``runtime``/``harness``/``model`` combos and
+  ``Skills`` + ``MCP`` tabs are disabled, ``Refresh session`` is
+  greyed out, and ``ws-local`` is added to the ``runtime`` combo so
+  the field renders correctly. ``Pause`` / ``Resume`` /
+  ``Archive`` / ``Export`` still work — pause is the only
+  lifecycle action with a defined meaning for ws-local (daemon
+  stops accepting server messages).
+
 ## [0.11.0] — 2026-06-05
 
 ### Added
