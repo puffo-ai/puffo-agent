@@ -258,10 +258,14 @@ class AgentDetail(QWidget):
         self._soul.setMinimumHeight(160)
         layout.addRow("Soul", self._soul)
 
-        # Only the CLI runtimes are surfaced; provider is derived from harness.
+        # CLI runtimes + ws-local are surfaced. provider is derived from
+        # harness for the CLI kinds; ws-local has no harness/model on the
+        # daemon side so the dropdowns get locked in ``set_agent`` for
+        # those agents.
         self._runtime_kind = QComboBox()
         self._runtime_kind.addItem("cli-local")
         self._runtime_kind.addItem("cli-docker")
+        self._runtime_kind.addItem("ws-local")
         layout.addRow("Runtime", self._runtime_kind)
 
         self._harness = QComboBox()
@@ -387,10 +391,20 @@ class AgentDetail(QWidget):
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
         # ws-local agents bring their own brain — runtime / harness / model
-        # have no daemon-side meaning, so lock the dropdowns.
+        # have no daemon-side meaning, so lock the dropdowns and grey them
+        # out explicitly. PySide's platform style on Windows leaves a
+        # disabled QComboBox visually indistinguishable from an enabled one
+        # in some themes, so the stylesheet does the work.
         is_ws_local = (cfg.runtime.kind or "") == "ws-local"
+        disabled_qss = (
+            "QComboBox:disabled {"
+            " color: #9ca3af; background-color: #f3f4f6;"
+            " border: 1px solid #e5e7eb;"
+            "}"
+        )
         for w in (self._runtime_kind, self._harness, self._model):
             w.setEnabled(not is_ws_local)
+            w.setStyleSheet(disabled_qss if is_ws_local else "")
             w.setToolTip(
                 "ws-local agents bring their own AI tool — daemon-side "
                 "runtime / harness / model don't apply."
