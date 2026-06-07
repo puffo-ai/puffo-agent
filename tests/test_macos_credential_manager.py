@@ -190,6 +190,23 @@ def test_read_keychain_blob_skips_non_oauth_json_for_valid_candidate(monkeypatch
     assert result.service == "Claude Code"
 
 
+def test_read_keychain_blob_rejects_non_object_json_without_crashing(monkeypatch):
+    # A valid-JSON-but-non-object blob (e.g. a bare number) must be
+    # rejected cleanly, not raise AttributeError mid-read.
+    _force_macos(monkeypatch)
+
+    def _fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        if service == "Claude Code-credentials":
+            return _FakeCompletedProcess(0, stdout="5")
+        return _FakeCompletedProcess(44, stderr="entry not found")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = cm.read_keychain_blob()
+    assert result.ok is False
+    assert "invalid_oauth_blob" in result.error
+
+
 def test_read_keychain_blob_invalid_json(monkeypatch):
     _force_macos(monkeypatch)
     monkeypatch.setattr(
