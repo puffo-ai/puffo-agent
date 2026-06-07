@@ -94,22 +94,29 @@ class _KeychainCandidate:
     expires_at_ms: Optional[int]
 
 
-def _credential_expires_at_ms(blob: str) -> Optional[int]:
+def _parse_credential(blob: str) -> tuple[Optional[int], Optional[str]]:
+    """Validate a Claude OAuth blob in a single parse. Returns
+    ``(expires_at_ms, None)`` for a well-formed blob, else
+    ``(None, reason)`` — ``invalid_json`` for bad JSON, otherwise
+    ``invalid_oauth_blob``.
+    """
     try:
         data = json.loads(blob)
-        oauth = data.get("claudeAiOauth")
-        if not isinstance(oauth, dict):
-            return None
-        access_token = oauth.get("accessToken")
-        refresh_token = oauth.get("refreshToken")
-        if not isinstance(access_token, str) or not access_token:
-            return None
-        if not isinstance(refresh_token, str) or not refresh_token:
-            return None
-        value = oauth.get("expiresAt")
-        return int(value)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+    except json.JSONDecodeError as exc:
+        return None, f"invalid_json: {exc}"
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return None, "invalid_oauth_blob"
+    access_token = oauth.get("accessToken")
+    refresh_token = oauth.get("refreshToken")
+    if not isinstance(access_token, str) or not access_token:
+        return None, "invalid_oauth_blob"
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None, "invalid_oauth_blob"
+    try:
+        return int(oauth.get("expiresAt")), None
+    except (TypeError, ValueError):
+        return None, "invalid_oauth_blob"
 
 
 def _service_rank(service: str) -> int:
@@ -143,7 +150,10 @@ def _select_keychain_candidate(
 def _read_keychain_service(
     service: str,
     timeout: float,
-) -> KeychainReadResult:
+) -> tuple[KeychainReadResult, Optional[int]]:
+    """Read one service. Returns the result plus the parsed
+    ``expiresAt`` (only set when ``result.ok``) so the caller doesn't
+    re-parse the blob to rank candidates."""
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-w"],
@@ -152,11 +162,11 @@ def _read_keychain_service(
     except FileNotFoundError:
         return KeychainReadResult(
             False, None, "security_binary_missing", None, service,
-        )
+        ), None
     except subprocess.TimeoutExpired:
         return KeychainReadResult(
             False, None, "timeout (ACL prompt may be open)", None, service,
-        )
+        ), None
     if result.returncode != 0:
         return KeychainReadResult(
             False,
@@ -164,21 +174,14 @@ def _read_keychain_service(
             f"exit_code={result.returncode}",
             result.stderr or None,
             service,
-        )
+        ), None
     blob = result.stdout.strip()
     if not blob:
-        return KeychainReadResult(False, None, "empty_stdout", None, service)
-    try:
-        json.loads(blob)
-    except json.JSONDecodeError as exc:
-        return KeychainReadResult(
-            False, None, f"invalid_json: {exc}", None, service,
-        )
-    if _credential_expires_at_ms(blob) is None:
-        return KeychainReadResult(
-            False, None, "invalid_oauth_blob", None, service,
-        )
-    return KeychainReadResult(True, blob, None, None, service)
+        return KeychainReadResult(False, None, "empty_stdout", None, service), None
+    expires_at_ms, reason = _parse_credential(blob)
+    if reason is not None:
+        return KeychainReadResult(False, None, reason, None, service), None
+    return KeychainReadResult(True, blob, None, None, service), expires_at_ms
 
 
 def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainReadResult:
@@ -194,7 +197,7 @@ def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainRea
     errors: list[str] = []
     stderrs: list[str] = []
     for service in KEYCHAIN_SERVICES:
-        result = _read_keychain_service(service, timeout)
+        result, expires_at_ms = _read_keychain_service(service, timeout)
         if not result.ok:
             if result.error == "security_binary_missing":
                 return result
@@ -202,12 +205,11 @@ def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainRea
             if result.stderr:
                 stderrs.append(f"{service}: {result.stderr.strip()}")
             continue
-        blob = result.blob or ""
         candidates.append(
             _KeychainCandidate(
                 service=service,
-                blob=blob,
-                expires_at_ms=_credential_expires_at_ms(blob),
+                blob=result.blob or "",
+                expires_at_ms=expires_at_ms,
             )
         )
     if not candidates:

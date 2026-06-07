@@ -4,6 +4,17 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.2] — 2026-06-06
+
+### Fixed
+
+- **Harden Keychain credential parsing.** A valid-JSON-but-non-object
+  blob (e.g. a bare ``5``) could raise an uncaught ``AttributeError``
+  mid-read; it is now rejected cleanly as ``invalid_oauth_blob``. The
+  per-service validity / expiry / ranking checks were also folded into
+  a single ``_parse_credential`` pass instead of re-parsing the blob
+  up to three times — behavior-preserving otherwise.
+
 ## [0.12.1] — 2026-06-06
 
 ### Fixed
