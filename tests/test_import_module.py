@@ -187,6 +187,13 @@ def _build_bundle(server_url: str, password: str = "hunter2") -> tuple[bytes, di
 # ────────────────────────────────────────────────────────────────────
 
 
+async def test_remote_http_session_trusts_proxy_env():
+    from puffo_agent.portal import import_agents as imp
+
+    async with imp._remote_http_session("https://api.puffo.ai") as session:
+        assert getattr(session, "_trust_env", None) is True
+
+
 async def test_import_happy_path(mock_server):
     from puffo_agent.portal import import_agents as imp
     from puffo_agent.portal.state import AgentConfig
