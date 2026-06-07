@@ -165,6 +165,24 @@ def test_keychain_read_success_includes_redacted_blob(monkeypatch):
     body = rpt.render_markdown()
     assert "AAAA" not in body
     assert "BBBB" not in body
+    assert "selected service: Claude Code-credentials" in body
+
+
+def test_keychain_read_reports_selected_fallback_service(monkeypatch):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(diag, "is_macos", lambda: True)
+
+    def fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        if service == "Claude Code-credentials":
+            return _FakeCompletedProcess(44, stderr="entry not found")
+        return _FakeCompletedProcess(0, stdout=_BLOB)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    rpt = diag.probe_keychain_read()
+    body = rpt.render_markdown()
+    assert rpt.overall() == diag.VERDICT_OK
+    assert "selected service: Claude Code" in body
 
 
 def test_keychain_write_roundtrip_success(monkeypatch):
@@ -176,6 +194,29 @@ def test_keychain_write_roundtrip_success(monkeypatch):
     )
     rpt = diag.probe_keychain_write()
     assert rpt.overall() == diag.VERDICT_OK
+
+
+def test_keychain_write_uses_selected_service(monkeypatch):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(diag, "is_macos", lambda: True)
+    reads = [
+        cm.KeychainReadResult(True, _BLOB, None, None, "Claude Code"),
+        cm.KeychainReadResult(True, _BLOB, None, None, "Claude Code"),
+    ]
+    captured = {}
+
+    def fake_read():
+        return reads.pop(0)
+
+    def fake_write(blob, *, timeout=cm.SECURITY_TIMEOUT_SECONDS, service=None):
+        captured["service"] = service
+        return (True, None)
+
+    monkeypatch.setattr(diag, "read_keychain_blob", fake_read)
+    monkeypatch.setattr(cm, "writeback_to_keychain", fake_write)
+    rpt = diag.probe_keychain_write()
+    assert rpt.overall() == diag.VERDICT_OK
+    assert captured["service"] == "Claude Code"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

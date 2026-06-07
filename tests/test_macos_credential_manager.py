@@ -104,17 +104,90 @@ class _FakeCompletedProcess:
 
 def test_read_keychain_blob_success(monkeypatch):
     _force_macos(monkeypatch)
+    calls: list[str] = []
 
     def _fake_run(cmd, **kwargs):
         assert cmd[0] == "security"
         assert "find-generic-password" in cmd
-        assert "Claude Code-credentials" in cmd
+        calls.append(cmd[cmd.index("-s") + 1])
         return _FakeCompletedProcess(0, stdout=_BLOB)
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
     result = cm.read_keychain_blob()
     assert result.ok is True
     assert result.blob == _BLOB
+    assert result.service == "Claude Code-credentials"
+    assert calls == ["Claude Code-credentials", "Claude Code"]
+
+
+def test_read_keychain_blob_falls_back_to_bare_claude_code_service(monkeypatch):
+    _force_macos(monkeypatch)
+
+    def _fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        if service == "Claude Code-credentials":
+            return _FakeCompletedProcess(44, stderr="entry not found")
+        return _FakeCompletedProcess(0, stdout=_BLOB)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = cm.read_keychain_blob()
+    assert result.ok is True
+    assert result.blob == _BLOB
+    assert result.service == "Claude Code"
+
+
+def test_read_keychain_blob_selects_fresher_candidate(monkeypatch):
+    _force_macos(monkeypatch)
+    stale_blob = json.dumps({
+        "claudeAiOauth": {
+            "accessToken": "stale",
+            "refreshToken": "rt-stale",
+            "expiresAt": 1_000,
+        },
+    })
+
+    def _fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        blob = stale_blob if service == "Claude Code-credentials" else _BLOB
+        return _FakeCompletedProcess(0, stdout=blob)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = cm.read_keychain_blob()
+    assert result.ok is True
+    assert result.blob == _BLOB
+    assert result.service == "Claude Code"
+
+
+def test_read_keychain_blob_rejects_non_oauth_json(monkeypatch):
+    _force_macos(monkeypatch)
+
+    def _fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        if service == "Claude Code-credentials":
+            return _FakeCompletedProcess(0, stdout=json.dumps({"ok": True}))
+        return _FakeCompletedProcess(44, stderr="entry not found")
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = cm.read_keychain_blob()
+    assert result.ok is False
+    assert "invalid_oauth_blob" in result.error
+    assert "exit_code=44" in result.error
+
+
+def test_read_keychain_blob_skips_non_oauth_json_for_valid_candidate(monkeypatch):
+    _force_macos(monkeypatch)
+
+    def _fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        if service == "Claude Code-credentials":
+            return _FakeCompletedProcess(0, stdout=json.dumps({"ok": True}))
+        return _FakeCompletedProcess(0, stdout=_BLOB)
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+    result = cm.read_keychain_blob()
+    assert result.ok is True
+    assert result.blob == _BLOB
+    assert result.service == "Claude Code"
 
 
 def test_read_keychain_blob_invalid_json(monkeypatch):
@@ -137,7 +210,7 @@ def test_read_keychain_blob_nonzero_exit(monkeypatch):
     result = cm.read_keychain_blob()
     assert result.ok is False
     assert "exit_code=44" in result.error
-    assert result.stderr == "entry not found"
+    assert "entry not found" in result.stderr
 
 
 def test_read_keychain_blob_skipped_off_macos(monkeypatch):

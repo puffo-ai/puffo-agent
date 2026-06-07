@@ -145,18 +145,22 @@ def _expand(*paths: str) -> list[Path]:
 
 def claude_has_credentials(home: Path | None = None) -> bool:
     """True if Claude OAuth credentials exist on this host. On macOS
-    the canonical store is the ``Claude Code-credentials`` Keychain
-    entry; on Linux/Windows it's ``~/.claude/.credentials.json``."""
+    the canonical store is a Claude Code Keychain entry; on
+    Linux/Windows it's ``~/.claude/.credentials.json``."""
     h = home if home is not None else Path.home()
     if (h / ".claude" / ".credentials.json").exists():
         return True
     if sys.platform == "darwin":
+        from ..macos.keychain import KEYCHAIN_SERVICES
         try:
-            r = subprocess.run(
-                ["security", "find-generic-password", "-s", "Claude Code-credentials"],
-                capture_output=True, timeout=2,
-            )
-            return r.returncode == 0
+            for service in KEYCHAIN_SERVICES:
+                r = subprocess.run(
+                    ["security", "find-generic-password", "-s", service],
+                    capture_output=True, timeout=2,
+                )
+                if r.returncode == 0:
+                    return True
+            return False
         except Exception:
             return False
     return False

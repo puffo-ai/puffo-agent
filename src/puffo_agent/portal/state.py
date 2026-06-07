@@ -132,25 +132,22 @@ def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
 
 def _sync_credentials_from_keychain(host_home: Path) -> bool:
     """On macOS, materialise ``~/.claude/.credentials.json`` from the
-    Keychain entry ``"Claude Code-credentials"`` when missing or stale.
+    Claude Code Keychain entry when missing or stale.
 
-    Claude Code 2.x stores OAuth in Keychain instead of the file; this
-    bridges to the shared-file path used by every other agent. Called
-    on every ``link_host_credentials`` invocation so refreshed tokens
-    propagate. Returns True if the file was written.
+    Claude Code stores OAuth in Keychain instead of the file on macOS;
+    this bridges to the shared-file path used by every other agent.
+    Called on every ``link_host_credentials`` invocation so refreshed
+    tokens propagate. Returns True if the file was written.
     """
     import platform
-    import subprocess
     if platform.system() != "Darwin":
         return False
     try:
-        result = subprocess.run(
-            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
+        from ..macos.keychain import read_keychain_blob
+        keychain = read_keychain_blob(timeout=5)
+        if not keychain.ok or not keychain.blob:
             return False
-        keychain_raw = result.stdout.strip()
+        keychain_raw = keychain.blob
         # Validate JSON before touching the file.
         keychain_data = json.loads(keychain_raw)
     except Exception:

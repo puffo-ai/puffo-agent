@@ -187,6 +187,27 @@ def test_claude_has_credentials_macos_falls_back_to_keychain(tmp_path, monkeypat
     assert cli_bin.claude_has_credentials(home=tmp_path) is False
 
 
+def test_claude_has_credentials_macos_checks_both_keychain_services(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr("puffo_agent.agent.cli_bin.sys.platform", "darwin")
+
+    class _RC:
+        def __init__(self, code):
+            self.returncode = code
+
+    calls: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        service = cmd[cmd.index("-s") + 1]
+        calls.append(service)
+        return _RC(0 if service == "Claude Code" else 44)
+
+    monkeypatch.setattr("puffo_agent.agent.cli_bin.subprocess.run", fake_run)
+    assert cli_bin.claude_has_credentials(home=tmp_path) is True
+    assert calls == ["Claude Code-credentials", "Claude Code"]
+
+
 def test_claude_has_credentials_keychain_probe_failure_treated_as_false(
     tmp_path, monkeypatch,
 ):
