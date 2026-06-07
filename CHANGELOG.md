@@ -4,6 +4,19 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] — 2026-06-06
+
+### Added
+
+- **``puffo-agent start --background``.** Detaches the daemon into a
+  background process (POSIX ``setsid`` / Windows ``DETACHED_PROCESS``)
+  that survives the launching terminal closing, and shows a status-bar
+  / system-tray icon whose only action is **Quit** (graceful, same
+  path as ``puffo-agent stop``). Detached stdout/stderr land in
+  ``~/.puffo-agent/background.log``. On a GUI session without a tray
+  host the daemon still runs headless with a logged warning. The
+  internal ``--tray-runner`` flag hosts the tray in the detached child.
+
 ## [0.12.2] — 2026-06-06
 
 ### Fixed

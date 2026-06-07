@@ -237,6 +237,12 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    if getattr(args, "tray_runner", False):
+        from .ui.tray import run_tray
+        return run_tray()
+    if getattr(args, "background", False):
+        from .background import spawn_background
+        return spawn_background()
     if getattr(args, "ui", False):
         from .ui.launcher import launch
         return launch()
@@ -1287,13 +1293,29 @@ def build_parser() -> argparse.ArgumentParser:
     ).set_defaults(func=cmd_config)
     start = sub.add_parser(
         "start",
-        help="Run the daemon in the foreground (add --ui to launch the Qt desktop window)",
+        help=(
+            "Run the daemon (foreground by default; --background detaches "
+            "with a status-bar icon, --ui opens the desktop window)"
+        ),
     )
-    start.add_argument(
+    start_mode = start.add_mutually_exclusive_group()
+    start_mode.add_argument(
         "--ui",
         action="store_true",
         help="Launch the PySide6 desktop window alongside the daemon.",
     )
+    start_mode.add_argument(
+        "--background",
+        action="store_true",
+        help=(
+            "Detach the daemon into the background with a status-bar (tray) "
+            "icon; it survives the terminal closing. Quit from the icon or "
+            "run `puffo-agent stop`."
+        ),
+    )
+    # Internal: the detached child that --background spawns to host the
+    # tray. Hidden from --help.
+    start.add_argument("--tray-runner", action="store_true", help=argparse.SUPPRESS)
     start.set_defaults(func=cmd_start)
     stop = sub.add_parser(
         "stop",

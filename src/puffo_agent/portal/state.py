@@ -714,6 +714,12 @@ def daemon_pid_path() -> Path:
     return home_dir() / "daemon.pid"
 
 
+def background_log_path() -> Path:
+    """stdout/stderr sink for ``start --background`` — the detached
+    tray+daemon child has no terminal to write to."""
+    return home_dir() / "background.log"
+
+
 def pairing_path() -> Path:
     """Single-pairing file holding (slug, device_id) + cached certs
     for the operator currently authorised to drive this daemon.
