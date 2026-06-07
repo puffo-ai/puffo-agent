@@ -1,7 +1,8 @@
 """macOS Keychain primitives for Claude Code OAuth credentials.
 
-Claude Code 2.x stores its OAuth token in the system Keychain
-(``"Claude Code-credentials"``). The Keychain is the canonical store on
+Claude Code stores its OAuth token in the system Keychain. Most 2.x
+installs use ``"Claude Code-credentials"``, while some hosts expose the
+same OAuth blob under ``"Claude Code"``. The Keychain is the canonical store on
 macOS; the daemon-side ``KeychainBackend`` (in
 ``portal/credential_refresh.py``) just reads it for expiry inspection,
 triggers refresh by running ``claude --print ok`` exactly the way an
@@ -51,10 +52,11 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# The macOS Keychain "service" name Claude Code uses. Hard-coded by
-# Claude Code itself; verified via reverse-engineered cli.js in issue
-# #37512 and reproducible with ``security dump-keychain | grep``.
+# The macOS Keychain "service" names Claude Code has used. Prefer the
+# historical puffo-compatible name on ties, but probe both because some
+# current Claude Code installs only expose the bare "Claude Code" item.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+KEYCHAIN_SERVICES = (KEYCHAIN_SERVICE, "Claude Code")
 
 # File name for the cache JSON blob — picked deliberately short + obvious.
 CACHE_FILENAME = "claude-credentials.json"
@@ -82,42 +84,147 @@ class KeychainReadResult:
     blob: Optional[str]
     error: Optional[str]
     stderr: Optional[str]
+    service: Optional[str] = None
 
 
-def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainReadResult:
-    """Read the ``"Claude Code-credentials"`` entry from the user's
-    login Keychain. Returns the raw stdout (a JSON-shaped string written
-    by Claude Code) or an error reason.
+@dataclass(frozen=True)
+class _KeychainCandidate:
+    service: str
+    blob: str
+    expires_at_ms: Optional[int]
+
+
+def _credential_expires_at_ms(blob: str) -> Optional[int]:
+    try:
+        data = json.loads(blob)
+        oauth = data.get("claudeAiOauth")
+        if not isinstance(oauth, dict):
+            return None
+        access_token = oauth.get("accessToken")
+        refresh_token = oauth.get("refreshToken")
+        if not isinstance(access_token, str) or not access_token:
+            return None
+        if not isinstance(refresh_token, str) or not refresh_token:
+            return None
+        value = oauth.get("expiresAt")
+        return int(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _service_rank(service: str) -> int:
+    try:
+        return KEYCHAIN_SERVICES.index(service)
+    except ValueError:
+        return len(KEYCHAIN_SERVICES)
+
+
+def _select_keychain_candidate(
+    candidates: list[_KeychainCandidate],
+) -> _KeychainCandidate:
+    """Pick the freshest valid credential blob.
+
+    If an operator previously copied a stale blob into the old
+    ``Claude Code-credentials`` item but Claude Code now rotates the
+    bare ``Claude Code`` item, blindly preferring the old service would
+    keep syncing stale refresh tokens. ``expiresAt`` is the least
+    invasive freshness signal available inside the blob.
     """
-    if not is_macos():
-        return KeychainReadResult(False, None, "not_macos", None)
+    return max(
+        candidates,
+        key=lambda c: (
+            c.expires_at_ms is not None,
+            c.expires_at_ms or -1,
+            -_service_rank(c.service),
+        ),
+    )
+
+
+def _read_keychain_service(
+    service: str,
+    timeout: float,
+) -> KeychainReadResult:
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            ["security", "find-generic-password", "-s", service, "-w"],
             capture_output=True, text=True, timeout=timeout,
         )
     except FileNotFoundError:
-        return KeychainReadResult(False, None, "security_binary_missing", None)
+        return KeychainReadResult(
+            False, None, "security_binary_missing", None, service,
+        )
     except subprocess.TimeoutExpired:
         return KeychainReadResult(
-            False, None, "timeout (ACL prompt may be open)", None,
+            False, None, "timeout (ACL prompt may be open)", None, service,
         )
     if result.returncode != 0:
         return KeychainReadResult(
-            False, None, f"exit_code={result.returncode}", result.stderr or None,
+            False,
+            None,
+            f"exit_code={result.returncode}",
+            result.stderr or None,
+            service,
         )
     blob = result.stdout.strip()
     if not blob:
-        return KeychainReadResult(False, None, "empty_stdout", None)
+        return KeychainReadResult(False, None, "empty_stdout", None, service)
     try:
         json.loads(blob)
     except json.JSONDecodeError as exc:
-        return KeychainReadResult(False, None, f"invalid_json: {exc}", None)
-    return KeychainReadResult(True, blob, None, None)
+        return KeychainReadResult(
+            False, None, f"invalid_json: {exc}", None, service,
+        )
+    if _credential_expires_at_ms(blob) is None:
+        return KeychainReadResult(
+            False, None, "invalid_oauth_blob", None, service,
+        )
+    return KeychainReadResult(True, blob, None, None, service)
+
+
+def read_keychain_blob(timeout: float = SECURITY_TIMEOUT_SECONDS) -> KeychainReadResult:
+    """Read a Claude Code credential entry from the user's login Keychain.
+
+    Returns the raw stdout (a JSON-shaped string written by Claude
+    Code) or an error reason. Probes all known Claude Code service names
+    and chooses the freshest valid blob when more than one exists.
+    """
+    if not is_macos():
+        return KeychainReadResult(False, None, "not_macos", None)
+    candidates: list[_KeychainCandidate] = []
+    errors: list[str] = []
+    stderrs: list[str] = []
+    for service in KEYCHAIN_SERVICES:
+        result = _read_keychain_service(service, timeout)
+        if not result.ok:
+            if result.error == "security_binary_missing":
+                return result
+            errors.append(f"{service}: {result.error}")
+            if result.stderr:
+                stderrs.append(f"{service}: {result.stderr.strip()}")
+            continue
+        blob = result.blob or ""
+        candidates.append(
+            _KeychainCandidate(
+                service=service,
+                blob=blob,
+                expires_at_ms=_credential_expires_at_ms(blob),
+            )
+        )
+    if not candidates:
+        return KeychainReadResult(
+            False,
+            None,
+            "; ".join(errors) if errors else "no_keychain_services",
+            "\n".join(stderrs) if stderrs else None,
+        )
+    selected = _select_keychain_candidate(candidates)
+    return KeychainReadResult(True, selected.blob, None, None, selected.service)
 
 
 def writeback_to_keychain(
-    blob: str, timeout: float = SECURITY_TIMEOUT_SECONDS,
+    blob: str,
+    timeout: float = SECURITY_TIMEOUT_SECONDS,
+    service: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Upsert the JSON blob into the Keychain entry. Best-effort.
 
@@ -127,12 +234,13 @@ def writeback_to_keychain(
     """
     if not is_macos():
         return (False, "not_macos")
+    target_service = service or KEYCHAIN_SERVICE
     try:
         result = subprocess.run(
             [
                 "security", "add-generic-password",
                 "-U",
-                "-s", KEYCHAIN_SERVICE,
+                "-s", target_service,
                 "-a", os.environ.get("USER", "claude"),
                 "-w", blob,
             ],

@@ -32,6 +32,7 @@ from typing import Optional
 from ..agent.cli_bin import resolve_claude_bin
 from ..macos.keychain import (
     KEYCHAIN_SERVICE,
+    KEYCHAIN_SERVICES,
     is_macos,
     read_keychain_blob,
 )
@@ -146,7 +147,10 @@ def probe_keychain_read() -> ProbeReport:
     rpt.add(
         "command",
         VERDICT_OK,
-        f"$ security find-generic-password -s {KEYCHAIN_SERVICE!r} -w",
+        "\n".join(
+            f"$ security find-generic-password -s {service!r} -w"
+            for service in KEYCHAIN_SERVICES
+        ),
     )
     result = read_keychain_blob()
     if not result.ok:
@@ -162,7 +166,12 @@ def probe_keychain_read() -> ProbeReport:
         )
         rpt.summary = "Keychain read failed — daemon cannot bootstrap."
         return rpt
-    rpt.add("read", VERDICT_OK, _summarise_blob(result.blob))
+    rpt.add(
+        "read",
+        VERDICT_OK,
+        f"selected service: {result.service or KEYCHAIN_SERVICE}\n"
+        f"{_summarise_blob(result.blob)}",
+    )
     rpt.summary = "Keychain read succeeded. Bootstrap path will work."
     return rpt
 
@@ -189,7 +198,7 @@ def probe_keychain_write() -> ProbeReport:
         return rpt
     rpt.add("prerequisite-read", VERDICT_OK, "captured existing blob")
 
-    ok, reason = writeback_to_keychain(pre.blob)
+    ok, reason = writeback_to_keychain(pre.blob, service=pre.service)
     if not ok:
         rpt.add("write", VERDICT_FAIL, f"upsert failed: {reason}")
         return rpt
