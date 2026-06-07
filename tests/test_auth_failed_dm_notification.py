@@ -263,7 +263,7 @@ def test_notify_skipped_when_operator_slug_empty(tmp_path, monkeypatch, caplog):
     coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
     with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.worker"):
         asyncio.new_event_loop().run_until_complete(coro)
-    assert any("no operator_slug configured" in r.message for r in caplog.records)
+    assert any("no operator_slug" in r.message for r in caplog.records)
 
 
 def test_notify_sends_dm_when_operator_slug_set(tmp_path, monkeypatch):
@@ -462,3 +462,58 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
     d.refresher.callback()
     assert w.runtime.health == "ok"
     assert w._auth_failed_notification_sent is False
+
+
+# ── re-arm on a transient failed send (PR #70 review) ──────────────
+
+
+def _run_notify(worker_obj):
+    from puffo_agent.portal import worker as worker_module
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(worker_obj)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+
+def test_notify_rearms_dedup_when_client_not_warm():
+    """Client not yet warm at send time → no DM went out, so re-arm the
+    flag for the next ENTER instead of staying silently gated."""
+    class _StubWorker:
+        agent_cfg = type("A", (), {"id": "t-agent", "display_name": ""})()
+        _client = None
+        _auth_failed_notification_sent = True
+
+    w = _StubWorker()
+    _run_notify(w)
+    assert w._auth_failed_notification_sent is False
+
+
+def test_notify_rearms_dedup_when_send_dm_raises():
+    class _StubClient:
+        operator_slug = "@han-0001"
+
+        async def _send_dm(self, recipient, text, root_id):
+            raise RuntimeError("network down")
+
+    class _StubWorker:
+        agent_cfg = type("A", (), {"id": "t-agent", "display_name": ""})()
+        _client = _StubClient()
+        _auth_failed_notification_sent = True
+
+    w = _StubWorker()
+    _run_notify(w)
+    assert w._auth_failed_notification_sent is False
+
+
+def test_notify_stays_gated_when_no_operator_slug():
+    """No operator is a permanent config gap — stay gated so we don't
+    respin a task on every 401."""
+    class _StubClient:
+        operator_slug = ""
+
+    class _StubWorker:
+        agent_cfg = type("A", (), {"id": "t-agent", "display_name": ""})()
+        _client = _StubClient()
+        _auth_failed_notification_sent = True
+
+    w = _StubWorker()
+    _run_notify(w)
+    assert w._auth_failed_notification_sent is True

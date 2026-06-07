@@ -474,9 +474,9 @@ def _handle_suppressed_reply(
     it. ``on_auth_failure`` fires on the auth-class branch only;
     PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
     here so a 401-leak short-circuits the 2-min poll instead of
-    waiting for the next tick. ``on_auth_failed_enter`` (PUF-283)
-    fires ONLY on the was-ok→auth_failed transition (not re-entries),
-    so the per-session DM dedup gate has a natural firing edge."""
+    waiting for the next tick. ``on_auth_failed_enter`` fires ONLY on
+    the was-ok→auth_failed transition (not re-entries), giving the
+    per-session DM dedup a natural firing edge."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False, 0.0
@@ -588,24 +588,16 @@ class Worker:
         )
 
     def _on_auth_failed_enter(self) -> None:
-        """PUF-283: ENTER-edge callback from ``_handle_suppressed_reply``.
-        Dedup gate + asyncio-task dispatch — the actual DM send is async
-        so it can't block the suppression backoff loop. The dedup flag
-        is in-memory + reset on auth_failed CLEAR (see
-        ``daemon.py:on_refresh_success``).
-        """
+        """Fire the operator DM once per auth_failed episode. The flag
+        re-arms on auth_failed CLEAR (daemon ``on_refresh_success``) and
+        on a failed send, so a later genuine failure re-notifies."""
         if self._auth_failed_notification_sent:
             return
         self._auth_failed_notification_sent = True
         try:
             asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
         except Exception as exc:  # noqa: BLE001
-            # Defensive: no running loop (the documented RuntimeError
-            # shape from asyncio) OR any other scheduling failure.
-            # ``_handle_suppressed_reply`` always runs from inside an
-            # awaited turn so this is extremely rare, but resetting
-            # broadly here means a future schedule-broken corner case
-            # still arms the next ENTER instead of silently swallowing.
+            # Re-arm so a schedule failure retries on the next ENTER.
             self._auth_failed_notification_sent = False
             logger.warning(
                 "agent %s: couldn't schedule auth-failed DM: %s",
@@ -613,14 +605,14 @@ class Worker:
             )
 
     async def _notify_operator_of_auth_failed_oauth(self) -> None:
-        """Send the bilingual OAuth-expired DM to the operator. Mirrors
-        ``puffo_core_client.PuffoCoreMessageClient._notify_operator_of_invite``:
-        early-guard on ``operator_slug``, format via the
-        ``_invite_strings.format_oauth_expired`` helper, send via the
-        client's existing ``_send_dm`` primitive. PUF-283.
-        """
+        """DM the operator the bilingual OAuth-expired recovery copy.
+        Re-arms the dedup flag on a transient failure (client not warm,
+        or send raised) so the next ENTER retries instead of staying
+        silently gated."""
         client = self._client
         if client is None:
+            # Still warming — re-arm so a later ENTER retries.
+            self._auth_failed_notification_sent = False
             logger.warning(
                 "agent %s: auth-failed DM skipped — client not yet warm",
                 self.agent_cfg.id,
@@ -628,18 +620,14 @@ class Worker:
             return
         operator_slug = getattr(client, "operator_slug", "") or ""
         if not operator_slug:
+            # No operator to DM; the red-dot UI is the only signal. Stay
+            # gated — re-arming would respin on every 401.
             logger.warning(
-                "agent %s: auth-failed but no operator_slug configured — "
-                "not DMing (red-dot UI is the only visible signal until "
-                "operator runs `claude /login` + resume)",
+                "agent %s: auth-failed but no operator_slug — not DMing",
                 self.agent_cfg.id,
             )
             return
         from ..agent._invite_strings import format_oauth_expired
-        # Display name is best-effort: agent.yml carries it as
-        # ``display_name`` but the client's ``slug`` is the addressable
-        # identity. Empty display_name degrades gracefully to a
-        # bare ``id`` in the copy.
         display_name = (
             getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
         )
@@ -647,13 +635,15 @@ class Worker:
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:
+            # Transient send failure — re-arm for the next ENTER.
+            self._auth_failed_notification_sent = False
             logger.exception(
                 "agent %s: auth-failed DM to %s raised: %s",
                 self.agent_cfg.id, operator_slug, exc,
             )
             return
         logger.info(
-            "agent %s: notified operator @%s of OAuth-expired (auth_failed ENTER)",
+            "agent %s: notified operator @%s of OAuth-expired",
             self.agent_cfg.id, operator_slug,
         )
 
@@ -724,12 +714,9 @@ class Worker:
         # 401 surfacing in a reply short-circuits the daemon's 2-min
         # poll instead of waiting for the next tick.
         self._notify_refresh_needed = notify_refresh_needed
-        # PUF-283: in-memory dedup gate for the operator-DM that fires
-        # on the auth_failed ENTER edge. Reset on auth_failed CLEAR
-        # via daemon.py's on_refresh_success callback so the next
-        # ENTER-cycle re-notifies. Daemon restart also resets — matches
-        # PUF-258's sticky-state-on-disk + transient-state-in-memory
-        # design.
+        # In-memory dedup for the auth_failed ENTER operator DM;
+        # re-armed on credential refresh-success (daemon
+        # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
         self.runtime = RuntimeState(
             status="running",

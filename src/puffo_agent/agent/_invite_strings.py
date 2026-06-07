@@ -1,10 +1,5 @@
-"""PUF-247: human-facing copy for invite-accept/reject failures.
-
-PUF-283: also hosts the bilingual ``format_oauth_expired`` copy fired
-from the daemon when ``runtime.health`` enters ``auth_failed`` due to
-an OAuth 401 / token-revoked / login-required signal in the worker's
-suppressed reply.
-"""
+"""Human-facing copy for invite failures and the OAuth-expired
+operator DM (``format_oauth_expired``)."""
 
 from __future__ import annotations
 
@@ -68,15 +63,9 @@ def format_invite_error(exc: Exception, verb: str) -> str:
 
 
 def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
-    """Bilingual zh+en DM copy fired once per agent-per-session per
-    OAuth-expired 401 ENTER on ``runtime.health=auth_failed``. PUF-283.
-
-    Operator's spec called for a friendly note pointing at concrete
-    recovery steps; the harness-side ``claude /login`` + daemon-side
-    ``puffo-agent agent resume`` pair is the documented recovery flow
-    today (matches ``runtime.error`` copy at
-    ``worker.py::_handle_suppressed_reply``).
-    """
+    """Bilingual (zh+en) operator DM for an OAuth-expired agent, with
+    the ``claude /login`` + ``agent resume`` recovery steps. Falls back
+    to a bare ``id`` when ``agent_display_name`` is empty."""
     label = (
         f"**{agent_display_name}** (`{agent_id}`)"
         if agent_display_name else f"`{agent_id}`"

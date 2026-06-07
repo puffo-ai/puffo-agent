@@ -279,11 +279,8 @@ class Daemon:
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime, agent_id, logger,
             )
-            # PUF-283: arm the per-session DM dedup so the NEXT
-            # auth_failed ENTER (if the credential expires again
-            # within the same daemon process lifetime) re-notifies
-            # the operator. Matches the "once per 401 event" semantics
-            # in the operator spec.
+            # Re-arm the auth_failed DM dedup so a re-expiry this
+            # session re-notifies the operator.
             worker._auth_failed_notification_sent = False
 
         refresher.register_on_refresh_success(on_refresh_success)
