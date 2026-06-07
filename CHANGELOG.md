@@ -4,6 +4,28 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.1] — 2026-06-06
+
+### Fixed
+
+- **Claude Code macOS Keychain service fallback.** Some Claude Code
+  installs expose the OAuth blob under the bare ``"Claude Code"``
+  Keychain service instead of ``"Claude Code-credentials"``. The
+  daemon now probes both names everywhere it reads the Keychain
+  (bootstrap, refresh/poll, file sync, presence check, diagnostics)
+  and, when both exist, selects the freshest valid blob by
+  ``claudeAiOauth.expiresAt`` — so a stale leftover under the old
+  service can't shadow the one Claude Code is actively rotating.
+  Writeback targets the service the blob was read from.
+
+### Changed
+
+- **Keychain reads now require a valid Claude OAuth shape**
+  (``claudeAiOauth.accessToken`` / ``refreshToken`` / ``expiresAt``)
+  before a blob is accepted; a valid-JSON-but-non-OAuth entry is now
+  rejected up front as ``invalid_oauth_blob`` instead of being read
+  and failing downstream.
+
 ## [0.12.0] — 2026-06-06
 
 ### Added
