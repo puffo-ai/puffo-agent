@@ -320,3 +320,145 @@ def test_notify_swallows_send_dm_exception(monkeypatch, caplog):
     with caplog.at_level(logging.ERROR, logger="puffo_agent.portal.worker"):
         asyncio.new_event_loop().run_until_complete(coro)
     assert any("auth-failed DM" in r.message for r in caplog.records)
+
+
+# ── PR #70 polish folds ────────────────────────────────────────────
+
+
+def test_create_task_failure_broadly_caught(monkeypatch):
+    """PR #70 nit #3: any failure to schedule the async DM (not just
+    ``RuntimeError``) should reset the dedup flag so the next ENTER
+    re-tries. Otherwise the flag stays stuck-True until a refresh
+    arrives, masking a legitimate retry opportunity."""
+    from puffo_agent.portal import worker as worker_module
+
+    def crash(_coro):
+        # close coro so it doesn't warn "never awaited"
+        try:
+            _coro.close()
+        except Exception:
+            pass
+        raise OSError("unexpected scheduler failure")
+
+    monkeypatch.setattr(worker_module.asyncio, "create_task", crash)
+
+    class _StubWorker:
+        agent_cfg = type("A", (), {"id": "t-agent"})()
+        _client = None
+        _auth_failed_notification_sent = False
+
+        _on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter
+        _notify_operator_of_auth_failed_oauth = (
+            worker_module.Worker._notify_operator_of_auth_failed_oauth
+        )
+
+    w = _StubWorker()
+    w._on_auth_failed_enter()
+    # Flag reset so a subsequent ENTER tries again instead of
+    # silently swallowing.
+    assert w._auth_failed_notification_sent is False
+
+
+def test_workers_have_independent_dedup_flags(monkeypatch):
+    """PR #70 nit #4: a Worker's ``_auth_failed_notification_sent``
+    is instance state; one agent's ENTER must not silence another's."""
+    from puffo_agent.portal import worker as worker_module
+
+    stub_loop = _StubLoop()
+    monkeypatch.setattr(
+        worker_module.asyncio, "create_task", stub_loop.create_task,
+    )
+
+    class _StubWorker:
+        _client = None
+        _auth_failed_notification_sent = False
+
+        _on_auth_failed_enter = worker_module.Worker._on_auth_failed_enter
+        _notify_operator_of_auth_failed_oauth = (
+            worker_module.Worker._notify_operator_of_auth_failed_oauth
+        )
+
+        def __init__(self, agent_id: str):
+            self.agent_cfg = type("A", (), {"id": agent_id})()
+            self._auth_failed_notification_sent = False
+
+    w_a = _StubWorker("agent-a")
+    w_b = _StubWorker("agent-b")
+
+    w_a._on_auth_failed_enter()
+    w_b._on_auth_failed_enter()
+
+    # Both fired exactly once; the flag is per-instance.
+    assert stub_loop.calls == 2
+    assert w_a._auth_failed_notification_sent is True
+    assert w_b._auth_failed_notification_sent is True
+
+
+def test_oauth_copy_quotes_agent_id_for_markdown_safety():
+    """PR #70 nit #5: ``agent_id`` is interpolated into a Markdown DM;
+    backtick-wrapping it (which is what the helper does today) is the
+    load-bearing defense against a stray ``*``/``_``/``[`` slipping
+    through and breaking the rendered recovery instruction. Slugs are
+    [a-z0-9-] today so injection is near-zero risk, but pinning the
+    contract avoids future regression if the slug regex changes."""
+    text = format_oauth_expired("a-b-c", "")
+    # Backtick-wrap in both strands of recovery instruction.
+    assert "`puffo-agent agent resume a-b-c`" in text
+    assert "`a-b-c`" in text
+
+
+def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
+    """PR #70 nit #1: the daemon's refresh-success closure resets
+    ``worker._auth_failed_notification_sent``. The pieces are
+    unit-tested individually; this pins the wiring between
+    ``daemon._register_with_refresher`` and Worker."""
+    from puffo_agent.portal import daemon as daemon_module
+    from puffo_agent.portal.state import RuntimeState
+
+    class _StubRefresher:
+        """Captures the ``on_refresh_success`` callback the daemon
+        registers without actually wiring the refresh loop."""
+        def __init__(self):
+            self.callback = None
+
+        def register_agent(self, _path):
+            pass
+
+        def register_on_refresh_success(self, cb):
+            self.callback = cb
+
+    class _StubAgentCfg:
+        id = "t-agent"
+
+        class runtime:
+            harness = "claude-code"
+
+        class puffo_core:
+            slug = "alice-0001"
+
+    class _StubWorker:
+        agent_cfg = _StubAgentCfg()
+        runtime = RuntimeState(status="running", started_at=0, msg_count=0)
+        _auth_failed_notification_sent = True
+        _refresh_success_callback = None
+
+    class _StubDaemon:
+        refresher = _StubRefresher()
+        codex_refresher = _StubRefresher()
+
+        def _refresher_for(self, _cfg):
+            return self.refresher
+
+        _register_with_refresher = daemon_module.Daemon._register_with_refresher
+
+    d = _StubDaemon()
+    w = _StubWorker()
+    # Simulate auth_failed → refresh_success → expect both
+    # ``runtime.health`` cleared AND ``_auth_failed_notification_sent``
+    # reset, so the next ENTER re-notifies.
+    w.runtime.health = "auth_failed"
+    d._register_with_refresher(w.agent_cfg, w)
+    assert d.refresher.callback is not None
+    d.refresher.callback()
+    assert w.runtime.health == "ok"
+    assert w._auth_failed_notification_sent is False

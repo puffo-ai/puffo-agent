@@ -599,10 +599,13 @@ class Worker:
         self._auth_failed_notification_sent = True
         try:
             asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
-        except RuntimeError as exc:
-            # No running loop (extremely defensive — _handle_suppressed_reply
-            # always runs from inside an awaited turn). Reset the flag so
-            # the next ENTER tries again instead of silently swallowing.
+        except Exception as exc:  # noqa: BLE001
+            # Defensive: no running loop (the documented RuntimeError
+            # shape from asyncio) OR any other scheduling failure.
+            # ``_handle_suppressed_reply`` always runs from inside an
+            # awaited turn so this is extremely rare, but resetting
+            # broadly here means a future schedule-broken corner case
+            # still arms the next ENTER instead of silently swallowing.
             self._auth_failed_notification_sent = False
             logger.warning(
                 "agent %s: couldn't schedule auth-failed DM: %s",
