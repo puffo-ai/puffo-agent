@@ -1,4 +1,10 @@
-"""PUF-247: human-facing copy for invite-accept/reject failures."""
+"""PUF-247: human-facing copy for invite-accept/reject failures.
+
+PUF-283: also hosts the bilingual ``format_oauth_expired`` copy fired
+from the daemon when ``runtime.health`` enters ``auth_failed`` due to
+an OAuth 401 / token-revoked / login-required signal in the worker's
+suppressed reply.
+"""
 
 from __future__ import annotations
 
@@ -59,3 +65,29 @@ def format_invite_error(exc: Exception, verb: str) -> str:
             )
 
     return f"{prefix}: unexpected error. Please try again."
+
+
+def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
+    """Bilingual zh+en DM copy fired once per agent-per-session per
+    OAuth-expired 401 ENTER on ``runtime.health=auth_failed``. PUF-283.
+
+    Operator's spec called for a friendly note pointing at concrete
+    recovery steps; the harness-side ``claude /login`` + daemon-side
+    ``puffo-agent agent resume`` pair is the documented recovery flow
+    today (matches ``runtime.error`` copy at
+    ``worker.py::_handle_suppressed_reply``).
+    """
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    return (
+        f"⚠️ {label} — Claude OAuth has expired and I can't reach "
+        "the model right now.\n"
+        f"To recover: run `claude /login` in your terminal, then "
+        f"`puffo-agent agent resume {agent_id}` to bring me back online.\n"
+        "\n"
+        f"⚠️ {label} — Claude OAuth 已过期，我现在无法访问模型。\n"
+        f"恢复方法：在终端运行 `claude /login`，然后 "
+        f"`puffo-agent agent resume {agent_id}` 让我重新上线。"
+    )

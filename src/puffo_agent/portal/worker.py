@@ -457,6 +457,7 @@ def _handle_suppressed_reply(
     *,
     scope: str,
     on_auth_failure: Optional[Callable[[], None]] = None,
+    on_auth_failed_enter: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
     ``(suppressed, backoff_seconds)``:
@@ -473,7 +474,9 @@ def _handle_suppressed_reply(
     it. ``on_auth_failure`` fires on the auth-class branch only;
     PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
     here so a 401-leak short-circuits the 2-min poll instead of
-    waiting for the next tick."""
+    waiting for the next tick. ``on_auth_failed_enter`` (PUF-283)
+    fires ONLY on the was-ok→auth_failed transition (not re-entries),
+    so the per-session DM dedup gate has a natural firing edge."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False, 0.0
@@ -487,6 +490,7 @@ def _handle_suppressed_reply(
         agent_id, scope, backoff, reply[:200],
     )
     if is_auth:
+        was_ok = runtime.health != "auth_failed"
         runtime.health = "auth_failed"
         if on_auth_failure is not None:
             try:
@@ -494,6 +498,14 @@ def _handle_suppressed_reply(
             except Exception as exc:
                 logger.warning(
                     "agent %s: on_auth_failure callback raised: %s",
+                    agent_id, exc,
+                )
+        if was_ok and on_auth_failed_enter is not None:
+            try:
+                on_auth_failed_enter()
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: on_auth_failed_enter callback raised: %s",
                     agent_id, exc,
                 )
     if scope == "api-error-retry":
@@ -575,6 +587,73 @@ class Worker:
             agent_id,
         )
 
+    def _on_auth_failed_enter(self) -> None:
+        """PUF-283: ENTER-edge callback from ``_handle_suppressed_reply``.
+        Dedup gate + asyncio-task dispatch — the actual DM send is async
+        so it can't block the suppression backoff loop. The dedup flag
+        is in-memory + reset on auth_failed CLEAR (see
+        ``daemon.py:on_refresh_success``).
+        """
+        if self._auth_failed_notification_sent:
+            return
+        self._auth_failed_notification_sent = True
+        try:
+            asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
+        except RuntimeError as exc:
+            # No running loop (extremely defensive — _handle_suppressed_reply
+            # always runs from inside an awaited turn). Reset the flag so
+            # the next ENTER tries again instead of silently swallowing.
+            self._auth_failed_notification_sent = False
+            logger.warning(
+                "agent %s: couldn't schedule auth-failed DM: %s",
+                self.agent_cfg.id, exc,
+            )
+
+    async def _notify_operator_of_auth_failed_oauth(self) -> None:
+        """Send the bilingual OAuth-expired DM to the operator. Mirrors
+        ``puffo_core_client.PuffoCoreMessageClient._notify_operator_of_invite``:
+        early-guard on ``operator_slug``, format via the
+        ``_invite_strings.format_oauth_expired`` helper, send via the
+        client's existing ``_send_dm`` primitive. PUF-283.
+        """
+        client = self._client
+        if client is None:
+            logger.warning(
+                "agent %s: auth-failed DM skipped — client not yet warm",
+                self.agent_cfg.id,
+            )
+            return
+        operator_slug = getattr(client, "operator_slug", "") or ""
+        if not operator_slug:
+            logger.warning(
+                "agent %s: auth-failed but no operator_slug configured — "
+                "not DMing (red-dot UI is the only visible signal until "
+                "operator runs `claude /login` + resume)",
+                self.agent_cfg.id,
+            )
+            return
+        from ..agent._invite_strings import format_oauth_expired
+        # Display name is best-effort: agent.yml carries it as
+        # ``display_name`` but the client's ``slug`` is the addressable
+        # identity. Empty display_name degrades gracefully to a
+        # bare ``id`` in the copy.
+        display_name = (
+            getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        )
+        text = format_oauth_expired(self.agent_cfg.id, display_name)
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception as exc:
+            logger.exception(
+                "agent %s: auth-failed DM to %s raised: %s",
+                self.agent_cfg.id, operator_slug, exc,
+            )
+            return
+        logger.info(
+            "agent %s: notified operator @%s of OAuth-expired (auth_failed ENTER)",
+            self.agent_cfg.id, operator_slug,
+        )
+
     @staticmethod
     def _flip_health_in_progress(
         runtime: "RuntimeState",
@@ -642,6 +721,13 @@ class Worker:
         # 401 surfacing in a reply short-circuits the daemon's 2-min
         # poll instead of waiting for the next tick.
         self._notify_refresh_needed = notify_refresh_needed
+        # PUF-283: in-memory dedup gate for the operator-DM that fires
+        # on the auth_failed ENTER edge. Reset on auth_failed CLEAR
+        # via daemon.py's on_refresh_success callback so the next
+        # ENTER-cycle re-notifies. Daemon restart also resets — matches
+        # PUF-258's sticky-state-on-disk + transient-state-in-memory
+        # design.
+        self._auth_failed_notification_sent = False
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),
@@ -1090,6 +1176,7 @@ class Worker:
                     agent_id,
                     scope="fallback",
                     on_auth_failure=self._notify_refresh_needed,
+                    on_auth_failed_enter=self._on_auth_failed_enter,
                 )
                 if suppressed:
                     await asyncio.sleep(backoff)
@@ -1132,6 +1219,7 @@ class Worker:
                     agent_id,
                     scope="api-error-retry",
                     on_auth_failure=self._notify_refresh_needed,
+                    on_auth_failed_enter=self._on_auth_failed_enter,
                 )
                 if suppressed:
                     # Hottest leak site (FB-88 / FB-159 case-studies).
