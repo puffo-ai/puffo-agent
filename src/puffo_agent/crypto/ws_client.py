@@ -95,11 +95,8 @@ class PuffoCoreWsClient:
         listen. The structured log line below is the FB-238 audit
         surface (catch-up count per reconnect; non-zero values on
         re-connect after a roll-call window are the load-bearing
-        signal). ``self.session_id`` in the log line is the WS
-        session-registry key returned by the server's handshake reply
-        (``ws.rs::handle_connect``); cross-correlating against the
-        server's ``ws_pubsub`` ``NOTIFICATIONS_DISPATCHED`` counter
-        keyed on the same id is how FB-238 audits the receive-side gap.
+        signal). ``session_id`` matches the server WS registry key;
+        cross-correlate against ``ws_pubsub::NOTIFICATIONS_DISPATCHED``.
         """
         try:
             data = await self.http_client.get("/messages/pending")
