@@ -86,12 +86,31 @@ class PuffoCoreWsClient:
         return resp["session_id"]
 
     async def _catchup(self) -> None:
+        """Drain `message_deliveries` rows the server has for us but
+        couldn't deliver via the live WS while we were offline. PUF-204
+        + PUF-285 (β): this MUST run after ``_handshake`` completes —
+        the handshake registers the session server-side, but the
+        catch-up GET pulls the actual envelopes. Ordering invariant:
+        register-via-handshake → /messages/pending fetch → live
+        listen. The structured log line below is the FB-238 audit
+        surface (catch-up count per reconnect; non-zero values on
+        re-connect after a roll-call window are the load-bearing
+        signal).
+        """
         try:
             data = await self.http_client.get("/messages/pending")
             messages = data.get("messages", [])
+            # PUF-285 (β): always log the count, including zero, so
+            # the structured-log stream carries one line per reconnect
+            # for cross-correlation with server-side
+            # NOTIFICATIONS_RECEIVED. Without the zero line, a silent
+            # reconnect is indistinguishable from a no-op.
+            logger.info(
+                "Catch-up: %d pending messages (session=%s)",
+                len(messages), self.session_id,
+            )
             if not messages:
                 return
-            logger.info("Catch-up: %d pending messages", len(messages))
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
