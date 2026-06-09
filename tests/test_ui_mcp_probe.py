@@ -40,6 +40,72 @@ def test_mcp_probe_sample_is_safe():
     assert McpProbe().sample() == []
 
 
+def test_mcp_probe_sample_attributes_to_agent(monkeypatch):
+    """A node MCP server is attributed to the agent that owns the
+    claude session two levels up (node ← cmd/npx ← claude session)."""
+    from pathlib import Path
+
+    from puffo_agent.portal.ui import mcp_probe
+
+    class _Mem:
+        rss = 2 * 1024 * 1024
+
+    tree: dict[int, "_FakeProc"] = {}
+
+    class _FakeProc:
+        def __init__(self, pid, ppid, name, cmd, cwd=""):
+            self.pid = pid
+            self._ppid, self._name, self._cmd, self._cwd = ppid, name, cmd, cwd
+
+        def ppid(self):
+            return self._ppid
+
+        def name(self):
+            return self._name
+
+        def cmdline(self):
+            return self._cmd
+
+        def cwd(self):
+            return self._cwd
+
+        def status(self):
+            return "running"
+
+        def cpu_percent(self, _interval=None):
+            return 0.0
+
+        def memory_info(self):
+            return _Mem()
+
+        def children(self, recursive=False):
+            return [p for p in tree.values() if p.pid != 1]
+
+    for p in (
+        _FakeProc(1, 0, "python", ["python"]),
+        _FakeProc(2, 1, "claude.exe", ["claude", "--resume"],
+                  cwd=r"C:\h\.puffo-agent\agents\a1\workspace"),
+        _FakeProc(3, 2, "cmd.exe", ["cmd", "/c", "npx", "@playwright/mcp"]),
+        _FakeProc(4, 3, "node.exe", ["node", "@playwright/mcp", "cli.js"]),
+    ):
+        tree[p.pid] = p
+
+    class _FakePsutil:
+        Process = staticmethod(lambda pid=1: tree[pid])
+
+    monkeypatch.setattr(mcp_probe, "psutil", _FakePsutil)
+    monkeypatch.setattr(mcp_probe.os, "getpid", lambda: 1)
+    monkeypatch.setattr(
+        mcp_probe, "agents_dir", lambda: Path(r"C:\h\.puffo-agent\agents"),
+    )
+
+    rows = mcp_probe.McpProbe().sample()
+    assert len(rows) == 1
+    assert rows[0]["agent"] == "a1"
+    assert rows[0]["server"] == "playwright"
+    assert rows[0]["pid"] == 4
+
+
 def test_log_buffer_counter_monotonic_through_roll():
     h = LogRingHandler(maxlen=3)
     for i in range(5):

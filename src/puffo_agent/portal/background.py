@@ -59,6 +59,6 @@ def spawn_background() -> int:
         log_handle.close()
 
     print(f"puffo-agent running in the background (pid={proc.pid}).")
-    print("  status-bar icon → Quit to stop, or run `puffo-agent stop`.")
+    print("  status-bar icon → Open UI (beta) or Quit (or run `puffo-agent stop`).")
     print(f"  logs: {log_path}")
     return 0
