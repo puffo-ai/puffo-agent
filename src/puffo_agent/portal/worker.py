@@ -588,10 +588,8 @@ class Worker:
         )
 
     def _maybe_wake_refresher_if_auth_failed(self, agent_id: str) -> None:
-        """If a new batch arrives while we're auth_failed, wake the
-        refresher so it re-checks for an operator re-login immediately
-        (which, on a detected change, syncs the new credential and
-        restarts us) instead of waiting up to a full poll interval."""
+        """A new batch while auth_failed: wake the refresher to re-check
+        for an operator re-login now instead of waiting for the poll."""
         if self.runtime.health != "auth_failed":
             return
         if self._notify_refresh_needed is None:
@@ -604,11 +602,9 @@ class Worker:
             )
 
     def _enter_auth_failed(self, agent_id: str) -> None:
-        """Flip ``auth_failed`` and fire recovery: the refresher kick
-        (so the daemon re-checks credentials now) + the operator DM.
-        Used when an adapter raises a *confirmed* auth error so we skip
-        the pointless rate-limit kick-retries and go straight to the
-        recover-via-relogin flow."""
+        """Flip ``auth_failed`` + fire recovery (refresher kick + operator
+        DM). Used on a confirmed adapter auth error so we skip the
+        pointless kick-retries and go straight to recover-via-relogin."""
         rt = self.runtime
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
@@ -1099,9 +1095,8 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
-            # A new batch arrived while auth_failed: wake the refresher
-            # to check for an operator re-login NOW rather than waiting
-            # for the next poll (the flip below would mask auth_failed).
+            # New batch while auth_failed: wake the refresher to check
+            # for a re-login now (the flip below would mask auth_failed).
             self._maybe_wake_refresher_if_auth_failed(agent_id)
             try:
                 Worker._flip_health_in_progress(self.runtime, agent_id, logger)
@@ -1132,10 +1127,8 @@ class Worker:
                 # errored and re-raise; the consumer loop re-enqueues
                 # the batch with cursor preserved and backs off.
                 if getattr(exc, "is_auth", False):
-                    # Auth error: kick-retries are pointless. Flip
-                    # auth_failed + DM the operator now; the consumer
-                    # skips retries and abandons (batch redelivers once
-                    # the operator re-logs in).
+                    # Auth: skip the pointless kick-retries — flag
+                    # auth_failed + DM now; consumer abandons (redelivers).
                     logger.warning(
                         "agent %s: adapter auth error — flagging auth_failed, "
                         "no kick-retry", agent_id,

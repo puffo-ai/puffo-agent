@@ -200,3 +200,13 @@ def test_new_message_when_healthy_does_not_wake():
 def test_wake_is_noop_without_notify_callback():
     Worker, w = _wake_stub("auth_failed", has_cb=False)
     Worker._maybe_wake_refresher_if_auth_failed(w, "t-agent")   # no crash
+
+
+def test_wake_survives_notify_raising():
+    Worker, w = _wake_stub("auth_failed")
+
+    def _boom():
+        raise RuntimeError("no loop")
+
+    w._notify_refresh_needed = _boom
+    Worker._maybe_wake_refresher_if_auth_failed(w, "t-agent")   # no crash

@@ -1021,12 +1021,10 @@ class PuffoCoreMessageClient:
         entry.dispatching_ids = set()
 
         if is_auth:
-            # Auth failure: retrying is pointless until the operator
-            # re-logs in. The worker already flipped auth_failed + DMed,
-            # so we just stop here — the cursor stays un-advanced (the
-            # batch redelivers on recovery). Deliberately NOT firing the
-            # api-error-abandon callback: it would overwrite the
-            # auth_failed status with api_error_abandoned.
+            # Retrying is pointless until re-login (worker already set
+            # auth_failed + DMed). Don't fire the abandon callback — it
+            # would overwrite auth_failed; cursor stays un-advanced so
+            # the batch redelivers on recovery.
             self._log.warning(
                 "agent reply was an auth error for thread %s (last envelope "
                 "%s); skipping kick-retries until operator re-login",

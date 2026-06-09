@@ -334,8 +334,8 @@ class FileBackend:
 
     def fingerprint(self) -> tuple[int, int] | None:
         """(mtime_ns, size) of the host credential. Lets the refresher
-        spot an external rotation — operator `claude /login` — on
-        copy-mode hosts (Windows) where there's no symlink to carry it."""
+        spot an external rotation (operator re-login) on copy-mode hosts
+        (Windows) where there's no symlink to carry it."""
         try:
             st = self.host_credentials.stat()
         except OSError:
@@ -747,10 +747,10 @@ class CredentialRefresher:
         self._lock = asyncio.Lock()
         self._consecutive_non_success = 0
         self._rate_limit_retry_task: asyncio.Task | None = None
-        # Last host-credential fingerprint we observed, for spotting an
-        # external rotation (operator `claude /login`) on copy-mode hosts
-        # where there's no symlink to carry it. ``None`` until the first
-        # tick establishes a baseline (so we don't false-fire on start).
+        # Last host-credential fingerprint, for spotting an external
+        # rotation (operator re-login) on copy-mode hosts with no symlink
+        # to carry it. ``None`` until the first tick sets a baseline (so
+        # we don't false-fire on start).
         self._last_cred_fingerprint: tuple[int, int] | None = None
 
     def register_agent(self, agent_home: Path) -> None:
@@ -879,12 +879,11 @@ class CredentialRefresher:
             refresh_task.cancel()
 
     def _detect_external_rotation(self) -> None:
-        """Spot an external host-credential change (operator
-        `claude /login`) against the last fingerprint and, if changed,
-        sync to agents + fire refresh-success. This is the copy-mode
-        (Windows) counterpart to the macOS Keychain rotation poll, whose
-        symlink-propagation assumption doesn't hold here. No-op for
-        backends without ``fingerprint`` (e.g. Keychain)."""
+        """Spot an external host-credential change (operator re-login)
+        against the last fingerprint and, if changed, sync to agents +
+        fire refresh-success — the copy-mode (Windows) counterpart to the
+        macOS Keychain rotation poll. No-op for backends without
+        ``fingerprint`` (e.g. Keychain, which has its own poll)."""
         fingerprint = getattr(self.backend, "fingerprint", None)
         if fingerprint is None:
             return

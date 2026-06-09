@@ -1,13 +1,8 @@
 """Shared auth-error detection for adapter / provider error output.
 
-Used by the CLI session adapter (retry decision) and ``core`` (tagging
-``AgentAPIError.is_auth``) so the two can't drift — a divergence here is
-exactly what let a ``401 Invalid authentication credentials`` get
-mis-handled as a rate-limit.
-
-Substring match: safe on adapter *error output*, but do NOT apply to
-free-form agent prose. The worker uses anchored patterns for that, so a
-reply merely *mentioning* an auth concept isn't suppressed.
+Used by the CLI session adapter and ``core`` so their auth-vs-rate-limit
+split can't drift. Substring match — safe on adapter error output, but
+NOT on free-form agent prose (the worker uses anchored patterns there).
 """
 
 from __future__ import annotations

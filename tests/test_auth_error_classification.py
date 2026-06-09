@@ -53,6 +53,66 @@ def test_agent_api_error_carries_is_auth():
     assert AgentAPIError("y").is_auth is False
 
 
+@pytest.mark.asyncio
+async def test_core_tags_is_auth_on_raise(tmp_path):
+    """A turn whose output contains an auth-class `API Error` raises
+    AgentAPIError(is_auth=True); a rate-limit one stays is_auth=False."""
+    from puffo_agent.agent.adapters import Adapter, TurnContext, TurnResult
+    from puffo_agent.agent.core import PuffoAgent
+
+    class _StubAdapter(Adapter):
+        def __init__(self, reply):
+            self._reply = reply
+
+        async def run_turn(self, ctx: TurnContext) -> TurnResult:
+            return TurnResult(reply=self._reply, metadata={})
+
+    async def _raise_for(reply):
+        agent = PuffoAgent(
+            adapter=_StubAdapter(reply),
+            system_prompt="t",
+            memory_dir=str(tmp_path),
+        )
+        try:
+            await agent.handle_message(
+                channel_id="c", channel_name="g", sender="u",
+                sender_email="u@x", text="hi", post_id="p", root_id="",
+            )
+        except AgentAPIError as exc:
+            return exc
+        return None
+
+    auth = await _raise_for(
+        "Failed to authenticate. API Error: 401 Invalid authentication credentials"
+    )
+    assert auth is not None and auth.is_auth is True
+
+    rate = await _raise_for("API Error: Request rejected (429)")
+    assert rate is not None and rate.is_auth is False
+
+    # Same tagging on the retry path (handle_api_error_retry).
+    async def _retry_raise_for(reply):
+        agent = PuffoAgent(
+            adapter=_StubAdapter(reply),
+            system_prompt="t",
+            memory_dir=str(tmp_path),
+        )
+        try:
+            await agent.handle_api_error_retry(
+                root_id="r",
+                channel_meta={"channel_name": "g"},
+                fallback_batch=[{"text": "hi"}],
+            )
+        except AgentAPIError as exc:
+            return exc
+        return None
+
+    auth_retry = await _retry_raise_for(
+        "Failed to authenticate. API Error: 401 Invalid authentication credentials"
+    )
+    assert auth_retry is not None and auth_retry.is_auth is True
+
+
 # ── consumer: auth skips kick-retries ──────────────────────────────
 
 
@@ -183,3 +243,16 @@ def test_enter_auth_failed_no_dm_on_reentry():
     assert w.runtime.health == "auth_failed"
     assert w.refresh_fired == [1]     # still kicks the refresher
     assert w.dm_fired == []           # but no duplicate DM (was_ok=False)
+
+
+def test_enter_auth_failed_survives_refresh_kick_raising():
+    """A throwing notify_refresh_needed must not break the flip/DM."""
+    w = _stub_worker("ok")
+
+    def _boom():
+        raise RuntimeError("no loop")
+
+    w._notify_refresh_needed = _boom
+    Worker._enter_auth_failed(w, "t-agent")   # no crash
+    assert w.runtime.health == "auth_failed"
+    assert w.dm_fired == [1]
