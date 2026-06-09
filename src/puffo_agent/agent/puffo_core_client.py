@@ -655,26 +655,29 @@ class PuffoCoreMessageClient:
             if payload.sender_slug == self.slug:
                 return
 
-            # Daemon-side intercept: ``y``/``n`` in the thread of an
-            # outstanding invite-DM accepts/rejects the invite without
-            # waking the LLM. Other text falls through to the queue.
-            # PUF-227-A: use the validated thread_root_id — an invite-DM
-            # thread linkage that doesn't resolve in local cache is also
-            # invalid for the inline-handler path.
+            # Daemon-side intercept: ``y``/``n`` from the operator on
+            # an outstanding invite-DM accepts/rejects without waking
+            # the LLM. PUF-227-A established the threaded path;
+            # PUF-287 extends it to top-level replies when exactly one
+            # invite is pending (Shan-pattern: users default to
+            # top-level per the chat-app norm).
             if (
                 payload.envelope_kind == "dm"
                 and payload.sender_slug == self.operator_slug
-                and payload_thread_root_id
-                and payload_thread_root_id in self._pending_invite_dms
             ):
-                handled = await self._maybe_handle_invite_reply(
-                    thread_root_id=payload_thread_root_id,
-                    text=str(payload.content) if payload.content else "",
+                text_raw = str(payload.content) if payload.content else ""
+                resolved_root = self._resolve_invite_thread_root(
+                    payload_thread_root_id, text_raw,
                 )
-                if handled:
-                    # Handled inline — don't queue for the LLM.
-                    self._last_dm_sender = payload.sender_slug
-                    return
+                if resolved_root is not None:
+                    handled = await self._maybe_handle_invite_reply(
+                        thread_root_id=resolved_root,
+                        text=text_raw,
+                    )
+                    if handled:
+                        # Handled inline — don't queue for the LLM.
+                        self._last_dm_sender = payload.sender_slug
+                        return
 
             channel_id = payload.channel_id or ""
             is_dm = payload.envelope_kind == "dm"
@@ -2510,6 +2513,37 @@ class PuffoCoreMessageClient:
             channel_id, space_id,
         )
 
+    def _resolve_invite_thread_root(
+        self, payload_thread_root_id: str | None, text: str,
+    ) -> str | None:
+        """Pick which pending invite the operator's strict-Y/N reply
+        targets. Threaded reply that matches ``_pending_invite_dms``
+        wins (PUF-227-A path). Otherwise — top-level reply, or threaded
+        in some unrelated DM — fall back to single-pending lookup
+        (PUF-287). Returns ``None`` when no match (caller falls to
+        LLM); ``_maybe_handle_invite_reply`` still does the strict
+        body-parse so this resolver only triages routing.
+        """
+        if (
+            payload_thread_root_id
+            and payload_thread_root_id in self._pending_invite_dms
+        ):
+            return payload_thread_root_id
+        normalized = text.strip().lower()
+        if normalized not in ("y", "yes", "n", "no"):
+            return None
+        pending_ids = list(self._pending_invite_dms.keys())
+        if len(pending_ids) == 1:
+            return pending_ids[0]
+        if len(pending_ids) > 1:
+            # Ambiguous; fall to LLM. v1 default per PUF-287 intake.
+            self._log.info(
+                "operator top-level y/n with %d pending invites; "
+                "ambiguous, falling through to LLM",
+                len(pending_ids),
+            )
+        return None
+
     async def _maybe_handle_invite_reply(
         self, *, thread_root_id: str, text: str,
     ) -> bool:
@@ -2678,7 +2712,8 @@ class PuffoCoreMessageClient:
             text = (
                 f"{inviter_label} invited me to space {space_label}. "
                 f"They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject in this thread."
+                f"Reply `y` to accept or `n` to reject — either in this "
+                f"thread or as a direct reply."
             )
         else:
             channel_label = (
@@ -2687,7 +2722,8 @@ class PuffoCoreMessageClient:
             text = (
                 f"{inviter_label} invited me to channel {channel_label} in "
                 f"space {space_label}. They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject in this thread."
+                f"Reply `y` to accept or `n` to reject — either in this "
+                f"thread or as a direct reply."
             )
         try:
             envelope = await self._send_dm(self.operator_slug, text, root_id="")
