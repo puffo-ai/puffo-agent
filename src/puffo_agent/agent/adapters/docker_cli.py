@@ -304,11 +304,13 @@ class DockerCLIAdapter(Adapter):
             "--env", *env_flags,
         ]
         try:
+            from ..._proc import no_window_kwargs
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **no_window_kwargs(),
             )
             stdout, stderr = await proc.communicate(b"y\n")
         except Exception as exc:
@@ -970,11 +972,13 @@ class DockerCLIAdapter(Adapter):
             await self._build_image()
 
     async def _build_image(self) -> None:
+        from ..._proc import no_window_kwargs
         proc = await asyncio.create_subprocess_exec(
             "docker", "build", "-t", self.image, "-",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **no_window_kwargs(),
         )
         stdout, _ = await proc.communicate(DOCKERFILE.encode())
         if proc.returncode != 0:
@@ -1199,10 +1203,12 @@ def _parse_gemini_reply(stdout_text: str) -> tuple[str, str, str]:
 
 
 async def _run_cmd(cmd: list[str], check: bool = True) -> tuple[int, bytes, bytes]:
+    from ..._proc import no_window_kwargs
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **no_window_kwargs(),
     )
     stdout, stderr = await proc.communicate()
     if check and proc.returncode != 0:

@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
+from .._proc import no_window_kwargs
 from .state import link_host_codex_auth, link_host_credentials
 
 
@@ -287,6 +288,7 @@ class FileBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(self.host_home),
+                **no_window_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -415,6 +417,7 @@ class CodexFileBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(self.host_home),
+                **no_window_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -582,6 +585,7 @@ class KeychainBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(host_home),
+                **no_window_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),

@@ -483,6 +483,7 @@ class ClaudeSession:
             "agent %s: spawning claude session (resume=%s)",
             self.agent_id, bool(self._session_id),
         )
+        from ..._proc import no_window_kwargs
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -491,6 +492,7 @@ class ClaudeSession:
             cwd=self.cwd,
             env=self.env,
             limit=STREAM_READER_LIMIT_BYTES,
+            **no_window_kwargs(),
         )
         if self.audit is not None:
             self.audit.write(

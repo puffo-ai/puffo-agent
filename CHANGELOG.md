@@ -16,6 +16,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ``~/.puffo-agent/background.log``. On a GUI session without a tray
   host the daemon still runs headless with a logged warning. The
   internal ``--tray-runner`` flag hosts the tray in the detached child.
+  Child subprocesses (claude / codex / docker) spawn with
+  ``CREATE_NO_WINDOW`` on Windows so the console-less detached daemon
+  doesn't pop a console window per agent.
 - **Operator DM on agent auth failure.** When an agent's Claude OAuth
   expires/revokes (a 401), the daemon DMs the operator a bilingual
   (zh+en) note: run `claude auth login` and just send a message (a new
