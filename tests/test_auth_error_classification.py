@@ -89,7 +89,7 @@ def _make_entry():
 
 
 @pytest.mark.asyncio
-async def test_auth_error_skips_kick_retries_and_abandons():
+async def test_auth_error_skips_kick_retries_without_overwriting_status():
     client = _make_client()
     retry_calls: list[int] = []
     abandon: list[Any] = []
@@ -111,7 +111,9 @@ async def test_auth_error_skips_kick_retries_and_abandons():
         is_auth=True,
     )
     assert retry_calls == []   # no pointless kick-retries
-    assert abandon == [0]      # abandoned immediately (0 attempts)
+    # The api-error-abandon callback must NOT fire — it would overwrite
+    # the worker's auth_failed status with api_error_abandoned.
+    assert abandon == []
 
 
 @pytest.mark.asyncio
