@@ -23,7 +23,7 @@ def run_tray() -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    install_log_buffer(maxlen=500)
+    log_buffer = install_log_buffer(maxlen=500)
 
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
@@ -53,7 +53,30 @@ def run_tray() -> int:
     tray = QSystemTrayIcon(icon)
     tray.setToolTip("Puffo Agent — running")
 
+    # Lazily-opened desktop window. Detached so closing it just hides the
+    # window — only Quit (below) stops the daemon.
+    window: dict = {"w": None}
+
+    def _open_ui() -> None:
+        existing = window["w"]
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        from .main_window import MainWindow
+        from .style import APP_STYLESHEET
+        app.setStyleSheet(APP_STYLESHEET)
+        win = MainWindow(
+            daemon_thread=daemon_thread, log_buffer=log_buffer, detached=True,
+        )
+        window["w"] = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
     menu = QMenu()
+    ui_action = menu.addAction("Open UI (beta)")
+    ui_action.triggered.connect(_open_ui)
     quit_action = menu.addAction("Quit")
 
     def _quit() -> None:

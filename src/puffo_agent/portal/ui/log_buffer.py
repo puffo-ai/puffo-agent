@@ -17,6 +17,10 @@ class LogRingHandler(logging.Handler):
         super().__init__()
         self._buf: Deque[str] = deque(maxlen=maxlen)
         self._lock = Lock()
+        # Monotonic count of every line ever emitted. The view diffs on
+        # this (not on buffer length) so it keeps tailing once the ring
+        # fills — otherwise length stays pinned and the view freezes.
+        self._total = 0
         self.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%H:%M:%S",
@@ -29,10 +33,15 @@ class LogRingHandler(logging.Handler):
             return
         with self._lock:
             self._buf.append(line)
+            self._total += 1
 
     def snapshot(self) -> list[str]:
         with self._lock:
             return list(self._buf)
+
+    def counter(self) -> int:
+        with self._lock:
+            return self._total
 
 
 def install_log_buffer(maxlen: int = 500) -> LogRingHandler:

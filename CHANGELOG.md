@@ -10,15 +10,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **``puffo-agent start --background``.** Detaches the daemon into a
   background process (POSIX ``setsid`` / Windows ``DETACHED_PROCESS``)
-  that survives the launching terminal closing, and shows a status-bar
-  / system-tray icon whose only action is **Quit** (graceful, same
-  path as ``puffo-agent stop``). Detached stdout/stderr land in
-  ``~/.puffo-agent/background.log``. On a GUI session without a tray
-  host the daemon still runs headless with a logged warning. The
+  that survives the launching terminal closing, and shows a system-tray
+  icon with **Open UI (beta)** (opens the desktop window) and **Quit**
+  (graceful, same path as ``puffo-agent stop``). Closing the
+  tray-opened window leaves the daemon running — only Quit stops it; a
+  direct ``--ui`` close still stops the daemon. Detached stdout/stderr
+  land in ``~/.puffo-agent/background.log``. On a GUI session without a
+  tray host the daemon still runs headless with a logged warning. The
   internal ``--tray-runner`` flag hosts the tray in the detached child.
   Child subprocesses (claude / codex / docker) spawn with
   ``CREATE_NO_WINDOW`` on Windows so the console-less detached daemon
   doesn't pop a console window per agent.
+- **Status page in the UI.** A new "🔌 Status" tab lists the MCP server
+  subprocesses each agent is running — Agent · Server · PID · Status ·
+  CPU% · Mem — by walking the daemon's process tree.
 - **Operator DM on agent auth failure.** When an agent's Claude OAuth
   expires/revokes (a 401), the daemon DMs the operator a bilingual
   (zh+en) note: run `claude auth login` and just send a message (a new
@@ -27,6 +32,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **UI log view always tails the newest lines.** The view diffed on
+  buffer length, but the log buffer is a ring that drops its oldest
+  line — so once full it froze on the first ~500 lines (the oldest).
+  It now diffs on a monotonic counter and caps the widget to the latest
+  500, so it keeps showing the newest.
 - **Auth errors are distinguished from rate-limits.** A `401 Invalid
   authentication credentials` reply was treated as a generic rate-limit
   `API Error` — kick-retried then abandoned, never flipping

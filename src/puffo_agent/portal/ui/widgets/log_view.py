@@ -1,44 +1,54 @@
 """Append-only log viewer used by both the runtime-wide and per-agent
 panes.
 
-Pin-to-bottom semantics: if the user scrolled up to read something
-the new lines do NOT yank them back. Only when their cursor is at
-the latest line do we auto-tail.
+The source is a ring buffer that drops its OLDEST line, so we diff on a
+monotonic counter rather than buffer length — otherwise, once the ring
+fills, length stays pinned and the view freezes on the lines it first
+saw (the oldest). ``setMaximumBlockCount`` bounds the widget to the
+latest ``max_lines`` so it always shows the newest.
+
+Pin-to-bottom: if the user scrolled up to read something, new lines do
+NOT yank them back; we only auto-tail when they're already at the end.
 """
 from __future__ import annotations
 
 from typing import Callable, Optional
 
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import QTextEdit, QWidget
+from PySide6.QtWidgets import QPlainTextEdit, QWidget
 
 
-class LogView(QTextEdit):
+class LogView(QPlainTextEdit):
     """Drop-in log pane.
 
-    Pass a ``snapshot_fn`` returning the full log line list. Optional
-    ``filter_fn`` drops lines that don't match the current scope (e.g.
-    "this agent's id"). Both are called on every ``poll()``.
+    ``snapshot_fn`` returns the buffer's current lines (oldest→newest);
+    ``counter_fn`` returns the monotonic total-emitted count. Optional
+    ``filter_fn`` drops lines outside the current scope (e.g. an agent's
+    id). Both fns are called on every ``poll()``.
     """
 
     def __init__(
         self,
         snapshot_fn: Callable[[], list[str]],
+        counter_fn: Callable[[], int],
         filter_fn: Optional[Callable[[str], bool]] = None,
         parent: Optional[QWidget] = None,
+        max_lines: int = 500,
     ) -> None:
         super().__init__(parent)
         self.setReadOnly(True)
+        self.setMaximumBlockCount(max_lines)
         self.setStyleSheet(
             "font-family: Consolas, 'Courier New', monospace; font-size: 9pt;"
         )
         self._snapshot_fn = snapshot_fn
+        self._counter_fn = counter_fn
         self._filter_fn = filter_fn
-        self._cursor = 0
+        self._seen = 0
 
     def reset(self) -> None:
         """Re-render from scratch on filter / scope change."""
-        self._cursor = 0
+        self._seen = 0
         self.clear()
 
     def set_filter(self, filter_fn: Optional[Callable[[str], bool]]) -> None:
@@ -46,14 +56,18 @@ class LogView(QTextEdit):
         self.reset()
 
     def poll(self) -> None:
-        snapshot = self._snapshot_fn()
-        if self._cursor > len(snapshot):
-            # Ring buffer rolled past our cursor — re-render.
+        total = self._counter_fn()
+        if total < self._seen:
+            # Counter went backwards (handler replaced) — re-render.
             self.reset()
-        new_lines = snapshot[self._cursor:]
-        self._cursor = len(snapshot)
-        if not new_lines:
+        if total <= self._seen:
             return
+        snapshot = self._snapshot_fn()
+        delta = total - self._seen
+        self._seen = total
+        # New lines are the last ``delta`` of the snapshot; if we fell
+        # behind by more than the ring holds, only the latest survive.
+        new_lines = snapshot[-delta:] if delta < len(snapshot) else snapshot
         if self._filter_fn:
             new_lines = [line for line in new_lines if self._filter_fn(line)]
         if not new_lines:

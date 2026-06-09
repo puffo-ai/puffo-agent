@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QButtonGroup, QPushButton, QVBoxLayout, QWidget
 class Rail(QWidget):
     """Two buttons stacked vertically: ``Home`` and ``Agents``."""
 
-    section_changed = Signal(str)  # "home" or "agents"
+    section_changed = Signal(str)  # "home" / "agents" / "logs" / "status"
 
     _BUTTON_QSS = (
         "QPushButton { color: #1f2937; background-color: transparent;"
@@ -39,9 +39,11 @@ class Rail(QWidget):
         self._home_btn = self._make_button("🏠\nHome", "home")
         self._agents_btn = self._make_button("👥\nAgents", "agents")
         self._logs_btn = self._make_button("📜\nLogs", "logs")
+        self._status_btn = self._make_button("🔌\nStatus", "status")
         layout.addWidget(self._home_btn)
         layout.addWidget(self._agents_btn)
         layout.addWidget(self._logs_btn)
+        layout.addWidget(self._status_btn)
         layout.addStretch(1)
         self._home_btn.setChecked(True)
 

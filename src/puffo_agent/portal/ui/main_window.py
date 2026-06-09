@@ -24,6 +24,7 @@ from .widgets.agent_workspace import AgentWorkspace
 from .widgets.avatar import AvatarCache
 from .widgets.home_view import HomeView
 from .widgets.log_view import LogView
+from .widgets.mcp_status import McpStatusView
 from .widgets.rail import Rail
 
 
@@ -40,10 +41,15 @@ class MainWindow(QMainWindow):
         *,
         daemon_thread: DaemonThread,
         log_buffer: LogRingHandler,
+        detached: bool = False,
     ) -> None:
         super().__init__()
         self._daemon_thread = daemon_thread
         self._log_buffer = log_buffer
+        # Detached = opened from the tray (start --background); closing the
+        # window must NOT stop the daemon (only the tray's Quit does).
+        # --ui (non-detached) keeps the close-stops-daemon behaviour.
+        self._detached = detached
         self._stop_requested = False
         self._selected_id: Optional[str] = None
         self._section = "home"
@@ -88,6 +94,7 @@ class MainWindow(QMainWindow):
         self._sections.addWidget(self._build_home_section())     # 0
         self._sections.addWidget(self._build_agents_section())   # 1
         self._sections.addWidget(self._build_logs_section())     # 2
+        self._sections.addWidget(self._build_status_section())   # 3
         root_layout.addWidget(self._sections, stretch=1)
 
     def _build_home_section(self) -> QWidget:
@@ -102,9 +109,15 @@ class MainWindow(QMainWindow):
         title = QLabel("System log")
         title.setStyleSheet("font-size: 14pt; font-weight: 600; color: #1f2937;")
         layout.addWidget(title)
-        self._system_log = LogView(self._log_buffer.snapshot)
+        self._system_log = LogView(
+            self._log_buffer.snapshot, self._log_buffer.counter,
+        )
         layout.addWidget(self._system_log, stretch=1)
         return wrap
+
+    def _build_status_section(self) -> QWidget:
+        self._mcp_status = McpStatusView()
+        return self._mcp_status
 
     def _build_agents_section(self) -> QWidget:
         splitter = QSplitter(Qt.Horizontal)
@@ -143,7 +156,9 @@ class MainWindow(QMainWindow):
         wrap.setChildrenCollapsible(False)
         self._detail = AgentDetail()
         self._detail.saved.connect(self._on_detail_saved)
-        self._workspace = AgentWorkspace(self._log_buffer.snapshot)
+        self._workspace = AgentWorkspace(
+            self._log_buffer.snapshot, self._log_buffer.counter,
+        )
         wrap.addWidget(self._detail)
         wrap.addWidget(self._workspace)
         wrap.setSizes([460, 540])
@@ -154,7 +169,7 @@ class MainWindow(QMainWindow):
     def _on_section_changed(self, section: str) -> None:
         self._section = section
         self._sections.setCurrentIndex(
-            {"home": 0, "agents": 1, "logs": 2}.get(section, 0)
+            {"home": 0, "agents": 1, "logs": 2, "status": 3}.get(section, 0)
         )
 
     def _on_agent_selected(self, agent_id: Optional[str]) -> None:
@@ -179,6 +194,9 @@ class MainWindow(QMainWindow):
         if self._section == "logs":
             self._system_log.poll()
             return
+        if self._section == "status":
+            self._mcp_status.poll()
+            return
         self._agent_list.refresh()
         if self._selected_id is None:
             self._runtime_log.poll()
@@ -195,9 +213,20 @@ class MainWindow(QMainWindow):
         if self._daemon_thread.is_alive():
             return
         self._daemon_watchdog.stop()
+        if self._detached:
+            # Tray owns the app lifecycle; just close this viewer window.
+            self.close()
+            return
         QApplication.instance().quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._detached:
+            # Tray-owned viewer: closing must NOT stop the daemon — only
+            # the tray's Quit does. Just tear down this window's timers.
+            self._timer.stop()
+            self._daemon_watchdog.stop()
+            event.accept()
+            return
         if not self._stop_requested:
             self._stop_requested = True
             self._timer.stop()
