@@ -587,6 +587,22 @@ class Worker:
             agent_id,
         )
 
+    def _maybe_wake_refresher_if_auth_failed(self, agent_id: str) -> None:
+        """If a new batch arrives while we're auth_failed, wake the
+        refresher so it re-checks for an operator re-login immediately
+        (which, on a detected change, syncs the new credential and
+        restarts us) instead of waiting up to a full poll interval."""
+        if self.runtime.health != "auth_failed":
+            return
+        if self._notify_refresh_needed is None:
+            return
+        try:
+            self._notify_refresh_needed()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+            )
+
     def _enter_auth_failed(self, agent_id: str) -> None:
         """Flip ``auth_failed`` and fire recovery: the refresher kick
         (so the daemon re-checks credentials now) + the operator DM.
@@ -1083,6 +1099,10 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
+            # A new batch arrived while auth_failed: wake the refresher
+            # to check for an operator re-login NOW rather than waiting
+            # for the next poll (the flip below would mask auth_failed).
+            self._maybe_wake_refresher_if_auth_failed(agent_id)
             try:
                 Worker._flip_health_in_progress(self.runtime, agent_id, logger)
             except Exception as exc:  # noqa: BLE001

@@ -30,7 +30,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   fingerprints the host credential (claude + codex) and, on an external
   change, syncs every agent and fires refresh-success; the daemon then
   restarts the agents that were `auth_failed` so their session respawns
-  with the fresh credential and the stalled batch redelivers.
+  with the fresh credential and the stalled batch redelivers. A new
+  message to an `auth_failed` agent also wakes the refresher on the spot,
+  so recovery doesn't wait for the next poll.
 - **Harden Keychain credential parsing.** A valid-JSON-but-non-object
   blob (e.g. a bare ``5``) could raise an uncaught ``AttributeError``
   mid-read; it is now rejected cleanly as ``invalid_oauth_blob``. The

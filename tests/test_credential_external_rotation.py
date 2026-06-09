@@ -163,3 +163,40 @@ def test_on_refresh_success_no_restart_when_healthy(tmp_path, monkeypatch):
     d, w, flag = _daemon_harness(monkeypatch, tmp_path, "ok")
     d.refresher.callback()
     assert not flag.exists()    # nothing to recover → no restart
+
+
+# ── new message while auth_failed wakes the refresher ──────────────
+
+
+def _wake_stub(health: str, *, has_cb: bool = True):
+    from puffo_agent.portal.worker import Worker
+
+    class _RT:
+        def __init__(self, h):
+            self.health = h
+
+    class _W:
+        pass
+
+    w = _W()
+    w.runtime = _RT(health)
+    w.fired: list[int] = []
+    w._notify_refresh_needed = (lambda: w.fired.append(1)) if has_cb else None
+    return Worker, w
+
+
+def test_new_message_while_auth_failed_wakes_refresher():
+    Worker, w = _wake_stub("auth_failed")
+    Worker._maybe_wake_refresher_if_auth_failed(w, "t-agent")
+    assert w.fired == [1]
+
+
+def test_new_message_when_healthy_does_not_wake():
+    Worker, w = _wake_stub("ok")
+    Worker._maybe_wake_refresher_if_auth_failed(w, "t-agent")
+    assert w.fired == []
+
+
+def test_wake_is_noop_without_notify_callback():
+    Worker, w = _wake_stub("auth_failed", has_cb=False)
+    Worker._maybe_wake_refresher_if_auth_failed(w, "t-agent")   # no crash
