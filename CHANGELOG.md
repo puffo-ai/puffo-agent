@@ -22,6 +22,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   now share one auth detector, so a confirmed auth error skips the
   pointless retries and goes straight to `auth_failed` + the operator
   DM (the batch redelivers once the operator re-logs in).
+- **Re-login now recovers running agents on copy-mode hosts (Windows).**
+  The file-credential backend assumed a symlink carried an operator
+  `claude /login` to every agent — but Windows falls back to a copy, so
+  a re-login never reached running agents and they sat in `auth_failed`
+  until a manual new message / `agent resume`. The refresher now
+  fingerprints the host credential (claude + codex) and, on an external
+  change, syncs every agent and fires refresh-success; the daemon then
+  restarts the agents that were `auth_failed` so their session respawns
+  with the fresh credential and the stalled batch redelivers.
 - **Harden Keychain credential parsing.** A valid-JSON-but-non-object
   blob (e.g. a bare ``5``) could raise an uncaught ``AttributeError``
   mid-read; it is now rejected cleanly as ``invalid_oauth_blob``. The
