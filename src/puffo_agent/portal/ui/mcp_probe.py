@@ -62,6 +62,20 @@ def _is_mcp_node(name: str, cmdline_lc: str) -> bool:
 class McpProbe:
     def __init__(self) -> None:
         self._cache: dict[int, "psutil.Process"] = {}
+        self._name_cache: dict[str, str] = {}
+
+    def _display_name(self, agent_id: str) -> str:
+        if agent_id in self._name_cache:
+            return self._name_cache[agent_id]
+        name = agent_id
+        try:
+            from ..state import AgentConfig
+            cfg = AgentConfig.load(agent_id)
+            name = cfg.display_name or agent_id
+        except Exception:
+            pass
+        self._name_cache[agent_id] = name
+        return name
 
     def sample(self) -> list[dict]:
         if psutil is None:
@@ -98,8 +112,10 @@ class McpProbe:
                     proc = p
                     self._cache[pid] = proc
                     proc.cpu_percent(None)  # prime; first reading is 0.0
+                aid = self._owner(p, sessions)
                 rows.append({
-                    "agent": self._owner(p, sessions),
+                    "agent": aid,
+                    "agent_name": self._display_name(aid) if aid != "?" else "?",
                     "server": server_name(cmd),
                     "pid": pid,
                     "status": p.status(),
