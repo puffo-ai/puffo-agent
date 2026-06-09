@@ -94,6 +94,17 @@ def test_top_level_y_with_zero_pending_returns_none():
     assert resolved is None
 
 
+def test_resolver_handles_none_payload_thread_root_id():
+    """The gate passes ``payload_thread_root_id`` straight in even
+    when the WS frame omits it; resolver must treat ``None`` like a
+    non-match and fall through to the single-pending path.
+    """
+    client = _make_client()
+    _seed_pending(client, "env_invite_solo")
+    resolved = client._resolve_invite_thread_root(None, "y")
+    assert resolved == "env_invite_solo"
+
+
 def test_top_level_y_with_multi_pending_returns_none():
     client = _make_client()
     _seed_pending(client, "env_invite_a")
@@ -201,6 +212,45 @@ async def test_top_level_y_with_zero_pending_no_op():
     assert resolved is None
     assert client._accept_calls == []
     assert client._reject_calls == []
+
+
+@pytest.mark.asyncio
+async def test_new_invite_seeded_between_awaits_does_not_corrupt_accept():
+    """PUF-287 race scenario: a fresh invite registers in
+    ``_pending_invite_dms`` while ``_maybe_handle_invite_reply`` is
+    mid-await on ``_accept_invite``. asyncio's single-threaded model
+    means the resolver's pending-id snapshot is taken before the
+    handler awaits, so a concurrent insert can't redirect this y/n.
+    Locks the contract: the resolved root is consumed exactly once
+    and the late-arriving invite stays untouched.
+    """
+    client = _make_client()
+    _seed_pending(client, "env_invite_first", invitation_event_id="ev_first")
+    late_arrived = {"slug": False}
+
+    async def _stub_accept_with_late_seed(kind, eid, space_id, channel_id):
+        # Simulate a second invite registering mid-accept.
+        _seed_pending(
+            client, "env_invite_late",
+            invitation_event_id="ev_late",
+        )
+        late_arrived["slug"] = True
+        # Original stub records the call.
+        client._accept_calls.append((kind, eid, space_id, channel_id))
+
+    client._accept_invite = _stub_accept_with_late_seed  # type: ignore[assignment]
+
+    resolved = client._resolve_invite_thread_root("env_top_msg", "y")
+    handled = await client._maybe_handle_invite_reply(
+        thread_root_id=resolved, text="y",
+    )
+
+    assert handled is True
+    assert late_arrived["slug"] is True
+    # First invite consumed; late invite still pending and untouched.
+    assert client._accept_calls == [("invite_to_space", "ev_first", "sp_1", "")]
+    assert "env_invite_first" not in client._pending_invite_dms
+    assert "env_invite_late" in client._pending_invite_dms
 
 
 @pytest.mark.asyncio
