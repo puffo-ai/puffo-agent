@@ -1,5 +1,6 @@
 import os
 
+from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
@@ -13,8 +14,16 @@ class AgentAPIError(Exception):
     consumer to suppress the reply, mark the turn errored, and
     re-enqueue the triggering message after a 15-45s backoff so
     transient provider failures recover without operator intervention.
+
+    ``is_auth`` is set when the error is an auth failure (expired/revoked
+    OAuth, invalid key). Retrying that is pointless, so the consumer
+    skips the kick-retries and the worker flips ``auth_failed`` + DMs the
+    operator instead.
     """
-    pass
+
+    def __init__(self, message: str, *, is_auth: bool = False) -> None:
+        super().__init__(message)
+        self.is_auth = is_auth
 
 
 def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
@@ -230,12 +239,15 @@ class PuffoAgent:
         if "[SILENT]" in joined:
             return None
         if "API Error" in joined:
+            is_auth = looks_like_auth_error(joined)
             self.logger.warning(
-                "[api-error-retry] adapter still rate-limited; "
-                "raising for consumer-side backoff"
+                "[api-error-retry] adapter still %s; raising for "
+                "consumer-side handling",
+                "auth-failed" if is_auth else "rate-limited",
             )
             raise AgentAPIError(
-                "agent adapter output contained 'API Error' on retry"
+                "agent adapter output contained 'API Error' on retry",
+                is_auth=is_auth,
             )
         if not text_parts and not result.reply:
             return None
@@ -296,12 +308,15 @@ class PuffoAgent:
         # internals and spam the thread on transient rate-limits.
         # Raise so the consumer can re-enqueue after a backoff.
         if "API Error" in joined:
+            is_auth = looks_like_auth_error(joined)
             self.logger.warning(
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
-                "contained 'API Error'; suppressing post, abandoning batch"
+                "contained 'API Error' (%s); suppressing post",
+                "auth-failed" if is_auth else "rate-limited",
             )
             raise AgentAPIError(
-                "agent adapter output contained 'API Error'"
+                "agent adapter output contained 'API Error'",
+                is_auth=is_auth,
             )
 
         if not text_parts and not result.reply:

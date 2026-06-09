@@ -587,6 +587,27 @@ class Worker:
             agent_id,
         )
 
+    def _enter_auth_failed(self, agent_id: str) -> None:
+        """Flip ``auth_failed`` and fire recovery: the refresher kick
+        (so the daemon re-checks credentials now) + the operator DM.
+        Used when an adapter raises a *confirmed* auth error so we skip
+        the pointless rate-limit kick-retries and go straight to the
+        recover-via-relogin flow."""
+        rt = self.runtime
+        was_ok = rt.health != "auth_failed"
+        rt.health = "auth_failed"
+        rt.error = "auth error — run `claude /login`, then resume the agent"
+        rt.save(agent_id)
+        if self._notify_refresh_needed is not None:
+            try:
+                self._notify_refresh_needed()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+                )
+        if was_ok:
+            self._on_auth_failed_enter()
+
     def _on_auth_failed_enter(self) -> None:
         """Fire the operator DM once per auth_failed episode. The flag
         re-arms on auth_failed CLEAR (daemon ``on_refresh_success``) and
@@ -1090,11 +1111,23 @@ class Worker:
                 # Adapter surfaced an "API Error" string. Mark turn
                 # errored and re-raise; the consumer loop re-enqueues
                 # the batch with cursor preserved and backs off.
-                logger.warning("agent %s: api-error retry: %s", agent_id, exc)
+                if getattr(exc, "is_auth", False):
+                    # Auth error: kick-retries are pointless. Flip
+                    # auth_failed + DM the operator now; the consumer
+                    # skips retries and abandons (batch redelivers once
+                    # the operator re-logs in).
+                    logger.warning(
+                        "agent %s: adapter auth error — flagging auth_failed, "
+                        "no kick-retry", agent_id,
+                    )
+                    self._enter_auth_failed(agent_id)
+                    turn_error = "auth error"
+                else:
+                    logger.warning("agent %s: api-error retry: %s", agent_id, exc)
+                    turn_error = "API Error"
                 reply = None
                 turn_succeeded = False
                 turn_will_retry = True
-                turn_error = "API Error"
                 raise
             except Exception as exc:
                 logger.error(

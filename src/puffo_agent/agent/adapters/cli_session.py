@@ -61,24 +61,6 @@ _REQUEST_TOO_LARGE_PATTERN: re.Pattern[str] = re.compile(
 )
 
 
-# Case-insensitive substrings that mark a claude reply as an auth /
-# token failure rather than a real response. Kept STRONG-ONLY — weak
-# markers like "401" or "unauthorized" would false-positive on users
-# discussing HTTP / auth concepts.
-_AUTH_ERROR_MARKERS = (
-    "please run /login",
-    "please run `claude /login`",
-    "run `claude login`",
-    "invalid api key",
-    "invalid_grant",
-    "authentication failed",
-    "credentials expired",
-    "failed to authenticate",
-    "api error: 401",
-    "invalid authentication credentials",
-    '"type":"authentication_error"',
-)
-
 # Backoffs between auth-error retries (5 attempts total, worst case
 # ~45s). First interval is short: the common cause is a multi-agent
 # rotating-refresh-token race that resolves within a second of the
@@ -103,11 +85,9 @@ _POISONED_SESSION_MARKERS = (
 )
 
 
-def _looks_like_auth_error(text: str) -> bool:
-    if not text:
-        return False
-    low = text.lower()
-    return any(marker in low for marker in _AUTH_ERROR_MARKERS)
+# Shared with ``core`` (which tags ``AgentAPIError.is_auth``) so the
+# two detections can't drift.
+from .._auth_markers import looks_like_auth_error as _looks_like_auth_error  # noqa: E402
 
 
 def _looks_like_poisoned_session(text: str) -> bool:

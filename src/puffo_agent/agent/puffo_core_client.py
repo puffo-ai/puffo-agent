@@ -992,6 +992,7 @@ class PuffoCoreMessageClient:
         on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
         on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
         last_envelope: str,
+        is_auth: bool = False,
     ) -> None:
         """Loop the API-Error kick-retry path until the agent
         succeeds, the retry cap is hit, or a non-retry exception
@@ -1018,6 +1019,24 @@ class PuffoCoreMessageClient:
         # those envelopes need to be caught by the cursor (advanced
         # by the kick's successful dispatch) or by in-batch dedup.
         entry.dispatching_ids = set()
+
+        if is_auth:
+            # Auth failure: retrying is pointless until the operator
+            # re-logs in. The worker already flipped auth_failed + DMed;
+            # abandon now (cursor not advanced → redelivers on recovery).
+            self._log.warning(
+                "agent reply was an auth error for thread %s (last envelope "
+                "%s); skipping kick-retries, abandoning batch",
+                root_id, last_envelope,
+            )
+            await self._fire_api_error_abandon(
+                on_api_error_abandon=on_api_error_abandon,
+                root_id=root_id,
+                batch=batch,
+                channel_meta=channel_meta,
+                attempts=0,
+            )
+            return
 
         if on_api_error_retry is None:
             self._log.warning(
@@ -1246,7 +1265,7 @@ class PuffoCoreMessageClient:
 
             try:
                 await on_message_batch(root_id, batch, channel_meta)
-            except AgentAPIError:
+            except AgentAPIError as exc:
                 # Adapter surfaced "API Error" — most commonly
                 # claude-code's transient rate-limit error. The
                 # original user input is already in claude-code's
@@ -1261,7 +1280,8 @@ class PuffoCoreMessageClient:
                 # via ``on_api_error_retry``; if ``--resume`` is no
                 # longer valid the adapter falls back to the original
                 # payload on its own so the agent has something to
-                # work from.
+                # work from. Auth errors skip retries entirely (the
+                # worker already flipped auth_failed + DMed).
                 last_envelope = batch[-1].get("envelope_id", "") if batch else ""
                 await self._do_api_error_retries(
                     root_id=root_id,
@@ -1272,6 +1292,7 @@ class PuffoCoreMessageClient:
                     on_api_error_abandon=on_api_error_abandon,
                     on_turn_success=on_turn_success,
                     last_envelope=last_envelope,
+                    is_auth=getattr(exc, "is_auth", False),
                 )
                 continue
             except asyncio.CancelledError:
