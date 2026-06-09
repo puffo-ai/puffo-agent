@@ -359,7 +359,7 @@ def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "refresh_broken"
-    assert "claude /login" in rs.error
+    assert "claude auth login" in rs.error
     assert "unchanged" in rs.error
 
 

@@ -19,8 +19,34 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.12.2] — 2026-06-06
 
+### Added
+
+- **Operator DM on agent auth failure.** When an agent's Claude OAuth
+  expires/revokes (a 401), the daemon DMs the operator a bilingual
+  (zh+en) note: run `claude auth login` and just send a message (a new
+  message auto-resumes) — once per failure episode, re-armed after the
+  credential recovers.
+
 ### Fixed
 
+- **Auth errors are distinguished from rate-limits.** A `401 Invalid
+  authentication credentials` reply was treated as a generic rate-limit
+  `API Error` — kick-retried then abandoned, never flipping
+  `auth_failed` or notifying the operator. The CLI adapter and `core`
+  now share one auth detector, so a confirmed auth error skips the
+  pointless retries and goes straight to `auth_failed` + the operator
+  DM (the batch redelivers once the operator re-logs in).
+- **Re-login now recovers running agents on copy-mode hosts (Windows).**
+  The file-credential backend assumed a symlink carried an operator
+  `claude auth login` to every agent — but Windows falls back to a copy,
+  so a re-login never reached running agents and they sat in
+  `auth_failed` until a manual new message. The refresher now
+  fingerprints the host credential (claude + codex) and, on an external
+  change, syncs every agent and fires refresh-success; the daemon then
+  restarts the agents that were `auth_failed` so their session respawns
+  with the fresh credential and the stalled batch redelivers. A new
+  message to an `auth_failed` agent also wakes the refresher on the spot,
+  so recovery doesn't wait for the next poll.
 - **Harden Keychain credential parsing.** A valid-JSON-but-non-object
   blob (e.g. a bare ``5``) could raise an uncaught ``AttributeError``
   mid-read; it is now rejected cleanly as ``invalid_oauth_blob``. The
