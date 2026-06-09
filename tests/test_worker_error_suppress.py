@@ -186,9 +186,9 @@ def test_handle_suppressed_reply_returns_true_on_leak_api_retry_scope(tmp_path, 
     )
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
-    # API-retry / auth-class branch: re-login + resume recovery copy.
-    assert "claude /login" in runtime.error
-    assert "puffo-agent agent resume agent-suppress-retry" in runtime.error
+    # API-retry / auth-class branch: re-login + send-a-message copy.
+    assert "claude auth login" in runtime.error
+    assert "send the agent a message" in runtime.error
     assert runtime.health == "auth_failed"
 
 
@@ -209,8 +209,8 @@ def test_handle_suppressed_reply_api_retry_rate_limit_branches_message(tmp_path,
     assert runtime.health == "unknown"  # NOT auth_failed
     assert "rate-limit" in runtime.error
     assert "self-recovers" in runtime.error
-    assert "claude /login" not in runtime.error
-    assert "puffo-agent agent resume" not in runtime.error
+    assert "claude auth login" not in runtime.error
+    assert "agent resume" not in runtime.error
 
 
 def test_handle_suppressed_reply_returns_false_on_legit_prose(tmp_path, monkeypatch):
@@ -467,7 +467,7 @@ def test_call_site_skips_send_on_suppressed_leak(tmp_path, monkeypatch):
     assert client.calls == []  # NEVER called when filter suppresses
     # Operator-side surface populated.
     assert runtime.health == "auth_failed"
-    assert "puffo-agent agent resume agent-skip-send" in runtime.error
+    assert "send the agent a message" in runtime.error
     # And the call site DID sleep with a backoff in range.
     assert len(sleeps) == 1
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= sleeps[0] <= _SUPPRESSION_BACKOFF_MAX_SECONDS

@@ -28,13 +28,14 @@ from puffo_agent.portal.worker import _handle_suppressed_reply
 
 def test_oauth_copy_includes_english_and_chinese():
     text = format_oauth_expired("planner-1234", "Planner")
-    # English strand
+    # English strand: `claude auth login` + send-a-message (auto-resume)
     assert "Claude OAuth expired" in text
-    assert "claude /login" in text
-    assert "puffo-agent agent resume planner-1234" in text
+    assert "claude auth login" in text
+    assert "send me a message" in text
+    assert "agent resume" not in text   # no manual resume step anymore
     # Chinese strand
     assert "Claude OAuth 已过期" in text
-    assert "puffo-agent agent resume planner-1234" in text
+    assert "发条消息" in text
     # Bold display name format
     assert "**Planner**" in text
 
@@ -295,7 +296,7 @@ def test_notify_sends_dm_when_operator_slug_set(tmp_path, monkeypatch):
     assert captured["root_id"] == ""
     assert "Claude OAuth expired" in captured["text"]
     assert "Claude OAuth 已过期" in captured["text"]
-    assert "puffo-agent agent resume t-agent" in captured["text"]
+    assert "claude auth login" in captured["text"]
 
 
 def test_notify_swallows_send_dm_exception(monkeypatch, caplog):
@@ -401,8 +402,8 @@ def test_oauth_copy_quotes_agent_id_for_markdown_safety():
     [a-z0-9-] today so injection is near-zero risk, but pinning the
     contract avoids future regression if the slug regex changes."""
     text = format_oauth_expired("a-b-c", "")
-    # Backtick-wrap in both strands of recovery instruction.
-    assert "`puffo-agent agent resume a-b-c`" in text
+    # agent_id is backtick-wrapped in the label so a stray markdown char
+    # can't break the rendered DM.
     assert "`a-b-c`" in text
 
 

@@ -1019,8 +1019,8 @@ class CredentialRefresher:
         msg = (
             f"daemon CredentialRefresher saw {self._consecutive_non_success} "
             f"consecutive {outcome.value} outcome(s); on-disk token isn't "
-            f"advancing. Run `claude /login` then "
-            f"`puffo-agent agent resume <id>` to recover."
+            f"advancing. Run `claude auth login`, then send the agent "
+            f"a message to recover."
         )
         for agent_home in self._agent_homes:
             agent_id = Path(agent_home).name

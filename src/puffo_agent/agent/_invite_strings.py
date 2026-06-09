@@ -63,16 +63,17 @@ def format_invite_error(exc: Exception, verb: str) -> str:
 
 
 def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
-    """Bilingual (zh+en) operator DM for an OAuth-expired agent, with
-    the ``claude /login`` + ``agent resume`` recovery steps. Falls back
-    to a bare ``id`` when ``agent_display_name`` is empty."""
+    """Bilingual (zh+en) operator DM for an OAuth-expired agent: run
+    ``claude auth login`` and just send a message (a new message
+    auto-resumes the agent). Falls back to a bare ``id`` when
+    ``agent_display_name`` is empty."""
     label = (
         f"**{agent_display_name}** (`{agent_id}`)"
         if agent_display_name else f"`{agent_id}`"
     )
     return (
-        f"⚠️ {label} — Claude OAuth expired. Run `claude /login`, then "
-        f"`puffo-agent agent resume {agent_id}`.\n"
-        f"⚠️ Claude OAuth 已过期。请运行 `claude /login`，再 "
-        f"`puffo-agent agent resume {agent_id}`。"
+        f"⚠️ {label} — Claude OAuth expired. Run `claude auth login`, "
+        "then send me a message and I'll pick up where I left off.\n"
+        "⚠️ Claude OAuth 已过期。请运行 `claude auth login`，"
+        "然后给我发条消息即可恢复。"
     )

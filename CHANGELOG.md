@@ -10,8 +10,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Operator DM on agent auth failure.** When an agent's Claude OAuth
   expires/revokes (a 401), the daemon DMs the operator a bilingual
-  (zh+en) note with the `claude /login` + `agent resume` recovery steps
-  — once per failure episode, re-armed after the credential recovers.
+  (zh+en) note: run `claude auth login` and just send a message (a new
+  message auto-resumes) — once per failure episode, re-armed after the
+  credential recovers.
 
 ### Fixed
 
@@ -24,9 +25,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   DM (the batch redelivers once the operator re-logs in).
 - **Re-login now recovers running agents on copy-mode hosts (Windows).**
   The file-credential backend assumed a symlink carried an operator
-  `claude /login` to every agent — but Windows falls back to a copy, so
-  a re-login never reached running agents and they sat in `auth_failed`
-  until a manual new message / `agent resume`. The refresher now
+  `claude auth login` to every agent — but Windows falls back to a copy,
+  so a re-login never reached running agents and they sat in
+  `auth_failed` until a manual new message. The refresher now
   fingerprints the host credential (claude + codex) and, on an external
   change, syncs every agent and fires refresh-success; the daemon then
   restarts the agents that were `auth_failed` so their session respawns

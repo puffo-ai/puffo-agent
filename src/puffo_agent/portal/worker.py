@@ -512,9 +512,9 @@ def _handle_suppressed_reply(
         if is_auth:
             runtime.error = (
                 "Worker emitted an auth-error string after an API "
-                "error; suppressed from channel post. Re-run "
-                "`claude /login`, then "
-                f"`puffo-agent agent resume {agent_id}`."
+                "error; suppressed from channel post. Run "
+                "`claude auth login`, then send the agent a message "
+                "to recover."
             )
         else:
             runtime.error = (
@@ -612,7 +612,7 @@ class Worker:
         rt = self.runtime
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
-        rt.error = "auth error — run `claude /login`, then resume the agent"
+        rt.error = "auth error — run `claude auth login`, then send a message to recover"
         rt.save(agent_id)
         if self._notify_refresh_needed is not None:
             try:
