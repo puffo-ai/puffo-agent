@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.13.0] — 2026-06-06
+## [0.12.2] — 2026-06-06
 
 ### Added
 
@@ -16,11 +16,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   ``~/.puffo-agent/background.log``. On a GUI session without a tray
   host the daemon still runs headless with a logged warning. The
   internal ``--tray-runner`` flag hosts the tray in the detached child.
-
-## [0.12.2] — 2026-06-06
-
-### Added
-
 - **Operator DM on agent auth failure.** When an agent's Claude OAuth
   expires/revokes (a 401), the daemon DMs the operator a bilingual
   (zh+en) note: run `claude auth login` and just send a message (a new
