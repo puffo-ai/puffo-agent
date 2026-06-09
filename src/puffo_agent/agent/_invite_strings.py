@@ -71,12 +71,8 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
         if agent_display_name else f"`{agent_id}`"
     )
     return (
-        f"⚠️ {label} — Claude OAuth has expired and I can't reach "
-        "the model right now.\n"
-        f"To recover: run `claude /login` in your terminal, then "
-        f"`puffo-agent agent resume {agent_id}` to bring me back online.\n"
-        "\n"
-        f"⚠️ {label} — Claude OAuth 已过期，我现在无法访问模型。\n"
-        f"恢复方法：在终端运行 `claude /login`，然后 "
-        f"`puffo-agent agent resume {agent_id}` 让我重新上线。"
+        f"⚠️ {label} — Claude OAuth expired. Run `claude /login`, then "
+        f"`puffo-agent agent resume {agent_id}`.\n"
+        f"⚠️ Claude OAuth 已过期。请运行 `claude /login`，再 "
+        f"`puffo-agent agent resume {agent_id}`。"
     )

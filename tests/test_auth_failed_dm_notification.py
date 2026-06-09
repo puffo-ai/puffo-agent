@@ -29,12 +29,11 @@ from puffo_agent.portal.worker import _handle_suppressed_reply
 def test_oauth_copy_includes_english_and_chinese():
     text = format_oauth_expired("planner-1234", "Planner")
     # English strand
-    assert "Claude OAuth has expired" in text
+    assert "Claude OAuth expired" in text
     assert "claude /login" in text
     assert "puffo-agent agent resume planner-1234" in text
     # Chinese strand
     assert "Claude OAuth 已过期" in text
-    assert "终端" in text
     assert "puffo-agent agent resume planner-1234" in text
     # Bold display name format
     assert "**Planner**" in text
@@ -43,7 +42,7 @@ def test_oauth_copy_includes_english_and_chinese():
 def test_oauth_copy_degrades_when_display_name_missing():
     text = format_oauth_expired("agent-5678", "")
     # Both strands still present
-    assert "Claude OAuth has expired" in text
+    assert "Claude OAuth expired" in text
     assert "Claude OAuth 已过期" in text
     # Backtick-id (no bold display name) — degrades cleanly
     assert "`agent-5678`" in text
@@ -294,7 +293,7 @@ def test_notify_sends_dm_when_operator_slug_set(tmp_path, monkeypatch):
 
     assert captured["recipient"] == "@han-0001"
     assert captured["root_id"] == ""
-    assert "Claude OAuth has expired" in captured["text"]
+    assert "Claude OAuth expired" in captured["text"]
     assert "Claude OAuth 已过期" in captured["text"]
     assert "puffo-agent agent resume t-agent" in captured["text"]
 
