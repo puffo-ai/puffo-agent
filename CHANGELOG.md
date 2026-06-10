@@ -4,18 +4,6 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.12.3] — 2026-06-07
-
-### Fixed
-
-- **Proxy support for Python agent networking.** ``puffo-agent`` now
-  installs ``python-socks`` so ``websockets`` can connect through
-  SOCKS proxies configured in the environment. Remote Puffo Core
-  HTTP/import requests now honor ``HTTP_PROXY``, ``HTTPS_PROXY``,
-  ``ALL_PROXY``, ``SOCKS_PROXY``, and ``NO_PROXY``; HTTP proxies use
-  aiohttp's native environment handling, while SOCKS proxies use
-  ``aiohttp-socks``.
-
 ## [0.12.2] — 2026-06-06
 
 ### Added
@@ -44,6 +32,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Proxy support for Python agent networking.** ``puffo-agent`` now
+  installs ``python-socks`` so ``websockets`` can connect through
+  SOCKS proxies configured in the environment. Remote Puffo Core
+  HTTP/import requests now honor ``HTTP_PROXY``, ``HTTPS_PROXY``,
+  ``ALL_PROXY``, ``SOCKS_PROXY``, and ``NO_PROXY``; HTTP proxies use
+  aiohttp's native environment handling, while SOCKS proxies use
+  ``aiohttp-socks``.
 - **UI log view always tails the newest lines.** The view diffed on
   buffer length, but the log buffer is a ring that drops its oldest
   line — so once full it froze on the first ~500 lines (the oldest).
