@@ -8,6 +8,7 @@ import time
 import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
+from aiohttp_socks import ProxyConnector
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -15,6 +16,7 @@ from puffo_agent.crypto.certs import SUBKEY_TTL_HOURS
 from puffo_agent.crypto.encoding import base64url_decode, base64url_encode
 from puffo_agent.crypto.http_auth import sign_request
 from puffo_agent.crypto.http_client import HttpError, PuffoCoreHttpClient
+from puffo_agent.crypto.http_session import create_remote_http_session
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, ed25519_verify
 
@@ -50,6 +52,66 @@ def _make_keystore_with_session(ks, subkey):
     )
     ks.save_session(session)
     return session
+
+
+def _clear_proxy_env(monkeypatch):
+    for key in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "SOCKS_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "socks_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+def test_remote_http_session_trusts_env_without_socks_proxy(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+
+    async def run():
+        session = create_remote_http_session("https://api.puffo.ai")
+        try:
+            assert getattr(session, "_trust_env", None) is True
+            assert not isinstance(session.connector, ProxyConnector)
+        finally:
+            await session.close()
+
+    asyncio.run(run())
+
+
+def test_remote_http_session_uses_socks_connector(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:9")
+
+    async def run():
+        session = create_remote_http_session("https://api.puffo.ai")
+        try:
+            assert getattr(session, "_trust_env", None) is False
+            assert isinstance(session.connector, ProxyConnector)
+        finally:
+            await session.close()
+
+    asyncio.run(run())
+
+
+def test_remote_http_session_uses_socks_proxy_env(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("SOCKS_PROXY", "socks5://127.0.0.1:9")
+
+    async def run():
+        session = create_remote_http_session("https://api.puffo.ai")
+        try:
+            assert getattr(session, "_trust_env", None) is False
+            assert isinstance(session.connector, ProxyConnector)
+        finally:
+            await session.close()
+
+    asyncio.run(run())
 
 
 class TestHttpClientSigning(AioHTTPTestCase):

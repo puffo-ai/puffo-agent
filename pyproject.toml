@@ -34,6 +34,7 @@ classifiers = [
 ]
 dependencies = [
     "aiohttp>=3.9",
+    "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
     "anthropic>=0.25",
     "cryptography>=43.0",
@@ -45,6 +46,7 @@ dependencies = [
     "openai>=1.30",
     "psutil>=5.9",
     "pyside6>=6.7",
+    "python-socks>=2.4",
     "pyyaml>=6.0",
     "websockets>=12.0",
 ]
