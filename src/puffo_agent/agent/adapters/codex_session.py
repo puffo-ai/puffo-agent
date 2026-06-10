@@ -492,6 +492,7 @@ class CodexSession:
             self.agent_id, " ".join(self.argv),
         )
         try:
+            from ..._proc import no_window_kwargs
             proc = await asyncio.create_subprocess_exec(
                 *self.argv,
                 stdin=asyncio.subprocess.PIPE,
@@ -499,6 +500,7 @@ class CodexSession:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
                 env=self.env,
+                **no_window_kwargs(),
                 # Override asyncio's default 64 KiB StreamReader buffer
                 # — codex emits very chunky single-line JSON
                 # notifications (full tool catalogs on

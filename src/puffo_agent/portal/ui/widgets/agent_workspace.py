@@ -34,12 +34,14 @@ class AgentWorkspace(QWidget):
     def __init__(
         self,
         snapshot_fn: Callable[[], list[str]],
+        counter_fn: Callable[[], int],
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._agent_id: Optional[str] = None
         self._cfg: Optional[AgentConfig] = None
         self._snapshot_fn = snapshot_fn
+        self._counter_fn = counter_fn
         self._build()
 
     # Construction ──────────────────────────────────────────────────
@@ -57,7 +59,9 @@ class AgentWorkspace(QWidget):
         outer.addWidget(self._tabs)
 
     def _build_logs_tab(self) -> QWidget:
-        self._agent_log = LogView(self._snapshot_fn, filter_fn=lambda _line: False)
+        self._agent_log = LogView(
+            self._snapshot_fn, self._counter_fn, filter_fn=lambda _line: False,
+        )
         return self._agent_log
 
     def _build_files_tab(self) -> QWidget:

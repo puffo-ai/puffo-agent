@@ -457,6 +457,7 @@ def _handle_suppressed_reply(
     *,
     scope: str,
     on_auth_failure: Optional[Callable[[], None]] = None,
+    on_auth_failed_enter: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
     ``(suppressed, backoff_seconds)``:
@@ -473,7 +474,9 @@ def _handle_suppressed_reply(
     it. ``on_auth_failure`` fires on the auth-class branch only;
     PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
     here so a 401-leak short-circuits the 2-min poll instead of
-    waiting for the next tick."""
+    waiting for the next tick. ``on_auth_failed_enter`` fires ONLY on
+    the was-ok→auth_failed transition (not re-entries), giving the
+    per-session DM dedup a natural firing edge."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False, 0.0
@@ -487,6 +490,7 @@ def _handle_suppressed_reply(
         agent_id, scope, backoff, reply[:200],
     )
     if is_auth:
+        was_ok = runtime.health != "auth_failed"
         runtime.health = "auth_failed"
         if on_auth_failure is not None:
             try:
@@ -496,13 +500,21 @@ def _handle_suppressed_reply(
                     "agent %s: on_auth_failure callback raised: %s",
                     agent_id, exc,
                 )
+        if was_ok and on_auth_failed_enter is not None:
+            try:
+                on_auth_failed_enter()
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: on_auth_failed_enter callback raised: %s",
+                    agent_id, exc,
+                )
     if scope == "api-error-retry":
         if is_auth:
             runtime.error = (
                 "Worker emitted an auth-error string after an API "
-                "error; suppressed from channel post. Re-run "
-                "`claude /login`, then "
-                f"`puffo-agent agent resume {agent_id}`."
+                "error; suppressed from channel post. Run "
+                "`claude auth login`, then send the agent a message "
+                "to recover."
             )
         else:
             runtime.error = (
@@ -575,6 +587,99 @@ class Worker:
             agent_id,
         )
 
+    def _maybe_wake_refresher_if_auth_failed(self, agent_id: str) -> None:
+        """A new batch while auth_failed: wake the refresher to re-check
+        for an operator re-login now instead of waiting for the poll."""
+        if self.runtime.health != "auth_failed":
+            return
+        if self._notify_refresh_needed is None:
+            return
+        try:
+            self._notify_refresh_needed()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+            )
+
+    def _enter_auth_failed(self, agent_id: str) -> None:
+        """Flip ``auth_failed`` + fire recovery (refresher kick + operator
+        DM). Used on a confirmed adapter auth error so we skip the
+        pointless kick-retries and go straight to recover-via-relogin."""
+        rt = self.runtime
+        was_ok = rt.health != "auth_failed"
+        rt.health = "auth_failed"
+        rt.error = "auth error — run `claude auth login`, then send a message to recover"
+        rt.save(agent_id)
+        if self._notify_refresh_needed is not None:
+            try:
+                self._notify_refresh_needed()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+                )
+        if was_ok:
+            self._on_auth_failed_enter()
+
+    def _on_auth_failed_enter(self) -> None:
+        """Fire the operator DM once per auth_failed episode. The flag
+        re-arms on auth_failed CLEAR (daemon ``on_refresh_success``) and
+        on a failed send, so a later genuine failure re-notifies."""
+        if self._auth_failed_notification_sent:
+            return
+        self._auth_failed_notification_sent = True
+        try:
+            asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
+        except Exception as exc:  # noqa: BLE001
+            # Re-arm so a schedule failure retries on the next ENTER.
+            self._auth_failed_notification_sent = False
+            logger.warning(
+                "agent %s: couldn't schedule auth-failed DM: %s",
+                self.agent_cfg.id, exc,
+            )
+
+    async def _notify_operator_of_auth_failed_oauth(self) -> None:
+        """DM the operator the bilingual OAuth-expired recovery copy.
+        Re-arms the dedup flag on a transient failure (client not warm,
+        or send raised) so the next ENTER retries instead of staying
+        silently gated."""
+        client = self._client
+        if client is None:
+            # Still warming — re-arm so a later ENTER retries.
+            self._auth_failed_notification_sent = False
+            logger.warning(
+                "agent %s: auth-failed DM skipped — client not yet warm",
+                self.agent_cfg.id,
+            )
+            return
+        operator_slug = getattr(client, "operator_slug", "") or ""
+        if not operator_slug:
+            # No operator to DM; the red-dot UI is the only signal. Stay
+            # gated — re-arming would respin on every 401.
+            logger.warning(
+                "agent %s: auth-failed but no operator_slug — not DMing",
+                self.agent_cfg.id,
+            )
+            return
+        from ..agent._invite_strings import format_oauth_expired
+        display_name = (
+            getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        )
+        text = format_oauth_expired(self.agent_cfg.id, display_name)
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception as exc:
+            # Transient send failure — re-arm for the next ENTER.
+            self._auth_failed_notification_sent = False
+            logger.exception(
+                "agent %s: auth-failed DM to %s raised: %s",
+                self.agent_cfg.id, operator_slug, exc,
+            )
+            return
+        logger.info(
+            "agent %s: notified operator @%s of OAuth-expired",
+            self.agent_cfg.id, operator_slug,
+        )
+
     @staticmethod
     def _flip_health_in_progress(
         runtime: "RuntimeState",
@@ -642,6 +747,10 @@ class Worker:
         # 401 surfacing in a reply short-circuits the daemon's 2-min
         # poll instead of waiting for the next tick.
         self._notify_refresh_needed = notify_refresh_needed
+        # In-memory dedup for the auth_failed ENTER operator DM;
+        # re-armed on credential refresh-success (daemon
+        # on_refresh_success) and on a failed send.
+        self._auth_failed_notification_sent = False
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),
@@ -986,6 +1095,9 @@ class Worker:
                     "agent %s: could not write current_turn.json: %s "
                     "(permission hook will fail-open)", agent_id, exc,
                 )
+            # New batch while auth_failed: wake the refresher to check
+            # for a re-login now (the flip below would mask auth_failed).
+            self._maybe_wake_refresher_if_auth_failed(agent_id)
             try:
                 Worker._flip_health_in_progress(self.runtime, agent_id, logger)
             except Exception as exc:  # noqa: BLE001
@@ -1014,11 +1126,21 @@ class Worker:
                 # Adapter surfaced an "API Error" string. Mark turn
                 # errored and re-raise; the consumer loop re-enqueues
                 # the batch with cursor preserved and backs off.
-                logger.warning("agent %s: api-error retry: %s", agent_id, exc)
+                if getattr(exc, "is_auth", False):
+                    # Auth: skip the pointless kick-retries — flag
+                    # auth_failed + DM now; consumer abandons (redelivers).
+                    logger.warning(
+                        "agent %s: adapter auth error — flagging auth_failed, "
+                        "no kick-retry", agent_id,
+                    )
+                    self._enter_auth_failed(agent_id)
+                    turn_error = "auth error"
+                else:
+                    logger.warning("agent %s: api-error retry: %s", agent_id, exc)
+                    turn_error = "API Error"
                 reply = None
                 turn_succeeded = False
                 turn_will_retry = True
-                turn_error = "API Error"
                 raise
             except Exception as exc:
                 logger.error(
@@ -1090,6 +1212,7 @@ class Worker:
                     agent_id,
                     scope="fallback",
                     on_auth_failure=self._notify_refresh_needed,
+                    on_auth_failed_enter=self._on_auth_failed_enter,
                 )
                 if suppressed:
                     await asyncio.sleep(backoff)
@@ -1132,6 +1255,7 @@ class Worker:
                     agent_id,
                     scope="api-error-retry",
                     on_auth_failure=self._notify_refresh_needed,
+                    on_auth_failed_enter=self._on_auth_failed_enter,
                 )
                 if suppressed:
                     # Hottest leak site (FB-88 / FB-159 case-studies).
