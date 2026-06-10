@@ -408,11 +408,9 @@ async def test_nonce_unique_per_connect():
 
 @pytest.mark.asyncio
 async def test_catchup_logs_zero_pending_count(caplog):
-    """PUF-285 (β): the catch-up INFO log must fire on every
-    reconnect, including ``N=0`` — that's the FB-238 audit signal
-    distinguishing a silent reconnect from a no-op. A future
-    "tidy-up" that re-introduces zero-suppression must trip this
-    test.
+    """The catch-up INFO log must fire on every reconnect, including
+    ``N=0`` — a future tidy-up that re-suppresses the zero line must
+    trip this test.
     """
     import logging as _stdlib_logging
 
