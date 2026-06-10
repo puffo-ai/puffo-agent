@@ -99,6 +99,31 @@ def test_prune_ignores_loose_files(tmp_path):
     assert (root / "loose.md").exists()
 
 
+def test_prune_tolerates_rmtree_oserror(tmp_path, monkeypatch, caplog):
+    """A dir that fails to rmtree is logged + skipped, not fatal — the
+    rest still prune."""
+    from puffo_agent.agent.adapters import desired_install as di
+    root = tmp_path / "skills"
+    bad = _make_skill_dir(root, "bad", DESIRED_INSTALLED_MARKER)
+    good = _make_skill_dir(root, "good", DESIRED_INSTALLED_MARKER)
+
+    real_rmtree = di.shutil.rmtree
+
+    def _rmtree(p, *a, **kw):
+        if Path(p).name == "bad":
+            raise OSError("permission denied")
+        return real_rmtree(p, *a, **kw)
+
+    monkeypatch.setattr(di.shutil, "rmtree", _rmtree)
+    with caplog.at_level(logging.WARNING):
+        pruned = prune_stale_desired_skills(root, [])
+
+    assert pruned == 1          # only "good" removed
+    assert bad.is_dir()         # "bad" left in place after the failure
+    assert not good.exists()
+    assert any("rmtree failed" in r.message for r in caplog.records)
+
+
 # ─── (a) GC fires from install_desired after the install loop ───────────────
 
 
@@ -394,3 +419,50 @@ async def test_docker_install_desired_skills_passes_skills_only(
     calls.clear()
     await adapter._install_desired_skills()
     assert calls == {}
+
+
+@pytest.mark.asyncio
+async def test_run_spawn_install_tolerates_install_crash(monkeypatch, caplog):
+    """A crash inside install_desired is logged + swallowed (spawn
+    continues), the http client is closed, and {} is returned."""
+    from puffo_agent.agent.adapters import desired_install as di
+    import puffo_agent.crypto.http_client as hc
+    import puffo_agent.crypto.keystore as ks_mod
+
+    closed = {"v": False}
+
+    class _Http:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def close(self):
+            closed["v"] = True
+
+    class _KS:
+        def __init__(self, *a, **kw):
+            pass
+
+    monkeypatch.setattr(hc, "PuffoCoreHttpClient", _Http)
+    monkeypatch.setattr(ks_mod, "KeyStore", _KS)
+
+    async def _boom(**kw):
+        raise RuntimeError("install blew up")
+
+    monkeypatch.setattr(di, "install_desired", _boom)
+
+    with caplog.at_level(logging.WARNING):
+        out = await di.run_spawn_install(
+            agent_id="a",
+            agent_home=Path("/x"),
+            workspace_dir=Path("/x"),
+            harness_name="claude-code",
+            desired_skills=["s1"],
+            desired_mcps=[],
+            server_url="u",
+            slug="sl",
+            keys_dir="k",
+        )
+
+    assert out == {}
+    assert closed["v"] is True
+    assert any("install pass crashed" in r.message for r in caplog.records)

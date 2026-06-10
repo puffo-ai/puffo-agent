@@ -136,13 +136,9 @@ def write_desired_skill(
 def prune_stale_desired_skills(
     skills_root: Path, current_desired: list[str],
 ) -> int:
-    """Remove skill dirs that only carry the desired-installed marker
-    for ids no longer in the current desired list. host-synced and
-    agent-installed entries are left alone — those lifecycles are
-    owned elsewhere. Returns the count of dirs removed.
-
-    Idempotent; spawn-time install calls this after the install loop
-    so a freshly-installed skill is never pruned in the same pass.
+    """Remove skill dirs carrying only the desired-installed marker for
+    ids no longer desired; host-synced / agent-installed entries are
+    left alone. Returns the count removed. Idempotent.
     """
     if not skills_root.is_dir():
         return 0
@@ -155,9 +151,7 @@ def prune_stale_desired_skills(
             continue
         if not (entry / DESIRED_INSTALLED_MARKER).exists():
             continue
-        # Stronger provenance wins — host-sync or agent-install
-        # signals the skill should stay even after operator drops it
-        # from the desired list.
+        # Stronger provenance keeps the skill even after it's dropped.
         if (entry / AGENT_INSTALLED_MARKER).exists():
             continue
         if (entry / HOST_SYNCED_MARKER).exists():
@@ -296,8 +290,7 @@ async def run_spawn_install(
 ) -> dict[str, dict[str, Any]]:
     """Build the puffo-core client from spawn wiring and run
     ``install_desired``, tolerating fetch / crash errors. Shared by the
-    cli-local and cli-docker adapters. Returns ``codex_extra_servers``
-    (``{}`` for claude, or when there's nothing to install).
+    cli-local and cli-docker adapters. Returns ``codex_extra_servers``.
     """
     if not desired_skills and not desired_mcps:
         return {}
@@ -347,10 +340,8 @@ async def install_desired(
     Returns ``codex_extra_servers`` — a ``{id: spec}`` map for codex to
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
     """
-    # hermes is one-shot per turn and has no skills / MCP surface; the
-    # picker still accepts ids for an hermes agent today, so bail
-    # explicitly rather than write into ``.claude/`` for an agent that
-    # won't read from it.
+    # hermes has no skills / MCP surface — bail rather than write into
+    # a ``.claude/`` it never reads.
     if harness_name == "hermes":
         if desired_skills or desired_mcps:
             logger.info(
@@ -382,9 +373,8 @@ async def install_desired(
                 agent_id, sid,
             )
 
-    # Prune skill dirs whose only provenance is a now-stale
-    # desired-installed marker. Runs after the install loop so
-    # freshly-added ids in the current list aren't candidates.
+    # Sweep desired-only leftovers, after the install loop so this
+    # pass's own ids aren't candidates.
     skills_root = (
         workspace_dir / ".agents" / "skills" if is_codex
         else agent_home / ".claude" / "skills"

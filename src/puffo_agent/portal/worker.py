@@ -128,11 +128,8 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     # ~/.claude/.credentials.json (set up by `claude login`); no
     # api_key is threaded through. Model overrides still flow.
     if kind == "cli-docker":
-        # desired_skills ARE installed (below, into the agent's
-        # .claude/skills/, which docker bind-mounts into the
-        # container). desired_mcps stay cli-local — their launch
-        # commands don't resolve inside the container — so reject
-        # loudly rather than silently drop.
+        # desired_skills install below; desired_mcps can't (their
+        # launch commands don't resolve in-container) — reject loudly.
         if agent_cfg.desired_mcps:
             raise RuntimeError(
                 f"agent {agent_cfg.id!r}: desired_mcps are not supported "

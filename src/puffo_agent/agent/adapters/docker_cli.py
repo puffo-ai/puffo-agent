@@ -189,10 +189,8 @@ class DockerCLIAdapter(Adapter):
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
         self.harness = harness
-        # Operator-picked skills install into the bind-mounted
-        # .claude/skills/ on first start (see _ensure_started); MCPs are
-        # rejected upstream in build_adapter — cli-docker can't host
-        # them yet.
+        # Installed into the bind-mounted .claude/skills/ on first
+        # start (see _ensure_started). MCPs are rejected upstream.
         self.desired_skills = list(desired_skills or [])
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
@@ -786,10 +784,8 @@ class DockerCLIAdapter(Adapter):
         return out.decode("utf-8", errors="replace").strip()
 
     async def _install_desired_skills(self) -> None:
-        """Install operator-picked skills into the per-agent
-        .claude/skills/. Once per adapter instance; MCPs are gated out
-        upstream so only skills flow here. Fetch errors are tolerated.
-        """
+        """Install desired skills into .claude/skills/, once per
+        instance. MCPs are gated out upstream, so skills only."""
         if self._desired_installed or not self.desired_skills:
             return
         self._desired_installed = True
@@ -837,10 +833,7 @@ class DockerCLIAdapter(Adapter):
                     self.agent_id, skill_count,
                     self.agent_home_dir / ".claude" / "skills",
                 )
-            # Operator-picked desired skills, after host-sync so host
-            # skills win on collision (they carry the stronger
-            # host-synced marker). Writes into the bind-mounted
-            # .claude/skills/, so they appear inside the container.
+            # After host-sync so host skills win on collision.
             await self._install_desired_skills()
             merged_mcp, unreachable = sync_host_mcp_servers(
                 host_home, self.agent_home_dir,
