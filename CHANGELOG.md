@@ -32,13 +32,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **Proxy support for Python agent networking.** ``puffo-agent`` now
-  installs ``python-socks`` so ``websockets`` can connect through
-  SOCKS proxies configured in the environment. Remote Puffo Core
-  HTTP/import requests now honor ``HTTP_PROXY``, ``HTTPS_PROXY``,
-  ``ALL_PROXY``, ``SOCKS_PROXY``, and ``NO_PROXY``; HTTP proxies use
-  aiohttp's native environment handling, while SOCKS proxies use
-  ``aiohttp-socks``.
+- **Network-proxy support.** Connections to Puffo Core (the HTTPS API +
+  the WebSocket relay) now honor ``HTTP_PROXY`` / ``HTTPS_PROXY`` /
+  ``ALL_PROXY`` / ``SOCKS_PROXY`` / ``NO_PROXY``. HTTP(S) proxies use
+  aiohttp's native handling; SOCKS proxies route through ``aiohttp-socks``
+  (HTTP) and ``python-socks`` (WebSocket), both now bundled as
+  dependencies. See the "Network proxies" section in the README.
 - **UI log view always tails the newest lines.** The view diffed on
   buffer length, but the log buffer is a ring that drops its oldest
   line — so once full it froze on the first ~500 lines (the oldest).

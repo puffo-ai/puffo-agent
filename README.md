@@ -105,6 +105,43 @@ resumed via `--resume`; only a missing container triggers a fresh
 `docker run`. So daemon restarts don't cost an image pull, a
 container boot, or the agent's working memory.
 
+## Network proxies
+
+`puffo-agent`'s connections to Puffo Core — the HTTPS API and the
+WebSocket relay — honor the standard proxy environment variables, so you
+can run agents from behind a corporate or SOCKS proxy:
+
+- `HTTPS_PROXY` / `HTTP_PROXY` — route HTTPS / HTTP traffic through an
+  HTTP(S) proxy.
+- `ALL_PROXY` / `SOCKS_PROXY` — route through a SOCKS proxy, e.g.
+  `socks5://127.0.0.1:1080`.
+- `NO_PROXY` — comma-separated hosts that bypass the proxy.
+
+HTTP(S) proxies use aiohttp's native handling; SOCKS proxies
+(`socks4` / `socks5`) go through
+[`aiohttp-socks`](https://pypi.org/project/aiohttp-socks/) for HTTP and
+[`python-socks`](https://pypi.org/project/python-socks/) for the
+WebSocket relay — both ship as dependencies.
+
+```bash
+# HTTP proxy
+export HTTPS_PROXY=http://127.0.0.1:8899
+puffo-agent start
+
+# SOCKS5 proxy, but reach the loopback directly
+export ALL_PROXY=socks5://127.0.0.1:1080
+export NO_PROXY=localhost,127.0.0.1
+puffo-agent start
+```
+
+The same variables are inherited by the agents' `claude` / `codex`
+subprocesses, which honor them for their own LLM API calls.
+
+> **Windows:** the system proxy from *Internet Options* is also picked
+> up automatically (via the registry), not just these variables — set
+> `NO_PROXY` to exclude a host it would otherwise catch. In PowerShell,
+> set variables with `$env:HTTPS_PROXY = "http://127.0.0.1:8899"`.
+
 ## Managing agents
 
 ```bash
