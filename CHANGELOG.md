@@ -4,6 +4,27 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.3] — unreleased
+
+### Added
+
+- **Desired skills install on the `cli-docker` runtime.** Operator-picked
+  skills now install for cli-docker agents too — written into the agent's
+  `.claude/skills/`, which docker bind-mounts into the container — not
+  just cli-local. `desired_mcps` stay cli-local for now: their launch
+  commands don't resolve inside the container, so they're rejected loudly
+  rather than silently dropped.
+
+### Fixed
+
+- **Stale desired-installed skills are pruned.** When an operator removes
+  a skill from an agent's `desired_skills`, its directory is cleaned up
+  on the next spawn. Host-synced and agent-installed skills are kept —
+  only desired-only leftovers are swept.
+- **`hermes` agents skip the desired-install pass.** hermes has no skills
+  / MCP surface, so the spawn-time install now short-circuits for it
+  instead of writing into a `.claude/` it never reads.
+
 ## [0.12.2] — 2026-06-06
 
 ### Added
