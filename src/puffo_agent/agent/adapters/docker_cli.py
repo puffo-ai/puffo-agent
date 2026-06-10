@@ -152,6 +152,10 @@ class DockerCLIAdapter(Adapter):
         google_api_key: str = "",
         memory_limit: str = "",
         memory_reservation: str = "",
+        desired_skills: list[str] | None = None,
+        puffo_core_server_url: str = "",
+        puffo_core_slug: str = "",
+        puffo_core_keys_dir: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
@@ -185,6 +189,15 @@ class DockerCLIAdapter(Adapter):
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
         self.harness = harness
+        # Operator-picked skills install into the bind-mounted
+        # .claude/skills/ on first start (see _ensure_started); MCPs are
+        # rejected upstream in build_adapter — cli-docker can't host
+        # them yet.
+        self.desired_skills = list(desired_skills or [])
+        self.puffo_core_server_url = puffo_core_server_url
+        self.puffo_core_slug = puffo_core_slug
+        self.puffo_core_keys_dir = puffo_core_keys_dir
+        self._desired_installed = False
         self._started_lock = asyncio.Lock()
         self._started = False
         self._session: ClaudeSession | None = None
@@ -772,6 +785,27 @@ class DockerCLIAdapter(Adapter):
             return ""
         return out.decode("utf-8", errors="replace").strip()
 
+    async def _install_desired_skills(self) -> None:
+        """Install operator-picked skills into the per-agent
+        .claude/skills/. Once per adapter instance; MCPs are gated out
+        upstream so only skills flow here. Fetch errors are tolerated.
+        """
+        if self._desired_installed or not self.desired_skills:
+            return
+        self._desired_installed = True
+        from .desired_install import run_spawn_install
+        await run_spawn_install(
+            agent_id=self.agent_id,
+            agent_home=self.agent_home_dir,
+            workspace_dir=Path(self.workspace_dir),
+            harness_name=self.harness.name(),
+            desired_skills=self.desired_skills,
+            desired_mcps=[],
+            server_url=self.puffo_core_server_url,
+            slug=self.puffo_core_slug,
+            keys_dir=self.puffo_core_keys_dir,
+        )
+
     async def _ensure_started(self) -> None:
         async with self._started_lock:
             if self._started:
@@ -803,6 +837,11 @@ class DockerCLIAdapter(Adapter):
                     self.agent_id, skill_count,
                     self.agent_home_dir / ".claude" / "skills",
                 )
+            # Operator-picked desired skills, after host-sync so host
+            # skills win on collision (they carry the stronger
+            # host-synced marker). Writes into the bind-mounted
+            # .claude/skills/, so they appear inside the container.
+            await self._install_desired_skills()
             merged_mcp, unreachable = sync_host_mcp_servers(
                 host_home, self.agent_home_dir,
             )

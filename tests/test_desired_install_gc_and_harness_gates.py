@@ -284,16 +284,34 @@ def _make_daemon_cfg():
     )
 
 
-def test_build_adapter_cli_docker_rejects_non_empty_desired_skills():
+def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
+    """desired_skills no longer reject on cli-docker — they install into
+    the bind-mounted .claude/skills/. The adapter must receive both the
+    skills and the puffo_core install wiring."""
     from puffo_agent.portal.worker import build_adapter
+    from puffo_agent.agent.adapters import docker_cli as dc
+    from puffo_agent.agent import harness
+
+    captured: dict = {}
+
+    class _Stub:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(dc, "DockerCLIAdapter", _Stub)
+
+    class _Harness:
+        def name(self) -> str:
+            return "claude-code"
+
+    monkeypatch.setattr(harness, "build_harness", lambda _: _Harness())
 
     agent_cfg = _make_agent_cfg(
-        runtime_kind="cli-docker", desired_skills=["s1"],
+        runtime_kind="cli-docker", desired_skills=["s1", "s2"],
     )
-    with pytest.raises(RuntimeError) as ei:
-        build_adapter(_make_daemon_cfg(), agent_cfg)
-    assert "cli-docker" in str(ei.value)
-    assert "desired_skills" in str(ei.value) or "cli-local" in str(ei.value)
+    build_adapter(_make_daemon_cfg(), agent_cfg)  # no RuntimeError
+    assert captured.get("desired_skills") == ["s1", "s2"]
+    assert "puffo_core_keys_dir" in captured
 
 
 def test_build_adapter_cli_docker_rejects_non_empty_desired_mcps():
@@ -305,6 +323,7 @@ def test_build_adapter_cli_docker_rejects_non_empty_desired_mcps():
     with pytest.raises(RuntimeError) as ei:
         build_adapter(_make_daemon_cfg(), agent_cfg)
     assert "cli-docker" in str(ei.value)
+    assert "desired_mcps" in str(ei.value)
 
 
 def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
@@ -334,3 +353,44 @@ def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
     # tail-check that the stub adapter actually saw the agent_id so
     # we know the code path executed past the reject gate.
     assert captured.get("agent_id") == "t-agent"
+
+
+@pytest.mark.asyncio
+async def test_docker_install_desired_skills_passes_skills_only(
+    monkeypatch, tmp_path,
+):
+    """The docker adapter installs skills but never MCPs — MCPs are
+    gated out upstream, so it always calls run_spawn_install with an
+    empty desired_mcps list."""
+    from puffo_agent.agent.adapters import desired_install
+    from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
+
+    calls: dict = {}
+
+    async def _fake_run(**kw):
+        calls.update(kw)
+        return {}
+
+    monkeypatch.setattr(desired_install, "run_spawn_install", _fake_run)
+
+    adapter = DockerCLIAdapter(
+        agent_id="t",
+        model="",
+        image="img",
+        workspace_dir=str(tmp_path),
+        claude_dir=str(tmp_path / ".claude"),
+        session_file=str(tmp_path / "s.json"),
+        agent_home_dir=str(tmp_path),
+        shared_fs_dir=str(tmp_path),
+        desired_skills=["s1"],
+        puffo_core_server_url="u",
+        puffo_core_slug="sl",
+        puffo_core_keys_dir=str(tmp_path / "keys"),
+    )
+    await adapter._install_desired_skills()
+    assert calls["desired_skills"] == ["s1"]
+    assert calls["desired_mcps"] == []
+    # idempotent — a second call is a no-op
+    calls.clear()
+    await adapter._install_desired_skills()
+    assert calls == {}

@@ -128,16 +128,17 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     # ~/.claude/.credentials.json (set up by `claude login`); no
     # api_key is threaded through. Model overrides still flow.
     if kind == "cli-docker":
-        # The desired-skills / desired-mcps install path is cli-local
-        # only today (PUF-268). Failing fast here makes the gap
-        # operator-visible — picks were otherwise silently dropped
-        # at adapter-construction. PUF-273 item (b).
-        if agent_cfg.desired_skills or agent_cfg.desired_mcps:
+        # desired_skills ARE installed (below, into the agent's
+        # .claude/skills/, which docker bind-mounts into the
+        # container). desired_mcps stay cli-local — their launch
+        # commands don't resolve inside the container — so reject
+        # loudly rather than silently drop.
+        if agent_cfg.desired_mcps:
             raise RuntimeError(
-                f"agent {agent_cfg.id!r}: desired_skills / desired_mcps "
-                "are not supported on the cli-docker runtime yet. Either "
-                "clear them from agent.yml or switch runtime.kind to "
-                "cli-local."
+                f"agent {agent_cfg.id!r}: desired_mcps are not supported "
+                "on the cli-docker runtime yet (the MCP launch command "
+                "won't resolve inside the container). Clear them from "
+                "agent.yml or switch runtime.kind to cli-local."
             )
         from ..agent.adapters.docker_cli import DockerCLIAdapter
         from ..agent.harness import build_harness
@@ -177,6 +178,10 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             google_api_key=google_key,
             memory_limit=memory_limit,
             memory_reservation=memory_reservation,
+            desired_skills=agent_cfg.desired_skills,
+            puffo_core_server_url=agent_cfg.puffo_core.server_url,
+            puffo_core_slug=agent_cfg.puffo_core.slug,
+            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
         )
         # When puffo_core is configured, give the adapter env to spawn
         # ``python -m puffo_agent.mcp.puffo_core_server``. The adapter
