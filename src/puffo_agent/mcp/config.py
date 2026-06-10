@@ -32,6 +32,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "list_channels_in_space",
     "list_channel_members",
     "get_channel_history",
+    "get_dm_history",
     "get_thread_history",
     "get_post",
     "get_post_segment",

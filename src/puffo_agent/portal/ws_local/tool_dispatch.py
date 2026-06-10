@@ -22,6 +22,7 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "get_user_info",
     "get_post",
     "get_channel_history",
+    "get_dm_history",
     "list_channel_members",
 })
 

@@ -144,6 +144,39 @@ class DataClient:
             logger.warning("data-service: get_channel_history transport: %s", exc)
             return []
 
+    async def get_dm_history(
+        self, peer_slug: str, limit: int = 20, before: int | None = None,
+    ) -> list[StoredMessageDict]:
+        """Recent DM messages exchanged with ``peer_slug``, oldest first.
+        ``before`` is an exclusive ms-epoch upper bound for paging."""
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/dms/recent"
+        )
+        params = {"peer": peer_slug, "limit": str(limit)}
+        if before is not None:
+            params["before"] = str(before)
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}{path}", params=params,
+            ) as resp:
+                if resp.status == 404:
+                    return []
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "data-service: get_dm_history %s -> %d %s",
+                        path, resp.status, body,
+                    )
+                    return []
+                data = await resp.json()
+                msgs = data.get("messages") or []
+                return [_msg_from_dict(m) for m in msgs]
+        except aiohttp.ClientError as exc:
+            logger.warning("data-service: get_dm_history transport: %s", exc)
+            return []
+
     async def get_channel_roots(
         self,
         channel_id: str,

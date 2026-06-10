@@ -300,19 +300,25 @@ async def test_end_turn_batch_swallows_http_error():
 @pytest.mark.asyncio
 async def test_begin_turn_skips_http_for_local_only_envelope():
     """Daemon-minted synthetic envelopes (intro-prompt-...) have no
-    server-side row. Posting to ``/messages/<id>/processing/start``
-    used to 404 and log a WARN per nudge — kill that noise."""
+    server-side row, so we skip ``/messages/<id>/processing/start``
+    (which used to 404 + WARN per nudge) — but push an immediate busy
+    heartbeat so the agent shows in-progress while composing its intro,
+    not idle until the next scheduled beat."""
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
 
     run_id = await rep.begin_turn("intro-prompt-ch_xxx-1778641626040")
 
     assert run_id.startswith("run_")
-    assert http.calls == []  # No round-trip.
-    # Local-only run still flips state to busy so the heartbeat
-    # carries the in-progress envelope id.
+    # No per-message processing POST — just a busy heartbeat.
+    assert not any(p.endswith("/processing/start") for p, _ in http.calls)
+    assert len(http.calls) == 1
+    path, body = http.calls[0]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "busy"
+    assert "current_message_id" not in body   # synthetic id isn't sent
     assert rep._current_status == "busy"
-    assert rep._current_message_id == "intro-prompt-ch_xxx-1778641626040"
+    assert rep._current_message_id is None
 
 
 @pytest.mark.asyncio
@@ -324,7 +330,12 @@ async def test_end_turn_skips_http_for_local_only_envelope():
 
     await rep.end_turn("intro-prompt-ch_a-1", "run_x", succeeded=True)
 
-    assert http.calls == []
+    # No /processing/end POST — just an idle heartbeat.
+    assert not any("/processing/" in p for p, _ in http.calls)
+    assert len(http.calls) == 1
+    path, body = http.calls[0]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "idle"
     assert rep._current_status == "idle"
     assert rep._current_message_id is None
 
@@ -351,15 +362,20 @@ async def test_end_turn_batch_filters_local_only_runs():
 
 @pytest.mark.asyncio
 async def test_end_turn_batch_all_local_only_skips_http():
-    """All-synthetic batches don't hit the wire — there's nothing
-    for the server to upsert."""
+    """All-synthetic batches don't hit the processing endpoint — but
+    still push an idle heartbeat so the in-progress flag clears."""
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep._current_status = "busy"
 
     await rep.end_turn_batch([
         {"run_id": "run_a", "message_id": "intro-prompt-ch_a-1", "succeeded": True},
         {"run_id": "run_b", "message_id": "intro-prompt-ch_b-1", "succeeded": True},
     ])
 
-    assert http.calls == []
+    assert not any("/processing/" in p for p, _ in http.calls)
+    assert len(http.calls) == 1
+    path, body = http.calls[0]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "idle"
     assert rep._current_status == "idle"

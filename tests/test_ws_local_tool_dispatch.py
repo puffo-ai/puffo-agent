@@ -19,13 +19,14 @@ from puffo_agent.portal.ws_local.tool_dispatch import (
 )
 
 
-def test_allowed_tools_are_the_six_message_shaped_ones():
+def test_allowed_tools_are_the_message_shaped_ones():
     assert WS_LOCAL_ALLOWED_TOOLS == frozenset({
         "send_message",
         "send_message_with_attachments",
         "get_user_info",
         "get_post",
         "get_channel_history",
+        "get_dm_history",
         "list_channel_members",
     })
 

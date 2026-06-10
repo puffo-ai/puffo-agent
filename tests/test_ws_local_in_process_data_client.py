@@ -53,6 +53,15 @@ async def test_get_channel_roots_forwards_kwargs():
 
 
 @pytest.mark.asyncio
+async def test_get_dm_history_forwards():
+    client, store, _ = _make_client()
+    store.get_dm_history = AsyncMock(return_value=["m1"])
+    out = await client.get_dm_history("alice-1a", limit=10, before=123)
+    assert out == ["m1"]
+    store.get_dm_history.assert_awaited_once_with("alice-1a", 10, 123)
+
+
+@pytest.mark.asyncio
 async def test_get_thread_messages_forwards_kwargs():
     client, store, _ = _make_client()
     await client.get_thread_messages(
