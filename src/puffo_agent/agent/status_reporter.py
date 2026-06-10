@@ -76,12 +76,10 @@ class StatusReporter:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = f"run_{uuid.uuid4().hex}"
         if _is_local_only_envelope(message_id):
-            # Daemon-minted synthetic envelope (e.g. intro-prompt). The
-            # server has no row for it, so skip the per-message
-            # /processing/start POST — but still flag the agent busy via
-            # an immediate heartbeat so it shows in-progress while it
-            # composes (e.g. its channel self-intro), instead of looking
-            # idle until the next scheduled beat. No current_message_id:
+            # Daemon-minted synthetic envelope (e.g. intro-prompt): no
+            # server row, so skip /processing/start — but push an
+            # immediate busy heartbeat so the agent shows in-progress
+            # while it composes (e.g. its intro). No current_message_id:
             # the message doesn't exist server-side.
             self._current_status = "busy"
             self._current_message_id = None
