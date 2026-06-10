@@ -149,6 +149,40 @@ async def list_recent_messages(request: web.Request) -> web.Response:
     })
 
 
+async def list_dm_history(request: web.Request) -> web.Response:
+    """Recent DM messages with a peer (by slug), oldest first."""
+    agent_id = request.match_info["agent_id"]
+    peer = request.query.get("peer", "")
+    if not peer:
+        return web.json_response(
+            {"error": "peer query param required"}, status=400,
+        )
+    try:
+        limit = max(1, min(int(request.query.get("limit", "20")), 200))
+        before_raw = request.query.get("before")
+        before = int(before_raw) if before_raw else None
+    except ValueError:
+        return web.json_response(
+            {"error": "limit/before must be integers"}, status=400,
+        )
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"error": "agent db not found"}, status=404)
+    try:
+        msgs = await store.get_dm_history(peer, limit, before)
+    except Exception as exc:
+        logger.exception(
+            "data-service: get_dm_history failed (agent=%s peer=%s)",
+            agent_id, peer,
+        )
+        return web.json_response(
+            {"error": f"dm history fetch failed: {exc}"}, status=500,
+        )
+    return web.json_response({
+        "messages": [_msg_to_dict(m) for m in msgs],
+    })
+
+
 def _parse_int_param(value: str | None, name: str) -> tuple[int | None, web.Response | None]:
     """Return (parsed, error_response). ``None, None`` if missing."""
     if value is None or value == "":
@@ -365,6 +399,10 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     app.router.add_get(
         "/v1/data/{agent_id}/messages/recent",
         list_recent_messages,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/dms/recent",
+        list_dm_history,
     )
     app.router.add_get(
         "/v1/data/{agent_id}/channels/roots",
