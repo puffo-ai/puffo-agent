@@ -56,6 +56,33 @@ async def test_info_no_auth(client):
     assert j["paired"] is False
 
 
+async def test_providers_no_auth(client, monkeypatch):
+    from puffo_agent.agent import model_catalog as mc
+
+    fake = {
+        "claude-code": [
+            mc.ModelOption("", "(daemon default)"),
+            mc.ModelOption("opus", "opus", is_alias=True),
+            mc.ModelOption("claude-fable-5", "Claude Fable 5"),
+        ],
+        "codex": [mc.ModelOption("", "(daemon default)"), mc.ModelOption("gpt-5.5", "GPT-5.5")],
+    }
+    monkeypatch.setattr(
+        mc, "provider_models",
+        lambda h, *, fetch=False: fake.get(h, [mc.ModelOption("", "(daemon default)")]),
+    )
+    r = await client.get("/v1/providers", headers=_HOST)
+    assert r.status == 200
+    by = {p["provider"]: p["models"] for p in (await r.json())["providers"]}
+    assert set(by) == set(mc.KNOWN_HARNESSES)  # every known harness reported
+    # daemon-default sentinel dropped; alias flag + label carried through
+    assert by["claude-code"] == [
+        {"id": "opus", "label": "opus", "alias": True},
+        {"id": "claude-fable-5", "label": "Claude Fable 5", "alias": False},
+    ]
+    assert by["codex"] == [{"id": "gpt-5.5", "label": "GPT-5.5", "alias": False}]
+
+
 async def test_info_carries_cli_tools_status(client, monkeypatch):
     from puffo_agent.portal.api import handlers
     monkeypatch.setattr(

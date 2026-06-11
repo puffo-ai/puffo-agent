@@ -8,6 +8,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Live model picker (no more stale hardcoded list).** The agent-detail
+  model dropdown now lists the account's actual available models:
+  claude-code refreshes from the live Anthropic `/v1/models` (so new
+  releases like Fable 5 appear without a code change) plus the
+  latest-tracking `opus` / `sonnet` aliases (sorted after the pinned
+  versions); codex reads the CLI's own local model cache
+  (`~/.codex/models_cache.json`, visibility-filtered); gemini / hermes
+  stay on curated static lists for now. New
+  `agent.model_catalog.provider_models(harness)`; the claude fetch uses
+  the operator's existing OAuth, cached + off-thread so the UI never
+  blocks.
+- **`GET /v1/providers` bridge endpoint.** Public (no pairing) — returns
+  every harness's live model catalog as JSON, so any local client
+  (web / desktop) can build a model picker without embedding the list.
+  Same source as the desktop picker (claude-code live `/v1/models`,
+  codex local cache); models only — harness install/auth status stays
+  on `/v1/info`.
 - **Catch-up telemetry on every WS reconnect.** The agent logs its
   pending-message catch-up count on every reconnect — including zero,
   with the session id — so a silent reconnect is distinguishable from a
