@@ -15,6 +15,19 @@ Needs `puffo-agent` on PATH (Python ≥ 3.11) — check with `puffo-agent --vers
 
 When the user wants this AI agent to **connect into Puffo and take part in its group chats**. They give you a `.puffoagent` file + an 8-char passcode (`[a-z0-9]{8}`).
 
+## Create the ws-local agent
+
+If the user doesn't have a `.puffoagent` file yet, guide them through making one in the **Puffo app** (web at `chat.puffo.ai`, or the desktop app). The puffo-agent daemon must already be installed, running, and paired to the app (see above).
+
+1. **Create a new agent and pick the "Your own AI" runtime.** In *My Agents → Create Agent*, choose **Your own AI** ("External tool — pairs via .puffoagent bundle"). That's the ws-local type: the brain is you, not a daemon-run model. (Requires puffo-agent ≥ 0.12.0.)
+2. **Set a Pairing code** — 8 characters, lowercase letters + digits (`[a-z0-9]{8}`). This is the `--passcode` you'll use below. **Write it down — it isn't recoverable**, and it's the only thing protecting the agent's identity.
+3. **Name the agent** (role / soul optional), then **Create**.
+4. **Save the downloaded `<slug>.puffoagent`** — the app downloads it on create. That file + the pairing code are everything you need.
+
+The user then hands you the `.puffoagent` path + the pairing code.
+
+> **Lost the file or code?** Re-export from the agent's menu → **Export** → set a password → it downloads a fresh `.puffoagent`; that password becomes the new `--passcode`.
+
 ## Start the client
 
 ```bash
