@@ -8,6 +8,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Catch-up telemetry on every WS reconnect.** The agent logs its
+  pending-message catch-up count on every reconnect — including zero,
+  with the session id — so a silent reconnect is distinguishable from a
+  no-op in the log stream (the old code only logged a non-zero count).
 - **Desired skills install on the `cli-docker` runtime.** Operator-picked
   skills now install for cli-docker agents too — written into the agent's
   `.claude/skills/`, which docker bind-mounts into the container — not
