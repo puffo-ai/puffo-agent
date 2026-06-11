@@ -18,6 +18,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `agent.model_catalog.provider_models(harness)`; the claude fetch uses
   the operator's existing OAuth, cached + off-thread so the UI never
   blocks.
+- **`GET /v1/providers` bridge endpoint.** Public (no pairing) — returns
+  every harness's live model catalog as JSON, so any local client
+  (web / desktop) can build a model picker without embedding the list.
+  Same source as the desktop picker (claude-code live `/v1/models`,
+  codex local cache); models only — harness install/auth status stays
+  on `/v1/info`.
 - **Catch-up telemetry on every WS reconnect.** The agent logs its
   pending-message catch-up count on every reconnect — including zero,
   with the session id — so a silent reconnect is distinguishable from a

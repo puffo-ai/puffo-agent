@@ -83,6 +83,9 @@ _STATIC: dict[str, tuple[ModelOption, ...]] = {
     ),
 }
 
+# Harnesses the catalog can answer for (claude-code + codex are dynamic).
+KNOWN_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "gemini-cli", "hermes")
+
 _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _CACHE_TTL_S = 3600.0
 _FETCH_TIMEOUT_S = 6.0
