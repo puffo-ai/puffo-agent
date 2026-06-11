@@ -4,6 +4,19 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.4] — unreleased
+
+### Fixed
+
+- **Operator invite `y`/`n` works as a top-level reply.** An invite's
+  accept/reject `y`/`n` used to require replying *in the invite-DM
+  thread* — a plain top-level reply (the chat-app norm) was missed and
+  the invite stayed pending. A direct (top-level) `y`/`n` now answers
+  **all** the operator's pending invites at once, with a consolidated
+  summary posted back in the reply's own thread (on top of the
+  per-invite confirmations); a threaded `y`/`n` still answers just that
+  one. The invite prompt spells out both paths.
+
 ## [0.12.3] — 2026-06-11
 
 ### Added

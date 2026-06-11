@@ -676,7 +676,7 @@ class PuffoCoreMessageClient:
                     self._last_dm_sender = payload.sender_slug
                     if is_direct:
                         await self._send_invite_bulk_summary(
-                            handled_labels, text_raw, payload_thread_root_id,
+                            handled_labels, text_raw, payload_thread_root_id or "",
                         )
                     return
 
