@@ -1,10 +1,12 @@
 """ws-local ``tool_call`` dispatch.
 
 Reuses ``mcp.puffo_core_tools.register_core_tools`` by feeding it a
-FastMCP stand-in that captures handlers by name. ws-local exposes
-only the six message-shaped tools — subprocess-bound ones
-(``refresh``, ``reload_system_prompt``, ``install_host_mcp``,
-``sync_host_mcp``) are filtered out.
+FastMCP stand-in that captures handlers by name. ws-local exposes the
+message-shaped + read/navigation tools; harness/host/identity ops
+(``refresh``, ``reload_system_prompt``, ``install_*``, ``*_skill``,
+``*_mcp_server``, ``list_mcp_servers``, ``sync_host_mcp``) are filtered
+out — the harness, skills, and host config belong to the attached tool,
+not to puffo-agent.
 """
 
 from __future__ import annotations
@@ -17,12 +19,21 @@ WsLocalTool = Callable[..., Awaitable[Any]]
 
 
 WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
+    # send
     "send_message",
     "send_message_with_attachments",
+    # read / navigation
     "get_user_info",
+    "whoami",
     "get_post",
+    "get_post_segment",
     "get_channel_history",
+    "get_dm_history",
+    "get_thread_history",
     "list_channel_members",
+    "list_spaces",
+    "list_channels_in_space",
+    "list_channels_in_all_spaces",
 })
 
 

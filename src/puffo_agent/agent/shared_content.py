@@ -167,6 +167,8 @@ below is the authoritative reference.
 - `list_channel_members(channel)` — slugs + roles.
 - `get_channel_history(channel, limit=20, since="", before=0, after=0)`
   — recent **root posts** + reply counts. Replies NOT inlined.
+- `get_dm_history(peer, limit=20, before=0)` — recent **direct
+  messages** with a peer (by slug), oldest-first.
 - `get_thread_history(root_id, limit=50, since="", before=0, after=0)`
   — root + every reply, oldest-first.
 - `get_post(post_ref)` — one envelope by id (local store).

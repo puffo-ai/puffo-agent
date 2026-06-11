@@ -79,6 +79,7 @@ async def run_cmd(
 ) -> tuple[int, bytes, bytes]:
     """Spawn ``cmd``, return (rc, stdout, stderr). ``check`` raises
     on non-zero exit; ``stdin`` pipes bytes if given."""
+    from ..._proc import no_window_kwargs
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         env=env,
@@ -86,6 +87,7 @@ async def run_cmd(
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **no_window_kwargs(),
     )
     stdout, stderr = await proc.communicate(stdin)
     if check and proc.returncode != 0:

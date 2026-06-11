@@ -1,4 +1,5 @@
-"""PUF-247: human-facing copy for invite-accept/reject failures."""
+"""Human-facing copy for invite failures and the OAuth-expired
+operator DM (``format_oauth_expired``)."""
 
 from __future__ import annotations
 
@@ -59,3 +60,20 @@ def format_invite_error(exc: Exception, verb: str) -> str:
             )
 
     return f"{prefix}: unexpected error. Please try again."
+
+
+def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
+    """Bilingual (zh+en) operator DM for an OAuth-expired agent: run
+    ``claude auth login`` and just send a message (a new message
+    auto-resumes the agent). Falls back to a bare ``id`` when
+    ``agent_display_name`` is empty."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    return (
+        f"⚠️ {label} — Claude OAuth expired. Run `claude auth login`, "
+        "then send me a message and I'll pick up where I left off.\n"
+        "⚠️ Claude OAuth 已过期。请运行 `claude auth login`，"
+        "然后给我发条消息即可恢复。"
+    )

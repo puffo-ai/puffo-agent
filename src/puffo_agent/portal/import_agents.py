@@ -34,6 +34,7 @@ import aiohttp
 from ..crypto.certs import create_subkey_cert
 from ..crypto.encoding import base64url_decode, base64url_encode
 from ..crypto.http_auth import sign_request
+from ..crypto.http_session import create_remote_http_session
 from ..crypto.keystore import KeyStore, StoredIdentity, decode_secret, encode_secret
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from .export import (
@@ -54,6 +55,10 @@ from .state import agent_dir, agent_yml_path, agents_dir
 logger = logging.getLogger(__name__)
 
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=20)
+
+
+def _remote_http_session(server_url: str) -> aiohttp.ClientSession:
+    return create_remote_http_session(server_url, timeout=HTTP_TIMEOUT)
 
 
 class ImportError(Exception):
@@ -281,7 +286,7 @@ async def _register_new_device_subkey(
     new_device_id: str,
     new_signing_key: Ed25519KeyPair,
 ) -> tuple[Ed25519KeyPair, dict]:
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+    async with _remote_http_session(server_url) as session:
         return await _register_subkey_via_device(
             session,
             server_url=server_url,
@@ -411,7 +416,7 @@ async def _enroll_new_device(
     kem_pk_b64 = base64url_encode(new_kem_pk)
     nonce = base64url_encode(secrets.token_bytes(32))
 
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+    async with _remote_http_session(server_url) as session:
         old_subkey, old_subkey_cert = await _register_subkey_via_device(
             session,
             server_url=server_url,
@@ -470,7 +475,7 @@ async def _revoke_old_device(
     preregistered_subkey: tuple[Ed25519KeyPair, dict] | None = None,
 ) -> None:
     revocation = create_device_revocation(root_signing_key, old_device_id)
-    async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+    async with _remote_http_session(server_url) as session:
         if preregistered_subkey is not None:
             new_subkey, new_subkey_cert = preregistered_subkey
         else:

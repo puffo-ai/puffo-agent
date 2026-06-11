@@ -76,12 +76,14 @@ class StatusReporter:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = f"run_{uuid.uuid4().hex}"
         if _is_local_only_envelope(message_id):
-            # Daemon-minted synthetic envelope (e.g. intro-prompt).
-            # The server has no row for it; skip the POST so we
-            # don't log a 404 WARN per nudge. Run is still tracked
-            # in-memory via the returned run_id.
+            # Daemon-minted synthetic envelope (e.g. intro-prompt): no
+            # server row, so skip /processing/start — but push an
+            # immediate busy heartbeat so the agent shows in-progress
+            # while it composes (e.g. its intro). No current_message_id:
+            # the message doesn't exist server-side.
             self._current_status = "busy"
-            self._current_message_id = message_id
+            self._current_message_id = None
+            await self._send_heartbeat()
             return run_id
         try:
             await self._http.post(
@@ -105,11 +107,12 @@ class StatusReporter:
         error_text: str | None = None,
     ) -> None:
         if _is_local_only_envelope(message_id):
-            # Symmetric to ``begin_turn`` — local-only envelopes have
-            # no server-side row to mark ended. Update local status
-            # only.
+            # Symmetric to ``begin_turn`` — no server-side row, but push
+            # the idle/error status now instead of waiting for the next
+            # scheduled beat, so the in-progress flag clears promptly.
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
+            await self._send_heartbeat()
             return
         body: dict[str, Any] = {"run_id": run_id, "succeeded": succeeded}
         if error_text is not None:
@@ -155,11 +158,13 @@ class StatusReporter:
             if err is not None:
                 entry["error_text"] = err[:1024]
             payload_runs.append(entry)
-        # If every run was local-only, there's nothing to POST.
+        # If every run was local-only, there's nothing to POST — but
+        # still push the resolved status now (see ``begin_turn``).
         if not payload_runs:
             any_failed = any(not r["succeeded"] for r in runs)
             self._current_status = "error" if any_failed else "idle"
             self._current_message_id = None
+            await self._send_heartbeat()
             return
         try:
             await self._http.post(

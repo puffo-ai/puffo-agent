@@ -4,10 +4,121 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.12.2] — 2026-06-06
+## [0.12.3] — 2026-06-11
+
+### Added
+
+- **Live model picker (no more stale hardcoded list).** The agent-detail
+  model dropdown now lists the account's actual available models:
+  claude-code refreshes from the live Anthropic `/v1/models` (so new
+  releases like Fable 5 appear without a code change) plus the
+  latest-tracking `opus` / `sonnet` aliases (sorted after the pinned
+  versions); codex reads the CLI's own local model cache
+  (`~/.codex/models_cache.json`, visibility-filtered); gemini / hermes
+  stay on curated static lists for now. New
+  `agent.model_catalog.provider_models(harness)`; the claude fetch uses
+  the operator's existing OAuth, cached + off-thread so the UI never
+  blocks.
+- **`GET /v1/providers` bridge endpoint.** Public (no pairing) — returns
+  every harness's live model catalog as JSON, so any local client
+  (web / desktop) can build a model picker without embedding the list.
+  Same source as the desktop picker (claude-code live `/v1/models`,
+  codex local cache); models only — harness install/auth status stays
+  on `/v1/info`.
+- **Catch-up telemetry on every WS reconnect.** The agent logs its
+  pending-message catch-up count on every reconnect — including zero,
+  with the session id — so a silent reconnect is distinguishable from a
+  no-op in the log stream (the old code only logged a non-zero count).
+- **Desired skills install on the `cli-docker` runtime.** Operator-picked
+  skills now install for cli-docker agents too — written into the agent's
+  `.claude/skills/`, which docker bind-mounts into the container — not
+  just cli-local. `desired_mcps` stay cli-local for now: their launch
+  commands don't resolve inside the container, so they're rejected loudly
+  rather than silently dropped.
 
 ### Fixed
 
+- **Stale desired-installed skills are pruned.** When an operator removes
+  a skill from an agent's `desired_skills`, its directory is cleaned up
+  on the next spawn. Host-synced and agent-installed skills are kept —
+  only desired-only leftovers are swept.
+- **`hermes` agents skip the desired-install pass.** hermes has no skills
+  / MCP surface, so the spawn-time install now short-circuits for it
+  instead of writing into a `.claude/` it never reads.
+
+## [0.12.2] — 2026-06-06
+
+### Added
+
+- **`get_dm_history` MCP tool.** Agents can now read their direct-message
+  history with a peer (by slug), mirroring `get_channel_history`. Wired
+  across every surface a tool needs — the primer, the allowed-tools gate,
+  the data-service + in-process data clients, and ws-local dispatch.
+- **ws-local exposes the read/navigation tools (7 → 13).** Attached
+  ws-local agents can now also call `whoami`, `get_post_segment`,
+  `get_thread_history`, `get_dm_history`, `list_spaces`,
+  `list_channels_in_space`, and `list_channels_in_all_spaces` — not just
+  send + the message-shaped reads. Harness/host/identity ops
+  (`refresh`, `reload_system_prompt`, `install_*`, `*_skill`,
+  `*_mcp_server`, `sync_host_mcp`) stay out by design.
+- **``puffo-agent start --background``.** Detaches the daemon into a
+  background process (POSIX ``setsid`` / Windows ``DETACHED_PROCESS``)
+  that survives the launching terminal closing, and shows a system-tray
+  icon with **Open UI (beta)** (opens the desktop window) and **Quit**
+  (graceful, same path as ``puffo-agent stop``). Closing the
+  tray-opened window leaves the daemon running — only Quit stops it; a
+  direct ``--ui`` close still stops the daemon. Detached stdout/stderr
+  land in ``~/.puffo-agent/background.log``. On a GUI session without a
+  tray host the daemon still runs headless with a logged warning. The
+  internal ``--tray-runner`` flag hosts the tray in the detached child.
+  Child subprocesses (claude / codex / docker) spawn with
+  ``CREATE_NO_WINDOW`` on Windows so the console-less detached daemon
+  doesn't pop a console window per agent.
+- **Status page in the UI.** A new "🔌 Status" tab lists the MCP server
+  subprocesses each agent is running — Agent · Server · PID · Status ·
+  CPU% · Mem — by walking the daemon's process tree.
+- **Operator DM on agent auth failure.** When an agent's Claude OAuth
+  expires/revokes (a 401), the daemon DMs the operator a bilingual
+  (zh+en) note: run `claude auth login` and just send a message (a new
+  message auto-resumes) — once per failure episode, re-armed after the
+  credential recovers.
+
+### Fixed
+
+- **Agents show in-progress while posting their channel intro.** The
+  self-introduction nudge a freshly-added agent processes is a synthetic
+  (server-rowless) message, so the status reporter skipped reporting busy
+  — leaving the agent looking idle during the intro. It now pushes an
+  immediate busy/idle heartbeat for those envelopes.
+- **Network-proxy support.** Connections to Puffo Core (the HTTPS API +
+  the WebSocket relay) now honor ``HTTP_PROXY`` / ``HTTPS_PROXY`` /
+  ``ALL_PROXY`` / ``SOCKS_PROXY`` / ``NO_PROXY``. HTTP(S) proxies use
+  aiohttp's native handling; SOCKS proxies route through ``aiohttp-socks``
+  (HTTP) and ``python-socks`` (WebSocket), both now bundled as
+  dependencies. See the "Network proxies" section in the README.
+- **UI log view always tails the newest lines.** The view diffed on
+  buffer length, but the log buffer is a ring that drops its oldest
+  line — so once full it froze on the first ~500 lines (the oldest).
+  It now diffs on a monotonic counter and caps the widget to the latest
+  500, so it keeps showing the newest.
+- **Auth errors are distinguished from rate-limits.** A `401 Invalid
+  authentication credentials` reply was treated as a generic rate-limit
+  `API Error` — kick-retried then abandoned, never flipping
+  `auth_failed` or notifying the operator. The CLI adapter and `core`
+  now share one auth detector, so a confirmed auth error skips the
+  pointless retries and goes straight to `auth_failed` + the operator
+  DM (the batch redelivers once the operator re-logs in).
+- **Re-login now recovers running agents on copy-mode hosts (Windows).**
+  The file-credential backend assumed a symlink carried an operator
+  `claude auth login` to every agent — but Windows falls back to a copy,
+  so a re-login never reached running agents and they sat in
+  `auth_failed` until a manual new message. The refresher now
+  fingerprints the host credential (claude + codex) and, on an external
+  change, syncs every agent and fires refresh-success; the daemon then
+  restarts the agents that were `auth_failed` so their session respawns
+  with the fresh credential and the stalled batch redelivers. A new
+  message to an `auth_failed` agent also wakes the refresher on the spot,
+  so recovery doesn't wait for the next poll.
 - **Harden Keychain credential parsing.** A valid-JSON-but-non-object
   blob (e.g. a bare ``5``) could raise an uncaught ``AttributeError``
   mid-read; it is now rejected cleanly as ``invalid_oauth_blob``. The

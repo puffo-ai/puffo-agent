@@ -102,6 +102,50 @@ async def test_recent_messages_returns_chronological() -> None:
         assert msgs[0]["sender_slug"] == "alice"
 
 
+async def _seed_dms(home: str, agent_id: str) -> None:
+    agent_path = Path(home) / "agents" / agent_id
+    agent_path.mkdir(parents=True, exist_ok=True)
+    store = MessageStore(agent_path / "messages.db")
+    await store.open()
+    for env, sender, recip, ts in (
+        ("dm_1", "alice", "me", 1700000000_000),
+        ("dm_2", "me", "alice", 1700000001_000),
+        ("dm_3", "bob", "me", 1700000002_000),   # different peer
+    ):
+        await store.store({
+            "envelope_id": env, "envelope_kind": "dm",
+            "sender_slug": sender, "recipient_slug": recip,
+            "content_type": "text/plain", "content": env, "sent_at": ts,
+        })
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_dm_history_route_returns_peer_dms() -> None:
+    home = _isolated_home()
+    await _seed_dms(home, "agent-dm-1")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-dm-1/dms/recent",
+            params={"peer": "alice", "limit": "10"},
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        # only the alice DMs, chronological; bob's excluded
+        assert [m["envelope_id"] for m in body["messages"]] == ["dm_1", "dm_2"]
+
+
+@pytest.mark.asyncio
+async def test_dm_history_route_requires_peer() -> None:
+    home = _isolated_home()
+    await _seed_dms(home, "agent-dm-2")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/v1/data/agent-dm-2/dms/recent")
+        assert resp.status == 400
+
+
 @pytest.mark.asyncio
 async def test_message_by_envelope_returns_single_row() -> None:
     home = _isolated_home()

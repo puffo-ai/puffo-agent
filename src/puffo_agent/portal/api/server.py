@@ -39,6 +39,7 @@ def build_app(cfg: BridgeConfig, ws_local_hub=None) -> web.Application:
     app["ws_local_hub"] = ws_local_hub
     app.router.add_get(WS_LOCAL_PATH, handle_ws_local)
     app.router.add_get("/v1/info", h.info)
+    app.router.add_get("/v1/providers", h.list_providers)
     app.router.add_post("/v1/pair", h.pair)
     app.router.add_delete("/v1/pairing", h.disconnect)
     app.router.add_get("/v1/agents", h.list_agents)

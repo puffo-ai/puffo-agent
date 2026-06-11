@@ -49,6 +49,11 @@ class InProcessDataClient:
             after_ts=after_ts,
         )
 
+    async def get_dm_history(
+        self, peer_slug: str, limit: int = 20, before: int | None = None,
+    ) -> list["StoredMessage"]:
+        return await self._store.get_dm_history(peer_slug, limit, before)
+
     async def get_thread_messages(
         self,
         root_id: str,

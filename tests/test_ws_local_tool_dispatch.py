@@ -19,15 +19,34 @@ from puffo_agent.portal.ws_local.tool_dispatch import (
 )
 
 
-def test_allowed_tools_are_the_six_message_shaped_ones():
+def test_allowed_tools_are_the_send_and_read_tools():
     assert WS_LOCAL_ALLOWED_TOOLS == frozenset({
+        # send
         "send_message",
         "send_message_with_attachments",
+        # read / navigation
         "get_user_info",
+        "whoami",
         "get_post",
+        "get_post_segment",
         "get_channel_history",
+        "get_dm_history",
+        "get_thread_history",
         "list_channel_members",
+        "list_spaces",
+        "list_channels_in_space",
+        "list_channels_in_all_spaces",
     })
+
+
+def test_harness_and_host_tools_excluded():
+    """Harness/host/identity ops must NOT be reachable over ws-local."""
+    for t in (
+        "refresh", "reload_system_prompt", "install_skill", "list_skills",
+        "install_mcp_server", "list_mcp_servers", "install_host_mcp",
+        "sync_host_mcp",
+    ):
+        assert t not in WS_LOCAL_ALLOWED_TOOLS
 
 
 def test_build_dispatch_returns_only_allowed_handlers():

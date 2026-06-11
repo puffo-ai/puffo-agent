@@ -86,12 +86,22 @@ class PuffoCoreWsClient:
         return resp["session_id"]
 
     async def _catchup(self) -> None:
+        """Drain `/messages/pending` — rows the server held while we
+        were offline. MUST run after ``_handshake`` (it registers the
+        session); ordering is register → pending fetch → live listen.
+        """
         try:
             data = await self.http_client.get("/messages/pending")
             messages = data.get("messages", [])
+            # Log on every reconnect, even zero — a silent reconnect
+            # should still leave one line (else it's indistinguishable
+            # from a no-op).
+            logger.info(
+                "Catch-up: %d pending messages (session=%s)",
+                len(messages), self.session_id or "<pre-handshake>",
+            )
             if not messages:
                 return
-            logger.info("Catch-up: %d pending messages", len(messages))
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)

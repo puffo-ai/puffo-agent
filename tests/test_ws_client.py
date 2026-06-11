@@ -407,6 +407,45 @@ async def test_nonce_unique_per_connect():
 
 
 @pytest.mark.asyncio
+async def test_catchup_logs_zero_pending_count(caplog):
+    """The catch-up INFO log must fire on every reconnect, including
+    ``N=0`` — a future tidy-up that re-suppresses the zero line must
+    trip this test.
+    """
+    import logging as _stdlib_logging
+
+    ks, _subkey = _make_keystore()
+    server = FakeWsServer()
+    await server.start()
+
+    http = FakeHttpClient()
+    http.pending_messages = []  # explicit zero
+
+    client = PuffoCoreWsClient(
+        f"http://127.0.0.1:{server.port}",
+        ks, "alice-0001", http,
+    )
+    client.ws_url = f"ws://127.0.0.1:{server.port}"
+
+    with caplog.at_level(_stdlib_logging.INFO, logger="puffo_agent.crypto.ws_client"):
+        task = asyncio.create_task(client.connect_once())
+        await asyncio.sleep(0.5)
+        client.stop()
+        try:
+            await asyncio.wait_for(task, timeout=2)
+        except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
+            pass
+
+    catchup_lines = [r for r in caplog.records if "Catch-up:" in r.getMessage()]
+    assert len(catchup_lines) == 1, (
+        f"expected exactly one Catch-up log line on reconnect with N=0; got {len(catchup_lines)}"
+    )
+    assert "0 pending messages" in catchup_lines[0].getMessage()
+    assert "session=sess_test" in catchup_lines[0].getMessage()
+    await server.stop()
+
+
+@pytest.mark.asyncio
 async def test_callback_exception_does_not_kill_loop():
     ks, subkey = _make_keystore()
     server = FakeWsServer()

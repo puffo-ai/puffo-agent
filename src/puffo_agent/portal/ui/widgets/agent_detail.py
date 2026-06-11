@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ....agent import disk_cache
+from ....agent.model_catalog import ModelOption, prefetch, provider_models
 from ... import export
 from ...api.handlers import (
     MAX_AVATAR_BYTES,
@@ -136,12 +137,6 @@ def _scan_mcp_servers(
     return out
 
 
-_DEFAULT_MODELS = {
-    "claude-code": ["", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
-    "hermes":      ["", "claude-opus-4-7", "claude-sonnet-4-6", "gpt-5.5", "gpt-5.4"],
-    "codex":       ["", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
-}
-
 
 class AgentDetail(QWidget):
     """Tabbed info pane bound to a single agent id."""
@@ -154,6 +149,9 @@ class AgentDetail(QWidget):
         self._agent_id: Optional[str] = None
         self._cfg: Optional[AgentConfig] = None
         self._initial_snapshot: Optional[tuple] = None
+        # Warm the live claude-code model list off-thread so the picker
+        # reads from cache, not a blocking /v1/models fetch.
+        prefetch()
         self._build()
         self._avatar_uploaded.connect(self._on_avatar_uploaded)
         for w, sig in (
@@ -665,13 +663,13 @@ class AgentDetail(QWidget):
     def _populate_model_combo(self, harness: str, current: str) -> None:
         self._model.blockSignals(True)
         self._model.clear()
-        models = list(_DEFAULT_MODELS.get(harness, [""]))
-        # Preserve a user-saved model that isn't in the curated list
-        # so editing other fields doesn't silently flip them to default.
-        if current and current not in models:
-            models.append(current)
-        for m in models:
-            self._model.addItem(m or "(daemon default)", m)
+        options = provider_models(harness)
+        # Preserve a user-saved model that isn't in the catalog so
+        # editing other fields doesn't silently flip it to default.
+        if current and current not in [o.id for o in options]:
+            options = options + [ModelOption(current, current)]
+        for o in options:
+            self._model.addItem(o.label, o.id)
         idx = self._model.findData(current)
         if idx >= 0:
             self._model.setCurrentIndex(idx)

@@ -9,6 +9,7 @@ import aiohttp
 from .certs import create_subkey_cert, needs_rotation
 from .encoding import base64url_encode
 from .http_auth import sign_request
+from .http_session import create_remote_http_session
 from .keystore import KeyStore, Session, decode_secret
 from .primitives import Ed25519KeyPair
 
@@ -31,7 +32,7 @@ class PuffoCoreHttpClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = create_remote_http_session(self.server_url)
         return self._session
 
     async def close(self) -> None:

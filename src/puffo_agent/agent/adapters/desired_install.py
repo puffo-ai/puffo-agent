@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,9 @@ _MCP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # host-sync pruner doesn't sweep these and operators can tell which
 # layer wrote what.
 DESIRED_INSTALLED_MARKER = "desired-installed.md"
+# Stronger-provenance markers the desired pruner must never sweep.
+AGENT_INSTALLED_MARKER = "agent-installed.md"
+HOST_SYNCED_MARKER = "host-synced.md"
 _DESIRED_INSTALLED_BODY = (
     "Installed at spawn time from a puffo-server template selected "
     "by the operator. See PUF-268.\n"
@@ -127,6 +131,40 @@ def write_desired_skill(
     return _write_skill_to_dir(
         agent_home / ".claude" / "skills" / template_id, template_id, body,
     )
+
+
+def prune_stale_desired_skills(
+    skills_root: Path, current_desired: list[str],
+) -> int:
+    """Remove skill dirs carrying only the desired-installed marker for
+    ids no longer desired; host-synced / agent-installed entries are
+    left alone. Returns the count removed. Idempotent.
+    """
+    if not skills_root.is_dir():
+        return 0
+    current_set = set(current_desired)
+    pruned = 0
+    for entry in skills_root.iterdir():
+        if not entry.is_dir():
+            continue
+        if entry.name in current_set:
+            continue
+        if not (entry / DESIRED_INSTALLED_MARKER).exists():
+            continue
+        # Stronger provenance keeps the skill even after it's dropped.
+        if (entry / AGENT_INSTALLED_MARKER).exists():
+            continue
+        if (entry / HOST_SYNCED_MARKER).exists():
+            continue
+        try:
+            shutil.rmtree(entry)
+            pruned += 1
+        except OSError as exc:
+            logger.warning(
+                "desired-install prune %r: rmtree failed: %s — skipping",
+                entry.name, exc,
+            )
+    return pruned
 
 
 def write_desired_skill_codex(
@@ -238,6 +276,55 @@ def _codex_extras_entry(spec: dict[str, Any]) -> dict[str, Any]:
     return {"url": spec["url"], "env": spec["env"]}
 
 
+async def run_spawn_install(
+    *,
+    agent_id: str,
+    agent_home: Path,
+    workspace_dir: Path,
+    harness_name: str,
+    desired_skills: list[str],
+    desired_mcps: list[str],
+    server_url: str,
+    slug: str,
+    keys_dir: str,
+) -> dict[str, dict[str, Any]]:
+    """Build the puffo-core client from spawn wiring and run
+    ``install_desired``, tolerating fetch / crash errors. Shared by the
+    cli-local and cli-docker adapters. Returns ``codex_extra_servers``.
+    """
+    if not desired_skills and not desired_mcps:
+        return {}
+    if not (server_url and slug and keys_dir):
+        logger.warning(
+            "agent %s: desired_skills/desired_mcps configured but "
+            "puffo_core wiring is incomplete — skipping spawn-time "
+            "install (server_url=%r slug=%r keys_dir=%r)",
+            agent_id, server_url, slug, keys_dir,
+        )
+        return {}
+    from ...crypto.http_client import PuffoCoreHttpClient
+    from ...crypto.keystore import KeyStore
+    http = PuffoCoreHttpClient(server_url, KeyStore(keys_dir), slug)
+    try:
+        return await install_desired(
+            http=http,
+            agent_home=agent_home,
+            workspace_dir=workspace_dir,
+            agent_id=agent_id,
+            harness_name=harness_name,
+            desired_skills=desired_skills,
+            desired_mcps=desired_mcps,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "agent %s: desired install pass crashed: %s — continuing spawn",
+            agent_id, exc,
+        )
+        return {}
+    finally:
+        await http.close()
+
+
 async def install_desired(
     *,
     http: PuffoCoreHttpClient,
@@ -253,6 +340,17 @@ async def install_desired(
     Returns ``codex_extra_servers`` — a ``{id: spec}`` map for codex to
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
     """
+    # hermes has no skills / MCP surface — bail rather than write into
+    # a ``.claude/`` it never reads.
+    if harness_name == "hermes":
+        if desired_skills or desired_mcps:
+            logger.info(
+                "agent %s: hermes harness — skipping %d desired_skills + "
+                "%d desired_mcps (no skills/MCP surface in hermes v1)",
+                agent_id, len(desired_skills), len(desired_mcps),
+            )
+        return {}
+
     is_codex = harness_name == "codex"
 
     for sid in desired_skills:
@@ -274,6 +372,19 @@ async def install_desired(
                 "agent %s: desired skill %r already present — left untouched",
                 agent_id, sid,
             )
+
+    # Sweep desired-only leftovers, after the install loop so this
+    # pass's own ids aren't candidates.
+    skills_root = (
+        workspace_dir / ".agents" / "skills" if is_codex
+        else agent_home / ".claude" / "skills"
+    )
+    pruned = prune_stale_desired_skills(skills_root, desired_skills)
+    if pruned:
+        logger.info(
+            "agent %s: pruned %d stale desired-installed skill dir(s)",
+            agent_id, pruned,
+        )
 
     codex_extras: dict[str, dict[str, Any]] = {}
     for mid in desired_mcps:

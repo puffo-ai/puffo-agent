@@ -506,6 +506,44 @@ async def test_get_channel_history_unknown_channel():
 
 
 @pytest.mark.asyncio
+async def test_get_dm_history_from_local():
+    cfg, _, ms = _setup()
+    await ms.open()
+    base = _now_ms()
+    await ms.store({
+        "envelope_id": "dm_1", "envelope_kind": "dm",
+        "sender_slug": "alice-0001", "recipient_slug": "me-0001",
+        "content_type": "text/plain", "content": "hi from alice", "sent_at": base,
+    })
+    await ms.store({
+        "envelope_id": "dm_2", "envelope_kind": "dm",
+        "sender_slug": "me-0001", "recipient_slug": "alice-0001",
+        "content_type": "text/plain", "content": "hi back", "sent_at": base + 1000,
+    })
+    await ms.store({
+        "envelope_id": "dm_3", "envelope_kind": "dm",
+        "sender_slug": "bob-0002", "recipient_slug": "me-0001",
+        "content_type": "text/plain", "content": "bob here", "sent_at": base + 2000,
+    })
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "get_dm_history", {"peer": "alice-0001", "limit": 10})
+    assert "hi from alice" in result
+    assert "hi back" in result
+    assert "bob here" not in result   # a different peer is filtered out
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_get_dm_history_empty():
+    cfg, _, ms = _setup()
+    await ms.open()
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "get_dm_history", {"peer": "nobody-9999"})
+    assert "no direct messages" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
 async def test_get_channel_history_empty_window():
     """Channel exists but the ``since`` filter pushes past every
     root → 'no root posts in the requested window'."""

@@ -152,6 +152,10 @@ class DockerCLIAdapter(Adapter):
         google_api_key: str = "",
         memory_limit: str = "",
         memory_reservation: str = "",
+        desired_skills: list[str] | None = None,
+        puffo_core_server_url: str = "",
+        puffo_core_slug: str = "",
+        puffo_core_keys_dir: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
@@ -185,6 +189,13 @@ class DockerCLIAdapter(Adapter):
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
         self.harness = harness
+        # Installed into the bind-mounted .claude/skills/ on first
+        # start (see _ensure_started). MCPs are rejected upstream.
+        self.desired_skills = list(desired_skills or [])
+        self.puffo_core_server_url = puffo_core_server_url
+        self.puffo_core_slug = puffo_core_slug
+        self.puffo_core_keys_dir = puffo_core_keys_dir
+        self._desired_installed = False
         self._started_lock = asyncio.Lock()
         self._started = False
         self._session: ClaudeSession | None = None
@@ -304,11 +315,13 @@ class DockerCLIAdapter(Adapter):
             "--env", *env_flags,
         ]
         try:
+            from ..._proc import no_window_kwargs
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **no_window_kwargs(),
             )
             stdout, stderr = await proc.communicate(b"y\n")
         except Exception as exc:
@@ -770,6 +783,25 @@ class DockerCLIAdapter(Adapter):
             return ""
         return out.decode("utf-8", errors="replace").strip()
 
+    async def _install_desired_skills(self) -> None:
+        """Install desired skills into .claude/skills/, once per
+        instance. MCPs are gated out upstream, so skills only."""
+        if self._desired_installed or not self.desired_skills:
+            return
+        self._desired_installed = True
+        from .desired_install import run_spawn_install
+        await run_spawn_install(
+            agent_id=self.agent_id,
+            agent_home=self.agent_home_dir,
+            workspace_dir=Path(self.workspace_dir),
+            harness_name=self.harness.name(),
+            desired_skills=self.desired_skills,
+            desired_mcps=[],
+            server_url=self.puffo_core_server_url,
+            slug=self.puffo_core_slug,
+            keys_dir=self.puffo_core_keys_dir,
+        )
+
     async def _ensure_started(self) -> None:
         async with self._started_lock:
             if self._started:
@@ -801,6 +833,8 @@ class DockerCLIAdapter(Adapter):
                     self.agent_id, skill_count,
                     self.agent_home_dir / ".claude" / "skills",
                 )
+            # After host-sync so host skills win on collision.
+            await self._install_desired_skills()
             merged_mcp, unreachable = sync_host_mcp_servers(
                 host_home, self.agent_home_dir,
             )
@@ -970,11 +1004,13 @@ class DockerCLIAdapter(Adapter):
             await self._build_image()
 
     async def _build_image(self) -> None:
+        from ..._proc import no_window_kwargs
         proc = await asyncio.create_subprocess_exec(
             "docker", "build", "-t", self.image, "-",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            **no_window_kwargs(),
         )
         stdout, _ = await proc.communicate(DOCKERFILE.encode())
         if proc.returncode != 0:
@@ -1199,10 +1235,12 @@ def _parse_gemini_reply(stdout_text: str) -> tuple[str, str, str]:
 
 
 async def _run_cmd(cmd: list[str], check: bool = True) -> tuple[int, bytes, bytes]:
+    from ..._proc import no_window_kwargs
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **no_window_kwargs(),
     )
     stdout, stderr = await proc.communicate()
     if check and proc.returncode != 0:

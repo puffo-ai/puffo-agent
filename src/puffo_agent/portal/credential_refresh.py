@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
+from .._proc import no_window_kwargs
 from .state import link_host_codex_auth, link_host_credentials
 
 
@@ -287,6 +288,7 @@ class FileBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(self.host_home),
+                **no_window_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -331,6 +333,16 @@ class FileBackend:
 
     def sync_to_agent(self, agent_home: Path) -> None:
         link_host_credentials(self.host_home, agent_home)
+
+    def fingerprint(self) -> tuple[int, int] | None:
+        """(mtime_ns, size) of the host credential. Lets the refresher
+        spot an external rotation (operator re-login) on copy-mode hosts
+        (Windows) where there's no symlink to carry it."""
+        try:
+            st = self.host_credentials.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
         return (True, "host_file_authoritative")
@@ -405,6 +417,7 @@ class CodexFileBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(self.host_home),
+                **no_window_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -454,6 +467,15 @@ class CodexFileBackend:
         if not agent_codex_home.exists():
             return
         link_host_codex_auth(self.host_home, agent_codex_home)
+
+    def fingerprint(self) -> tuple[int, int] | None:
+        """(mtime_ns, size) of the host codex auth — external-rotation
+        signal for copy-mode hosts, mirroring ``FileBackend``."""
+        try:
+            st = self.host_auth.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
         if not self.host_auth.exists():
@@ -563,6 +585,7 @@ class KeychainBackend:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=str(host_home),
+                **no_window_kwargs(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -728,6 +751,11 @@ class CredentialRefresher:
         self._lock = asyncio.Lock()
         self._consecutive_non_success = 0
         self._rate_limit_retry_task: asyncio.Task | None = None
+        # Last host-credential fingerprint, for spotting an external
+        # rotation (operator re-login) on copy-mode hosts with no symlink
+        # to carry it. ``None`` until the first tick sets a baseline (so
+        # we don't false-fire on start).
+        self._last_cred_fingerprint: tuple[int, int] | None = None
 
     def register_agent(self, agent_home: Path) -> None:
         self._agent_homes.add(Path(agent_home))
@@ -854,12 +882,44 @@ class CredentialRefresher:
             stop_task.cancel()
             refresh_task.cancel()
 
+    def _detect_external_rotation(self) -> None:
+        """Spot an external host-credential change (operator re-login)
+        against the last fingerprint and, if changed, sync to agents +
+        fire refresh-success — the copy-mode (Windows) counterpart to the
+        macOS Keychain rotation poll. No-op for backends without
+        ``fingerprint`` (e.g. Keychain, which has its own poll)."""
+        fingerprint = getattr(self.backend, "fingerprint", None)
+        if fingerprint is None:
+            return
+        current = fingerprint()
+        if current is None or self._last_cred_fingerprint is None:
+            return
+        if current != self._last_cred_fingerprint:
+            logger.info(
+                "external credential rotation detected (host file changed) "
+                "— syncing agents + firing refresh-success",
+            )
+            self._sync_views()
+            self._fire_refresh_success()
+
+    def _record_cred_fingerprint(self) -> None:
+        fingerprint = getattr(self.backend, "fingerprint", None)
+        if fingerprint is None:
+            return
+        current = fingerprint()
+        if current is not None:
+            self._last_cred_fingerprint = current
+
     async def _tick(self, *, triggered_by_agent: bool = False) -> None:
-        """One refresh cycle: check expiry, refresh if needed, sync
-        views regardless so external rotation propagates."""
+        """One refresh cycle: detect external rotation, check expiry,
+        refresh if needed, sync views regardless so rotation propagates.
+        The trailing fingerprint record absorbs our own refresh so it
+        isn't re-seen as 'external' next tick."""
+        self._detect_external_rotation()
         expires_in = self.expires_in_seconds()
         if expires_in is None and not triggered_by_agent:
             self._sync_views()
+            self._record_cred_fingerprint()
             return
         should_refresh = triggered_by_agent or (
             expires_in is not None
@@ -870,6 +930,7 @@ class CredentialRefresher:
                 expires_in=expires_in, by_agent=triggered_by_agent,
             )
         self._sync_views()
+        self._record_cred_fingerprint()
 
     async def _refresh_now(
         self, *, expires_in: int | None, by_agent: bool,
@@ -961,8 +1022,8 @@ class CredentialRefresher:
         msg = (
             f"daemon CredentialRefresher saw {self._consecutive_non_success} "
             f"consecutive {outcome.value} outcome(s); on-disk token isn't "
-            f"advancing. Run `claude /login` then "
-            f"`puffo-agent agent resume <id>` to recover."
+            f"advancing. Run `claude auth login`, then send the agent "
+            f"a message to recover."
         )
         for agent_home in self._agent_homes:
             agent_id = Path(agent_home).name

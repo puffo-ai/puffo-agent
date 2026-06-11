@@ -45,7 +45,7 @@ from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
-from .desired_install import install_desired
+from .desired_install import run_spawn_install
 from .hermes_helpers import (
     HERMES_NO_RESUME_SIGNATURE,
     hermes_model_id,
@@ -1004,47 +1004,17 @@ class LocalCLIAdapter(Adapter):
         if self._desired_installed:
             return
         self._desired_installed = True
-        if not self.desired_skills and not self.desired_mcps:
-            return
-        if not (
-            self.puffo_core_server_url
-            and self.puffo_core_slug
-            and self.puffo_core_keys_dir
-        ):
-            logger.warning(
-                "agent %s: desired_skills/desired_mcps configured but "
-                "puffo_core wiring is incomplete — skipping spawn-time "
-                "install (server_url=%r slug=%r keys_dir=%r)",
-                self.agent_id,
-                self.puffo_core_server_url,
-                self.puffo_core_slug,
-                self.puffo_core_keys_dir,
-            )
-            return
-        from ...crypto.http_client import PuffoCoreHttpClient
-        from ...crypto.keystore import KeyStore
-        ks = KeyStore(self.puffo_core_keys_dir)
-        http = PuffoCoreHttpClient(
-            self.puffo_core_server_url, ks, self.puffo_core_slug,
+        codex_extras = await run_spawn_install(
+            agent_id=self.agent_id,
+            agent_home=self.agent_home_dir,
+            workspace_dir=Path(self.workspace_dir),
+            harness_name=self.harness.name(),
+            desired_skills=self.desired_skills,
+            desired_mcps=self.desired_mcps,
+            server_url=self.puffo_core_server_url,
+            slug=self.puffo_core_slug,
+            keys_dir=self.puffo_core_keys_dir,
         )
-        try:
-            codex_extras = await install_desired(
-                http=http,
-                agent_home=self.agent_home_dir,
-                workspace_dir=Path(self.workspace_dir),
-                agent_id=self.agent_id,
-                harness_name=self.harness.name(),
-                desired_skills=self.desired_skills,
-                desired_mcps=self.desired_mcps,
-            )
-        except Exception as exc:
-            logger.warning(
-                "agent %s: desired install pass crashed: %s — "
-                "continuing spawn", self.agent_id, exc,
-            )
-            codex_extras = {}
-        finally:
-            await http.close()
         if codex_extras:
             self._desired_codex_extras = codex_extras
 

@@ -111,6 +111,28 @@ async def info(_request: web.Request) -> web.Response:
     })
 
 
+async def list_providers(_request: web.Request) -> web.Response:
+    """Public: live per-provider model catalogs. claude-code hits
+    ``/v1/models``, codex reads its local cache. Models only — harness
+    install/auth status lives on ``/v1/info``."""
+    import asyncio
+
+    from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
+
+    def _build() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for harness in KNOWN_HARNESSES:
+            models = [
+                {"id": o.id, "label": o.label, "alias": o.is_alias}
+                for o in provider_models(harness, fetch=True)
+                if o.id  # drop the daemon-default ("") sentinel
+            ]
+            out.append({"provider": harness, "models": models})
+        return out
+
+    return web.json_response({"providers": await asyncio.to_thread(_build)})
+
+
 # ────────────────────────────────────────────────────────────────────
 # /v1/pair
 # ────────────────────────────────────────────────────────────────────

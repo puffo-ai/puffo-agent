@@ -276,9 +276,30 @@ class Daemon:
         agent_id = agent_cfg.id
 
         def on_refresh_success() -> None:
+            was_auth_failed = worker.runtime.health == "auth_failed"
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime, agent_id, logger,
             )
+            # Re-arm the auth_failed DM dedup so a re-expiry this
+            # session re-notifies the operator.
+            worker._auth_failed_notification_sent = False
+            if was_auth_failed:
+                # The running adapter session still holds the stale
+                # credential; a restart re-links the fresh cred and
+                # redelivers the stalled batch (cursor wasn't advanced).
+                try:
+                    flag = restart_flag_path(agent_id)
+                    flag.parent.mkdir(parents=True, exist_ok=True)
+                    flag.write_text("")
+                    logger.info(
+                        "agent %s: credential recovered — requesting restart "
+                        "to pick up the new credential", agent_id,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "agent %s: could not write restart flag: %s",
+                        agent_id, exc,
+                    )
 
         refresher.register_on_refresh_success(on_refresh_success)
         # Stash callback identity for _stop_worker's unregister.

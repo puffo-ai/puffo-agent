@@ -526,6 +526,37 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
+    async def get_dm_history(
+        peer: str,
+        limit: int = 20,
+        before: int = 0,
+    ) -> str:
+        """List recent **direct messages** between you and ``peer``,
+        oldest-first, from local storage.
+
+        ``peer`` is the other party's slug (e.g. ``alice-1a2b``) — the
+        same slug you'd DM with ``send_message``. ``before`` is an
+        optional ms-epoch upper bound (exclusive) for paging back.
+
+        Output lines: ``<ts>  msg:<envelope_id>  @<sender>: <text>``,
+        oldest-first."""
+        limit = max(1, min(int(limit), 200))
+        peer_slug = peer.strip().lstrip("@")
+        if not peer_slug:
+            raise RuntimeError("pass the peer's slug to read DM history.")
+        msgs = await cfg.data_client.get_dm_history(
+            peer_slug, limit=limit, before=int(before) if before else None,
+        )
+        if not msgs:
+            return "(no direct messages with that peer in the requested window)"
+        lines = []
+        for m in msgs:
+            ts = _ts_to_iso(m.sent_at)
+            text = str(m.content).replace("\n", " ") if m.content else ""
+            lines.append(f"{ts}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def get_thread_history(
         root_id: str,
         limit: int = 50,
