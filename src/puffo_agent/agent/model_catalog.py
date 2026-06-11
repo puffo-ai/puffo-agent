@@ -159,10 +159,13 @@ def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
     return [_DAEMON_DEFAULT, *_STATIC.get(harness, ())]
 
 
-def prefetch() -> None:
+def prefetch() -> threading.Thread:
     """Warm the claude-code live list in a background thread (call once
-    at UI/daemon start so later ``provider_models`` reads hit cache)."""
-    threading.Thread(
+    at UI/daemon start so later ``provider_models`` reads hit cache).
+    Returns the thread; callers may ignore it."""
+    t = threading.Thread(
         target=lambda: provider_models("claude-code", fetch=True),
         daemon=True,
-    ).start()
+    )
+    t.start()
+    return t

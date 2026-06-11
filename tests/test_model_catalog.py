@@ -114,3 +114,56 @@ def test_fetch_drops_blocked_models(monkeypatch):
         lambda req, timeout=None: io.BytesIO(json.dumps(payload).encode()),
     )
     assert _ids(mc._fetch_anthropic_models()) == ["claude-opus-4-8", "claude-fable-5"]
+
+
+def test_fetch_returns_none_on_network_error(monkeypatch):
+    monkeypatch.setattr(mc, "_anthropic_oauth_token", lambda: "tok")
+
+    def _boom(req, timeout=None):
+        raise mc.urllib.error.URLError("no network")
+
+    monkeypatch.setattr(mc.urllib.request, "urlopen", _boom)
+    assert mc._fetch_anthropic_models() is None
+
+
+def test_oauth_token_read_from_creds(monkeypatch, tmp_path):
+    cred = tmp_path / ".claude" / ".credentials.json"
+    cred.parent.mkdir(parents=True)
+    cred.write_text(
+        json.dumps({"claudeAiOauth": {"accessToken": "sk-tok"}}), encoding="utf-8"
+    )
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    assert mc._anthropic_oauth_token() == "sk-tok"
+
+
+def test_oauth_token_none_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)  # no .claude dir
+    assert mc._anthropic_oauth_token() is None
+
+
+def test_oauth_token_none_on_bad_json(monkeypatch, tmp_path):
+    cred = tmp_path / ".claude" / ".credentials.json"
+    cred.parent.mkdir(parents=True)
+    cred.write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    assert mc._anthropic_oauth_token() is None
+
+
+def test_prefetch_warms_cache(monkeypatch):
+    live = (ModelOption("claude-fable-5", "Claude Fable 5"),)
+    monkeypatch.setattr(mc, "_fetch_anthropic_models", lambda: live)
+    mc.prefetch().join(timeout=5)
+    assert mc._cache.get("claude-code") is not None
+    assert mc._cache["claude-code"][1] == live
+
+
+def test_stale_cache_served_when_refetch_fails(monkeypatch):
+    monkeypatch.setattr(
+        mc, "_fetch_anthropic_models", lambda: (ModelOption("claude-x", "X"),)
+    )
+    provider_models("claude-code", fetch=True)  # warm
+    ts, models = mc._cache["claude-code"]
+    mc._cache["claude-code"] = (ts - mc._CACHE_TTL_S - 1, models)  # force stale
+    monkeypatch.setattr(mc, "_fetch_anthropic_models", lambda: None)  # refetch fails
+    ids = _ids(provider_models("claude-code", fetch=True))
+    assert "claude-x" in ids  # stale cache served, not the static fallback
