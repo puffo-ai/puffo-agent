@@ -116,7 +116,10 @@ def _add_agent(zf: zipfile.ZipFile, agent_id: str) -> dict:
         if path.suffix == ".tmp":
             continue
         arcname = f"agents/{agent_id}/{path.relative_to(src).as_posix()}"
-        zf.write(path, arcname=arcname)
+        # writestr stamps the current time — sidesteps files whose mtime
+        # predates 1980, which ZIP can't represent (and timestamps don't
+        # survive the import round-trip anyway).
+        zf.writestr(arcname, path.read_bytes())
     return {
         "id": agent_id,
         "slug": slug,

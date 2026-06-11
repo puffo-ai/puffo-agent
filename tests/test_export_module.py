@@ -69,6 +69,22 @@ def test_pack_unpack_roundtrip_single():
     assert bundle.agents["alpha"]["memory/notes.md"] == b"hello-memory"
 
 
+def test_pack_tolerates_pre_1980_file_mtime():
+    """A file whose mtime predates 1980 (ZIP's floor) must not break the
+    export — content is preserved, timestamp is not."""
+    from puffo_agent.portal import export as exp
+
+    adir = _seed(
+        os.environ["PUFFO_AGENT_HOME"], "alpha",
+        extra_files={"messages.db": "fake-sqlite"},
+    )
+    os.utime(adir / "messages.db", (0, 0))  # 1970-01-01, before ZIP's 1980
+
+    blob = exp.pack(["alpha"], password="hunter2")
+    bundle = exp.unpack(blob, password="hunter2")
+    assert bundle.agents["alpha"]["messages.db"] == b"fake-sqlite"
+
+
 def test_pack_unpack_roundtrip_multi():
     from puffo_agent.portal import export as exp
 
