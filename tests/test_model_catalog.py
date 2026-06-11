@@ -70,10 +70,33 @@ def test_no_fetch_does_not_hit_the_api(monkeypatch):
     assert "claude-opus-4-8" in ids  # served from static, no network
 
 
-def test_codex_is_static():
+def test_codex_reads_local_cache(monkeypatch, tmp_path):
+    cache = tmp_path / ".codex" / "models_cache.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text(json.dumps({"models": [
+        {"slug": "gpt-5.4", "display_name": "GPT-5.4", "visibility": "list", "priority": 16},
+        {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list", "priority": 9},
+        {"slug": "codex-auto-review", "display_name": "Codex Auto Review",
+         "visibility": "hide", "priority": 43},
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
     ids = _ids(provider_models("codex"))
-    assert ids[0] == "" and "gpt-5.5" in ids
-    assert "claude-opus-4-8" not in ids
+    assert ids[0] == ""  # daemon default
+    # visibility=hide excluded; ordered by priority (gpt-5.5 before gpt-5.4)
+    assert ids[1:] == ["gpt-5.5", "gpt-5.4"]
+
+
+def test_codex_fallback_when_cache_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)  # no .codex dir
+    assert _ids(provider_models("codex"))[1:] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+
+
+def test_codex_fallback_on_bad_json(monkeypatch, tmp_path):
+    cache = tmp_path / ".codex" / "models_cache.json"
+    cache.parent.mkdir(parents=True)
+    cache.write_text("not json", encoding="utf-8")
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    assert _ids(provider_models("codex"))[1:] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
 
 
 def test_unknown_harness_is_just_default():

@@ -60,16 +60,17 @@ _CLAUDE_STATIC: tuple[ModelOption, ...] = (
     ModelOption("claude-sonnet-4-6", "Claude Sonnet 4.6"),
 )
 
-# Other harnesses: static for now.
-# TODO: same /v1/models refresh against the OpenAI / Google endpoints.
+# codex reads its own local model cache (see _codex_models); these are
+# the fallback when that cache is unreadable.
+_CODEX_STATIC: tuple[ModelOption, ...] = (
+    ModelOption("gpt-5.5", "GPT-5.5"),
+    ModelOption("gpt-5.4", "GPT-5.4"),
+    ModelOption("gpt-5.4-mini", "GPT-5.4-Mini"),
+)
+
+# hermes / gemini-cli are static for now.
+# TODO: a dynamic source for gemini (Google API) like claude / codex.
 _STATIC: dict[str, tuple[ModelOption, ...]] = {
-    "codex": (
-        ModelOption("gpt-5.5", "GPT-5.5"),
-        ModelOption("gpt-5.4", "GPT-5.4"),
-        ModelOption("gpt-5.4-mini", "GPT-5.4 Mini"),
-        ModelOption("gpt-5.3-codex", "GPT-5.3 Codex"),
-        ModelOption("gpt-5.2", "GPT-5.2"),
-    ),
     "hermes": (
         ModelOption("opus", "opus — latest Opus", is_alias=True),
         ModelOption("sonnet", "sonnet — latest Sonnet", is_alias=True),
@@ -145,6 +146,30 @@ def _claude_concrete(*, fetch: bool) -> tuple[ModelOption, ...]:
     return cached[1] if cached else _CLAUDE_STATIC
 
 
+def _codex_models() -> tuple[ModelOption, ...]:
+    """The codex CLI's own local model cache. ``visibility == "list"``
+    drops internal entries (e.g. codex-auto-review); the CLI's
+    ``priority`` sets the order. Falls back to the static list when the
+    cache is missing / unreadable. No block-list needed — ``visibility``
+    does the filtering."""
+    path = Path.home() / ".codex" / "models_cache.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _CODEX_STATIC
+    listed = sorted(
+        (
+            m for m in data.get("models", [])
+            if m.get("slug") and m.get("visibility") == "list"
+        ),
+        key=lambda m: m.get("priority", 9999),
+    )
+    out = tuple(
+        ModelOption(m["slug"], m.get("display_name") or m["slug"]) for m in listed
+    )
+    return out or _CODEX_STATIC
+
+
 def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
     """Selectable models for ``harness``: daemon-default + aliases +
     concrete versions.
@@ -152,10 +177,13 @@ def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
     ``fetch`` only affects claude-code: when True it may hit
     ``/v1/models`` synchronously (use off the UI thread — see
     ``prefetch``); when False it serves the cache or the static
-    fallback without blocking.
+    fallback without blocking. codex reads its local cache; the rest
+    are static.
     """
     if harness == "claude-code":
         return [_DAEMON_DEFAULT, *_CLAUDE_ALIASES, *_claude_concrete(fetch=fetch)]
+    if harness == "codex":
+        return [_DAEMON_DEFAULT, *_codex_models()]
     return [_DAEMON_DEFAULT, *_STATIC.get(harness, ())]
 
 
