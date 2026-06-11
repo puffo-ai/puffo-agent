@@ -20,6 +20,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   whose modification time predated 1980 (which ZIP can't represent)
   failed the whole `.puffoagent` export with a `ValueError`; entries are
   now stamped with the current time.
+- **`claude` / `codex` are found even when off the daemon's PATH.** A
+  daemon started by a service / before a shell-profile refresh inherits
+  a narrow, stale PATH and missed npm-global / scoop / nvm / homebrew
+  installs. The resolver now reconstructs the user's real PATH
+  (Machine+User registry env on Windows, a login shell on POSIX) and
+  caches the resolved path to `resolved_clis.json`, so restarts don't
+  re-search.
 
 ## [0.12.3] — 2026-06-11
 
