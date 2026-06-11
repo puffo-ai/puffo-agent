@@ -655,25 +655,29 @@ class PuffoCoreMessageClient:
             if payload.sender_slug == self.slug:
                 return
 
-            # Daemon-side intercept: ``y``/``n`` in the thread of an
-            # outstanding invite-DM accepts/rejects the invite without
-            # waking the LLM. Other text falls through to the queue.
-            # PUF-227-A: use the validated thread_root_id — an invite-DM
-            # thread linkage that doesn't resolve in local cache is also
-            # invalid for the inline-handler path.
+            # Daemon-side intercept: ``y``/``n`` from the operator on an
+            # outstanding invite-DM accepts/rejects without waking the
+            # LLM. A threaded reply answers just that invite; a direct
+            # (top-level) reply answers all pending invites at once.
             if (
                 payload.envelope_kind == "dm"
                 and payload.sender_slug == self.operator_slug
-                and payload_thread_root_id
-                and payload_thread_root_id in self._pending_invite_dms
             ):
-                handled = await self._maybe_handle_invite_reply(
-                    thread_root_id=payload_thread_root_id,
-                    text=str(payload.content) if payload.content else "",
+                text_raw = str(payload.content) if payload.content else ""
+                targets, is_direct = self._resolve_invite_targets(
+                    payload_thread_root_id, text_raw,
                 )
-                if handled:
+                handled_labels = (
+                    await self._apply_invite_replies(targets, text_raw)
+                    if targets else []
+                )
+                if handled_labels:
                     # Handled inline — don't queue for the LLM.
                     self._last_dm_sender = payload.sender_slug
+                    if is_direct:
+                        await self._send_invite_bulk_summary(
+                            handled_labels, text_raw, payload_thread_root_id or "",
+                        )
                     return
 
             channel_id = payload.channel_id or ""
@@ -2525,6 +2529,70 @@ class PuffoCoreMessageClient:
             channel_id, space_id,
         )
 
+    def _resolve_invite_targets(
+        self, payload_thread_root_id: str | None, text: str,
+    ) -> tuple[list[str], bool]:
+        """Which pending invites the operator's strict-Y/N reply targets,
+        and whether it's a *direct* (top-level) reply. A threaded reply
+        matching a registered invite answers just that one; a direct
+        strict-Y/N answers all pending invites. Empty list = nothing to
+        act on (caller falls through to the LLM). Routing only —
+        ``_maybe_handle_invite_reply`` still does the strict body-parse.
+        """
+        if (
+            payload_thread_root_id
+            and payload_thread_root_id in self._pending_invite_dms
+        ):
+            return ([payload_thread_root_id], False)
+        if text.strip().lower() not in ("y", "yes", "n", "no"):
+            return ([], False)
+        return (list(self._pending_invite_dms.keys()), True)
+
+    async def _apply_invite_replies(
+        self, roots: list[str], text: str,
+    ) -> list[str]:
+        """Accept/reject each invite (per-invite confirm in its own
+        thread); return the target labels actually handled."""
+        labels: list[str] = []
+        for root in roots:
+            meta = self._pending_invite_dms.get(root)
+            handled = await self._maybe_handle_invite_reply(
+                thread_root_id=root, text=text,
+            )
+            if handled and meta:
+                labels.append(self._invite_target_label(meta))
+        return labels
+
+    async def _send_invite_bulk_summary(
+        self, labels: list[str], text: str, root_id: str,
+    ) -> None:
+        """Consolidated accept/reject summary in the direct reply's own
+        thread, on top of the per-invite confirmations."""
+        accepted = text.strip().lower() in ("y", "yes")
+        verb = "Accepted" if accepted else "Rejected"
+        mark = " ✓" if accepted else ""
+        if len(labels) == 1:
+            summary = f"{verb} invite to {labels[0]}.{mark}"
+        else:
+            summary = f"{verb} {len(labels)} invites: {', '.join(labels)}.{mark}"
+        try:
+            await self._send_dm(self.operator_slug, summary, root_id=root_id)
+        except Exception:
+            self._log.exception("failed to send bulk invite summary to operator")
+
+    @staticmethod
+    def _invite_target_label(meta: dict) -> str:
+        """Human label for an invite's destination (space or channel)."""
+        space_id = meta.get("space_id") or ""
+        space_label = f"**{meta['space_name']}**" if meta.get("space_name") else space_id
+        if meta.get("kind") == "invite_to_channel":
+            channel_id = meta.get("channel_id") or ""
+            channel_label = (
+                f"**{meta['channel_name']}**" if meta.get("channel_name") else channel_id
+            )
+            return f"channel {channel_label} in space {space_label}"
+        return f"space {space_label}"
+
     async def _maybe_handle_invite_reply(
         self, *, thread_root_id: str, text: str,
     ) -> bool:
@@ -2550,16 +2618,7 @@ class PuffoCoreMessageClient:
         space_id = meta["space_id"]
         channel_id = meta.get("channel_id") or ""
         inviter_slug = meta.get("inviter_slug") or "?"
-        space_name = meta.get("space_name") or None
-        channel_name = meta.get("channel_name") or None
-        space_label = f"**{space_name}**" if space_name else space_id
-        if kind == "invite_to_channel":
-            channel_label = (
-                f"**{channel_name}**" if channel_name else channel_id
-            )
-            target = f"channel {channel_label} in space {space_label}"
-        else:
-            target = f"space {space_label}"
+        target = self._invite_target_label(meta)
         # Pretty inviter label for confirmation; cached from the
         # original DM lookup.
         inviter_display = await self._fetch_display_name(inviter_slug)
@@ -2693,7 +2752,8 @@ class PuffoCoreMessageClient:
             text = (
                 f"{inviter_label} invited me to space {space_label}. "
                 f"They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject in this thread."
+                f"Reply `y` to accept or `n` to reject — in this thread for "
+                f"this one, or a direct `y`/`n` for all your pending invites."
             )
         else:
             channel_label = (
@@ -2702,7 +2762,8 @@ class PuffoCoreMessageClient:
             text = (
                 f"{inviter_label} invited me to channel {channel_label} in "
                 f"space {space_label}. They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject in this thread."
+                f"Reply `y` to accept or `n` to reject — in this thread for "
+                f"this one, or a direct `y`/`n` for all your pending invites."
             )
         try:
             envelope = await self._send_dm(self.operator_slug, text, root_id="")
