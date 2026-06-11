@@ -41,14 +41,24 @@ _CLAUDE_ALIASES: tuple[ModelOption, ...] = (
     ModelOption("opusplan", "opusplan — plan w/ Opus, run w/ Sonnet", is_alias=True),
 )
 
-# Offline fallback for claude-code. Concrete ids confirmed live 2026-06;
-# only consulted when ``/v1/models`` is unreachable, since the aliases +
-# the live refresh otherwise keep the list current.
+# Old dated point-releases that ``/v1/models`` still returns but that
+# only clutter the picker — filtered out of the live result.
+_BLOCKED_MODELS: frozenset[str] = frozenset({
+    "claude-opus-4-5-20251101",
+    "claude-opus-4-1-20250805",
+    "claude-opus-4-20250514",
+    "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-20250514",
+})
+
+# Offline fallback for claude-code — only consulted when ``/v1/models``
+# is unreachable (the aliases + the live refresh otherwise keep it
+# current).
 _CLAUDE_STATIC: tuple[ModelOption, ...] = (
-    ModelOption("claude-fable-5", "Claude Fable 5"),
     ModelOption("claude-opus-4-8", "Claude Opus 4.8"),
+    ModelOption("claude-opus-4-7", "Claude Opus 4.7"),
+    ModelOption("claude-opus-4-6", "Claude Opus 4.6"),
     ModelOption("claude-sonnet-4-6", "Claude Sonnet 4.6"),
-    ModelOption("claude-haiku-4-5", "Claude Haiku 4.5"),
 )
 
 # Other harnesses: static for now.
@@ -115,7 +125,7 @@ def _fetch_anthropic_models() -> tuple[ModelOption, ...] | None:
     out = [
         ModelOption(m["id"], m.get("display_name") or m["id"])
         for m in data.get("data", [])
-        if m.get("id")
+        if m.get("id") and m["id"] not in _BLOCKED_MODELS
     ]
     return tuple(out) or None
 

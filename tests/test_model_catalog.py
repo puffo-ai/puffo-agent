@@ -29,8 +29,10 @@ def test_claude_code_default_and_aliases_offline(monkeypatch):
     ids = _ids(opts)
     assert ids[0] == ""  # daemon default first
     assert {"opus", "sonnet", "haiku"} <= set(ids)  # aliases
-    # static fallback concrete versions
-    assert "claude-fable-5" in ids and "claude-opus-4-8" in ids
+    # static fallback = the curated 4 (no Fable 5 in the fallback)
+    assert {"claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+            "claude-sonnet-4-6"} <= set(ids)
+    assert "claude-fable-5" not in ids
 
 
 def test_claude_code_prefers_live_models(monkeypatch):
@@ -96,3 +98,18 @@ def test_fetch_parses_id_and_display_name(monkeypatch):
     assert _ids(out) == ["claude-fable-5", "claude-opus-4-8"]
     assert out[0].label == "Claude Fable 5"
     assert out[1].label == "claude-opus-4-8"
+
+
+def test_fetch_drops_blocked_models(monkeypatch):
+    monkeypatch.setattr(mc, "_anthropic_oauth_token", lambda: "tok")
+    payload = {"data": [
+        {"id": "claude-opus-4-8"},
+        {"id": "claude-opus-4-20250514"},  # blocked
+        {"id": "claude-sonnet-4-5-20250929"},  # blocked
+        {"id": "claude-fable-5"},
+    ]}
+    monkeypatch.setattr(
+        mc.urllib.request, "urlopen",
+        lambda req, timeout=None: io.BytesIO(json.dumps(payload).encode()),
+    )
+    assert _ids(mc._fetch_anthropic_models()) == ["claude-opus-4-8", "claude-fable-5"]
