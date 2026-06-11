@@ -34,6 +34,9 @@ def test_claude_code_default_and_aliases_offline(monkeypatch):
     assert {"claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
             "claude-sonnet-4-6"} <= set(ids)
     assert "claude-fable-5" not in ids
+    # general aliases sort to the end, after the concrete versions
+    assert ids.index("opus") > ids.index("claude-opus-4-8")
+    assert ids.index("sonnet") > ids.index("claude-sonnet-4-6")
 
 
 def test_claude_code_prefers_live_models(monkeypatch):

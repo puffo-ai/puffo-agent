@@ -72,10 +72,10 @@ _CODEX_STATIC: tuple[ModelOption, ...] = (
 # TODO: a dynamic source for gemini (Google API) like claude / codex.
 _STATIC: dict[str, tuple[ModelOption, ...]] = {
     "hermes": (
-        ModelOption("opus", "opus — latest Opus", is_alias=True),
-        ModelOption("sonnet", "sonnet — latest Sonnet", is_alias=True),
         ModelOption("gpt-5.5", "GPT-5.5"),
         ModelOption("gpt-5.4", "GPT-5.4"),
+        ModelOption("opus", "opus — latest Opus", is_alias=True),
+        ModelOption("sonnet", "sonnet — latest Sonnet", is_alias=True),
     ),
     "gemini-cli": (
         ModelOption("gemini-2.5-pro", "Gemini 2.5 Pro"),
@@ -184,7 +184,8 @@ def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
     are static.
     """
     if harness == "claude-code":
-        return [_DAEMON_DEFAULT, *_CLAUDE_ALIASES, *_claude_concrete(fetch=fetch)]
+        # General aliases (opus/sonnet) sort after the concrete versions.
+        return [_DAEMON_DEFAULT, *_claude_concrete(fetch=fetch), *_CLAUDE_ALIASES]
     if harness == "codex":
         return [_DAEMON_DEFAULT, *_codex_models()]
     return [_DAEMON_DEFAULT, *_STATIC.get(harness, ())]
