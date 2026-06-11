@@ -1,8 +1,7 @@
-"""PUF-287: routing-gate relax so top-level (un-threaded) operator
-Y/N on a pending invite-DM still triggers `_maybe_handle_invite_reply`.
-PUF-227-A's threaded-fast-path is preserved as the precedence rule;
-top-level falls back to single-pending lookup, multi-pending falls
-through to the LLM.
+"""Routing-gate relax so top-level (un-threaded) operator Y/N on a
+pending invite-DM still triggers `_maybe_handle_invite_reply`. The
+threaded fast-path stays the precedence rule; top-level falls back to
+single-pending lookup, multi-pending falls through to the LLM.
 """
 
 from __future__ import annotations
@@ -65,8 +64,8 @@ def _seed_pending(client, env_id: str, **over) -> None:
 
 
 def test_threaded_match_in_pending_wins_over_top_level_fallback():
-    """PUF-227-A regression guard: when payload thread_root_id matches
-    a registered invite, that's the resolver's answer regardless of
+    """Regression guard: when payload thread_root_id matches a
+    registered invite, that's the resolver's answer regardless of
     pending-count.
     """
     client = _make_client()
@@ -137,9 +136,9 @@ def test_top_level_strict_yn_variants_resolve_to_single_pending(text):
 
 @pytest.mark.asyncio
 async def test_top_level_y_with_one_pending_calls_accept():
-    """PUF-287 primary fix: Shan's scenario. Operator replies "y"
-    top-level (no thread); _accept_invite fires once and the pending
-    entry clears.
+    """Primary fix: operator replies "y" top-level (no thread) with one
+    pending invite; _accept_invite fires once and the pending entry
+    clears.
     """
     client = _make_client()
     _seed_pending(client, "env_invite_solo", invitation_event_id="ev_xyz")
@@ -160,9 +159,9 @@ async def test_top_level_y_with_one_pending_calls_accept():
 
 @pytest.mark.asyncio
 async def test_threaded_y_in_pending_root_still_works():
-    """PUF-227-A regression: threaded path remains the primary fast
-    route. payload_thread_root_id matches the registered invite root
-    directly without going through the single-pending fallback.
+    """Regression: the threaded path remains the primary fast route —
+    payload_thread_root_id matches the registered invite root directly
+    without going through the single-pending fallback.
     """
     client = _make_client()
     _seed_pending(client, "env_invite_thr", invitation_event_id="ev_thr")
@@ -216,13 +215,13 @@ async def test_top_level_y_with_zero_pending_no_op():
 
 @pytest.mark.asyncio
 async def test_new_invite_seeded_between_awaits_does_not_corrupt_accept():
-    """PUF-287 race scenario: a fresh invite registers in
-    ``_pending_invite_dms`` while ``_maybe_handle_invite_reply`` is
-    mid-await on ``_accept_invite``. asyncio's single-threaded model
-    means the resolver's pending-id snapshot is taken before the
-    handler awaits, so a concurrent insert can't redirect this y/n.
-    Locks the contract: the resolved root is consumed exactly once
-    and the late-arriving invite stays untouched.
+    """Race scenario: a fresh invite registers in ``_pending_invite_dms``
+    while ``_maybe_handle_invite_reply`` is mid-await on
+    ``_accept_invite``. asyncio's single-threaded model means the
+    resolver's pending-id snapshot is taken before the handler awaits,
+    so a concurrent insert can't redirect this y/n — the resolved root
+    is consumed exactly once and the late-arriving invite stays
+    untouched.
     """
     client = _make_client()
     _seed_pending(client, "env_invite_first", invitation_event_id="ev_first")
@@ -277,10 +276,9 @@ async def test_top_level_y_with_multi_pending_logs_and_falls_through(caplog):
 
 
 def test_invite_prompt_copy_mentions_top_level_path():
-    """PUF-287 (β): the operator-facing invite prompt must surface
-    that top-level replies are accepted, not just threaded ones.
-    Reads the source so the test fails the moment a refactor reverts
-    the wording.
+    """The operator-facing invite prompt must surface that top-level
+    replies are accepted, not just threaded ones. Reads the source so
+    the test fails the moment a refactor reverts the wording.
     """
     src_path = os.path.join(
         os.path.dirname(__file__), "..", "src", "puffo_agent",

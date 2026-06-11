@@ -657,10 +657,8 @@ class PuffoCoreMessageClient:
 
             # Daemon-side intercept: ``y``/``n`` from the operator on
             # an outstanding invite-DM accepts/rejects without waking
-            # the LLM. PUF-227-A established the threaded path;
-            # PUF-287 extends it to top-level replies when exactly one
-            # invite is pending (Shan-pattern: users default to
-            # top-level per the chat-app norm).
+            # the LLM — a threaded reply, or a top-level reply when
+            # exactly one invite is pending.
             if (
                 payload.envelope_kind == "dm"
                 and payload.sender_slug == self.operator_slug
@@ -2517,12 +2515,12 @@ class PuffoCoreMessageClient:
         self, payload_thread_root_id: str | None, text: str,
     ) -> str | None:
         """Pick which pending invite the operator's strict-Y/N reply
-        targets. Threaded reply that matches ``_pending_invite_dms``
-        wins (PUF-227-A path). Otherwise — top-level reply, or threaded
-        in some unrelated DM — fall back to single-pending lookup
-        (PUF-287). Returns ``None`` when no match (caller falls to
-        LLM); ``_maybe_handle_invite_reply`` still does the strict
-        body-parse so this resolver only triages routing.
+        targets. A threaded reply matching ``_pending_invite_dms`` wins;
+        otherwise (top-level, or threaded in an unrelated DM) fall back
+        to the single pending invite. Returns ``None`` when there's no
+        unambiguous match (caller falls through to the LLM) — routing
+        only; ``_maybe_handle_invite_reply`` still does the strict
+        body-parse.
         """
         if (
             payload_thread_root_id
@@ -2536,7 +2534,7 @@ class PuffoCoreMessageClient:
         if len(pending_ids) == 1:
             return pending_ids[0]
         if len(pending_ids) > 1:
-            # Ambiguous; fall to LLM. v1 default per PUF-287 intake.
+            # Ambiguous — fall through to the LLM.
             self._log.info(
                 "operator top-level y/n with %d pending invites; "
                 "ambiguous, falling through to LLM",
