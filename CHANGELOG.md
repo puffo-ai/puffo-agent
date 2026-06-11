@@ -12,9 +12,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   model dropdown now lists the account's actual available models:
   claude-code refreshes from the live Anthropic `/v1/models` (so new
   releases like Fable 5 appear without a code change) plus the
-  latest-tracking `opus` / `sonnet` aliases; codex reads the CLI's own
-  local model cache (`~/.codex/models_cache.json`, visibility-filtered);
-  gemini stays on a curated static list for now. New
+  latest-tracking `opus` / `sonnet` aliases (sorted after the pinned
+  versions); codex reads the CLI's own local model cache
+  (`~/.codex/models_cache.json`, visibility-filtered); gemini / hermes
+  stay on curated static lists for now. New
   `agent.model_catalog.provider_models(harness)`; the claude fetch uses
   the operator's existing OAuth, cached + off-thread so the UI never
   blocks.

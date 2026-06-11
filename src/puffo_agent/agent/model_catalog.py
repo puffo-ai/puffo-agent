@@ -1,12 +1,11 @@
 """Per-provider model catalogs.
 
-Mirrors the reference agent's ``runtime-catalog.ts``: each harness
-exposes selectable models = aliases (the CLI resolves these to the
-latest model in the family at runtime, so they never go stale) +
-concrete versions. The claude-code catalog refreshes its concrete
-list from the live, account-authoritative ``/v1/models`` — so new
-models (Fable 5, and whatever ships next) appear without a code change.
-Other harnesses are static for now.
+Each harness exposes selectable models = aliases (the CLI resolves
+these to the latest model in the family at runtime, so they never go
+stale) + concrete versions. claude-code refreshes its concrete list
+from the live, account-authoritative ``/v1/models`` — so new models
+appear without a code change; codex reads its local CLI cache; the rest
+are static.
 """
 
 from __future__ import annotations
