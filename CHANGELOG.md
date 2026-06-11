@@ -8,6 +8,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Live model picker (no more stale hardcoded list).** The agent-detail
+  model dropdown now lists the account's actual available models —
+  refreshed from the live Anthropic `/v1/models` for claude-code, so new
+  releases (Fable 5, and whatever ships next) appear without a code
+  change — plus the latest-tracking aliases (`opus` / `sonnet` /
+  `haiku` / `opusplan`). codex / gemini stay on a curated static list
+  for now. New `agent.model_catalog.provider_models(harness)`; the fetch
+  uses the operator's existing claude-code OAuth and is cached +
+  off-thread so the UI never blocks.
 - **Catch-up telemetry on every WS reconnect.** The agent logs its
   pending-message catch-up count on every reconnect — including zero,
   with the session id — so a silent reconnect is distinguishable from a
