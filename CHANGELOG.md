@@ -16,6 +16,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   summary posted back in the reply's own thread (on top of the
   per-invite confirmations); a threaded `y`/`n` still answers just that
   one. The invite prompt spells out both paths.
+- **Agent export no longer crashes on pre-1980 file timestamps.** A file
+  whose modification time predated 1980 (which ZIP can't represent)
+  failed the whole `.puffoagent` export with a `ValueError`; entries are
+  now stamped with the current time.
 
 ## [0.12.3] — 2026-06-11
 
