@@ -1,11 +1,24 @@
 """Unit tests for ``puffo_agent.agent.cli_bin``."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from puffo_agent.agent import cli_bin
+
+
+@pytest.fixture(autouse=True)
+def _isolate(tmp_path, monkeypatch):
+    # Isolate the on-disk cache + neutralize the (subprocess) real-PATH
+    # reconstruction so unit tests never fork PowerShell / a login shell.
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(cli_bin, "_real_path", lambda: "")
+    cli_bin._resolve_memcache.clear()
+    monkeypatch.setattr(cli_bin, "_real_path_cache", None)
+    yield
+    cli_bin._resolve_memcache.clear()
 
 
 def _make_exe(tmp_path: Path, name: str) -> Path:
@@ -19,7 +32,7 @@ def test_env_override_wins(tmp_path, monkeypatch):
     """``$PUFFO_CODEX_BIN`` beats PATH + bundle paths."""
     fake = _make_exe(tmp_path, "fake_codex")
     monkeypatch.setenv("PUFFO_CODEX_BIN", str(fake))
-    monkeypatch.setattr("shutil.which", lambda _name: "/some/other/codex")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/some/other/codex")
     assert cli_bin.resolve_codex_bin() == str(fake)
 
 
@@ -28,13 +41,13 @@ def test_env_override_ignored_when_file_missing(tmp_path, monkeypatch):
     falls through to PATH — protects against stale env vars."""
     bogus = tmp_path / "nope" / "codex"
     monkeypatch.setenv("PUFFO_CODEX_BIN", str(bogus))
-    monkeypatch.setattr("shutil.which", lambda _name: "/from/path/codex")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/from/path/codex")
     assert cli_bin.resolve_codex_bin() == "/from/path/codex"
 
 
 def test_path_used_when_env_unset(monkeypatch):
     monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
-    monkeypatch.setattr("shutil.which", lambda _name: "/usr/local/bin/codex")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/usr/local/bin/codex")
     assert cli_bin.resolve_codex_bin() == "/usr/local/bin/codex"
 
 
@@ -43,14 +56,14 @@ def test_bundle_path_hit_when_env_and_path_miss(tmp_path, monkeypatch):
     bundle path resolves the binary."""
     bundled = _make_exe(tmp_path, "codex_bundled")
     monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
-    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
     monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [bundled])
     assert cli_bin.resolve_codex_bin() == str(bundled)
 
 
 def test_returns_none_on_full_miss(monkeypatch):
     monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
-    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
     monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
     assert cli_bin.resolve_codex_bin() is None
 
@@ -61,7 +74,7 @@ def test_claude_resolver_uses_its_own_env(tmp_path, monkeypatch):
     fake_claude = _make_exe(tmp_path, "fake_claude")
     monkeypatch.setenv("PUFFO_CLAUDE_BIN", str(fake_claude))
     monkeypatch.setenv("PUFFO_CODEX_BIN", "/should/not/leak")
-    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
     monkeypatch.setattr(cli_bin, "_claude_bundle_paths", lambda: [])
     assert cli_bin.resolve_claude_bin() == str(fake_claude)
 
@@ -89,19 +102,19 @@ def test_hermes_env_override_wins(tmp_path, monkeypatch):
     """``$PUFFO_HERMES_BIN`` beats PATH + bundle paths."""
     fake = _make_exe(tmp_path, "fake_hermes")
     monkeypatch.setenv("PUFFO_HERMES_BIN", str(fake))
-    monkeypatch.setattr("shutil.which", lambda _name: "/some/other/hermes")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/some/other/hermes")
     assert cli_bin.resolve_hermes_bin() == str(fake)
 
 
 def test_hermes_path_used_when_env_unset(monkeypatch):
     monkeypatch.delenv("PUFFO_HERMES_BIN", raising=False)
-    monkeypatch.setattr("shutil.which", lambda _name: "/usr/local/bin/hermes")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/usr/local/bin/hermes")
     assert cli_bin.resolve_hermes_bin() == "/usr/local/bin/hermes"
 
 
 def test_hermes_returns_none_on_full_miss(monkeypatch):
     monkeypatch.delenv("PUFFO_HERMES_BIN", raising=False)
-    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
     monkeypatch.setattr(cli_bin, "_hermes_bundle_paths", lambda: [])
     assert cli_bin.resolve_hermes_bin() is None
 
@@ -114,9 +127,58 @@ def test_hermes_resolver_uses_its_own_env(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_HERMES_BIN", str(fake_hermes))
     monkeypatch.setenv("PUFFO_CODEX_BIN", "/should/not/leak")
     monkeypatch.setenv("PUFFO_CLAUDE_BIN", "/should/not/leak")
-    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
     monkeypatch.setattr(cli_bin, "_hermes_bundle_paths", lambda: [])
     assert cli_bin.resolve_hermes_bin() == str(fake_hermes)
+
+
+def test_real_path_used_when_process_path_misses(monkeypatch):
+    """When the process PATH misses, resolution retries against the
+    reconstructed real PATH."""
+    monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
+    monkeypatch.setattr(cli_bin, "_real_path", lambda: "/real/bin")
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name, path=None: "/real/bin/codex" if path == "/real/bin" else None,
+    )
+    assert cli_bin.resolve_codex_bin() == "/real/bin/codex"
+
+
+def test_resolved_path_survives_restart_via_disk_cache(tmp_path, monkeypatch):
+    """First resolve writes resolved_clis.json; a later resolve (fresh
+    process, PATH now missing) reads it back instead of re-searching."""
+    real = _make_exe(tmp_path, "codex_real")
+    monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+    monkeypatch.setattr("shutil.which", lambda name, path=None: str(real))
+    assert cli_bin.resolve_codex_bin() == str(real)
+
+    # Simulate a restart: in-memory cache gone, binary no longer on PATH.
+    cli_bin._resolve_memcache.clear()
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    assert cli_bin.resolve_codex_bin() == str(real)  # served from disk cache
+
+
+def test_disk_cache_rejected_when_binary_gone(tmp_path, monkeypatch):
+    """A cached path that no longer exists falls through to a fresh
+    lookup instead of returning a dead path."""
+    real = _make_exe(tmp_path, "codex_real")
+    monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+    monkeypatch.setattr("shutil.which", lambda name, path=None: str(real))
+    assert cli_bin.resolve_codex_bin() == str(real)
+
+    real.unlink()  # uninstalled
+    cli_bin._resolve_memcache.clear()
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    assert cli_bin.resolve_codex_bin() is None
+
+
+def test_merge_path_dedups_and_drops_empties():
+    sep = os.pathsep
+    merged = cli_bin._merge_path(f"/a{sep}/b", f"/b{sep}{sep}/c")
+    assert merged.split(sep) == ["/a", "/b", "/c"]
 
 
 @pytest.mark.parametrize("platform_value,want_substr", [
