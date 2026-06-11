@@ -28,7 +28,8 @@ def test_claude_code_default_and_aliases_offline(monkeypatch):
     opts = provider_models("claude-code", fetch=True)
     ids = _ids(opts)
     assert ids[0] == ""  # daemon default first
-    assert {"opus", "sonnet", "haiku"} <= set(ids)  # aliases
+    assert {"opus", "sonnet"} <= set(ids)  # aliases
+    assert "haiku" not in ids and "opusplan" not in ids  # blocked aliases
     # static fallback = the curated 4 (no Fable 5 in the fallback)
     assert {"claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
             "claude-sonnet-4-6"} <= set(ids)

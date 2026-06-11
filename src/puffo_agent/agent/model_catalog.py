@@ -37,18 +37,17 @@ _DAEMON_DEFAULT = ModelOption("", "(daemon default)")
 _CLAUDE_ALIASES: tuple[ModelOption, ...] = (
     ModelOption("opus", "opus — latest Opus", is_alias=True),
     ModelOption("sonnet", "sonnet — latest Sonnet", is_alias=True),
-    ModelOption("haiku", "haiku — latest Haiku", is_alias=True),
-    ModelOption("opusplan", "opusplan — plan w/ Opus, run w/ Sonnet", is_alias=True),
 )
 
-# Old dated point-releases that ``/v1/models`` still returns but that
-# only clutter the picker — filtered out of the live result.
+# Models filtered out of the live ``/v1/models`` result — old dated
+# point-releases + the haiku tier — to keep the picker to opus/sonnet.
 _BLOCKED_MODELS: frozenset[str] = frozenset({
     "claude-opus-4-5-20251101",
     "claude-opus-4-1-20250805",
     "claude-opus-4-20250514",
     "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-20250514",
+    "claude-haiku-4-5-20251001",
 })
 
 # Offline fallback for claude-code — only consulted when ``/v1/models``
