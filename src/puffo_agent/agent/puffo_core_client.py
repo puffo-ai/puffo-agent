@@ -481,10 +481,9 @@ class PuffoCoreMessageClient:
         # reply in that thread can be intercepted inside the daemon.
         # In-memory only — on restart we re-DM from the next poll.
         self._pending_invite_dms: dict[str, dict[str, Any]] = {}
-        # Agent-initiated leave requests awaiting operator y/n, keyed by
-        # the approval-DM envelope_id. ``_gate_left_spaces`` marks spaces
-        # left via that gate so the WS echo's ``_on_left_space`` skips its
-        # generic DM (the gate already reported in the approval thread).
+        # Agent-initiated leaves awaiting operator y/n, keyed by approval-DM
+        # envelope_id. ``_gate_left_spaces`` marks gate-approved space leaves
+        # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
 
@@ -2634,9 +2633,8 @@ class PuffoCoreMessageClient:
             channel_label = await self._resolve_channel_name(
                 space_id=space_id, channel_id=channel_id,
             )
-            # Public channels can't be left on their own (server rejects
-            # it). Tell the agent up front so it leaves the space instead,
-            # rather than asking the operator for an approval that 403s.
+            # Public channels can't be left on their own; tell the agent
+            # up front instead of asking the operator for a doomed approval.
             if await self._channel_is_public(space_id, channel_id):
                 return (
                     f"**{channel_label}** is a public channel, which can't "
@@ -2701,9 +2699,8 @@ class PuffoCoreMessageClient:
                 await self._sign_and_post_leave(
                     kind=kind, space_id=space_id, channel_id=channel_id,
                 )
-                # Suppress the WS echo's generic membership DM (space
-                # only — ``_on_left_channel`` doesn't DM); the line below
-                # is the authoritative report, in this thread.
+                # Suppress the WS echo's generic membership DM (space only);
+                # the in-thread confirm below is the authoritative report.
                 if kind == "leave_space":
                     self._gate_left_spaces.add(space_id)
                 confirm = f"Left {target}. ✓"
