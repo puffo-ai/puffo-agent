@@ -432,8 +432,6 @@ class PuffoCoreMessageClient:
         # Operator's slug — used to DM them on non-auto-acceptable
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
-        # Hidden agent.yml flag: auto-accept non-operator space invites,
-        # then DM the operator a report.
         self.auto_accept_space_invitations = bool(auto_accept_space_invitations)
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
@@ -1887,10 +1885,8 @@ class PuffoCoreMessageClient:
             return
 
         is_from_operator = await self._inviter_is_operator(inviter_slug)
-        # Auto-accept when the operator invited us, or — space invites
-        # only — when the hidden auto_accept_space_invitations flag is on.
-        # The operator case is silent (they know); the flag case DMs a
-        # report afterwards (they didn't initiate it).
+        # Flag-driven auto-accept covers space invites from non-operators;
+        # unlike the (silent) operator path it DMs a report afterwards.
         flag_accept = (
             kind == "invite_to_space" and self.auto_accept_space_invitations
         )
