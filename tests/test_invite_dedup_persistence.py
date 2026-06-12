@@ -38,6 +38,7 @@ def _make_client(operator_slug: str = "op-1") -> tuple[PuffoCoreMessageClient, l
     client.operator_slug = operator_slug
     client._processed_invite_ids = set()
     client._pending_invite_dms = {}
+    client.auto_accept_space_invitations = False
     client._operator_root_pubkey = b"op-root-pk"
     client._inviter_root_cache = {}
     client._invites_response: dict = {"invites": []}

@@ -948,6 +948,9 @@ class PuffoCoreConfig:
     # human attention is needed. Cryptographic ownership is still
     # carried by ``identity_cert.declared_operator_public_key``.
     operator_slug: str = ""
+    # Hidden knob (no UI, agent.yml only): when true, space invites from
+    # non-operators are auto-accepted, then the operator is DM'd a report.
+    auto_accept_space_invitations: bool = False
 
     def is_configured(self) -> bool:
         return bool(self.server_url and self.slug and self.device_id and self.space_id)
@@ -1071,6 +1074,9 @@ class AgentConfig:
                 device_id=pc.get("device_id", ""),
                 space_id=pc.get("space_id", ""),
                 operator_slug=pc.get("operator_slug", ""),
+                auto_accept_space_invitations=bool(
+                    pc.get("auto_accept_space_invitations", False)
+                ),
             ),
             runtime=RuntimeConfig(
                 kind=kind,

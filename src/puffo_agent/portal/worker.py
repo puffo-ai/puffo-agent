@@ -372,6 +372,7 @@ def _build_puffo_core_client(
         device_id=pc.device_id,
         space_id=pc.space_id,
         operator_slug=pc.operator_slug,
+        auto_accept_space_invitations=pc.auto_accept_space_invitations,
         keystore=ks,
         http_client=http,
         message_store=ms,

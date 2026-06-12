@@ -418,6 +418,7 @@ class PuffoCoreMessageClient:
         http_client: PuffoCoreHttpClient,
         message_store: MessageStore,
         operator_slug: str = "",
+        auto_accept_space_invitations: bool = False,
         workspace: str = "",
         max_inline_chars: int = 4000,
         segment_chars: int = 2000,
@@ -431,6 +432,9 @@ class PuffoCoreMessageClient:
         # Operator's slug — used to DM them on non-auto-acceptable
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
+        # Hidden agent.yml flag: auto-accept non-operator space invites,
+        # then DM the operator a report.
+        self.auto_accept_space_invitations = bool(auto_accept_space_invitations)
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
         self.workspace = workspace
@@ -1883,20 +1887,34 @@ class PuffoCoreMessageClient:
             return
 
         is_from_operator = await self._inviter_is_operator(inviter_slug)
-        if is_from_operator:
+        # Auto-accept when the operator invited us, or — space invites
+        # only — when the hidden auto_accept_space_invitations flag is on.
+        # The operator case is silent (they know); the flag case DMs a
+        # report afterwards (they didn't initiate it).
+        flag_accept = (
+            kind == "invite_to_space" and self.auto_accept_space_invitations
+        )
+        if is_from_operator or flag_accept:
             try:
                 await self._accept_invite(
                     kind, invitation_event_id, space_id, channel_id,
                 )
                 self._log.info(
-                    "auto-accepted %s from operator %s (event_id=%s)",
+                    "auto-accepted %s from %s (event_id=%s)",
                     kind, inviter_slug, invitation_event_id,
                 )
                 self._processed_invite_ids.add(invitation_event_id)
             except Exception:
                 self._log.exception(
-                    "failed to auto-accept %s from operator %s (event_id=%s)",
+                    "failed to auto-accept %s from %s (event_id=%s)",
                     kind, inviter_slug, invitation_event_id,
+                )
+                return
+            if not is_from_operator:
+                await self._report_auto_accepted_space_invite(
+                    inviter_slug=inviter_slug,
+                    space_id=space_id,
+                    space_name=space_name,
                 )
         else:
             try:
@@ -1913,6 +1931,31 @@ class PuffoCoreMessageClient:
                 # Mark processed even on DM failure — the operator
                 # still sees the invite in their chat client.
                 self._processed_invite_ids.add(invitation_event_id)
+
+    async def _report_auto_accepted_space_invite(
+        self, *, inviter_slug: str, space_id: str, space_name: str | None,
+    ) -> None:
+        """Tell the operator we auto-accepted a non-operator space invite
+        on their behalf (the auto_accept_space_invitations flag is on).
+        Best-effort."""
+        if not self.operator_slug:
+            return
+        space_label = f"**{space_name}**({space_id})" if space_name else space_id
+        inviter_display = await self._fetch_display_name(inviter_slug)
+        inviter_label = (
+            f"**{inviter_display}**(@{inviter_slug})"
+            if inviter_display else f"@{inviter_slug}"
+        )
+        text = (
+            f"Auto-accepted an invite to space {space_label} from "
+            f"{inviter_label} (auto-accept-space-invitations is on)."
+        )
+        try:
+            await self._send_dm(self.operator_slug, text, root_id="")
+        except Exception:
+            self._log.exception(
+                "failed to report auto-accepted space invite to operator",
+            )
 
     async def _inviter_is_operator(self, inviter_slug: str) -> bool:
         """True iff ``inviter_slug``'s root pubkey matches our
