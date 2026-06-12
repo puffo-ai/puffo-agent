@@ -88,3 +88,21 @@ class PuffoRpcClient:
         return await self._post(
             "sync-mcp", {"template_id": template_id},
         )
+
+    async def request_leave(
+        self,
+        *,
+        kind: str,
+        space_id: str,
+        channel_id: str = "",
+        reason: str = "",
+    ) -> str:
+        return await self._post(
+            "leave-request",
+            {
+                "kind": kind,
+                "space_id": space_id,
+                "channel_id": channel_id,
+                "reason": reason,
+            },
+        )

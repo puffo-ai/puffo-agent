@@ -825,6 +825,7 @@ class Worker:
             harness=harness,
             keystore=client.keystore,
             http_client=client.http,
+            message_client=client,
         )
 
     async def stop(self) -> None:

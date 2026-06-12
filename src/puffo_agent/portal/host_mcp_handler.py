@@ -38,6 +38,9 @@ class HostMcpContext:
     harness: str
     keystore: KeyStore
     http_client: PuffoCoreHttpClient
+    # The worker's live PuffoCoreMessageClient, for tools that drive
+    # daemon-side state (leave requests). None until warm().
+    message_client: Any = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -453,4 +456,34 @@ async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
         f"Synced host's {template_id!r} entry into your "
         f"~/.claude.json. Call refresh() so claude respawns and "
         f"loads it."
+    )
+
+
+async def request_leave(
+    ctx: HostMcpContext,
+    *,
+    kind: str,
+    space_id: str,
+    channel_id: str,
+    reason: str,
+) -> str:
+    """Agent asked to leave a space/channel — hand off to the daemon's
+    message client, which DMs the operator for y/n and signs the leave
+    only on approval. ``kind`` is ``leave_space`` / ``leave_channel``."""
+    client = ctx.message_client
+    if client is None:
+        raise RuntimeError(
+            "agent isn't fully warm yet — try again in a moment"
+        )
+    if kind not in ("leave_space", "leave_channel"):
+        raise RuntimeError(f"unknown leave kind {kind!r}")
+    if not space_id:
+        raise RuntimeError("space_id is required")
+    if kind == "leave_channel" and not channel_id:
+        raise RuntimeError("channel_id is required for leave_channel")
+    return await client.request_leave_approval(
+        kind=kind,
+        space_id=space_id,
+        channel_id=channel_id,
+        reason=reason or "",
     )

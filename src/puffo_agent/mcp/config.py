@@ -47,6 +47,8 @@ PUFFO_CORE_TOOL_NAMES = (
     "list_mcp_servers",
     "install_host_mcp",
     "sync_host_mcp",
+    "leave_space",
+    "leave_channel",
     "refresh",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(

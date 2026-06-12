@@ -54,6 +54,8 @@ def _make_client(
     client._space_members = {}
     client._processed_invite_ids = set()
     client._pending_invite_dms = {}
+    client._pending_leave_dms = {}
+    client._gate_left_spaces = set()
 
     # _evict_*_caches now also drops persistent ``channel_space_map``
     # rows so the MCP subprocess's send_message tool doesn't keep

@@ -190,6 +190,12 @@ below is the authoritative reference.
 - `sync_host_mcp(template_id)` — copy the operator's populated entry
   from host into your own `.claude.json`. Pair with `refresh()`.
 
+**Membership:**
+- `leave_space(space_id, reason="")` / `leave_channel(channel_id,
+  reason="")` — *request* to leave; does NOT leave immediately. Your
+  operator gets a DM and replies `y` (you leave) or `n` (you stay). Use
+  sparingly, and give an honest `reason`.
+
 Use write tools with intent — proactive messages surprise people.
 Read tools are cheap.
 

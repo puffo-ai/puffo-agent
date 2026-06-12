@@ -62,6 +62,47 @@ def format_invite_error(exc: Exception, verb: str) -> str:
     return f"{prefix}: unexpected error. Please try again."
 
 
+def format_leave_error(exc: Exception) -> str:
+    """Translate a ``leave_space``/``leave_channel`` failure into copy
+    safe to surface in the operator-DM confirm. The two server-enforced
+    rejections worth naming: a space owner can't leave directly, and a
+    public channel can't be left without leaving the whole space."""
+    prefix = "Couldn't leave"
+    if isinstance(exc, HttpError):
+        error_code = ""
+        message_text = ""
+        try:
+            parsed = json.loads(exc.body)
+            if isinstance(parsed, dict):
+                error_code = str(parsed.get("error") or "")
+                message_text = str(parsed.get("message") or "")
+        except (ValueError, TypeError):
+            pass
+        lower_msg = message_text.lower()
+        if "owner" in lower_msg:
+            return (
+                f"{prefix}: I'm the space owner, so I can't leave directly — "
+                "ownership has to be transferred first."
+            )
+        if "public" in lower_msg:
+            return (
+                f"{prefix}: that's a public channel — I can only leave the "
+                "whole space, not just the channel."
+            )
+        if exc.status == 403 or error_code == "FORBIDDEN":
+            return f"{prefix}: the server won't let me leave this one."
+        if exc.status == 409 or error_code == "CONFLICT":
+            return f"{prefix}: looks like I'm already out."
+        if 400 <= exc.status < 500:
+            return f"{prefix}: please try again."
+        if exc.status >= 500:
+            return (
+                f"{prefix}: Puffo server hit an issue. "
+                "Please try again in a moment."
+            )
+    return f"{prefix}: unexpected error. Please try again."
+
+
 def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
     """Bilingual (zh+en) operator DM for an OAuth-expired agent: run
     ``claude auth login`` and just send a message (a new message

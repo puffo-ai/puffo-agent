@@ -93,6 +93,15 @@ async def sync_host_mcp_route(request: web.Request) -> web.Response:
     )
 
 
+async def leave_request_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/leave-request —
+    ``{kind, space_id, channel_id, reason}``."""
+    return await _dispatch(
+        request, host_mcp_handler.request_leave,
+        body_keys=("kind", "space_id", "channel_id", "reason"),
+    )
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -102,6 +111,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/sync-mcp",
         sync_host_mcp_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/leave-request",
+        leave_request_route,
     )
     return app
 
