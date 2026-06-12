@@ -44,6 +44,10 @@ def _make_client(operator_slug: str = "op-1") -> PuffoCoreMessageClient:
     async def _stub_resolve_channel(*, space_id, channel_id):
         return {"ch_1": "general"}.get(channel_id, channel_id)
 
+    async def _stub_channel_is_public(space_id, channel_id):
+        return False
+
+    client._channel_is_public = _stub_channel_is_public  # type: ignore[assignment]
     client._sign_and_post_leave = _stub_sign_post  # type: ignore[assignment]
     client._send_dm = _stub_send_dm  # type: ignore[assignment]
     client._resolve_space_name = _stub_resolve_space  # type: ignore[assignment]
@@ -85,6 +89,24 @@ async def test_request_leave_channel_resolves_name_and_omits_empty_reason():
     text = client._sent_dms[0]["text"]
     assert "**general**" in text
     assert "Reason:" not in text
+
+
+@pytest.mark.asyncio
+async def test_request_leave_public_channel_short_circuits_to_space():
+    client = _make_client()
+
+    async def _public(space_id, channel_id):
+        return True
+
+    client._channel_is_public = _public  # type: ignore[assignment]
+    msg = await client.request_leave_approval(
+        kind="leave_channel", space_id="sp_1", channel_id="ch_1", reason="x",
+    )
+    # Agent is told to leave the space; operator is NOT bothered.
+    assert "public channel" in msg.lower()
+    assert "leave_space" in msg
+    assert client._sent_dms == []
+    assert client._pending_leave_dms == {}
 
 
 @pytest.mark.asyncio

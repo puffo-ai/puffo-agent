@@ -2634,6 +2634,15 @@ class PuffoCoreMessageClient:
             channel_label = await self._resolve_channel_name(
                 space_id=space_id, channel_id=channel_id,
             )
+            # Public channels can't be left on their own (server rejects
+            # it). Tell the agent up front so it leaves the space instead,
+            # rather than asking the operator for an approval that 403s.
+            if await self._channel_is_public(space_id, channel_id):
+                return (
+                    f"**{channel_label}** is a public channel, which can't "
+                    f"be left on its own. To leave it, request to leave the "
+                    f"whole space instead with `leave_space`."
+                )
             target = (
                 f"channel **{channel_label}**({channel_id}) in space "
                 f"**{space_label}**({space_id})"
@@ -2734,6 +2743,26 @@ class PuffoCoreMessageClient:
             )
             return f"channel {channel_label} in space {space_label}"
         return f"space {space_label}"
+
+    async def _channel_is_public(
+        self, space_id: str, channel_id: str,
+    ) -> bool | None:
+        """Whether ``channel_id`` is public (and so can't be left on its
+        own). ``True``/``False`` from ``GET /spaces/<id>/channels``;
+        ``None`` when undeterminable, so callers fall through to the
+        normal approval path rather than blocking on a flake."""
+        if not space_id or not channel_id:
+            return None
+        try:
+            data = await self.http.get(f"/spaces/{space_id}/channels")
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        for entry in data.get("channels") or []:
+            if (entry.get("channel_id") or "") == channel_id:
+                return bool(entry.get("is_public"))
+        return None
 
     async def _sign_and_post_leave(
         self, *, kind: str, space_id: str, channel_id: str,
