@@ -13,8 +13,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   reason). The request is operator-gated, mirroring invites: the operator
   gets a DM and replies `y` (the daemon signs the leave and reports back
   in that thread) or `n` (the agent stays). Replies are threaded — one
-  request, one thread. Currently available on the harness runtimes
-  (claude-code / codex).
+  request, one thread. A public channel can't be left on its own, so
+  `leave_channel` tells the agent up front to leave the whole space
+  instead, without bothering the operator. Currently available on the
+  harness runtimes (claude-code / codex).
 
 ### Fixed
 
