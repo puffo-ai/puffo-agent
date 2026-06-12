@@ -15,8 +15,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   in that thread) or `n` (the agent stays). Replies are threaded — one
   request, one thread. A public channel can't be left on its own, so
   `leave_channel` tells the agent up front to leave the whole space
-  instead, without bothering the operator. Currently available on the
-  harness runtimes (claude-code / codex).
+  instead, without bothering the operator.
 
 ### Fixed
 

@@ -85,6 +85,9 @@ class PuffoCoreToolsConfig:
     # None when PUFFO_RPC_URL isn't set; install/sync tools surface
     # a clear error rather than touching operator files in-process.
     rpc_client: Optional[PuffoRpcClient] = None
+    # Set only on the in-process (ws-local) path, where tools run inside
+    # the daemon and drive the message client directly instead of via RPC.
+    message_client: Any = None
 
 
 async def _fetch_device_keys(
@@ -1160,14 +1163,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         Note: a space owner can't leave directly, and the request only
         goes through while you're a member.
         """
+        sp = space_id.strip()
+        if not sp:
+            raise RuntimeError("space_id is required")
+        # ws-local runs in-process → drive the client directly; harness
+        # runtimes go through the daemon's rpc_service.
+        if cfg.message_client is not None:
+            return await cfg.message_client.request_leave_approval(
+                kind="leave_space", space_id=sp, channel_id="", reason=reason,
+            )
         if cfg.rpc_client is None:
             raise RuntimeError(
                 "leave_space unavailable — PUFFO_RPC_URL not set on this "
                 "MCP runtime, so the puffo-agent daemon isn't reachable."
             )
-        sp = space_id.strip()
-        if not sp:
-            raise RuntimeError("space_id is required")
         return await cfg.rpc_client.request_leave(
             kind="leave_space", space_id=sp, channel_id="", reason=reason,
         )
@@ -1187,16 +1196,21 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         Note: public channels can't be left on their own — to leave one
         you'd leave the whole space (``leave_space``).
         """
+        ch = channel_id.strip()
+        if not ch:
+            raise RuntimeError("channel_id is required")
+        space_id = await _resolve_channel_space(cfg, ch)
+        if cfg.message_client is not None:
+            return await cfg.message_client.request_leave_approval(
+                kind="leave_channel", space_id=space_id, channel_id=ch,
+                reason=reason,
+            )
         if cfg.rpc_client is None:
             raise RuntimeError(
                 "leave_channel unavailable — PUFFO_RPC_URL not set on "
                 "this MCP runtime, so the puffo-agent daemon isn't "
                 "reachable."
             )
-        ch = channel_id.strip()
-        if not ch:
-            raise RuntimeError("channel_id is required")
-        space_id = await _resolve_channel_space(cfg, ch)
         return await cfg.rpc_client.request_leave(
             kind="leave_channel", space_id=space_id, channel_id=ch,
             reason=reason,

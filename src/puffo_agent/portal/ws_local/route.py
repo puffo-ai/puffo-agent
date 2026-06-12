@@ -43,6 +43,7 @@ def _build_tool_dispatch(point: AttachPoint):
         data_client=InProcessDataClient(client.store, client),
         space_id=getattr(client, "space_id", None),
         workspace=getattr(client, "workspace", None),
+        message_client=client,
     )
     return _build_dispatch(cfg)
 
