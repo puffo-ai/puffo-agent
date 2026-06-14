@@ -798,3 +798,53 @@ while True:
     # Session file should now hold the fresh cid the spawn-path created.
     persisted = json.loads(session_file.read_text(encoding="utf-8"))
     assert persisted.get("conversation_id") == "conv_recovered"
+
+
+def test_puf291_bootstrap_raises_when_thread_start_returns_no_id(tmp_path):
+    """PUF-291 polish (Solution QA gap #2/#4 combined): the post-call
+    invariant of ``_ensure_running`` (proc alive AND cid non-empty) is
+    only sound if ``_bootstrap_session`` reliably surfaces a malformed
+    ``thread/start`` response as an exception. Guard the chain so a
+    future regression that drops the "no thread id" check would fail
+    here loudly instead of letting the session limp along with
+    ``_conversation_id=""`` (the exact Shan-Shadow wedge).
+    """
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+assert msg["method"] == "thread/start"
+# Reply with a structurally valid result that nonetheless carries no
+# thread id under any of the keys _extract_thread_id walks.
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"createdAt": "2026-06-13T00:00:00Z"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    cs = CodexSession(
+        agent_id="puf291-bootstrap-no-id",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        try:
+            await cs.warm("sys")
+            return None
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            await cs.aclose()
+
+    err = asyncio.run(_run())
+    assert err is not None, "warm should propagate the bootstrap failure"
+    assert "no thread id" in err, err
+    # _spawn's try/except must have torn the proc back down so a
+    # subsequent _ensure_running goes through the cold-start path
+    # instead of seeing a half-initialised live proc.
+    assert cs._proc is None
+    assert cs._conversation_id == ""

@@ -505,6 +505,15 @@ class CodexSession:
         # ``thread/start`` returning no id; see ``:_bootstrap_session``).
         # Post-call invariant: proc alive AND ``_conversation_id`` non-empty.
         if proc_alive:
+            # Log the load-bearing diagnostic so Shan-Shadow-class
+            # incidents are visible from daemon logs alone, without
+            # needing a live repro.
+            logger.info(
+                "agent %s: codex session has alive proc but empty "
+                "conversation_id; tearing down + respawning to recover "
+                "(PUF-291)",
+                self.agent_id,
+            )
             await self._teardown_locked()
         await self._spawn()
 
