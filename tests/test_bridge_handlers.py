@@ -501,6 +501,7 @@ async def test_puf294_rename_rewrites_profile_md_and_drops_reload_flag():
     assert body.count("Helper Bot") == 3
     assert flag_path.exists()
     flag_body = json.loads(flag_path.read_text(encoding="utf-8"))
+    assert flag_body.get("version") == 1
     assert "requested_at" in flag_body
     assert flag_body.get("reason") == "agent rename"
 
@@ -637,6 +638,91 @@ async def test_puf294_rename_doesnt_overreach_other_fields():
     assert "Preserve Bot — a senior backend engineer" in body
     assert "## Style notes" in body
     assert "force-pushes to main" in body
+
+
+async def test_puf294_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
+    # PR #82 polish: the rename PATCH must still return 200 even when
+    # the reload.flag write hits a transient OSError (read-only
+    # workspace / disk-full / cross-uid ``.puffo-agent/``). The agent
+    # still picks up the new name on the worker's next restart;
+    # ``logger.warning`` carries the diagnostic. Lock the contract so a
+    # future regression that bubbles the OSError fails here loudly.
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "ro-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "ro-bot"
+    (agent_dir / "profile.md").write_text(
+        "You are ro-bot.\n", encoding="utf-8",
+    )
+
+    # Patch ``Path.write_text`` so the reload.flag write blows up, but
+    # the profile.md rewrite (which uses the same method) still
+    # succeeds. We branch by the path's basename so only the flag is
+    # affected.
+    real_write_text = Path.write_text
+    flag_calls = {"n": 0}
+
+    def fake_write_text(self, *args, **kwargs):
+        if self.name == "reload.flag":
+            flag_calls["n"] += 1
+            raise PermissionError("simulated readonly workspace")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fake_write_text)
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        r = await _rename_agent(c, user, "ro-bot", "Resilient Bot")
+        # Rename still succeeds even though the flag write failed.
+        assert r.status == 200, await r.text()
+    assert flag_calls["n"] == 1, "expected one flag-write attempt"
+    # profile.md still landed (proof the OSError was scoped to the flag).
+    assert "Resilient Bot" in (agent_dir / "profile.md").read_text(encoding="utf-8")
+
+
+async def test_puf294_substring_replace_is_intentional_design():
+    # PR #82 polish: pin the substring-replace contract — the known
+    # "Bob → Robert inside Bobcat rewrites to Robertcat" limit is
+    # *intentional* (so CJK names work without word boundaries). A
+    # future "fix" that adds ``\b`` guards would break the CJK cohort;
+    # this test fails loudly if someone tries.
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "footgun-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "footgun-bot"
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        # Set initial name to "Bob".
+        r = await _rename_agent(c, user, "footgun-bot", "Bob")
+        assert r.status == 200
+        (agent_dir / "profile.md").write_text(
+            "You are Bob, who watches Bobcats and writes about Bob's cabin.\n",
+            encoding="utf-8",
+        )
+        r = await _rename_agent(c, user, "footgun-bot", "Robert")
+        assert r.status == 200, await r.text()
+
+    body = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    # All Bob occurrences flipped — including the Bobcat one. The
+    # operator can clean this up by editing profile.md, which is the
+    # documented tradeoff for the CJK cohort working at all.
+    assert body == (
+        "You are Robert, who watches Robertcats and writes about Robert's cabin.\n"
+    )
 
 
 # Unit-level coverage on the ``rewrite_profile_name`` helper lives in

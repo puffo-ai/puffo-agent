@@ -758,8 +758,14 @@ async def update_profile(request: web.Request) -> web.Response:
     #      ``_reload_from_disk`` → ``rebuild_agent_claude_md`` (and
     #      the codex + gemini equivalents) — without operator DM.
     #
-    # Without (2) the new profile.md only takes effect on the next
-    # worker restart, which defeats the workaround-elimination goal.
+    # Concurrency note: this fold is NOT wrapped in a per-agent lock.
+    # Quick-succession renames (Bob → Bobcat → Wolverine within
+    # seconds) could interleave: profile.md's intermediate state may
+    # contain both names in different spots and reload.flag fires
+    # twice. Tolerated because: (i) UI debounces rename submits,
+    # (ii) the worker's reload picks up whatever profile.md eventually
+    # settles to, (iii) the cost of a lock is not justified for the
+    # observed rename cadence.
     if (
         cfg.display_name != old_display_name
         and old_display_name
@@ -771,14 +777,22 @@ async def update_profile(request: web.Request) -> web.Response:
         flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
         try:
             flag_path.parent.mkdir(parents=True, exist_ok=True)
+            # ``version`` versions the schema so a future worker that
+            # dispatches on additional fields (affected_files,
+            # triggered_by, etc) can fall back when reading old flags.
             flag_path.write_text(
                 json.dumps({
+                    "version": 1,
                     "requested_at": int(datetime.now(tz=timezone.utc).timestamp()),
                     "reason": "agent rename",
                 }) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:
+            # Read-only workspace / disk-full / cross-uid ``.puffo-agent/``:
+            # the rename's agent.yml + profile.md writes already
+            # landed, so the worker picks up the new name on its next
+            # restart even without the flag. Don't fail the PATCH.
             logger.warning(
                 "bridge: failed to write reload.flag for agent=%s after "
                 "rename: %s (agent will pick up new name on next restart)",
