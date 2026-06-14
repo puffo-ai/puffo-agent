@@ -1100,6 +1100,38 @@ def rebuild_agent_claude_md(
     return claude_md
 
 
+def rewrite_profile_name(
+    profile_path: Path, old_name: str, new_name: str,
+) -> int:
+    """Replace literal occurrences of ``old_name`` with ``new_name`` in
+    the agent's ``profile.md``. Returns the number of replacements.
+
+    PUF-294 (FB-294): when the operator renames an agent the daemon
+    must update the prose source of truth for the next CLAUDE.md /
+    AGENTS.md / GEMINI.md assembly. Literal substring (NOT regex word
+    boundaries) keeps family-ops CJK display names working — ``\\b``
+    doesn't fire between two CJK characters, so a boundary-anchored
+    pattern would silently miss the common case. The cost is that
+    "Bob → Robert" inside "Bobcat" rewrites to "Robertcat"; operators
+    can clean that up in profile.md after the rename if it surfaces.
+
+    No-op + returns 0 when: old_name == new_name, either name is empty,
+    profile.md doesn't exist, or the file simply doesn't reference
+    old_name.
+    """
+    if not old_name or not new_name or old_name == new_name:
+        return 0
+    try:
+        text = profile_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    count = text.count(old_name)
+    if count == 0:
+        return 0
+    profile_path.write_text(text.replace(old_name, new_name), encoding="utf-8")
+    return count
+
+
 # First line of the default shared primer. Used to identify
 # previously-generated managed CLAUDE.md files so the worker can
 # safely remove stale managed copies without touching agent-authored

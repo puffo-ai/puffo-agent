@@ -22,6 +22,7 @@ from aiohttp import web
 
 from ...crypto.http_auth import VerifyError, is_timestamp_fresh, verify_request
 from ...crypto.encoding import base64url_decode
+from ...agent.shared_content import rewrite_profile_name
 from ..state import (
     AgentConfig,
     PuffoCoreConfig,
@@ -633,6 +634,10 @@ async def update_profile(request: web.Request) -> web.Response:
         return _bad("body must be a JSON object")
 
     cfg = AgentConfig.load(agent_id)
+    # Snapshot pre-edit display_name so we can detect a rename
+    # post-save and feed the old → new pair to the profile.md rewrite
+    # (PUF-294 / FB-294).
+    old_display_name = cfg.display_name
     new_display_name = payload.get("display_name")
     avatar_b64 = payload.get("avatar_bytes_b64")
     new_role = payload.get("role")
@@ -740,6 +745,50 @@ async def update_profile(request: web.Request) -> web.Response:
         "(set)" if cfg.avatar_url else "(empty)",
         cfg.role_short,
     )
+
+    # PUF-294 (FB-294): when display_name actually changed, propagate
+    # to the agent's own context. The name lives in operator-written
+    # ``profile.md`` prose — CLAUDE.md / AGENTS.md / GEMINI.md are
+    # assembled from it on the worker's next reload. Two-step fold:
+    #
+    #   1. Rewrite literal occurrences in profile.md so the next
+    #      assembly carries the new name.
+    #   2. Drop ``<workspace>/.puffo-agent/reload.flag`` — the worker
+    #      detects this on the next message and calls
+    #      ``_reload_from_disk`` → ``rebuild_agent_claude_md`` (and
+    #      the codex + gemini equivalents) — without operator DM.
+    #
+    # Without (2) the new profile.md only takes effect on the next
+    # worker restart, which defeats the workaround-elimination goal.
+    if (
+        cfg.display_name != old_display_name
+        and old_display_name
+        and cfg.display_name
+    ):
+        replacements = rewrite_profile_name(
+            cfg.resolve_profile_path(), old_display_name, cfg.display_name,
+        )
+        flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            flag_path.write_text(
+                json.dumps({
+                    "requested_at": int(datetime.now(tz=timezone.utc).timestamp()),
+                    "reason": "agent rename",
+                }) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "bridge: failed to write reload.flag for agent=%s after "
+                "rename: %s (agent will pick up new name on next restart)",
+                agent_id, exc,
+            )
+        logger.info(
+            "bridge: rename agent=%s %r → %r — profile.md replacements=%d, "
+            "reload.flag written",
+            agent_id, old_display_name, cfg.display_name, replacements,
+        )
     body: dict[str, Any] = {
         "agent_id": agent_id,
         "display_name": cfg.display_name,

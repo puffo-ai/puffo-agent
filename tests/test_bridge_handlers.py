@@ -450,3 +450,195 @@ async def test_update_profile_caps_post_strip():
         h["content-type"] = "application/json"
         r = await c.patch("/v1/agents/soul-bot/profile", data=body, headers=h)
         assert r.status == 200, await r.text()
+
+
+# ────────────────────────────────────────────────────────────────────
+# PUF-294 (FB-294): rename folds into PATCH /v1/agents/{id}/profile —
+# profile.md is rewritten with the new display_name and a reload.flag
+# is dropped so the worker re-assembles CLAUDE.md / AGENTS.md /
+# GEMINI.md on the next message (no operator-DM workaround).
+# ────────────────────────────────────────────────────────────────────
+
+
+async def _rename_agent(c, user, agent_id: str, new_name: str):
+    body = json.dumps({"display_name": new_name}).encode("utf-8")
+    path = f"/v1/agents/{agent_id}/profile"
+    h = signed_headers(user, "PATCH", path, body); h.update(_HOST)
+    h["content-type"] = "application/json"
+    return await c.patch(path, data=body, headers=h)
+
+
+async def test_puf294_rename_rewrites_profile_md_and_drops_reload_flag():
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "rename-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "rename-bot"
+    # The default display_name from write_test_agent is the agent id;
+    # seed profile.md with references that look operator-written.
+    (agent_dir / "profile.md").write_text(
+        "# Your role\n\n"
+        "You are rename-bot, our helpful assistant. rename-bot writes "
+        "docs and pings rename-bot's teammates when stuck.\n",
+        encoding="utf-8",
+    )
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+    assert not flag_path.exists()
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        r = await _rename_agent(c, user, "rename-bot", "Helper Bot")
+        assert r.status == 200, await r.text()
+
+    body = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    assert "rename-bot" not in body
+    assert body.count("Helper Bot") == 3
+    assert flag_path.exists()
+    flag_body = json.loads(flag_path.read_text(encoding="utf-8"))
+    assert "requested_at" in flag_body
+    assert flag_body.get("reason") == "agent rename"
+
+
+async def test_puf294_unchanged_display_name_is_a_noop():
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "stay-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "stay-bot"
+    (agent_dir / "profile.md").write_text(
+        "# Your role\n\nYou are stay-bot.\n", encoding="utf-8",
+    )
+    profile_mtime_before = (agent_dir / "profile.md").stat().st_mtime_ns
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        # PATCH with the SAME display_name → no rename → no rewrite +
+        # no reload.flag.
+        r = await _rename_agent(c, user, "stay-bot", "stay-bot")
+        assert r.status == 200, await r.text()
+
+    assert (agent_dir / "profile.md").stat().st_mtime_ns == profile_mtime_before
+    assert not flag_path.exists()
+
+
+async def test_puf294_rename_drops_reload_flag_even_when_profile_md_has_no_old_name():
+    # The agent's profile.md doesn't reference the old name at all —
+    # the rewrite is a no-op (0 replacements) but the reload.flag still
+    # fires because agent.yml's display_name changed and we want the
+    # next reload to pick up the new state.
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "nameless-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "nameless-bot"
+    (agent_dir / "profile.md").write_text(
+        "# Your role\n\nGeneric helpful agent. No name embedded.\n",
+        encoding="utf-8",
+    )
+    profile_before = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        r = await _rename_agent(c, user, "nameless-bot", "Renamed Bot")
+        assert r.status == 200, await r.text()
+
+    # profile.md content unchanged (the old name wasn't there to find)
+    assert (agent_dir / "profile.md").read_text(encoding="utf-8") == profile_before
+    # reload.flag still dropped so the next reload picks up agent.yml's
+    # new display_name in case other surfaces (banner, agent list, etc)
+    # read it.
+    assert flag_path.exists()
+
+
+async def test_puf294_rename_handles_cjk_display_names():
+    # Family-ops fleet uses CJK names; rewrite must work without \b
+    # word boundaries (which don't fire between CJK characters).
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "cjk-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "cjk-bot"
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        # Initial rename so the bot is set up with the CJK old name.
+        r = await _rename_agent(c, user, "cjk-bot", "田中")
+        assert r.status == 200
+        (agent_dir / "profile.md").write_text(
+            "# 角色\n\n你是田中，家庭群组里的助手。田中负责整理大家的安排。\n",
+            encoding="utf-8",
+        )
+        # Now rename to the new CJK name.
+        r = await _rename_agent(c, user, "cjk-bot", "山田")
+        assert r.status == 200, await r.text()
+
+    body = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    assert "田中" not in body
+    assert body.count("山田") == 2
+
+
+async def test_puf294_rename_doesnt_overreach_other_fields():
+    # Renaming via PATCH should NOT clobber operator-edited
+    # profile.md sections that don't reference the old name. Regression
+    # guard: the rewrite is a literal substring replace, not a profile
+    # regeneration.
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "preserve-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "preserve-bot"
+    operator_prose = (
+        "# Your role\n\n"
+        "You are preserve-bot — a senior backend engineer who loves "
+        "rust, prefers small PRs, and never force-pushes to main.\n\n"
+        "## Style notes\n\nReply in clipped sentences. Avoid emoji.\n"
+    )
+    (agent_dir / "profile.md").write_text(operator_prose, encoding="utf-8")
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        r = await _rename_agent(c, user, "preserve-bot", "Preserve Bot")
+        assert r.status == 200, await r.text()
+
+    body = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    # Name flipped; everything else verbatim.
+    assert "preserve-bot" not in body
+    assert "Preserve Bot — a senior backend engineer" in body
+    assert "## Style notes" in body
+    assert "force-pushes to main" in body
+
+
+# Unit-level coverage on the ``rewrite_profile_name`` helper lives in
+# ``tests/test_rewrite_profile_name.py`` — sync tests don't compose
+# with this file's ``pytestmark = pytest.mark.asyncio``.
