@@ -602,3 +602,199 @@ while True:
     # 10s graceful + 3s terminate window + slack for slow CI.
     elapsed = asyncio.run(_run())
     assert elapsed < 20.0, f"aclose hung for {elapsed:.1f}s"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUF-291: silent-wedge recovery when conversation_id loads empty
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_puf291_load_conversation_id_failsoft_on_corrupt_json(tmp_path):
+    """Regression-guard on the failsoft itself — corrupt session JSON
+    must return ``""`` (the load-time signal that PUF-291 (α) keys on
+    inside ``_ensure_running``)."""
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text("not-valid-json{", encoding="utf-8")
+    cs = CodexSession.__new__(CodexSession)
+    cs.session_file = session_file
+    assert cs._load_conversation_id() == ""
+
+
+def test_puf291_ensure_running_with_empty_cid_and_alive_proc_respawns(tmp_path):
+    """PUF-291 (α): if a previous load left ``_conversation_id`` empty
+    but the proc handle is still alive (corrupt session file +
+    warm-spawn race), ``_ensure_running`` must tear the proc down and
+    respawn so ``_bootstrap_session`` re-establishes a thread.
+    """
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "puf291-empty-cid"
+    cs._conversation_id = ""
+    cs.current_instructions = None
+    # Fake "alive" proc — returncode None signals running.
+    class _FakeProc:
+        returncode = None
+    cs._proc = _FakeProc()
+
+    calls = {"teardown": 0, "spawn": 0}
+
+    async def _stub_teardown():
+        calls["teardown"] += 1
+        cs._proc = None
+
+    async def _stub_spawn():
+        calls["spawn"] += 1
+        # Simulate _bootstrap_session establishing a fresh thread.
+        cs._conversation_id = "conv_fresh"
+        cs._proc = _FakeProc()
+
+    cs._teardown_locked = _stub_teardown  # type: ignore[assignment]
+    cs._spawn = _stub_spawn  # type: ignore[assignment]
+
+    asyncio.run(cs._ensure_running("sys"))
+
+    assert calls["teardown"] == 1, "expected teardown of stale proc"
+    assert calls["spawn"] == 1, "expected respawn after teardown"
+    assert cs._conversation_id == "conv_fresh"
+
+
+def test_puf291_ensure_running_with_non_empty_cid_and_alive_proc_is_noop(tmp_path):
+    """Regression-guard: the (α) added branch must NOT respawn when
+    the proc is alive AND ``_conversation_id`` is already set."""
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "puf291-warm-noop"
+    cs._conversation_id = "conv_existing"
+    cs.current_instructions = None
+    class _FakeProc:
+        returncode = None
+    cs._proc = _FakeProc()
+
+    calls = {"teardown": 0, "spawn": 0}
+
+    async def _stub_teardown():
+        calls["teardown"] += 1
+
+    async def _stub_spawn():
+        calls["spawn"] += 1
+
+    cs._teardown_locked = _stub_teardown  # type: ignore[assignment]
+    cs._spawn = _stub_spawn  # type: ignore[assignment]
+
+    asyncio.run(cs._ensure_running("sys"))
+
+    assert calls["teardown"] == 0
+    assert calls["spawn"] == 0
+    assert cs._conversation_id == "conv_existing"
+
+
+def test_puf291_ensure_running_with_dead_proc_spawns_without_teardown(tmp_path):
+    """Regression-guard on the existing dead-proc path: cold-start +
+    after-aclose must still go straight to ``_spawn`` without the
+    extra teardown the (α) branch only fires on a live-proc-empty-cid
+    pairing.
+    """
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "puf291-cold-start"
+    cs._conversation_id = ""
+    cs.current_instructions = None
+    cs._proc = None  # No live proc.
+
+    calls = {"teardown": 0, "spawn": 0}
+
+    async def _stub_teardown():
+        calls["teardown"] += 1
+
+    async def _stub_spawn():
+        calls["spawn"] += 1
+        cs._conversation_id = "conv_new"
+
+    cs._teardown_locked = _stub_teardown  # type: ignore[assignment]
+    cs._spawn = _stub_spawn  # type: ignore[assignment]
+
+    asyncio.run(cs._ensure_running("sys"))
+
+    assert calls["teardown"] == 0, "no proc to tear down"
+    assert calls["spawn"] == 1
+    assert cs._conversation_id == "conv_new"
+
+
+def test_puf291_run_turn_raises_when_cid_stays_empty(tmp_path):
+    """PUF-291 (β / FB-274): defence-in-depth — even if a future
+    regression lets ``_ensure_running`` return without securing a
+    cid, ``run_turn`` must surface the failure rather than send
+    ``threadId=""`` and silently wedge.
+    """
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "puf291-beta-fail-loud"
+    cs._conversation_id = ""
+    cs._lock = asyncio.Lock()
+    cs._next_id = 1
+    cs._active_turn = None
+    cs.current_instructions = None
+
+    async def _stub_ensure_running(_system_prompt):
+        # Simulate the regression: ensure_running returns without
+        # populating the cid. The (β) guard should catch this.
+        pass
+
+    cs._ensure_running = _stub_ensure_running  # type: ignore[assignment]
+
+    async def _run():
+        return await cs.run_turn("hi", "sys")
+
+    with pytest.raises(RuntimeError, match="empty conversation_id after _ensure_running"):
+        asyncio.run(_run())
+
+
+def test_puf291_shan_shadow_repro_corrupt_session_recovers(tmp_path):
+    """Shan-Shadow user-observable repro: a corrupt session-file +
+    cold start must recover via the spawn-path's
+    ``METHOD_NEW_CONVERSATION`` branch — no manual delete needed.
+    Existing tests already cover cold-start recovery through
+    ``_load_conversation_id`` returning ``""``; this one explicitly
+    seeds a corrupt JSON file to lock the Shan-Shadow user-observable
+    fingerprint.
+    """
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+
+msg = r()
+assert msg["method"] == "thread/start", f"unexpected first method {msg.get('method')!r}"
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_recovered", "createdAt": "2026-06-13T23:58:00Z"}}})
+
+msg = r()  # turn/start
+assert msg["method"] == "turn/start"
+assert msg["params"]["threadId"] == "conv_recovered"
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "back"}})
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    # Shan-Shadow's case: file exists but JSON is invalid.
+    session_file.write_text("partial-corrupt{not-json", encoding="utf-8")
+
+    cs = CodexSession(
+        agent_id="shan-shadow-puf291",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        result = await cs.run_turn("are you there?", "sys")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    assert "back" in (result.reply or "")
+    # Session file should now hold the fresh cid the spawn-path created.
+    persisted = json.loads(session_file.read_text(encoding="utf-8"))
+    assert persisted.get("conversation_id") == "conv_recovered"

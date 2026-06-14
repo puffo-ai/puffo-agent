@@ -230,6 +230,16 @@ class CodexSession:
         """Send one turn; wait for ``turn/completed``."""
         async with self._lock:
             await self._ensure_running(system_prompt)
+            # PUF-291 (β / FB-274): ``_ensure_running`` is supposed to
+            # guarantee a non-empty cid on return (see its docstring +
+            # the α invariant), but a future regression that loosens
+            # that contract would silently send ``threadId=""`` and
+            # wedge the agent. Surface the failure loudly instead.
+            if not self._conversation_id:
+                raise RuntimeError(
+                    f"agent {self.agent_id}: codex run_turn aborted — "
+                    f"empty conversation_id after _ensure_running"
+                )
             turn = _PendingTurn(
                 request_id=self._reserve_id(),
                 started_at=time.time(),
@@ -482,8 +492,20 @@ class CodexSession:
         # per turn anyway.
         if system_prompt:
             self.current_instructions = system_prompt
-        if self._proc is not None and self._proc.returncode is None:
+        proc_alive = self._proc is not None and self._proc.returncode is None
+        if proc_alive and self._conversation_id:
             return
+        # PUF-291 (α / FB-274): a stale proc with empty
+        # ``_conversation_id`` (corrupt ``codex_session.json`` load +
+        # warm-spawn race, or a future bug that resets the cid without
+        # respawning) would otherwise make ``run_turn`` send
+        # ``threadId=""`` and silently wedge. Tear the proc down so
+        # ``_spawn`` runs the full bootstrap and ``_bootstrap_session``
+        # either resumes / creates a new thread (it raises on
+        # ``thread/start`` returning no id; see ``:_bootstrap_session``).
+        # Post-call invariant: proc alive AND ``_conversation_id`` non-empty.
+        if proc_alive:
+            await self._teardown_locked()
         await self._spawn()
 
     async def _spawn(self) -> None:
