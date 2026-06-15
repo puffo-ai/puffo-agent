@@ -245,6 +245,14 @@ class CodexSession:
         """Send one turn; wait for ``turn/completed``."""
         async with self._lock:
             await self._ensure_running(system_prompt)
+            # Defence-in-depth: a non-empty cid is ``_ensure_running``'s
+            # contract; never send ``threadId=""`` (a silent wedge) if
+            # that ever regresses.
+            if not self._conversation_id:
+                raise RuntimeError(
+                    f"agent {self.agent_id}: codex run_turn aborted — "
+                    f"empty conversation_id after _ensure_running"
+                )
             turn = _PendingTurn(
                 request_id=self._reserve_id(),
                 started_at=time.time(),
@@ -508,8 +516,20 @@ class CodexSession:
         # per turn anyway.
         if system_prompt:
             self.current_instructions = system_prompt
-        if self._proc is not None and self._proc.returncode is None:
+        proc_alive = self._proc is not None and self._proc.returncode is None
+        if proc_alive and self._conversation_id:
             return
+        # A live proc with an empty cid (corrupt session load + warm
+        # race) would make run_turn send ``threadId=""`` and wedge —
+        # respawn so _spawn re-establishes a thread (it raises if
+        # thread/start returns no id).
+        if proc_alive:
+            logger.info(
+                "agent %s: codex session has alive proc but empty "
+                "conversation_id; respawning to recover",
+                self.agent_id,
+            )
+            await self._teardown_locked()
         await self._spawn()
 
     async def _spawn(self) -> None:
