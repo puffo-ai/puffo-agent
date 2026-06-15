@@ -26,6 +26,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the agent went quiet. The session now tears down + respawns to
   re-establish a thread, and a turn aborts loudly rather than send an
   empty `threadId`.
+- **Renaming an agent updates its own self-knowledge.** A rename via the
+  UI now rewrites the agent's `profile.md` with the new display name and
+  signals the worker to re-assemble its system prompt on the next
+  message — so the agent stops referring to itself by the old name
+  without an operator workaround.
 
 ## [0.12.4] — 2026-06-12
 
