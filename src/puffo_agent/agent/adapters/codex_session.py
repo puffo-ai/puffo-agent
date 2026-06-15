@@ -210,6 +210,19 @@ class CodexSession:
         self._active_turn: _PendingTurn | None = None
         self._lock = asyncio.Lock()
         self._conversation_id: str = self._load_conversation_id()
+        # ``sandbox`` (+ the other thread/start params) aren't re-sent on
+        # resume, so a sandbox change would silently keep the old policy.
+        # Drop the persisted thread when it was created under a different
+        # sandbox; the next start re-applies the current one.
+        if self._conversation_id:
+            persisted_sandbox = self._load_persisted_sandbox()
+            if persisted_sandbox != self.sandbox:
+                logger.info(
+                    "agent %s: codex sandbox changed (%s → %s); starting a "
+                    "fresh thread so the new policy applies",
+                    self.agent_id, persisted_sandbox, self.sandbox,
+                )
+                self._conversation_id = ""
         # The latest system prompt we've been handed. Stored so
         # ``reload`` can detect a no-op vs a real change, and so a
         # respawn can re-issue ``newConversation`` with current
@@ -466,11 +479,22 @@ class CodexSession:
             return ""
         return str(data.get("conversation_id") or "")
 
+    def _load_persisted_sandbox(self) -> str:
+        """Sandbox the persisted thread was created under. A missing key
+        (pre-sandbox-config session files) defaults to
+        ``danger-full-access`` — the old hardcoded value — so agents that
+        never changed sandbox don't get reset."""
+        try:
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "danger-full-access"
+        return str(data.get("sandbox") or "danger-full-access")
+
     def _save_conversation_id(self, cid: str) -> None:
         try:
             self.session_file.parent.mkdir(parents=True, exist_ok=True)
             self.session_file.write_text(
-                json.dumps({"conversation_id": cid}),
+                json.dumps({"conversation_id": cid, "sandbox": self.sandbox}),
                 encoding="utf-8",
             )
         except OSError as exc:

@@ -13,7 +13,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `workspace-write`, or `danger-full-access`. Defaults to
   `danger-full-access` (the prior behaviour), so existing agents are
   unchanged; an unrecognised value falls back to `danger-full-access`
-  with a warning.
+  with a warning. Changing the sandbox automatically starts a fresh
+  codex thread on the next turn so the new policy takes effect (codex
+  doesn't re-send thread params on resume).
 
 ## [0.12.4] — 2026-06-12
 

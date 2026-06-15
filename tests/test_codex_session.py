@@ -654,3 +654,39 @@ def test_sanitise_sandbox_falls_back_on_unknown():
     assert _sanitise_sandbox("danger-full-access", "a") == "danger-full-access"
     assert _sanitise_sandbox("bogus", "a") == "danger-full-access"
     assert _sanitise_sandbox("", "a") == "danger-full-access"
+
+
+def test_codex_sandbox_change_resets_persisted_thread(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(
+        json.dumps({"conversation_id": "old_thread", "sandbox": "danger-full-access"}),
+        encoding="utf-8",
+    )
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert cs._conversation_id == ""  # changed → fresh thread next start
+
+
+def test_codex_same_sandbox_keeps_persisted_thread(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(
+        json.dumps({"conversation_id": "old_thread", "sandbox": "workspace-write"}),
+        encoding="utf-8",
+    )
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert cs._conversation_id == "old_thread"  # unchanged → resume
+
+
+def test_codex_legacy_session_file_treated_as_full_access(tmp_path):
+    # Pre-feature file: only conversation_id, no sandbox → danger-full-access.
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(json.dumps({"conversation_id": "old_thread"}), encoding="utf-8")
+    keep = CodexSession(agent_id="a", session_file=sf, argv=["x"])
+    assert keep._conversation_id == "old_thread"  # still full-access → resume
+    reset = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert reset._conversation_id == ""  # now differs → reset
