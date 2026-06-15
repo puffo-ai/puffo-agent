@@ -602,3 +602,306 @@ while True:
     # 10s graceful + 3s terminate window + slack for slow CI.
     elapsed = asyncio.run(_run())
     assert elapsed < 20.0, f"aclose hung for {elapsed:.1f}s"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recovery when conversation_id loads empty (silent-wedge guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_load_conversation_id_failsoft_on_corrupt_json(tmp_path):
+    """Corrupt session JSON loads as ``""`` — the signal
+    ``_ensure_running`` keys on to recover."""
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text("not-valid-json{", encoding="utf-8")
+    cs = CodexSession.__new__(CodexSession)
+    cs.session_file = session_file
+    assert cs._load_conversation_id() == ""
+
+
+def test_ensure_running_with_empty_cid_and_alive_proc_respawns(tmp_path):
+    """Alive proc but empty cid (corrupt load + warm-spawn race): tear
+    the proc down and respawn so the thread is re-established."""
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "empty-cid"
+    cs._conversation_id = ""
+    cs.current_instructions = None
+
+    class _FakeProc:
+        returncode = None
+
+    cs._proc = _FakeProc()
+
+    calls = {"teardown": 0, "spawn": 0}
+
+    async def _stub_teardown():
+        calls["teardown"] += 1
+        cs._proc = None
+
+    async def _stub_spawn():
+        calls["spawn"] += 1
+        cs._conversation_id = "conv_fresh"
+        cs._proc = _FakeProc()
+
+    cs._teardown_locked = _stub_teardown  # type: ignore[assignment]
+    cs._spawn = _stub_spawn  # type: ignore[assignment]
+
+    asyncio.run(cs._ensure_running("sys"))
+
+    assert calls["teardown"] == 1
+    assert calls["spawn"] == 1
+    assert cs._conversation_id == "conv_fresh"
+
+
+def test_ensure_running_with_non_empty_cid_and_alive_proc_is_noop(tmp_path):
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "warm-noop"
+    cs._conversation_id = "conv_existing"
+    cs.current_instructions = None
+
+    class _FakeProc:
+        returncode = None
+
+    cs._proc = _FakeProc()
+
+    calls = {"teardown": 0, "spawn": 0}
+
+    async def _stub_teardown():
+        calls["teardown"] += 1
+
+    async def _stub_spawn():
+        calls["spawn"] += 1
+
+    cs._teardown_locked = _stub_teardown  # type: ignore[assignment]
+    cs._spawn = _stub_spawn  # type: ignore[assignment]
+
+    asyncio.run(cs._ensure_running("sys"))
+
+    assert calls["teardown"] == 0
+    assert calls["spawn"] == 0
+    assert cs._conversation_id == "conv_existing"
+
+
+def test_ensure_running_with_dead_proc_spawns_without_teardown(tmp_path):
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "cold-start"
+    cs._conversation_id = ""
+    cs.current_instructions = None
+    cs._proc = None
+
+    calls = {"teardown": 0, "spawn": 0}
+
+    async def _stub_teardown():
+        calls["teardown"] += 1
+
+    async def _stub_spawn():
+        calls["spawn"] += 1
+        cs._conversation_id = "conv_new"
+
+    cs._teardown_locked = _stub_teardown  # type: ignore[assignment]
+    cs._spawn = _stub_spawn  # type: ignore[assignment]
+
+    asyncio.run(cs._ensure_running("sys"))
+
+    assert calls["teardown"] == 0
+    assert calls["spawn"] == 1
+    assert cs._conversation_id == "conv_new"
+
+
+def test_run_turn_raises_when_cid_stays_empty(tmp_path):
+    """Defence-in-depth: if ``_ensure_running`` ever returns without a
+    cid, ``run_turn`` raises rather than sending ``threadId=""``."""
+    cs = CodexSession.__new__(CodexSession)
+    cs.agent_id = "fail-loud"
+    cs._conversation_id = ""
+    cs._lock = asyncio.Lock()
+    cs._next_id = 1
+    cs._active_turn = None
+    cs.current_instructions = None
+
+    async def _stub_ensure_running(_system_prompt):
+        pass
+
+    cs._ensure_running = _stub_ensure_running  # type: ignore[assignment]
+
+    async def _run():
+        return await cs.run_turn("hi", "sys")
+
+    with pytest.raises(RuntimeError, match="empty conversation_id after _ensure_running"):
+        asyncio.run(_run())
+
+
+def test_corrupt_session_file_recovers_via_fresh_thread(tmp_path):
+    """A corrupt session file + cold start recovers through the
+    thread/start branch — no manual delete needed."""
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+
+msg = r()
+assert msg["method"] == "thread/start", f"unexpected first method {msg.get('method')!r}"
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_recovered", "createdAt": "2026-06-13T23:58:00Z"}}})
+
+msg = r()  # turn/start
+assert msg["method"] == "turn/start"
+assert msg["params"]["threadId"] == "conv_recovered"
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+   "params": {"threadId": "t", "turnId": "u", "itemId": "m", "delta": "back"}})
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text("partial-corrupt{not-json", encoding="utf-8")
+
+    cs = CodexSession(
+        agent_id="corrupt-session",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        result = await cs.run_turn("are you there?", "sys")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    assert "back" in (result.reply or "")
+    persisted = json.loads(session_file.read_text(encoding="utf-8"))
+    assert persisted.get("conversation_id") == "conv_recovered"
+
+
+def test_bootstrap_raises_when_thread_start_returns_no_id(tmp_path):
+    """``_ensure_running``'s post-call invariant (alive proc + non-empty
+    cid) relies on ``_bootstrap_session`` raising when thread/start
+    returns no id — guard it so the session can't limp on empty."""
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+assert msg["method"] == "thread/start"
+# Structurally valid result, but no thread id under any key.
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"createdAt": "2026-06-13T00:00:00Z"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    cs = CodexSession(
+        agent_id="bootstrap-no-id",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        try:
+            await cs.warm("sys")
+            return None
+        except RuntimeError as exc:
+            return str(exc)
+        finally:
+            await cs.aclose()
+
+    err = asyncio.run(_run())
+    assert err is not None, "warm should propagate the bootstrap failure"
+    assert "no thread id" in err, err
+    assert cs._proc is None
+    assert cs._conversation_id == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sandbox policy — thread/start carries the configured sandbox; adapter
+# sanitises unknown values
+# ─────────────────────────────────────────────────────────────────────────────
+
+SANDBOX_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+assert msg["method"] == "thread/start"
+assert msg["params"]["sandbox"] == "workspace-write", \\
+    f"sandbox was {msg['params'].get('sandbox')!r}"
+assert msg["params"]["approvalPolicy"] == "never"
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_sb", "createdAt": "2026-05-15T00:00:00Z"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_thread_start_carries_configured_sandbox(tmp_path):
+    fake = _write_fake(tmp_path, SANDBOX_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        sandbox="workspace-write",
+    )
+
+    async def _run():
+        # The fake asserts sandbox/approvalPolicy on thread/start — a
+        # mismatch crashes it, so warm() fails.
+        await cs.warm("system prompt v1")
+        await cs.aclose()
+
+    asyncio.run(_run())
+
+
+def test_sanitise_sandbox_falls_back_on_unknown():
+    from puffo_agent.agent.adapters.local_cli import _sanitise_sandbox
+
+    assert _sanitise_sandbox("workspace-write", "a") == "workspace-write"
+    assert _sanitise_sandbox("read-only", "a") == "read-only"
+    assert _sanitise_sandbox("danger-full-access", "a") == "danger-full-access"
+    assert _sanitise_sandbox("bogus", "a") == "danger-full-access"
+    assert _sanitise_sandbox("", "a") == "danger-full-access"
+
+
+def test_codex_sandbox_change_resets_persisted_thread(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(
+        json.dumps({"conversation_id": "old_thread", "sandbox": "danger-full-access"}),
+        encoding="utf-8",
+    )
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert cs._conversation_id == ""  # changed → fresh thread next start
+
+
+def test_codex_same_sandbox_keeps_persisted_thread(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(
+        json.dumps({"conversation_id": "old_thread", "sandbox": "workspace-write"}),
+        encoding="utf-8",
+    )
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert cs._conversation_id == "old_thread"  # unchanged → resume
+
+
+def test_codex_legacy_session_file_treated_as_full_access(tmp_path):
+    # Pre-feature file: only conversation_id, no sandbox → danger-full-access.
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(json.dumps({"conversation_id": "old_thread"}), encoding="utf-8")
+    keep = CodexSession(agent_id="a", session_file=sf, argv=["x"])
+    assert keep._conversation_id == "old_thread"  # still full-access → resume
+    reset = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
+    )
+    assert reset._conversation_id == ""  # now differs → reset

@@ -275,6 +275,13 @@ class AgentDetail(QWidget):
         self._model = QComboBox()
         layout.addRow("Model", self._model)
 
+        # Read-only access policy: claude-code shows its permission mode;
+        # codex shows the sandbox + approval policy.
+        self._access = QLabel("")
+        self._access.setStyleSheet("color: #6b7280;")
+        self._access.setWordWrap(True)
+        layout.addRow("Access", self._access)
+
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
@@ -386,6 +393,7 @@ class AgentDetail(QWidget):
         self._set_combo(self._runtime_kind, cfg.runtime.kind)
         self._set_combo(self._harness, cfg.runtime.harness)
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
+        self._access.setText(self._access_summary(cfg.runtime.harness, cfg))
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
         # ws-local agents bring their own brain — runtime / harness / model
@@ -659,6 +667,21 @@ class AgentDetail(QWidget):
     def _on_harness_changed(self, harness: str) -> None:
         current = self._model.currentText()
         self._populate_model_combo(harness, current)
+        if self._cfg is not None:
+            self._access.setText(self._access_summary(harness, self._cfg))
+
+    def _access_summary(self, harness: str, cfg) -> str:
+        """Read-only access line: permission mode for claude-code,
+        sandbox + approval policy for codex."""
+        if (cfg.runtime.kind or "") == "ws-local":
+            return "n/a — ws-local brings its own AI"
+        if harness == "codex":
+            policy = (
+                "never" if cfg.runtime.permission_mode == "bypassPermissions"
+                else "untrusted"
+            )
+            return f"sandbox: {cfg.runtime.sandbox} · approve: {policy}"
+        return f"permission: {cfg.runtime.permission_mode}"
 
     def _populate_model_combo(self, harness: str, current: str) -> None:
         self._model.blockSignals(True)

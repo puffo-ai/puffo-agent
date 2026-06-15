@@ -4,6 +4,29 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.5] — unreleased
+
+### Added
+
+- **Per-agent codex sandbox policy.** A new `runtime.sandbox` field in
+  `agent.yml` (cli-local / codex) sets codex's sandbox: `read-only`,
+  `workspace-write`, or `danger-full-access`. Defaults to
+  `danger-full-access` (the prior behaviour), so existing agents are
+  unchanged; an unrecognised value falls back to `danger-full-access`
+  with a warning. Changing the sandbox automatically starts a fresh
+  codex thread on the next turn so the new policy takes effect (codex
+  doesn't re-send thread params on resume).
+
+### Fixed
+
+- **Codex agents recover from an empty `conversation_id` instead of
+  silently wedging.** A corrupt `codex_session.json` (or a future
+  reset-without-respawn) could leave a live codex process with no
+  conversation id, after which every turn sent an empty `threadId` and
+  the agent went quiet. The session now tears down + respawns to
+  re-establish a thread, and a turn aborts loudly rather than send an
+  empty `threadId`.
+
 ## [0.12.4] — 2026-06-12
 
 ### Added
