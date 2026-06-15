@@ -982,6 +982,9 @@ class RuntimeConfig:
     # cli-local Claude Code permission mode. Only ``bypassPermissions``
     # is supported today; see LocalCLIAdapter._sanitise_permission_mode.
     permission_mode: str = "bypassPermissions"
+    # codex (cli-local) sandbox policy: read-only | workspace-write |
+    # danger-full-access. Default leaves codex's sandbox fully open.
+    sandbox: str = "danger-full-access"
     # Agent engine (CLI kinds only):
     #   - ``claude-code``: ``claude`` CLI with our stream-json session
     #     protocol, --resume, --model, and the puffo MCP tool suite.
@@ -1088,6 +1091,7 @@ class AgentConfig:
                 docker_memory_limit=rt.get("docker_memory_limit", ""),
                 docker_memory_reservation=rt.get("docker_memory_reservation", ""),
                 permission_mode=rt.get("permission_mode", "bypassPermissions"),
+                sandbox=rt.get("sandbox", "danger-full-access"),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),
             ),

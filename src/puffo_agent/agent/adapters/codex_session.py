@@ -185,6 +185,7 @@ class CodexSession:
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         permission_mode: str = "bypassPermissions",
+        sandbox: str = "danger-full-access",
         model: str = "",
     ):
         self.agent_id = agent_id
@@ -196,6 +197,7 @@ class CodexSession:
         # The plan's v1 stance — other modes are deferred until the
         # permission-proxy DM flow is ready for codex too.
         self.permission_mode = permission_mode
+        self.sandbox = sandbox
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
@@ -208,6 +210,19 @@ class CodexSession:
         self._active_turn: _PendingTurn | None = None
         self._lock = asyncio.Lock()
         self._conversation_id: str = self._load_conversation_id()
+        # ``sandbox`` (+ the other thread/start params) aren't re-sent on
+        # resume, so a sandbox change would silently keep the old policy.
+        # Drop the persisted thread when it was created under a different
+        # sandbox; the next start re-applies the current one.
+        if self._conversation_id:
+            persisted_sandbox = self._load_persisted_sandbox()
+            if persisted_sandbox != self.sandbox:
+                logger.info(
+                    "agent %s: codex sandbox changed (%s → %s); starting a "
+                    "fresh thread so the new policy applies",
+                    self.agent_id, persisted_sandbox, self.sandbox,
+                )
+                self._conversation_id = ""
         # The latest system prompt we've been handed. Stored so
         # ``reload`` can detect a no-op vs a real change, and so a
         # respawn can re-issue ``newConversation`` with current
@@ -230,11 +245,9 @@ class CodexSession:
         """Send one turn; wait for ``turn/completed``."""
         async with self._lock:
             await self._ensure_running(system_prompt)
-            # PUF-291 (β / FB-274): ``_ensure_running`` is supposed to
-            # guarantee a non-empty cid on return (see its docstring +
-            # the α invariant), but a future regression that loosens
-            # that contract would silently send ``threadId=""`` and
-            # wedge the agent. Surface the failure loudly instead.
+            # Defence-in-depth: a non-empty cid is ``_ensure_running``'s
+            # contract; never send ``threadId=""`` (a silent wedge) if
+            # that ever regresses.
             if not self._conversation_id:
                 raise RuntimeError(
                     f"agent {self.agent_id}: codex run_turn aborted — "
@@ -474,11 +487,22 @@ class CodexSession:
             return ""
         return str(data.get("conversation_id") or "")
 
+    def _load_persisted_sandbox(self) -> str:
+        """Sandbox the persisted thread was created under. A missing key
+        (pre-sandbox-config session files) defaults to
+        ``danger-full-access`` — the old hardcoded value — so agents that
+        never changed sandbox don't get reset."""
+        try:
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return "danger-full-access"
+        return str(data.get("sandbox") or "danger-full-access")
+
     def _save_conversation_id(self, cid: str) -> None:
         try:
             self.session_file.parent.mkdir(parents=True, exist_ok=True)
             self.session_file.write_text(
-                json.dumps({"conversation_id": cid}),
+                json.dumps({"conversation_id": cid, "sandbox": self.sandbox}),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -495,23 +519,14 @@ class CodexSession:
         proc_alive = self._proc is not None and self._proc.returncode is None
         if proc_alive and self._conversation_id:
             return
-        # PUF-291 (α / FB-274): a stale proc with empty
-        # ``_conversation_id`` (corrupt ``codex_session.json`` load +
-        # warm-spawn race, or a future bug that resets the cid without
-        # respawning) would otherwise make ``run_turn`` send
-        # ``threadId=""`` and silently wedge. Tear the proc down so
-        # ``_spawn`` runs the full bootstrap and ``_bootstrap_session``
-        # either resumes / creates a new thread (it raises on
-        # ``thread/start`` returning no id; see ``:_bootstrap_session``).
-        # Post-call invariant: proc alive AND ``_conversation_id`` non-empty.
+        # A live proc with an empty cid (corrupt session load + warm
+        # race) would make run_turn send ``threadId=""`` and wedge —
+        # respawn so _spawn re-establishes a thread (it raises if
+        # thread/start returns no id).
         if proc_alive:
-            # Log the load-bearing diagnostic so Shan-Shadow-class
-            # incidents are visible from daemon logs alone, without
-            # needing a live repro.
             logger.info(
                 "agent %s: codex session has alive proc but empty "
-                "conversation_id; tearing down + respawning to recover "
-                "(PUF-291)",
+                "conversation_id; respawning to recover",
                 self.agent_id,
             )
             await self._teardown_locked()
@@ -631,16 +646,17 @@ class CodexSession:
         # live behaviour. Puffo trust model = operator vouches for the
         # agent + machine, all tools allowed.
         #
-        # ``sandbox: "danger-full-access"`` removes codex's in-process
-        # sandbox. cli-local runs as the operator's UID anyway —
-        # codex's sandbox is mostly cosmetic here. (cli-docker will
-        # keep this when supported; the container is the boundary.)
+        # ``sandbox`` is codex's sandbox policy (read-only |
+        # workspace-write | danger-full-access), per-agent via agent.yml.
+        # Default keeps it fully open — cli-local runs as the operator's
+        # UID, so codex's in-process sandbox is mostly cosmetic; the real
+        # boundary is cli-docker's container.
         new_conv_params: dict[str, Any] = {
             "cwd": self.cwd or os.getcwd(),
             "approvalPolicy": (
                 "never" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),
-            "sandbox": "danger-full-access",
+            "sandbox": self.sandbox,
         }
         if self.model:
             new_conv_params["model"] = self.model
