@@ -280,9 +280,17 @@ class Daemon:
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime, agent_id, logger,
             )
-            # Re-arm the auth_failed DM dedup so a re-expiry this
-            # session re-notifies the operator.
+            # PUF-303: also clear refresh_broken if the worker was
+            # stuck there. Recovery doesn't need to wait for the next
+            # daemon poll-tick — the on-disk credential is fresh, so
+            # we can flip back to ok immediately.
+            Worker._clear_refresh_broken_if_recoverable(
+                worker.runtime, agent_id, logger,
+            )
+            # Re-arm both DM dedup flags so a re-expiry / re-break
+            # this session re-notifies the operator.
             worker._auth_failed_notification_sent = False
+            worker._refresh_broken_notification_sent = False
             if was_auth_failed:
                 # The running adapter session still holds the stale
                 # credential; a restart re-links the fresh cred and
@@ -304,6 +312,17 @@ class Daemon:
         refresher.register_on_refresh_success(on_refresh_success)
         # Stash callback identity for _stop_worker's unregister.
         worker._refresh_success_callback = on_refresh_success
+
+        # PUF-303: refresh_broken-enter handler. The daemon fires this
+        # with the agent_id when CredentialRefresher flips an agent
+        # newly to refresh_broken; we only act for OUR agent.
+        def on_refresh_broken_enter(flipped_agent_id: str) -> None:
+            if flipped_agent_id != agent_id:
+                return
+            worker._on_refresh_broken_enter()
+
+        refresher.register_on_refresh_broken_enter(on_refresh_broken_enter)
+        worker._refresh_broken_callback = on_refresh_broken_enter
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         return self._refresher_for(agent_cfg).notify_refresh_needed
@@ -341,6 +360,12 @@ class Daemon:
             if cb is not None:
                 self.refresher.unregister_on_refresh_success(cb)
                 self.codex_refresher.unregister_on_refresh_success(cb)
+            # PUF-303: also unregister the refresh-broken-enter
+            # callback so the stopped worker stops receiving events.
+            rb_cb = getattr(worker, "_refresh_broken_callback", None)
+            if rb_cb is not None:
+                self.refresher.unregister_on_refresh_broken_enter(rb_cb)
+                self.codex_refresher.unregister_on_refresh_broken_enter(rb_cb)
             await worker.stop()
 
     async def _stop_all_workers(self) -> None:

@@ -695,6 +695,97 @@ class Worker:
             self.agent_cfg.id, operator_slug,
         )
 
+    # ─────────────────────────────────────────────────────────────────
+    # PUF-303: refresh_broken-state notification + reactive clear.
+    # Parallel to PUF-283's auth_failed substrate above. The daemon's
+    # CredentialRefresher fires _on_refresh_broken_enter when it newly
+    # flips an agent to refresh_broken; this worker DMs the operator
+    # bilingual recovery copy with one-per-session dedup. Recovery
+    # clear runs via the existing on_refresh_success callback.
+    # ─────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _clear_refresh_broken_if_recoverable(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """Symmetric to ``_clear_auth_failed_if_recoverable``: fired on
+        refresh-success so a manual ``claude auth login`` recovery
+        clears the state immediately instead of waiting for the next
+        daemon poll-tick. Optimistic: if the next request still 401s,
+        ``_flip_refresh_broken`` will re-set."""
+        if runtime.health != "refresh_broken":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: credential-refresh-success; "
+            "runtime.health cleared from refresh_broken back to ok",
+            agent_id,
+        )
+
+    def _on_refresh_broken_enter(self) -> None:
+        """Fire the operator DM once per refresh_broken episode. The
+        flag re-arms on refresh-success (daemon on_refresh_success)
+        and on a failed send, so a later genuine failure re-notifies."""
+        if self._refresh_broken_notification_sent:
+            return
+        self._refresh_broken_notification_sent = True
+        try:
+            asyncio.create_task(self._notify_operator_of_refresh_broken())
+        except Exception as exc:  # noqa: BLE001
+            # Re-arm so a schedule failure retries on the next ENTER.
+            self._refresh_broken_notification_sent = False
+            logger.warning(
+                "agent %s: couldn't schedule refresh-broken DM: %s",
+                self.agent_cfg.id, exc,
+            )
+
+    async def _notify_operator_of_refresh_broken(self) -> None:
+        """DM the operator the bilingual refresh-broken recovery copy.
+        Re-arms the dedup flag on a transient failure (client not warm,
+        or send raised) so the next ENTER retries instead of staying
+        silently gated."""
+        client = self._client
+        if client is None:
+            # Still warming — re-arm so a later ENTER retries.
+            self._refresh_broken_notification_sent = False
+            logger.warning(
+                "agent %s: refresh-broken DM skipped — client not yet warm",
+                self.agent_cfg.id,
+            )
+            return
+        operator_slug = getattr(client, "operator_slug", "") or ""
+        if not operator_slug:
+            # No operator to DM; stay gated — re-arming would respin
+            # on every refresh-broken flip.
+            logger.warning(
+                "agent %s: refresh-broken but no operator_slug — not DMing",
+                self.agent_cfg.id,
+            )
+            return
+        from ..agent._invite_strings import format_refresh_broken
+        display_name = (
+            getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        )
+        text = format_refresh_broken(self.agent_cfg.id, display_name)
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception as exc:
+            # Transient send failure — re-arm for the next ENTER.
+            self._refresh_broken_notification_sent = False
+            logger.exception(
+                "agent %s: refresh-broken DM to %s raised: %s",
+                self.agent_cfg.id, operator_slug, exc,
+            )
+            return
+        logger.info(
+            "agent %s: notified operator @%s of refresh_broken",
+            self.agent_cfg.id, operator_slug,
+        )
+
     @staticmethod
     def _flip_health_in_progress(
         runtime: "RuntimeState",
@@ -766,6 +857,10 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        # PUF-303: parallel dedup flag for the refresh_broken ENTER
+        # operator DM. Re-armed on credential refresh-success (same
+        # callback that re-arms auth_failed) and on a failed send.
+        self._refresh_broken_notification_sent = False
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),

@@ -748,6 +748,12 @@ class CredentialRefresher:
         self._refresh_request = asyncio.Event()
         self._agent_homes: set[Path] = set()
         self._on_refresh_success: list[Callable[[], None]] = []
+        # PUF-303: callbacks fired when an agent's runtime newly flips
+        # to refresh_broken. Parallel to ``_on_refresh_success`` so the
+        # worker side can DM the operator analogous to PUF-283's
+        # ``auth_failed`` notification. Receives the agent_id of the
+        # newly-broken agent so the worker can scope the dedup flag.
+        self._on_refresh_broken_enter: list[Callable[[str], None]] = []
         self._lock = asyncio.Lock()
         self._consecutive_non_success = 0
         self._rate_limit_retry_task: asyncio.Task | None = None
@@ -780,6 +786,33 @@ class CredentialRefresher:
             except Exception as exc:
                 logger.warning(
                     "credential refresh-success callback raised: %s", exc,
+                )
+
+    def register_on_refresh_broken_enter(
+        self, callback: Callable[[str], None],
+    ) -> None:
+        """PUF-303: register a callback fired when an agent's runtime
+        newly flips to refresh_broken. The callback receives the
+        agent_id of the newly-broken agent."""
+        self._on_refresh_broken_enter.append(callback)
+
+    def unregister_on_refresh_broken_enter(
+        self, callback: Callable[[str], None],
+    ) -> None:
+        try:
+            self._on_refresh_broken_enter.remove(callback)
+        except ValueError:
+            pass
+
+    def _fire_refresh_broken_enter(self, agent_id: str) -> None:
+        # list(...) defensive copy: callback may (un)register during dispatch.
+        for cb in list(self._on_refresh_broken_enter):
+            try:
+                cb(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "refresh-broken-enter callback raised for %s: %s",
+                    agent_id, exc,
                 )
 
     def notify_refresh_needed(self) -> None:
@@ -1025,6 +1058,12 @@ class CredentialRefresher:
             f"advancing. Run `claude auth login`, then send the agent "
             f"a message to recover."
         )
+        # PUF-303: collect agents that newly flipped so we fire the
+        # refresh-broken-enter callback exactly once per transition.
+        # The skip-if-already-broken branch above means callers can
+        # rely on "fired ⇒ new transition," same was_ok semantics as
+        # worker._enter_auth_failed.
+        newly_broken: list[str] = []
         for agent_home in self._agent_homes:
             agent_id = Path(agent_home).name
             try:
@@ -1051,6 +1090,10 @@ class CredentialRefresher:
                     "refresh_broken flip: failed to save runtime for %s: %s",
                     agent_id, exc,
                 )
+                continue
+            newly_broken.append(agent_id)
+        for agent_id in newly_broken:
+            self._fire_refresh_broken_enter(agent_id)
 
     def _clear_refresh_broken(self) -> None:
         from .state import RuntimeState

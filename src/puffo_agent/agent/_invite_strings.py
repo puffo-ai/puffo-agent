@@ -118,3 +118,23 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
         "⚠️ Claude OAuth 已过期。请运行 `claude auth login`，"
         "然后给我发条消息即可恢复。"
     )
+
+
+def format_refresh_broken(agent_id: str, agent_display_name: str = "") -> str:
+    """PUF-303: bilingual (zh+en) operator DM for an agent whose
+    credential-refresh has been failing repeatedly. Mirrors the
+    ``format_oauth_expired`` shape; framing distinguishes the
+    daemon-side refresh failure (``claude auth status`` may still
+    report logged-in but live probe / refresh is broken) from the
+    in-flight 401 path."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    return (
+        f"⚠️ {label} — Claude credential refresh is broken (the daemon "
+        "can't roll the token). Run `claude auth login`, then send me a "
+        "message and I'll pick up where I left off.\n"
+        "⚠️ Claude 凭证刷新失败（守护进程无法续期 token）。"
+        "请运行 `claude auth login`，然后给我发条消息即可恢复。"
+    )

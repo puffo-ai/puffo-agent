@@ -420,12 +420,18 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
         registers without actually wiring the refresh loop."""
         def __init__(self):
             self.callback = None
+            self.refresh_broken_callback = None
 
         def register_agent(self, _path):
             pass
 
         def register_on_refresh_success(self, cb):
             self.callback = cb
+
+        # PUF-303: daemon now also registers a refresh-broken-enter
+        # callback. Capture for completeness; not asserted here.
+        def register_on_refresh_broken_enter(self, cb):
+            self.refresh_broken_callback = cb
 
     class _StubAgentCfg:
         id = "t-agent"
@@ -440,7 +446,9 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
         agent_cfg = _StubAgentCfg()
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
+        _refresh_broken_notification_sent = True
         _refresh_success_callback = None
+        _refresh_broken_callback = None
 
     class _StubDaemon:
         refresher = _StubRefresher()
