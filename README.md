@@ -47,12 +47,16 @@ Python:
 
 ```bash
 uv tool install puffo-agent
+# pin to a specific version:
+uv tool install puffo-agent==0.12.4
 ```
 
 Otherwise use pip:
 
 ```bash
 pip install puffo-agent
+# pin to a specific version:
+pip install puffo-agent==0.12.4
 ```
 
 Both paths install the `puffo-agent` console script. The CLI's

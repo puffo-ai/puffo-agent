@@ -467,9 +467,22 @@ async def run_daemon() -> int:
     # the new daemon had auto-spawned before the user's manual start
     # command landed. The enforcement is unchanged (we still don't
     # spawn a second daemon); only the exit code + framing soften.
+    #
+    # Intentional: the soft-exit fires even when the running daemon
+    # is at a different version than this process would have started.
+    # Bridge-side version-query would be needed to discriminate;
+    # that's out of scope here. ``puffo-agent stop && start`` is the
+    # supported version-swap path. Run ``puffo-agent status`` /
+    # ``puffo-agent version`` if you need to confirm what's running.
     if is_daemon_alive():
         pid = read_daemon_pid()
-        logger.info("puffo-agent daemon already running (pid=%s)", pid)
+        # Both ``logger.info`` AND ``print`` because background /
+        # tray runners may not surface INFO logs to the user, and
+        # the "already running" framing is load-bearing for the
+        # upgrade-flow UX.
+        msg = f"puffo-agent daemon already running (pid={pid})"
+        logger.info(msg)
+        print(msg)
         return 0
 
     home_dir().mkdir(parents=True, exist_ok=True)

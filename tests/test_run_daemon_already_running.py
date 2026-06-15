@@ -42,3 +42,14 @@ class TestRunDaemonAlreadyRunning:
              caplog.at_level(logging.INFO):
             asyncio.run(run_daemon())
         assert any("4242" in r.message for r in caplog.records)
+
+    def test_message_also_prints_to_stdout_for_background_runners(self, capsys):
+        """PUF-302 polish: tray + background runners may not surface
+        INFO logs to the user. The "already running" message also
+        goes to stdout so the user always sees it (Solution QA #4)."""
+        with patch("puffo_agent.portal.daemon.is_daemon_alive", return_value=True), \
+             patch("puffo_agent.portal.daemon.read_daemon_pid", return_value=4242):
+            asyncio.run(run_daemon())
+        out = capsys.readouterr().out
+        assert "already running" in out
+        assert "4242" in out

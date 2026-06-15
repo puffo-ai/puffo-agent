@@ -98,6 +98,39 @@ class TestCmdStopOriginalPid:
         assert f"daemon stopped (pid={original_pid})" in out
         assert f"new daemon" in out and f"pid={new_pid}" in out
 
+    def test_swap_message_skipped_when_new_pid_in_file_is_not_alive(self, capsys):
+        """Pid file changed mid-poll but the new pid isn't a live
+        daemon (stale write, race, etc.). The swap-message branch
+        is gated on ``is_pid_alive(new_pid)`` AND ``new_pid != pid``;
+        when the new pid is dead we should print plain
+        ``"daemon stopped"`` — not surface a phantom swap.
+        """
+        original_pid = 1234
+        bogus_new_pid = 9999  # written to pid file but not alive
+
+        def pid_alive(pid):
+            if pid == original_pid:
+                return next(alive_iter)
+            if pid == bogus_new_pid:
+                return False  # the load-bearing gate
+            return False
+
+        alive_iter = iter([True, False])
+
+        with patch(
+            "puffo_agent.portal.cli.read_daemon_pid",
+            side_effect=[original_pid, bogus_new_pid],
+        ), \
+             patch("puffo_agent.portal.cli.is_pid_alive", side_effect=pid_alive), \
+             patch("puffo_agent.portal.cli.write_stop_request"), \
+             patch("puffo_agent.portal.cli.clear_stop_request"), \
+             patch("puffo_agent.portal.cli.time.sleep"):
+            rc = cli.cmd_stop(_args(timeout=5))
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "daemon stopped" in out
+        assert "new daemon" not in out
+
     def test_daemon_does_not_stop_within_timeout(self, capsys):
         """Original pid keeps reporting alive past timeout → exit 1."""
         # Entry: alive. Poll forever: alive (we control time via sleep mock).
