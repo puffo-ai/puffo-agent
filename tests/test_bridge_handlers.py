@@ -686,12 +686,10 @@ async def test_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
     assert "Resilient Bot" in (agent_dir / "profile.md").read_text(encoding="utf-8")
 
 
-async def test_substring_replace_is_intentional_design():
-    # PR #82 polish: pin the substring-replace contract — the known
-    # "Bob → Robert inside Bobcat rewrites to Robertcat" limit is
-    # *intentional* (so CJK names work without word boundaries). A
-    # future "fix" that adds ``\b`` guards would break the CJK cohort;
-    # this test fails loudly if someone tries.
+async def test_rename_respects_ascii_word_boundaries():
+    # Standalone "Bob" (and the possessive "Bob's") is renamed; "Bob"
+    # inside a longer ASCII word ("Bobcats") is left alone. CJK names,
+    # which have no ASCII flanking, still match — see the CJK test.
     user = make_user()
     home = isolated_home()
     write_test_agent(
@@ -705,7 +703,6 @@ async def test_substring_replace_is_intentional_design():
     server = TestServer(app)
     async with TestClient(server) as c:
         await _pair(c, user)
-        # Set initial name to "Bob".
         r = await _rename_agent(c, user, "footgun-bot", "Bob")
         assert r.status == 200
         (agent_dir / "profile.md").write_text(
@@ -716,11 +713,8 @@ async def test_substring_replace_is_intentional_design():
         assert r.status == 200, await r.text()
 
     body = (agent_dir / "profile.md").read_text(encoding="utf-8")
-    # All Bob occurrences flipped — including the Bobcat one. The
-    # operator can clean this up by editing profile.md, which is the
-    # documented tradeoff for the CJK cohort working at all.
     assert body == (
-        "You are Robert, who watches Robertcats and writes about Robert's cabin.\n"
+        "You are Robert, who watches Bobcats and writes about Robert's cabin.\n"
     )
 
 

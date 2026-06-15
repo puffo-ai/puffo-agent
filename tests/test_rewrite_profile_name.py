@@ -51,10 +51,21 @@ def test_rewrite_empty_names_are_noops(tmp_path):
 
 
 def test_rewrite_handles_cjk(tmp_path):
-    # ``\b`` doesn't fire between two CJK characters; the literal
-    # substring replace must still work.
+    # The ASCII-only boundary doesn't block CJK characters, so CJK
+    # display names still match (``\b`` never would).
     profile = tmp_path / "profile.md"
     profile.write_text("你是田中。田中负责安排。\n", encoding="utf-8")
     n = rewrite_profile_name(profile, "田中", "山田")
     assert n == 2
     assert profile.read_text(encoding="utf-8") == "你是山田。山田负责安排。\n"
+
+
+def test_rewrite_does_not_overreach_into_longer_ascii_words(tmp_path):
+    # Standalone + possessive match; "Bob" inside "Bobcats" does not.
+    profile = tmp_path / "profile.md"
+    profile.write_text("Bob watches Bobcats; Bob's cabin.\n", encoding="utf-8")
+    n = rewrite_profile_name(profile, "Bob", "Robert")
+    assert n == 2
+    assert profile.read_text(encoding="utf-8") == (
+        "Robert watches Bobcats; Robert's cabin.\n"
+    )

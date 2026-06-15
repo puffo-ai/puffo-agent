@@ -1103,14 +1103,15 @@ def rebuild_agent_claude_md(
 def rewrite_profile_name(
     profile_path: Path, old_name: str, new_name: str,
 ) -> int:
-    """Replace literal occurrences of ``old_name`` with ``new_name`` in
-    ``profile.md`` (the prose CLAUDE.md / AGENTS.md / GEMINI.md are
+    """Replace whole-token occurrences of ``old_name`` with ``new_name``
+    in ``profile.md`` (the prose CLAUDE.md / AGENTS.md / GEMINI.md are
     assembled from). Returns the replacement count.
 
-    Literal substring, not a ``\\b``-anchored regex: word boundaries
-    don't fire between CJK characters, so an anchored pattern would miss
-    CJK display names. Trade-off: "Bob"→"Robert" also rewrites "Bobcat".
-    No-op (0) on empty/equal names or a missing/unreferenced profile.
+    Matched only when not flanked by ASCII word characters, so
+    "Bob"→"Robert" leaves "Bobcat" alone but still hits "Bob's". The
+    boundary is ASCII-only (not ``\\b``, which never separates CJK
+    characters), so CJK display names still match. No-op (0) on
+    empty/equal names or a missing/unreferenced profile.
     """
     if not old_name or not new_name or old_name == new_name:
         return 0
@@ -1118,10 +1119,13 @@ def rewrite_profile_name(
         text = profile_path.read_text(encoding="utf-8")
     except OSError:
         return 0
-    count = text.count(old_name)
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(old_name)}(?![A-Za-z0-9_])"
+    )
+    new_text, count = pattern.subn(new_name, text)
     if count == 0:
         return 0
-    profile_path.write_text(text.replace(old_name, new_name), encoding="utf-8")
+    profile_path.write_text(new_text, encoding="utf-8")
     return count
 
 
