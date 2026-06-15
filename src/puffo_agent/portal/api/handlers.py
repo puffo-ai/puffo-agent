@@ -634,9 +634,7 @@ async def update_profile(request: web.Request) -> web.Response:
         return _bad("body must be a JSON object")
 
     cfg = AgentConfig.load(agent_id)
-    # Snapshot pre-edit display_name so we can detect a rename
-    # post-save and feed the old → new pair to the profile.md rewrite
-    # (PUF-294 / FB-294).
+    # Snapshot pre-edit display_name to detect a rename post-save.
     old_display_name = cfg.display_name
     new_display_name = payload.get("display_name")
     avatar_b64 = payload.get("avatar_bytes_b64")
@@ -746,26 +744,11 @@ async def update_profile(request: web.Request) -> web.Response:
         cfg.role_short,
     )
 
-    # PUF-294 (FB-294): when display_name actually changed, propagate
-    # to the agent's own context. The name lives in operator-written
-    # ``profile.md`` prose — CLAUDE.md / AGENTS.md / GEMINI.md are
-    # assembled from it on the worker's next reload. Two-step fold:
-    #
-    #   1. Rewrite literal occurrences in profile.md so the next
-    #      assembly carries the new name.
-    #   2. Drop ``<workspace>/.puffo-agent/reload.flag`` — the worker
-    #      detects this on the next message and calls
-    #      ``_reload_from_disk`` → ``rebuild_agent_claude_md`` (and
-    #      the codex + gemini equivalents) — without operator DM.
-    #
-    # Concurrency note: this fold is NOT wrapped in a per-agent lock.
-    # Quick-succession renames (Bob → Bobcat → Wolverine within
-    # seconds) could interleave: profile.md's intermediate state may
-    # contain both names in different spots and reload.flag fires
-    # twice. Tolerated because: (i) UI debounces rename submits,
-    # (ii) the worker's reload picks up whatever profile.md eventually
-    # settles to, (iii) the cost of a lock is not justified for the
-    # observed rename cadence.
+    # On an actual rename, rewrite profile.md (the prose CLAUDE.md /
+    # AGENTS.md are assembled from) then drop reload.flag so the worker
+    # re-assembles on its next message. Not locked — rapid renames may
+    # interleave; tolerated given UI debounce + the worker reloads
+    # whatever profile.md settles to.
     if (
         cfg.display_name != old_display_name
         and old_display_name
@@ -777,9 +760,6 @@ async def update_profile(request: web.Request) -> web.Response:
         flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
         try:
             flag_path.parent.mkdir(parents=True, exist_ok=True)
-            # ``version`` versions the schema so a future worker that
-            # dispatches on additional fields (affected_files,
-            # triggered_by, etc) can fall back when reading old flags.
             flag_path.write_text(
                 json.dumps({
                     "version": 1,
@@ -789,10 +769,8 @@ async def update_profile(request: web.Request) -> web.Response:
                 encoding="utf-8",
             )
         except OSError as exc:
-            # Read-only workspace / disk-full / cross-uid ``.puffo-agent/``:
-            # the rename's agent.yml + profile.md writes already
-            # landed, so the worker picks up the new name on its next
-            # restart even without the flag. Don't fail the PATCH.
+            # Flag is best-effort: agent.yml + profile.md already wrote,
+            # so a restart still picks up the new name. Don't fail PATCH.
             logger.warning(
                 "bridge: failed to write reload.flag for agent=%s after "
                 "rename: %s (agent will pick up new name on next restart)",

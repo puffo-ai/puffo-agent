@@ -453,10 +453,9 @@ async def test_update_profile_caps_post_strip():
 
 
 # ────────────────────────────────────────────────────────────────────
-# PUF-294 (FB-294): rename folds into PATCH /v1/agents/{id}/profile —
-# profile.md is rewritten with the new display_name and a reload.flag
-# is dropped so the worker re-assembles CLAUDE.md / AGENTS.md /
-# GEMINI.md on the next message (no operator-DM workaround).
+# Rename folds into PATCH /profile — profile.md is rewritten with the
+# new display_name and a reload.flag is dropped so the worker
+# re-assembles the system prompt on the next message.
 # ────────────────────────────────────────────────────────────────────
 
 
@@ -468,7 +467,7 @@ async def _rename_agent(c, user, agent_id: str, new_name: str):
     return await c.patch(path, data=body, headers=h)
 
 
-async def test_puf294_rename_rewrites_profile_md_and_drops_reload_flag():
+async def test_rename_rewrites_profile_md_and_drops_reload_flag():
     user = make_user()
     home = isolated_home()
     write_test_agent(
@@ -506,7 +505,7 @@ async def test_puf294_rename_rewrites_profile_md_and_drops_reload_flag():
     assert flag_body.get("reason") == "agent rename"
 
 
-async def test_puf294_unchanged_display_name_is_a_noop():
+async def test_unchanged_display_name_is_a_noop():
     user = make_user()
     home = isolated_home()
     write_test_agent(
@@ -535,7 +534,7 @@ async def test_puf294_unchanged_display_name_is_a_noop():
     assert not flag_path.exists()
 
 
-async def test_puf294_rename_drops_reload_flag_even_when_profile_md_has_no_old_name():
+async def test_rename_drops_reload_flag_even_when_profile_md_has_no_old_name():
     # The agent's profile.md doesn't reference the old name at all —
     # the rewrite is a no-op (0 replacements) but the reload.flag still
     # fires because agent.yml's display_name changed and we want the
@@ -571,7 +570,7 @@ async def test_puf294_rename_drops_reload_flag_even_when_profile_md_has_no_old_n
     assert flag_path.exists()
 
 
-async def test_puf294_rename_handles_cjk_display_names():
+async def test_rename_handles_cjk_display_names():
     # Family-ops fleet uses CJK names; rewrite must work without \b
     # word boundaries (which don't fire between CJK characters).
     user = make_user()
@@ -603,7 +602,7 @@ async def test_puf294_rename_handles_cjk_display_names():
     assert body.count("山田") == 2
 
 
-async def test_puf294_rename_doesnt_overreach_other_fields():
+async def test_rename_doesnt_overreach_other_fields():
     # Renaming via PATCH should NOT clobber operator-edited
     # profile.md sections that don't reference the old name. Regression
     # guard: the rewrite is a literal substring replace, not a profile
@@ -640,7 +639,7 @@ async def test_puf294_rename_doesnt_overreach_other_fields():
     assert "force-pushes to main" in body
 
 
-async def test_puf294_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
+async def test_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
     # PR #82 polish: the rename PATCH must still return 200 even when
     # the reload.flag write hits a transient OSError (read-only
     # workspace / disk-full / cross-uid ``.puffo-agent/``). The agent
@@ -687,7 +686,7 @@ async def test_puf294_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
     assert "Resilient Bot" in (agent_dir / "profile.md").read_text(encoding="utf-8")
 
 
-async def test_puf294_substring_replace_is_intentional_design():
+async def test_substring_replace_is_intentional_design():
     # PR #82 polish: pin the substring-replace contract — the known
     # "Bob → Robert inside Bobcat rewrites to Robertcat" limit is
     # *intentional* (so CJK names work without word boundaries). A

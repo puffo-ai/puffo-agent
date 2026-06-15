@@ -1,4 +1,4 @@
-"""PUF-294 (FB-294) — ``rewrite_profile_name`` helper unit coverage.
+"""``rewrite_profile_name`` helper unit coverage.
 
 Sync tests live in their own module so they don't pick up
 ``test_bridge_handlers.py``'s file-level ``pytest.mark.asyncio`` mark.
