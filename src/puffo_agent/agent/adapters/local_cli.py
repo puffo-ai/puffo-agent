@@ -129,6 +129,28 @@ def _sanitise_permission_mode(mode: str, agent_id: str) -> str:
     return "bypassPermissions"
 
 
+VALID_SANDBOX_MODES = frozenset({
+    "read-only",
+    "workspace-write",
+    "danger-full-access",
+})
+
+
+def _sanitise_sandbox(mode: str, agent_id: str) -> str:
+    """Validate ``mode`` against codex's sandbox set; unknown values
+    fall back to ``danger-full-access`` (the prior hardcoded default)
+    with a WARNING."""
+    if mode in VALID_SANDBOX_MODES:
+        return mode
+    if mode:
+        logger.warning(
+            "agent %s: sandbox %r is not a valid codex sandbox — "
+            "falling back to 'danger-full-access'. valid: %s",
+            agent_id, mode, sorted(VALID_SANDBOX_MODES),
+        )
+    return "danger-full-access"
+
+
 class LocalCLIAdapter(Adapter):
     def __init__(
         self,
@@ -141,6 +163,7 @@ class LocalCLIAdapter(Adapter):
         agent_home_dir: str,
         owner_username: str = "",
         permission_mode: str = "default",
+        sandbox: str = "danger-full-access",
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
@@ -160,6 +183,7 @@ class LocalCLIAdapter(Adapter):
         self.agent_home_dir = Path(agent_home_dir)
         self.owner_username = owner_username
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
+        self.sandbox = _sanitise_sandbox(sandbox, agent_id)
         self.desired_skills = list(desired_skills or [])
         self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
@@ -382,6 +406,7 @@ class LocalCLIAdapter(Adapter):
             cwd=self.workspace_dir,
             env=env,
             permission_mode=self.permission_mode,
+            sandbox=self.sandbox,
             model=self.model,
         )
         return self._codex_session

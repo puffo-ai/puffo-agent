@@ -185,6 +185,7 @@ class CodexSession:
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         permission_mode: str = "bypassPermissions",
+        sandbox: str = "danger-full-access",
         model: str = "",
     ):
         self.agent_id = agent_id
@@ -196,6 +197,7 @@ class CodexSession:
         # The plan's v1 stance — other modes are deferred until the
         # permission-proxy DM flow is ready for codex too.
         self.permission_mode = permission_mode
+        self.sandbox = sandbox
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
@@ -600,16 +602,17 @@ class CodexSession:
         # live behaviour. Puffo trust model = operator vouches for the
         # agent + machine, all tools allowed.
         #
-        # ``sandbox: "danger-full-access"`` removes codex's in-process
-        # sandbox. cli-local runs as the operator's UID anyway —
-        # codex's sandbox is mostly cosmetic here. (cli-docker will
-        # keep this when supported; the container is the boundary.)
+        # ``sandbox`` is codex's sandbox policy (read-only |
+        # workspace-write | danger-full-access), per-agent via agent.yml.
+        # Default keeps it fully open — cli-local runs as the operator's
+        # UID, so codex's in-process sandbox is mostly cosmetic; the real
+        # boundary is cli-docker's container.
         new_conv_params: dict[str, Any] = {
             "cwd": self.cwd or os.getcwd(),
             "approvalPolicy": (
                 "never" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),
-            "sandbox": "danger-full-access",
+            "sandbox": self.sandbox,
         }
         if self.model:
             new_conv_params["model"] = self.model

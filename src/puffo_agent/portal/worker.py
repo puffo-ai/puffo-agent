@@ -228,6 +228,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             agent_home_dir=str(agent_home_dir(agent_cfg.id)),
             owner_username=operator,
             permission_mode=agent_cfg.runtime.permission_mode,
+            sandbox=agent_cfg.runtime.sandbox,
             harness=harness,
             desired_skills=agent_cfg.desired_skills,
             desired_mcps=agent_cfg.desired_mcps,
