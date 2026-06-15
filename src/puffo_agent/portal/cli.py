@@ -41,6 +41,7 @@ from .state import (
     docker_shared_dir,
     home_dir,
     is_daemon_alive,
+    is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
     write_refresh_token_request,
@@ -162,13 +163,35 @@ def is_outdated(local: str, remote: str) -> bool:
         return False
 
 
+def _is_uv_tool_install() -> bool:
+    """True when puffo-agent was installed via ``uv tool install``.
+
+    Detected by ``sys.prefix`` landing under uv's tool store
+    (``~/.local/share/uv/tools/puffo-agent/`` on POSIX,
+    ``%APPDATA%\\uv\\tools\\puffo-agent\\`` on Windows). Users on
+    uv-managed Python hit PEP 668 ``externally-managed-environment``
+    on ``pip install`` — the right upgrade command for them is
+    ``uv tool install puffo-agent --force`` (FB-261, PUF-302).
+    """
+    import sys
+    prefix = sys.prefix.replace("\\", "/")
+    return "/uv/tools/" in prefix
+
+
 def upgrade_command_for_install_mode() -> str:
-    """Suggested upgrade command for the current install mode."""
+    """Suggested upgrade command for the current install mode.
+
+    PUF-302: branches on uv-tool install detection so the FB-261
+    recurrence cohort sees the right command instead of the pip path
+    that PEP 668 rejects.
+    """
     if is_source_install():
         return (
             "pip install --upgrade --user "
             "'git+https://github.com/puffo-ai/puffo-agent.git'"
         )
+    if _is_uv_tool_install():
+        return "uv tool install puffo-agent --force"
     return "pip install --upgrade puffo-agent"
 
 
@@ -259,12 +282,20 @@ def cmd_stop(args: argparse.Namespace) -> int:
     The signal-file path is required on Windows where the proactor
     loop doesn't accept ``add_signal_handler(SIGTERM)``; without this
     only ``taskkill /F`` would work, leaving containers running.
+
+    PUF-302 (FB-261 Issue 2): poll the SPECIFIC pid we asked to stop,
+    not ``is_daemon_alive()`` which re-reads the pid file each tick.
+    On upgrade, the pid file gets overwritten by a NEW daemon
+    mid-poll — the old code would then report "daemon still running
+    (pid=<old>)" while pid=<old> was already gone and pid=<new> was
+    a freshly-started daemon. Now we track the original pid + detect
+    the daemon-swap explicitly.
     """
     pid = read_daemon_pid()
     if pid is None:
         print("daemon: not running")
         return 0
-    if not is_daemon_alive():
+    if not is_pid_alive(pid):
         print(f"daemon: not running (stale pid file at {daemon_pid_path()})")
         clear_daemon_pid()
         return 0
@@ -273,9 +304,19 @@ def cmd_stop(args: argparse.Namespace) -> int:
     print(f"requested daemon shutdown (pid={pid}); waiting up to {args.timeout}s...")
     deadline = time.time() + max(1, args.timeout)
     while time.time() < deadline:
-        if not is_daemon_alive():
+        if not is_pid_alive(pid):
             clear_stop_request()
-            print("daemon stopped")
+            # A NEW daemon may have taken over mid-poll — surface
+            # that so the user understands their original daemon
+            # exited even though a new one is running now.
+            new_pid = read_daemon_pid()
+            if new_pid is not None and new_pid != pid and is_pid_alive(new_pid):
+                print(
+                    f"daemon stopped (pid={pid}); a new daemon has since "
+                    f"started (pid={new_pid})"
+                )
+            else:
+                print("daemon stopped")
             return 0
         time.sleep(1)
 

@@ -40,12 +40,26 @@ message keys, ed25519-signed events, structured AAD, and
 
 ## Install
 
+If you manage Python with `uv` (uv-managed interpreter, common on
+macOS via Homebrew + uv), use the `uv tool` path — `pip install`
+fails with PEP 668 `externally-managed-environment` on uv-managed
+Python:
+
+```bash
+uv tool install puffo-agent
+```
+
+Otherwise use pip:
+
 ```bash
 pip install puffo-agent
 ```
 
-Installs the `puffo-agent` console script. For contributors working
-from a source checkout:
+Both paths install the `puffo-agent` console script. The CLI's
+`check-update` command detects which way you installed and prints
+the matching upgrade command, so you don't have to remember.
+
+For contributors working from a source checkout:
 
 ```bash
 git clone https://github.com/puffo-ai/puffo-agent.git
@@ -55,8 +69,9 @@ pip install -e ".[dev]"
 
 ## First-time setup
 
-There isn't one — `pip install puffo-agent` then `puffo-agent start`
-is the whole install-and-go path. The daemon lazy-creates
+There isn't one — install (via `uv tool install puffo-agent` or
+`pip install puffo-agent`) then `puffo-agent start` is the whole
+install-and-go path. The daemon lazy-creates
 `~/.puffo-agent/` on first run and ships sensible defaults (server
 `https://api.puffo.ai`, provider `anthropic`).
 

@@ -459,10 +459,18 @@ def _worker_needs_restart(old, new) -> bool:
 
 async def run_daemon() -> int:
     # Single-daemon enforcement.
+    #
+    # PUF-302 (FB-261 Issue 2): exit 0 rather than 1 when a daemon
+    # is already running. The user ran ``puffo-agent start`` to GET
+    # a running daemon — if one exists, their intent is met. Exit 1
+    # framed this as an error and surfaced in upgrade flows where
+    # the new daemon had auto-spawned before the user's manual start
+    # command landed. The enforcement is unchanged (we still don't
+    # spawn a second daemon); only the exit code + framing soften.
     if is_daemon_alive():
         pid = read_daemon_pid()
-        logger.error("another daemon is already running (pid=%s)", pid)
-        return 1
+        logger.info("puffo-agent daemon already running (pid=%s)", pid)
+        return 0
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)
