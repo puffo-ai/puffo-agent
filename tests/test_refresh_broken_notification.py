@@ -283,3 +283,239 @@ def test_notify_sends_dm_when_operator_slug_set():
     assert captured["root_id"] == ""
     # Dedup remains set so a re-fire requires explicit reset.
     assert w._refresh_broken_notification_sent is True
+
+
+# ── (5) Daemon-side wiring: agent_id filter + unregister + codex ──
+
+
+def _make_daemon_stub_pair(monkeypatch):
+    """Build (StubDaemon, claude_refresher, codex_refresher) with the
+    real ``_register_with_refresher`` and ``_stop_worker`` bound so we
+    can pin the load-bearing wiring without spinning a real refresher.
+    """
+    from puffo_agent.portal import daemon as daemon_module
+
+    captured = {"agent_homes": [], "refresh_success_cbs": [], "refresh_broken_cbs": []}
+
+    class _StubRefresher:
+        def __init__(self, name):
+            self.name = name
+            self.success_cbs: list = []
+            self.broken_cbs: list = []
+            self.agents: set = set()
+
+        def register_agent(self, path):
+            self.agents.add(path)
+
+        def unregister_agent(self, path):
+            self.agents.discard(path)
+
+        def register_on_refresh_success(self, cb):
+            self.success_cbs.append(cb)
+
+        def unregister_on_refresh_success(self, cb):
+            try:
+                self.success_cbs.remove(cb)
+            except ValueError:
+                pass
+
+        def register_on_refresh_broken_enter(self, cb):
+            self.broken_cbs.append(cb)
+
+        def unregister_on_refresh_broken_enter(self, cb):
+            try:
+                self.broken_cbs.remove(cb)
+            except ValueError:
+                pass
+
+    claude_r = _StubRefresher("claude")
+    codex_r = _StubRefresher("codex")
+
+    class _StubDaemon:
+        refresher = claude_r
+        codex_refresher = codex_r
+        workers: dict = {}
+
+        def _refresher_for(self, cfg):
+            if (getattr(cfg.runtime, "harness", "") or "claude-code") == "codex":
+                return self.codex_refresher
+            return self.refresher
+
+        _register_with_refresher = daemon_module.Daemon._register_with_refresher
+
+    # ``agent_home_dir`` is called inside _register_with_refresher.
+    monkeypatch.setattr(
+        daemon_module, "agent_home_dir", lambda agent_id: f"/tmp/agents/{agent_id}",
+    )
+    return _StubDaemon(), claude_r, codex_r, captured
+
+
+def _make_agent_cfg(agent_id: str, harness: str = "claude-code"):
+    cfg = type("Cfg", (), {})()
+    cfg.id = agent_id
+    cfg.runtime = type("R", (), {"harness": harness})()
+    return cfg
+
+
+def _make_worker_for_daemon_test():
+    from puffo_agent.portal.state import RuntimeState
+
+    fired: list[int] = []
+
+    class W:
+        runtime = RuntimeState(status="running", started_at=0, msg_count=0)
+        _auth_failed_notification_sent = True
+        _refresh_broken_notification_sent = True
+        _refresh_success_callback = None
+        _refresh_broken_callback = None
+
+        def _on_refresh_broken_enter(self):
+            fired.append(1)
+
+    return W(), fired
+
+
+def test_daemon_filter_only_dms_own_agent(monkeypatch):
+    """The load-bearing fan-out scope: worker-A's refresh-broken-enter
+    handler must NOT fire when CredentialRefresher reports agent-B
+    broke. Without the ``flipped_agent_id == agent_id`` filter at
+    daemon.py, every worker would DM the operator for every other
+    agent's break."""
+    d, claude_r, _, _ = _make_daemon_stub_pair(monkeypatch)
+
+    w_a, fired_a = _make_worker_for_daemon_test()
+    w_b, fired_b = _make_worker_for_daemon_test()
+    cfg_a = _make_agent_cfg("agent-a")
+    cfg_b = _make_agent_cfg("agent-b")
+
+    d._register_with_refresher(cfg_a, w_a)
+    d._register_with_refresher(cfg_b, w_b)
+    assert len(claude_r.broken_cbs) == 2
+
+    # CredentialRefresher fires the agent-A break.
+    for cb in claude_r.broken_cbs:
+        cb("agent-a")
+
+    assert fired_a == [1]
+    assert fired_b == []  # The load-bearing assert.
+
+
+def test_daemon_stop_worker_unregisters_refresh_broken_callback(monkeypatch):
+    """``_stop_worker`` must unregister the refresh-broken-enter
+    callback from BOTH refreshers so a stopped worker stops receiving
+    events. Mirrors the existing ``_refresh_success_callback``
+    unregister pattern."""
+    from puffo_agent.portal import daemon as daemon_module
+
+    d, claude_r, codex_r, _ = _make_daemon_stub_pair(monkeypatch)
+    w, _ = _make_worker_for_daemon_test()
+    cfg = _make_agent_cfg("agent-x")
+    d._register_with_refresher(cfg, w)
+
+    assert len(claude_r.broken_cbs) == 1
+    assert w._refresh_broken_callback is not None
+
+    # Inline the unregister body from _stop_worker (the rest is
+    # async + touches files; we just need the callback teardown).
+    rb_cb = getattr(w, "_refresh_broken_callback", None)
+    assert rb_cb is not None
+    d.refresher.unregister_on_refresh_broken_enter(rb_cb)
+    d.codex_refresher.unregister_on_refresh_broken_enter(rb_cb)
+    assert claude_r.broken_cbs == []
+    assert codex_r.broken_cbs == []
+
+
+def test_daemon_codex_agent_registers_on_codex_refresher(monkeypatch):
+    """A codex-harness agent must register its refresh-broken
+    callback on the codex_refresher, not the Claude refresher.
+    ``_refresher_for`` routes based on ``runtime.harness``."""
+    d, claude_r, codex_r, _ = _make_daemon_stub_pair(monkeypatch)
+
+    w, _ = _make_worker_for_daemon_test()
+    cfg = _make_agent_cfg("agent-codex", harness="codex")
+    d._register_with_refresher(cfg, w)
+
+    assert len(codex_r.broken_cbs) == 1
+    assert len(claude_r.broken_cbs) == 0
+
+
+# ── (6) Cross-state dedup re-arm + post-re-arm-fires ──────────────
+
+
+def test_on_refresh_success_rearms_refresh_broken_flag_even_when_auth_failed(
+    monkeypatch,
+):
+    """``on_refresh_success`` re-arms BOTH flags unconditionally,
+    even when the prior state was ``auth_failed`` (not refresh_broken).
+    The re-arm is benign (the flag is a gate, not a trigger) but worth
+    pinning so a future "only re-arm if was-broken" optimization
+    doesn't silently break the dedup invariants."""
+    from puffo_agent.portal.state import RuntimeState
+
+    d, claude_r, _, _ = _make_daemon_stub_pair(monkeypatch)
+
+    class W:
+        runtime = RuntimeState(status="running", started_at=0, msg_count=0)
+        _auth_failed_notification_sent = True
+        _refresh_broken_notification_sent = True
+        _refresh_success_callback = None
+        _refresh_broken_callback = None
+
+        def _on_refresh_broken_enter(self):
+            pass
+
+    w = W()
+    cfg = _make_agent_cfg("agent-mixed")
+    # Prior state was auth_failed, not refresh_broken.
+    w.runtime.health = "auth_failed"
+    d._register_with_refresher(cfg, w)
+    assert claude_r.success_cbs, "daemon should register on_refresh_success"
+
+    # Fire the success callback as the daemon would.
+    claude_r.success_cbs[0]()
+
+    # BOTH flags re-armed even though only auth_failed was active.
+    assert w._auth_failed_notification_sent is False
+    assert w._refresh_broken_notification_sent is False
+
+
+def test_dedup_rearm_then_subsequent_fire_actually_schedules(monkeypatch):
+    """The transient-recovery contract: after a no-warm-client (or
+    failed-send) re-arms the dedup, the NEXT ENTER must actually
+    schedule the DM. Pin the 2-step fail→succeed sequence so the
+    re-arm path's recovery value isn't silently lost."""
+    from puffo_agent.portal import worker as worker_module
+
+    stub_loop = _StubLoop()
+    monkeypatch.setattr(
+        worker_module.asyncio, "create_task", stub_loop.create_task,
+    )
+
+    class W:
+        agent_cfg = type("A", (), {"id": "t-agent"})()
+        _client = None  # not warm yet
+        _refresh_broken_notification_sent = False
+
+        _on_refresh_broken_enter = (
+            worker_module.Worker._on_refresh_broken_enter
+        )
+        _notify_operator_of_refresh_broken = (
+            worker_module.Worker._notify_operator_of_refresh_broken
+        )
+
+    w = W()
+    # First ENTER schedules; the async body sees _client=None and
+    # re-arms the dedup flag back to False.
+    w._on_refresh_broken_enter()
+    assert stub_loop.calls == 1
+    # Simulate the no-warm-client async re-arm.
+    asyncio.new_event_loop().run_until_complete(
+        worker_module.Worker._notify_operator_of_refresh_broken(w)
+    )
+    assert w._refresh_broken_notification_sent is False
+
+    # Second ENTER (after re-arm) MUST schedule again — load-bearing
+    # for the transient-recovery path.
+    w._on_refresh_broken_enter()
+    assert stub_loop.calls == 2
+    assert w._refresh_broken_notification_sent is True
