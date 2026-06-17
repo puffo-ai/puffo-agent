@@ -341,9 +341,27 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def whoami() -> str:
-        """Return your own identity: slug, device_id, and subkey info."""
+        """Return your own identity: display name, slug, device_id, and
+        subkey info."""
         identity = cfg.keystore.load_identity(cfg.slug)
-        lines = [
+        lines = []
+        # display_name lives on the server (the local keystore only has
+        # the slug); fetch best-effort so whoami still works if offline.
+        try:
+            data = await cfg.http_client.get(
+                "/identities/profiles?slugs="
+                f"{urllib.parse.quote(cfg.slug, safe='')}"
+            )
+            profiles = data.get("profiles", []) if isinstance(data, dict) else []
+            display_name = (
+                (profiles[0].get("display_name") or "").strip()
+                if profiles else ""
+            )
+            if display_name:
+                lines.append(f"display_name: {display_name}")
+        except Exception as exc:
+            logger.warning("whoami: failed to fetch own display_name: %s", exc)
+        lines += [
             f"slug:      {identity.slug}",
             f"device_id: {identity.device_id}",
             f"server:    {identity.server_url}",

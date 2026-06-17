@@ -30,7 +30,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   UI now rewrites the agent's `profile.md` with the new display name and
   signals the worker to re-assemble its system prompt on the next
   message — so the agent stops referring to itself by the old name
-  without an operator workaround.
+  without an operator workaround. The `whoami` tool now also reports the
+  agent's current display name.
 
 ## [0.12.4] — 2026-06-12
 
