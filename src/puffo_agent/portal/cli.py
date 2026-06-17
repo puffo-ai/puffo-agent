@@ -164,27 +164,18 @@ def is_outdated(local: str, remote: str) -> bool:
 
 
 def _is_uv_tool_install() -> bool:
-    """True when puffo-agent was installed via ``uv tool install``.
-
-    Detected by ``sys.prefix`` landing under uv's tool store
-    (``~/.local/share/uv/tools/puffo-agent/`` on POSIX,
-    ``%APPDATA%\\uv\\tools\\puffo-agent\\`` on Windows). Users on
-    uv-managed Python hit PEP 668 ``externally-managed-environment``
-    on ``pip install`` — the right upgrade command for them is
-    ``uv tool install puffo-agent --force`` (FB-261, PUF-302).
+    """True when puffo-agent was installed via ``uv tool install``,
+    detected by ``sys.prefix`` landing under uv's tool store
+    (``.../uv/tools/puffo-agent/``). Those users hit PEP 668
+    ``externally-managed-environment`` on ``pip install``, so their
+    upgrade command is ``uv tool install puffo-agent --force``.
     """
-    import sys
     prefix = sys.prefix.replace("\\", "/")
     return "/uv/tools/" in prefix
 
 
 def upgrade_command_for_install_mode() -> str:
-    """Suggested upgrade command for the current install mode.
-
-    PUF-302: branches on uv-tool install detection so the FB-261
-    recurrence cohort sees the right command instead of the pip path
-    that PEP 668 rejects.
-    """
+    """Suggested upgrade command for the current install mode."""
     if is_source_install():
         return (
             "pip install --upgrade --user "
@@ -283,13 +274,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
     loop doesn't accept ``add_signal_handler(SIGTERM)``; without this
     only ``taskkill /F`` would work, leaving containers running.
 
-    PUF-302 (FB-261 Issue 2): poll the SPECIFIC pid we asked to stop,
-    not ``is_daemon_alive()`` which re-reads the pid file each tick.
-    On upgrade, the pid file gets overwritten by a NEW daemon
-    mid-poll — the old code would then report "daemon still running
-    (pid=<old>)" while pid=<old> was already gone and pid=<new> was
-    a freshly-started daemon. Now we track the original pid + detect
-    the daemon-swap explicitly.
+    Polls the specific pid we asked to stop (not the pid file, which a
+    new daemon can overwrite mid-upgrade), so a daemon-swap is reported
+    as such instead of as "still running".
     """
     pid = read_daemon_pid()
     if pid is None:
@@ -306,9 +293,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
     while time.time() < deadline:
         if not is_pid_alive(pid):
             clear_stop_request()
-            # A NEW daemon may have taken over mid-poll — surface
-            # that so the user understands their original daemon
-            # exited even though a new one is running now.
+            # A new daemon may have taken the pid file mid-poll — say so,
+            # rather than a bare "stopped".
             new_pid = read_daemon_pid()
             if new_pid is not None and new_pid != pid and is_pid_alive(new_pid):
                 print(

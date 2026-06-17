@@ -1,14 +1,7 @@
-"""PUF-302 (FB-261 Issue 2): cmd_stop tracks the specific pid it
-asked to stop, not "whatever's in the pid file right now."
-
-Before the fix: on upgrade, the pid file swaps to the new daemon's
-pid mid-poll; cmd_stop's ``is_daemon_alive()`` then says True for
-the new pid while the warning still cites the original pid. Result:
-"warning: daemon still running after 60s (pid=<old>)" while the old
-process exited long ago and a fresh daemon is healthy.
-
-After the fix: cmd_stop polls ``is_pid_alive(original_pid)`` and
-surfaces the daemon-swap explicitly in the success path.
+"""cmd_stop tracks the specific pid it asked to stop, not whatever's in
+the pid file. On upgrade the pid file swaps to a new daemon mid-poll;
+tracking the original pid lets cmd_stop report the swap instead of a
+misleading "still running (pid=<old>)".
 """
 from __future__ import annotations
 

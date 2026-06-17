@@ -458,28 +458,14 @@ def _worker_needs_restart(old, new) -> bool:
 
 
 async def run_daemon() -> int:
-    # Single-daemon enforcement.
-    #
-    # PUF-302 (FB-261 Issue 2): exit 0 rather than 1 when a daemon
-    # is already running. The user ran ``puffo-agent start`` to GET
-    # a running daemon — if one exists, their intent is met. Exit 1
-    # framed this as an error and surfaced in upgrade flows where
-    # the new daemon had auto-spawned before the user's manual start
-    # command landed. The enforcement is unchanged (we still don't
-    # spawn a second daemon); only the exit code + framing soften.
-    #
-    # Intentional: the soft-exit fires even when the running daemon
-    # is at a different version than this process would have started.
-    # Bridge-side version-query would be needed to discriminate;
-    # that's out of scope here. ``puffo-agent stop && start`` is the
-    # supported version-swap path. Run ``puffo-agent status`` /
-    # ``puffo-agent version`` if you need to confirm what's running.
+    # Single-daemon enforcement. ``start`` against an already-running
+    # daemon exits 0 (the user wanted a running daemon; one exists) —
+    # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
+    # we never spawn a second daemon. A different running version isn't
+    # discriminated here; ``stop && start`` is the version-swap path.
     if is_daemon_alive():
         pid = read_daemon_pid()
-        # Both ``logger.info`` AND ``print`` because background /
-        # tray runners may not surface INFO logs to the user, and
-        # the "already running" framing is load-bearing for the
-        # upgrade-flow UX.
+        # print + log: background / tray runners may not surface INFO.
         msg = f"puffo-agent daemon already running (pid={pid})"
         logger.info(msg)
         print(msg)

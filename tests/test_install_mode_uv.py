@@ -1,9 +1,7 @@
-"""PUF-302: uv-tool install detection + upgrade-command branching.
+"""uv-tool install detection + upgrade-command branching.
 
-FB-261 Issue 1 recurrence: users on uv-managed Python hit PEP 668
-``externally-managed-environment`` on ``pip install puffo-agent``.
-The fix detects uv-tool install at runtime so ``check-update`` and
-``version`` surface the matching install command.
+Users on uv-managed Python hit PEP 668 ``externally-managed-environment``
+on ``pip install``; runtime detection picks the matching upgrade command.
 """
 from __future__ import annotations
 

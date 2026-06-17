@@ -1269,12 +1269,11 @@ def is_daemon_alive() -> bool:
 
 
 def is_pid_alive(pid: int) -> bool:
-    """PUF-302: True iff ``pid`` is a live puffo-agent daemon process.
+    """True iff ``pid`` is a live puffo-agent daemon process.
 
-    Unlike ``is_daemon_alive()``, this checks a SPECIFIC pid passed
-    by the caller — so a ``cmd_stop`` polling loop can track the
-    daemon it asked to stop instead of "whatever's in the pid file
-    right now," which can swap mid-poll on upgrade (FB-261 Issue 2).
+    Unlike ``is_daemon_alive()``, this checks a SPECIFIC pid the caller
+    holds — so a ``cmd_stop`` poll tracks the daemon it asked to stop
+    instead of whatever's in the pid file, which can swap mid-upgrade.
     """
     return _is_puffo_agent_process(pid)
 

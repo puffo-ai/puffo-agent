@@ -1,10 +1,6 @@
-"""PUF-302 (FB-261 Issue 2): run_daemon's already-running path now
-returns exit 0 with an info log, not exit 1 with an error log.
-
-The user ran ``puffo-agent start`` to GET a running daemon — if
-one's already there, their intent is met. Single-daemon enforcement
-is unchanged (we don't spawn a second); only the exit code + log
-level + message softens.
+"""run_daemon's already-running path returns exit 0 (info log), not
+exit 1 (error). ``start`` against a live daemon meets the user's intent;
+single-daemon enforcement is unchanged.
 """
 from __future__ import annotations
 
@@ -24,8 +20,8 @@ class TestRunDaemonAlreadyRunning:
         assert rc == 0
 
     def test_logs_at_info_not_error_when_already_running(self, caplog):
-        # Before PUF-302 this was logger.error → exit 1, surfaced in
-        # the upgrade-flow UX as a confusing failure. Now logger.info.
+        # An already-running daemon is the user's intent, not an error —
+        # log at INFO, not ERROR.
         with patch("puffo_agent.portal.daemon.is_daemon_alive", return_value=True), \
              patch("puffo_agent.portal.daemon.read_daemon_pid", return_value=4242), \
              caplog.at_level(logging.INFO):
@@ -44,9 +40,8 @@ class TestRunDaemonAlreadyRunning:
         assert any("4242" in r.message for r in caplog.records)
 
     def test_message_also_prints_to_stdout_for_background_runners(self, capsys):
-        """PUF-302 polish: tray + background runners may not surface
-        INFO logs to the user. The "already running" message also
-        goes to stdout so the user always sees it (Solution QA #4)."""
+        """tray + background runners may not surface INFO logs, so the
+        "already running" message also goes to stdout."""
         with patch("puffo_agent.portal.daemon.is_daemon_alive", return_value=True), \
              patch("puffo_agent.portal.daemon.read_daemon_pid", return_value=4242):
             asyncio.run(run_daemon())
