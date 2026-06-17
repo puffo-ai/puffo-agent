@@ -459,14 +459,10 @@ def _worker_needs_restart(old, new) -> bool:
 
 
 def _install_posix_stop_handlers(loop, handle_signal) -> bool:
-    """Wire SIGINT/SIGTERM to ``handle_signal`` via the asyncio loop;
-    return whether it succeeded.
-
-    No-op (``False``) off the main thread: ``add_signal_handler`` →
-    ``signal.set_wakeup_fd`` raises ``RuntimeError`` there, which is the
-    Linux/macOS ``--ui`` / ``--background`` case (the daemon runs in
-    DaemonThread while Qt holds the main thread). Those modes stop via
-    the file sentinel, so skipping the asyncio signal route is fine.
+    """Install SIGINT/SIGTERM via the asyncio loop; return whether it
+    did. No-op off the main thread, where ``add_signal_handler`` →
+    ``set_wakeup_fd`` raises (the ``--ui`` / ``--background`` DaemonThread
+    case — those stop via the file sentinel instead).
     """
     if threading.current_thread() is not threading.main_thread():
         return False
