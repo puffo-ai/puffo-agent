@@ -315,12 +315,15 @@ def _maybe_redact_long_text(
 _MAX_IMAGE_EDGE_PX = 1568
 
 
-def _downscale_oversized_image(path) -> None:
+def _downscale_oversized_image(path, original_path=None) -> None:
     """Resize ``path`` in place if it's an image whose longest edge
-    tops ``_MAX_IMAGE_EDGE_PX``. No-op for non-images, small images,
-    or anything Pillow can't open (claude-code's loader can't open
-    it either, so it can't reach the API as an oversized image).
-    Best-effort — never raises."""
+    tops ``_MAX_IMAGE_EDGE_PX``. When ``original_path`` is supplied
+    AND the resize is actually about to fire, the pre-resize bytes
+    are copied there first so the agent's file-access tools can
+    reach the full-fidelity version while the LLM-payload version
+    stays under the cap. No-op (and no copy) for non-images, small
+    images, or anything Pillow can't open. Best-effort — never
+    raises."""
     try:
         from PIL import Image
     except ImportError:
@@ -337,6 +340,12 @@ def _downscale_oversized_image(path) -> None:
             longest = max(w, h)
             if longest <= _MAX_IMAGE_EDGE_PX:
                 return
+            if original_path is not None:
+                import shutil
+                from pathlib import Path
+                op = Path(original_path)
+                op.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, op)
             scale = _MAX_IMAGE_EDGE_PX / longest
             new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
             fmt = img.format or "PNG"
@@ -3088,8 +3097,12 @@ class PuffoCoreMessageClient:
                 continue
             # Shrink oversized images before the agent can Read them
             # into — and poison — its claude session. Off-loop: Pillow
-            # decode/resize is blocking.
-            await asyncio.to_thread(_downscale_oversized_image, target)
+            # decode/resize is blocking. ``original/<name>`` keeps the
+            # full-fidelity copy for the agent's file-access tools.
+            original = target.parent / "original" / target.name
+            await asyncio.to_thread(
+                _downscale_oversized_image, target, original,
+            )
             paths.append(str(target))
         return paths
 
