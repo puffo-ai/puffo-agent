@@ -46,6 +46,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   reports a daemon swap explicitly when a new daemon takes over
   mid-shutdown, and `puffo-agent start` against an already-running
   daemon now exits 0 (the user's intent is met) instead of erroring.
+- **The operator is DM'd when an agent's credential refresh breaks.**
+  When the daemon can't roll a Claude/Codex token (refresh keeps
+  failing), the agent now DMs its operator bilingual recovery
+  instructions (run `claude auth login`) — once per episode — mirroring
+  the existing auth-failed notification. A manual re-login clears the
+  state on the agent's next turn instead of waiting for the next poll.
 
 ## [0.12.4] — 2026-06-12
 

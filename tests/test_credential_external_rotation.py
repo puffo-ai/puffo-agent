@@ -121,6 +121,9 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
         def register_on_refresh_success(self, cb):
             self.callback = cb
 
+        def register_on_refresh_broken_enter(self, cb):
+            self.refresh_broken_callback = cb
+
     class _StubAgentCfg:
         id = "t-agent"
 
