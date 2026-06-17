@@ -1100,6 +1100,35 @@ def rebuild_agent_claude_md(
     return claude_md
 
 
+def rewrite_profile_name(
+    profile_path: Path, old_name: str, new_name: str,
+) -> int:
+    """Replace whole-token occurrences of ``old_name`` with ``new_name``
+    in ``profile.md`` (the prose CLAUDE.md / AGENTS.md / GEMINI.md are
+    assembled from). Returns the replacement count.
+
+    Matched only when not flanked by ASCII word characters, so
+    "Bob"→"Robert" leaves "Bobcat" alone but still hits "Bob's". The
+    boundary is ASCII-only (not ``\\b``, which never separates CJK
+    characters), so CJK display names still match. No-op (0) on
+    empty/equal names or a missing/unreferenced profile.
+    """
+    if not old_name or not new_name or old_name == new_name:
+        return 0
+    try:
+        text = profile_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9_]){re.escape(old_name)}(?![A-Za-z0-9_])"
+    )
+    new_text, count = pattern.subn(new_name, text)
+    if count == 0:
+        return 0
+    profile_path.write_text(new_text, encoding="utf-8")
+    return count
+
+
 # First line of the default shared primer. Used to identify
 # previously-generated managed CLAUDE.md files so the worker can
 # safely remove stale managed copies without touching agent-authored

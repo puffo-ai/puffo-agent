@@ -26,6 +26,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the agent went quiet. The session now tears down + respawns to
   re-establish a thread, and a turn aborts loudly rather than send an
   empty `threadId`.
+- **Renaming an agent updates its own self-knowledge.** A rename via the
+  UI now rewrites the agent's `profile.md` with the new display name and
+  signals the worker to re-assemble its system prompt on the next
+  message — so the agent stops referring to itself by the old name
+  without an operator workaround. The `whoami` tool now also reports the
+  agent's current display name.
+- **`--background` / `--ui` mode no longer crashes on Linux/macOS.** The
+  daemon installs SIGINT/SIGTERM via the asyncio loop, which calls
+  `signal.set_wakeup_fd` — only allowed on the main thread. In `--ui` /
+  `--background` the daemon runs in a child thread (Qt owns the main
+  thread), so this raised `RuntimeError` at startup. POSIX handlers are
+  now installed only when on the main thread; those modes stop via the
+  existing file sentinel.
 
 ## [0.12.4] — 2026-06-12
 

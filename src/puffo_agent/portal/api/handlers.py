@@ -22,6 +22,7 @@ from aiohttp import web
 
 from ...crypto.http_auth import VerifyError, is_timestamp_fresh, verify_request
 from ...crypto.encoding import base64url_decode
+from ...agent.shared_content import rewrite_profile_name
 from ..state import (
     AgentConfig,
     PuffoCoreConfig,
@@ -633,6 +634,8 @@ async def update_profile(request: web.Request) -> web.Response:
         return _bad("body must be a JSON object")
 
     cfg = AgentConfig.load(agent_id)
+    # Snapshot pre-edit display_name to detect a rename post-save.
+    old_display_name = cfg.display_name
     new_display_name = payload.get("display_name")
     avatar_b64 = payload.get("avatar_bytes_b64")
     new_role = payload.get("role")
@@ -740,6 +743,44 @@ async def update_profile(request: web.Request) -> web.Response:
         "(set)" if cfg.avatar_url else "(empty)",
         cfg.role_short,
     )
+
+    # On an actual rename, rewrite profile.md (the prose CLAUDE.md /
+    # AGENTS.md are assembled from) then drop reload.flag so the worker
+    # re-assembles on its next message. Not locked — rapid renames may
+    # interleave; tolerated given UI debounce + the worker reloads
+    # whatever profile.md settles to.
+    if (
+        cfg.display_name != old_display_name
+        and old_display_name
+        and cfg.display_name
+    ):
+        replacements = rewrite_profile_name(
+            cfg.resolve_profile_path(), old_display_name, cfg.display_name,
+        )
+        flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            flag_path.write_text(
+                json.dumps({
+                    "version": 1,
+                    "requested_at": int(datetime.now(tz=timezone.utc).timestamp()),
+                    "reason": "agent rename",
+                }) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            # Flag is best-effort: agent.yml + profile.md already wrote,
+            # so a restart still picks up the new name. Don't fail PATCH.
+            logger.warning(
+                "bridge: failed to write reload.flag for agent=%s after "
+                "rename: %s (agent will pick up new name on next restart)",
+                agent_id, exc,
+            )
+        logger.info(
+            "bridge: rename agent=%s %r → %r — profile.md replacements=%d, "
+            "reload.flag written",
+            agent_id, old_display_name, cfg.display_name, replacements,
+        )
     body: dict[str, Any] = {
         "agent_id": agent_id,
         "display_name": cfg.display_name,
