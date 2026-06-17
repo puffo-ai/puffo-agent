@@ -1265,6 +1265,20 @@ def is_daemon_alive() -> bool:
     pid = read_daemon_pid()
     if pid is None:
         return False
+    return _is_puffo_agent_process(pid)
+
+
+def is_pid_alive(pid: int) -> bool:
+    """True iff ``pid`` is a live puffo-agent daemon process.
+
+    Unlike ``is_daemon_alive()``, this checks a SPECIFIC pid the caller
+    holds — so a ``cmd_stop`` poll tracks the daemon it asked to stop
+    instead of whatever's in the pid file, which can swap mid-upgrade.
+    """
+    return _is_puffo_agent_process(pid)
+
+
+def _is_puffo_agent_process(pid: int) -> bool:
     try:
         proc = psutil.Process(pid)
         tokens = [t or "" for t in proc.cmdline()]

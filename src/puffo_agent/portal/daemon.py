@@ -481,11 +481,18 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
 
 
 async def run_daemon() -> int:
-    # Single-daemon enforcement.
+    # Single-daemon enforcement. ``start`` against an already-running
+    # daemon exits 0 (the user wanted a running daemon; one exists) —
+    # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
+    # we never spawn a second daemon. A different running version isn't
+    # discriminated here; ``stop && start`` is the version-swap path.
     if is_daemon_alive():
         pid = read_daemon_pid()
-        logger.error("another daemon is already running (pid=%s)", pid)
-        return 1
+        # print + log: background / tray runners may not surface INFO.
+        msg = f"puffo-agent daemon already running (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)

@@ -41,6 +41,7 @@ from .state import (
     docker_shared_dir,
     home_dir,
     is_daemon_alive,
+    is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
     write_refresh_token_request,
@@ -162,6 +163,17 @@ def is_outdated(local: str, remote: str) -> bool:
         return False
 
 
+def _is_uv_tool_install() -> bool:
+    """True when puffo-agent was installed via ``uv tool install``,
+    detected by ``sys.prefix`` landing under uv's tool store
+    (``.../uv/tools/puffo-agent/``). Those users hit PEP 668
+    ``externally-managed-environment`` on ``pip install``, so their
+    upgrade command is ``uv tool install puffo-agent --force``.
+    """
+    prefix = sys.prefix.replace("\\", "/")
+    return "/uv/tools/" in prefix
+
+
 def upgrade_command_for_install_mode() -> str:
     """Suggested upgrade command for the current install mode."""
     if is_source_install():
@@ -169,6 +181,8 @@ def upgrade_command_for_install_mode() -> str:
             "pip install --upgrade --user "
             "'git+https://github.com/puffo-ai/puffo-agent.git'"
         )
+    if _is_uv_tool_install():
+        return "uv tool install puffo-agent --force"
     return "pip install --upgrade puffo-agent"
 
 
@@ -259,12 +273,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
     The signal-file path is required on Windows where the proactor
     loop doesn't accept ``add_signal_handler(SIGTERM)``; without this
     only ``taskkill /F`` would work, leaving containers running.
+
+    Polls the specific pid we asked to stop (not the pid file, which a
+    new daemon can overwrite mid-upgrade), so a daemon-swap is reported
+    as such instead of as "still running".
     """
     pid = read_daemon_pid()
     if pid is None:
         print("daemon: not running")
         return 0
-    if not is_daemon_alive():
+    if not is_pid_alive(pid):
         print(f"daemon: not running (stale pid file at {daemon_pid_path()})")
         clear_daemon_pid()
         return 0
@@ -273,9 +291,18 @@ def cmd_stop(args: argparse.Namespace) -> int:
     print(f"requested daemon shutdown (pid={pid}); waiting up to {args.timeout}s...")
     deadline = time.time() + max(1, args.timeout)
     while time.time() < deadline:
-        if not is_daemon_alive():
+        if not is_pid_alive(pid):
             clear_stop_request()
-            print("daemon stopped")
+            # A new daemon may have taken the pid file mid-poll — say so,
+            # rather than a bare "stopped".
+            new_pid = read_daemon_pid()
+            if new_pid is not None and new_pid != pid and is_pid_alive(new_pid):
+                print(
+                    f"daemon stopped (pid={pid}); a new daemon has since "
+                    f"started (pid={new_pid})"
+                )
+            else:
+                print("daemon stopped")
             return 0
         time.sleep(1)
 
