@@ -88,6 +88,10 @@ class PuffoCoreToolsConfig:
     # Set only on the in-process (ws-local) path, where tools run inside
     # the daemon and drive the message client directly instead of via RPC.
     message_client: Any = None
+    # cli-cloud (posture B): when set, write tools send plaintext through
+    # the Bridge (which encrypts/signs/forwards) instead of encrypting
+    # locally — the sandbox holds no keystore. See ``bridge`` package.
+    bridge_outbound: Any = None
 
 
 async def _fetch_device_keys(
@@ -409,6 +413,22 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "use the channel id (e.g. 'ch_<uuid>') or call "
                 "list_channels_in_all_spaces to look one up."
             )
+
+        # Posture B (cli-cloud): the sandbox has no keystore, so recipient
+        # resolution + encryption + signing all happen Bridge-side; we
+        # just hand it the plaintext.
+        if cfg.bridge_outbound is not None:
+            effective_visible, fold_note = _coerce_root_visibility(
+                is_visible_to_human, root_id,
+            )
+            result = await cfg.bridge_outbound.send_message(
+                channel=channel_ref,
+                text=text,
+                is_visible_to_human=effective_visible,
+                root_id=root_id,
+            )
+            envelope_id = result.get("envelope_id", "?") if isinstance(result, dict) else "?"
+            return f"posted {envelope_id} to {channel}{fold_note}"
 
         if channel_ref.startswith("@"):
             recipient_slug = channel_ref[1:]

@@ -965,7 +965,7 @@ class RuntimeConfig:
     CLI kinds only). Empty strings on ``provider`` / ``model`` /
     ``api_key`` mean "inherit from daemon defaults".
     """
-    kind: str = "chat-local"      # chat-local | sdk-local | cli-local | cli-docker
+    kind: str = "chat-local"      # chat-local | sdk-local | cli-local | cli-docker | cli-cloud | ws-local
     provider: str = ""            # empty = default for kind
     model: str = ""
     api_key: str = ""
@@ -999,6 +999,36 @@ class RuntimeConfig:
     # for short Q&A; multi-step work often needs 30-50. CLI kinds
     # delegate turn-bounding to the claude CLI itself.
     max_turns: int = 10
+    # cli-cloud only. The session token + LLM virtual key are never
+    # stored in agent.yml — they're late-bound via env on wake (see
+    # bridge.client). These two endpoints may be baked or, when empty,
+    # overlaid from env at load.
+    bridge_url: str = ""
+    llm_gateway_url: str = ""
+
+
+def _apply_cloud_late_binding(cfg: "AgentConfig") -> None:
+    """Overlay env-injected identity onto a cli-cloud agent.
+
+    Only fills fields the agent.yml left blank, so a baked value still
+    wins; the Bridge session token + LLM virtual key are read straight
+    from env at spawn and never stored here.
+    """
+    from ..bridge.client import BridgeConfig
+
+    bc = BridgeConfig.from_env()
+    if bc.agent_id and not cfg.id:
+        cfg.id = bc.agent_id
+    if bc.slug and not cfg.puffo_core.slug:
+        cfg.puffo_core.slug = bc.slug
+    if bc.space_id and not cfg.puffo_core.space_id:
+        cfg.puffo_core.space_id = bc.space_id
+    if bc.operator_slug and not cfg.puffo_core.operator_slug:
+        cfg.puffo_core.operator_slug = bc.operator_slug
+    if bc.bridge_url and not cfg.runtime.bridge_url:
+        cfg.runtime.bridge_url = bc.bridge_url
+    if bc.llm_gateway_url and not cfg.runtime.llm_gateway_url:
+        cfg.runtime.llm_gateway_url = bc.llm_gateway_url
 
 
 @dataclass
@@ -1039,7 +1069,11 @@ class AgentConfig:
 
     @classmethod
     def load(cls, agent_id: str) -> "AgentConfig":
-        from .runtime_matrix import migrate_legacy_kind, validate_triple
+        from .runtime_matrix import (
+            RUNTIME_CLI_CLOUD,
+            migrate_legacy_kind,
+            validate_triple,
+        )
 
         path = agent_yml_path(agent_id)
         with path.open("r", encoding="utf-8") as f:
@@ -1064,7 +1098,7 @@ class AgentConfig:
                 f"agent {agent_id!r}: invalid runtime config — {result.error}"
             )
 
-        return cls(
+        cfg = cls(
             id=raw.get("id", agent_id),
             state=raw.get("state", "running"),
             display_name=raw.get("display_name", ""),
@@ -1094,6 +1128,8 @@ class AgentConfig:
                 sandbox=rt.get("sandbox", "danger-full-access"),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),
+                bridge_url=rt.get("bridge_url", ""),
+                llm_gateway_url=rt.get("llm_gateway_url", ""),
             ),
             profile=raw.get("profile", "profile.md"),
             memory_dir=raw.get("memory_dir", "memory"),
@@ -1106,6 +1142,12 @@ class AgentConfig:
             desired_mcps=list(raw.get("desired_mcps") or []),
             created_at=int(raw.get("created_at", 0)),
         )
+        # cli-cloud templates ship without identity baked in — the Agent
+        # Instance Manager injects it via env on first wake. Fill any
+        # field the agent.yml left blank from the environment.
+        if kind == RUNTIME_CLI_CLOUD:
+            _apply_cloud_late_binding(cfg)
+        return cfg
 
     def save(self) -> None:
         path = agent_yml_path(self.id)

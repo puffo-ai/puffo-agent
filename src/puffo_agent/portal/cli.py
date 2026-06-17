@@ -407,7 +407,7 @@ def _resolve_api_key_for_create(
     """Pick an API key for ``agent create``. Resolution order:
     --api-key, env var, daemon.yml default, interactive prompt. CLI
     runtimes return early — they auth via ~/.claude/.credentials."""
-    if runtime_kind in ("cli-local", "cli-docker"):
+    if runtime_kind in ("cli-local", "cli-docker", "cli-cloud"):
         return flag_value
     if flag_value:
         return flag_value
@@ -1403,7 +1403,7 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--profile", help="Path to a profile.md to copy (default: built-in template)")
     create.add_argument(
         "--runtime",
-        choices=["chat-local", "sdk-local", "cli-local", "cli-docker"],
+        choices=["chat-local", "sdk-local", "cli-local", "cli-docker", "cli-cloud"],
         default="chat-local",
         help="Runtime adapter kind (default: chat-local)",
     )
@@ -1458,7 +1458,7 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("id")
     runtime.add_argument(
         "--kind",
-        choices=["chat-local", "sdk-local", "cli-local", "cli-docker"],
+        choices=["chat-local", "sdk-local", "cli-local", "cli-docker", "cli-cloud"],
         help="Runtime adapter kind",
     )
     runtime.add_argument(

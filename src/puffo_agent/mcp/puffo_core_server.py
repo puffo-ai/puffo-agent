@@ -188,6 +188,8 @@ def build_server(
     data_service_url: str,
     runtime_kind: str = "",
     harness: str = "",
+    bridge_url: str = "",
+    bridge_token: str = "",
 ) -> FastMCP:
     ks = KeyStore(keystore_dir)
     http = PuffoCoreHttpClient(server_url, ks, slug)
@@ -200,6 +202,16 @@ def build_server(
         PuffoRpcClient(rpc_url, agent_id) if rpc_url else None
     )
 
+    # cli-cloud (posture B): no local keystore — write tools send
+    # plaintext through the Bridge, which holds the keys.
+    bridge_outbound = None
+    if bridge_url and bridge_token:
+        from ..bridge.client import BridgeConfig
+        from ..bridge.http import HttpBridgeOutbound
+        bridge_outbound = HttpBridgeOutbound(
+            BridgeConfig(bridge_url=bridge_url, session_token=bridge_token, slug=slug)
+        )
+
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
         device_id=device_id,
@@ -209,6 +221,7 @@ def build_server(
         space_id=space_id,
         workspace=workspace,
         rpc_client=rpc_client,
+        bridge_outbound=bridge_outbound,
     )
 
     mcp = FastMCP("puffo-core")
@@ -246,6 +259,8 @@ def _cfg_from_env() -> dict[str, str]:
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
+        "bridge_url": os.environ.get("PUFFO_BRIDGE_URL", ""),
+        "bridge_token": os.environ.get("PUFFO_BRIDGE_TOKEN", ""),
     }
 
 

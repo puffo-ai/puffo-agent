@@ -170,6 +170,8 @@ class LocalCLIAdapter(Adapter):
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
+        llm_gateway_url: str = "",
+        llm_api_key: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
@@ -189,6 +191,10 @@ class LocalCLIAdapter(Adapter):
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
+        # When set (cli-cloud), the harness routes model calls through the
+        # LiteLLM gateway with a scoped virtual key; empty for host runtimes.
+        self.llm_gateway_url = llm_gateway_url
+        self.llm_api_key = llm_api_key
         self._desired_codex_extras: dict[str, dict] = {}
         self._desired_installed = False
         if harness is None:
@@ -367,6 +373,7 @@ class LocalCLIAdapter(Adapter):
         env = {
             **os.environ,
             "CODEX_HOME": str(codex_home),
+            **self._llm_gateway_env(),
         }
         auth_mode = link_host_codex_auth(Path.home(), codex_home)
         if auth_mode == "no-host-file":
@@ -747,6 +754,7 @@ class LocalCLIAdapter(Adapter):
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
             **self._macos_credential_env(),
+            **self._llm_gateway_env(),
         }
         self._session = ClaudeSession(
             agent_id=self.agent_id,
@@ -761,6 +769,23 @@ class LocalCLIAdapter(Adapter):
             extra_args=extra,
         )
         return self._session
+
+    def _llm_gateway_env(self) -> dict[str, str]:
+        """Point the harness at the LiteLLM gateway with its scoped
+        virtual key. Empty when no gateway is configured (host runtimes
+        keep using their own credentials)."""
+        if not self.llm_gateway_url:
+            return {}
+        if self.harness.name() == "codex":
+            env = {"OPENAI_BASE_URL": self.llm_gateway_url}
+            if self.llm_api_key:
+                env["OPENAI_API_KEY"] = self.llm_api_key
+            return env
+        # claude-code / hermes both read the Anthropic env pair.
+        env = {"ANTHROPIC_BASE_URL": self.llm_gateway_url}
+        if self.llm_api_key:
+            env["ANTHROPIC_AUTH_TOKEN"] = self.llm_api_key
+        return env
 
     def _macos_credential_env(self) -> dict[str, str]:
         """macOS-only env hardening:

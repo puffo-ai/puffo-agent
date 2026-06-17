@@ -244,11 +244,15 @@ def puffo_core_mcp_env(
     rpc_url: str = "http://127.0.0.1:63385",
     runtime_kind: str = "",
     harness: str = "",
+    bridge_url: str = "",
+    bridge_token: str = "",
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess. The MCP never
     touches ``messages.db`` or ``~/.claude.json`` directly — the
     daemon owns both. cli-docker rewrites the loopback URLs to
-    ``host.docker.internal``."""
+    ``host.docker.internal``. cli-cloud passes ``bridge_url`` +
+    ``bridge_token`` so the MCP sends outbound through the Bridge
+    (posture B) instead of signing with a local keystore."""
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -265,6 +269,10 @@ def puffo_core_mcp_env(
         env["PUFFO_CORE_SPACE_ID"] = space_id
     if runtime_kind:
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
+    if bridge_url:
+        env["PUFFO_BRIDGE_URL"] = bridge_url
+    if bridge_token:
+        env["PUFFO_BRIDGE_TOKEN"] = bridge_token
     if harness:
         env["PUFFO_HARNESS"] = harness
     # codex only forwards [mcp_servers.puffo.env] to the subprocess,

@@ -22,7 +22,7 @@ from typing import Callable, Optional
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
-from .runtime_matrix import RUNTIME_WS_LOCAL
+from .runtime_matrix import RUNTIME_CLI_CLOUD, RUNTIME_WS_LOCAL
 from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
     looks_like_managed_claude_md,
@@ -254,9 +254,58 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             )
         return adapter
 
+    if kind == "cli-cloud":
+        from ..agent.adapters.cli_cloud import CliCloudAdapter
+        from ..agent.harness import build_harness
+        from ..bridge.client import BridgeConfig
+        bc = BridgeConfig.from_env()
+        harness = build_harness(agent_cfg.runtime.harness)
+        if harness.name() == "codex":
+            model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
+        else:
+            model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or ""
+        adapter = CliCloudAdapter(
+            agent_id=agent_cfg.id,
+            model=model,
+            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
+            claude_dir=str(agent_cfg.resolve_claude_dir()),
+            session_file=str(cli_session_json_path(agent_cfg.id)),
+            mcp_config_file=str(agent_dir(agent_cfg.id) / "mcp-config.json"),
+            agent_home_dir=str(agent_home_dir(agent_cfg.id)),
+            permission_mode=agent_cfg.runtime.permission_mode,
+            sandbox=agent_cfg.runtime.sandbox,
+            harness=harness,
+            desired_skills=agent_cfg.desired_skills,
+            desired_mcps=agent_cfg.desired_mcps,
+            puffo_core_slug=agent_cfg.puffo_core.slug,
+            llm_gateway_url=agent_cfg.runtime.llm_gateway_url or bc.llm_gateway_url,
+            llm_api_key=bc.llm_virtual_key,
+        )
+        # Posture B: the MCP server sends through the Bridge (no
+        # keystore in the sandbox). Bridge endpoint + session token
+        # ride the env; keystore_dir is passed empty.
+        from ..mcp.config import puffo_core_mcp_env
+        pc = agent_cfg.puffo_core
+        adapter.puffo_core_mcp_env = puffo_core_mcp_env(
+            slug=pc.slug,
+            device_id=pc.device_id,
+            server_url=pc.server_url,
+            space_id=pc.space_id,
+            keystore_dir="",
+            workspace=str(agent_cfg.resolve_workspace_dir()),
+            agent_id=agent_cfg.id,
+            data_service_url=f"http://127.0.0.1:{daemon_cfg.data_service.port}",
+            rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
+            runtime_kind="cli-cloud",
+            harness=agent_cfg.runtime.harness,
+            bridge_url=agent_cfg.runtime.bridge_url or bc.bridge_url,
+            bridge_token=bc.session_token,
+        )
+        return adapter
+
     raise RuntimeError(
         f"agent {agent_cfg.id!r}: unknown runtime kind {kind!r} "
-        "(valid: chat-local, sdk-local, cli-docker, cli-local)"
+        "(valid: chat-local, sdk-local, cli-docker, cli-local, cli-cloud)"
     )
 
 
@@ -354,6 +403,9 @@ def _build_puffo_core_client(
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
+    if (agent_cfg.runtime.kind or "") == RUNTIME_CLI_CLOUD:
+        return _build_bridge_message_client(agent_cfg, agent_id)
+
     pc = agent_cfg.puffo_core
     _ensure_agent_identity_imported(agent_id, pc.slug)
     ks_dir = str(agent_dir(agent_id) / "keys")
@@ -381,6 +433,36 @@ def _build_puffo_core_client(
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
+    )
+
+
+def _build_bridge_message_client(agent_cfg: AgentConfig, agent_id: str):
+    """cli-cloud inbound/outbound client (posture B). Identity + Bridge
+    endpoint are late-bound from env on wake; no keystore in-sandbox."""
+    from ..agent.message_store import MessageStore
+    from ..bridge import build_bridge_client
+    from ..bridge.client import BridgeConfig
+    from ..bridge.message_client import BridgeMessageClient
+
+    pc = agent_cfg.puffo_core
+    bc = BridgeConfig.from_env()
+    bc.bridge_url = bc.bridge_url or agent_cfg.runtime.bridge_url
+    bc.slug = bc.slug or pc.slug
+    bc.space_id = bc.space_id or pc.space_id
+    bc.operator_slug = bc.operator_slug or pc.operator_slug
+    if not bc.is_configured():
+        raise RuntimeError(
+            f"agent {agent_id!r}: cli-cloud needs PUFFO_BRIDGE_URL + "
+            "PUFFO_BRIDGE_TOKEN (injected by the Agent Instance Manager on wake)"
+        )
+    ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
+    return BridgeMessageClient(
+        bridge=build_bridge_client(bc),
+        message_store=ms,
+        slug=bc.slug,
+        operator_slug=bc.operator_slug,
+        space_id=bc.space_id,
+        workspace=str(agent_cfg.resolve_workspace_dir()),
     )
 
 
@@ -987,7 +1069,12 @@ class Worker:
                 agent_id=agent_id,
             )
 
-            if not self.agent_cfg.puffo_core.is_configured():
+            # cli-cloud validates its Bridge config in
+            # _build_bridge_message_client; its puffo_core block is
+            # intentionally thin (no device/keystore in-sandbox).
+            if (
+                self.agent_cfg.runtime.kind or ""
+            ) != RUNTIME_CLI_CLOUD and not self.agent_cfg.puffo_core.is_configured():
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml "
                     "is incomplete. Required fields: server_url, slug, "
