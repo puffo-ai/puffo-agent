@@ -1001,8 +1001,8 @@ class RuntimeConfig:
     max_turns: int = 10
     # cli-cloud only. The session token + LLM virtual key are never
     # stored in agent.yml — they're late-bound via env on wake (see
-    # bridge.client). These two endpoints may be baked or, when empty,
-    # overlaid from env at load.
+    # cloud.bridge.client). These two endpoints may be baked or, when
+    # empty, overlaid from env at load.
     bridge_url: str = ""
     llm_gateway_url: str = ""
 
@@ -1014,7 +1014,7 @@ def _apply_cloud_late_binding(cfg: "AgentConfig") -> None:
     wins; the Bridge session token + LLM virtual key are read straight
     from env at spawn and never stored here.
     """
-    from ..bridge.client import BridgeConfig
+    from ..cloud.bridge.client import BridgeConfig
 
     bc = BridgeConfig.from_env()
     if bc.agent_id and not cfg.id:

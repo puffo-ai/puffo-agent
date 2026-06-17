@@ -6,10 +6,14 @@ import asyncio
 
 import pytest
 
-from puffo_agent.bridge import message_client as mc_mod
-from puffo_agent.bridge.backup import is_backed_up
-from puffo_agent.bridge.client import BridgeConfig, BridgeInboundEvent, StubBridgeClient
-from puffo_agent.bridge.message_client import BridgeMessageClient
+from puffo_agent.cloud.bridge import message_client as mc_mod
+from puffo_agent.cloud.bridge.backup import is_backed_up
+from puffo_agent.cloud.bridge.client import (
+    BridgeConfig,
+    BridgeInboundEvent,
+    StubBridgeClient,
+)
+from puffo_agent.cloud.bridge.message_client import BridgeMessageClient
 from puffo_agent.portal.runtime_matrix import (
     RUNTIME_CLI_CLOUD,
     VALID_RUNTIMES,

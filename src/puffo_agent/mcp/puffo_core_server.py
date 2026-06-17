@@ -206,8 +206,8 @@ def build_server(
     # plaintext through the Bridge, which holds the keys.
     bridge_outbound = None
     if bridge_url and bridge_token:
-        from ..bridge.client import BridgeConfig
-        from ..bridge.http import HttpBridgeOutbound
+        from ..cloud.bridge.client import BridgeConfig
+        from ..cloud.bridge.http import HttpBridgeOutbound
         bridge_outbound = HttpBridgeOutbound(
             BridgeConfig(bridge_url=bridge_url, session_token=bridge_token, slug=slug)
         )

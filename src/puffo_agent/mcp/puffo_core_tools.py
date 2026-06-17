@@ -90,7 +90,7 @@ class PuffoCoreToolsConfig:
     message_client: Any = None
     # cli-cloud (posture B): when set, write tools send plaintext through
     # the Bridge (which encrypts/signs/forwards) instead of encrypting
-    # locally — the sandbox holds no keystore. See ``bridge`` package.
+    # locally — the sandbox holds no keystore. See ``cloud.bridge``.
     bridge_outbound: Any = None
 
 

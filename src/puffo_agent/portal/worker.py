@@ -257,7 +257,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     if kind == "cli-cloud":
         from ..agent.adapters.cli_cloud import CliCloudAdapter
         from ..agent.harness import build_harness
-        from ..bridge.client import BridgeConfig
+        from ..cloud.bridge.client import BridgeConfig
         bc = BridgeConfig.from_env()
         harness = build_harness(agent_cfg.runtime.harness)
         if harness.name() == "codex":
@@ -440,9 +440,9 @@ def _build_bridge_message_client(agent_cfg: AgentConfig, agent_id: str):
     """cli-cloud inbound/outbound client (posture B). Identity + Bridge
     endpoint are late-bound from env on wake; no keystore in-sandbox."""
     from ..agent.message_store import MessageStore
-    from ..bridge import build_bridge_client
-    from ..bridge.client import BridgeConfig
-    from ..bridge.message_client import BridgeMessageClient
+    from ..cloud.bridge import build_bridge_client
+    from ..cloud.bridge.client import BridgeConfig
+    from ..cloud.bridge.message_client import BridgeMessageClient
 
     pc = agent_cfg.puffo_core
     bc = BridgeConfig.from_env()
