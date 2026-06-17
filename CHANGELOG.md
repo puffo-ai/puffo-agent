@@ -4,6 +4,22 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.13.0] — unreleased
+
+### Added
+
+- **`cli-cloud` runtime (preview).** A new `runtime.kind` that runs the
+  cli-local claude/codex harness inside an E2B sandbox holding no
+  identity keys: all puffo-server I/O goes through a Bridge over a
+  session token (the Bridge encrypts/signs/forwards), and model calls
+  route through a LiteLLM gateway with a scoped virtual key. Identity
+  and endpoints are late-bound from env on first wake rather than baked
+  into the template, and the inbound stream reconnects after a sandbox
+  resume. A new `bridge` package holds the client seam; the real Bridge
+  wire contract isn't locked yet, so the transport is provisional and
+  exercised against an in-repo stub. Not selectable in the desktop UI
+  (cloud-provisioned only).
+
 ## [0.12.5] — 2026-06-17
 
 ### Added
