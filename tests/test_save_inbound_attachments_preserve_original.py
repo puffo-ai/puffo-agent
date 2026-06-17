@@ -64,7 +64,9 @@ def test_oversized_image_lands_in_both_locations(tmp_path, monkeypatch):
     """Happy path: an oversized inbound image is downscaled in place
     at ``inbox/<env>/<name>`` and the original bytes are preserved
     at ``inbox/<env>/original/<name>``. Returned LLM-payload paths
-    point at the downscaled file only."""
+    point at the downscaled file only. ``shutil.copy2`` is used so
+    the original's mtime tracks the on-disk source — agent tools
+    that key freshness on stat() see a coherent timestamp."""
     oversized = _png_bytes(4000, 1000)
     _patch_decrypt(monkeypatch, {"blob-1": oversized})
 
@@ -84,6 +86,108 @@ def test_oversized_image_lands_in_both_locations(tmp_path, monkeypatch):
     with Image.open(downscaled) as img:
         assert max(img.size) <= _MAX_IMAGE_EDGE_PX
     assert paths == [str(downscaled)]
+
+
+def test_original_mtime_tracks_pre_resize_source(tmp_path, monkeypatch):
+    """``shutil.copy2`` preserves the source mtime. The original copy
+    must carry the pre-resize file's mtime — any agent tool that
+    keys cache freshness on stat() sees a coherent timestamp linked
+    to the actual receive moment, not the resize moment."""
+    import shutil as _shutil
+
+    oversized = _png_bytes(4000, 1000)
+    pre_resize_mtime: dict[str, float] = {}
+    real_copy2 = _shutil.copy2
+
+    def spying_copy2(src, dst, *args, **kwargs):
+        pre_resize_mtime["src_mtime"] = Path(src).stat().st_mtime
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(_shutil, "copy2", spying_copy2)
+
+    _patch_decrypt(monkeypatch, {"blob-1": oversized})
+    stub = _stub_self(tmp_path)
+    asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub, envelope_id="env_mtime",
+            metas_raw=[_meta("blob-1", "shot.png")],
+        )
+    )
+
+    original = tmp_path / ".puffo" / "inbox" / "env_mtime" / "original" / "shot.png"
+    # copy2's mtime preservation is the contract we're pinning;
+    # tolerate filesystem-rounding to whole seconds across platforms.
+    assert abs(original.stat().st_mtime - pre_resize_mtime["src_mtime"]) < 1
+
+
+def test_repeated_envelope_overwrites_original_with_latest_bytes(
+    tmp_path, monkeypatch,
+):
+    """Envelope-id reuse / partial-retry rewrite case: a second call
+    with the same envelope_id and filename but different bytes lands
+    the latest version in ``original/`` (last-write-wins semantic).
+    Same envelope_id and filename can occur on daemon-restart-during-
+    write or relay-side replay; users should see the most-recently-
+    received bytes, not a stale first copy."""
+    first = _png_bytes(4000, 1000)
+    second = _png_bytes(5000, 800)
+    assert first != second
+
+    _patch_decrypt(monkeypatch, {"blob-1": first})
+    stub = _stub_self(tmp_path)
+    asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub, envelope_id="env_dup",
+            metas_raw=[_meta("blob-1", "shot.png")],
+        )
+    )
+
+    # Second pass: replace the patched payload with `second`.
+    _patch_decrypt(monkeypatch, {"blob-1": second})
+    asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub, envelope_id="env_dup",
+            metas_raw=[_meta("blob-1", "shot.png")],
+        )
+    )
+
+    original = tmp_path / ".puffo" / "inbox" / "env_dup" / "original" / "shot.png"
+    assert original.read_bytes() == second
+
+
+def test_concurrent_oversized_writes_share_original_dir(
+    tmp_path, monkeypatch,
+):
+    """Forward-looking race: if a future refactor parallelises
+    attachment writes via ``asyncio.gather`` over ``metas_raw``,
+    multiple oversized images in one envelope must share the
+    ``original/`` subdir without a ``FileExistsError`` collision.
+    ``Path.mkdir(parents=True, exist_ok=True)`` covers the gate;
+    this test pins that guarantee against future changes."""
+    overs_a = _png_bytes(4000, 1000)
+    overs_b = _png_bytes(3000, 1200)
+    _patch_decrypt(monkeypatch, {"blob-a": overs_a, "blob-b": overs_b})
+    stub = _stub_self(tmp_path)
+
+    async def race() -> list[list[str]]:
+        return await asyncio.gather(
+            PuffoCoreMessageClient._save_inbound_attachments(
+                stub, envelope_id="env_race",
+                metas_raw=[_meta("blob-a", "a.png")],
+            ),
+            PuffoCoreMessageClient._save_inbound_attachments(
+                stub, envelope_id="env_race",
+                metas_raw=[_meta("blob-b", "b.png")],
+            ),
+        )
+
+    asyncio.run(race())
+
+    original_dir = tmp_path / ".puffo" / "inbox" / "env_race" / "original"
+    assert (original_dir / "a.png").exists()
+    assert (original_dir / "b.png").exists()
+    assert (original_dir / "a.png").read_bytes() == overs_a
+    assert (original_dir / "b.png").read_bytes() == overs_b
 
 
 def test_small_image_no_original_sibling(tmp_path, monkeypatch):
