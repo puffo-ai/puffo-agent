@@ -39,6 +39,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   thread), so this raised `RuntimeError` at startup. POSIX handlers are
   now installed only when on the main thread; those modes stop via the
   existing file sentinel.
+- **Correct upgrade + restart messaging on `uv`-managed Python and
+  daemon swaps.** `check-update` now detects a `uv tool` install and
+  prints `uv tool install puffo-agent --force` instead of `pip install`
+  (which PEP 668 rejects on uv-managed Python). `puffo-agent stop`
+  reports a daemon swap explicitly when a new daemon takes over
+  mid-shutdown, and `puffo-agent start` against an already-running
+  daemon now exits 0 (the user's intent is met) instead of erroring.
 
 ## [0.12.4] — 2026-06-12
 
