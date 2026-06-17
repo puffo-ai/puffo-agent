@@ -26,6 +26,26 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the agent went quiet. The session now tears down + respawns to
   re-establish a thread, and a turn aborts loudly rather than send an
   empty `threadId`.
+- **Renaming an agent updates its own self-knowledge.** A rename via the
+  UI now rewrites the agent's `profile.md` with the new display name and
+  signals the worker to re-assemble its system prompt on the next
+  message — so the agent stops referring to itself by the old name
+  without an operator workaround. The `whoami` tool now also reports the
+  agent's current display name.
+- **`--background` / `--ui` mode no longer crashes on Linux/macOS.** The
+  daemon installs SIGINT/SIGTERM via the asyncio loop, which calls
+  `signal.set_wakeup_fd` — only allowed on the main thread. In `--ui` /
+  `--background` the daemon runs in a child thread (Qt owns the main
+  thread), so this raised `RuntimeError` at startup. POSIX handlers are
+  now installed only when on the main thread; those modes stop via the
+  existing file sentinel.
+- **Correct upgrade + restart messaging on `uv`-managed Python and
+  daemon swaps.** `check-update` now detects a `uv tool` install and
+  prints `uv tool install puffo-agent --force` instead of `pip install`
+  (which PEP 668 rejects on uv-managed Python). `puffo-agent stop`
+  reports a daemon swap explicitly when a new daemon takes over
+  mid-shutdown, and `puffo-agent start` against an already-running
+  daemon now exits 0 (the user's intent is met) instead of erroring.
 
 ## [0.12.4] — 2026-06-12
 

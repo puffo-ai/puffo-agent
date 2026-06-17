@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import signal
+import threading
 import time
 
 from pathlib import Path
@@ -478,12 +479,41 @@ def _worker_needs_restart(old, new) -> bool:
     )
 
 
+def _install_posix_stop_handlers(loop, handle_signal) -> bool:
+    """Install SIGINT/SIGTERM via the asyncio loop; return whether it
+    did. No-op off the main thread, where ``add_signal_handler`` →
+    ``set_wakeup_fd`` raises (the ``--ui`` / ``--background`` DaemonThread
+    case — those stop via the file sentinel instead).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    installed = False
+    for sig_name in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, handle_signal)
+            installed = True
+        except NotImplementedError:
+            # Windows proactor loop doesn't support add_signal_handler.
+            pass
+    return installed
+
+
 async def run_daemon() -> int:
-    # Single-daemon enforcement.
+    # Single-daemon enforcement. ``start`` against an already-running
+    # daemon exits 0 (the user wanted a running daemon; one exists) —
+    # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
+    # we never spawn a second daemon. A different running version isn't
+    # discriminated here; ``stop && start`` is the version-swap path.
     if is_daemon_alive():
         pid = read_daemon_pid()
-        logger.error("another daemon is already running (pid=%s)", pid)
-        return 1
+        # print + log: background / tray runners may not surface INFO.
+        msg = f"puffo-agent daemon already running (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)
@@ -502,18 +532,7 @@ async def run_daemon() -> int:
         logger.info("received stop signal; shutting down")
         daemon.request_stop()
 
-    # SIGINT/SIGTERM on posix.
-    posix_handlers_installed = False
-    for sig_name in ("SIGINT", "SIGTERM"):
-        sig = getattr(signal, sig_name, None)
-        if sig is None:
-            continue
-        try:
-            loop.add_signal_handler(sig, handle_signal)
-            posix_handlers_installed = True
-        except NotImplementedError:
-            # Windows proactor loop doesn't support add_signal_handler.
-            pass
+    posix_handlers_installed = _install_posix_stop_handlers(loop, handle_signal)
 
     # Windows fallback: synchronous C-runtime Ctrl+C handler dispatched
     # back onto the loop via call_soon_threadsafe. Without this the

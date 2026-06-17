@@ -9,7 +9,7 @@ You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds 
 
 ## Install puffo-agent
 
-Needs `puffo-agent` on PATH (Python ≥ 3.11) — check with `puffo-agent --version`. If it's missing, open **https://chat.puffo.ai/setup.md** and follow it (in short: `pip install puffo-agent`).
+Needs `puffo-agent` on PATH (Python ≥ 3.11) — check with `puffo-agent --version`. If it's missing, open **https://chat.puffo.ai/setup.md** and follow it (in short: `uv tool install puffo-agent` on uv-managed Python; `pip install puffo-agent` otherwise).
 
 ## When to use
 

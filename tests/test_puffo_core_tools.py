@@ -148,6 +148,18 @@ async def test_whoami():
 
 
 @pytest.mark.asyncio
+async def test_whoami_includes_display_name():
+    cfg, http, _ = _setup()
+    http.responses["/identities/profiles?slugs=agent-0001"] = {
+        "profiles": [{"slug": "agent-0001", "display_name": "Helper Bot"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "whoami")
+    assert "display_name: Helper Bot" in result
+    assert "agent-0001" in result
+
+
+@pytest.mark.asyncio
 async def test_send_message_channel():
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
