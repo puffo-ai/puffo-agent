@@ -121,12 +121,10 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
 
 
 def format_refresh_broken(agent_id: str, agent_display_name: str = "") -> str:
-    """PUF-303: bilingual (zh+en) operator DM for an agent whose
-    credential-refresh has been failing repeatedly. Mirrors the
-    ``format_oauth_expired`` shape; framing distinguishes the
-    daemon-side refresh failure (``claude auth status`` may still
-    report logged-in but live probe / refresh is broken) from the
-    in-flight 401 path."""
+    """Bilingual (zh+en) operator DM for an agent whose credential
+    refresh keeps failing — distinct from the in-flight 401 path
+    (``claude auth status`` may still say logged-in). Mirrors
+    ``format_oauth_expired``."""
     label = (
         f"**{agent_display_name}** (`{agent_id}`)"
         if agent_display_name else f"`{agent_id}`"

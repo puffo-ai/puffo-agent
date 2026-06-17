@@ -428,8 +428,7 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
         def register_on_refresh_success(self, cb):
             self.callback = cb
 
-        # PUF-303: daemon now also registers a refresh-broken-enter
-        # callback. Capture for completeness; not asserted here.
+        # Daemon also registers a refresh-broken callback; capture it.
         def register_on_refresh_broken_enter(self, cb):
             self.refresh_broken_callback = cb
 

@@ -696,12 +696,9 @@ class Worker:
         )
 
     # ─────────────────────────────────────────────────────────────────
-    # PUF-303: refresh_broken-state notification + reactive clear.
-    # Parallel to PUF-283's auth_failed substrate above. The daemon's
-    # CredentialRefresher fires _on_refresh_broken_enter when it newly
-    # flips an agent to refresh_broken; this worker DMs the operator
-    # bilingual recovery copy with one-per-session dedup. Recovery
-    # clear runs via the existing on_refresh_success callback.
+    # refresh_broken notification + reactive clear (parallel to the
+    # auth_failed substrate above): DM the operator once per episode on
+    # a refresh_broken flip; clear on refresh-success.
     # ─────────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -857,9 +854,7 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
-        # PUF-303: parallel dedup flag for the refresh_broken ENTER
-        # operator DM. Re-armed on credential refresh-success (same
-        # callback that re-arms auth_failed) and on a failed send.
+        # Re-armed on refresh-success + on a failed send (like auth_failed).
         self._refresh_broken_notification_sent = False
         self.runtime = RuntimeState(
             status="running",

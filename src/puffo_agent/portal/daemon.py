@@ -280,10 +280,8 @@ class Daemon:
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime, agent_id, logger,
             )
-            # PUF-303: also clear refresh_broken if the worker was
-            # stuck there. Recovery doesn't need to wait for the next
-            # daemon poll-tick — the on-disk credential is fresh, so
-            # we can flip back to ok immediately.
+            # Also clear refresh_broken — the on-disk credential is fresh
+            # now, so recover immediately instead of waiting for a poll tick.
             Worker._clear_refresh_broken_if_recoverable(
                 worker.runtime, agent_id, logger,
             )
@@ -313,9 +311,8 @@ class Daemon:
         # Stash callback identity for _stop_worker's unregister.
         worker._refresh_success_callback = on_refresh_success
 
-        # PUF-303: refresh_broken-enter handler. The daemon fires this
-        # with the agent_id when CredentialRefresher flips an agent
-        # newly to refresh_broken; we only act for OUR agent.
+        # Refresh-broken handler — fired with the flipped agent_id; act
+        # only for ours.
         def on_refresh_broken_enter(flipped_agent_id: str) -> None:
             if flipped_agent_id != agent_id:
                 return
@@ -360,8 +357,7 @@ class Daemon:
             if cb is not None:
                 self.refresher.unregister_on_refresh_success(cb)
                 self.codex_refresher.unregister_on_refresh_success(cb)
-            # PUF-303: also unregister the refresh-broken-enter
-            # callback so the stopped worker stops receiving events.
+            # Unregister the refresh-broken callback too.
             rb_cb = getattr(worker, "_refresh_broken_callback", None)
             if rb_cb is not None:
                 self.refresher.unregister_on_refresh_broken_enter(rb_cb)

@@ -1,7 +1,6 @@
-"""PUF-303: ``Worker._clear_refresh_broken_if_recoverable`` worker-
-side reactive clear, fired from the daemon's on_refresh_success
-callback so manual ``claude auth login`` recovery doesn't have to
-wait for the next CredentialRefresher poll-tick.
+"""``Worker._clear_refresh_broken_if_recoverable`` reactive clear, fired
+from the daemon's on_refresh_success callback so a manual ``claude auth
+login`` recovery doesn't wait for the next refresher poll-tick.
 
 Mirrors ``_clear_auth_failed_if_recoverable``.
 """

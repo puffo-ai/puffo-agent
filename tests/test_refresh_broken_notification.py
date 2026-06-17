@@ -1,6 +1,6 @@
-"""PUF-303: proactive refresh_broken DM to operator on the
-``CredentialRefresher._flip_refresh_broken`` newly-broken transition.
-Mirrors PUF-283's auth_failed substrate.
+"""Proactive refresh_broken DM to the operator on the
+``CredentialRefresher._flip_refresh_broken`` newly-broken transition
+(mirrors the auth_failed substrate).
 
 Tests cover:
   1. ``format_refresh_broken`` bilingual copy invariants.

@@ -748,11 +748,8 @@ class CredentialRefresher:
         self._refresh_request = asyncio.Event()
         self._agent_homes: set[Path] = set()
         self._on_refresh_success: list[Callable[[], None]] = []
-        # PUF-303: callbacks fired when an agent's runtime newly flips
-        # to refresh_broken. Parallel to ``_on_refresh_success`` so the
-        # worker side can DM the operator analogous to PUF-283's
-        # ``auth_failed`` notification. Receives the agent_id of the
-        # newly-broken agent so the worker can scope the dedup flag.
+        # Fired when an agent newly flips to refresh_broken (was_ok →
+        # broken), with the agent_id, so the worker can DM the operator.
         self._on_refresh_broken_enter: list[Callable[[str], None]] = []
         self._lock = asyncio.Lock()
         self._consecutive_non_success = 0
@@ -791,9 +788,8 @@ class CredentialRefresher:
     def register_on_refresh_broken_enter(
         self, callback: Callable[[str], None],
     ) -> None:
-        """PUF-303: register a callback fired when an agent's runtime
-        newly flips to refresh_broken. The callback receives the
-        agent_id of the newly-broken agent."""
+        """Register a callback fired when an agent newly flips to
+        refresh_broken; it receives the agent_id."""
         self._on_refresh_broken_enter.append(callback)
 
     def unregister_on_refresh_broken_enter(
@@ -1058,11 +1054,8 @@ class CredentialRefresher:
             f"advancing. Run `claude auth login`, then send the agent "
             f"a message to recover."
         )
-        # PUF-303: collect agents that newly flipped so we fire the
-        # refresh-broken-enter callback exactly once per transition.
-        # The skip-if-already-broken branch above means callers can
-        # rely on "fired ⇒ new transition," same was_ok semantics as
-        # worker._enter_auth_failed.
+        # Collect agents that newly flipped (was_ok → broken) so the
+        # callback fires exactly once per transition.
         newly_broken: list[str] = []
         for agent_home in self._agent_homes:
             agent_id = Path(agent_home).name
