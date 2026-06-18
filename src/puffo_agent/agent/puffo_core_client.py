@@ -343,9 +343,17 @@ def _downscale_oversized_image(path, original_path=None) -> None:
             if original_path is not None:
                 import shutil
                 from pathlib import Path
-                op = Path(original_path)
-                op.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, op)
+                try:
+                    op = Path(original_path)
+                    op.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, op)
+                except Exception as exc:  # noqa: BLE001
+                    # A failed original-copy must not block the size-cap
+                    # downscale — that downscale is the session-poison guard.
+                    logger.warning(
+                        "could not preserve original image %s: %s",
+                        original_path, exc,
+                    )
             scale = _MAX_IMAGE_EDGE_PX / longest
             new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
             fmt = img.format or "PNG"

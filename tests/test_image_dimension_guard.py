@@ -232,3 +232,26 @@ def test_resize_failure_does_not_raise_after_original_copied(
     # Original copy made it to disk before the save blew up — that's
     # fine; the agent's file-access tools can still reach it.
     assert original.exists()
+
+
+def test_copy_failure_does_not_block_downscale(tmp_path, monkeypatch):
+    """A failed original-copy must NOT defeat the size-cap downscale.
+    The downscale is the session-poison guard; preserving the original
+    is a nice-to-have that can't be allowed to leave an oversized image
+    on the LLM-payload path."""
+    path = tmp_path / "big.png"
+    Image.new("RGB", (4000, 1000), color="red").save(path)
+    original = tmp_path / "original" / "big.png"
+
+    import shutil as _shutil
+
+    def boom_copy2(*a, **kw):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(_shutil, "copy2", boom_copy2)
+
+    _downscale_oversized_image(path, original)  # must not raise
+
+    assert not original.exists()
+    with Image.open(path) as img:
+        assert max(img.size) <= _MAX_IMAGE_EDGE_PX
