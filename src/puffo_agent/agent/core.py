@@ -39,6 +39,20 @@ def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
     return "\n".join(f"- {p}" for p in cleaned)
 
 
+def _origin_for_compressed(path: str) -> str | None:
+    """If ``path`` is a downscaled ``<stem>.compressed<ext>`` attachment,
+    return its full-resolution ``<stem>.origin<ext>`` sibling, else None.
+    String-only so it's separator-agnostic across hosts."""
+    dot = path.rfind(".")
+    if dot <= 0:
+        return None
+    base, ext = path[:dot], path[dot:]
+    marker = ".compressed"
+    if not base.endswith(marker):
+        return None
+    return base[: -len(marker)] + ".origin" + ext
+
+
 class PuffoAgent:
     def __init__(
         self,
@@ -445,6 +459,14 @@ class PuffoAgent:
             lines.append("- attachments:")
             for path in attachments:
                 lines.append(f"  - {path}")
+                origin = _origin_for_compressed(path)
+                if origin:
+                    lines.append(
+                        f"    (downscaled to fit the model; full-resolution "
+                        f"original at {origin} — to read fine detail, crop a "
+                        f"region of the original rather than opening the whole "
+                        f"image)"
+                    )
         lines.append("- message: " + text)
         if followups:
             # Messages that arrived in the same thread/channel AFTER

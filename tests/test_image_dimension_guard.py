@@ -1,8 +1,8 @@
-"""Tests for ``_downscale_oversized_image`` — the prevention half of
-the oversized-image session-poison fix. An inbound image whose longest
-edge tops Anthropic's 2000px many-image cap, once Read into the claude
-session, makes every later turn fail wholesale. We downscale the file
-on disk at save time so claude-code only ever loads in-bounds images.
+"""Tests for ``_downscale_oversized_image`` and the per-model cap. Inbound
+images are downscaled to the model's native vision resolution so they don't
+dominate context and so a >20-image request (which rejects any image whose
+longest edge tops 2000px) stays in bounds. The cap is 2576px on Opus 4.7+,
+1568px otherwise.
 """
 
 from __future__ import annotations

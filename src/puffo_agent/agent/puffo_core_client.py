@@ -305,10 +305,11 @@ def _maybe_redact_long_text(
     return placeholder
 
 
-# Inbound images are downscaled to the model's native vision resolution so
-# the harness can Read them without the image dominating context — and so a
-# >20-image request (where the Anthropic API rejects anything over 2000px,
-# poisoning the session) stays in bounds. The native long-edge cap is
+# Inbound images are downscaled to the model's native vision resolution at
+# save time. The Claude API resizes a single oversized image on its own, but
+# a request carrying >20 images rejects any whose longest edge tops 2000px
+# ("many-image requests"), and a full-res image costs ~4784 visual tokens on
+# Opus 4.7+ — capping on disk avoids both. The native long-edge cap is
 # model-specific: Opus 4.7+ resolves 2576px, all other models 1568px.
 _DEFAULT_IMAGE_EDGE_PX = 1568
 _HIGH_RES_IMAGE_EDGE_PX = 2576
@@ -340,7 +341,7 @@ def _downscale_oversized_image(
     except ImportError:
         logger.warning(
             "Pillow missing — inbound images aren't dimension-checked; "
-            "an oversized image can dead-lock the claude session "
+            "a many-image request can then reject an oversized one "
             "(pip install pillow)",
         )
         return False
@@ -359,8 +360,8 @@ def _downscale_oversized_image(
                     op.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, op)
                 except Exception as exc:  # noqa: BLE001
-                    # A failed original-copy must not block the size-cap
-                    # downscale — that downscale is the session-poison guard.
+                    # A failed original-copy must not block the resize — the
+                    # in-bounds version is what the agent actually Reads.
                     logger.warning(
                         "could not preserve original image %s: %s",
                         original_path, exc,
