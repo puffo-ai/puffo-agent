@@ -683,11 +683,22 @@ class Worker:
                 self.agent_cfg.id,
             )
             return
-        from ..agent._invite_strings import format_oauth_expired
+        from ..agent._invite_strings import (
+            format_codex_oauth_expired,
+            format_oauth_expired,
+        )
         display_name = (
             getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
         )
-        text = format_oauth_expired(self.agent_cfg.id, display_name)
+        # Codex agents need the Codex recovery command, not the Claude
+        # one; otherwise the operator runs the wrong CLI and assumes
+        # the alert is broken. Harness is the cheapest signal we have.
+        runtime = getattr(self.agent_cfg, "runtime", None)
+        harness = getattr(runtime, "harness", "") if runtime is not None else ""
+        if harness == "codex":
+            text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
+        else:
+            text = format_oauth_expired(self.agent_cfg.id, display_name)
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:

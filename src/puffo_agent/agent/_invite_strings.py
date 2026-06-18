@@ -118,3 +118,22 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
         "⚠️ Claude OAuth 已过期。请运行 `claude auth login`，"
         "然后给我发条消息即可恢复。"
     )
+
+
+def format_codex_oauth_expired(
+    agent_id: str, agent_display_name: str = "",
+) -> str:
+    """Sibling of :func:`format_oauth_expired` for the Codex provider.
+    Worker dispatches between the two on ``agent_cfg.runtime.harness``
+    so the operator sees the right recovery command for the agent that
+    actually failed."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    return (
+        f"⚠️ {label} — Codex OAuth expired. Run `codex login`, "
+        "then send me a message and I'll pick up where I left off.\n"
+        "⚠️ Codex OAuth 已过期。请运行 `codex login`，"
+        "然后给我发条消息即可恢复。"
+    )

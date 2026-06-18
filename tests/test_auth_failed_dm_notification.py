@@ -517,3 +517,125 @@ def test_notify_stays_gated_when_no_operator_slug():
     w = _StubWorker()
     _run_notify(w)
     assert w._auth_failed_notification_sent is True
+
+
+# ── PUF-310: harness-aware DM copy ─────────────────────────────────
+
+
+def _make_dispatch_stub(harness_name: str | None):
+    """Build a stub worker whose ``agent_cfg.runtime.harness`` reads as
+    ``harness_name``. Pass ``None`` to omit the runtime block entirely
+    (covers the pre-PUF-310 agent_cfg shape — must still fall through
+    to the Claude copy without raising)."""
+    captured: dict = {}
+
+    class _StubClient:
+        operator_slug = "@han-0001"
+
+        async def _send_dm(self, recipient, text, root_id):
+            captured["text"] = text
+            return {"envelope_id": "env-fake"}
+
+    if harness_name is None:
+        agent_cfg = type(
+            "A", (), {"id": "t-agent", "display_name": "Planner"},
+        )()
+    else:
+        runtime = type("R", (), {"harness": harness_name})()
+        agent_cfg = type(
+            "A", (),
+            {"id": "t-agent", "display_name": "Planner", "runtime": runtime},
+        )()
+
+    class _StubWorker:
+        pass
+
+    w = _StubWorker()
+    w.agent_cfg = agent_cfg
+    w._client = _StubClient()
+    return w, captured
+
+
+def test_codex_harness_dispatches_codex_copy():
+    """PUF-310: Codex agents must get the Codex recovery command in
+    the bilingual DM, not the Claude one — otherwise the operator
+    runs the wrong CLI and assumes the alert is broken."""
+    from puffo_agent.portal import worker as worker_module
+
+    w, captured = _make_dispatch_stub("codex")
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+    assert "Codex OAuth expired" in captured["text"]
+    assert "codex login" in captured["text"]
+    assert "Codex OAuth 已过期" in captured["text"]
+    assert "Claude OAuth" not in captured["text"]
+    assert "claude auth login" not in captured["text"]
+
+
+def test_claude_harness_keeps_claude_copy():
+    """Regression-pin for PUF-283: explicit ``harness="claude-code"``
+    keeps the existing Claude bilingual copy unchanged."""
+    from puffo_agent.portal import worker as worker_module
+
+    w, captured = _make_dispatch_stub("claude-code")
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+    assert "Claude OAuth expired" in captured["text"]
+    assert "claude auth login" in captured["text"]
+    assert "Codex" not in captured["text"]
+
+
+def test_missing_runtime_falls_back_to_claude_copy():
+    """Defensive: an agent_cfg without a ``runtime`` block (legacy /
+    test stubs) must NOT raise; falls through to the Claude copy so
+    existing PUF-283 tests + any pre-runtime-config agents still get
+    a DM."""
+    from puffo_agent.portal import worker as worker_module
+
+    w, captured = _make_dispatch_stub(None)
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+    assert "Claude OAuth expired" in captured["text"]
+
+
+def test_unknown_harness_falls_back_to_claude_copy():
+    """Forward-compat: a harness name we don't recognise yet (hermes,
+    gemini-cli, future provider) defaults to the Claude copy. Better
+    than silent no-DM until we add the specific copy."""
+    from puffo_agent.portal import worker as worker_module
+
+    w, captured = _make_dispatch_stub("hermes")
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+    assert "Claude OAuth expired" in captured["text"]
+
+
+# ── PUF-310: format_codex_oauth_expired bilingual copy ─────────────
+
+
+def test_format_codex_oauth_expired_bilingual_copy():
+    """Mirror of test_format_oauth_expired_contains_both_languages for
+    the Codex sibling: zh + en + the codex login command verbatim."""
+    from puffo_agent.agent._invite_strings import format_codex_oauth_expired
+
+    text = format_codex_oauth_expired("planner-1234", "Planner")
+    assert "Codex OAuth expired" in text
+    assert "Codex OAuth 已过期" in text
+    assert "codex login" in text
+    assert "Planner" in text
+    assert "planner-1234" in text
+
+
+def test_format_codex_oauth_expired_falls_back_to_id_when_no_name():
+    """No display name → label is just the bare id; copy still
+    bilingual."""
+    from puffo_agent.agent._invite_strings import format_codex_oauth_expired
+
+    text = format_codex_oauth_expired("agent-5678", "")
+    assert "agent-5678" in text
+    assert "Codex OAuth expired" in text
+    assert "Codex OAuth 已过期" in text
