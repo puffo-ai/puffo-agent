@@ -1,8 +1,8 @@
-"""End-to-end coverage for the dual-storage attachment write path:
-inbound oversized images land downscaled at
-``inbox/<env>/<name>`` (LLM-payload) AND originals land at
-``inbox/<env>/original/<name>`` (agent file-access). Non-oversized
-attachments don't get a spurious ``original/`` sibling.
+"""End-to-end coverage for the dual-storage attachment write path: when an
+inbound image is oversized it's split into ``<stem>.compressed<ext>`` (the
+in-bounds LLM-payload version, returned in the attachment list) and
+``<stem>.origin<ext>`` (the full-fidelity sibling). Non-oversized
+attachments keep their bare name with no spurious siblings.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ from PIL import Image
 
 from puffo_agent.agent import puffo_core_client as pcc
 from puffo_agent.agent.puffo_core_client import (
-    _MAX_IMAGE_EDGE_PX,
+    _DEFAULT_IMAGE_EDGE_PX,
+    _HIGH_RES_IMAGE_EDGE_PX,
     PuffoCoreMessageClient,
 )
 
@@ -39,11 +40,12 @@ def _png_bytes(w: int, h: int) -> bytes:
     return buf.getvalue()
 
 
-def _stub_self(workspace: Path) -> SimpleNamespace:
+def _stub_self(workspace: Path, edge_px: int = _DEFAULT_IMAGE_EDGE_PX) -> SimpleNamespace:
     return SimpleNamespace(
         workspace=str(workspace),
         http=object(),
         _log=logging.getLogger("puf308-test"),
+        _image_edge_px=edge_px,
     )
 
 
@@ -60,13 +62,10 @@ def _patch_decrypt(monkeypatch, payloads: dict[str, bytes]) -> None:
     )
 
 
-def test_oversized_image_lands_in_both_locations(tmp_path, monkeypatch):
-    """Happy path: an oversized inbound image is downscaled in place
-    at ``inbox/<env>/<name>`` and the original bytes are preserved
-    at ``inbox/<env>/original/<name>``. Returned LLM-payload paths
-    point at the downscaled file only. ``shutil.copy2`` is used so
-    the original's mtime tracks the on-disk source — agent tools
-    that key freshness on stat() see a coherent timestamp."""
+def test_oversized_image_splits_into_compressed_and_origin(tmp_path, monkeypatch):
+    """An oversized inbound image lands as ``shot.compressed.png`` (downscaled,
+    returned in the attachment list) plus ``shot.origin.png`` (full-res). The
+    bare ``shot.png`` is renamed away, not left behind."""
     oversized = _png_bytes(4000, 1000)
     _patch_decrypt(monkeypatch, {"blob-1": oversized})
 
@@ -78,21 +77,20 @@ def test_oversized_image_lands_in_both_locations(tmp_path, monkeypatch):
     )
 
     inbox = tmp_path / ".puffo" / "inbox" / "env_a"
-    downscaled = inbox / "shot.png"
-    original = inbox / "original" / "shot.png"
-    assert downscaled.exists()
-    assert original.exists()
-    assert original.read_bytes() == oversized
-    with Image.open(downscaled) as img:
-        assert max(img.size) <= _MAX_IMAGE_EDGE_PX
-    assert paths == [str(downscaled)]
+    compressed = inbox / "shot.compressed.png"
+    origin = inbox / "shot.origin.png"
+    assert compressed.exists()
+    assert origin.exists()
+    assert not (inbox / "shot.png").exists()
+    assert origin.read_bytes() == oversized
+    with Image.open(compressed) as img:
+        assert max(img.size) <= _DEFAULT_IMAGE_EDGE_PX
+    assert paths == [str(compressed)]
 
 
-def test_original_mtime_tracks_pre_resize_source(tmp_path, monkeypatch):
-    """``shutil.copy2`` preserves the source mtime. The original copy
-    must carry the pre-resize file's mtime — any agent tool that
-    keys cache freshness on stat() sees a coherent timestamp linked
-    to the actual receive moment, not the resize moment."""
+def test_origin_mtime_tracks_pre_resize_source(tmp_path, monkeypatch):
+    """``shutil.copy2`` preserves the source mtime, so ``shot.origin.png``
+    carries the pre-resize file's mtime."""
     import shutil as _shutil
 
     oversized = _png_bytes(4000, 1000)
@@ -114,21 +112,15 @@ def test_original_mtime_tracks_pre_resize_source(tmp_path, monkeypatch):
         )
     )
 
-    original = tmp_path / ".puffo" / "inbox" / "env_mtime" / "original" / "shot.png"
-    # copy2's mtime preservation is the contract we're pinning;
-    # tolerate filesystem-rounding to whole seconds across platforms.
-    assert abs(original.stat().st_mtime - pre_resize_mtime["src_mtime"]) < 1
+    origin = tmp_path / ".puffo" / "inbox" / "env_mtime" / "shot.origin.png"
+    assert abs(origin.stat().st_mtime - pre_resize_mtime["src_mtime"]) < 1
 
 
-def test_repeated_envelope_overwrites_original_with_latest_bytes(
+def test_repeated_envelope_overwrites_origin_with_latest_bytes(
     tmp_path, monkeypatch,
 ):
-    """Envelope-id reuse / partial-retry rewrite case: a second call
-    with the same envelope_id and filename but different bytes lands
-    the latest version in ``original/`` (last-write-wins semantic).
-    Same envelope_id and filename can occur on daemon-restart-during-
-    write or relay-side replay; users should see the most-recently-
-    received bytes, not a stale first copy."""
+    """Envelope-id reuse: a second call with the same envelope_id + filename
+    but different bytes lands the latest version in ``shot.origin.png``."""
     first = _png_bytes(4000, 1000)
     second = _png_bytes(5000, 800)
     assert first != second
@@ -142,7 +134,6 @@ def test_repeated_envelope_overwrites_original_with_latest_bytes(
         )
     )
 
-    # Second pass: replace the patched payload with `second`.
     _patch_decrypt(monkeypatch, {"blob-1": second})
     asyncio.run(
         PuffoCoreMessageClient._save_inbound_attachments(
@@ -151,19 +142,13 @@ def test_repeated_envelope_overwrites_original_with_latest_bytes(
         )
     )
 
-    original = tmp_path / ".puffo" / "inbox" / "env_dup" / "original" / "shot.png"
-    assert original.read_bytes() == second
+    origin = tmp_path / ".puffo" / "inbox" / "env_dup" / "shot.origin.png"
+    assert origin.read_bytes() == second
 
 
-def test_concurrent_oversized_writes_share_original_dir(
-    tmp_path, monkeypatch,
-):
-    """Forward-looking race: if a future refactor parallelises
-    attachment writes via ``asyncio.gather`` over ``metas_raw``,
-    multiple oversized images in one envelope must share the
-    ``original/`` subdir without a ``FileExistsError`` collision.
-    ``Path.mkdir(parents=True, exist_ok=True)`` covers the gate;
-    this test pins that guarantee against future changes."""
+def test_concurrent_oversized_writes_share_inbox(tmp_path, monkeypatch):
+    """Two oversized images in one envelope each split into their own
+    compressed/origin pair in the same inbox dir without collision."""
     overs_a = _png_bytes(4000, 1000)
     overs_b = _png_bytes(3000, 1200)
     _patch_decrypt(monkeypatch, {"blob-a": overs_a, "blob-b": overs_b})
@@ -183,17 +168,16 @@ def test_concurrent_oversized_writes_share_original_dir(
 
     asyncio.run(race())
 
-    original_dir = tmp_path / ".puffo" / "inbox" / "env_race" / "original"
-    assert (original_dir / "a.png").exists()
-    assert (original_dir / "b.png").exists()
-    assert (original_dir / "a.png").read_bytes() == overs_a
-    assert (original_dir / "b.png").read_bytes() == overs_b
+    inbox = tmp_path / ".puffo" / "inbox" / "env_race"
+    assert (inbox / "a.compressed.png").exists()
+    assert (inbox / "b.compressed.png").exists()
+    assert (inbox / "a.origin.png").read_bytes() == overs_a
+    assert (inbox / "b.origin.png").read_bytes() == overs_b
 
 
-def test_small_image_no_original_sibling(tmp_path, monkeypatch):
-    """Unhappy-of-original-preservation: a small image doesn't trip
-    the downscale, so the ``original/`` subdir is never created. The
-    LLM-payload path is the (untouched) original."""
+def test_small_image_keeps_bare_name(tmp_path, monkeypatch):
+    """A small image doesn't trip the downscale, so it keeps its bare name
+    with no compressed/origin split."""
     small = _png_bytes(800, 600)
     _patch_decrypt(monkeypatch, {"blob-1": small})
 
@@ -206,13 +190,32 @@ def test_small_image_no_original_sibling(tmp_path, monkeypatch):
 
     inbox = tmp_path / ".puffo" / "inbox" / "env_b"
     assert (inbox / "thumb.png").exists()
-    assert not (inbox / "original").exists()
+    assert not (inbox / "thumb.compressed.png").exists()
+    assert not (inbox / "thumb.origin.png").exists()
     assert paths == [str(inbox / "thumb.png")]
 
 
-def test_non_image_attachment_no_original_sibling(tmp_path, monkeypatch):
-    """A text attachment never hits the downscale gate; no spurious
-    ``original/`` directory."""
+def test_within_high_res_cap_keeps_bare_name(tmp_path, monkeypatch):
+    """At the 2576px high-res cap (Opus 4.7+), a 2000px image is in-bounds —
+    no split, bare name retained."""
+    img = _png_bytes(2000, 1200)
+    _patch_decrypt(monkeypatch, {"blob-1": img})
+
+    stub = _stub_self(tmp_path, edge_px=_HIGH_RES_IMAGE_EDGE_PX)
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub, envelope_id="env_hr", metas_raw=[_meta("blob-1", "shot.png")],
+        )
+    )
+
+    inbox = tmp_path / ".puffo" / "inbox" / "env_hr"
+    assert (inbox / "shot.png").exists()
+    assert not (inbox / "shot.origin.png").exists()
+    assert paths == [str(inbox / "shot.png")]
+
+
+def test_non_image_attachment_keeps_bare_name(tmp_path, monkeypatch):
+    """A text attachment never hits the downscale gate; bare name, no split."""
     _patch_decrypt(monkeypatch, {"blob-1": b"hello world"})
 
     stub = _stub_self(tmp_path)
@@ -224,15 +227,13 @@ def test_non_image_attachment_no_original_sibling(tmp_path, monkeypatch):
 
     inbox = tmp_path / ".puffo" / "inbox" / "env_c"
     assert (inbox / "notes.txt").exists()
-    assert not (inbox / "original").exists()
+    assert not (inbox / "notes.origin.txt").exists()
     assert paths == [str(inbox / "notes.txt")]
 
 
-def test_mixed_envelope_only_oversized_gets_original(tmp_path, monkeypatch):
-    """Race-shape coverage: a single envelope with text + small image
-    + oversized image. The ``original/`` subdir holds only the
-    oversized image; the LLM-payload list carries one path per
-    attachment."""
+def test_mixed_envelope_only_oversized_splits(tmp_path, monkeypatch):
+    """A single envelope with text + small image + oversized image: only the
+    oversized one gets the compressed/origin split."""
     oversized = _png_bytes(4000, 1000)
     small = _png_bytes(800, 600)
     _patch_decrypt(monkeypatch, {
@@ -254,14 +255,12 @@ def test_mixed_envelope_only_oversized_gets_original(tmp_path, monkeypatch):
     )
 
     inbox = tmp_path / ".puffo" / "inbox" / "env_d"
-    original_dir = inbox / "original"
-    assert original_dir.is_dir()
-    assert (original_dir / "big.png").exists()
-    assert (original_dir / "big.png").read_bytes() == oversized
-    assert not (original_dir / "thumb.png").exists()
-    assert not (original_dir / "notes.txt").exists()
+    assert (inbox / "big.compressed.png").exists()
+    assert (inbox / "big.origin.png").read_bytes() == oversized
+    assert not (inbox / "thumb.origin.png").exists()
+    assert not (inbox / "notes.origin.txt").exists()
     assert set(paths) == {
         str(inbox / "notes.txt"),
         str(inbox / "thumb.png"),
-        str(inbox / "big.png"),
+        str(inbox / "big.compressed.png"),
     }

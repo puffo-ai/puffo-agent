@@ -10,9 +10,46 @@ from __future__ import annotations
 from PIL import Image
 
 from puffo_agent.agent.puffo_core_client import (
-    _MAX_IMAGE_EDGE_PX,
+    _DEFAULT_IMAGE_EDGE_PX,
+    _HIGH_RES_IMAGE_EDGE_PX,
     _downscale_oversized_image,
+    max_image_edge_px,
 )
+
+_MAX_IMAGE_EDGE_PX = _DEFAULT_IMAGE_EDGE_PX
+
+
+def test_max_image_edge_px_per_model():
+    assert max_image_edge_px("claude-opus-4-8") == _HIGH_RES_IMAGE_EDGE_PX
+    assert max_image_edge_px("claude-opus-4-7") == _HIGH_RES_IMAGE_EDGE_PX
+    assert max_image_edge_px("claude-sonnet-4-6") == _DEFAULT_IMAGE_EDGE_PX
+    assert max_image_edge_px("") == _DEFAULT_IMAGE_EDGE_PX
+    assert max_image_edge_px(None) == _DEFAULT_IMAGE_EDGE_PX
+
+
+def test_downscale_returns_whether_it_resized(tmp_path):
+    big = tmp_path / "big.png"
+    Image.new("RGB", (4000, 1000), color="red").save(big)
+    assert _downscale_oversized_image(big) is True
+
+    small = tmp_path / "small.png"
+    Image.new("RGB", (800, 600), color="green").save(small)
+    assert _downscale_oversized_image(small) is False
+
+
+def test_higher_cap_keeps_more_detail(tmp_path):
+    """A 2000px image is over the 1568 default but within the 2576 high-res
+    cap — at the higher cap it's left untouched."""
+    path = tmp_path / "shot.png"
+    Image.new("RGB", (2000, 1200), color="blue").save(path)
+    before = path.read_bytes()
+
+    assert _downscale_oversized_image(path, None, _HIGH_RES_IMAGE_EDGE_PX) is False
+    assert path.read_bytes() == before  # untouched at the high-res cap
+
+    assert _downscale_oversized_image(path, None, _DEFAULT_IMAGE_EDGE_PX) is True
+    with Image.open(path) as img:
+        assert max(img.size) <= _DEFAULT_IMAGE_EDGE_PX
 
 
 def test_oversized_landscape_image_is_downscaled(tmp_path):

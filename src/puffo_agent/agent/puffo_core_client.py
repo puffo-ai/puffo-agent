@@ -305,25 +305,36 @@ def _maybe_redact_long_text(
     return placeholder
 
 
-# Anthropic's API rejects any conversation containing an image whose
-# longest edge tops 2000px. Claude-code Read-ing such an attachment
-# poisons the session transcript — every later turn then fails
-# wholesale (see ClaudeSession._looks_like_poisoned_session). We
-# can't stop claude-code Read-ing a file, but we CAN keep the file
-# on disk in bounds. 1568px is Anthropic's recommended max — well
-# under the 2000px hard cap.
-_MAX_IMAGE_EDGE_PX = 1568
+# Inbound images are downscaled to the model's native vision resolution so
+# the harness can Read them without the image dominating context — and so a
+# >20-image request (where the Anthropic API rejects anything over 2000px,
+# poisoning the session) stays in bounds. The native long-edge cap is
+# model-specific: Opus 4.7+ resolves 2576px, all other models 1568px.
+_DEFAULT_IMAGE_EDGE_PX = 1568
+_HIGH_RES_IMAGE_EDGE_PX = 2576
+# Model-id substrings that resolve high-resolution vision. Unknown models
+# default to 1568 — safe (over-shrinks at worst); add new ones here.
+_HIGH_RES_MODEL_MARKERS = ("opus-4-7", "opus-4-8")
 
 
-def _downscale_oversized_image(path, original_path=None) -> None:
-    """Resize ``path`` in place if it's an image whose longest edge
-    tops ``_MAX_IMAGE_EDGE_PX``. When ``original_path`` is supplied
-    AND the resize is actually about to fire, the pre-resize bytes
-    are copied there first so the agent's file-access tools can
-    reach the full-fidelity version while the LLM-payload version
-    stays under the cap. No-op (and no copy) for non-images, small
-    images, or anything Pillow can't open. Best-effort — never
-    raises."""
+def max_image_edge_px(model: str) -> int:
+    """Native vision long-edge cap for ``model`` — 2576px for models with
+    high-resolution input, else the conservative 1568px default."""
+    m = (model or "").lower()
+    if any(marker in m for marker in _HIGH_RES_MODEL_MARKERS):
+        return _HIGH_RES_IMAGE_EDGE_PX
+    return _DEFAULT_IMAGE_EDGE_PX
+
+
+def _downscale_oversized_image(
+    path, original_path=None, max_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
+) -> bool:
+    """Resize ``path`` in place when it's an image whose longest edge tops
+    ``max_edge_px``; return whether a resize happened. When ``original_path``
+    is supplied and the resize fires, the pre-resize bytes are copied there
+    first so the agent's file-access tools can reach the full-fidelity
+    version. Returns False (no-op) for non-images, small images, or anything
+    Pillow can't open. Best-effort — never raises."""
     try:
         from PIL import Image
     except ImportError:
@@ -332,14 +343,14 @@ def _downscale_oversized_image(path, original_path=None) -> None:
             "an oversized image can dead-lock the claude session "
             "(pip install pillow)",
         )
-        return
+        return False
     try:
         with Image.open(path) as img:
             img.load()
             w, h = img.size
             longest = max(w, h)
-            if longest <= _MAX_IMAGE_EDGE_PX:
-                return
+            if longest <= max_edge_px:
+                return False
             if original_path is not None:
                 import shutil
                 from pathlib import Path
@@ -354,17 +365,19 @@ def _downscale_oversized_image(path, original_path=None) -> None:
                         "could not preserve original image %s: %s",
                         original_path, exc,
                     )
-            scale = _MAX_IMAGE_EDGE_PX / longest
+            scale = max_edge_px / longest
             new_size = (max(1, round(w * scale)), max(1, round(h * scale)))
             fmt = img.format or "PNG"
             img.resize(new_size, Image.LANCZOS).save(path, format=fmt)
         logger.info(
-            "downscaled inbound image %s: %dx%d -> %dx%d "
-            "(claude image dimension cap)",
+            "downscaled inbound image %s: %dx%d -> %dx%d (cap %dpx)",
             getattr(path, "name", path), w, h, new_size[0], new_size[1],
+            max_edge_px,
         )
+        return True
     except Exception as exc:
         logger.warning("could not dimension-check image %s: %s", path, exc)
+        return False
 
 
 class DeviceKeyCache:
@@ -440,6 +453,7 @@ class PuffoCoreMessageClient:
         max_inline_chars: int = 4000,
         segment_chars: int = 2000,
         agent_created_at: int = 0,
+        image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -462,6 +476,7 @@ class PuffoCoreMessageClient:
         # 200k-context model with a verbose system prompt.
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
+        self._image_edge_px = int(image_edge_px) or _DEFAULT_IMAGE_EDGE_PX
         self.keystore = keystore
         self.http = http_client
         self.store = message_store
@@ -3103,15 +3118,30 @@ class PuffoCoreMessageClient:
                     "attachment save failed (%s): %s", target, exc,
                 )
                 continue
-            # Shrink oversized images before the agent can Read them
-            # into — and poison — its claude session. Off-loop: Pillow
-            # decode/resize is blocking. ``original/<name>`` keeps the
-            # full-fidelity copy for the agent's file-access tools.
-            original = target.parent / "original" / target.name
-            await asyncio.to_thread(
-                _downscale_oversized_image, target, original,
+            # Shrink oversized images so the agent can Read them without
+            # the image dominating context (or being rejected in a
+            # >20-image request). Off-loop: Pillow decode/resize is
+            # blocking. When a resize fires, the in-place file becomes
+            # ``<stem>.compressed<ext>`` and the pre-resize bytes are kept
+            # alongside as ``<stem>.origin<ext>`` for full-fidelity access.
+            origin = target.with_name(f"{target.stem}.origin{target.suffix}")
+            resized = await asyncio.to_thread(
+                _downscale_oversized_image, target, origin, self._image_edge_px,
             )
-            paths.append(str(target))
+            if resized:
+                compressed = target.with_name(
+                    f"{target.stem}.compressed{target.suffix}"
+                )
+                try:
+                    target.rename(compressed)
+                    paths.append(str(compressed))
+                except OSError as exc:
+                    self._log.warning(
+                        "could not rename compressed image %s: %s", target, exc,
+                    )
+                    paths.append(str(target))
+            else:
+                paths.append(str(target))
         return paths
 
     async def _send_dm(

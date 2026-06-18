@@ -350,7 +350,7 @@ def _build_puffo_core_client(
     the dataclass defaults.
     """
     from ..agent.message_store import MessageStore
-    from ..agent.puffo_core_client import PuffoCoreMessageClient
+    from ..agent.puffo_core_client import PuffoCoreMessageClient, max_image_edge_px
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
@@ -368,6 +368,13 @@ def _build_puffo_core_client(
         daemon_cfg.segment_chars if daemon_cfg is not None else 2000
     )
 
+    # The inbound-image downscale cap follows the harness's effective model
+    # (Opus 4.7+ resolves 2576px, else 1568px).
+    if (agent_cfg.runtime.harness or "claude-code") == "codex":
+        model = agent_cfg.runtime.model or (daemon_cfg.openai.model if daemon_cfg else "")
+    else:
+        model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
+
     return PuffoCoreMessageClient(
         slug=pc.slug,
         device_id=pc.device_id,
@@ -381,6 +388,7 @@ def _build_puffo_core_client(
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
+        image_edge_px=max_image_edge_px(model),
     )
 
 
