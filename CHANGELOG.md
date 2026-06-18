@@ -4,6 +4,26 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.12.6] — unreleased
+
+### Added
+
+- **Full-resolution copy of downscaled inbound images.** When an inbound
+  image is over the model's vision cap and gets downscaled, the pre-resize
+  bytes are now kept alongside it: the in-bounds version is saved as
+  `<name>.compressed.<ext>` and the original as `<name>.origin.<ext>`. The
+  attachment list points the agent at the original and suggests cropping a
+  region of it for fine detail rather than reading the whole file. Images
+  within the cap are untouched and keep their bare name.
+
+### Changed
+
+- **Inbound-image downscale cap is now model-aware.** The long-edge cap
+  follows the agent's effective model — 2576px for Opus 4.7+ (which resolve
+  high-resolution images natively), 1568px for all other models (the
+  conservative default). Previously every image was downscaled to 1568px,
+  discarding detail newer models can use.
+
 ## [0.12.5] — 2026-06-17
 
 ### Added
