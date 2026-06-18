@@ -151,6 +151,88 @@ while True:
     assert "model not supported" in str(excinfo.value)
 
 
+# ── Top-level ``error`` notification path ──────────────────────────────────
+# codex_session.py:990-1006's dispatcher treats both ``turn/failed`` and
+# the top-level ``error`` notification as turn-fatal. The classifier
+# must convert AgentAPIError regardless of which envelope shape carried
+# the err_text.
+
+
+def test_auth_class_top_level_error_notification_raises_agent_api_error_auth(
+    tmp_path,
+):
+    """Codex emits a top-level ``error`` JSON-RPC notification when
+    the failure happens client-side (rather than as a ``turn/failed``
+    upstream from the model). The dispatch path is the same, and
+    PUF-310's conversion must fire either way — pinning here so a
+    future codex protocol shift doesn't silently regress."""
+    cs = _make_session(tmp_path, '''\
+absorb_initialize()
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_top_error"}}})
+
+msg = r()
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "id": turn_id,
+   "result": {"turn": {"id": "t1", "status": "running"}}})
+# Top-level error (m == "error"), NOT turn/failed.
+w({"jsonrpc": "2.0", "method": "error",
+   "params": {"error": {"message": "refresh token was revoked"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+
+    async def _run():
+        try:
+            await cs.warm("sp")
+            await cs.run_turn("hi", "sp")
+        finally:
+            await cs.aclose()
+
+    with pytest.raises(AgentAPIError) as excinfo:
+        asyncio.run(_run())
+    assert excinfo.value.is_auth is True
+    assert "refresh token was revoked" in str(excinfo.value).lower()
+
+
+def test_non_auth_top_level_error_notification_raises_runtime_error(tmp_path):
+    """Symmetric regression-pin: a top-level ``error`` carrying a
+    non-auth message must NOT be coerced to AgentAPIError."""
+    cs = _make_session(tmp_path, '''\
+absorb_initialize()
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_top_nonauth"}}})
+
+msg = r()
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "id": turn_id,
+   "result": {"turn": {"id": "t1", "status": "running"}}})
+w({"jsonrpc": "2.0", "method": "error",
+   "params": {"error": {"message": "model not supported"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+
+    async def _run():
+        try:
+            await cs.warm("sp")
+            await cs.run_turn("hi", "sp")
+        finally:
+            await cs.aclose()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(_run())
+    assert not isinstance(excinfo.value, AgentAPIError)
+
+
 def test_invalid_thread_id_not_classified_as_auth(tmp_path):
     """Regression-pin: ``invalid thread id ... found 0`` was 矩阵's
     initial (later-corrected) auth-guess in the d2d2 case. PUF-310's

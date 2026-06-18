@@ -639,3 +639,65 @@ def test_format_codex_oauth_expired_falls_back_to_id_when_no_name():
     assert "agent-5678" in text
     assert "Codex OAuth expired" in text
     assert "Codex OAuth 已过期" in text
+
+
+def test_harness_read_snapshots_before_dm_dispatch():
+    """Mid-flight race: an operator may rename the agent's harness
+    between the worker reading ``agent_cfg.runtime.harness`` and the
+    DM landing on the wire. The pick must snapshot the harness value
+    once and use that local for the dispatch, so a concurrent attr
+    mutation can't half-flip the choice (e.g. read `codex`, dispatch
+    to Claude copy). Python attribute access is atomic, so the local
+    `harness` variable in _notify_operator_of_auth_failed_oauth is
+    stable for the rest of the function regardless of later
+    `agent_cfg.runtime.harness = ...` writes; this test pins that
+    guarantee against a future refactor that re-reads the attribute
+    mid-function."""
+    from puffo_agent.portal import worker as worker_module
+
+    captured: dict = {}
+    sequence: list[str] = []
+
+    class _MutatingRuntime:
+        def __init__(self):
+            self._harness = "codex"
+
+        @property
+        def harness(self):
+            sequence.append(self._harness)
+            return self._harness
+
+    runtime = _MutatingRuntime()
+
+    class _StubClient:
+        operator_slug = "@han-0001"
+
+        async def _send_dm(self, recipient, text, root_id):
+            # Operator mutates the runtime mid-DM. The DM body was
+            # built BEFORE this point; the mutation must not change
+            # which copy got sent.
+            runtime._harness = "claude-code"
+            captured["text"] = text
+            return {"envelope_id": "env-fake"}
+
+    agent_cfg = type(
+        "A", (),
+        {"id": "t-agent", "display_name": "Planner", "runtime": runtime},
+    )()
+
+    class _StubWorker:
+        pass
+
+    w = _StubWorker()
+    w.agent_cfg = agent_cfg
+    w._client = _StubClient()
+
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+    # The DM body is the Codex copy snapshotted before the mutation.
+    assert "Codex OAuth expired" in captured["text"]
+    assert "codex login" in captured["text"]
+    # Harness was read exactly once during the call (the property
+    # getter recorded the read on the sequence list).
+    assert sequence == ["codex"]

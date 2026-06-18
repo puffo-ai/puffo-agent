@@ -65,3 +65,46 @@ def test_invalid_thread_id_not_auth_class():
         "codex turn failed: invalid thread id: invalid length: "
         "expected length 32 for simple format, found 0"
     )
+
+
+# ── Classifier precision: /responses + 401 false-positive probes ──────────
+# The clause-bound pattern rejects cases where /responses and 401 appear
+# in the same string but for unrelated reasons (cache references, prose
+# mentioning the endpoint, retries-exhausted log lines).
+
+
+@pytest.mark.parametrize("err_text", [
+    # Solution's polish-round flag: cache hit references both substrings.
+    "upstream cache hit for /responses; 401 retries exhausted in batch 401",
+    # Solution's polish-round flag: agent prose + a separate quota error.
+    "prompt referenced /responses endpoint; 401 model not supported",
+    # Cross-sentence: a period breaks the clause.
+    "Hit /responses. Later batch returned 401 from another endpoint.",
+    # Multi-line log: \n breaks the clause.
+    "fetched /responses ok\n401 errors logged on a different stream",
+    # /responses and 401 too far apart in the same clause (>40 chars).
+    "/responses is the streaming endpoint per the codex docs page 42 and 401 "
+    "is mentioned only as part of a quota retry path with backoff",
+])
+def test_responses_and_401_unrelated_does_not_classify(err_text):
+    """False-positive probes for the /responses + 401 co-occurrence
+    rule. Each string contains BOTH substrings but the surrounding
+    structure makes it clear they're not signalling a real /responses
+    401 auth failure — the clause-bound regex must reject them."""
+    assert not _looks_like_codex_auth_error(err_text)
+
+
+@pytest.mark.parametrize("err_text", [
+    # JSON envelope shape (TRUE — code + path in same object).
+    "{\"error\": {\"code\": 401, \"path\": \"/responses\"}}",
+    # Stderr-style line.
+    "websocket /responses returned 401 Unauthorized",
+    # Reversed ordering with short prefix.
+    "401 Unauthorized from /responses",
+    # The verbatim d2d2 paraphrase Equation captured.
+    "websocket /responses 401",
+])
+def test_responses_and_401_genuine_still_classifies(err_text):
+    """Regression-pin: the precision tightening must NOT regress the
+    genuine d2d2-class shapes the classifier was built to catch."""
+    assert _looks_like_codex_auth_error(err_text)

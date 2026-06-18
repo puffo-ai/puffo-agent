@@ -110,26 +110,32 @@ _CODEX_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\btoken_invalidated\b", re.IGNORECASE),
 )
 
-# Co-occurrence signal: a 401 alongside a ``/responses`` reference.
-# Kept separate from the pattern tuple because direction-agnostic
-# substring co-occurrence is simpler + more robust than positional
-# regex (``\b/`` doesn't match a word boundary, so a single
-# left-to-right or right-to-left regex would miss real cases).
-_CODEX_RESPONSES_401_PATTERN = re.compile(r"\b401\b")
+# Co-occurrence signal: ``401`` next to ``/responses`` in the SAME
+# clause — bounded distance + no sentence-boundary punctuation
+# between them. The bidirectional pair covers either ordering
+# ("/responses returned 401" vs "401 Unauthorized from /responses"
+# vs the JSON-envelope shape "code: 401, path: /responses").
+# A loose substring co-occurrence FPs on log lines that mention
+# both fragments for unrelated reasons (e.g. "cache hit for
+# /responses; 401 retries exhausted") — the clause-bound regex
+# rejects those.
+_CODEX_RESPONSES_401_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"/responses[^.;\n]{0,40}\b401\b", re.IGNORECASE),
+    re.compile(r"\b401\b[^.;\n]{0,40}/responses", re.IGNORECASE),
+)
 
 
 def _looks_like_codex_auth_error(err_text: str) -> bool:
     """True iff ``err_text`` carries one of the verbatim Codex auth
     signals (``refresh token (was) revoked`` / ``token_invalidated`` /
-    a ``/responses 401`` co-occurrence). Drives the conversion of a
-    ``turn_failed`` ``RuntimeError`` into an ``AgentAPIError(is_auth=
-    True)`` so the worker's PUF-283 auth_failed substrate fires."""
+    a ``/responses 401`` clause-bound co-occurrence). Drives the
+    conversion of a ``turn_failed`` ``RuntimeError`` into an
+    ``AgentAPIError(is_auth=True)`` so the worker's PUF-283
+    auth_failed substrate fires."""
     text = err_text or ""
     if any(p.search(text) for p in _CODEX_AUTH_ERROR_PATTERNS):
         return True
-    if "/responses" in text and _CODEX_RESPONSES_401_PATTERN.search(text):
-        return True
-    return False
+    return any(p.search(text) for p in _CODEX_RESPONSES_401_PATTERNS)
 
 # Tool names of the puffo MCP server's "this counts as posting a
 # reply" family. When the agent invokes one of these and it completes
