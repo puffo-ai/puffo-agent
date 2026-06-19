@@ -100,25 +100,17 @@ def _looks_like_codex_thread_limit(err_text: str) -> bool:
     return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
 
-# Codex-provider auth-failure strings. Anchored to verbatim signals
-# captured in the d2d2 stuck-state case (msg_2237ad78) so we don't
-# auto-flip on legitimate model/quota errors. ``invalid thread id ...
-# found 0`` is the downstream-of-empty-conversation_id surface symptom,
-# NOT an auth signal — stays out per the diagnostic chain.
+# Verbatim Codex auth-failure signals — anchored so we don't auto-flip on
+# legitimate model/quota errors. ``invalid thread id ... found 0`` is a
+# downstream symptom of an empty conversation_id, not auth — kept out.
 _CODEX_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"refresh token (?:was )?revoked", re.IGNORECASE),
     re.compile(r"\btoken_invalidated\b", re.IGNORECASE),
 )
 
-# Co-occurrence signal: ``401`` next to ``/responses`` in the SAME
-# clause — bounded distance + no sentence-boundary punctuation
-# between them. The bidirectional pair covers either ordering
-# ("/responses returned 401" vs "401 Unauthorized from /responses"
-# vs the JSON-envelope shape "code: 401, path: /responses").
-# A loose substring co-occurrence FPs on log lines that mention
-# both fragments for unrelated reasons (e.g. "cache hit for
-# /responses; 401 retries exhausted") — the clause-bound regex
-# rejects those.
+# ``401`` next to ``/responses`` in the same clause (bounded distance, no
+# sentence break between), either ordering. Clause-bound so it doesn't FP
+# on unrelated lines that happen to mention both fragments.
 _CODEX_RESPONSES_401_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"/responses[^.;\n]{0,40}\b401\b", re.IGNORECASE),
     re.compile(r"\b401\b[^.;\n]{0,40}/responses", re.IGNORECASE),
@@ -126,11 +118,10 @@ _CODEX_RESPONSES_401_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _looks_like_codex_auth_error(err_text: str) -> bool:
-    """True iff ``err_text`` carries one of the verbatim Codex auth
-    signals (``refresh token (was) revoked`` / ``token_invalidated`` /
-    a ``/responses 401`` clause-bound co-occurrence). Drives the
-    conversion of a ``turn_failed`` ``RuntimeError`` into an
-    ``AgentAPIError(is_auth=True)`` so the worker's PUF-283
+    """True iff ``err_text`` carries a verbatim Codex auth signal
+    (``refresh token (was) revoked`` / ``token_invalidated`` / a
+    ``/responses 401`` clause-bound co-occurrence). Drives converting a
+    ``turn_failed`` into an ``AgentAPIError(is_auth=True)`` so the worker's
     auth_failed substrate fires."""
     text = err_text or ""
     if any(p.search(text) for p in _CODEX_AUTH_ERROR_PATTERNS):
@@ -371,11 +362,10 @@ class CodexSession:
             self._propagate_turn_outcome(
                 outcome="turn_failed", err_text=err_text,
             )
-            # Codex auth-failures are sticky + user-actionable (operator
-            # must re-run ``codex login``). Convert to AgentAPIError so
-            # the worker's PUF-283 auth_failed substrate (state-flip +
-            # operator DM + dedup + refresher kick) reuses the Claude
-            # path — see core.py:317 + worker.py:1141-1152.
+            # Codex auth-failures are sticky + operator-actionable (re-run
+            # ``codex login``). Convert to AgentAPIError so the worker's
+            # auth_failed substrate (state-flip + operator DM + refresher
+            # kick) reuses the Claude path.
             if _looks_like_codex_auth_error(err_text):
                 from ..core import AgentAPIError
                 raise AgentAPIError(
