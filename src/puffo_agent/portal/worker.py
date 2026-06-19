@@ -624,6 +624,27 @@ class Worker:
                 "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
             )
 
+    async def _run_post_warm_gate(self, agent_id: str) -> None:
+        """PUF-311: probe the adapter's round-trip-readiness AFTER
+        warm() succeeds, reassert ``runtime.health = auth_failed`` if
+        the probe says the provider's still unreachable, THEN release
+        ``_warm_done``. Order matters — flipping ``_warm_done`` first
+        would let a queued message dispatch against an
+        unprobed/possibly-broken runtime."""
+        try:
+            probe_ok = await self._adapter.health_probe()
+        except Exception as exc:
+            logger.warning(
+                "agent %s: health_probe raised; treating as "
+                "probe-fail: %s", agent_id, exc,
+            )
+            probe_ok = False
+        if not probe_ok:
+            Worker._reassert_auth_failed_after_failed_probe(
+                self.runtime, agent_id, logger,
+            )
+        self._warm_done.set()
+
     @staticmethod
     def _reassert_auth_failed_after_failed_probe(
         runtime: "RuntimeState",
@@ -1072,27 +1093,12 @@ class Worker:
                 agent_id, exc,
             )
         if warm_ok:
-            # PUF-311: post-warm health probe gate. Codex agents need
-            # to verify the JSON-RPC handshake + thread/start round-
-            # trip before we mark the runtime healthy — the
-            # on_refresh_success eager-clear of auth_failed is
-            # optimistic; the probe gives us the second opinion that
-            # prevents marking-healthy-speculatively. Non-Codex
-            # adapters inherit the default-True probe so there's no
-            # behavioral change for Claude.
-            try:
-                probe_ok = await self._adapter.health_probe()
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: health_probe raised; treating as "
-                    "probe-fail: %s", agent_id, exc,
-                )
-                probe_ok = False
-            if not probe_ok:
-                Worker._reassert_auth_failed_after_failed_probe(
-                    self.runtime, agent_id, logger,
-                )
-        self._warm_done.set()
+            await self._run_post_warm_gate(agent_id)
+        else:
+            # Warm failed; release the startup gate so the daemon's
+            # wait_warm doesn't block forever. Probe would have nothing
+            # to verify anyway since the adapter never came up.
+            self._warm_done.set()
 
         reload_flag_path = Path(workspace_path) / ".puffo-agent" / "reload.flag"
         refresh_flag_path = Path(workspace_path) / ".puffo-agent" / "refresh.flag"
