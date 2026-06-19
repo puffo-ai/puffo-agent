@@ -108,3 +108,22 @@ def test_responses_and_401_genuine_still_classifies(err_text):
     """Regression-pin: the precision tightening must NOT regress the
     genuine d2d2-class shapes the classifier was built to catch."""
     assert _looks_like_codex_auth_error(err_text)
+
+
+@pytest.mark.parametrize("err_text", [
+    # Observed live on a codex relogin: the human-readable form (a space,
+    # not the ``token_invalidated`` JSON field) + a 401 on
+    # ``/backend-api/codex`` rather than ``/responses``.
+    "failed to refresh available models: unexpected status 401 Unauthorized: "
+    "Encountered invalidated oauth token for user, failing request, "
+    "url: https://chatgpt.com/backend-api/codex/models, "
+    "auth error: identity_edge_internal_error",
+    "401 Unauthorized: Encountered invalidated oauth token",
+    "invalidated oauth token for user",
+    "request to /backend-api/codex/models returned 401",
+])
+def test_real_world_invalidated_oauth_token_classifies(err_text):
+    """Live-observed variant the original d2d2 anchors missed: codex emits
+    ``invalidated oauth token`` (space form) and 401s on /backend-api/codex,
+    not just /responses. Both must classify as auth."""
+    assert _looks_like_codex_auth_error(err_text)

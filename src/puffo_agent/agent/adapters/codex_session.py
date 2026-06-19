@@ -103,30 +103,38 @@ def _looks_like_codex_thread_limit(err_text: str) -> bool:
 # Verbatim Codex auth-failure signals — anchored so we don't auto-flip on
 # legitimate model/quota errors. ``invalid thread id ... found 0`` is a
 # downstream symptom of an empty conversation_id, not auth — kept out.
+# ``invalidated oauth token`` is codex's human-readable form (distinct from
+# the ``token_invalidated`` JSON field), observed live on a relogin.
 _CODEX_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"refresh token (?:was )?revoked", re.IGNORECASE),
     re.compile(r"\btoken_invalidated\b", re.IGNORECASE),
+    re.compile(r"invalidated\s+oauth\s+token", re.IGNORECASE),
 )
 
-# ``401`` next to ``/responses`` in the same clause (bounded distance, no
-# sentence break between), either ordering. Clause-bound so it doesn't FP
-# on unrelated lines that happen to mention both fragments.
-_CODEX_RESPONSES_401_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"/responses[^.;\n]{0,40}\b401\b", re.IGNORECASE),
-    re.compile(r"\b401\b[^.;\n]{0,40}/responses", re.IGNORECASE),
+# A 401 in an OAuth/auth context. Codex surfaces a broken token as a 401 on
+# its API endpoints (``/responses``, ``/backend-api/codex/...``), so require
+# an auth-context marker within the same clause as the ``401`` rather than
+# pinning a single path — bounded distance + no sentence break keeps an
+# unrelated 401 in a log line from tripping it.
+_AUTH_401_CONTEXT = (
+    r"(?:oauth|invalidated|auth[\s_]error|identity_edge|/responses|/backend-api/codex)"
+)
+_CODEX_AUTH_401_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(rf"\b401\b[^.;\n]{{0,40}}{_AUTH_401_CONTEXT}", re.IGNORECASE),
+    re.compile(rf"{_AUTH_401_CONTEXT}[^.;\n]{{0,40}}\b401\b", re.IGNORECASE),
 )
 
 
 def _looks_like_codex_auth_error(err_text: str) -> bool:
-    """True iff ``err_text`` carries a verbatim Codex auth signal
-    (``refresh token (was) revoked`` / ``token_invalidated`` / a
-    ``/responses 401`` clause-bound co-occurrence). Drives converting a
-    ``turn_failed`` into an ``AgentAPIError(is_auth=True)`` so the worker's
-    auth_failed substrate fires."""
+    """True iff ``err_text`` carries a Codex auth signal (``refresh token
+    (was) revoked`` / ``token_invalidated`` / ``invalidated oauth token`` /
+    a clause-bound 401-in-auth-context). Drives converting a ``turn_failed``
+    into an ``AgentAPIError(is_auth=True)`` so the worker's auth_failed
+    substrate fires."""
     text = err_text or ""
     if any(p.search(text) for p in _CODEX_AUTH_ERROR_PATTERNS):
         return True
-    return any(p.search(text) for p in _CODEX_RESPONSES_401_PATTERNS)
+    return any(p.search(text) for p in _CODEX_AUTH_401_PATTERNS)
 
 # Tool names of the puffo MCP server's "this counts as posting a
 # reply" family. When the agent invokes one of these and it completes
