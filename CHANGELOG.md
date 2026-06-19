@@ -24,6 +24,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   conservative default). Previously every image was downscaled to 1568px,
   discarding detail newer models can use.
 
+### Fixed
+
+- **Codex agents alert the operator on an auth failure.** A Codex agent that
+  hit an OAuth failure (revoked/invalidated refresh token, or a `/responses`
+  401) previously went silent indefinitely. It now reuses the same
+  operator-DM substrate as Claude, sending a bilingual DM with the
+  `codex login` recovery command. Claude agents are unchanged.
+
 ## [0.12.5] — 2026-06-17
 
 ### Added
