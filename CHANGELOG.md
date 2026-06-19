@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.12.6] — unreleased
+## [0.12.6] — 2026-06-18
 
 ### Added
 
@@ -31,6 +31,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   401) previously went silent indefinitely. It now reuses the same
   operator-DM substrate as Claude, sending a bilingual DM with the
   `codex login` recovery command. Claude agents are unchanged.
+- **Codex auth-failure detection + recovery hardened.** The auth classifier
+  recognises more real-world Codex 401 forms (the human-readable
+  `invalidated oauth token`, and 401s on `/backend-api/codex`, not only
+  `/responses`). And after a credential refresh optimistically clears
+  `auth_failed`, the agent verifies the Codex handshake + thread round-trip
+  on respawn before marking itself healthy — a still-broken token
+  re-asserts `auth_failed` instead of going silently "ok".
 
 ## [0.12.5] — 2026-06-17
 
