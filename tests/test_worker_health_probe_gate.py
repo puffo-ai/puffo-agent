@@ -1,18 +1,7 @@
-"""PUF-311 worker-side reassertion + adapter dispatch.
-
-Two seams that the round-trip-Codex test doesn't cover:
-
-1. ``LocalCli.health_probe`` must delegate to the live
-   ``CodexSession`` when one exists and short-circuit to True
-   otherwise (Claude / hermes / gemini-cli inherit the no-probe
-   default).
-
-2. ``Worker._reassert_auth_failed_after_failed_probe`` is the
-   state-mutation helper the worker calls when ``health_probe``
-   returns False. It must only re-flip when the runtime is
-   currently ``ok`` (the eager-clear case) and otherwise no-op so
-   sticky-red states aren't clobbered.
-"""
+"""Worker-side reassertion + adapter dispatch — the seams the round-trip
+probe test doesn't cover: ``LocalCli.health_probe`` delegates to a live
+``CodexSession`` (else True), and ``_reassert_auth_failed_after_failed_probe``
+only re-flips the eager-cleared ``ok`` state (no clobber of sticky-red)."""
 
 from __future__ import annotations
 
@@ -25,8 +14,7 @@ from types import SimpleNamespace
 
 
 def test_local_cli_probe_delegates_to_codex_session(monkeypatch):
-    """Codex harness path: when the adapter has built a CodexSession,
-    its probe is the source of truth. LocalCli is a thin shim."""
+    """With a CodexSession built, LocalCli delegates to its probe."""
     from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
 
     class _StubCodex:
@@ -34,8 +22,7 @@ def test_local_cli_probe_delegates_to_codex_session(monkeypatch):
             return False
 
     stub = SimpleNamespace.__new__(SimpleNamespace)
-    # Build a minimal LocalCLIAdapter without going through __init__
-    # — the only attribute the method reads is _codex_session.
+    # __new__ to skip __init__ — the method only reads _codex_session.
     adapter = LocalCLIAdapter.__new__(LocalCLIAdapter)
     adapter._session = None
     adapter._codex_session = _StubCodex()
@@ -44,10 +31,8 @@ def test_local_cli_probe_delegates_to_codex_session(monkeypatch):
 
 
 def test_local_cli_probe_returns_true_without_codex_session():
-    """Non-Codex agents (no _codex_session built) inherit the safe
-    True default — their next-message path surfaces a real failure
-    via the existing leak filter; the probe doesn't need to
-    pre-empt them."""
+    """No _codex_session → inherit the True default (non-Codex agents
+    surface a real failure via the existing leak filter)."""
     from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
 
     adapter = LocalCLIAdapter.__new__(LocalCLIAdapter)
@@ -61,9 +46,8 @@ def test_local_cli_probe_returns_true_without_codex_session():
 
 
 class _Runtime:
-    """Stand-in for portal.state.RuntimeState — just the fields the
-    reassert helper touches. The real class hits disk via save();
-    here we record the calls instead."""
+    """Stand-in for RuntimeState — records save() calls instead of
+    hitting disk."""
     def __init__(self, health="ok", error=""):
         self.health = health
         self.error = error
@@ -74,9 +58,7 @@ class _Runtime:
 
 
 def test_reassert_flips_ok_back_to_auth_failed():
-    """The load-bearing case: eager-clear set health=ok before the
-    worker even respawned; post-warm probe returned False; the helper
-    re-asserts auth_failed so the next refresh cycle retries."""
+    """eager-clear left health=ok; probe-fail → re-assert auth_failed."""
     from puffo_agent.portal.worker import Worker
 
     rt = _Runtime(health="ok", error="")
@@ -93,10 +75,7 @@ def test_reassert_flips_ok_back_to_auth_failed():
 
 
 def test_reassert_noop_when_already_auth_failed():
-    """No second flip / second DM. Worker's existing
-    _auth_failed_notification_sent dedup gates the DM separately;
-    this helper just refuses to clobber the existing sticky-red
-    state. Specifically: no save() call, so the existing error
+    """Already auth_failed → no re-flip, no save(); the existing error
     message survives."""
     from puffo_agent.portal.worker import Worker
 
@@ -111,10 +90,8 @@ def test_reassert_noop_when_already_auth_failed():
 
 
 def test_reassert_noop_for_other_sticky_health_values():
-    """Don't clobber api_error_abandoned, codex_thread_wedged,
-    refresh_broken, or any other sticky-red state — the probe only
-    speaks to auth/transport reachability, and other red states have
-    their own clear-on-recover paths that shouldn't be hijacked."""
+    """Other sticky-red states (api_error_abandoned, codex_thread_wedged,
+    refresh_broken, …) have their own recovery paths — don't clobber them."""
     from puffo_agent.portal.worker import Worker
 
     for sticky in (
@@ -132,9 +109,7 @@ def test_reassert_noop_for_other_sticky_health_values():
 
 
 def test_reassert_noop_when_in_progress():
-    """``in_progress`` is the active-batch marker. The probe runs
-    pre-batch, so this should never trigger in practice — but pin
-    it anyway: don't clobber an in-progress turn."""
+    """``in_progress`` (active-batch marker) must not be clobbered."""
     from puffo_agent.portal.worker import Worker
 
     rt = _Runtime(health="in_progress", error="")
@@ -150,9 +125,7 @@ def test_reassert_noop_when_in_progress():
 
 
 def test_base_adapter_health_probe_defaults_true():
-    """The default at the Adapter base — non-Codex adapters must NOT
-    need any new code to opt out of the probe. Returning True keeps
-    the eager-clear behaviour intact for Claude / hermes / etc."""
+    """Base default is True — non-Codex adapters need no opt-out code."""
     from puffo_agent.agent.adapters.base import Adapter
 
     class _Concrete(Adapter):
@@ -167,9 +140,8 @@ def test_base_adapter_health_probe_defaults_true():
 
 
 def _make_gate_worker(runtime, adapter):
-    """Build a minimal worker stub the post-warm gate can run against.
-    The real Worker constructor does a lot of setup we don't need here;
-    we just need the attributes _run_post_warm_gate reads."""
+    """Minimal Worker stub with just the attributes _run_post_warm_gate
+    reads."""
     from puffo_agent.portal.worker import Worker
 
     w = Worker.__new__(Worker)
@@ -180,11 +152,9 @@ def _make_gate_worker(runtime, adapter):
 
 
 def test_warm_done_only_flips_after_probe_completes():
-    """PUF-311 ordering invariant: ``_warm_done`` MUST stay clear
-    until the probe (+ reassert if probe-fail) finishes. Reversing
-    the order would let a queued message dispatch against an
-    unprobed runtime. Stub the adapter probe with an Event so we can
-    observe the order from outside."""
+    """Ordering invariant: ``_warm_done`` stays clear until the probe
+    finishes (else a queued message could dispatch against an unprobed
+    runtime). A slow stubbed probe makes the order observable."""
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -211,11 +181,8 @@ def test_warm_done_only_flips_after_probe_completes():
 
 
 def test_warm_done_only_flips_after_reassert_when_probe_fails():
-    """Tighter ordering: the reassert helper must ALSO finish before
-    ``_warm_done`` flips, otherwise a queued message could fire while
-    runtime.health is mid-reassert. Probe returns False → reassert
-    runs → _warm_done set. Asserted via a runtime stub whose save()
-    is observable from the test."""
+    """Probe-fail path: the reassert must ALSO finish before
+    ``_warm_done`` flips, so no message fires mid-reassert."""
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -248,10 +215,8 @@ def test_warm_done_only_flips_after_reassert_when_probe_fails():
 
 
 def test_gate_treats_adapter_probe_exception_as_failure():
-    """A future adapter override that forgets the internal try/except
-    must NOT crash the worker; the gate's own try/except catches and
-    treats as probe-fail, reasserting auth_failed. Otherwise the
-    warm path would die and the agent would stay stuck-spawning."""
+    """A probe that raises is caught by the gate's own try/except and
+    treated as probe-fail (reassert + release warm), not a crash."""
 
     class _RaisingProbe:
         async def health_probe(self):
@@ -271,13 +236,9 @@ def test_gate_treats_adapter_probe_exception_as_failure():
 
 
 def test_reassert_does_not_fire_a_second_operator_dm():
-    """The reassert helper must NOT call ``_on_auth_failed_enter`` /
-    schedule a new DM. The operator already got the original
-    auth_failed DM before eager-clear; probe-fail is a "still broken"
-    signal, not a new fault. A future change wiring the ENTER hook
-    into the reassert path would surface as silent operator-spam —
-    pin the no-DM contract via a stub that would fail if any DM is
-    sent."""
+    """Probe-fail re-asserts state but must NOT fire a second operator
+    DM (the operator already got the original auth_failed DM before
+    eager-clear) — pinned via a stub that records any DM sent."""
 
     sent: list = []
 
