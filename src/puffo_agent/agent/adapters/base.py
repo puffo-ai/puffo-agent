@@ -103,6 +103,17 @@ class Adapter(ABC):
         """
         return None
 
+    async def health_probe(self) -> bool:
+        """Verify the runtime can reach its provider after a recovery
+        respawn. Worker calls this once post-``warm()`` so the
+        ``on_refresh_success`` eager-clear of ``runtime.health =
+        auth_failed`` can be reasserted if the round-trip still
+        fails. Default-True for adapters without a meaningful
+        round-trip probe — only the Codex (subprocess + thread/start)
+        override needs a real probe; see PUF-311.
+        """
+        return True
+
 
 def format_history_as_prompt(messages: list[dict]) -> str:
     """Render shell conversation history as a single prompt string.

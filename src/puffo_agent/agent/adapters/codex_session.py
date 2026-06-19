@@ -412,6 +412,28 @@ class CodexSession:
     def has_persisted_session(self) -> bool:
         return bool(self._conversation_id)
 
+    async def health_probe(self) -> bool:
+        """PUF-311 post-respawn round-trip check. Verify the codex
+        app-server is reachable (or relaunchable) AND a thread is
+        established. ``_ensure_running`` does the load-bearing work:
+        spawns the subprocess if needed and runs ``_bootstrap_session``
+        which initialises + starts (or resumes) a thread. A non-empty
+        ``_conversation_id`` after that means the JSON-RPC handshake
+        + ``thread/start`` round-trip succeeded — which would have
+        re-raised an auth error inline if the host token were still
+        broken. Returns False on any exception so the worker
+        re-asserts ``runtime.health = auth_failed`` rather than
+        marking the agent healthy speculatively."""
+        try:
+            await self._ensure_running(self.current_instructions or "")
+        except Exception as exc:
+            logger.warning(
+                "agent %s: codex health probe failed: %s",
+                self.agent_id, exc,
+            )
+            return False
+        return bool(self._conversation_id)
+
     # ── thread-wedge propagation ──────────────────────────────────────────────
 
     def _propagate_turn_outcome(
