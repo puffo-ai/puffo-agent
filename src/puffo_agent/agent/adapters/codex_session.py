@@ -413,17 +413,11 @@ class CodexSession:
         return bool(self._conversation_id)
 
     async def health_probe(self) -> bool:
-        """PUF-311 post-respawn round-trip check. Verify the codex
-        app-server is reachable (or relaunchable) AND a thread is
-        established. ``_ensure_running`` does the load-bearing work:
-        spawns the subprocess if needed and runs ``_bootstrap_session``
-        which initialises + starts (or resumes) a thread. A non-empty
-        ``_conversation_id`` after that means the JSON-RPC handshake
-        + ``thread/start`` round-trip succeeded — which would have
-        re-raised an auth error inline if the host token were still
-        broken. Returns False on any exception so the worker
-        re-asserts ``runtime.health = auth_failed`` rather than
-        marking the agent healthy speculatively."""
+        """Post-respawn round-trip check: ``_ensure_running`` spawns the
+        app-server + bootstraps a thread (re-raising an auth error inline
+        if the token is still broken), so a non-empty ``_conversation_id``
+        afterwards means the handshake + ``thread/start`` succeeded. Any
+        exception → False so the worker reasserts ``auth_failed``."""
         try:
             await self._ensure_running(self.current_instructions or "")
         except Exception as exc:

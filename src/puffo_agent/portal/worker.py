@@ -625,12 +625,10 @@ class Worker:
             )
 
     async def _run_post_warm_gate(self, agent_id: str) -> None:
-        """PUF-311: probe the adapter's round-trip-readiness AFTER
-        warm() succeeds, reassert ``runtime.health = auth_failed`` if
-        the probe says the provider's still unreachable, THEN release
-        ``_warm_done``. Order matters — flipping ``_warm_done`` first
-        would let a queued message dispatch against an
-        unprobed/possibly-broken runtime."""
+        """Probe the adapter's round-trip readiness after warm() succeeds,
+        reassert ``auth_failed`` if the provider's still unreachable, THEN
+        release ``_warm_done``. Order matters — releasing first would let a
+        queued message dispatch against an unprobed runtime."""
         try:
             probe_ok = await self._adapter.health_probe()
         except Exception as exc:
@@ -651,15 +649,11 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """PUF-311: ``on_refresh_success`` eagerly clears
-        ``auth_failed`` before the worker even respawns, so by the
-        time the new adapter has warmed up the runtime is showing
-        healthy regardless of whether the round-trip actually works.
-        When the post-warm ``health_probe`` returns False, this re-
-        asserts the failed state so the next refresh cycle retries
-        instead of marking the agent healthy speculatively. No-ops
-        when the runtime is already in a sticky-red state or never
-        cleared (only the eager-clear case matters)."""
+        """``on_refresh_success`` eagerly clears ``auth_failed`` before
+        the respawn, so a still-broken provider warms up looking healthy.
+        When the post-warm probe fails, re-assert the failed state so the
+        next refresh cycle retries. No-op unless the runtime is in the
+        eager-cleared ``ok`` state."""
         if runtime.health != "ok":
             return
         runtime.health = "auth_failed"

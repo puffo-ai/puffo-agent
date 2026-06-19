@@ -312,13 +312,10 @@ class LocalCLIAdapter(Adapter):
             self._codex_session = None
 
     async def health_probe(self) -> bool:
-        """PUF-311 post-respawn round-trip check. Delegates to the
-        Codex session probe for Codex harnesses; non-Codex harnesses
-        (claude-code, hermes, gemini-cli) inherit the base True
-        default since their re-spawn doesn't pay a per-provider
-        round-trip cost worth verifying — the next inbound message
-        will surface a real auth failure via the worker leak-filter
-        path the same way it always has."""
+        """Delegate to the Codex session probe when one exists; other
+        harnesses (claude-code, hermes, gemini-cli) inherit the True
+        default — their next inbound message surfaces a real auth
+        failure via the worker leak-filter as before."""
         if self._codex_session is not None:
             return await self._codex_session.health_probe()
         return True
