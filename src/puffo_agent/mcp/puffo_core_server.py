@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore
+from ._lifespan import make_lifespan
 from .data_client import DataClient
 from ._host_mcp import PuffoRpcClient
 from .host_tools import (
@@ -211,7 +212,16 @@ def build_server(
         rpc_client=rpc_client,
     )
 
-    mcp = FastMCP("puffo-core")
+    # PUF-323: wire FastMCP's lifespan hook so the aiohttp.ClientSession
+    # instances inside DataClient + PuffoRpcClient (+ PuffoCoreHttpClient)
+    # close while the event loop is still alive. Without this, the
+    # ``FastMCP.run()`` blocking call exits with sessions open, the
+    # loop tears down, and Python's gc emits the operator-confusing
+    # ``Unclosed client session`` error every subprocess shutdown.
+    mcp = FastMCP(
+        "puffo-core",
+        lifespan=make_lifespan(data, rpc_client, http),
+    )
     register_core_tools(mcp, core_cfg)
     _register_local_tools(mcp, workspace, runtime_kind, harness)
     return mcp

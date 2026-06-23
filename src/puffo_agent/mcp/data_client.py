@@ -15,6 +15,8 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class StoredMessageDict:
@@ -80,6 +82,15 @@ class DataClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
+            # PUF-323: pin the call-site so any future ``Unclosed
+            # client session`` warning has a grep-able prior log line
+            # the operator can match against the bare memory-address
+            # repr aiohttp emits at gc time.
+            logger.info(
+                "aiohttp ClientSession created (class=DataClient "
+                "base_url=%s agent_id=%s)",
+                self.base_url, self.agent_id,
+            )
         return self._session
 
     async def close(self) -> None:
