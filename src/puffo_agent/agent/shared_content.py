@@ -72,6 +72,10 @@ Common ones:
   — page chunks back with `mcp__puffo__get_post_segment(envelope_id=...,
   segment=N, segment_size=...)`. The placeholder's `preview:` is
   usually enough; fetch only what you need.
+- `Channel membership update: ... joined/left/was removed from
+  channel #X ...` — announcement that another member's channel
+  membership changed. Read-only context (e.g. stop @-mentioning a
+  member that just left); no reply expected, no action required.
 
 ## How to reply (read this carefully)
 

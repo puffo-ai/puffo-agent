@@ -1486,7 +1486,12 @@ class PuffoCoreMessageClient:
         # Mirror just the nudge here.
         if kind == "accept_channel_invite":
             if event.get("signer_slug") != self.slug:
-                return  # Someone else's accept — not our business.
+                # Another member joined a channel we may also be in
+                # — fall through to the announce-membership path.
+                await self._maybe_announce_membership_change(
+                    kind, event, payload,
+                )
+                return
             # Distinguish the server-emitted synthetic from a
             # real signed accept that's bouncing back over WS.
             # ``original_invite`` is the canonical marker — the
@@ -1544,6 +1549,18 @@ class PuffoCoreMessageClient:
                 channel_id=payload.get("channel_id") or "",
                 space_id=payload.get("space_id") or "",
                 kicker_slug=event.get("signer_slug") or "",
+            )
+            return
+
+        # Membership-change announcements for OTHER members of a
+        # channel this agent is also in. Distinct from the
+        # self-targeted branches above (those DM the operator);
+        # these inject a non-replyable system-message into the
+        # agent's transcript so it can react in-context (e.g. stop
+        # @-mentioning a member that just left). PUF-317.
+        if kind in ("leave_channel", "remove_from_channel"):
+            await self._maybe_announce_membership_change(
+                kind, event, payload,
             )
             return
 
@@ -2617,6 +2634,177 @@ class PuffoCoreMessageClient:
         self._log.info(
             "enqueued channel-intro nudge for channel=%s (space=%s)",
             channel_id, space_id,
+        )
+
+    async def _maybe_announce_membership_change(
+        self, kind: str, event: dict, payload: dict,
+    ) -> None:
+        """Surface another member's channel join/leave/removal into
+        the agent's transcript as a non-replyable system-message.
+
+        Predicate: skip when the channel isn't one the agent has
+        visibility into (``_channel_space`` populated via prior
+        ``invite_to_channel`` / ``accept_channel_invite`` /
+        ``create_channel``) so we don't announce on channels we'd
+        only see as a forwarded event noise. Skip when the actor is
+        this agent itself — self-joins go through
+        ``_enqueue_channel_intro_nudge`` and self-exits surface via
+        operator-DM paths; double-emitting would confuse the agent.
+        """
+        channel_id = payload.get("channel_id") or ""
+        if not channel_id or channel_id not in self._channel_space:
+            return
+
+        if kind == "accept_channel_invite":
+            actor_slug = event.get("signer_slug") or ""
+            action = "joined"
+            kicker_slug = ""
+        elif kind == "leave_channel":
+            actor_slug = event.get("signer_slug") or ""
+            action = "left"
+            kicker_slug = ""
+        elif kind == "remove_from_channel":
+            actor_slug = payload.get("removed_slug") or ""
+            action = "removed"
+            kicker_slug = event.get("signer_slug") or ""
+        else:
+            return
+
+        if not actor_slug or actor_slug == self.slug:
+            return
+
+        try:
+            await self._enqueue_membership_system_message(
+                channel_id=channel_id,
+                actor_slug=actor_slug,
+                action=action,
+                kicker_slug=kicker_slug,
+            )
+        except Exception:
+            self._log.exception(
+                "failed to enqueue membership system-message "
+                "(kind=%s channel=%s actor=%s)",
+                kind, channel_id, actor_slug,
+            )
+
+    async def _enqueue_membership_system_message(
+        self,
+        *,
+        channel_id: str,
+        actor_slug: str,
+        action: str,
+        kicker_slug: str = "",
+    ) -> None:
+        """Inject a non-replyable ``[puffo-agent system message]``
+        envelope announcing a channel membership change. Mirrors
+        ``_enqueue_channel_intro_nudge`` (PRIORITY_SYSTEM, sender_slug
+        ``system``, persisted to messages.db so
+        ``get_channel_history`` stays coherent) but the body is an
+        announcement — there's no directive, and the prefix marker
+        signals to the agent that no reply is expected.
+
+        ``action`` is one of ``"joined" | "left" | "removed"``.
+        ``kicker_slug`` only consulted when ``action == "removed"``.
+        """
+        space_id = self._channel_space.get(channel_id) or ""
+        space_name = (
+            await self._resolve_space_name(space_id) if space_id else ""
+        )
+        channel_name = await self._resolve_channel_name(
+            space_id=space_id, channel_id=channel_id,
+        )
+        actor_display = await self._fetch_display_name(actor_slug)
+        actor_label = (
+            f"**{actor_display}**(@{actor_slug})"
+            if actor_display else f"@{actor_slug}"
+        )
+
+        if action == "joined":
+            body = f"{actor_label} joined channel #{channel_name}."
+        elif action == "left":
+            body = f"{actor_label} left channel #{channel_name}."
+        elif action == "removed":
+            kicker_display = (
+                await self._fetch_display_name(kicker_slug)
+                if kicker_slug else ""
+            )
+            kicker_label = (
+                f"**{kicker_display}**(@{kicker_slug})"
+                if kicker_display
+                else f"@{kicker_slug}" if kicker_slug else "an operator"
+            )
+            body = (
+                f"{actor_label} was removed from channel "
+                f"#{channel_name} by {kicker_label}."
+            )
+        else:
+            return
+
+        now_ms = int(time.time() * 1000)
+        envelope_id = (
+            f"membership-{action}-{channel_id}-{actor_slug}-{now_ms}"
+        )
+        prompt_text = (
+            f"[puffo-agent system message] Channel membership update: "
+            f"{body} This is an announcement; you cannot reply to it."
+        )
+
+        msg_dict = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "sender_slug": "system",
+            "sender_display_name": "",
+            "sender_email": "",
+            "text": prompt_text,
+            "root_id": "",
+            "is_dm": False,
+            "attachments": [],
+            "sender_is_bot": False,
+            "mentions": [],
+            "envelope_id": envelope_id,
+            "sent_at": now_ms,
+        }
+        channel_meta = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "is_dm": False,
+        }
+
+        store_payload = {
+            "envelope_id": envelope_id,
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": channel_id,
+            "space_id": space_id,
+            "content_type": "text/plain",
+            "content": prompt_text,
+            "sent_at": now_ms,
+            "thread_root_id": envelope_id,
+            "reply_to_id": None,
+        }
+        try:
+            await self.store.store(store_payload)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning(
+                "membership system-message: failed to persist "
+                "envelope=%s to messages.db: %s",
+                envelope_id, exc,
+            )
+
+        await self._admit_thread_message(
+            root_id=envelope_id,
+            priority=PRIORITY_SYSTEM,
+            msg_dict=msg_dict,
+            channel_meta=channel_meta,
+        )
+        self._log.info(
+            "enqueued membership system-message channel=%s "
+            "actor=%s action=%s",
+            channel_id, actor_slug, action,
         )
 
     def _resolve_invite_targets(
