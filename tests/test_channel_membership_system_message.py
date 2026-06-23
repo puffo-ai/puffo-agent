@@ -16,6 +16,7 @@ These tests exercise the two new helpers
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import tempfile
@@ -51,6 +52,7 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._space_name_cache = {}
     client._channel_name_cache = {}
     client._space_members = {}
+    client._processed_membership_event_ids = set()
 
     async def _stub_space_name(space_id: str) -> str:
         return "Team" if space_id == "sp_1" else space_id
@@ -481,4 +483,150 @@ async def test_handle_event_other_leave_on_unknown_channel_is_silent():
     )
 
     assert client._queue.qsize() == 0
+    await store.close()
+
+
+# ─── per-event-id idempotency (reconnect-replay dedup) ────────────
+
+
+@pytest.mark.asyncio
+async def test_announce_dedups_on_duplicate_event_id():
+    """A WS reconnect / event-replay re-fires the same signed event.
+    The announce path must not double-emit — keyed on ``event_id``,
+    same dedup contract as ``_processed_invite_ids``."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    event = {
+        "kind": "leave_channel",
+        "signer_slug": "alice-0001",
+        "event_id": "ev_replay_test",
+        "payload": {"channel_id": "ch_1", "space_id": "sp_1"},
+    }
+
+    await client._handle_event(scope="sp_1", event=event)
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._queue.qsize() == 1
+    assert "ev_replay_test" in client._processed_membership_event_ids
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_uses_event_id_in_envelope_id_when_present():
+    """Deterministic envelope_id off the signed event_id so the
+    sqlite layer's INSERT OR IGNORE catches a replay even if the
+    in-memory dedup set was lost across restart."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_channel",
+            "signer_slug": "alice-0001",
+            "event_id": "ev_abc123",
+            "payload": {"channel_id": "ch_1", "space_id": "sp_1"},
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    assert root_id == "membership-left-ch_1-alice-0001-ev_abc123"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_falls_back_to_timestamp_when_event_id_missing():
+    """Direct unit-test invocation may omit event_id; fall back to
+    the ms-timestamp so two distinct calls still get distinct
+    envelope_ids."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    # Drive via _maybe_announce_membership_change with no event_id.
+    await client._maybe_announce_membership_change(
+        "leave_channel",
+        {"signer_slug": "alice-0001"},  # no event_id
+        {"channel_id": "ch_1", "space_id": "sp_1"},
+    )
+
+    assert client._queue.qsize() == 1
+    _, _, root_id = await client._queue.get()
+    # Suffix is a millisecond timestamp — must NOT be an empty
+    # string and must NOT collide with the event_id-prefixed shape.
+    assert root_id.startswith("membership-left-ch_1-alice-0001-")
+    assert not root_id.endswith("-")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_announce_skips_dedup_when_event_id_empty():
+    """Empty event_id should not poison the dedup set — two such
+    events (a misbehaving server omitting event_id, repeated) must
+    each get an announce so the agent's transcript stays honest
+    rather than silently dropping later events."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._maybe_announce_membership_change(
+        "leave_channel",
+        {"signer_slug": "alice-0001"},
+        {"channel_id": "ch_1", "space_id": "sp_1"},
+    )
+    await client._maybe_announce_membership_change(
+        "leave_channel",
+        {"signer_slug": "bob-0002"},
+        {"channel_id": "ch_1", "space_id": "sp_1"},
+    )
+
+    assert client._queue.qsize() == 2
+    assert client._processed_membership_event_ids == set()
+    await store.close()
+
+
+# ─── persistence-failure mirror ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persist_failure_still_delivers_in_memory_envelope(
+    monkeypatch, caplog,
+):
+    """``store.store`` raising must not block the in-memory thread
+    queue — the agent still gets the announcement in its current
+    turn even if sqlite is wedged (disk full, permission, etc.). A
+    warning is logged so the operator can spot the
+    history/transcript divergence. Mirrors the web side's
+    ``persistMembershipSystemMessage returns null on throw`` test."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+    client._log = logging.getLogger("test_persist_failure")
+
+    async def _explode(_payload):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(client.store, "store", _explode)
+
+    with caplog.at_level(logging.WARNING, logger="test_persist_failure"):
+        await client._enqueue_membership_system_message(
+            channel_id="ch_1",
+            actor_slug="alice-0001",
+            action="joined",
+        )
+
+    # In-memory delivery happened even though persistence failed.
+    assert client._queue.qsize() == 1
+    _, _, root_id = await client._queue.get()
+    assert "joined" in client._thread_state[root_id].messages[0]["text"]
+
+    # Warning fired so the operator sees the divergence in logs.
+    assert any(
+        "membership system-message" in rec.message
+        and "failed to persist" in rec.message
+        for rec in caplog.records
+    )
     await store.close()

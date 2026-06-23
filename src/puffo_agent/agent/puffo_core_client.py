@@ -511,6 +511,14 @@ class PuffoCoreMessageClient:
         # invite. Lost on daemon restart (acceptable: re-DM rate is
         # naturally rare).
         self._processed_invite_ids: set[str] = set()
+        # PUF-317: WS event_ids the membership-announce path has
+        # already emitted for. Reconnect-replay would otherwise show
+        # the agent two "Bob left #channel" envelopes back-to-back
+        # — same lifetime + reset semantics as
+        # ``_processed_invite_ids``. Memory cost stays bounded in
+        # practice (~24 bytes per event_id; channels with sustained
+        # churn at 1Hz would take ~5 days to reach 10MB).
+        self._processed_membership_event_ids: set[str] = set()
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
         # reply in that thread can be intercepted inside the daemon.
@@ -2650,6 +2658,9 @@ class PuffoCoreMessageClient:
         this agent itself — self-joins go through
         ``_enqueue_channel_intro_nudge`` and self-exits surface via
         operator-DM paths; double-emitting would confuse the agent.
+
+        Idempotent against ``event.event_id``: a reconnect-replay
+        of the same signed event won't enqueue a second envelope.
         """
         channel_id = payload.get("channel_id") or ""
         if not channel_id or channel_id not in self._channel_space:
@@ -2673,12 +2684,17 @@ class PuffoCoreMessageClient:
         if not actor_slug or actor_slug == self.slug:
             return
 
+        event_id = event.get("event_id") or ""
+        if event_id and event_id in self._processed_membership_event_ids:
+            return
+
         try:
             await self._enqueue_membership_system_message(
                 channel_id=channel_id,
                 actor_slug=actor_slug,
                 action=action,
                 kicker_slug=kicker_slug,
+                event_id=event_id,
             )
         except Exception:
             self._log.exception(
@@ -2686,6 +2702,10 @@ class PuffoCoreMessageClient:
                 "(kind=%s channel=%s actor=%s)",
                 kind, channel_id, actor_slug,
             )
+            return
+
+        if event_id:
+            self._processed_membership_event_ids.add(event_id)
 
     async def _enqueue_membership_system_message(
         self,
@@ -2694,6 +2714,7 @@ class PuffoCoreMessageClient:
         actor_slug: str,
         action: str,
         kicker_slug: str = "",
+        event_id: str = "",
     ) -> None:
         """Inject a non-replyable ``[puffo-agent system message]``
         envelope announcing a channel membership change. Mirrors
@@ -2741,8 +2762,16 @@ class PuffoCoreMessageClient:
             return
 
         now_ms = int(time.time() * 1000)
+        # Prefer the signed event_id when available so a
+        # reconnect-replay collapses to the same envelope_id and the
+        # store's INSERT OR IGNORE rejects the duplicate at the
+        # sqlite layer in addition to the in-memory dedup set in
+        # ``_maybe_announce_membership_change``. Fall back to the
+        # ms-timestamp when callers omit event_id (direct unit-test
+        # invocation of this helper).
+        envelope_id_suffix = event_id or str(now_ms)
         envelope_id = (
-            f"membership-{action}-{channel_id}-{actor_slug}-{now_ms}"
+            f"membership-{action}-{channel_id}-{actor_slug}-{envelope_id_suffix}"
         )
         prompt_text = (
             f"[puffo-agent system message] Channel membership update: "
