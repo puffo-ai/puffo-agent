@@ -117,6 +117,10 @@ class Daemon:
         codex_refresher_task = asyncio.ensure_future(
             self.codex_refresher.run_loop(self._stop)
         )
+        from .control.client import ControlManager
+
+        control_manager = ControlManager()
+        control_task = asyncio.ensure_future(control_manager.run())
 
         try:
             while not self._stop.is_set():
@@ -149,7 +153,8 @@ class Daemon:
                     pass
         finally:
             await self._stop_all_workers()
-            for t in (refresher_task, codex_refresher_task):
+            control_manager.stop()
+            for t in (refresher_task, codex_refresher_task, control_task):
                 t.cancel()
                 try:
                     await t

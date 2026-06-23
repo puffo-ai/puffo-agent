@@ -1070,6 +1070,28 @@ def cmd_pairing_unpair(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_link(args: argparse.Namespace) -> int:
+    """Link this machine to an operator via the online agent portal."""
+    import socket
+
+    from .control.link import DEFAULT_SERVER_URL, run_link
+
+    name = args.name or socket.gethostname() or "machine"
+    server_url = args.server_url or DEFAULT_SERVER_URL
+    try:
+        return asyncio.run(run_link(server_url, name))
+    except KeyboardInterrupt:
+        print("\nlink: cancelled.")
+        return 1
+
+
+def cmd_unlink(args: argparse.Namespace) -> int:
+    """Remove an operator pairing and pause that operator's agents."""
+    from .control.link import run_unlink
+
+    return asyncio.run(run_unlink(args.slug))
+
+
 def cmd_api_status(args: argparse.Namespace) -> int:
     """Print bridge configuration + pairing status."""
     cfg = DaemonConfig.load()
@@ -1644,6 +1666,29 @@ def build_parser() -> argparse.ArgumentParser:
         "unpair",
         help="Delete pairing.json so a different identity can pair next",
     ).set_defaults(func=cmd_pairing_unpair)
+
+    link = sub.add_parser(
+        "link",
+        help="Link this machine to a puffo operator via the online agent portal",
+    )
+    link.add_argument(
+        "--name",
+        default=None,
+        help="Name for this machine in the portal (default: hostname).",
+    )
+    link.add_argument(
+        "--server-url",
+        default=None,
+        help="puffo-server base URL (default: the production relay).",
+    )
+    link.set_defaults(func=cmd_link)
+
+    unlink = sub.add_parser(
+        "unlink",
+        help="Remove an operator pairing and pause that operator's agents",
+    )
+    unlink.add_argument("slug", help="Operator slug to unlink")
+    unlink.set_defaults(func=cmd_unlink)
 
     api = sub.add_parser(
         "api",

@@ -203,6 +203,12 @@ class StatusReporter:
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
+        # Agent Portal: tag which machine this agent runs on (None if unlinked).
+        from ..portal.control.store import current_machine_id
+
+        machine_id = current_machine_id()
+        if machine_id:
+            body["machine_id"] = machine_id
         if self._runtime_health_provider is not None:
             try:
                 body["health"] = self._runtime_health_provider()
