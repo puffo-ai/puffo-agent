@@ -1462,50 +1462,32 @@ def _verify_attestation(att: dict, agent_root_pk: bytes, paired_root_pk: bytes) 
         raise CertError("attestation signature verification failed")
 
 
-async def create_agent(request: web.Request) -> web.Response:
-    """Provision a new agent locally.
+class ProvisionError(Exception):
+    """A create-agent bundle was inconsistent or could not be written.
+    ``fields`` carry structured context for the HTTP handler's log line."""
 
-    The web client has already signed the operator attestation and
-    registered the new identity with puffo-server; this handler
-    only verifies cryptographic consistency and writes the agent
-    dir on disk for the reconcile loop to pick up.
+    def __init__(self, reason: str, **fields: Any) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.fields = fields
 
-    Body shape::
 
-        {
-          "display_name": "...",
-          "profile": "<full profile.md text>",
-          "puffo_core": {server_url, slug, device_id, space_id},
-          "runtime": {kind, provider, model, api_key, harness, permission_mode},
-          "identity_bundle": {
-            "identity_cert": <obj>,
-            "device_cert": <obj>,
-            "operator_attestation": <obj>,
-            "slug_binding": <obj>,
-            "root_secret_key": "<b64url>",
-            "device_signing_secret_key": "<b64url>",
-            "kem_secret_key": "<b64url>"
-          }
-        }
-    """
-    paired_root_pubkey_b64 = request["paired_root_pubkey"]
+def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
+    """Verify a create-agent bundle (certs, attestation, puffo_core, runtime)
+    against the paired operator. Returns a context dict the writer consumes.
+    No disk writes, no network. Raises ``ProvisionError`` on any mismatch."""
     try:
         paired_root_pk = base64url_decode(paired_root_pubkey_b64)
     except Exception as exc:
-        return _create_reject(f"paired root pubkey decode: {exc}")
-
-    try:
-        payload = await request.json()
-    except Exception:
-        return _create_reject("body must be JSON")
+        raise ProvisionError(f"paired root pubkey decode: {exc}") from exc
     if not isinstance(payload, dict):
-        return _create_reject("body must be a JSON object")
+        raise ProvisionError("body must be a JSON object")
 
     bundle = payload.get("identity_bundle")
     pc = payload.get("puffo_core")
     rt = payload.get("runtime")
     if not isinstance(bundle, dict) or not isinstance(pc, dict) or not isinstance(rt, dict):
-        return _create_reject(
+        raise ProvisionError(
             "identity_bundle, puffo_core, and runtime are required",
             bundle_type=type(bundle).__name__,
             pc_type=type(pc).__name__,
@@ -1522,25 +1504,25 @@ async def create_agent(request: web.Request) -> web.Response:
         and isinstance(attestation, dict)
         and isinstance(slug_binding, dict)
     ):
-        return _create_reject("identity_bundle missing one of identity_cert/device_cert/operator_attestation/slug_binding")
+        raise ProvisionError("identity_bundle missing one of identity_cert/device_cert/operator_attestation/slug_binding")
 
-    # Surface cert errors verbatim so the web client can show the
+    # Cert errors surface verbatim so the web client can show the
     # specific cryptographic mismatch.
     try:
         agent_root_pk = verify_identity_cert(identity_cert)
     except CertError as exc:
-        return _create_reject(f"identity_cert: {exc}")
+        raise ProvisionError(f"identity_cert: {exc}") from exc
     if identity_cert.get("identity_type") != "agent":
-        return _create_reject(
+        raise ProvisionError(
             "identity_cert.identity_type must be 'agent'",
             got=identity_cert.get("identity_type"),
         )
 
     declared_op_pk_b64 = identity_cert.get("declared_operator_public_key")
     if not isinstance(declared_op_pk_b64, str) or not declared_op_pk_b64:
-        return _create_reject("identity_cert.declared_operator_public_key required for agent identity")
+        raise ProvisionError("identity_cert.declared_operator_public_key required for agent identity")
     if declared_op_pk_b64 != paired_root_pubkey_b64:
-        return _create_reject(
+        raise ProvisionError(
             "identity_cert.declared_operator_public_key does not match paired operator",
             cert=declared_op_pk_b64, paired=paired_root_pubkey_b64,
         )
@@ -1548,48 +1530,44 @@ async def create_agent(request: web.Request) -> web.Response:
     try:
         verify_device_cert(device_cert, agent_root_pk)
     except CertError as exc:
-        return _create_reject(f"device_cert: {exc}")
+        raise ProvisionError(f"device_cert: {exc}") from exc
     try:
         slug_from_binding = verify_slug_binding(slug_binding, agent_root_pk)
     except CertError as exc:
-        return _create_reject(f"slug_binding: {exc}")
+        raise ProvisionError(f"slug_binding: {exc}") from exc
     try:
         _verify_attestation(attestation, agent_root_pk, paired_root_pk)
     except CertError as exc:
-        return _create_reject(f"operator_attestation: {exc}")
+        raise ProvisionError(f"operator_attestation: {exc}") from exc
 
-    # Validate the slug + device_id match the cert bundle. A
-    # mismatch means a doctored payload (or rare provisioning race).
+    # The slug + device_id must match the cert bundle. A mismatch means
+    # a doctored payload (or a rare provisioning race).
     server_url = (pc.get("server_url") or "").strip()
     pc_slug = (pc.get("slug") or "").strip()
     pc_device_id = (pc.get("device_id") or "").strip()
     space_id = (pc.get("space_id") or "").strip()
-    # Optional on the wire. Without it the worker can't DM the
-    # operator about non-auto-acceptable invites (falls back to
-    # logging).
+    # Optional on the wire. Without it the worker can't DM the operator
+    # about non-auto-acceptable invites (falls back to logging).
     operator_slug = (pc.get("operator_slug") or "").strip()
     if not (server_url and pc_slug and pc_device_id and space_id):
-        return _create_reject(
+        raise ProvisionError(
             "puffo_core block must include server_url, slug, device_id, space_id",
             keys_present=sorted(pc.keys()),
         )
     if pc_slug != slug_from_binding:
-        return _create_reject(
+        raise ProvisionError(
             "puffo_core.slug != slug_binding.slug",
             puffo_core=pc_slug, slug_binding=slug_from_binding,
         )
     if pc_device_id != device_cert.get("device_id"):
-        return _create_reject(
+        raise ProvisionError(
             "puffo_core.device_id != device_cert.device_id",
             puffo_core=pc_device_id, device_cert=device_cert.get("device_id"),
         )
 
-    # The agent dir name is the full slug.
     agent_id = pc_slug
     if not is_valid_agent_id(agent_id):
-        return _create_reject(f"slug {agent_id!r} is not a valid agent id")
-    if agent_yml_path(agent_id).exists():
-        return _create_reject(f"agent {agent_id!r} already exists on this daemon")
+        raise ProvisionError(f"slug {agent_id!r} is not a valid agent id")
 
     # Defaults match the CLI's `agent create` behaviour.
     display_name = (payload.get("display_name") or agent_id).strip() or agent_id
@@ -1597,17 +1575,13 @@ async def create_agent(request: web.Request) -> web.Response:
     role = (payload.get("role") or "").strip()
     role_short_raw = payload.get("role_short")
     if role_short_raw is not None and not isinstance(role_short_raw, str):
-        return _create_reject("role_short must be a string")
+        raise ProvisionError("role_short must be a string")
     if role and len(role) > MAX_ROLE_LEN:
-        return _create_reject(
-            f"role must be at most {MAX_ROLE_LEN} characters",
-        )
+        raise ProvisionError(f"role must be at most {MAX_ROLE_LEN} characters")
     if isinstance(role_short_raw, str) and len(role_short_raw) > MAX_ROLE_SHORT_LEN:
-        return _create_reject(
-            f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters",
-        )
+        raise ProvisionError(f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters")
     if not role and role_short_raw:
-        return _create_reject("role_short cannot be set without role")
+        raise ProvisionError("role_short cannot be set without role")
     role_short = (
         role_short_raw.strip() if isinstance(role_short_raw, str)
         else _derive_role_short(role) if role
@@ -1615,10 +1589,10 @@ async def create_agent(request: web.Request) -> web.Response:
     )
     profile_text = payload.get("profile")
     if not isinstance(profile_text, str) or not profile_text.strip():
-        return _create_reject("profile (markdown body) is required")
+        raise ProvisionError("profile (markdown body) is required")
 
-    # Reject invalid runtime triples up front instead of letting
-    # the worker crash on the next reconcile tick.
+    # Reject invalid runtime triples up front instead of letting the
+    # worker crash on the next reconcile tick.
     runtime = RuntimeConfig(
         kind=str(rt.get("kind", "chat-local")),
         provider=str(rt.get("provider", "")),
@@ -1631,108 +1605,174 @@ async def create_agent(request: web.Request) -> web.Response:
     from ..runtime_matrix import validate_triple
     validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
     if not validation.ok:
-        return _create_reject(f"runtime: {validation.error}")
+        raise ProvisionError(f"runtime: {validation.error}")
 
-    # PUF-268: operator-picked skill + MCP template ids. Each entry
-    # is a string template id from puffo-server's
-    # ``/v2/skill-templates`` / ``/v2/mcp-templates`` catalogs. The
-    # daemon resolves them to install metadata at spawn time
-    # (post-host-sync dedupe gate in ``local_cli._verify``). Missing-
-    # from-catalog logs a warning at spawn but doesn't block create —
-    # the operator may have removed a template between picker render
-    # and submit.
+    # PUF-268: operator-picked skill + MCP template ids, resolved to
+    # install metadata at spawn time. Missing-from-catalog warns at
+    # spawn but doesn't block create.
     desired_skills = payload.get("desired_skills") or []
     desired_mcps = payload.get("desired_mcps") or []
-    if not isinstance(desired_skills, list) or not all(
-        isinstance(s, str) and s for s in desired_skills
-    ):
-        return _create_reject(
-            "desired_skills must be a list of non-empty template-id strings",
-        )
-    if not isinstance(desired_mcps, list) or not all(
-        isinstance(s, str) and s for s in desired_mcps
-    ):
-        return _create_reject(
-            "desired_mcps must be a list of non-empty template-id strings",
-        )
+    if not isinstance(desired_skills, list) or not all(isinstance(s, str) and s for s in desired_skills):
+        raise ProvisionError("desired_skills must be a list of non-empty template-id strings")
+    if not isinstance(desired_mcps, list) or not all(isinstance(s, str) and s for s in desired_mcps):
+        raise ProvisionError("desired_mcps must be a list of non-empty template-id strings")
 
-    # On any failure tear the half-built dir down so the reconcile
-    # loop doesn't keep retrying a half-provisioned agent.
+    return {
+        "agent_id": agent_id,
+        "display_name": display_name,
+        "avatar_url": avatar_url,
+        "role": role,
+        "role_short": role_short,
+        "profile_text": profile_text,
+        "server_url": server_url,
+        "slug": pc_slug,
+        "device_id": pc_device_id,
+        "space_id": space_id,
+        "operator_slug": operator_slug,
+        "runtime": runtime,
+        "desired_skills": list(desired_skills),
+        "desired_mcps": list(desired_mcps),
+        "bundle": bundle,
+    }
+
+
+def _write_agent_from_context(ctx: dict) -> dict:
+    """Write the agent dir + keystore from a verified context. Raises
+    ``ProvisionError`` on slug collision; tears down a half-built dir on
+    any write failure and re-raises. Returns ``{agent_id, agent_dir}``."""
+    agent_id = ctx["agent_id"]
+    if agent_yml_path(agent_id).exists():
+        raise ProvisionError(f"agent {agent_id!r} already exists on this daemon")
+
     target = agent_dir(agent_id)
     try:
         target.mkdir(parents=True, exist_ok=False)
         cfg = AgentConfig(
             id=agent_id,
             state="running",
-            display_name=display_name,
-            avatar_url=avatar_url,
-            role=role,
-            role_short=role_short,
+            display_name=ctx["display_name"],
+            avatar_url=ctx["avatar_url"],
+            role=ctx["role"],
+            role_short=ctx["role_short"],
             puffo_core=PuffoCoreConfig(
-                server_url=server_url,
-                slug=pc_slug,
-                device_id=pc_device_id,
-                space_id=space_id,
-                operator_slug=operator_slug,
+                server_url=ctx["server_url"],
+                slug=ctx["slug"],
+                device_id=ctx["device_id"],
+                space_id=ctx["space_id"],
+                operator_slug=ctx["operator_slug"],
             ),
-            runtime=runtime,
+            runtime=ctx["runtime"],
             profile="profile.md",
             memory_dir="memory",
             workspace_dir="workspace",
             triggers=TriggerRules(on_mention=True, on_dm=True),
-            desired_skills=list(desired_skills),
-            desired_mcps=list(desired_mcps),
+            desired_skills=list(ctx["desired_skills"]),
+            desired_mcps=list(ctx["desired_mcps"]),
             created_at=int(now_ms() / 1000),
         )
         cfg.save()
         (target / "memory").mkdir(exist_ok=True)
-        (target / "profile.md").write_text(profile_text, encoding="utf-8")
-        _write_keystore(agent_id, pc_slug, server_url, bundle, pc_device_id)
-    except Exception as exc:
-        # Best-effort cleanup; otherwise the reconcile loop would
-        # log a partial-agent.yml warning every tick.
+        (target / "profile.md").write_text(ctx["profile_text"], encoding="utf-8")
+        _write_keystore(agent_id, ctx["slug"], ctx["server_url"], ctx["bundle"], ctx["device_id"])
+    except ProvisionError:
+        raise
+    except Exception:
+        # Best-effort cleanup so the reconcile loop doesn't keep
+        # retrying a half-provisioned agent.
         import shutil
         shutil.rmtree(target, ignore_errors=True)
+        raise
+    return {"agent_id": agent_id, "agent_dir": str(target)}
+
+
+async def provision_agent_from_bundle(
+    payload: dict, paired_root_pubkey_b64: str, *, materialize=None,
+) -> dict:
+    """Verify a web-signed create-agent bundle, optionally run an async
+    ``materialize`` hook (Agent Portal remote create: finalize the pending
+    identity with puffo-server *before* the dir lands, so the reconcile loop
+    never spawns an unmaterialised agent), then write the agent dir.
+
+    Returns ``{agent_id, agent_dir, device_id, role, role_short, runtime}``.
+    The HTTP bridge passes no hook — its identity is materialised by the
+    browser before the call.
+    """
+    ctx = _verify_agent_bundle(payload, paired_root_pubkey_b64)
+    if materialize is not None:
+        await materialize(ctx)
+    result = _write_agent_from_context(ctx)
+    result.update(
+        device_id=ctx["device_id"],
+        role=ctx["role"],
+        role_short=ctx["role_short"],
+        runtime=ctx["runtime"],
+    )
+    return result
+
+
+async def create_agent(request: web.Request) -> web.Response:
+    """Provision a new agent locally from a web-signed bundle.
+
+    The web client has already signed the operator attestation and
+    registered + materialised the identity with puffo-server; this handler
+    verifies cryptographic consistency and writes the agent dir on disk for
+    the reconcile loop to pick up.
+
+    Body shape::
+
+        {
+          "display_name": "...",
+          "profile": "<full profile.md text>",
+          "puffo_core": {server_url, slug, device_id, space_id},
+          "runtime": {kind, provider, model, api_key, harness, permission_mode},
+          "identity_bundle": {identity_cert, device_cert, operator_attestation,
+            slug_binding, root_secret_key, device_signing_secret_key,
+            kem_secret_key}
+        }
+    """
+    paired_root_pubkey_b64 = request["paired_root_pubkey"]
+    try:
+        payload = await request.json()
+    except Exception:
+        return _create_reject("body must be JSON")
+
+    try:
+        result = await provision_agent_from_bundle(payload, paired_root_pubkey_b64)
+    except ProvisionError as exc:
+        return _create_reject(exc.reason, **exc.fields)
+    except Exception as exc:
         logger.error("bridge: create-agent write failed: %s", exc, exc_info=True)
         return web.json_response({"error": f"write failed: {exc}"}, status=500)
 
+    agent_id = result["agent_id"]
     logger.info(
         "bridge: created agent slug=%s device_id=%s by operator=%s",
-        agent_id, pc_device_id, request["paired_slug"],
+        agent_id, result["device_id"], request["paired_slug"],
     )
 
-    # Best-effort: push role to the agent's server-side identity
-    # profile. display_name + avatar_url already flow through the
-    # pending_agents → identities materialisation in puffo-server
-    # signup, so they're set at registration time; ``role`` was
-    # added later (migration 019_identity_role) and doesn't have a
-    # matching signup pathway yet, so the bridge has to sync it
-    # post-create. Failure here is non-fatal — the operator can
-    # retry via ``PATCH /v1/agents/{id}/profile`` later.
-    if role:
+    # Best-effort: push role to the agent's server-side identity profile.
+    # display_name + avatar_url flow through the pending_agents → identities
+    # materialisation in puffo-server, so they're set at registration; ``role``
+    # has no signup pathway yet so the bridge syncs it post-create.
+    if result["role"]:
         try:
-            patch: dict[str, Any] = {"role": role}
-            if role_short:
-                patch["role_short"] = role_short
+            patch: dict[str, Any] = {"role": result["role"]}
+            if result["role_short"]:
+                patch["role_short"] = result["role_short"]
             await _sync_agent_profile(AgentConfig.load(agent_id), patch)
         except Exception as exc:
-            logger.warning(
-                "bridge: post-create role sync failed for agent=%s: %s",
-                agent_id, exc,
-            )
+            logger.warning("bridge: post-create role sync failed for agent=%s: %s", agent_id, exc)
 
     response_body: dict[str, Any] = {
         "agent_id": agent_id,
-        "agent_dir": str(target),
+        "agent_dir": result["agent_dir"],
     }
 
-    # ws-local: passcode doubles as the ``.puffoagent`` export password
-    # so the web can round-trip create + export in one call. Pack
-    # failure is logged + surfaced via ``bundle_error``; the agent
-    # stays on disk and the operator can retry via /v1/agents/export.
+    # ws-local: passcode doubles as the ``.puffoagent`` export password so the
+    # web can round-trip create + export in one call.
     from ..runtime_matrix import RUNTIME_WS_LOCAL
     passcode = (payload.get("passcode") or "").strip()
-    if runtime.kind == RUNTIME_WS_LOCAL and passcode:
+    if result["runtime"].kind == RUNTIME_WS_LOCAL and passcode:
         try:
             from .. import export as exp
             bundle_bytes = exp.pack(
@@ -1741,10 +1781,7 @@ async def create_agent(request: web.Request) -> web.Response:
             )
             response_body["bundle_base64"] = base64.b64encode(bundle_bytes).decode("ascii")
         except Exception as exc:
-            logger.warning(
-                "bridge: ws-local bundle pack failed for agent=%s: %s",
-                agent_id, exc,
-            )
+            logger.warning("bridge: ws-local bundle pack failed for agent=%s: %s", agent_id, exc)
             response_body["bundle_error"] = str(exc)
 
     return web.json_response(response_body, status=201)

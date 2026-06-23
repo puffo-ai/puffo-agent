@@ -27,6 +27,10 @@ log = logging.getLogger("puffo_agent.control")
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
 RESCAN_SECONDS = 5.0
+HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
+# Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
+# well under the server's HEARTBEAT_TIMEOUT (90s) or the server culls us.
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 def _touch_flag(path) -> None:
@@ -34,10 +38,76 @@ def _touch_flag(path) -> None:
     path.write_text("", encoding="utf-8")
 
 
-def execute_command(op: str, agent_slug: str | None, params: dict) -> dict:
+async def _materialize_slug_binding(
+    server_url: str, pending_token: str, slug_binding: dict
+) -> None:
+    """Finalize a pending agent identity on puffo-server by POSTing the
+    browser-pre-built slug_binding (agent self-signed, transport-
+    unauthenticated). Done on the machine *after* delivery, so a command that
+    never arrives leaves only a TTL'd pending row — never a permanent orphan."""
+    from ...crypto.http_session import create_remote_http_session
+
+    body = {"pending_token": pending_token, "slug_binding": slug_binding}
+    async with create_remote_http_session(server_url, timeout=HTTP_TIMEOUT) as session:
+        async with session.post(
+            f"{server_url.rstrip('/')}/certs/slug_binding", json=body
+        ) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise ControlError(f"slug_binding {resp.status}: {text}")
+
+
+async def _create_agent_command(
+    params: dict, server_url: str | None, paired_root_pubkey: str | None
+) -> dict:
+    """Agent Portal remote create: materialize the pending identity, then write
+    the agent dir. Order is verify → materialize → write, so a verify failure
+    never materializes and a never-delivered command never registers."""
+    if not server_url or not paired_root_pubkey:
+        return {"ok": False, "error": "create missing operator pairing context"}
+    pending_token = params.get("pending_token")
+    slug_binding = (params.get("identity_bundle") or {}).get("slug_binding")
+    if not isinstance(pending_token, str) or not pending_token:
+        return {"ok": False, "error": "create missing pending_token"}
+    if not isinstance(slug_binding, dict):
+        return {"ok": False, "error": "create missing identity_bundle.slug_binding"}
+
+    # The browser's server_url placeholder is unreachable from this machine;
+    # stamp our own paired server_url so the agent.yml + worker talk to a URL
+    # the machine can actually reach.
+    pc = params.get("puffo_core")
+    if isinstance(pc, dict):
+        pc["server_url"] = server_url
+
+    from ..api.handlers import ProvisionError, provision_agent_from_bundle
+
+    async def _materialize(_ctx: dict) -> None:
+        await _materialize_slug_binding(server_url, pending_token, slug_binding)
+
+    try:
+        result = await provision_agent_from_bundle(
+            params, paired_root_pubkey, materialize=_materialize
+        )
+    except ProvisionError as exc:
+        return {"ok": False, "error": exc.reason}
+    except ControlError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "agent_slug": result["agent_id"]}
+
+
+async def execute_command(
+    op: str,
+    agent_slug: str | None,
+    params: dict,
+    *,
+    server_url: str | None = None,
+    paired_root_pubkey: str | None = None,
+) -> dict:
     """Apply a decrypted command to local agent state, the same way the local
     bridge handlers do (flip ``agent.yml`` state, drop sentinel flags) so the
-    reconcile loop applies it — a single-writer model."""
+    reconcile loop applies it — a single-writer model. ``create`` additionally
+    finalizes the pending identity with puffo-server (needs the operator
+    pairing context)."""
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
@@ -70,7 +140,9 @@ def execute_command(op: str, agent_slug: str | None, params: dict) -> dict:
                 params["profile"], encoding="utf-8"
             )
         return {"ok": True}
-    # create/export/import carry key material + bigger flows; not yet wired.
+    if op == "create":
+        return await _create_agent_command(params, server_url, paired_root_pubkey)
+    # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
 
@@ -86,6 +158,38 @@ async def _sleep_or_stop(stop: asyncio.Event, timeout: float) -> None:
         pass
 
 
+def build_capabilities() -> dict:
+    """This machine's reportable capabilities: CLI-tool auth status + provider/
+    model catalog. Mirrors the local bridge's ``info.cli_tools`` + ``/v1/
+    providers`` so the portal renders a remote machine's providers like a local
+    one. ``fetch=False`` keeps it off the network (serves cache/static)."""
+    from ...agent.cli_bin import (
+        claude_has_credentials,
+        codex_has_credentials,
+        resolve_claude_bin,
+        resolve_codex_bin,
+    )
+    from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
+    from ..api.handlers import _cli_tool_status
+
+    cli_tools = {
+        "claude-code": _cli_tool_status(resolve_claude_bin, claude_has_credentials),
+        "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
+    }
+    providers = [
+        {
+            "provider": h,
+            "models": [
+                {"id": o.id, "label": o.label, "alias": o.is_alias}
+                for o in provider_models(h, fetch=False)
+                if o.id
+            ],
+        }
+        for h in KNOWN_HARNESSES
+    ]
+    return {"cli_tools": cli_tools, "providers": providers}
+
+
 class MachineControlClient:
     """Holds the single control WS; verifies each command against the pinned
     operator root named in the frame, executes it, and acks."""
@@ -93,6 +197,9 @@ class MachineControlClient:
     def __init__(self, machine) -> None:
         self.machine = machine
         self._seen_nonces: set[str] = set()
+        # Serialize WS writes — acks (receive loop) + heartbeat/capabilities
+        # (sender task) share one socket; concurrent send_json would interleave.
+        self._send_lock = asyncio.Lock()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -104,6 +211,10 @@ class MachineControlClient:
                 log.debug("control: ws error: %s", exc)
             await _sleep_or_stop(stop, RECONNECT_BACKOFF_SECONDS)
 
+    async def _send(self, ws: aiohttp.ClientWebSocketResponse, obj: dict) -> None:
+        async with self._send_lock:
+            await ws.send_json(obj)
+
     async def _connect_once(self, stop: asyncio.Event) -> None:
         pairings = load_pairings()
         if not pairings:
@@ -111,23 +222,51 @@ class MachineControlClient:
         base = next(iter(pairings.values())).server_url.rstrip("/")
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(_ws_url(base), heartbeat=None) as ws:
-                await ws.send_json(machine_auth.ws_connect_frame(self.machine))
-                async for msg in ws:
-                    if stop.is_set():
-                        break
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                await self._send(ws, machine_auth.ws_connect_frame(self.machine))
+                # Initial capability snapshot on connect.
+                last_caps = await asyncio.to_thread(build_capabilities)
+                await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
+                sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
+                try:
+                    async for msg in ws:
+                        if stop.is_set():
                             break
-                        continue
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                            continue
+                        try:
+                            frame = json.loads(msg.data)
+                        except ValueError:
+                            continue
+                        if frame.get("type") == "command":
+                            await self._handle(ws, frame)
+                        elif frame.get("type") == "error":
+                            log.warning("control: server rejected ws: %s", frame.get("reason"))
+                            break
+                finally:
+                    sender.cancel()
                     try:
-                        frame = json.loads(msg.data)
-                    except ValueError:
-                        continue
-                    if frame.get("type") == "command":
-                        await self._handle(ws, frame)
-                    elif frame.get("type") == "error":
-                        log.warning("control: server rejected ws: %s", frame.get("reason"))
-                        break
+                        await sender
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+
+    async def _heartbeat_loop(
+        self, ws: aiohttp.ClientWebSocketResponse, stop: asyncio.Event, initial_caps: dict
+    ) -> None:
+        """Periodic liveness ping; re-push capabilities only when they change
+        (e.g. a CLI tool gets authed). Capability compute runs off-thread so a
+        stale model-catalog fetch never blocks the heartbeat."""
+        last_caps = initial_caps
+        while not stop.is_set():
+            await _sleep_or_stop(stop, HEARTBEAT_INTERVAL_SECONDS)
+            if stop.is_set():
+                break
+            await self._send(ws, {"type": "heartbeat"})
+            caps = await asyncio.to_thread(build_capabilities)
+            if caps != last_caps:
+                await self._send(ws, {"type": "capabilities", "capabilities": caps})
+                last_caps = caps
 
     async def _handle(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
         command_id = frame.get("command_id")
@@ -145,7 +284,18 @@ class MachineControlClient:
             )
             if nonce:
                 self._seen_nonces.add(nonce)
-            execute_command(decrypted["op"], decrypted["agent_slug"], decrypted["params"])
+            result = await execute_command(
+                decrypted["op"],
+                decrypted["agent_slug"],
+                decrypted["params"],
+                server_url=pairing.server_url,
+                paired_root_pubkey=pairing.operator_root_pubkey,
+            )
+            if isinstance(result, dict) and not result.get("ok", True):
+                log.warning(
+                    "control: command %s op=%s failed: %s",
+                    command_id, decrypted["op"], result.get("error"),
+                )
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
@@ -154,7 +304,7 @@ class MachineControlClient:
 
         if command_id:
             try:
-                await ws.send_json({"type": "ack", "command_id": command_id})
+                await self._send(ws, {"type": "ack", "command_id": command_id})
             except Exception as exc:  # noqa: BLE001
                 log.debug("control: ack %s failed: %s", command_id, exc)
 
