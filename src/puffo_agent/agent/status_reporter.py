@@ -47,6 +47,7 @@ class StatusReporter:
         *,
         heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
         runtime_health_provider: Optional[Callable[[], str]] = None,
+        runtime_provider: Optional[Callable[[], dict[str, Any]]] = None,
     ) -> None:
         self._http = http
         self._interval = max(10.0, heartbeat_interval_s)
@@ -54,6 +55,9 @@ class StatusReporter:
         self._current_message_id: str | None = None
         # None keeps the legacy single-stream wire shape.
         self._runtime_health_provider = runtime_health_provider
+        # Agent Portal: reports kind/provider/harness/model so the operator's
+        # portal can show + pre-select the live model.
+        self._runtime_provider = runtime_provider
         self._stop = asyncio.Event()
 
     async def run_heartbeat_loop(self) -> None:
@@ -209,6 +213,12 @@ class StatusReporter:
         machine_id = current_machine_id()
         if machine_id:
             body["machine_id"] = machine_id
+            # Runtime only matters in the portal context (a linked machine).
+            if self._runtime_provider is not None:
+                try:
+                    body["runtime"] = self._runtime_provider()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("runtime_provider raised (%s)", exc)
         if self._runtime_health_provider is not None:
             try:
                 body["health"] = self._runtime_health_provider()
