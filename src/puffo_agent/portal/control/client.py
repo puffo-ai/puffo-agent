@@ -130,15 +130,27 @@ async def execute_command(
         return {"ok": True}
     if op == "edit":
         cfg = AgentConfig.load(agent_slug)
+        patch: dict = {}
         if isinstance(params.get("display_name"), str):
             cfg.display_name = params["display_name"]
+            patch["display_name"] = params["display_name"]
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
+            patch["role"] = params["role"]
         cfg.save()
         if isinstance(params.get("profile"), str):
             (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
                 params["profile"], encoding="utf-8"
             )
+        # Sync display_name/role to the server identity so the operator's portal
+        # reflects the edit — agent.yml alone isn't visible server-side.
+        if patch:
+            try:
+                from ..api.handlers import _sync_agent_profile
+
+                await _sync_agent_profile(cfg, patch)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("control: edit profile sync failed: %s", exc)
         return {"ok": True}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
@@ -172,6 +184,13 @@ def build_capabilities() -> dict:
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
     from ..api.handlers import _cli_tool_status
 
+    import importlib.metadata
+
+    try:
+        daemon_version = importlib.metadata.version("puffo-agent")
+    except Exception:  # noqa: BLE001
+        daemon_version = ""
+
     cli_tools = {
         "claude-code": _cli_tool_status(resolve_claude_bin, claude_has_credentials),
         "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
@@ -187,7 +206,7 @@ def build_capabilities() -> dict:
         }
         for h in KNOWN_HARNESSES
     ]
-    return {"cli_tools": cli_tools, "providers": providers}
+    return {"cli_tools": cli_tools, "providers": providers, "daemon_version": daemon_version}
 
 
 class MachineControlClient:
