@@ -61,6 +61,10 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
+        # Agents whose "paused" state we've already reported this session, so a
+        # paused-with-no-worker agent (e.g. after a daemon restart) is asserted
+        # once instead of every tick. Cleared when the agent runs again.
+        self._paused_reported: set[str] = set()
         # Shared attach registry: ws-local Workers register here; the
         # bridge's /v1/ws-local route serves tools against it.
         self.ws_local_hub = WsLocalHub()
@@ -228,6 +232,7 @@ class Daemon:
             worker = self.workers.get(agent_id)
 
             if desired_state == "running":
+                self._paused_reported.discard(agent_id)
                 if worker is None:
                     logger.info("agent %s: starting worker", agent_id)
                     worker = Worker(
@@ -265,7 +270,13 @@ class Daemon:
                     await self._stop_worker(agent_id)
                     # Worker's gone → it can't heartbeat "paused"; the daemon
                     # reports it so the operator's portal reflects the pause.
-                    await _report_lifecycle(agent_cfg, "paused")
+                    if await _report_lifecycle(agent_cfg, "paused"):
+                        self._paused_reported.add(agent_id)
+                elif agent_id not in self._paused_reported:
+                    # Paused with no worker (e.g. after a daemon restart) —
+                    # assert the state once so the portal isn't stuck stale.
+                    if await _report_lifecycle(agent_cfg, "paused"):
+                        self._paused_reported.add(agent_id)
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
 
@@ -411,17 +422,18 @@ class Daemon:
             )
 
 
-async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> None:
+async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
     """Report an operator lifecycle state (paused/archived) to the server as the
     agent. The worker is stopped at this point, so it can't heartbeat the state
-    itself; the daemon does it out-of-band. Best-effort."""
+    itself; the daemon does it out-of-band. Returns True on success so callers
+    can retry a transient failure next tick."""
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
     from .control.store import current_machine_id
 
     pc = agent_cfg.puffo_core
     if not pc.is_configured():
-        return
+        return False
     http = PuffoCoreHttpClient(pc.server_url, KeyStore.for_agent(agent_cfg.id), pc.slug)
     try:
         body: dict = {"status": status}
@@ -429,8 +441,10 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> None:
         if machine_id:
             body["machine_id"] = machine_id
         await http.post("/agents/me/heartbeat", body)
+        return True
     except Exception as exc:  # noqa: BLE001
         logger.warning("agent %s: lifecycle report %r failed: %s", agent_cfg.id, status, exc)
+        return False
     finally:
         await http.close()
 
