@@ -141,6 +141,19 @@ async def execute_command(
         # server identity (it isn't kept in agent.yml).
         if isinstance(params.get("soul_url"), str):
             patch["soul_url"] = params["soul_url"]
+        # Runtime block (kind/provider/harness/model) — same fields the local
+        # bridge's update_runtime accepts; reject invalid triples before saving.
+        rt_in = params.get("runtime")
+        if isinstance(rt_in, dict):
+            rt = cfg.runtime
+            for key in ("kind", "provider", "harness", "model"):
+                if isinstance(rt_in.get(key), str):
+                    setattr(rt, key, rt_in[key])
+            from ..runtime_matrix import validate_triple
+
+            result = validate_triple(rt.kind, rt.provider, rt.harness)
+            if not result.ok:
+                return {"ok": False, "error": f"runtime: {result.error}"}
         cfg.save()
         if isinstance(params.get("profile"), str):
             (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
@@ -155,6 +168,10 @@ async def execute_command(
                 await _sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
+        # Restart a running worker so profile.md / runtime / identity edits take
+        # effect now rather than on the next manual restart.
+        if cfg.state == "running":
+            _touch_flag(restart_flag_path(agent_slug))
         return {"ok": True}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
