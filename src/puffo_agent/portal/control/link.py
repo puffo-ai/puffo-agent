@@ -25,6 +25,16 @@ POLL_INTERVAL_SECONDS = 2.0
 LINK_TIMEOUT_SECONDS = 300
 
 
+def _web_url_from_server(server_url: str) -> str:
+    """Derive the web-app base from the server URL: the public edge serves the
+    relay at ``<web>/relay``, so drop that suffix. Self-hosted/dev setups whose
+    web app lives elsewhere can ignore the printed link and enter the code."""
+    base = server_url.rstrip("/")
+    if base.endswith("/relay"):
+        base = base[: -len("/relay")]
+    return base
+
+
 async def run_link(server_url: str, hostname: str) -> int:
     """Register this machine, mint a link code, and wait for an operator to
     approve it. The machine's private key never leaves disk."""
@@ -47,9 +57,11 @@ async def run_link(server_url: str, hostname: str) -> int:
                 return 1
             code = (await resp.json())["code"]
 
+        web = _web_url_from_server(server_url)
         print(f"\n  Link code:  {code}\n")
-        print("  Open the puffo web app, go to Devices → Link a machine,")
-        print(f"  and enter this code to approve '{hostname}'.\n")
+        print(f"  Open:  {web}/chat/agents?linkCode={code}")
+        print("  (the link opens the puffo web app with the code pre-filled —")
+        print(f"   or go to My Agents → Link machine and enter it to approve '{hostname}'.)\n")
         print("  Waiting for approval (Ctrl-C to cancel)...")
 
         waited = 0.0
