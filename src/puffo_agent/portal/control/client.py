@@ -137,6 +137,11 @@ async def execute_command(
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
             patch["role"] = params["role"]
+        # avatar_url points to a blob the operator already uploaded; sync it to
+        # the server identity (avatars are public, so no gating needed).
+        if isinstance(params.get("avatar_url"), str):
+            cfg.avatar_url = params["avatar_url"]
+            patch["avatar_url"] = params["avatar_url"]
         # Soul is owner-gated text on the server identity (not kept in
         # agent.yml); the profile.md body carries it for the worker.
         if isinstance(params.get("soul"), str):
