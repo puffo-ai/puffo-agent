@@ -263,6 +263,9 @@ class Daemon:
                 if worker is not None:
                     logger.info("agent %s: state=paused, stopping worker", agent_id)
                     await self._stop_worker(agent_id)
+                    # Worker's gone → it can't heartbeat "paused"; the daemon
+                    # reports it so the operator's portal reflects the pause.
+                    await _report_lifecycle(agent_cfg, "paused")
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
 
@@ -363,6 +366,11 @@ class Daemon:
             agent_id,
         )
         await self._stop_worker(agent_id)
+        # Report archived before the dir (+ keystore) moves out from under us.
+        try:
+            await _report_lifecycle(AgentConfig.load(agent_id), "archived")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: archived report failed: %s", agent_id, exc)
         src = agent_dir(agent_id)
         if not src.exists():
             return
@@ -401,6 +409,30 @@ class Daemon:
                 "agent %s: delete failed: %s (flag still present — will retry next tick)",
                 agent_id, exc,
             )
+
+
+async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> None:
+    """Report an operator lifecycle state (paused/archived) to the server as the
+    agent. The worker is stopped at this point, so it can't heartbeat the state
+    itself; the daemon does it out-of-band. Best-effort."""
+    from ..crypto.http_client import PuffoCoreHttpClient
+    from ..crypto.keystore import KeyStore
+    from .control.store import current_machine_id
+
+    pc = agent_cfg.puffo_core
+    if not pc.is_configured():
+        return
+    http = PuffoCoreHttpClient(pc.server_url, KeyStore.for_agent(agent_cfg.id), pc.slug)
+    try:
+        body: dict = {"status": status}
+        machine_id = current_machine_id()
+        if machine_id:
+            body["machine_id"] = machine_id
+        await http.post("/agents/me/heartbeat", body)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent %s: lifecycle report %r failed: %s", agent_cfg.id, status, exc)
+    finally:
+        await http.close()
 
 
 async def _drain_codex_tmp(src: Path) -> None:
