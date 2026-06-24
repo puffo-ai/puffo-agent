@@ -137,6 +137,10 @@ async def execute_command(
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
             patch["role"] = params["role"]
+        # soul_url points to the operator-uploaded soul blob; sync it to the
+        # server identity (it isn't kept in agent.yml).
+        if isinstance(params.get("soul_url"), str):
+            patch["soul_url"] = params["soul_url"]
         cfg.save()
         if isinstance(params.get("profile"), str):
             (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
