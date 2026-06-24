@@ -120,8 +120,14 @@ class MessageStore:
 
     @staticmethod
     def for_agent(agent_id: str) -> MessageStore:
-        home = os.environ.get("PUFFO_HOME", os.path.expanduser("~/.puffo-agent"))
-        path = Path(home) / "agents" / agent_id / "messages.db"
+        # PUFFO_AGENT_HOME is the daemon's home override (see portal.state);
+        # PUFFO_HOME is the legacy fallback.
+        home = (
+            os.environ.get("PUFFO_AGENT_HOME")
+            or os.environ.get("PUFFO_HOME")
+            or os.path.expanduser("~/.puffo-agent")
+        )
+        path = Path(home).expanduser() / "agents" / agent_id / "messages.db"
         return MessageStore(path)
 
     async def open(self) -> None:
