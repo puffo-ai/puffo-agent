@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .base import TurnResult
+from .cli_session import AuditLog
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class CodexSession:
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
         model: str = "",
+        audit: Optional[AuditLog] = None,
     ):
         self.agent_id = agent_id
         self.session_file = session_file
@@ -238,6 +240,12 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
+        # PUF-324: per-agent NDJSON audit log. Matches the
+        # ``ClaudeSession.audit`` contract — each ``assistant.text``
+        # streaming delta + ``tool``-use completion gets a row so
+        # operators can tail the same ``<workspace>/.puffo-agent/audit.log``
+        # regardless of which adapter is driving the agent.
+        self.audit = audit
 
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -1093,6 +1101,12 @@ class CodexSession:
             delta_text = params.get("delta")
             if isinstance(delta_text, str) and delta_text:
                 turn.reply_chunks.append(delta_text)
+                # PUF-324: tee streaming narrative into the audit log
+                # so the operator can see intermediate ``searching
+                # web`` / ``updating code`` text live, matching the
+                # claude-code adapter's ``assistant.text`` shape.
+                if self.audit is not None:
+                    self.audit.write("assistant.text", text=delta_text)
             return
         # 2. Final item — nested under params.item.
         item = params.get("item") or {}
@@ -1109,8 +1123,31 @@ class CodexSession:
                     joined = "".join(turn.reply_chunks)
                     if joined.strip() != text.strip():
                         turn.reply_chunks = [text]
+                        # PUF-324: when we replace the delta-built
+                        # buffer because of the missed-delta path, the
+                        # streaming-delta audit rows above don't reflect
+                        # the authoritative text. Emit a synthetic
+                        # ``assistant.text`` so audit.log still carries
+                        # the operator-observable final narrative.
+                        if self.audit is not None:
+                            self.audit.write(
+                                "assistant.text", text=text,
+                            )
             elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
                 turn.tool_calls += 1
+                # PUF-324: cross-adapter parity with
+                # ``ClaudeSession``'s tool capture. Some codex shapes
+                # nest the tool name as ``item.name`` / args as
+                # ``item.input``; fall through to empty strings rather
+                # than skipping the row entirely so the operator at
+                # least sees the count + presence in audit.log.
+                if self.audit is not None:
+                    self.audit.write(
+                        "tool",
+                        name=str(item.get("name") or kind),
+                        input=item.get("input") or item.get("arguments") or {},
+                        id=str(item.get("id") or ""),
+                    )
             elif kind == "mcptoolcall":
                 # Real codex shape per debug logs: ``item/completed``
                 # with ``item.type == "mcpToolCall"``, ``item.server``
@@ -1134,6 +1171,17 @@ class CodexSession:
                         "channel": str(args.get("channel", "")),
                         "root_id": str(args.get("root_id", "")),
                     })
+                # PUF-324: cross-adapter audit-log shape — the tool
+                # name codex puts on the ``mcpToolCall`` item is
+                # ``server__tool`` (e.g. ``puffo__send_message``),
+                # mirroring how the claude-code adapter sees these.
+                if self.audit is not None:
+                    self.audit.write(
+                        "tool",
+                        name=f"{server}__{tool}" if server and tool else (tool or "mcp"),
+                        input=args,
+                        id=str(item.get("id") or ""),
+                    )
             return
 
     def _absorb_turn_usage(self, turn: _PendingTurn, params: dict) -> None:
