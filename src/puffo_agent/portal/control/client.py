@@ -137,10 +137,10 @@ async def execute_command(
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
             patch["role"] = params["role"]
-        # soul_url points to the operator-uploaded soul blob; sync it to the
-        # server identity (it isn't kept in agent.yml).
-        if isinstance(params.get("soul_url"), str):
-            patch["soul_url"] = params["soul_url"]
+        # Soul is owner-gated text on the server identity (not kept in
+        # agent.yml); the profile.md body carries it for the worker.
+        if isinstance(params.get("soul"), str):
+            patch["soul"] = params["soul"]
         # Runtime block (kind/provider/harness/model) — same fields the local
         # bridge's update_runtime accepts; reject invalid triples before saving.
         rt_in = params.get("runtime")
