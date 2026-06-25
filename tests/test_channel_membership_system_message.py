@@ -943,8 +943,8 @@ async def test_space_membership_skips_self_actor():
 
 
 @pytest.mark.asyncio
-async def test_space_membership_picks_first_channel_deterministically():
-    """Multiple shared channels → lexicographically-first channel is
+async def test_space_membership_falls_back_to_lex_first_when_no_general():
+    """No channel named ``general`` → lexicographically-first id is
     picked so a reconnect-replay collapses to the same envelope_id."""
     store = await _make_store()
     client = _make_client(store)
@@ -966,6 +966,43 @@ async def test_space_membership_picks_first_channel_deterministically():
     msg = client._thread_state[root_id].messages[0]
     assert msg["channel_id"] == "ch_a"
     assert root_id == "membership-left_space-ch_a-alice-0001-ev_pick"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_prefers_general_channel_when_present():
+    """Space-scope events land in #general so the agent transcript
+    lines up with the human UI; lex-first only kicks in when no
+    General is visible."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_zulu"] = "sp_1"
+    client._channel_space["ch_general"] = "sp_1"
+    client._channel_space["ch_alpha"] = "sp_1"
+
+    async def _stub_channel_name(*, space_id: str, channel_id: str) -> str:
+        return {
+            "ch_general": "General",
+            "ch_alpha": "alpha",
+            "ch_zulu": "zulu",
+        }.get(channel_id, channel_id)
+
+    client._resolve_channel_name = _stub_channel_name  # type: ignore[assignment]
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_space",
+            "signer_slug": "alice-0001",
+            "event_id": "ev_general",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert msg["channel_id"] == "ch_general"
+    assert root_id == "membership-left_space-ch_general-alice-0001-ev_general"
     await store.close()
 
 

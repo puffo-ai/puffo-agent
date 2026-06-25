@@ -2784,12 +2784,12 @@ class PuffoCoreMessageClient:
         who silently dropped out of #general (or fails to greet a
         member who just auto-joined).
 
-        Resolves the space to the lexicographically-first channel
-        the agent has visibility into within that space
-        (``_channel_space`` mapping). Stable pick so reconnect-replay
-        collapses to the same target envelope_id. Skip silently when
-        the agent has no visibility into any channel of the space —
-        no transcript to surface into.
+        Prefers the channel named ``general`` (case-insensitive) so
+        the agent's transcript lines up with the human-side UI, which
+        renders space events into General. Falls back to the
+        lexicographically-first visible channel when no General is
+        present. Skip silently when the agent has no visibility into
+        any channel of the space — no transcript to surface into.
         """
         space_id = payload.get("space_id") or ""
         if not space_id:
@@ -2802,6 +2802,13 @@ class PuffoCoreMessageClient:
         if not channels_in_space:
             return
         target_channel_id = channels_in_space[0]
+        for cid in channels_in_space:
+            name = await self._resolve_channel_name(
+                space_id=space_id, channel_id=cid,
+            )
+            if (name or "").strip().lower() == "general":
+                target_channel_id = cid
+                break
 
         inviter_slug = ""
         if kind == "accept_space_invite":
