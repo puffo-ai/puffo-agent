@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import aiosqlite
+
+from ..portal.state import home_dir
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -120,15 +121,7 @@ class MessageStore:
 
     @staticmethod
     def for_agent(agent_id: str) -> MessageStore:
-        # PUFFO_AGENT_HOME is the daemon's home override (see portal.state);
-        # PUFFO_HOME is the legacy fallback.
-        home = (
-            os.environ.get("PUFFO_AGENT_HOME")
-            or os.environ.get("PUFFO_HOME")
-            or os.path.expanduser("~/.puffo-agent")
-        )
-        path = Path(home).expanduser() / "agents" / agent_id / "messages.db"
-        return MessageStore(path)
+        return MessageStore(home_dir() / "agents" / agent_id / "messages.db")
 
     async def open(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

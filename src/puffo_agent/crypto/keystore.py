@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from ..portal.state import home_dir
 from .encoding import base64url_decode, base64url_encode
 
 
@@ -83,12 +83,7 @@ class KeyStore:
 
     @staticmethod
     def for_agent(agent_id: str) -> KeyStore:
-        home = (
-            os.environ.get("PUFFO_AGENT_HOME")
-            or os.environ.get("PUFFO_HOME")
-            or os.path.expanduser("~/.puffo-agent")
-        )
-        return KeyStore(Path(home).expanduser() / "agents" / agent_id / "keys")
+        return KeyStore(home_dir() / "agents" / agent_id / "keys")
 
     def _identity_path(self, slug: str) -> Path:
         return self.base_dir / f"{slug}.json"
