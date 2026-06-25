@@ -630,3 +630,362 @@ async def test_persist_failure_still_delivers_in_memory_envelope(
         for rec in caplog.records
     )
     await store.close()
+
+
+# ─── PR #94 review-#2: inviter citation in joined body ─────────────
+
+
+@pytest.mark.asyncio
+async def test_joined_body_cites_inviter_when_supplied():
+    """Server-auto-accept embeds ``original_invite.signer_slug``; the
+    body should render '(invited by <inviter>)' so the agent can
+    distinguish who pulled the new member in."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._enqueue_membership_system_message(
+        channel_id="ch_1",
+        actor_slug="bob-0002",
+        action="joined",
+        inviter_slug="alice-0001",
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "joined channel #general" in msg["text"]
+    assert "(invited by " in msg["text"]
+    assert "Alice" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_joined_body_omits_inviter_when_empty():
+    """Manual-accept omits ``original_invite``; the body should NOT
+    grow a '(invited by )' fragment when the slug is empty."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._enqueue_membership_system_message(
+        channel_id="ch_1",
+        actor_slug="bob-0002",
+        action="joined",
+        inviter_slug="",
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "joined channel #general" in msg["text"]
+    assert "invited by" not in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_accept_channel_invite_with_original_invite_cites_inviter():
+    """Server-auto-accept payload path: original_invite.signer_slug
+    must be lifted into the rendered body."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_channel_invite",
+            "signer_slug": "bob-0002",  # the joiner
+            "payload": {
+                "channel_id": "ch_1",
+                "space_id": "sp_1",
+                "original_invite": {"signer_slug": "alice-0001"},
+            },
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "joined channel #general" in msg["text"]
+    assert "(invited by " in msg["text"]
+    assert "Alice" in msg["text"]
+    await store.close()
+
+
+# ─── PR #94 review-#1: space-membership announce path ─────────────
+
+
+@pytest.mark.asyncio
+async def test_space_membership_joined_renders_joined_space_body():
+    store = await _make_store()
+    client = _make_client(store)
+    # Visibility into one channel of the space — required for the
+    # space announce path to pick a target channel.
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._enqueue_membership_system_message(
+        channel_id="ch_1",
+        actor_slug="alice-0001",
+        action="joined_space",
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert msg["envelope_id"].startswith(
+        "membership-joined_space-ch_1-alice-0001-"
+    )
+    assert "Alice" in msg["text"]
+    assert "joined space" in msg["text"]
+    assert "**Team**" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_left_renders_left_space_body():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._enqueue_membership_system_message(
+        channel_id="ch_1",
+        actor_slug="bob-0002",
+        action="left_space",
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "left space" in msg["text"]
+    assert "**Team**" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_removed_includes_kicker_and_space():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._enqueue_membership_system_message(
+        channel_id="ch_1",
+        actor_slug="bob-0002",
+        action="removed_from_space",
+        kicker_slug="alice-0001",
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "was removed from space" in msg["text"]
+    assert "**Team**" in msg["text"]
+    assert "Alice" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_leave_space_by_other_announces_into_first_channel():
+    """puffo-server #74 cascade-leave doesn't fan per-channel events.
+    The space announce path picks the first known channel as the
+    transcript target so the agent sees the member dropping out."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_space",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    assert client._queue.qsize() == 1
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert msg["channel_id"] == "ch_1"
+    assert "Alice" in msg["text"]
+    assert "left space" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_remove_from_space_by_other_announces_with_kicker():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "remove_from_space",
+            "signer_slug": "alice-0001",  # kicker
+            "payload": {
+                "space_id": "sp_1",
+                "removed_slug": "bob-0002",
+            },
+        },
+    )
+
+    assert client._queue.qsize() == 1
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "Alice" in msg["text"]
+    assert "removed from space" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_accept_space_invite_by_other_announces_join():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_space_invite",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    assert client._queue.qsize() == 1
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Alice" in msg["text"]
+    assert "joined space" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_event_accept_space_invite_cites_inviter_when_present():
+    """Server-auto-accept embeds the inviter under original_invite —
+    same shape as the channel path."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_space_invite",
+            "signer_slug": "bob-0002",
+            "payload": {
+                "space_id": "sp_1",
+                "original_invite": {"signer_slug": "alice-0001"},
+            },
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "(invited by " in msg["text"]
+    assert "Alice" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_skips_when_no_channel_visibility():
+    """Agent has no channel in this space → no transcript to surface
+    the announcement into → skip silently."""
+    store = await _make_store()
+    client = _make_client(store)
+    # _channel_space has no entries for sp_1.
+    client._channel_space["ch_other"] = "sp_2"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_space",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    assert client._queue.qsize() == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_skips_self_actor():
+    """Self space exits route through ``_on_left_space`` /
+    ``_on_kicked_from_space`` (operator-DM paths) and must NOT
+    double-emit into the agent's own transcript."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    # Self-leave is short-circuited by the earlier
+    # "self leave_space" branch; here we drive the announce path
+    # directly to prove the actor==self guard in it.
+    await client._maybe_announce_space_membership_change(
+        "leave_space",
+        {"signer_slug": "agent-1"},
+        {"space_id": "sp_1"},
+    )
+    await client._maybe_announce_space_membership_change(
+        "remove_from_space",
+        {"signer_slug": "alice-0001"},
+        {"space_id": "sp_1", "removed_slug": "agent-1"},
+    )
+    await client._maybe_announce_space_membership_change(
+        "accept_space_invite",
+        {"signer_slug": "agent-1"},
+        {"space_id": "sp_1"},
+    )
+
+    assert client._queue.qsize() == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_picks_first_channel_deterministically():
+    """Multiple shared channels → lexicographically-first channel is
+    picked so a reconnect-replay collapses to the same envelope_id."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_z"] = "sp_1"
+    client._channel_space["ch_a"] = "sp_1"
+    client._channel_space["ch_m"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_space",
+            "signer_slug": "alice-0001",
+            "event_id": "ev_pick",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert msg["channel_id"] == "ch_a"
+    assert root_id == "membership-left_space-ch_a-alice-0001-ev_pick"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_dedups_on_duplicate_event_id():
+    """Reconnect-replay sees the same signed event twice — announce
+    only once, same contract as the channel path."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    event = {
+        "kind": "leave_space",
+        "signer_slug": "alice-0001",
+        "event_id": "ev_space_replay",
+        "payload": {"space_id": "sp_1"},
+    }
+
+    await client._handle_event(scope="sp_1", event=event)
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._queue.qsize() == 1
+    assert "ev_space_replay" in client._processed_membership_event_ids
+    await store.close()

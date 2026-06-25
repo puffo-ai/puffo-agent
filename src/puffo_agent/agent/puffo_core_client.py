@@ -1572,6 +1572,23 @@ class PuffoCoreMessageClient:
             )
             return
 
+        # PUF-317 review-#1: space-level membership for OTHER actors.
+        # puffo-server #74 ``cascade_remove_from_channels`` mutates the
+        # ``channel_memberships`` table directly when an operator
+        # leaves or is removed from a space — no per-channel
+        # ``leave_channel`` event fires for the cascaded slugs. Without
+        # this announce path the agent keeps @-mentioning a member
+        # who's silently dropped out of #general. ``accept_space_invite``
+        # cascade into auto-joined public channels has the same
+        # symptom in reverse. Surface all three through the same
+        # announce wrapper so the General-channel transcript stays in
+        # sync with channel-roster reality.
+        if kind in ("leave_space", "remove_from_space", "accept_space_invite"):
+            await self._maybe_announce_space_membership_change(
+                kind, event, payload,
+            )
+            return
+
         # Invite-withdrawn paths. The server emits the cancel to the
         # invitee's session too (puffo-server review/events: invitee
         # added to ``extra_ws_targets`` for cancel/reject). If the
@@ -2666,10 +2683,19 @@ class PuffoCoreMessageClient:
         if not channel_id or channel_id not in self._channel_space:
             return
 
+        inviter_slug = ""
         if kind == "accept_channel_invite":
             actor_slug = event.get("signer_slug") or ""
             action = "joined"
             kicker_slug = ""
+            # PUF-317 review-#2: server-auto-accept embeds the
+            # original signed InviteToChannel under ``original_invite``;
+            # its ``signer_slug`` is the inviter. Manual-accept paths
+            # omit ``original_invite`` so this falls back to "" and
+            # the body just renders "Alice joined channel #general."
+            original_invite = payload.get("original_invite")
+            if isinstance(original_invite, dict):
+                inviter_slug = original_invite.get("signer_slug") or ""
         elif kind == "leave_channel":
             actor_slug = event.get("signer_slug") or ""
             action = "left"
@@ -2694,6 +2720,7 @@ class PuffoCoreMessageClient:
                 actor_slug=actor_slug,
                 action=action,
                 kicker_slug=kicker_slug,
+                inviter_slug=inviter_slug,
                 event_id=event_id,
             )
         except Exception:
@@ -2707,6 +2734,90 @@ class PuffoCoreMessageClient:
         if event_id:
             self._processed_membership_event_ids.add(event_id)
 
+    async def _maybe_announce_space_membership_change(
+        self, kind: str, event: dict, payload: dict,
+    ) -> None:
+        """Surface another member's space-level join/leave/removal
+        into the agent's transcript as a non-replyable system-message
+        in a channel the agent shares with the space.
+
+        PUF-317 review-#1: puffo-server #74
+        ``cascade_remove_from_channels`` mutates
+        ``channel_memberships`` directly on a space exit — no
+        per-channel ``leave_channel`` event fires for the cascaded
+        slugs. ``accept_space_invite`` cascades into auto-joined
+        public channels with the same symptom in reverse. Without
+        this announce path the agent keeps @-mentioning a member
+        who silently dropped out of #general (or fails to greet a
+        member who just auto-joined).
+
+        Resolves the space to the lexicographically-first channel
+        the agent has visibility into within that space
+        (``_channel_space`` mapping). Stable pick so reconnect-replay
+        collapses to the same target envelope_id. Skip silently when
+        the agent has no visibility into any channel of the space —
+        no transcript to surface into.
+        """
+        space_id = payload.get("space_id") or ""
+        if not space_id:
+            return
+
+        channels_in_space = sorted(
+            cid for cid, sid in self._channel_space.items()
+            if sid == space_id
+        )
+        if not channels_in_space:
+            return
+        target_channel_id = channels_in_space[0]
+
+        inviter_slug = ""
+        if kind == "accept_space_invite":
+            actor_slug = event.get("signer_slug") or ""
+            action = "joined_space"
+            kicker_slug = ""
+            # Mirror the channel path: server-auto-accept embeds the
+            # original signed InviteToSpace under ``original_invite``.
+            original_invite = payload.get("original_invite")
+            if isinstance(original_invite, dict):
+                inviter_slug = original_invite.get("signer_slug") or ""
+        elif kind == "leave_space":
+            actor_slug = event.get("signer_slug") or ""
+            action = "left_space"
+            kicker_slug = ""
+        elif kind == "remove_from_space":
+            actor_slug = payload.get("removed_slug") or ""
+            action = "removed_from_space"
+            kicker_slug = event.get("signer_slug") or ""
+        else:
+            return
+
+        if not actor_slug or actor_slug == self.slug:
+            return
+
+        event_id = event.get("event_id") or ""
+        if event_id and event_id in self._processed_membership_event_ids:
+            return
+
+        try:
+            await self._enqueue_membership_system_message(
+                channel_id=target_channel_id,
+                actor_slug=actor_slug,
+                action=action,
+                kicker_slug=kicker_slug,
+                inviter_slug=inviter_slug,
+                event_id=event_id,
+            )
+        except Exception:
+            self._log.exception(
+                "failed to enqueue space membership system-message "
+                "(kind=%s space=%s actor=%s)",
+                kind, space_id, actor_slug,
+            )
+            return
+
+        if event_id:
+            self._processed_membership_event_ids.add(event_id)
+
     async def _enqueue_membership_system_message(
         self,
         *,
@@ -2714,18 +2825,23 @@ class PuffoCoreMessageClient:
         actor_slug: str,
         action: str,
         kicker_slug: str = "",
+        inviter_slug: str = "",
         event_id: str = "",
     ) -> None:
         """Inject a non-replyable ``[puffo-agent system message]``
-        envelope announcing a channel membership change. Mirrors
-        ``_enqueue_channel_intro_nudge`` (PRIORITY_SYSTEM, sender_slug
-        ``system``, persisted to messages.db so
-        ``get_channel_history`` stays coherent) but the body is an
-        announcement — there's no directive, and the prefix marker
-        signals to the agent that no reply is expected.
+        envelope announcing a channel- or space-level membership
+        change. Mirrors ``_enqueue_channel_intro_nudge``
+        (PRIORITY_SYSTEM, sender_slug ``system``, persisted to
+        messages.db so ``get_channel_history`` stays coherent) but
+        the body is an announcement — there's no directive, and the
+        prefix marker signals to the agent that no reply is
+        expected.
 
-        ``action`` is one of ``"joined" | "left" | "removed"``.
-        ``kicker_slug`` only consulted when ``action == "removed"``.
+        ``action`` is one of ``"joined" | "left" | "removed" |
+        "joined_space" | "left_space" | "removed_from_space"``.
+        ``kicker_slug`` only consulted when ``action`` ends in
+        ``"removed"``. ``inviter_slug`` only consulted when ``action``
+        starts with ``"joined"`` (server-auto-accept inviter cite).
         """
         space_id = self._channel_space.get(channel_id) or ""
         space_name = (
@@ -2739,9 +2855,25 @@ class PuffoCoreMessageClient:
             f"**{actor_display}**(@{actor_slug})"
             if actor_display else f"@{actor_slug}"
         )
+        space_label = (
+            f"**{space_name}**" if space_name else (space_id or "the space")
+        )
+
+        async def _invited_by_suffix() -> str:
+            # Server-auto-accept embeds the inviter; manual-accept
+            # omits original_invite, so this falls through to "".
+            if not inviter_slug:
+                return ""
+            inviter_display = await self._fetch_display_name(inviter_slug)
+            inviter_label = (
+                f"**{inviter_display}**(@{inviter_slug})"
+                if inviter_display else f"@{inviter_slug}"
+            )
+            return f" (invited by {inviter_label})"
 
         if action == "joined":
-            body = f"{actor_label} joined channel #{channel_name}."
+            suffix = await _invited_by_suffix()
+            body = f"{actor_label} joined channel #{channel_name}{suffix}."
         elif action == "left":
             body = f"{actor_label} left channel #{channel_name}."
         elif action == "removed":
@@ -2757,6 +2889,25 @@ class PuffoCoreMessageClient:
             body = (
                 f"{actor_label} was removed from channel "
                 f"#{channel_name} by {kicker_label}."
+            )
+        elif action == "joined_space":
+            suffix = await _invited_by_suffix()
+            body = f"{actor_label} joined space {space_label}{suffix}."
+        elif action == "left_space":
+            body = f"{actor_label} left space {space_label}."
+        elif action == "removed_from_space":
+            kicker_display = (
+                await self._fetch_display_name(kicker_slug)
+                if kicker_slug else ""
+            )
+            kicker_label = (
+                f"**{kicker_display}**(@{kicker_slug})"
+                if kicker_display
+                else f"@{kicker_slug}" if kicker_slug else "an operator"
+            )
+            body = (
+                f"{actor_label} was removed from space "
+                f"{space_label} by {kicker_label}."
             )
         else:
             return
