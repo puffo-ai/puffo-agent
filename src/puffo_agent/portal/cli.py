@@ -1097,7 +1097,7 @@ def cmd_unlink(args: argparse.Namespace) -> int:
     """Remove an operator pairing and pause that operator's agents."""
     from .control.link import run_unlink
 
-    return asyncio.run(run_unlink(args.slug))
+    return asyncio.run(run_unlink(args.operator, expected_server_url=args.server_url))
 
 
 def cmd_api_status(args: argparse.Namespace) -> int:
@@ -1683,28 +1683,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete pairing.json so a different identity can pair next",
     ).set_defaults(func=cmd_pairing_unpair)
 
-    link = sub.add_parser(
+    machine = sub.add_parser(
+        "machine",
+        help="Link / unlink this machine to puffo operators via the agent portal",
+    )
+    machine_sub = machine.add_subparsers(dest="machine_cmd", required=True)
+
+    machine_link = machine_sub.add_parser(
         "link",
         help="Link this machine to a puffo operator via the online agent portal",
     )
-    link.add_argument(
-        "--name",
-        default=None,
-        help="Name for this machine in the portal (default: hostname).",
-    )
-    link.add_argument(
+    machine_link.add_argument(
         "--server-url",
         default=None,
         help="puffo-server base URL (default: the production relay).",
     )
-    link.set_defaults(func=cmd_link)
+    machine_link.add_argument(
+        "--name",
+        default=None,
+        help="Name for this machine in the portal (default: hostname).",
+    )
+    machine_link.set_defaults(func=cmd_link)
 
-    unlink = sub.add_parser(
+    machine_unlink = machine_sub.add_parser(
         "unlink",
         help="Remove an operator pairing and pause that operator's agents",
     )
-    unlink.add_argument("slug", help="Operator slug to unlink")
-    unlink.set_defaults(func=cmd_unlink)
+    machine_unlink.add_argument(
+        "--operator", required=True, help="Operator slug to unlink",
+    )
+    machine_unlink.add_argument(
+        "--server-url",
+        default=None,
+        help="Only unlink the pairing on this server URL (default: match by operator).",
+    )
+    machine_unlink.set_defaults(func=cmd_unlink)
 
     api = sub.add_parser(
         "api",

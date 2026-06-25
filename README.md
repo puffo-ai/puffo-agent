@@ -108,7 +108,7 @@ puffo-agent stop          # graceful shutdown from any terminal
 ```
 
 To connect a remote web operator to this machine, see [Agent
-Portal](#agent-portal-v04) (`puffo-agent link`).
+Portal](#agent-portal-v04) (`puffo-agent machine link`).
 
 The daemon watches `~/.puffo-agent/agents/<agent-id>/` and reconciles
 on-disk state every couple of seconds — you don't restart it after
@@ -136,20 +136,20 @@ relays end-to-end-encrypted control frames between them.
 
 ![Agent Portal v0.4 architecture](docs/agent-portal-architecture.svg)
 
-**Link a machine.** `puffo-agent link` registers the machine (a self-minted
+**Link a machine.** `puffo-agent machine link` registers the machine (a self-minted
 ed25519 identity; the private key never leaves disk), mints a short code, and
 waits for an operator to approve it in the web app (My Agents → Link machine).
 On approval the daemon opens a control WebSocket to the server and serves that
 operator's commands.
 
 ```bash
-puffo-agent link                                   # default server (chat.puffo.ai/relay)
-puffo-agent link --server-url <url> --name <name>  # self-hosted / custom machine name
-puffo-agent unlink <operator-slug>                 # revoke a pairing + pause its agents
+puffo-agent machine link                                      # default server (chat.puffo.ai/relay)
+puffo-agent machine link --server-url <url> --name <name>     # self-hosted / custom machine name
+puffo-agent machine unlink --operator <slug> [--server-url <url>]   # revoke a pairing + pause its agents
 ```
 
-`link` auto-starts the daemon (without the local bridge) if it isn't already
-running, so it's a one-step onboard.
+`machine link` auto-starts the daemon (without the local bridge) if it isn't
+already running, so it's a one-step onboard.
 
 **Control plane.** Each operator command arrives as an HPKE envelope, signed by
 the operator's root key over a canonical form and bound to `(machine_id,

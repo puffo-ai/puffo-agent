@@ -212,3 +212,34 @@ async def test_info_includes_machine_id(monkeypatch):
     resp = await handlers.info(None)
     data = json.loads(resp.body)
     assert data["machine_id"] == "mac_INFO"
+
+
+# ── machine unlink CLI wiring ───────────────────────────────────────
+
+def test_cmd_unlink_passes_operator_and_server(monkeypatch):
+    from puffo_agent.portal import cli
+    from puffo_agent.portal.control import link
+
+    seen = {}
+
+    async def _fake_unlink(slug, expected_server_url=None):
+        seen["slug"] = slug
+        seen["server"] = expected_server_url
+        return 0
+
+    monkeypatch.setattr(link, "run_unlink", _fake_unlink)
+    rc = cli.cmd_unlink(argparse.Namespace(operator="op-x", server_url="https://s"))
+    assert rc == 0
+    assert seen == {"slug": "op-x", "server": "https://s"}
+
+
+@pytest.mark.asyncio
+async def test_run_unlink_refuses_server_mismatch(monkeypatch):
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(
+        link, "get_pairing",
+        lambda slug: types.SimpleNamespace(server_url="https://prod", operator_root_pubkey="R"),
+    )
+    rc = await link.run_unlink("op", expected_server_url="https://staging")
+    assert rc == 2  # paired on a different server → refused, nothing torn down

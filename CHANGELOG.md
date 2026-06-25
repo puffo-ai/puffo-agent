@@ -9,15 +9,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Agent Portal — remote agent management.** A web operator can now manage a
-  machine's agents without a direct connection to it. `puffo-agent link`
+  machine's agents without a direct connection to it. `puffo-agent machine link`
   registers the machine (a self-minted ed25519 identity whose private key never
   leaves disk), mints a short code, and waits for an operator to approve it in
   the web app. The daemon then serves that operator's commands — pause, resume,
   restart, archive, edit, create — over an end-to-end-encrypted control
   WebSocket relayed by puffo-server, which never sees the plaintext. Each
   command is signature-verified, timestamp-windowed, and replay-guarded.
-- **`puffo-agent unlink <operator>`** revokes a pairing and pauses that
-  operator's agents on the machine.
+- **`puffo-agent machine unlink --operator <slug>`** revokes a pairing and
+  pauses that operator's agents on the machine.
 - **Operators tab** in the desktop UI: lists the operators this machine is
   linked to and mints new link codes against a chosen server URL.
 - **Local → remote migration.** On link and on every `start`, the daemon stamps
@@ -31,8 +31,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the local-bridge HTTP API; the portal replaces it as the primary management
   path. The MCP-facing data (`:63386`) and rpc (`:63385`) loopback services stay
   up. Opt back into the bridge with `puffo-agent start --with-local-bridge`.
-- **`puffo-agent link` auto-starts the daemon** (without the bridge) when none
-  is running, so linking is a one-step onboard.
+- **`puffo-agent machine link` auto-starts the daemon** (without the bridge) when
+  none is running, so linking is a one-step onboard.
 
 ### Fixed
 

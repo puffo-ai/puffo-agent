@@ -1,4 +1,4 @@
-"""Machine enrollment: `puffo-agent link` / `unlink` (v0.4)."""
+"""Machine enrollment: `puffo-agent machine link` / `machine unlink` (v0.4)."""
 
 from __future__ import annotations
 
@@ -169,7 +169,7 @@ async def run_link(server_url: str, hostname: str) -> int:
         print(f"link: {exc}; aborting.")
         return 1
     if status == "expired":
-        print("link: code expired before approval. Run `puffo-agent link` again.")
+        print("link: code expired before approval. Run `puffo-agent machine link` again.")
         return 1
     if status == "timeout":
         print("link: timed out waiting for approval.")
@@ -179,12 +179,19 @@ async def run_link(server_url: str, hostname: str) -> int:
     return 0
 
 
-async def run_unlink(operator_slug: str) -> int:
+async def run_unlink(operator_slug: str, expected_server_url: str | None = None) -> int:
     """Revoke an operator pairing server-side + locally, and pause that
-    operator's agents on this machine."""
+    operator's agents on this machine. ``expected_server_url`` is an optional
+    guard: refuse if the pairing is on a different server."""
     pairing = get_pairing(operator_slug)
     if pairing is None:
         print(f"unlink: no pairing for operator {operator_slug!r}")
+        return 2
+    if expected_server_url and pairing.server_url.rstrip("/") != expected_server_url.rstrip("/"):
+        print(
+            f"unlink: operator {operator_slug!r} is paired on {pairing.server_url}, "
+            f"not {expected_server_url}"
+        )
         return 2
     machine = load_or_create_machine()
     base = pairing.server_url.rstrip("/")
