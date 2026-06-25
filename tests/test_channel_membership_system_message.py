@@ -75,6 +75,7 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
         return None
 
     client._maybe_cache_channel_space = _noop_cache  # type: ignore[assignment]
+    client._inviter_by_invitation_event_id = {}
     return client
 
 
@@ -965,6 +966,222 @@ async def test_space_membership_picks_first_channel_deterministically():
     msg = client._thread_state[root_id].messages[0]
     assert msg["channel_id"] == "ch_a"
     assert root_id == "membership-left_space-ch_a-alice-0001-ev_pick"
+    await store.close()
+
+
+# ─── PR #94 review-#3: manual-accept inviter cache backfill ────────
+
+
+@pytest.mark.asyncio
+async def test_invite_to_channel_records_inviter_in_cache():
+    """Inbound ``invite_to_channel`` for a non-self invitee should
+    seed the cache so a later manual-accept (no ``original_invite``)
+    can still render '(invited by X)'."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "invite_to_channel",
+            "signer_slug": "alice-0001",  # inviter
+            "event_id": "ev_invite_42",
+            "payload": {
+                "space_id": "sp_1",
+                "channel_id": "ch_1",
+                "invitee_slug": "bob-0002",  # not us
+            },
+        },
+    )
+
+    assert client._inviter_by_invitation_event_id == {
+        "ev_invite_42": "alice-0001",
+    }
+    # Inbound invite alone does NOT post into the transcript.
+    assert client._queue.qsize() == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_accept_channel_invite_falls_back_to_cache_for_inviter():
+    """Manual-accept omits ``original_invite``; the announce path
+    must consult ``_inviter_by_invitation_event_id`` keyed off the
+    ``invitation_event_id`` the accept carries."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+    client._inviter_by_invitation_event_id["ev_invite_42"] = "alice-0001"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_channel_invite",
+            "signer_slug": "bob-0002",  # the joiner, manually accepting
+            "payload": {
+                "channel_id": "ch_1",
+                "space_id": "sp_1",
+                "invitation_event_id": "ev_invite_42",
+                # original_invite intentionally omitted (manual accept)
+            },
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "joined channel #general" in msg["text"]
+    assert "(invited by " in msg["text"]
+    assert "Alice" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_accept_channel_invite_renders_no_inviter_on_cache_miss():
+    """No prior ``invite_to_channel`` observed (e.g. daemon restarted
+    between invite + accept) → cache miss → body falls back to the
+    pre-review-#2 shape without growing a stray '(invited by )'."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+    # Empty cache.
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_channel_invite",
+            "signer_slug": "bob-0002",
+            "payload": {
+                "channel_id": "ch_1",
+                "space_id": "sp_1",
+                "invitation_event_id": "ev_missing",
+            },
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "joined channel #general" in msg["text"]
+    assert "invited by" not in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_original_invite_takes_precedence_over_cache():
+    """Server-auto-accept embeds ``original_invite`` AND populates
+    cache from the earlier invite_to_*. The body should cite the
+    embedded inviter, not the cached one. (In practice these are the
+    same slug, but the test pins the precedence so a future
+    inconsistency wouldn't surprise us.)"""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+    client._inviter_by_invitation_event_id["ev_invite_42"] = "stale-cache-0000"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_channel_invite",
+            "signer_slug": "bob-0002",
+            "payload": {
+                "channel_id": "ch_1",
+                "space_id": "sp_1",
+                "invitation_event_id": "ev_invite_42",
+                "original_invite": {"signer_slug": "alice-0001"},
+            },
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Alice" in msg["text"]
+    assert "stale-cache-0000" not in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_invite_to_space_records_inviter_for_later_space_accept():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "invite_to_space",
+            "signer_slug": "alice-0001",
+            "event_id": "ev_space_invite_7",
+            "payload": {
+                "space_id": "sp_1",
+                "invitee_slug": "bob-0002",
+            },
+        },
+    )
+
+    assert (
+        client._inviter_by_invitation_event_id["ev_space_invite_7"]
+        == "alice-0001"
+    )
+
+    # Now the manual-accept arrives; cache lookup populates inviter.
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "accept_space_invite",
+            "signer_slug": "bob-0002",
+            "payload": {
+                "space_id": "sp_1",
+                "invitation_event_id": "ev_space_invite_7",
+            },
+        },
+    )
+
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert "Bob" in msg["text"]
+    assert "joined space" in msg["text"]
+    assert "(invited by " in msg["text"]
+    assert "Alice" in msg["text"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_invite_record_skips_when_event_id_or_signer_missing():
+    """Defensive — a malformed invite event (missing event_id or
+    signer_slug) must not poison the cache with empty-string keys
+    or values."""
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "invite_to_channel",
+            "signer_slug": "",  # missing inviter
+            "event_id": "ev_no_signer",
+            "payload": {
+                "space_id": "sp_1",
+                "channel_id": "ch_1",
+                "invitee_slug": "bob-0002",
+            },
+        },
+    )
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "invite_to_channel",
+            "signer_slug": "alice-0001",
+            # event_id missing
+            "payload": {
+                "space_id": "sp_1",
+                "channel_id": "ch_1",
+                "invitee_slug": "bob-0002",
+            },
+        },
+    )
+
+    assert client._inviter_by_invitation_event_id == {}
     await store.close()
 
 

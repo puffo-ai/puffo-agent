@@ -56,6 +56,9 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     # the fixture leaves it empty so the predicate bails cleanly
     # rather than raising AttributeError.
     client._channel_space = {}
+    # PR #94 review-#3: ``_handle_event``'s ``invite_to_*`` branch
+    # writes here; mirror the production __init__ default.
+    client._inviter_by_invitation_event_id = {}
 
     async def _stub_space_name(space_id: str) -> str:
         return "Team" if space_id == "sp_1" else space_id

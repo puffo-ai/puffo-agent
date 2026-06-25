@@ -519,6 +519,20 @@ class PuffoCoreMessageClient:
         # practice (~24 bytes per event_id; channels with sustained
         # churn at 1Hz would take ~5 days to reach 10MB).
         self._processed_membership_event_ids: set[str] = set()
+        # PUF-317 PR #94 review-#3: ``invitation_event_id ->
+        # inviter_slug`` recorded on inbound ``invite_to_*`` events
+        # (signer of the invite IS the inviter). Consulted by the
+        # membership-announce paths when a manual-accept
+        # ``accept_*_invite`` arrives without ``original_invite``
+        # (server-auto-accept only embeds the original signed
+        # invite; manual-accept paths omit it). Mirrors the web
+        # side's ``_inviter_by_invitation`` cache. Lifetime-scoped
+        # like ``_processed_invite_ids`` — lost on daemon restart;
+        # post-restart manual-accepts that we haven't observed the
+        # invite for will silently render the body without an
+        # inviter suffix, which is the same shape as the existing
+        # "no original_invite" path.
+        self._inviter_by_invitation_event_id: dict[str, str] = {}
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
         # reply in that thread can be intercepted inside the daemon.
@@ -1477,6 +1491,18 @@ class PuffoCoreMessageClient:
                 self._space_members.pop(evict_space_id, None)
 
         if kind in ("invite_to_space", "invite_to_channel"):
+            # PUF-317 PR #94 review-#3: record inviter so a
+            # later manual-accept (which omits ``original_invite``
+            # — only server-auto-accept embeds it) can still
+            # render "(invited by X)" in the announce body. The
+            # signed invite's ``event_id`` becomes the key the
+            # accept event carries as ``invitation_event_id``.
+            invite_event_id = event.get("event_id") or ""
+            inviter_slug = event.get("signer_slug") or ""
+            if invite_event_id and inviter_slug:
+                self._inviter_by_invitation_event_id[invite_event_id] = (
+                    inviter_slug
+                )
             if payload.get("invitee_slug") != self.slug:
                 return  # Server fans the event to space members too.
             await self._poll_pending_invites()
@@ -2691,11 +2717,18 @@ class PuffoCoreMessageClient:
             # PUF-317 review-#2: server-auto-accept embeds the
             # original signed InviteToChannel under ``original_invite``;
             # its ``signer_slug`` is the inviter. Manual-accept paths
-            # omit ``original_invite`` so this falls back to "" and
-            # the body just renders "Alice joined channel #general."
+            # omit ``original_invite``, so review-#3 falls through to
+            # the ``_inviter_by_invitation_event_id`` cache populated
+            # in ``_handle_event``'s ``invite_to_*`` branch.
             original_invite = payload.get("original_invite")
             if isinstance(original_invite, dict):
                 inviter_slug = original_invite.get("signer_slug") or ""
+            if not inviter_slug:
+                invitation_event_id = payload.get("invitation_event_id") or ""
+                if invitation_event_id:
+                    inviter_slug = self._inviter_by_invitation_event_id.get(
+                        invitation_event_id, "",
+                    )
         elif kind == "leave_channel":
             actor_slug = event.get("signer_slug") or ""
             action = "left"
@@ -2776,10 +2809,17 @@ class PuffoCoreMessageClient:
             action = "joined_space"
             kicker_slug = ""
             # Mirror the channel path: server-auto-accept embeds the
-            # original signed InviteToSpace under ``original_invite``.
+            # original signed InviteToSpace under ``original_invite``;
+            # manual-accept falls through to the cache.
             original_invite = payload.get("original_invite")
             if isinstance(original_invite, dict):
                 inviter_slug = original_invite.get("signer_slug") or ""
+            if not inviter_slug:
+                invitation_event_id = payload.get("invitation_event_id") or ""
+                if invitation_event_id:
+                    inviter_slug = self._inviter_by_invitation_event_id.get(
+                        invitation_event_id, "",
+                    )
         elif kind == "leave_space":
             actor_slug = event.get("signer_slug") or ""
             action = "left_space"
