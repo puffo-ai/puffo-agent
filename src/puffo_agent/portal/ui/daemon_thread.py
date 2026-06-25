@@ -16,16 +16,17 @@ logger = logging.getLogger(__name__)
 
 
 class DaemonThread(threading.Thread):
-    def __init__(self) -> None:
+    def __init__(self, with_local_bridge: bool = False) -> None:
         super().__init__(name="puffo-daemon", daemon=False)
         self._stop_requested = False
+        self._with_local_bridge = with_local_bridge
 
     def run(self) -> None:
         from ..daemon import run_daemon
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_daemon())
+            loop.run_until_complete(run_daemon(with_local_bridge=self._with_local_bridge))
         except Exception:
             logger.exception("daemon thread crashed")
         finally:

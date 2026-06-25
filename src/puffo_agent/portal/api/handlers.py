@@ -95,12 +95,16 @@ async def info(_request: web.Request) -> web.Response:
         resolve_claude_bin,
         resolve_codex_bin,
     )
+    from ..control.store import current_machine_id
     return web.json_response({
         "service": "puffo-agent-bridge",
         "version": "v1",
         "runtime": "puffo-agent",
         "daemon_version": daemon_version,
         "pid": os.getpid(),
+        # Lets a web client that sees both the remote-linked machine and this
+        # local bridge recognise they're the same host and drop the dup UI.
+        "machine_id": current_machine_id(),
         "agent_count": len(discover_agents()),
         "paired": pairing is not None,
         "paired_slug": pairing.slug if pairing else None,

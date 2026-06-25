@@ -105,6 +105,9 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+        # Re-assert machine_id for already-linked operators' agents so agents
+        # created/paused before linking show as remote without a re-link.
+        asyncio.ensure_future(_migrate_linked_agents_at_startup())
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
@@ -425,15 +428,17 @@ class Daemon:
 async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
     """Report an operator lifecycle state (paused/archived) to the server as the
     agent. The worker is stopped at this point, so it can't heartbeat the state
-    itself; the daemon does it out-of-band. Returns True on success so callers
-    can retry a transient failure next tick."""
-    from ..crypto.http_client import PuffoCoreHttpClient
+    itself; the daemon does it out-of-band. Returns True when the report is
+    *settled* — delivered, or rejected with a permanent 4xx that retrying can't
+    fix — so the caller stops re-reporting; False only on a transient failure
+    (5xx / network) worth retrying next tick."""
+    from ..crypto.http_client import HttpError, PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
     from .control.store import current_machine_id
 
     pc = agent_cfg.puffo_core
     if not pc.is_configured():
-        return False
+        return True  # can never report without config — settled, don't retry
     http = PuffoCoreHttpClient(pc.server_url, KeyStore.for_agent(agent_cfg.id), pc.slug)
     try:
         body: dict = {"status": status}
@@ -442,8 +447,25 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
             body["machine_id"] = machine_id
         await http.post("/agents/me/heartbeat", body)
         return True
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("agent %s: lifecycle report %r failed: %s", agent_cfg.id, status, exc)
+    except HttpError as exc:
+        # 4xx is deterministic for this (agent, server) pair — foreign/stale certs
+        # (401) or a server that doesn't know the status (400). Retrying can't help,
+        # so treat it as settled and stop hammering; only 5xx is worth a retry.
+        if 400 <= exc.status < 500:
+            logger.warning(
+                "agent %s: lifecycle report %r rejected (HTTP %s); giving up: %s",
+                agent_cfg.id, status, exc.status, exc.body,
+            )
+            return True
+        logger.warning(
+            "agent %s: lifecycle report %r failed (HTTP %s); will retry",
+            agent_cfg.id, status, exc.status,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — transient (network); retry next tick
+        logger.warning(
+            "agent %s: lifecycle report %r failed; will retry: %s", agent_cfg.id, status, exc
+        )
         return False
     finally:
         await http.close()
@@ -462,6 +484,27 @@ async def _drain_codex_tmp(src: Path) -> None:
         except OSError:
             await asyncio.sleep(0.5)
     shutil.rmtree(codex_tmp, ignore_errors=True)
+
+
+async def _migrate_linked_agents_at_startup() -> None:
+    """For each already-linked operator, stamp machine_id on its owned agents
+    so locals created/paused before the link become remote. Best-effort."""
+    from .control.link import migrate_owned_agents
+    from .control.store import load_pairings
+
+    for pairing in load_pairings().values():
+        try:
+            n = await migrate_owned_agents(pairing.operator_root_pubkey)
+            if n:
+                logger.info(
+                    "startup: stamped machine_id on %d agent(s) for operator %s",
+                    n, pairing.operator_slug,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort, per-operator
+            logger.warning(
+                "startup machine_id migration failed for %s: %s",
+                pairing.operator_slug, exc,
+            )
 
 
 async def _log_outdated_version_warning() -> None:
@@ -531,7 +574,7 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def run_daemon() -> int:
+async def run_daemon(with_local_bridge: bool = False) -> int:
     # Single-daemon enforcement. ``start`` against an already-running
     # daemon exits 0 (the user wanted a running daemon; one exists) —
     # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
@@ -552,6 +595,8 @@ async def run_daemon() -> int:
     cleanup_staging_dir()
 
     daemon_cfg = DaemonConfig.load()
+    if with_local_bridge:
+        daemon_cfg.bridge.enabled = True
     write_daemon_pid(os.getpid())
 
     daemon = Daemon(daemon_cfg)
