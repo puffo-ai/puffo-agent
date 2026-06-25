@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 560" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arw" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#5d6a55"/>
+    </marker>
+    <marker id="arwL" markerWidth="9" markerHeight="9" refX="2" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M7,0 L0,3 L7,6 Z" fill="#9aa0a6"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="940" height="560" fill="#ffffff"/>
+  <text x="470" y="34" text-anchor="middle" font-size="20" font-weight="700" fill="#1b2417">Agent Portal — v0.4 architecture</text>
+  <text x="470" y="56" text-anchor="middle" font-size="12.5" fill="#5d6a55">End-to-end encrypted: puffo-server relays control frames it cannot read.</text>
+
+  <!-- Web operator -->
+  <rect x="40" y="120" width="190" height="110" rx="10" fill="#eaf2ff" stroke="#4a78c0" stroke-width="1.5"/>
+  <text x="135" y="158" text-anchor="middle" font-size="15" font-weight="700" fill="#1b2417">Web Operator</text>
+  <text x="135" y="180" text-anchor="middle" font-size="12" fill="#5d6a55">chat.puffo.ai</text>
+  <text x="135" y="200" text-anchor="middle" font-size="11.5" fill="#8b9481">manages agents remotely</text>
+
+  <!-- puffo-server -->
+  <rect x="375" y="120" width="190" height="110" rx="10" fill="#f1f1ee" stroke="#8b9481" stroke-width="1.5"/>
+  <text x="470" y="158" text-anchor="middle" font-size="15" font-weight="700" fill="#1b2417">puffo-server</text>
+  <text x="470" y="180" text-anchor="middle" font-size="12" fill="#5d6a55">blind relay</text>
+  <text x="470" y="200" text-anchor="middle" font-size="11.5" fill="#8b9481">never sees plaintext</text>
+
+  <!-- puffo-agent daemon container -->
+  <rect x="710" y="96" width="200" height="400" rx="12" fill="#f4fae8" stroke="#88a82e" stroke-width="2"/>
+  <text x="810" y="120" text-anchor="middle" font-size="14" font-weight="700" fill="#3f4a30">puffo-agent daemon</text>
+
+  <rect x="724" y="132" width="172" height="66" rx="8" fill="#ffffff" stroke="#c2d191" stroke-width="1.2"/>
+  <text x="810" y="156" text-anchor="middle" font-size="13" font-weight="600" fill="#1b2417">Control client</text>
+  <text x="810" y="174" text-anchor="middle" font-size="10.5" fill="#5d6a55">HPKE verify · ±5min ts window</text>
+  <text x="810" y="189" text-anchor="middle" font-size="10.5" fill="#5d6a55">replay-nonce guard</text>
+
+  <rect x="724" y="216" width="172" height="60" rx="8" fill="#ffffff" stroke="#c2d191" stroke-width="1.2"/>
+  <text x="810" y="240" text-anchor="middle" font-size="13" font-weight="600" fill="#1b2417">Agent workers</text>
+  <text x="810" y="258" text-anchor="middle" font-size="10.5" fill="#5d6a55">claude · codex · ws-local</text>
+
+  <rect x="724" y="294" width="172" height="60" rx="8" fill="#ffffff" stroke="#c2d191" stroke-width="1.2"/>
+  <text x="810" y="318" text-anchor="middle" font-size="13" font-weight="600" fill="#1b2417">MCP loopback</text>
+  <text x="810" y="336" text-anchor="middle" font-size="10.5" fill="#5d6a55">data :63386 · rpc :63385</text>
+
+  <rect x="724" y="372" width="172" height="56" rx="8" fill="#f6f6f4" stroke="#b7b7b7" stroke-width="1.2" stroke-dasharray="4 3"/>
+  <text x="810" y="395" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9aa0a6">Legacy bridge :63387</text>
+  <text x="810" y="412" text-anchor="middle" font-size="10.5" fill="#9aa0a6">off by default · --with-local-bridge</text>
+
+  <!-- forward arrows -->
+  <line x1="230" y1="162" x2="372" y2="162" stroke="#5d6a55" stroke-width="1.6" marker-end="url(#arw)"/>
+  <text x="301" y="152" text-anchor="middle" font-size="11" fill="#3f4a30">① link + commands</text>
+
+  <line x1="565" y1="162" x2="707" y2="162" stroke="#5d6a55" stroke-width="1.6" marker-end="url(#arw)"/>
+  <text x="637" y="152" text-anchor="middle" font-size="11" fill="#3f4a30">② control WS · HPKE</text>
+  <text x="637" y="180" text-anchor="middle" font-size="9.5" fill="#8b9481">relay can't read</text>
+
+  <!-- control client -> workers -->
+  <line x1="810" y1="198" x2="810" y2="216" stroke="#5d6a55" stroke-width="1.6" marker-end="url(#arw)"/>
+  <text x="884" y="211" text-anchor="end" font-size="10" fill="#3f4a30">③ apply op</text>
+
+  <!-- workers use MCP -->
+  <line x1="810" y1="276" x2="810" y2="294" stroke="#9cbf3a" stroke-width="1.4" marker-end="url(#arw)"/>
+
+  <!-- return path: agents -> server -> operator -->
+  <path d="M 810 496 L 810 524 L 135 524 L 135 230" fill="none" stroke="#9aa0a6" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arwL)"/>
+  <rect x="352" y="512" width="236" height="24" rx="6" fill="#ffffff"/>
+  <text x="470" y="528" text-anchor="middle" font-size="11" fill="#5d6a55">status + machine_id → operator's portal</text>
+
+  <!-- op legend -->
+  <text x="724" y="452" font-size="10.5" fill="#5d6a55">ops: pause · resume · restart · archive</text>
+  <text x="724" y="468" font-size="10.5" fill="#5d6a55">edit · create · machine_id migration</text>
+</svg>

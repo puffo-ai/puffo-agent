@@ -102,9 +102,13 @@ setups.
 ```bash
 puffo-agent start         # foreground daemon
 puffo-agent start --ui    # foreground daemon + PySide6 desktop window
+puffo-agent start --with-local-bridge   # also serve the legacy local-bridge API
 puffo-agent status        # is it alive? which agents are running?
 puffo-agent stop          # graceful shutdown from any terminal
 ```
+
+To connect a remote web operator to this machine, see [Agent
+Portal](#agent-portal-v04) (`puffo-agent link`).
 
 The daemon watches `~/.puffo-agent/agents/<agent-id>/` and reconciles
 on-disk state every couple of seconds — you don't restart it after
@@ -123,6 +127,52 @@ for an existing container by name. If the container is still around
 resumed via `--resume`; only a missing container triggers a fresh
 `docker run`. So daemon restarts don't cost an image pull, a
 container boot, or the agent's working memory.
+
+## Agent Portal (v0.4)
+
+How a remote web operator manages this machine's agents without a direct
+connection to it. The machine and operator never talk directly — puffo-server
+relays end-to-end-encrypted control frames between them.
+
+![Agent Portal v0.4 architecture](docs/agent-portal-architecture.svg)
+
+**Link a machine.** `puffo-agent link` registers the machine (a self-minted
+ed25519 identity; the private key never leaves disk), mints a short code, and
+waits for an operator to approve it in the web app (My Agents → Link machine).
+On approval the daemon opens a control WebSocket to the server and serves that
+operator's commands.
+
+```bash
+puffo-agent link                                   # default server (chat.puffo.ai/relay)
+puffo-agent link --server-url <url> --name <name>  # self-hosted / custom machine name
+puffo-agent unlink <operator-slug>                 # revoke a pairing + pause its agents
+```
+
+`link` auto-starts the daemon (without the local bridge) if it isn't already
+running, so it's a one-step onboard.
+
+**Control plane.** Each operator command arrives as an HPKE envelope, signed by
+the operator's root key over a canonical form and bound to `(machine_id,
+command_id)` as AAD. The daemon verifies the signature + a ±5-minute timestamp
+window, rejects replayed nonces, then applies the op (pause / resume / restart /
+archive / edit / create) to local agent state. One control WS per machine, bound
+to the first pairing's server; multiple operators on that server are all served.
+
+**Local → remote migration.** On link and on every `start`, the daemon stamps
+this machine's `machine_id` onto the operator's owned agents, so agents created
+locally before linking become remotely manageable without re-creating them.
+
+**MCP loopback services.** Two loopback HTTP services stay up regardless of the
+bridge:
+
+- `127.0.0.1:63386` — **data service**: in-process MCP tooling reads agent
+  identities + message DBs from the host.
+- `127.0.0.1:63385` — **rpc service**: daemon-mediated MCP ops (host-MCP
+  install / sync).
+
+The full **local bridge** (the legacy web-client HTTP API) is **off by
+default**; enable it with `puffo-agent start --with-local-bridge` (see
+[Legacy: local bridge](#legacy-local-bridge)).
 
 ## Network proxies
 
@@ -389,17 +439,18 @@ surfaced as a DM thread the LLM answers `y` / `n` on; the daemon
 intercepts the reply, accepts/declines on the agent's behalf, and
 swallows the message so the LLM never has to think about RPC.
 
-## Local bridge
+## Legacy: local bridge
 
-While the daemon is running it exposes two loopback HTTP services:
+> Superseded by the [Agent Portal](#agent-portal-v04). Before the portal,
+> the web client managed agents over a loopback HTTP API on the same machine,
+> with a single browser pairing. It's **off by default** now — enable it with
+> `puffo-agent start --with-local-bridge` only if you need the in-browser local
+> Agents pane.
 
-- `127.0.0.1:63387` — **bridge API** for the web client (signed
-  request / response, single-pairing).
-- `127.0.0.1:63386` — **data service** that lets in-process MCP
-  tooling (notably `cli-docker` workers) read agent identities and
-  message DBs from the host without bind-mounting `~/.puffo-agent`.
-  Loopback-only, no auth — same trust boundary as the daemon
-  process itself.
+The bridge API listens on `127.0.0.1:63387` (signed request / response,
+single-pairing). The MCP-facing data (`:63386`) and rpc (`:63385`) services are
+**not** part of the bridge — they stay up regardless (see [Agent
+Portal](#agent-portal-v04)).
 
 The web app probes the bridge on boot and, if reachable, surfaces
 an **Agents** pane: list / inspect / DM / invite-to-channel /
@@ -424,8 +475,8 @@ puffo-agent pairing show             # who's currently paired (or "(none)")
 puffo-agent pairing unpair           # release the pairing for a new client
 ```
 
-The bridge is enabled by default. Override per-install via
-`daemon.yml`:
+The bridge is **off by default**. Enable it per-run with `puffo-agent start
+--with-local-bridge`, or persistently in `daemon.yml`:
 
 ```yaml
 bridge:
