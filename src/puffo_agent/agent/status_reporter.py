@@ -20,13 +20,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
 
 
-# envelope_id prefixes the daemon mints for purely-local synthetic
-# messages (no server-side row exists). Status-reporter calls keyed
-# on these IDs would 404 against ``/messages/<id>/processing/{start,
-# end}`` — server reasonably reports "no such message" — and the
-# resulting WARN line per intro nudge was operator-visible noise.
-# Skip the HTTP round-trip entirely for these envelopes; the run is
-# still tracked in-memory by the worker via the returned ``run_id``.
+# Synthetic local envelopes have no server row; /messages/<id>/processing/*
+# would 404, so skip the HTTP round-trip (the worker still tracks the run).
 _LOCAL_ONLY_ENVELOPE_PREFIXES = ("intro-prompt-",)
 
 

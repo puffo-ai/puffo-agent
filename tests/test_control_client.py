@@ -2,11 +2,64 @@
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 from _bridge_support import isolated_home, write_test_agent
-from puffo_agent.portal.control.client import execute_command
+from puffo_agent.portal.control import client as cc
+from puffo_agent.portal.control.client import MachineControlClient, execute_command
 from puffo_agent.portal.state import AgentConfig
+
+
+class _FakeWS:
+    def __init__(self):
+        self.acks = []
+
+    async def send_json(self, obj):
+        self.acks.append(obj)
+
+
+@pytest.mark.asyncio
+async def test_handle_rejects_replayed_nonce_and_bounds_set(monkeypatch):
+    executed = []
+
+    async def _fake_exec(op, slug, params, **kw):
+        executed.append(slug)
+        return {"ok": True}
+
+    monkeypatch.setattr(cc, "execute_command", _fake_exec)
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(operator_root_pubkey="ROOT", server_url="https://s"),
+    })
+    monkeypatch.setattr(
+        cc, "decrypt_command",
+        lambda env, machine, root, now: {"op": "pause", "agent_slug": "a1", "params": {}},
+    )
+    monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
+
+    mc = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    def frame(cid, nonce, ts=1_000_000):
+        return {"command_id": cid, "operator_slug": "op",
+                "envelope": {"nonce": nonce, "ts": ts}}
+
+    await mc._handle(ws, frame("c1", "N1"))
+    assert executed == ["a1"]
+    assert "N1" in mc._seen_nonces
+    assert ws.acks[-1] == {"type": "ack", "command_id": "c1"}
+
+    # replayed nonce → not executed again, but still acked so it stops redelivering
+    await mc._handle(ws, frame("c2", "N1"))
+    assert executed == ["a1"]
+    assert ws.acks[-1] == {"type": "ack", "command_id": "c2"}
+
+    # a nonce older than the ts window is pruned on the next handled command
+    mc._seen_nonces["OLD"] = 1_000_000 - cc.TS_WINDOW_MS - 1
+    await mc._handle(ws, frame("c3", "N2"))
+    assert "OLD" not in mc._seen_nonces
+    assert "N2" in mc._seen_nonces
 
 
 @pytest.fixture

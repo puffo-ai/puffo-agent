@@ -19,7 +19,7 @@ from ..state import (
     restart_flag_path,
 )
 from . import machine_auth
-from .envelope import ControlError, decrypt_command
+from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
 
 log = logging.getLogger("puffo_agent.control")
@@ -241,7 +241,7 @@ class MachineControlClient:
 
     def __init__(self, machine) -> None:
         self.machine = machine
-        self._seen_nonces: set[str] = set()
+        self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
         # Serialize WS writes — acks (receive loop) + heartbeat/capabilities
         # (sender task) share one socket; concurrent send_json would interleave.
         self._send_lock = asyncio.Lock()
@@ -328,7 +328,13 @@ class MachineControlClient:
                 envelope, self.machine, pairing.operator_root_pubkey, now_ms()
             )
             if nonce:
-                self._seen_nonces.add(nonce)
+                # Bound the replay set: a nonce older than the ts window is
+                # already rejected by decrypt_command, so it's safe to forget.
+                cutoff = now_ms() - TS_WINDOW_MS
+                self._seen_nonces = {
+                    n: t for n, t in self._seen_nonces.items() if t > cutoff
+                }
+                self._seen_nonces[nonce] = int(envelope.get("ts", now_ms()))
             result = await execute_command(
                 decrypted["op"],
                 decrypted["agent_slug"],
@@ -357,7 +363,11 @@ class MachineControlClient:
 class ControlManager:
     """Starts the machine control WS + a periodic self-report once the machine
     has at least one operator pairing. Re-scans so link/unlink take effect
-    without a daemon restart."""
+    without a daemon restart.
+
+    Constraint: one control WS per machine, bound to the first pairing's
+    ``server_url``. Multiple operators on that same server are served; a
+    machine paired across two different servers only serves the first."""
 
     def __init__(self) -> None:
         self._stop = asyncio.Event()
