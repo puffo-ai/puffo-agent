@@ -83,9 +83,7 @@ class KeyStore:
 
     @staticmethod
     def for_agent(agent_id: str) -> KeyStore:
-        # PUFFO_AGENT_HOME is the daemon's home override (see portal.state);
-        # honor it so a custom-home daemon finds agent keys. PUFFO_HOME is the
-        # legacy fallback.
+        # Honor PUFFO_AGENT_HOME (daemon home override); PUFFO_HOME is legacy.
         home = (
             os.environ.get("PUFFO_AGENT_HOME")
             or os.environ.get("PUFFO_HOME")

@@ -1611,9 +1611,8 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
 
-    # PUF-268: operator-picked skill + MCP template ids, resolved to
-    # install metadata at spawn time. Missing-from-catalog warns at
-    # spawn but doesn't block create.
+    # Operator-picked skill + MCP template ids, resolved at spawn (missing
+    # ones warn but don't block create).
     desired_skills = payload.get("desired_skills") or []
     desired_mcps = payload.get("desired_mcps") or []
     if not isinstance(desired_skills, list) or not all(isinstance(s, str) and s for s in desired_skills):
@@ -1754,10 +1753,8 @@ async def create_agent(request: web.Request) -> web.Response:
         agent_id, result["device_id"], request["paired_slug"],
     )
 
-    # Best-effort: push role to the agent's server-side identity profile.
-    # display_name + avatar_url flow through the pending_agents → identities
-    # materialisation in puffo-server, so they're set at registration; ``role``
-    # has no signup pathway yet so the bridge syncs it post-create.
+    # role has no signup pathway, so sync it to the server profile post-create
+    # (display_name + avatar_url already land at registration).
     if result["role"]:
         try:
             patch: dict[str, Any] = {"role": result["role"]}

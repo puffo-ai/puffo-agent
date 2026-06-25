@@ -61,9 +61,8 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
-        # Agents whose "paused" state we've already reported this session, so a
-        # paused-with-no-worker agent (e.g. after a daemon restart) is asserted
-        # once instead of every tick. Cleared when the agent runs again.
+        # Paused agents already reported this session — assert once, not every
+        # tick. Cleared when the agent runs again.
         self._paused_reported: set[str] = set()
         # Shared attach registry: ws-local Workers register here; the
         # bridge's /v1/ws-local route serves tools against it.
@@ -448,9 +447,8 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
         await http.post("/agents/me/heartbeat", body)
         return True
     except HttpError as exc:
-        # 4xx is deterministic for this (agent, server) pair — foreign/stale certs
-        # (401) or a server that doesn't know the status (400). Retrying can't help,
-        # so treat it as settled and stop hammering; only 5xx is worth a retry.
+        # 4xx is deterministic for this (agent, server) pair (bad certs / unknown
+        # status) — settle and stop retrying; only 5xx is worth a retry.
         if 400 <= exc.status < 500:
             logger.warning(
                 "agent %s: lifecycle report %r rejected (HTTP %s); giving up: %s",

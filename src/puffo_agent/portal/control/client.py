@@ -72,9 +72,8 @@ async def _create_agent_command(
     if not isinstance(slug_binding, dict):
         return {"ok": False, "error": "create missing identity_bundle.slug_binding"}
 
-    # The browser's server_url placeholder is unreachable from this machine;
-    # stamp our own paired server_url so the agent.yml + worker talk to a URL
-    # the machine can actually reach.
+    # Browser server_url placeholders are unreachable here; stamp our paired
+    # server_url so the worker talks to a URL the machine can reach.
     pc = params.get("puffo_core")
     if isinstance(pc, dict):
         pc["server_url"] = server_url
