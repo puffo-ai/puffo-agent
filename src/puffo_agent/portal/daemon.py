@@ -61,8 +61,6 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
-        # Paused agents already reported this session — assert once, not every
-        # tick. Cleared when the agent runs again.
         self._paused_reported: set[str] = set()
         # Shared attach registry: ws-local Workers register here; the
         # bridge's /v1/ws-local route serves tools against it.

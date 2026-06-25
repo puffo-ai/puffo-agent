@@ -1611,8 +1611,6 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
 
-    # Operator-picked skill + MCP template ids, resolved at spawn (missing
-    # ones warn but don't block create).
     desired_skills = payload.get("desired_skills") or []
     desired_mcps = payload.get("desired_mcps") or []
     if not isinstance(desired_skills, list) or not all(isinstance(s, str) and s for s in desired_skills):

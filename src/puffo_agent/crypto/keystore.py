@@ -83,7 +83,6 @@ class KeyStore:
 
     @staticmethod
     def for_agent(agent_id: str) -> KeyStore:
-        # Honor PUFFO_AGENT_HOME (daemon home override); PUFFO_HOME is legacy.
         home = (
             os.environ.get("PUFFO_AGENT_HOME")
             or os.environ.get("PUFFO_HOME")
