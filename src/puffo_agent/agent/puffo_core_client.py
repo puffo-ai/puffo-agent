@@ -511,27 +511,16 @@ class PuffoCoreMessageClient:
         # invite. Lost on daemon restart (acceptable: re-DM rate is
         # naturally rare).
         self._processed_invite_ids: set[str] = set()
-        # PUF-317: WS event_ids the membership-announce path has
-        # already emitted for. Reconnect-replay would otherwise show
-        # the agent two "Bob left #channel" envelopes back-to-back
-        # — same lifetime + reset semantics as
-        # ``_processed_invite_ids``. Memory cost stays bounded in
-        # practice (~24 bytes per event_id; channels with sustained
-        # churn at 1Hz would take ~5 days to reach 10MB).
+        # WS event_ids the membership-announce path has already emitted.
+        # Same lifetime + reset semantics as ``_processed_invite_ids``;
+        # reconnect-replay would otherwise double up "Bob left #channel".
         self._processed_membership_event_ids: set[str] = set()
-        # PUF-317 PR #94 review-#3: ``invitation_event_id ->
-        # inviter_slug`` recorded on inbound ``invite_to_*`` events
-        # (signer of the invite IS the inviter). Consulted by the
-        # membership-announce paths when a manual-accept
-        # ``accept_*_invite`` arrives without ``original_invite``
-        # (server-auto-accept only embeds the original signed
-        # invite; manual-accept paths omit it). Mirrors the web
-        # side's ``_inviter_by_invitation`` cache. Lifetime-scoped
-        # like ``_processed_invite_ids`` — lost on daemon restart;
-        # post-restart manual-accepts that we haven't observed the
-        # invite for will silently render the body without an
-        # inviter suffix, which is the same shape as the existing
-        # "no original_invite" path.
+        # ``invitation_event_id -> inviter_slug`` cache for the manual-
+        # accept path (server-auto-accept embeds the original signed
+        # invite under ``original_invite``; manual accepts don't, so the
+        # announce body falls back to this cache for "(invited by X)").
+        # Lifetime-scoped — post-restart manual-accepts we never saw the
+        # invite for render without the suffix.
         self._inviter_by_invitation_event_id: dict[str, str] = {}
         # When the worker DMs the operator about a non-auto-acceptable
         # invite, the DM's envelope_id lives here so a ``y``/``n``
@@ -1491,12 +1480,8 @@ class PuffoCoreMessageClient:
                 self._space_members.pop(evict_space_id, None)
 
         if kind in ("invite_to_space", "invite_to_channel"):
-            # PUF-317 PR #94 review-#3: record inviter so a
-            # later manual-accept (which omits ``original_invite``
-            # — only server-auto-accept embeds it) can still
-            # render "(invited by X)" in the announce body. The
-            # signed invite's ``event_id`` becomes the key the
-            # accept event carries as ``invitation_event_id``.
+            # Cache inviter so a later manual-accept (which omits
+            # ``original_invite``) can still render "(invited by X)".
             invite_event_id = event.get("event_id") or ""
             inviter_slug = event.get("signer_slug") or ""
             if invite_event_id and inviter_slug:
@@ -1586,29 +1571,19 @@ class PuffoCoreMessageClient:
             )
             return
 
-        # Membership-change announcements for OTHER members of a
-        # channel this agent is also in. Distinct from the
-        # self-targeted branches above (those DM the operator);
-        # these inject a non-replyable system-message into the
-        # agent's transcript so it can react in-context (e.g. stop
-        # @-mentioning a member that just left). PUF-317.
+        # OTHER-member channel events → inject a non-replyable system
+        # message into the agent's transcript so it has live context
+        # (e.g. stop @-mentioning a member that just left).
         if kind in ("leave_channel", "remove_from_channel"):
             await self._maybe_announce_membership_change(
                 kind, event, payload,
             )
             return
 
-        # PUF-317 review-#1: space-level membership for OTHER actors.
-        # puffo-server #74 ``cascade_remove_from_channels`` mutates the
-        # ``channel_memberships`` table directly when an operator
-        # leaves or is removed from a space — no per-channel
-        # ``leave_channel`` event fires for the cascaded slugs. Without
-        # this announce path the agent keeps @-mentioning a member
-        # who's silently dropped out of #general. ``accept_space_invite``
-        # cascade into auto-joined public channels has the same
-        # symptom in reverse. Surface all three through the same
-        # announce wrapper so the General-channel transcript stays in
-        # sync with channel-roster reality.
+        # Space-level membership cascades into ``channel_memberships``
+        # server-side without per-channel events, so without this
+        # announce the agent keeps @-mentioning a member who silently
+        # dropped out of #general (or fails to greet an auto-joiner).
         if kind in ("leave_space", "remove_from_space", "accept_space_invite"):
             await self._maybe_announce_space_membership_change(
                 kind, event, payload,
@@ -2714,12 +2689,9 @@ class PuffoCoreMessageClient:
             actor_slug = event.get("signer_slug") or ""
             action = "joined"
             kicker_slug = ""
-            # PUF-317 review-#2: server-auto-accept embeds the
-            # original signed InviteToChannel under ``original_invite``;
-            # its ``signer_slug`` is the inviter. Manual-accept paths
-            # omit ``original_invite``, so review-#3 falls through to
-            # the ``_inviter_by_invitation_event_id`` cache populated
-            # in ``_handle_event``'s ``invite_to_*`` branch.
+            # Server-auto-accept embeds the inviter under
+            # ``original_invite``; manual accepts fall through to the
+            # cache populated in the ``invite_to_*`` branch.
             original_invite = payload.get("original_invite")
             if isinstance(original_invite, dict):
                 inviter_slug = original_invite.get("signer_slug") or ""
@@ -2774,16 +2746,6 @@ class PuffoCoreMessageClient:
         into the agent's transcript as a non-replyable system-message
         in a channel the agent shares with the space.
 
-        PUF-317 review-#1: puffo-server #74
-        ``cascade_remove_from_channels`` mutates
-        ``channel_memberships`` directly on a space exit — no
-        per-channel ``leave_channel`` event fires for the cascaded
-        slugs. ``accept_space_invite`` cascades into auto-joined
-        public channels with the same symptom in reverse. Without
-        this announce path the agent keeps @-mentioning a member
-        who silently dropped out of #general (or fails to greet a
-        member who just auto-joined).
-
         Prefers the channel named ``general`` (case-insensitive) so
         the agent's transcript lines up with the human-side UI, which
         renders space events into General. Falls back to the
@@ -2815,9 +2777,7 @@ class PuffoCoreMessageClient:
             actor_slug = event.get("signer_slug") or ""
             action = "joined_space"
             kicker_slug = ""
-            # Mirror the channel path: server-auto-accept embeds the
-            # original signed InviteToSpace under ``original_invite``;
-            # manual-accept falls through to the cache.
+            # Same cache fallback as the channel path.
             original_invite = payload.get("original_invite")
             if isinstance(original_invite, dict):
                 inviter_slug = original_invite.get("signer_slug") or ""
@@ -2876,19 +2836,14 @@ class PuffoCoreMessageClient:
         event_id: str = "",
     ) -> None:
         """Inject a non-replyable ``[puffo-agent system message]``
-        envelope announcing a channel- or space-level membership
-        change. Mirrors ``_enqueue_channel_intro_nudge``
-        (PRIORITY_SYSTEM, sender_slug ``system``, persisted to
-        messages.db so ``get_channel_history`` stays coherent) but
-        the body is an announcement — there's no directive, and the
-        prefix marker signals to the agent that no reply is
-        expected.
+        envelope announcing a membership change. Mirrors
+        ``_enqueue_channel_intro_nudge`` (PRIORITY_SYSTEM, sender
+        ``system``, persisted to messages.db) but the body is an
+        announcement and the prefix marker signals no reply expected.
 
-        ``action`` is one of ``"joined" | "left" | "removed" |
-        "joined_space" | "left_space" | "removed_from_space"``.
-        ``kicker_slug`` only consulted when ``action`` ends in
-        ``"removed"``. ``inviter_slug`` only consulted when ``action``
-        starts with ``"joined"`` (server-auto-accept inviter cite).
+        ``action`` ∈ {joined, left, removed, joined_space, left_space,
+        removed_from_space}. ``kicker_slug`` used on ``removed*``;
+        ``inviter_slug`` used on ``joined*``.
         """
         space_id = self._channel_space.get(channel_id) or ""
         space_name = (
@@ -2907,8 +2862,6 @@ class PuffoCoreMessageClient:
         )
 
         async def _invited_by_suffix() -> str:
-            # Server-auto-accept embeds the inviter; manual-accept
-            # omits original_invite, so this falls through to "".
             if not inviter_slug:
                 return ""
             inviter_display = await self._fetch_display_name(inviter_slug)
@@ -2960,13 +2913,8 @@ class PuffoCoreMessageClient:
             return
 
         now_ms = int(time.time() * 1000)
-        # Prefer the signed event_id when available so a
-        # reconnect-replay collapses to the same envelope_id and the
-        # store's INSERT OR IGNORE rejects the duplicate at the
-        # sqlite layer in addition to the in-memory dedup set in
-        # ``_maybe_announce_membership_change``. Fall back to the
-        # ms-timestamp when callers omit event_id (direct unit-test
-        # invocation of this helper).
+        # Signed event_id makes the envelope_id deterministic so the
+        # store's INSERT OR IGNORE dedups reconnect-replay.
         envelope_id_suffix = event_id or str(now_ms)
         envelope_id = (
             f"membership-{action}-{channel_id}-{actor_slug}-{envelope_id_suffix}"

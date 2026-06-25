@@ -1,4 +1,4 @@
-"""Channel-membership system-message announcements (PUF-317).
+"""Channel-membership system-message announcements.
 
 When another member joins, leaves, or is removed from a channel this
 agent has visibility into, the daemon injects a non-replyable
@@ -633,7 +633,7 @@ async def test_persist_failure_still_delivers_in_memory_envelope(
     await store.close()
 
 
-# ─── PR #94 review-#2: inviter citation in joined body ─────────────
+# ─── inviter citation in joined body ─────────────
 
 
 @pytest.mark.asyncio
@@ -713,7 +713,7 @@ async def test_handle_event_accept_channel_invite_with_original_invite_cites_inv
     await store.close()
 
 
-# ─── PR #94 review-#1: space-membership announce path ─────────────
+# ─── space-membership announce path ─────────────
 
 
 @pytest.mark.asyncio
@@ -785,9 +785,9 @@ async def test_space_membership_removed_includes_kicker_and_space():
 
 @pytest.mark.asyncio
 async def test_handle_event_leave_space_by_other_announces_into_first_channel():
-    """puffo-server #74 cascade-leave doesn't fan per-channel events.
-    The space announce path picks the first known channel as the
-    transcript target so the agent sees the member dropping out."""
+    """Space cascade-leave doesn't fan per-channel events server-side.
+    The announce path picks a visible channel as the transcript target
+    so the agent sees the member dropping out."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -1006,7 +1006,7 @@ async def test_space_membership_prefers_general_channel_when_present():
     await store.close()
 
 
-# ─── PR #94 review-#3: manual-accept inviter cache backfill ────────
+# ─── manual-accept inviter cache backfill ────────
 
 
 @pytest.mark.asyncio
@@ -1076,8 +1076,8 @@ async def test_manual_accept_channel_invite_falls_back_to_cache_for_inviter():
 @pytest.mark.asyncio
 async def test_manual_accept_channel_invite_renders_no_inviter_on_cache_miss():
     """No prior ``invite_to_channel`` observed (e.g. daemon restarted
-    between invite + accept) → cache miss → body falls back to the
-    pre-review-#2 shape without growing a stray '(invited by )'."""
+    between invite + accept) → cache miss → body has no '(invited by …)'
+    suffix at all (not a stray '(invited by )')."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
