@@ -9,6 +9,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: the test job only needs to read the repo.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
