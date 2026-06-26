@@ -29,6 +29,7 @@ from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .core import AgentAPIError
 from .events import random_nonce, sign_event
+from .event_kinds import EventKind
 from .message_store import MessageStore
 
 logger = logging.getLogger(__name__)
@@ -1466,12 +1467,16 @@ class PuffoCoreMessageClient:
         # is removed so the next mention extraction re-fetches; without
         # this the cache misses the new joiner and their @-mention is
         # silently dropped from the metadata.
-        if kind in ("accept_space_invite", "leave_space", "remove_from_space"):
+        if kind in (
+            EventKind.ACCEPT_SPACE_INVITE,
+            EventKind.LEAVE_SPACE,
+            EventKind.REMOVE_FROM_SPACE,
+        ):
             evict_space_id = payload.get("space_id") or ""
             if evict_space_id:
                 self._space_members.pop(evict_space_id, None)
 
-        if kind in ("invite_to_space", "invite_to_channel"):
+        if kind in (EventKind.INVITE_TO_SPACE, EventKind.INVITE_TO_CHANNEL):
             invite_event_id = event.get("event_id") or ""
             inviter_slug = event.get("signer_slug") or ""
             if invite_event_id and inviter_slug:
@@ -1493,7 +1498,7 @@ class PuffoCoreMessageClient:
         # runs, so the self-intro nudge that path normally fires
         # would otherwise be silently dropped on auto-accept.
         # Mirror just the nudge here.
-        if kind == "accept_channel_invite":
+        if kind == EventKind.ACCEPT_CHANNEL_INVITE:
             if event.get("signer_slug") != self.slug:
                 # Another member joined a channel we may also be in
                 # — fall through to the announce-membership path.
@@ -1531,7 +1536,7 @@ class PuffoCoreMessageClient:
         # the server emits when an operator leaves (puffo-server #74
         # agent-cascade) is signed-as-the-agent — same predicate as
         # a real self-signed leave, so it lands in the same branch.
-        if kind == "leave_space" and event.get("signer_slug") == self.slug:
+        if kind == EventKind.LEAVE_SPACE and event.get("signer_slug") == self.slug:
             await self._on_left_space(
                 space_id=payload.get("space_id") or "",
                 synthetic=str(event.get("signature") or "").startswith(
@@ -1540,20 +1545,20 @@ class PuffoCoreMessageClient:
             )
             return
 
-        if kind == "remove_from_space" and payload.get("removed_slug") == self.slug:
+        if kind == EventKind.REMOVE_FROM_SPACE and payload.get("removed_slug") == self.slug:
             await self._on_kicked_from_space(
                 space_id=payload.get("space_id") or "",
                 kicker_slug=event.get("signer_slug") or "",
             )
             return
 
-        if kind == "leave_channel" and event.get("signer_slug") == self.slug:
+        if kind == EventKind.LEAVE_CHANNEL and event.get("signer_slug") == self.slug:
             await self._on_left_channel(
                 channel_id=payload.get("channel_id") or "",
             )
             return
 
-        if kind == "remove_from_channel" and payload.get("removed_slug") == self.slug:
+        if kind == EventKind.REMOVE_FROM_CHANNEL and payload.get("removed_slug") == self.slug:
             await self._on_kicked_from_channel(
                 channel_id=payload.get("channel_id") or "",
                 space_id=payload.get("space_id") or "",
@@ -1561,7 +1566,7 @@ class PuffoCoreMessageClient:
             )
             return
 
-        if kind in ("leave_channel", "remove_from_channel"):
+        if kind in (EventKind.LEAVE_CHANNEL, EventKind.REMOVE_FROM_CHANNEL):
             await self._maybe_announce_membership_change(
                 kind, event, payload,
             )
@@ -1569,7 +1574,11 @@ class PuffoCoreMessageClient:
 
         # Space cascades silently into channel_memberships server-side
         # — surface here so #general transcript stays current.
-        if kind in ("leave_space", "remove_from_space", "accept_space_invite"):
+        if kind in (
+            EventKind.LEAVE_SPACE,
+            EventKind.REMOVE_FROM_SPACE,
+            EventKind.ACCEPT_SPACE_INVITE,
+        ):
             await self._maybe_announce_space_membership_change(
                 kind, event, payload,
             )
@@ -1580,10 +1589,10 @@ class PuffoCoreMessageClient:
         # added to ``extra_ws_targets`` for cancel/reject). If the
         # operator is still holding an un-answered y/n DM, follow up
         # so they don't reply ``y`` to a dead invite.
-        if kind in ("cancel_space_invite", "cancel_channel_invite"):
+        if kind in (EventKind.CANCEL_SPACE_INVITE, EventKind.CANCEL_CHANNEL_INVITE):
             await self._on_invite_canceled(
                 invitation_event_id=payload.get("invitation_event_id") or "",
-                scope="space" if kind == "cancel_space_invite" else "channel",
+                scope="space" if kind == EventKind.CANCEL_SPACE_INVITE else "channel",
             )
             return
 
@@ -1599,13 +1608,13 @@ class PuffoCoreMessageClient:
         space_id = payload.get("space_id") or ""
         if not channel_id or not space_id:
             return
-        if kind == "invite_to_channel":
+        if kind == EventKind.INVITE_TO_CHANNEL:
             if payload.get("invitee_slug") != self.slug:
                 return
-        elif kind == "accept_channel_invite":
+        elif kind == EventKind.ACCEPT_CHANNEL_INVITE:
             if event.get("signer_slug") != self.slug:
                 return
-        elif kind == "create_channel":
+        elif kind == EventKind.CREATE_CHANNEL:
             pass  # always cache; server only fans to space members
         else:
             return
@@ -1936,7 +1945,7 @@ class PuffoCoreMessageClient:
                 kind, invitation_event_id, inviter_slug, space_id,
             )
             return
-        if kind == "invite_to_channel" and not channel_id:
+        if kind == EventKind.INVITE_TO_CHANNEL and not channel_id:
             self._log.warning(
                 "channel invite missing channel_id: event_id=%s",
                 invitation_event_id,
@@ -1949,7 +1958,7 @@ class PuffoCoreMessageClient:
         # Flag-driven auto-accept covers space invites from non-operators;
         # unlike the (silent) operator path it DMs a report afterwards.
         flag_accept = (
-            kind == "invite_to_space" and self.auto_accept_space_invitations
+            kind == EventKind.INVITE_TO_SPACE and self.auto_accept_space_invitations
         )
         if is_from_operator or flag_accept:
             try:
@@ -2397,14 +2406,14 @@ class PuffoCoreMessageClient:
             decode_secret(sess.subkey_secret_key)
         )
         now_ms = int(__import__("time").time() * 1000)
-        if kind == "invite_to_space":
+        if kind == EventKind.INVITE_TO_SPACE:
             payload: dict[str, Any] = {
                 "space_id": space_id,
                 "invitation_event_id": invitation_event_id,
                 "accepted_at": now_ms,
                 "nonce": random_nonce(),
             }
-            accept_kind = "accept_space_invite"
+            accept_kind = EventKind.ACCEPT_SPACE_INVITE
         else:  # invite_to_channel
             payload = {
                 "space_id": space_id,
@@ -2413,7 +2422,7 @@ class PuffoCoreMessageClient:
                 "accepted_at": now_ms,
                 "nonce": random_nonce(),
             }
-            accept_kind = "accept_channel_invite"
+            accept_kind = EventKind.ACCEPT_CHANNEL_INVITE
         signed = sign_event(
             kind=accept_kind,
             payload=payload,
@@ -2434,7 +2443,7 @@ class PuffoCoreMessageClient:
         # ``send_message`` call (queued right below) could race the
         # WS echo and hit a cache miss on a channel the agent has
         # just provably joined.
-        if kind == "invite_to_channel" and channel_id and space_id:
+        if kind == EventKind.INVITE_TO_CHANNEL and channel_id and space_id:
             try:
                 await self.store.mark_channel_space(channel_id, space_id)
             except Exception:
@@ -2452,9 +2461,9 @@ class PuffoCoreMessageClient:
         # auto-fanned-out into per puffo-server's space-invite redeem
         # logic — any other channel needs its own invite_to_channel).
         intro_channel_id = ""
-        if kind == "invite_to_channel" and channel_id:
+        if kind == EventKind.INVITE_TO_CHANNEL and channel_id:
             intro_channel_id = channel_id
-        elif kind == "invite_to_space":
+        elif kind == EventKind.INVITE_TO_SPACE:
             try:
                 intro_channel_id = await self._find_public_general_channel(
                     space_id,
@@ -2656,7 +2665,7 @@ class PuffoCoreMessageClient:
             return
 
         inviter_slug = ""
-        if kind == "accept_channel_invite":
+        if kind == EventKind.ACCEPT_CHANNEL_INVITE:
             actor_slug = event.get("signer_slug") or ""
             action = "joined"
             kicker_slug = ""
@@ -2669,11 +2678,11 @@ class PuffoCoreMessageClient:
                     inviter_slug = self._inviter_by_invitation_event_id.get(
                         invitation_event_id, "",
                     )
-        elif kind == "leave_channel":
+        elif kind == EventKind.LEAVE_CHANNEL:
             actor_slug = event.get("signer_slug") or ""
             action = "left"
             kicker_slug = ""
-        elif kind == "remove_from_channel":
+        elif kind == EventKind.REMOVE_FROM_CHANNEL:
             actor_slug = payload.get("removed_slug") or ""
             action = "removed"
             kicker_slug = event.get("signer_slug") or ""
@@ -2771,7 +2780,7 @@ class PuffoCoreMessageClient:
             return
 
         inviter_slug = ""
-        if kind == "accept_space_invite":
+        if kind == EventKind.ACCEPT_SPACE_INVITE:
             actor_slug = event.get("signer_slug") or ""
             action = "joined_space"
             kicker_slug = ""
@@ -2784,11 +2793,11 @@ class PuffoCoreMessageClient:
                     inviter_slug = self._inviter_by_invitation_event_id.get(
                         invitation_event_id, "",
                     )
-        elif kind == "leave_space":
+        elif kind == EventKind.LEAVE_SPACE:
             actor_slug = event.get("signer_slug") or ""
             action = "left_space"
             kicker_slug = ""
-        elif kind == "remove_from_space":
+        elif kind == EventKind.REMOVE_FROM_SPACE:
             actor_slug = payload.get("removed_slug") or ""
             action = "removed_from_space"
             kicker_slug = event.get("signer_slug") or ""
@@ -3051,7 +3060,7 @@ class PuffoCoreMessageClient:
             )
         space_label = await self._resolve_space_name(space_id)
         channel_label = ""
-        if kind == "leave_channel":
+        if kind == EventKind.LEAVE_CHANNEL:
             channel_label = await self._resolve_channel_name(
                 space_id=space_id, channel_id=channel_id,
             )
@@ -3123,7 +3132,7 @@ class PuffoCoreMessageClient:
                 )
                 # Suppress the WS echo's generic membership DM (space only);
                 # the in-thread confirm below is the authoritative report.
-                if kind == "leave_space":
+                if kind == EventKind.LEAVE_SPACE:
                     self._gate_left_spaces.add(space_id)
                 confirm = f"Left {target}. ✓"
                 self._log.info(
@@ -3195,7 +3204,7 @@ class PuffoCoreMessageClient:
             decode_secret(sess.subkey_secret_key)
         )
         now_ms = int(__import__("time").time() * 1000)
-        if kind == "leave_channel":
+        if kind == EventKind.LEAVE_CHANNEL:
             payload: dict[str, Any] = {
                 "space_id": space_id,
                 "channel_id": channel_id,
@@ -3315,14 +3324,14 @@ class PuffoCoreMessageClient:
             decode_secret(sess.subkey_secret_key)
         )
         now_ms = int(__import__("time").time() * 1000)
-        if kind == "invite_to_space":
+        if kind == EventKind.INVITE_TO_SPACE:
             payload: dict[str, Any] = {
                 "space_id": space_id,
                 "invitation_event_id": invitation_event_id,
                 "rejected_at": now_ms,
                 "nonce": random_nonce(),
             }
-            reject_kind = "reject_space_invite"
+            reject_kind = EventKind.REJECT_SPACE_INVITE
         else:  # invite_to_channel
             payload = {
                 "space_id": space_id,
@@ -3331,7 +3340,7 @@ class PuffoCoreMessageClient:
                 "rejected_at": now_ms,
                 "nonce": random_nonce(),
             }
-            reject_kind = "reject_channel_invite"
+            reject_kind = EventKind.REJECT_CHANNEL_INVITE
         signed = sign_event(
             kind=reject_kind,
             payload=payload,
@@ -3376,7 +3385,7 @@ class PuffoCoreMessageClient:
             if inviter_display else f"@{inviter_slug}"
         )
         space_label = f"**{space_name}**({space_id})" if space_name else space_id
-        if kind == "invite_to_space":
+        if kind == EventKind.INVITE_TO_SPACE:
             text = (
                 f"{inviter_label} invited me to space {space_label}. "
                 f"They aren't my registered operator. "
