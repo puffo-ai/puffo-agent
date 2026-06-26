@@ -4,6 +4,34 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] — 2026-06-25
+
+### Added
+
+- **Membership system messages in the agent transcript.** When another member
+  joins, leaves, or is removed from a channel (or space) the agent is also in,
+  the daemon injects a non-replyable `[puffo-agent system message] Channel
+  membership update: …` envelope so the agent has read-only context (e.g.
+  stop @-mentioning a member that just left). Covers all six event kinds —
+  `accept_channel_invite` / `leave_channel` / `remove_from_channel` plus the
+  three space-scoped variants whose cascade into `channel_memberships` would
+  otherwise be invisible. Space events render in `#general` (lex-first
+  visible channel as fallback) so the agent's transcript lines up with the
+  web client's view.
+- **Inviter citation in `joined` bodies.** Server-auto-accepts that embed
+  `payload.original_invite.signer_slug` now render "(invited by Y)" alongside
+  the joiner. Manual-accept events that don't embed the invite fall back to a
+  per-session `invitation_event_id → inviter_slug` cache populated from the
+  earlier `invite_to_*` event.
+
+### Internal
+
+- Self-targeted membership events still route through the existing
+  `_on_left_*` / `_on_kicked_from_*` operator-DM paths; only OTHER actors
+  feed the announce path. Reconnect-replay is dedup'd both in-memory
+  (`_processed_membership_event_ids`) and at the sqlite layer via a
+  deterministic `envelope_id` keyed on the signed `event_id`.
+
 ## [1.0.0] — 2026-06-25
 
 ### Added
