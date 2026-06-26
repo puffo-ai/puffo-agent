@@ -2707,6 +2707,52 @@ class PuffoCoreMessageClient:
         if event_id:
             self._processed_membership_event_ids.add(event_id)
 
+    async def _pick_space_channel(self, space_id: str) -> str:
+        """Pick #general for the space-event announce target, falling
+        back to lex-first. Tries ``_channel_space`` first (in-memory
+        from prior per-channel events); if that's empty (e.g. the agent
+        cascade-joined via ``accept_space_invite``), fetches the
+        channel list and warms ``_channel_space`` for next time.
+        Returns "" if nothing usable found."""
+        known = sorted(
+            cid for cid, sid in self._channel_space.items()
+            if sid == space_id
+        )
+        if known:
+            for cid in known:
+                name = await self._resolve_channel_name(
+                    space_id=space_id, channel_id=cid,
+                )
+                if (name or "").strip().lower() == "general":
+                    return cid
+            return known[0]
+        try:
+            data = await self.http.get(f"/spaces/{space_id}/channels")
+        except Exception:
+            return ""
+        if not isinstance(data, dict):
+            return ""
+        channels = data.get("channels") or []
+        if not isinstance(channels, list) or not channels:
+            return ""
+        general = ""
+        first = ""
+        for c in channels:
+            if not isinstance(c, dict):
+                continue
+            cid = (c.get("channel_id") or "").strip()
+            if not cid:
+                continue
+            self._channel_space[cid] = space_id
+            name = (c.get("name") or "").strip()
+            if name:
+                self._channel_name_cache.setdefault(cid, name)
+            if not first:
+                first = cid
+            if not general and name.lower() == "general":
+                general = cid
+        return general or first
+
     async def _maybe_announce_space_membership_change(
         self, kind: str, event: dict, payload: dict,
     ) -> None:
@@ -2716,20 +2762,13 @@ class PuffoCoreMessageClient:
         if not space_id:
             return
 
-        channels_in_space = sorted(
-            cid for cid, sid in self._channel_space.items()
-            if sid == space_id
-        )
-        if not channels_in_space:
+        # ``accept_space_invite`` cascades the agent into public channels
+        # server-side without per-channel events, so ``_channel_space``
+        # stays empty for those. Lazy-fetch the channel list so we can
+        # still announce.
+        target_channel_id = await self._pick_space_channel(space_id)
+        if not target_channel_id:
             return
-        target_channel_id = channels_in_space[0]
-        for cid in channels_in_space:
-            name = await self._resolve_channel_name(
-                space_id=space_id, channel_id=cid,
-            )
-            if (name or "").strip().lower() == "general":
-                target_channel_id = cid
-                break
 
         inviter_slug = ""
         if kind == "accept_space_invite":
