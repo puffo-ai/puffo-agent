@@ -1,17 +1,4 @@
-"""Channel-membership system-message announcements.
-
-When another member joins, leaves, or is removed from a channel this
-agent has visibility into, the daemon injects a non-replyable
-``[puffo-agent system message]`` envelope into the agent's transcript
-so it has read-only context (e.g. stop @-mentioning a member that
-just left). Self-actions are deliberately skipped here — the
-self-join intro nudge and the self-exit operator DMs cover those.
-
-These tests exercise the two new helpers
-(``_maybe_announce_membership_change`` predicate +
-``_enqueue_membership_system_message`` injector) plus the
-``_handle_event`` wiring that calls them.
-"""
+"""Channel-membership system-message announcements (other-actor only)."""
 
 from __future__ import annotations
 
@@ -40,8 +27,7 @@ async def _make_store() -> MessageStore:
 
 
 def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
-    """Bare client with just enough state to drive
-    ``_handle_event`` through the membership-announce path."""
+    """Bare client wired enough to drive the membership-announce path."""
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "agent-1"
     client.store = store
@@ -196,16 +182,13 @@ async def test_membership_unknown_actor_falls_back_to_slug():
     _, _, root_id = await client._queue.get()
     msg = client._thread_state[root_id].messages[0]
     assert "@charlie-9999" in msg["text"]
-    # No bold display-name prefix when the name resolved empty.
     assert "**" not in msg["text"]
     await store.close()
 
 
 @pytest.mark.asyncio
 async def test_membership_envelope_persists_to_messages_db():
-    """The synthetic envelope must be queryable via the data-service
-    paths the agent uses at runtime so its transcript view is
-    consistent."""
+    """Envelope queryable via get_message_by_envelope + get_channel_history."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -233,9 +216,7 @@ async def test_membership_envelope_persists_to_messages_db():
 
 @pytest.mark.asyncio
 async def test_membership_unknown_action_is_noop():
-    """Defensive — the dispatcher in ``_handle_event`` only sends
-    "joined" / "left" / "removed", but the helper bails cleanly on
-    anything else rather than emitting garbage."""
+    """Helper bails cleanly on an action the dispatcher wouldn't send."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -256,12 +237,9 @@ async def test_membership_unknown_action_is_noop():
 
 @pytest.mark.asyncio
 async def test_announce_skipped_when_channel_not_in_visibility_map():
-    """Server may fan a leave/remove event to us as a former member
-    too. Don't announce on a channel we no longer (or never) had
-    visibility into."""
+    """Don't announce on a channel we no longer (or never) had visibility into."""
     store = await _make_store()
     client = _make_client(store)
-    # _channel_space is empty → no visibility.
 
     await client._maybe_announce_membership_change(
         "leave_channel",
@@ -275,9 +253,7 @@ async def test_announce_skipped_when_channel_not_in_visibility_map():
 
 @pytest.mark.asyncio
 async def test_announce_skipped_when_actor_is_self():
-    """Self-join is covered by the intro nudge; self-exit is covered
-    by the operator-DM path. The announce-membership path must NOT
-    fire on self-events or we'd double-emit."""
+    """Self-events are owned by other paths (intro nudge / operator DM)."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -400,13 +376,11 @@ async def test_handle_event_accept_channel_invite_by_other_announces_join():
 
 @pytest.mark.asyncio
 async def test_handle_event_self_leave_does_not_announce():
-    """Self-leave still routes to ``_on_left_channel`` (cache eviction)
-    and must NOT fan out as an announcement to its own transcript."""
+    """Self-leave routes to _on_left_channel, not the announce path."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
 
-    # Stub _on_left_channel since the real one touches the store.
     on_left_calls: list[str] = []
 
     async def _stub_on_left(*, channel_id: str) -> None:
@@ -423,9 +397,7 @@ async def test_handle_event_self_leave_does_not_announce():
         },
     )
 
-    # Self-leave path ran.
     assert on_left_calls == ["ch_1"]
-    # No announcement in the transcript queue.
     assert client._queue.qsize() == 0
     await store.close()
 
@@ -468,11 +440,9 @@ async def test_handle_event_self_kicked_does_not_announce():
 
 @pytest.mark.asyncio
 async def test_handle_event_other_leave_on_unknown_channel_is_silent():
-    """Channel not in our visibility map → server fan-out noise; no
-    announcement."""
+    """Unknown channel → server fan-out noise; no announce."""
     store = await _make_store()
     client = _make_client(store)
-    # _channel_space empty; we're not a member of ch_unknown.
 
     await client._handle_event(
         scope="sp_1",
@@ -492,9 +462,7 @@ async def test_handle_event_other_leave_on_unknown_channel_is_silent():
 
 @pytest.mark.asyncio
 async def test_announce_dedups_on_duplicate_event_id():
-    """A WS reconnect / event-replay re-fires the same signed event.
-    The announce path must not double-emit — keyed on ``event_id``,
-    same dedup contract as ``_processed_invite_ids``."""
+    """Reconnect-replay of the same signed event_id is a no-op."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -516,9 +484,7 @@ async def test_announce_dedups_on_duplicate_event_id():
 
 @pytest.mark.asyncio
 async def test_announce_uses_event_id_in_envelope_id_when_present():
-    """Deterministic envelope_id off the signed event_id so the
-    sqlite layer's INSERT OR IGNORE catches a replay even if the
-    in-memory dedup set was lost across restart."""
+    """Deterministic envelope_id so sqlite INSERT OR IGNORE catches replay across restart."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -540,24 +506,19 @@ async def test_announce_uses_event_id_in_envelope_id_when_present():
 
 @pytest.mark.asyncio
 async def test_announce_falls_back_to_timestamp_when_event_id_missing():
-    """Direct unit-test invocation may omit event_id; fall back to
-    the ms-timestamp so two distinct calls still get distinct
-    envelope_ids."""
+    """No event_id → ms-timestamp suffix, never empty."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
 
-    # Drive via _maybe_announce_membership_change with no event_id.
     await client._maybe_announce_membership_change(
         "leave_channel",
-        {"signer_slug": "alice-0001"},  # no event_id
+        {"signer_slug": "alice-0001"},
         {"channel_id": "ch_1", "space_id": "sp_1"},
     )
 
     assert client._queue.qsize() == 1
     _, _, root_id = await client._queue.get()
-    # Suffix is a millisecond timestamp — must NOT be an empty
-    # string and must NOT collide with the event_id-prefixed shape.
     assert root_id.startswith("membership-left-ch_1-alice-0001-")
     assert not root_id.endswith("-")
     await store.close()
@@ -565,10 +526,7 @@ async def test_announce_falls_back_to_timestamp_when_event_id_missing():
 
 @pytest.mark.asyncio
 async def test_announce_skips_dedup_when_event_id_empty():
-    """Empty event_id should not poison the dedup set — two such
-    events (a misbehaving server omitting event_id, repeated) must
-    each get an announce so the agent's transcript stays honest
-    rather than silently dropping later events."""
+    """Empty event_id must not poison the dedup set."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -596,12 +554,7 @@ async def test_announce_skips_dedup_when_event_id_empty():
 async def test_persist_failure_still_delivers_in_memory_envelope(
     monkeypatch, caplog,
 ):
-    """``store.store`` raising must not block the in-memory thread
-    queue — the agent still gets the announcement in its current
-    turn even if sqlite is wedged (disk full, permission, etc.). A
-    warning is logged so the operator can spot the
-    history/transcript divergence. Mirrors the web side's
-    ``persistMembershipSystemMessage returns null on throw`` test."""
+    """sqlite raising must not block in-memory delivery; warn instead."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -619,12 +572,10 @@ async def test_persist_failure_still_delivers_in_memory_envelope(
             action="joined",
         )
 
-    # In-memory delivery happened even though persistence failed.
     assert client._queue.qsize() == 1
     _, _, root_id = await client._queue.get()
     assert "joined" in client._thread_state[root_id].messages[0]["text"]
 
-    # Warning fired so the operator sees the divergence in logs.
     assert any(
         "membership system-message" in rec.message
         and "failed to persist" in rec.message
@@ -638,9 +589,7 @@ async def test_persist_failure_still_delivers_in_memory_envelope(
 
 @pytest.mark.asyncio
 async def test_joined_body_cites_inviter_when_supplied():
-    """Server-auto-accept embeds ``original_invite.signer_slug``; the
-    body should render '(invited by <inviter>)' so the agent can
-    distinguish who pulled the new member in."""
+    """inviter_slug supplied → '(invited by X)' suffix."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -663,8 +612,7 @@ async def test_joined_body_cites_inviter_when_supplied():
 
 @pytest.mark.asyncio
 async def test_joined_body_omits_inviter_when_empty():
-    """Manual-accept omits ``original_invite``; the body should NOT
-    grow a '(invited by )' fragment when the slug is empty."""
+    """Empty inviter_slug → no '(invited by …)' fragment at all."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -720,8 +668,6 @@ async def test_handle_event_accept_channel_invite_with_original_invite_cites_inv
 async def test_space_membership_joined_renders_joined_space_body():
     store = await _make_store()
     client = _make_client(store)
-    # Visibility into one channel of the space — required for the
-    # space announce path to pick a target channel.
     client._channel_space["ch_1"] = "sp_1"
 
     await client._enqueue_membership_system_message(
@@ -785,9 +731,7 @@ async def test_space_membership_removed_includes_kicker_and_space():
 
 @pytest.mark.asyncio
 async def test_handle_event_leave_space_by_other_announces_into_first_channel():
-    """Space cascade-leave doesn't fan per-channel events server-side.
-    The announce path picks a visible channel as the transcript target
-    so the agent sees the member dropping out."""
+    """Space cascade-leave has no per-channel event; the space-announce path picks a channel."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -862,8 +806,7 @@ async def test_handle_event_accept_space_invite_by_other_announces_join():
 
 @pytest.mark.asyncio
 async def test_handle_event_accept_space_invite_cites_inviter_when_present():
-    """Server-auto-accept embeds the inviter under original_invite —
-    same shape as the channel path."""
+    """original_invite.signer_slug → '(invited by X)' suffix."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -890,11 +833,9 @@ async def test_handle_event_accept_space_invite_cites_inviter_when_present():
 
 @pytest.mark.asyncio
 async def test_space_membership_skips_when_no_channel_visibility():
-    """Agent has no channel in this space → no transcript to surface
-    the announcement into → skip silently."""
+    """No visible channel in the space → skip silently."""
     store = await _make_store()
     client = _make_client(store)
-    # _channel_space has no entries for sp_1.
     client._channel_space["ch_other"] = "sp_2"
 
     await client._handle_event(
@@ -912,16 +853,11 @@ async def test_space_membership_skips_when_no_channel_visibility():
 
 @pytest.mark.asyncio
 async def test_space_membership_skips_self_actor():
-    """Self space exits route through ``_on_left_space`` /
-    ``_on_kicked_from_space`` (operator-DM paths) and must NOT
-    double-emit into the agent's own transcript."""
+    """Self space events are owned by other paths (_on_left_space etc.)."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
 
-    # Self-leave is short-circuited by the earlier
-    # "self leave_space" branch; here we drive the announce path
-    # directly to prove the actor==self guard in it.
     await client._maybe_announce_space_membership_change(
         "leave_space",
         {"signer_slug": "agent-1"},
@@ -944,8 +880,7 @@ async def test_space_membership_skips_self_actor():
 
 @pytest.mark.asyncio
 async def test_space_membership_falls_back_to_lex_first_when_no_general():
-    """No channel named ``general`` → lexicographically-first id is
-    picked so a reconnect-replay collapses to the same envelope_id."""
+    """No #general → lex-first channel_id (stable, dedup-friendly)."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_z"] = "sp_1"
@@ -971,9 +906,7 @@ async def test_space_membership_falls_back_to_lex_first_when_no_general():
 
 @pytest.mark.asyncio
 async def test_space_membership_prefers_general_channel_when_present():
-    """Space-scope events land in #general so the agent transcript
-    lines up with the human UI; lex-first only kicks in when no
-    General is visible."""
+    """Space-scope events land in #general (matches the human UI)."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_zulu"] = "sp_1"
@@ -1035,16 +968,13 @@ async def test_invite_to_channel_records_inviter_in_cache():
     assert client._inviter_by_invitation_event_id == {
         "ev_invite_42": "alice-0001",
     }
-    # Inbound invite alone does NOT post into the transcript.
     assert client._queue.qsize() == 0
     await store.close()
 
 
 @pytest.mark.asyncio
 async def test_manual_accept_channel_invite_falls_back_to_cache_for_inviter():
-    """Manual-accept omits ``original_invite``; the announce path
-    must consult ``_inviter_by_invitation_event_id`` keyed off the
-    ``invitation_event_id`` the accept carries."""
+    """No original_invite → resolve inviter via the cache."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -1059,7 +989,6 @@ async def test_manual_accept_channel_invite_falls_back_to_cache_for_inviter():
                 "channel_id": "ch_1",
                 "space_id": "sp_1",
                 "invitation_event_id": "ev_invite_42",
-                # original_invite intentionally omitted (manual accept)
             },
         },
     )
@@ -1075,13 +1004,10 @@ async def test_manual_accept_channel_invite_falls_back_to_cache_for_inviter():
 
 @pytest.mark.asyncio
 async def test_manual_accept_channel_invite_renders_no_inviter_on_cache_miss():
-    """No prior ``invite_to_channel`` observed (e.g. daemon restarted
-    between invite + accept) → cache miss → body has no '(invited by …)'
-    suffix at all (not a stray '(invited by )')."""
+    """Cache miss (e.g. restart between invite + accept) → no suffix."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
-    # Empty cache.
 
     await client._handle_event(
         scope="sp_1",
@@ -1105,11 +1031,7 @@ async def test_manual_accept_channel_invite_renders_no_inviter_on_cache_miss():
 
 @pytest.mark.asyncio
 async def test_original_invite_takes_precedence_over_cache():
-    """Server-auto-accept embeds ``original_invite`` AND populates
-    cache from the earlier invite_to_*. The body should cite the
-    embedded inviter, not the cached one. (In practice these are the
-    same slug, but the test pins the precedence so a future
-    inconsistency wouldn't surprise us.)"""
+    """original_invite wins over the cache when both are present."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -1160,7 +1082,6 @@ async def test_invite_to_space_records_inviter_for_later_space_accept():
         == "alice-0001"
     )
 
-    # Now the manual-accept arrives; cache lookup populates inviter.
     await client._handle_event(
         scope="sp_1",
         event={
@@ -1184,9 +1105,7 @@ async def test_invite_to_space_records_inviter_for_later_space_accept():
 
 @pytest.mark.asyncio
 async def test_invite_record_skips_when_event_id_or_signer_missing():
-    """Defensive — a malformed invite event (missing event_id or
-    signer_slug) must not poison the cache with empty-string keys
-    or values."""
+    """Malformed invite must not poison the cache with empty keys/values."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
@@ -1224,8 +1143,7 @@ async def test_invite_record_skips_when_event_id_or_signer_missing():
 
 @pytest.mark.asyncio
 async def test_space_membership_dedups_on_duplicate_event_id():
-    """Reconnect-replay sees the same signed event twice — announce
-    only once, same contract as the channel path."""
+    """Reconnect-replay → announce once."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_1"] = "sp_1"
