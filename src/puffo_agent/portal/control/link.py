@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
+import sys
 import webbrowser
 
 import aiohttp
@@ -28,6 +30,62 @@ logger = logging.getLogger(__name__)
 DEFAULT_SERVER_URL = "https://chat.puffo.ai/relay"
 POLL_INTERVAL_SECONDS = 2.0
 LINK_TIMEOUT_SECONDS = 300
+
+# SMBIOS placeholder strings OEMs leave when the field isn't set — useless as
+# a device name.
+_OEM_PLACEHOLDERS = {
+    "", "system manufacturer", "system product name", "to be filled by o.e.m.",
+    "default string", "none", "not applicable", "o.e.m.", "not specified",
+}
+
+
+def _compose_device_name(maker: str, model: str) -> str | None:
+    """Combine SMBIOS manufacturer + product into a friendly name (e.g.
+    ``Razer Blade 14``), dropping SKU noise and OEM placeholders. None if
+    unusable."""
+    maker = maker.strip()
+    model = model.split(" - ")[0].strip()  # "Blade 14 - RZ09-0370" -> "Blade 14"
+    if model.lower() in _OEM_PLACEHOLDERS:
+        model = ""
+    if maker.lower() in _OEM_PLACEHOLDERS:
+        maker = ""
+    if not model:
+        return None
+    if maker and not model.lower().startswith(maker.lower()):
+        return f"{maker} {model}"
+    return model
+
+
+def _windows_device_name() -> str | None:
+    """Manufacturer + model from the SMBIOS values in the registry (no
+    subprocess). e.g. ``Razer Blade 14``."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS"
+        ) as key:
+            def _read(name: str) -> str:
+                try:
+                    return str(winreg.QueryValueEx(key, name)[0]).strip()
+                except OSError:
+                    return ""
+
+            return _compose_device_name(
+                _read("SystemManufacturer"), _read("SystemProductName")
+            )
+    except OSError:
+        return None
+
+
+def friendly_device_name() -> str:
+    """A human-friendly default name for this machine, e.g. ``Razer Blade 14``,
+    falling back to the OS hostname. The operator can rename it at approval."""
+    if sys.platform == "win32":
+        name = _windows_device_name()
+        if name:
+            return name
+    return socket.gethostname() or "machine"
 
 
 def _web_url_from_server(server_url: str) -> str:

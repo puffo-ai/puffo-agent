@@ -1073,9 +1073,7 @@ def cmd_pairing_unpair(args: argparse.Namespace) -> int:
 
 def cmd_link(args: argparse.Namespace) -> int:
     """Link this machine to an operator via the online agent portal."""
-    import socket
-
-    from .control.link import DEFAULT_SERVER_URL, run_link
+    from .control.link import DEFAULT_SERVER_URL, friendly_device_name, run_link
 
     # The daemon holds the control WS that serves the operator's commands
     # once approved — auto-start it (without the local bridge) if it isn't
@@ -1084,7 +1082,7 @@ def cmd_link(args: argparse.Namespace) -> int:
         from .background import spawn_background
         spawn_background()
 
-    name = args.name or socket.gethostname() or "machine"
+    name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
         return asyncio.run(run_link(server_url, name, open_browser=not args.not_open))

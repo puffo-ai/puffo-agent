@@ -243,3 +243,26 @@ async def test_run_unlink_refuses_server_mismatch(monkeypatch):
     )
     rc = await link.run_unlink("op", expected_server_url="https://staging")
     assert rc == 2  # paired on a different server → refused, nothing torn down
+
+
+# ── friendly device name ─────────────────────────────────────────────
+
+def test_compose_device_name_cleans_sku_and_placeholders():
+    from puffo_agent.portal.control.link import _compose_device_name
+
+    assert _compose_device_name("Razer", "Blade 14 - RZ09-0370") == "Razer Blade 14"
+    # Model already carries the maker → don't double it up.
+    assert _compose_device_name("Dell Inc.", "Dell Inc. XPS 13") == "Dell Inc. XPS 13"
+    # OEM placeholder strings are unusable.
+    assert _compose_device_name("System manufacturer", "System Product Name") is None
+    assert _compose_device_name("Razer", "To be filled by O.E.M.") is None
+    # Maker-less but a real model still works.
+    assert _compose_device_name("", "MacBookPro18,3") == "MacBookPro18,3"
+
+
+def test_friendly_device_name_falls_back_to_hostname(monkeypatch):
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(link, "_windows_device_name", lambda: None)
+    monkeypatch.setattr(link.socket, "gethostname", lambda: "fallback-host")
+    assert link.friendly_device_name() == "fallback-host"

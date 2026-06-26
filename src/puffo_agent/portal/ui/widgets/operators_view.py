@@ -7,7 +7,6 @@ operator-side in the web app; this page shows the code and polls for it.
 from __future__ import annotations
 
 import asyncio
-import socket
 import threading
 import webbrowser
 from typing import Optional
@@ -28,13 +27,14 @@ from PySide6.QtWidgets import (
 from ...control.link import (
     DEFAULT_SERVER_URL,
     await_link_approval,
+    friendly_device_name,
     mint_link_code,
 )
 from ...control.store import load_pairings
 
 
 def _machine_name() -> str:
-    return socket.gethostname() or "machine"
+    return friendly_device_name()
 
 
 class _LinkDialog(QDialog):
