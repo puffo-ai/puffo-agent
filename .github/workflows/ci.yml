@@ -17,12 +17,21 @@ jobs:
   test:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen  # the PySide6 UI tests render headless
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+
+      # PySide6 (desktop UI tests) dlopens libEGL/libGL even under the
+      # offscreen platform; bare runners don't ship them.
+      - name: system libs for headless Qt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0
 
       - uses: actions/setup-python@v5
         with:
