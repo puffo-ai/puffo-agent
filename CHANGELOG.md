@@ -4,6 +4,26 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.2-unreleased]
+
+### Fixed
+
+- **`Unclosed client session` warning on every CLI-agent MCP subprocess
+  shutdown.** `DataClient`, `PuffoRpcClient`, and `PuffoCoreHttpClient` each
+  lazy-init an `aiohttp.ClientSession` and define `close()`, but `close()`
+  was never called. `FastMCP.run()` is blocking, so the subprocess exited
+  with sessions open and Python's gc emitted the warning during teardown.
+  A new FastMCP `lifespan` hook now closes each adapter's session while
+  the event loop is still alive. Per-adapter `try`/`except` so one
+  `close()` raising can't strand the rest.
+
+### Internal
+
+- `DataClient._get_session()` and `PuffoRpcClient._get_session()` log an
+  INFO line at first lazy-create (class name + `base_url` + `agent_id`),
+  so any future leak warning has a grep-able creation timestamp to match
+  against aiohttp's bare-memory-address gc repr.
+
 ## [1.0.1] — 2026-06-26
 
 ### Added
