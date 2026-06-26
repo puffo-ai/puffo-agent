@@ -98,7 +98,7 @@ async def test_membership_join_admits_system_priority_envelope():
     assert "alice-0001" in msg["text"]
     assert "joined" in msg["text"]
     assert "#general" in msg["text"]
-    assert "cannot reply" in msg["text"]
+    assert "for your context" in msg["text"]
     await store.close()
 
 

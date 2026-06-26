@@ -2917,7 +2917,7 @@ class PuffoCoreMessageClient:
         )
         prompt_text = (
             f"[puffo-agent system message] Channel membership update: "
-            f"{body} This is an announcement; you cannot reply to it."
+            f"{body} This is an announcement, for your context."
         )
 
         msg_dict = {
