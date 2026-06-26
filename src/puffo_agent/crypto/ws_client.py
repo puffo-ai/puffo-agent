@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable, Coroutine
 
 import websockets
+import websockets.exceptions  # websockets>=16 lazy-loads submodules; bare `import websockets` doesn't bind `.exceptions`
 
 from .encoding import base64url_encode, generate_nonce
 from .http_client import PuffoCoreHttpClient

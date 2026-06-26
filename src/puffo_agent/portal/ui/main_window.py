@@ -25,6 +25,7 @@ from .widgets.avatar import AvatarCache
 from .widgets.home_view import HomeView
 from .widgets.log_view import LogView
 from .widgets.mcp_status import McpStatusView
+from .widgets.operators_view import OperatorsView
 from .widgets.rail import Rail
 
 
@@ -91,15 +92,20 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(self._rail)
 
         self._sections = QStackedWidget()
-        self._sections.addWidget(self._build_home_section())     # 0
-        self._sections.addWidget(self._build_agents_section())   # 1
-        self._sections.addWidget(self._build_logs_section())     # 2
-        self._sections.addWidget(self._build_status_section())   # 3
+        self._sections.addWidget(self._build_home_section())        # 0
+        self._sections.addWidget(self._build_operators_section())   # 1
+        self._sections.addWidget(self._build_agents_section())      # 2
+        self._sections.addWidget(self._build_logs_section())        # 3
+        self._sections.addWidget(self._build_status_section())      # 4
         root_layout.addWidget(self._sections, stretch=1)
 
     def _build_home_section(self) -> QWidget:
         self._home = HomeView()
         return self._home
+
+    def _build_operators_section(self) -> QWidget:
+        self._operators = OperatorsView()
+        return self._operators
 
     def _build_logs_section(self) -> QWidget:
         wrap = QWidget()
@@ -169,7 +175,7 @@ class MainWindow(QMainWindow):
     def _on_section_changed(self, section: str) -> None:
         self._section = section
         self._sections.setCurrentIndex(
-            {"home": 0, "agents": 1, "logs": 2, "status": 3}.get(section, 0)
+            {"home": 0, "operators": 1, "agents": 2, "logs": 3, "status": 4}.get(section, 0)
         )
 
     def _on_agent_selected(self, agent_id: Optional[str]) -> None:
@@ -190,6 +196,9 @@ class MainWindow(QMainWindow):
     def _tick(self) -> None:
         if self._section == "home":
             self._home.poll()
+            return
+        if self._section == "operators":
+            self._operators.poll()
             return
         if self._section == "logs":
             self._system_log.poll()

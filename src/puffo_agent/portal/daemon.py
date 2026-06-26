@@ -61,6 +61,7 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
+        self._paused_reported: set[str] = set()
         # Shared attach registry: ws-local Workers register here; the
         # bridge's /v1/ws-local route serves tools against it.
         self.ws_local_hub = WsLocalHub()
@@ -101,6 +102,9 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+        # Re-assert machine_id for already-linked operators' agents so agents
+        # created/paused before linking show as remote without a re-link.
+        asyncio.ensure_future(_migrate_linked_agents_at_startup())
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
@@ -117,6 +121,10 @@ class Daemon:
         codex_refresher_task = asyncio.ensure_future(
             self.codex_refresher.run_loop(self._stop)
         )
+        from .control.client import ControlManager
+
+        control_manager = ControlManager()
+        control_task = asyncio.ensure_future(control_manager.run())
 
         try:
             while not self._stop.is_set():
@@ -149,7 +157,8 @@ class Daemon:
                     pass
         finally:
             await self._stop_all_workers()
-            for t in (refresher_task, codex_refresher_task):
+            control_manager.stop()
+            for t in (refresher_task, codex_refresher_task, control_task):
                 t.cancel()
                 try:
                     await t
@@ -223,6 +232,7 @@ class Daemon:
             worker = self.workers.get(agent_id)
 
             if desired_state == "running":
+                self._paused_reported.discard(agent_id)
                 if worker is None:
                     logger.info("agent %s: starting worker", agent_id)
                     worker = Worker(
@@ -258,6 +268,15 @@ class Daemon:
                 if worker is not None:
                     logger.info("agent %s: state=paused, stopping worker", agent_id)
                     await self._stop_worker(agent_id)
+                    # Worker's gone → it can't heartbeat "paused"; the daemon
+                    # reports it so the operator's portal reflects the pause.
+                    if await _report_lifecycle(agent_cfg, "paused"):
+                        self._paused_reported.add(agent_id)
+                elif agent_id not in self._paused_reported:
+                    # Paused with no worker (e.g. after a daemon restart) —
+                    # assert the state once so the portal isn't stuck stale.
+                    if await _report_lifecycle(agent_cfg, "paused"):
+                        self._paused_reported.add(agent_id)
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
 
@@ -358,6 +377,11 @@ class Daemon:
             agent_id,
         )
         await self._stop_worker(agent_id)
+        # Report archived before the dir (+ keystore) moves out from under us.
+        try:
+            await _report_lifecycle(AgentConfig.load(agent_id), "archived")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: archived report failed: %s", agent_id, exc)
         src = agent_dir(agent_id)
         if not src.exists():
             return
@@ -398,6 +422,51 @@ class Daemon:
             )
 
 
+async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
+    """Report an operator lifecycle state (paused/archived) to the server as the
+    agent. The worker is stopped at this point, so it can't heartbeat the state
+    itself; the daemon does it out-of-band. Returns True when the report is
+    *settled* — delivered, or rejected with a permanent 4xx that retrying can't
+    fix — so the caller stops re-reporting; False only on a transient failure
+    (5xx / network) worth retrying next tick."""
+    from ..crypto.http_client import HttpError, PuffoCoreHttpClient
+    from ..crypto.keystore import KeyStore
+    from .control.store import current_machine_id
+
+    pc = agent_cfg.puffo_core
+    if not pc.is_configured():
+        return True  # can never report without config — settled, don't retry
+    http = PuffoCoreHttpClient(pc.server_url, KeyStore.for_agent(agent_cfg.id), pc.slug)
+    try:
+        body: dict = {"status": status}
+        machine_id = current_machine_id()
+        if machine_id:
+            body["machine_id"] = machine_id
+        await http.post("/agents/me/heartbeat", body)
+        return True
+    except HttpError as exc:
+        # 4xx is deterministic for this (agent, server) pair (bad certs / unknown
+        # status) — settle and stop retrying; only 5xx is worth a retry.
+        if 400 <= exc.status < 500:
+            logger.warning(
+                "agent %s: lifecycle report %r rejected (HTTP %s); giving up: %s",
+                agent_cfg.id, status, exc.status, exc.body,
+            )
+            return True
+        logger.warning(
+            "agent %s: lifecycle report %r failed (HTTP %s); will retry",
+            agent_cfg.id, status, exc.status,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — transient (network); retry next tick
+        logger.warning(
+            "agent %s: lifecycle report %r failed; will retry: %s", agent_cfg.id, status, exc
+        )
+        return False
+    finally:
+        await http.close()
+
+
 async def _drain_codex_tmp(src: Path) -> None:
     """Windows: codex's .lock in .codex/tmp/ can outlive the subprocess
     by a few hundred ms; pre-clean so the outer move/rmtree doesn't trip."""
@@ -411,6 +480,27 @@ async def _drain_codex_tmp(src: Path) -> None:
         except OSError:
             await asyncio.sleep(0.5)
     shutil.rmtree(codex_tmp, ignore_errors=True)
+
+
+async def _migrate_linked_agents_at_startup() -> None:
+    """For each already-linked operator, stamp machine_id on its owned agents
+    so locals created/paused before the link become remote. Best-effort."""
+    from .control.link import migrate_owned_agents
+    from .control.store import load_pairings
+
+    for pairing in load_pairings().values():
+        try:
+            n = await migrate_owned_agents(pairing.operator_root_pubkey)
+            if n:
+                logger.info(
+                    "startup: stamped machine_id on %d agent(s) for operator %s",
+                    n, pairing.operator_slug,
+                )
+        except Exception as exc:  # noqa: BLE001 — best-effort, per-operator
+            logger.warning(
+                "startup machine_id migration failed for %s: %s",
+                pairing.operator_slug, exc,
+            )
 
 
 async def _log_outdated_version_warning() -> None:
@@ -480,7 +570,7 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def run_daemon() -> int:
+async def run_daemon(with_local_bridge: bool = False) -> int:
     # Single-daemon enforcement. ``start`` against an already-running
     # daemon exits 0 (the user wanted a running daemon; one exists) —
     # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
@@ -501,6 +591,8 @@ async def run_daemon() -> int:
     cleanup_staging_dir()
 
     daemon_cfg = DaemonConfig.load()
+    if with_local_bridge:
+        daemon_cfg.bridge.enabled = True
     write_daemon_pid(os.getpid())
 
     daemon = Daemon(daemon_cfg)

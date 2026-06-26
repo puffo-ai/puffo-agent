@@ -1,0 +1,57 @@
+# Test CI — runs the pytest suite (unit + integration) on every push to
+# main and every PR. puffo-agent's tests are self-contained (isolated
+# per-test homes, SQLite, a mocked relay), so there's no live-server e2e
+# stage and no services to stand up — the pytest run is the gate.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: the test job only needs to read the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen  # the PySide6 UI tests render headless
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # PySide6 (desktop UI tests) dlopens libEGL/libGL even under the
+      # offscreen platform; bare runners don't ship them.
+      - name: system libs for headless Qt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # [dev] pulls pytest + pytest-asyncio; without pytest-asyncio every
+      # async test silently skips and the suite passes vacuously.
+      - name: install (with dev extras)
+        run: pip install -e ".[dev]"
+
+      # Smoke: the console script + CLI load against the installed package.
+      - name: smoke — CLI loads
+        run: |
+          puffo-agent version
+          puffo-agent --help > /dev/null
+
+      - name: pytest
+        run: pytest -p no:warnings

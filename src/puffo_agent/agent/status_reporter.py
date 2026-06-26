@@ -20,13 +20,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
 
 
-# envelope_id prefixes the daemon mints for purely-local synthetic
-# messages (no server-side row exists). Status-reporter calls keyed
-# on these IDs would 404 against ``/messages/<id>/processing/{start,
-# end}`` — server reasonably reports "no such message" — and the
-# resulting WARN line per intro nudge was operator-visible noise.
-# Skip the HTTP round-trip entirely for these envelopes; the run is
-# still tracked in-memory by the worker via the returned ``run_id``.
+# Synthetic local envelopes have no server row; /messages/<id>/processing/*
+# would 404, so skip the HTTP round-trip (the worker still tracks the run).
 _LOCAL_ONLY_ENVELOPE_PREFIXES = ("intro-prompt-",)
 
 
@@ -47,6 +42,7 @@ class StatusReporter:
         *,
         heartbeat_interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S,
         runtime_health_provider: Optional[Callable[[], str]] = None,
+        runtime_provider: Optional[Callable[[], dict[str, Any]]] = None,
     ) -> None:
         self._http = http
         self._interval = max(10.0, heartbeat_interval_s)
@@ -54,6 +50,9 @@ class StatusReporter:
         self._current_message_id: str | None = None
         # None keeps the legacy single-stream wire shape.
         self._runtime_health_provider = runtime_health_provider
+        # Agent Portal: reports kind/provider/harness/model so the operator's
+        # portal can show + pre-select the live model.
+        self._runtime_provider = runtime_provider
         self._stop = asyncio.Event()
 
     async def run_heartbeat_loop(self) -> None:
@@ -203,6 +202,18 @@ class StatusReporter:
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
+        # Agent Portal: tag which machine this agent runs on (None if unlinked).
+        from ..portal.control.store import current_machine_id
+
+        machine_id = current_machine_id()
+        if machine_id:
+            body["machine_id"] = machine_id
+            # Runtime only matters in the portal context (a linked machine).
+            if self._runtime_provider is not None:
+                try:
+                    body["runtime"] = self._runtime_provider()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("runtime_provider raised (%s)", exc)
         if self._runtime_health_provider is not None:
             try:
                 body["health"] = self._runtime_health_provider()

@@ -797,8 +797,12 @@ class BridgeConfig:
     auth uses the same ed25519 request-signing scheme as puffo-server.
 
     ``allowed_origins`` is the CORS allowlist for PNA preflights.
+
+    Off by default — agents are managed remotely via the portal. Opt in
+    per-run with ``start --with-local-bridge`` (or ``bridge.enabled`` in
+    daemon.yml). The MCP-facing data + rpc services stay on regardless.
     """
-    enabled: bool = True
+    enabled: bool = False
     bind_host: str = "127.0.0.1"
     port: int = 63387
     allowed_origins: list[str] = field(default_factory=lambda: [

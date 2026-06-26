@@ -89,20 +89,33 @@ def _ns(**kw) -> argparse.Namespace:
 
 def test_cmd_start_routes_tray_runner(monkeypatch):
     import puffo_agent.portal.ui.tray as tray
-    monkeypatch.setattr(tray, "run_tray", lambda: 7)
+    monkeypatch.setattr(tray, "run_tray", lambda **kw: 7)
     from puffo_agent.portal.cli import cmd_start
     assert cmd_start(_ns(tray_runner=True)) == 7
 
 
 def test_cmd_start_routes_background(monkeypatch):
-    monkeypatch.setattr(bg, "spawn_background", lambda: 5)
+    monkeypatch.setattr(bg, "spawn_background", lambda **kw: 5)
     from puffo_agent.portal.cli import cmd_start
     assert cmd_start(_ns(background=True)) == 5
 
 
 def test_cmd_start_tray_runner_takes_priority_over_background(monkeypatch):
     import puffo_agent.portal.ui.tray as tray
-    monkeypatch.setattr(tray, "run_tray", lambda: 1)
-    monkeypatch.setattr(bg, "spawn_background", lambda: 2)
+    monkeypatch.setattr(tray, "run_tray", lambda **kw: 1)
+    monkeypatch.setattr(bg, "spawn_background", lambda **kw: 2)
     from puffo_agent.portal.cli import cmd_start
     assert cmd_start(_ns(tray_runner=True, background=True)) == 1
+
+
+def test_cmd_start_threads_with_local_bridge_flag(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bg, "spawn_background", lambda **kw: seen.update(kw) or 0)
+    from puffo_agent.portal.cli import cmd_start
+    cmd_start(_ns(background=True, with_local_bridge=True))
+    assert seen == {"with_local_bridge": True}
+
+
+def test_tray_runner_command_appends_bridge_flag():
+    assert "--with-local-bridge" not in bg.tray_runner_command(False)
+    assert bg.tray_runner_command(True)[-1] == "--with-local-bridge"

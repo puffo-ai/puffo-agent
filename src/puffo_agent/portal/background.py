@@ -21,10 +21,13 @@ _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
-def tray_runner_command() -> list[str]:
+def tray_runner_command(with_local_bridge: bool = False) -> list[str]:
     """Re-invoke this CLI as the detached tray host. ``-m`` avoids
     depending on the ``puffo-agent`` script being on PATH."""
-    return [sys.executable, "-m", "puffo_agent.portal.cli", "start", "--tray-runner"]
+    cmd = [sys.executable, "-m", "puffo_agent.portal.cli", "start", "--tray-runner"]
+    if with_local_bridge:
+        cmd.append("--with-local-bridge")
+    return cmd
 
 
 def detach_kwargs(log_handle) -> dict:
@@ -42,7 +45,7 @@ def detach_kwargs(log_handle) -> dict:
     return kwargs
 
 
-def spawn_background() -> int:
+def spawn_background(with_local_bridge: bool = False) -> int:
     """Launch the detached tray+daemon. Returns an exit code for the
     foreground caller, which exits immediately afterward."""
     if is_daemon_alive():
@@ -53,7 +56,9 @@ def spawn_background() -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = open(log_path, "ab")
     try:
-        proc = subprocess.Popen(tray_runner_command(), **detach_kwargs(log_handle))
+        proc = subprocess.Popen(
+            tray_runner_command(with_local_bridge), **detach_kwargs(log_handle)
+        )
     finally:
         # The child inherited its own copy of the fd; drop ours.
         log_handle.close()

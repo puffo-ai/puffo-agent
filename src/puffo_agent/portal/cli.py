@@ -251,20 +251,21 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
+    with_local_bridge = getattr(args, "with_local_bridge", False)
     if getattr(args, "tray_runner", False):
         from .ui.tray import run_tray
-        return run_tray()
+        return run_tray(with_local_bridge=with_local_bridge)
     if getattr(args, "background", False):
         from .background import spawn_background
-        return spawn_background()
+        return spawn_background(with_local_bridge=with_local_bridge)
     if getattr(args, "ui", False):
         from .ui.launcher import launch
-        return launch()
+        return launch(with_local_bridge=with_local_bridge)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    return asyncio.run(run_daemon())
+    return asyncio.run(run_daemon(with_local_bridge=with_local_bridge))
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -1070,6 +1071,35 @@ def cmd_pairing_unpair(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_link(args: argparse.Namespace) -> int:
+    """Link this machine to an operator via the online agent portal."""
+    import socket
+
+    from .control.link import DEFAULT_SERVER_URL, run_link
+
+    # The daemon holds the control WS that serves the operator's commands
+    # once approved — auto-start it (without the local bridge) if it isn't
+    # running, so `link` is a one-step onboard.
+    if not is_daemon_alive():
+        from .background import spawn_background
+        spawn_background()
+
+    name = args.name or socket.gethostname() or "machine"
+    server_url = args.server_url or DEFAULT_SERVER_URL
+    try:
+        return asyncio.run(run_link(server_url, name))
+    except KeyboardInterrupt:
+        print("\nlink: cancelled.")
+        return 1
+
+
+def cmd_unlink(args: argparse.Namespace) -> int:
+    """Remove an operator pairing and pause that operator's agents."""
+    from .control.link import run_unlink
+
+    return asyncio.run(run_unlink(args.operator, expected_server_url=args.server_url))
+
+
 def cmd_api_status(args: argparse.Namespace) -> int:
     """Print bridge configuration + pairing status."""
     cfg = DaemonConfig.load()
@@ -1338,6 +1368,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Detach the daemon into the background with a status-bar (tray) "
             "icon; it survives the terminal closing. Quit from the icon or "
             "run `puffo-agent stop`."
+        ),
+    )
+    start.add_argument(
+        "--with-local-bridge",
+        action="store_true",
+        help=(
+            "Also serve the local bridge HTTP API (off by default; the MCP "
+            "data + rpc ports are always served)."
         ),
     )
     # Internal: the detached child that --background spawns to host the
@@ -1644,6 +1682,42 @@ def build_parser() -> argparse.ArgumentParser:
         "unpair",
         help="Delete pairing.json so a different identity can pair next",
     ).set_defaults(func=cmd_pairing_unpair)
+
+    machine = sub.add_parser(
+        "machine",
+        help="Link / unlink this machine to puffo operators via the agent portal",
+    )
+    machine_sub = machine.add_subparsers(dest="machine_cmd", required=True)
+
+    machine_link = machine_sub.add_parser(
+        "link",
+        help="Link this machine to a puffo operator via the online agent portal",
+    )
+    machine_link.add_argument(
+        "--server-url",
+        default=None,
+        help="puffo-server base URL (default: the production relay).",
+    )
+    machine_link.add_argument(
+        "--name",
+        default=None,
+        help="Name for this machine in the portal (default: hostname).",
+    )
+    machine_link.set_defaults(func=cmd_link)
+
+    machine_unlink = machine_sub.add_parser(
+        "unlink",
+        help="Remove an operator pairing and pause that operator's agents",
+    )
+    machine_unlink.add_argument(
+        "--operator", required=True, help="Operator slug to unlink",
+    )
+    machine_unlink.add_argument(
+        "--server-url",
+        default=None,
+        help="Only unlink the pairing on this server URL (default: match by operator).",
+    )
+    machine_unlink.set_defaults(func=cmd_unlink)
 
     api = sub.add_parser(
         "api",

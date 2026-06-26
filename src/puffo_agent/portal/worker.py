@@ -944,6 +944,18 @@ class Worker:
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
+    def _runtime_info(self) -> dict[str, str]:
+        """Heartbeat payload: the agent's runtime, so the operator's portal can
+        show + pre-select the live model. An edit restarts the worker, so the
+        next instance reports the updated values."""
+        rt = self.agent_cfg.runtime
+        return {
+            "kind": rt.kind,
+            "provider": rt.provider,
+            "harness": rt.harness,
+            "model": rt.model,
+        }
+
     async def _run_ws_local(self) -> None:
         """ws-local agents run no harness consumer. Build the client,
         register an attach point, and idle — the bridge's /v1/ws-local
@@ -961,6 +973,7 @@ class Worker:
             reporter = StatusReporter(
                 client.http,
                 runtime_health_provider=lambda: self.runtime.health,
+                runtime_provider=self._runtime_info,
             )
             point = AttachPoint(
                 slug=self.agent_cfg.puffo_core.slug,
@@ -1427,6 +1440,7 @@ class Worker:
             StatusReporter(
                 client.http,
                 runtime_health_provider=lambda: self.runtime.health,
+                runtime_provider=self._runtime_info,
             )
             if hasattr(client, "http")
             else None

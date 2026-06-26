@@ -18,7 +18,7 @@ from .log_buffer import install_log_buffer
 logger = logging.getLogger(__name__)
 
 
-def run_tray() -> int:
+def run_tray(with_local_bridge: bool = False) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -30,7 +30,7 @@ def run_tray() -> int:
 
     from .assets import logo_path
 
-    daemon_thread = DaemonThread()
+    daemon_thread = DaemonThread(with_local_bridge=with_local_bridge)
     daemon_thread.start()
 
     app = QApplication(sys.argv)

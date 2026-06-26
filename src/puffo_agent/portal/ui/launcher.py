@@ -8,7 +8,7 @@ from .daemon_thread import DaemonThread
 from .log_buffer import install_log_buffer
 
 
-def launch() -> int:
+def launch(with_local_bridge: bool = False) -> int:
     # basicConfig must run before install_log_buffer attaches a handler,
     # otherwise root stays at WARNING and INFO records drop.
     logging.basicConfig(
@@ -23,7 +23,7 @@ def launch() -> int:
     from .main_window import MainWindow
     from .style import APP_STYLESHEET
 
-    daemon_thread = DaemonThread()
+    daemon_thread = DaemonThread(with_local_bridge=with_local_bridge)
     daemon_thread.start()
 
     app = QApplication(sys.argv)
