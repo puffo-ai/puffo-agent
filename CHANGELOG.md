@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.1] — 2026-06-25
+## [1.0.1] — 2026-06-26
 
 ### Added
 
@@ -23,6 +23,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the joiner. Manual-accept events that don't embed the invite fall back to a
   per-session `invitation_event_id → inviter_slug` cache populated from the
   earlier `invite_to_*` event.
+- **Browser-based machine linking.** `puffo-agent machine link` now opens the
+  link page (`/link-machine?code=…`) in a browser and waits for approval; pass
+  `--not-open` to only print the code. The tray's "Link a new operator" dialog
+  gains an **Open in browser** button.
+- **Friendlier default machine name on Windows.** The name registered at link
+  time defaults to the manufacturer + model (e.g. "Razer Blade 14") instead of
+  the bare hostname, falling back to the hostname when the SMBIOS fields are
+  unavailable.
+
+### Changed
+
+- Machine-link URLs point at the standalone `/link-machine` page instead of
+  `/chat/agents?linkCode=…`.
 
 ### Internal
 

@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
+import sys
+import webbrowser
 
 import aiohttp
 
@@ -27,6 +30,62 @@ logger = logging.getLogger(__name__)
 DEFAULT_SERVER_URL = "https://chat.puffo.ai/relay"
 POLL_INTERVAL_SECONDS = 2.0
 LINK_TIMEOUT_SECONDS = 300
+
+# SMBIOS placeholder strings OEMs leave when the field isn't set — useless as
+# a device name.
+_OEM_PLACEHOLDERS = {
+    "", "system manufacturer", "system product name", "to be filled by o.e.m.",
+    "default string", "none", "not applicable", "o.e.m.", "not specified",
+}
+
+
+def _compose_device_name(maker: str, model: str) -> str | None:
+    """Combine SMBIOS manufacturer + product into a friendly name (e.g.
+    ``Razer Blade 14``), dropping SKU noise and OEM placeholders. None if
+    unusable."""
+    maker = maker.strip()
+    model = model.split(" - ")[0].strip()  # "Blade 14 - RZ09-0370" -> "Blade 14"
+    if model.lower() in _OEM_PLACEHOLDERS:
+        model = ""
+    if maker.lower() in _OEM_PLACEHOLDERS:
+        maker = ""
+    if not model:
+        return None
+    if maker and not model.lower().startswith(maker.lower()):
+        return f"{maker} {model}"
+    return model
+
+
+def _windows_device_name() -> str | None:
+    """Manufacturer + model from the SMBIOS values in the registry (no
+    subprocess). e.g. ``Razer Blade 14``."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\BIOS"
+        ) as key:
+            def _read(name: str) -> str:
+                try:
+                    return str(winreg.QueryValueEx(key, name)[0]).strip()
+                except OSError:
+                    return ""
+
+            return _compose_device_name(
+                _read("SystemManufacturer"), _read("SystemProductName")
+            )
+    except OSError:
+        return None
+
+
+def friendly_device_name() -> str:
+    """A human-friendly default name for this machine, e.g. ``Razer Blade 14``,
+    falling back to the OS hostname. The operator can rename it at approval."""
+    if sys.platform == "win32":
+        name = _windows_device_name()
+        if name:
+            return name
+    return socket.gethostname() or "machine"
 
 
 def _web_url_from_server(server_url: str) -> str:
@@ -144,9 +203,10 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
     return reported
 
 
-async def run_link(server_url: str, hostname: str) -> int:
+async def run_link(server_url: str, hostname: str, open_browser: bool = True) -> int:
     """Register this machine, mint a link code, and wait for an operator to
-    approve it (CLI entry point)."""
+    approve it (CLI entry point). Auto-opens the link page in a browser unless
+    ``open_browser`` is False."""
     try:
         code, base = await mint_link_code(server_url, hostname)
     except LinkError as exc:
@@ -154,10 +214,16 @@ async def run_link(server_url: str, hostname: str) -> int:
         return 1
 
     web = _web_url_from_server(server_url)
+    link_url = f"{web}/link-machine?code={code}"
     print(f"\n  Link code:  {code}\n")
-    print(f"  Open:  {web}/chat/agents?linkCode={code}")
+    print(f"  Open:  {link_url}")
     print("  (the link opens the puffo web app with the code pre-filled —")
     print(f"   or go to My Agents → Link machine and enter it to approve '{hostname}'.)\n")
+    if open_browser:
+        try:
+            webbrowser.open(link_url)
+        except Exception as exc:  # noqa: BLE001 — best-effort; the URL is printed above
+            logger.debug("link: could not auto-open browser: %s", exc)
     print("  Waiting for approval (Ctrl-C to cancel)...")
 
     try:
