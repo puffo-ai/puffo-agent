@@ -1087,7 +1087,7 @@ def cmd_link(args: argparse.Namespace) -> int:
     name = args.name or socket.gethostname() or "machine"
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(run_link(server_url, name))
+        return asyncio.run(run_link(server_url, name, open_browser=not args.not_open))
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
@@ -1702,6 +1702,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--name",
         default=None,
         help="Name for this machine in the portal (default: hostname).",
+    )
+    machine_link.add_argument(
+        "--not-open",
+        action="store_true",
+        help="Don't auto-open the link page in your browser.",
     )
     machine_link.set_defaults(func=cmd_link)
 

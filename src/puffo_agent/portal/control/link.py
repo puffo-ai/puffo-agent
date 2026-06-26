@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import webbrowser
 
 import aiohttp
 
@@ -144,9 +145,10 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
     return reported
 
 
-async def run_link(server_url: str, hostname: str) -> int:
+async def run_link(server_url: str, hostname: str, open_browser: bool = True) -> int:
     """Register this machine, mint a link code, and wait for an operator to
-    approve it (CLI entry point)."""
+    approve it (CLI entry point). Auto-opens the link page in a browser unless
+    ``open_browser`` is False."""
     try:
         code, base = await mint_link_code(server_url, hostname)
     except LinkError as exc:
@@ -154,10 +156,16 @@ async def run_link(server_url: str, hostname: str) -> int:
         return 1
 
     web = _web_url_from_server(server_url)
+    link_url = f"{web}/link-machine?code={code}"
     print(f"\n  Link code:  {code}\n")
-    print(f"  Open:  {web}/chat/agents?linkCode={code}")
+    print(f"  Open:  {link_url}")
     print("  (the link opens the puffo web app with the code pre-filled —")
     print(f"   or go to My Agents → Link machine and enter it to approve '{hostname}'.)\n")
+    if open_browser:
+        try:
+            webbrowser.open(link_url)
+        except Exception as exc:  # noqa: BLE001 — best-effort; the URL is printed above
+            logger.debug("link: could not auto-open browser: %s", exc)
     print("  Waiting for approval (Ctrl-C to cancel)...")
 
     try:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import threading
+import webbrowser
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -49,6 +50,7 @@ class _LinkDialog(QDialog):
         self.setWindowTitle("Link a new operator")
         self.setMinimumWidth(440)
         self._hostname = _machine_name()
+        self._link_url = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -79,10 +81,15 @@ class _LinkDialog(QDialog):
         row.addStretch(1)
         self._close = QPushButton("Close")
         self._close.clicked.connect(self.reject)
+        self._open_browser = QPushButton("Open in browser")
+        self._open_browser.setCursor(Qt.PointingHandCursor)
+        self._open_browser.clicked.connect(self._on_open_browser)
+        self._open_browser.hide()
         self._create = QPushButton("Create link")
         self._create.setDefault(True)
         self._create.clicked.connect(self._on_create)
         row.addWidget(self._close)
+        row.addWidget(self._open_browser)
         row.addWidget(self._create)
         layout.addLayout(row)
 
@@ -111,11 +118,13 @@ class _LinkDialog(QDialog):
 
     def _on_minted(self, code: str, base: str) -> None:
         web = base[: -len("/relay")] if base.endswith("/relay") else base
+        self._link_url = f"{web}/link-machine?code={code}"
         self._status.setText(
             f"Link code:  {code}\n\n"
-            f"Approve at  {web}/chat/agents?linkCode={code}\n"
+            f"Approve at  {self._link_url}\n"
             "or in My Agents → Link machine.\n\nWaiting for approval…"
         )
+        self._open_browser.show()
 
         def worker() -> None:
             try:
@@ -127,6 +136,10 @@ class _LinkDialog(QDialog):
                 self._approval_failed.emit(str(exc))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_open_browser(self) -> None:
+        if self._link_url:
+            webbrowser.open(self._link_url)
 
     def _on_mint_failed(self, error: str) -> None:
         self._status.setText(f"Could not create link: {error}")
@@ -140,11 +153,13 @@ class _LinkDialog(QDialog):
             return
         msg = "Code expired." if status == "expired" else "Timed out waiting for approval."
         self._status.setText(f"{msg} Try again.")
+        self._open_browser.hide()  # the code is stale
         self._create.setEnabled(True)
         self._url.setEnabled(True)
 
     def _on_approval_failed(self, error: str) -> None:
         self._status.setText(f"Approval failed: {error}")
+        self._open_browser.hide()
         self._create.setEnabled(True)
         self._url.setEnabled(True)
 

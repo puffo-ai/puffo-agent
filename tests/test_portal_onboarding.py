@@ -123,7 +123,7 @@ async def test_migrate_survives_one_agent_failing(monkeypatch):
 # ── F3: link auto-starts the daemon ─────────────────────────────────
 
 def _link_ns():
-    return argparse.Namespace(name=None, server_url="https://x")
+    return argparse.Namespace(name=None, server_url="https://x", not_open=True)
 
 
 def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
@@ -135,7 +135,7 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
     monkeypatch.setattr(cli, "is_daemon_alive", lambda: False)
     monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
 
-    async def _fake_run_link(url, name):
+    async def _fake_run_link(url, name, open_browser=True):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
@@ -152,7 +152,7 @@ def test_cmd_link_skips_autostart_when_daemon_running(monkeypatch):
     monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
 
-    async def _fake_run_link(url, name):
+    async def _fake_run_link(url, name, open_browser=True):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
