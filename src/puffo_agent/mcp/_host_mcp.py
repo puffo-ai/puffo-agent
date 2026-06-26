@@ -25,10 +25,7 @@ class PuffoRpcClient:
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
-            # PUF-323: pin the call-site so any future ``Unclosed
-            # client session`` warning has a grep-able prior log line
-            # the operator can match against the bare memory-address
-            # repr aiohttp emits at gc time.
+            # Match the bare-address repr aiohttp gc-emits on a leak.
             logger.info(
                 "aiohttp ClientSession created (class=PuffoRpcClient "
                 "base_url=%s agent_id=%s)",

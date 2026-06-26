@@ -212,12 +212,8 @@ def build_server(
         rpc_client=rpc_client,
     )
 
-    # PUF-323: wire FastMCP's lifespan hook so the aiohttp.ClientSession
-    # instances inside DataClient + PuffoRpcClient (+ PuffoCoreHttpClient)
-    # close while the event loop is still alive. Without this, the
-    # ``FastMCP.run()`` blocking call exits with sessions open, the
-    # loop tears down, and Python's gc emits the operator-confusing
-    # ``Unclosed client session`` error every subprocess shutdown.
+    # Lifespan closes adapter sessions while the loop is alive,
+    # silencing the ``Unclosed client session`` gc warning.
     mcp = FastMCP(
         "puffo-core",
         lifespan=make_lifespan(data, rpc_client, http),
