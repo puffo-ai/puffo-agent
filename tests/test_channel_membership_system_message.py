@@ -833,7 +833,7 @@ async def test_handle_event_accept_space_invite_cites_inviter_when_present():
 
 @pytest.mark.asyncio
 async def test_space_membership_skips_when_no_channel_visibility():
-    """No visible channel in the space → skip silently."""
+    """No cached channel + no http stub (→ exception → caught) → skip."""
     store = await _make_store()
     client = _make_client(store)
     client._channel_space["ch_other"] = "sp_2"
@@ -936,6 +936,81 @@ async def test_space_membership_prefers_general_channel_when_present():
     msg = client._thread_state[root_id].messages[0]
     assert msg["channel_id"] == "ch_general"
     assert root_id == "membership-left_space-ch_general-alice-0001-ev_general"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_lazy_fetches_channels_when_cache_empty():
+    """Cascade-joined agents have an empty ``_channel_space`` for the
+    space; the announce path must fall back to GET /spaces/<id>/channels
+    and warm the cache for next time."""
+    store = await _make_store()
+    client = _make_client(store)
+    # _channel_space is empty for sp_1 — simulates the cascade-joined case.
+
+    fetched: list[str] = []
+
+    class _StubHttp:
+        async def get(self, path: str):
+            fetched.append(path)
+            return {
+                "channels": [
+                    {"channel_id": "ch_zulu", "name": "zulu"},
+                    {"channel_id": "ch_general", "name": "General"},
+                    {"channel_id": "ch_alpha", "name": "alpha"},
+                ],
+            }
+
+    client.http = _StubHttp()  # type: ignore[assignment]
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_space",
+            "signer_slug": "alice-0001",
+            "event_id": "ev_cascade",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    assert fetched == ["/spaces/sp_1/channels"]
+    _, _, root_id = await client._queue.get()
+    msg = client._thread_state[root_id].messages[0]
+    assert msg["channel_id"] == "ch_general"
+    # Cache warmed for next time so we don't refetch on every space event.
+    assert client._channel_space == {
+        "ch_zulu": "sp_1",
+        "ch_general": "sp_1",
+        "ch_alpha": "sp_1",
+    }
+    assert client._channel_name_cache["ch_general"] == "General"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_space_membership_silent_skip_when_http_fetch_fails():
+    """HTTP failure on the lazy-fetch fallback is silent — no announce,
+    no crash. Matches the prior 'no visibility → skip' contract."""
+    store = await _make_store()
+    client = _make_client(store)
+
+    class _ExplodingHttp:
+        async def get(self, path: str):
+            raise RuntimeError("server unreachable")
+
+    client.http = _ExplodingHttp()  # type: ignore[assignment]
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "kind": "leave_space",
+            "signer_slug": "alice-0001",
+            "event_id": "ev_dead_server",
+            "payload": {"space_id": "sp_1"},
+        },
+    )
+
+    assert client._queue.qsize() == 0
     await store.close()
 
 
