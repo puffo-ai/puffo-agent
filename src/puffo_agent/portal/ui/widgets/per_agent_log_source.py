@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -81,7 +82,19 @@ def _read_audit_tail(path: Path) -> list[str]:
 class PerAgentLogSource:
     """Snapshot+counter pair the LogView can poll. Merges the
     daemon-wide Python logger ring (filtered to lines mentioning this
-    agent's id or slug) with the agent's audit.log tail."""
+    agent's id or slug) with the agent's audit.log tail.
+
+    Dedup-by-content: tracks every distinct line ever emitted so the
+    LogView delta-slice contract can't double-render. Naive
+    ``py_counter + audit_line_count`` would bump the counter every
+    time ANOTHER agent writes a Python log line — none of those
+    deltas land in this snapshot, so the slice picks up the END of
+    the already-displayed merged view and re-appends duplicates."""
+
+    # Cap on the unique-line history we keep in memory. Bigger than the
+    # LogView's 500-line display so the user can scroll back through a
+    # ring that exceeds one screen.
+    _EMITTED_MAX = 1000
 
     def __init__(
         self,
@@ -95,49 +108,37 @@ class PerAgentLogSource:
         self._audit_path = audit_path
         self._py_snapshot = py_snapshot
         self._py_counter = py_counter
-        # Incremental line-count cache: previous file size → cumulative
-        # newline count. Polled every tick; recounting from scratch a
-        # multi-MB audit.log would burn cycles, so we only walk the
-        # bytes added since the last poll.
-        self._audit_seen_size = 0
-        self._audit_line_count = 0
+        self._emitted: deque[str] = deque(maxlen=self._EMITTED_MAX)
+        self._emitted_set: set[str] = set()
+        self._emit_count = 0
 
     def snapshot(self) -> list[str]:
+        return list(self._emitted)
+
+    def counter(self) -> int:
+        self._refresh()
+        return self._emit_count
+
+    def _refresh(self) -> None:
         py = [
             ln for ln in self._py_snapshot()
             if any(t in ln for t in self._tokens)
         ]
         audit = _read_audit_tail(self._audit_path)
-        # Lexicographic sort on the leading timestamp is good enough —
-        # Python ``YYYY-MM-DD HH:MM:SS,ms`` and audit ``YYYY-MM-DDTHH:MM:SS+TZ``
-        # both sort chronologically within the same day even though the
-        # separator differs (' ' < 'T'); cross-day comparisons are
-        # exact.
-        return sorted(py + audit, key=lambda ln: ln[:23])
-
-    def counter(self) -> int:
-        # Counter must be in LINE units to match the LogView delta-slice
-        # contract; mixing byte sizes with line counts double-renders
-        # already-shown audit rows every time the file grows.
-        return self._py_counter() + self._audit_line_count_cached()
-
-    def _audit_line_count_cached(self) -> int:
-        try:
-            size = self._audit_path.stat().st_size
-        except OSError:
-            return self._audit_line_count
-        if size == self._audit_seen_size:
-            return self._audit_line_count
-        if size < self._audit_seen_size:
-            # Rotated / truncated → recount from scratch.
-            self._audit_seen_size = 0
-            self._audit_line_count = 0
-        try:
-            with self._audit_path.open("rb") as f:
-                f.seek(self._audit_seen_size)
-                content = f.read()
-        except OSError:
-            return self._audit_line_count
-        self._audit_line_count += content.count(b"\n")
-        self._audit_seen_size = size
-        return self._audit_line_count
+        # Lex sort on the leading timestamp is good enough — Python
+        # ``YYYY-MM-DD HH:MM:SS,ms`` and audit ``YYYY-MM-DDTHH:MM:SS+TZ``
+        # both sort chronologically within the same day (' ' < 'T');
+        # cross-day comparisons are exact.
+        merged = sorted(py + audit, key=lambda ln: ln[:23])
+        for ln in merged:
+            if ln in self._emitted_set:
+                continue
+            if (
+                self._emitted.maxlen is not None
+                and len(self._emitted) == self._emitted.maxlen
+            ):
+                # Evict from the dedup set in lockstep with the deque.
+                self._emitted_set.discard(self._emitted[0])
+            self._emitted.append(ln)
+            self._emitted_set.add(ln)
+            self._emit_count += 1
