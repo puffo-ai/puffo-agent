@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from ...state import AgentConfig
 from ..names import channel_id_to_name, slug_to_display_name, space_id_to_name
 from .log_view import LogView
+from .per_agent_log_source import PerAgentLogSource
 
 
 class AgentWorkspace(QWidget):
@@ -59,9 +60,8 @@ class AgentWorkspace(QWidget):
         outer.addWidget(self._tabs)
 
     def _build_logs_tab(self) -> QWidget:
-        self._agent_log = LogView(
-            self._snapshot_fn, self._counter_fn, filter_fn=lambda _line: False,
-        )
+        # bind() swaps in a PerAgentLogSource once an agent id is known.
+        self._agent_log = LogView(lambda: [], lambda: 0)
         return self._agent_log
 
     def _build_files_tab(self) -> QWidget:
@@ -101,7 +101,7 @@ class AgentWorkspace(QWidget):
         self._agent_id = agent_id
         if agent_id is None:
             self._cfg = None
-            self._agent_log.set_filter(lambda _line: False)
+            self._agent_log.set_sources(lambda: [], lambda: 0)
             self._files_tree.setRootIndex(self._files_model.index(""))
             self._channel_list.clear()
             self._channel_messages.clear()
@@ -110,19 +110,18 @@ class AgentWorkspace(QWidget):
             self._cfg = AgentConfig.load(agent_id)
         except Exception:
             self._cfg = None
-        slug = self._cfg.puffo_core.slug if self._cfg else ""
-        haystack = {agent_id, slug}
-        haystack.discard("")
-        # Worker emits "agent <id>:" and data-service emits "[<id>] ...".
-        self._agent_log.set_filter(lambda line, h=haystack: any(token in line for token in h))
 
-        # Root at the agent dir so .claude/CLAUDE.md, .codex/AGENTS.md,
-        # agent.yml, profile.md are all reachable. keys/ shows up too.
         if self._cfg:
             from ...state import agent_dir
             root = str(agent_dir(self._agent_id))
             self._files_model.setRootPath(root)
             self._files_tree.setRootIndex(self._files_model.index(root))
+            audit_path = self._cfg.resolve_workspace_dir() / ".puffo-agent" / "audit.log"
+        else:
+            audit_path = Path("/nonexistent")
+
+        source = PerAgentLogSource(audit_path=audit_path)
+        self._agent_log.set_sources(source.snapshot, source.counter)
 
         self._reload_channels()
 

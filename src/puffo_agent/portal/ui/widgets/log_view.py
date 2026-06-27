@@ -55,6 +55,16 @@ class LogView(QPlainTextEdit):
         self._filter_fn = filter_fn
         self.reset()
 
+    def set_sources(
+        self,
+        snapshot_fn: Callable[[], list[str]],
+        counter_fn: Callable[[], int],
+    ) -> None:
+        """Swap the source pair + reset (e.g. when binding to a new agent)."""
+        self._snapshot_fn = snapshot_fn
+        self._counter_fn = counter_fn
+        self.reset()
+
     def poll(self) -> None:
         total = self._counter_fn()
         if total < self._seen:

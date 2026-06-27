@@ -495,13 +495,13 @@ async def update_runtime(request: web.Request) -> web.Response:
     """Patch the agent's runtime block. Owner-only.
 
     Accepts any subset of: ``kind``, ``provider``, ``model``,
-    ``harness``, ``api_key``, ``permission_mode``, ``allowed_tools``,
-    ``docker_image``, ``max_turns``. Missing fields are untouched.
-    ``harness`` editing requires the corresponding CLI to already be
-    installed + authenticated on the host (`claude login` /
-    `codex login` / ...) — the worker will hit auth_failed on first
-    turn otherwise. validate_triple below catches kind/provider/
-    harness combo violations before save.
+    ``harness``, ``api_key``, ``permission_mode``, ``sandbox``,
+    ``allowed_tools``, ``docker_image``, ``max_turns``. Missing fields
+    are untouched. ``harness`` editing requires the corresponding CLI
+    to already be installed + authenticated on the host
+    (`claude login` / `codex login` / ...) — the worker will hit
+    auth_failed on first turn otherwise. validate_triple below
+    catches kind/provider/harness combo violations before save.
 
     The reconcile loop notices ``runtime`` changed and respawns the
     worker on its next tick.
@@ -539,6 +539,14 @@ async def update_runtime(request: web.Request) -> web.Response:
         rt.api_key = str(payload["api_key"])
     if "permission_mode" in payload:
         rt.permission_mode = str(payload["permission_mode"])
+    if "sandbox" in payload:
+        sandbox = str(payload["sandbox"])
+        if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
+            return _bad(
+                "sandbox must be one of: read-only, workspace-write, "
+                "danger-full-access"
+            )
+        rt.sandbox = sandbox
     if "allowed_tools" in payload:
         tools = payload["allowed_tools"]
         if not isinstance(tools, list):
@@ -572,6 +580,7 @@ async def update_runtime(request: web.Request) -> web.Response:
             "model": rt.model,
             "api_key_set": bool(rt.api_key),
             "permission_mode": rt.permission_mode,
+            "sandbox": rt.sandbox,
             "harness": rt.harness,
             "allowed_tools": list(rt.allowed_tools),
             "docker_image": rt.docker_image,

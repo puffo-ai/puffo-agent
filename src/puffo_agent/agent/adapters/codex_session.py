@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .base import TurnResult
+from .cli_session import AuditLog
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,7 @@ class CodexSession:
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
         model: str = "",
+        audit: Optional[AuditLog] = None,
     ):
         self.agent_id = agent_id
         self.session_file = session_file
@@ -238,6 +240,7 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
+        self.audit = audit
 
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -296,6 +299,8 @@ class CodexSession:
             )
             self._active_turn = turn
 
+        if self.audit is not None:
+            self.audit.write("turn.input", content=user_message)
         logger.debug(
             "agent %s: codex turn/start sending (msg_len=%d, thread=%s)",
             self.agent_id, len(user_message), self._conversation_id,
@@ -389,6 +394,15 @@ class CodexSession:
             len(turn.send_message_targets),
             turn.input_tokens, turn.output_tokens,
         )
+        if self.audit is not None:
+            self.audit.write(
+                "turn.end",
+                reply_len=len(reply),
+                tool_calls=turn.tool_calls,
+                input_tokens=turn.input_tokens,
+                output_tokens=turn.output_tokens,
+                duration_ms=int((time.time() - turn.started_at) * 1000),
+            )
         self._propagate_turn_outcome(outcome="success")
         # core.py's reply-routing check: a non-empty
         # ``send_message_targets`` list means "agent already posted via
@@ -688,6 +702,12 @@ class CodexSession:
                     "agent %s: resumed codex thread %s",
                     self.agent_id, self._conversation_id,
                 )
+                if self.audit is not None:
+                    self.audit.write(
+                        "session.start",
+                        resume=True,
+                        session_id=self._conversation_id,
+                    )
                 return
             except Exception as exc:
                 logger.warning(
@@ -741,6 +761,12 @@ class CodexSession:
             "agent %s: started codex thread %s",
             self.agent_id, self._conversation_id,
         )
+        if self.audit is not None:
+            self.audit.write(
+                "session.start",
+                resume=False,
+                session_id=self._conversation_id,
+            )
 
 
     async def _teardown_locked(self) -> None:
@@ -1109,8 +1135,21 @@ class CodexSession:
                     joined = "".join(turn.reply_chunks)
                     if joined.strip() != text.strip():
                         turn.reply_chunks = [text]
+                # One row per assistant message (not per streaming token).
+                final_text = "".join(turn.reply_chunks) or (
+                    text if isinstance(text, str) else ""
+                )
+                if self.audit is not None and final_text:
+                    self.audit.write("assistant.text", text=final_text)
             elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
                 turn.tool_calls += 1
+                if self.audit is not None:
+                    self.audit.write(
+                        "tool",
+                        name=str(item.get("name") or kind),
+                        input=item.get("input") or item.get("arguments") or {},
+                        id=str(item.get("id") or ""),
+                    )
             elif kind == "mcptoolcall":
                 # Real codex shape per debug logs: ``item/completed``
                 # with ``item.type == "mcpToolCall"``, ``item.server``
@@ -1134,6 +1173,15 @@ class CodexSession:
                         "channel": str(args.get("channel", "")),
                         "root_id": str(args.get("root_id", "")),
                     })
+                # ``mcp__server__tool`` prefix matches claude-code's shape
+                # so a cross-adapter audit-log grep lights up on both.
+                if self.audit is not None:
+                    self.audit.write(
+                        "tool",
+                        name=f"mcp__{server}__{tool}" if server and tool else (tool or "mcp"),
+                        input=args,
+                        id=str(item.get("id") or ""),
+                    )
             return
 
     def _absorb_turn_usage(self, turn: _PendingTurn, params: dict) -> None:
