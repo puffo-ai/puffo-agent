@@ -6,6 +6,37 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [1.0.2-unreleased]
 
+### Added
+
+- **Codex agents now write to the per-agent audit log.** The
+  `ClaudeSession.audit` contract already captured `assistant.text`
+  / `tool` rows from claude-code; the codex adapter was
+  un-instrumented, so operators tailing
+  `<workspace>/.puffo-agent/audit.log` saw nothing for codex-driven
+  agents' replies + tool calls. `CodexSession` now emits one
+  `assistant.text` row per assistant message at completion (not per
+  streaming delta — earlier drafts split a single `[SILENT]` reply
+  into four rows) and one `tool` row per `tool_use` / `mcpToolCall`
+  completion. The `mcpToolCall` `name` uses the
+  `mcp__server__tool` shape that claude-code already emits, so a
+  cross-adapter `grep` on the audit log matches both surfaces.
+- **Per-agent Logs tab in the desktop UI surfaces audit.log.** The
+  `Logs` tab inside an agent's pane previously only showed the
+  daemon-wide Python logger ring filtered by agent id (mostly spawn
+  / WS / supervisor noise). It now tails the agent's audit.log so
+  operators see `assistant.text` / `tool` / `turn.input` /
+  `turn.end` / `session.start` / `auth_error.*` rows without
+  leaving the app. The daemon-wide Python log stays reachable
+  through the left rail's `Logs` section.
+- **`sandbox` is editable through the bridge API and the CLI.**
+  `PATCH /v1/agents/{id}/runtime` accepts a `sandbox` field
+  (`read-only` / `workspace-write` / `danger-full-access`);
+  `puffo-agent agent runtime <id> --sandbox <value>` exposes the
+  same on the terminal. Both routes existed for `permission_mode`
+  / `model` / etc. but skipped `sandbox` — operators had to
+  hand-edit `agent.yml`. Help text flags that `workspace-write`
+  is silently downgraded to read-only on Windows.
+
 ### Fixed
 
 - **`Unclosed client session` warning on every CLI-agent MCP subprocess
