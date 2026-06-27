@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from aiohttp import web
 
 from ..agent.message_store import MessageStore
+from ._port import bind_tcp_with_fallback
 from .state import agent_dir
 
 logger = logging.getLogger(__name__)
@@ -426,7 +427,15 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
 
 async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
     """Start the data service. Returns ``None`` when disabled or the
-    socket bind fails."""
+    socket bind fails (after the PUF-327 fallback window is
+    exhausted).
+
+    On port-bind conflict, scans forward from ``cfg.port`` up to
+    ``cfg.port + 99`` and mutates ``cfg.port`` to the bound value
+    so the daemon's later read for MCP-subprocess env vars
+    (``worker.py: data_service_url=...{cfg.port}``) sees the
+    resolved port without further plumbing.
+    """
     if not cfg.enabled:
         logger.info("data-service: disabled in daemon.yml; not starting")
         return None
@@ -438,17 +447,27 @@ async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
         access_log_format='%r -> %s (%Tf s)',
     )
     await runner.setup()
-    site = web.TCPSite(runner, host=cfg.bind_host, port=cfg.port)
+    requested_port = cfg.port
     try:
-        await site.start()
+        _, bound_port = await bind_tcp_with_fallback(
+            runner, host=cfg.bind_host, port=requested_port,
+        )
     except OSError as exc:
         logger.warning(
-            "data-service: failed to bind %s:%d (%s); cli-docker MCP "
-            "tools will see disk I/O errors on the bind-mounted DB",
-            cfg.bind_host, cfg.port, exc,
+            "data-service: failed to bind %s:%d (or any of the next "
+            "99 ports) (%s); cli-docker MCP tools will see disk I/O "
+            "errors on the bind-mounted DB",
+            cfg.bind_host, requested_port, exc,
         )
         await runner.cleanup()
         return None
+    if bound_port != requested_port:
+        logger.info(
+            "data-service: requested port %d in use; fell back to %d "
+            "(MCP subprocess env vars will use the resolved port)",
+            requested_port, bound_port,
+        )
+        cfg.port = bound_port
     logger.info("data-service: listening on http://%s:%d", cfg.bind_host, cfg.port)
     return runner
 
