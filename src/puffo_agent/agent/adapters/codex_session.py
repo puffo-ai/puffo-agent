@@ -1097,8 +1097,6 @@ class CodexSession:
             delta_text = params.get("delta")
             if isinstance(delta_text, str) and delta_text:
                 turn.reply_chunks.append(delta_text)
-                if self.audit is not None:
-                    self.audit.write("assistant.text", text=delta_text)
             return
         # 2. Final item — nested under params.item.
         item = params.get("item") or {}
@@ -1115,12 +1113,14 @@ class CodexSession:
                     joined = "".join(turn.reply_chunks)
                     if joined.strip() != text.strip():
                         turn.reply_chunks = [text]
-                        # Buffer replaced ⇒ prior delta rows are stale;
-                        # emit the authoritative text so audit.log matches.
-                        if self.audit is not None:
-                            self.audit.write(
-                                "assistant.text", text=text,
-                            )
+                # Single audit row per assistant message — matches the
+                # claude-code adapter's shape (one ``assistant.text`` per
+                # text block, not one per streaming token).
+                final_text = "".join(turn.reply_chunks) or (
+                    text if isinstance(text, str) else ""
+                )
+                if self.audit is not None and final_text:
+                    self.audit.write("assistant.text", text=final_text)
             elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
                 turn.tool_calls += 1
                 if self.audit is not None:

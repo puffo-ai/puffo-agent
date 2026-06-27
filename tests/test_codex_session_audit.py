@@ -36,32 +36,30 @@ def _make_turn() -> _PendingTurn:
     return _PendingTurn(request_id=1, started_at=0.0)
 
 
-# ─── streaming delta → assistant.text ────────────────────────────
+# ─── streaming delta buffers, completion emits one assistant.text ─
 
 
 @pytest.mark.asyncio
-async def test_streaming_delta_writes_assistant_text_to_audit():
+async def test_streaming_delta_buffers_but_does_not_write_audit():
+    """Per-token deltas accumulate into reply_chunks; we wait until
+    the completion event to emit a single audit row (matches the
+    claude-code adapter's per-message granularity)."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
 
-    await session._handle_item_event(
-        "item/agentMessage/delta",
-        {"delta": "searching web for the answer"},
-        turn,
-    )
+    for chunk in ("[", "S", "IL", "ENT", "]"):
+        await session._handle_item_event(
+            "item/agentMessage/delta", {"delta": chunk}, turn,
+        )
 
-    assert audit.calls == [
-        ("assistant.text", {"text": "searching web for the answer"}),
-    ]
-    # Reply buffer still gets the chunk so the final reply
-    # composition keeps working — audit is a tee, not a replacement.
-    assert turn.reply_chunks == ["searching web for the answer"]
+    assert audit.calls == []
+    assert turn.reply_chunks == ["[", "S", "IL", "ENT", "]"]
 
 
 @pytest.mark.asyncio
 async def test_streaming_delta_with_empty_string_writes_nothing():
-    """Empty delta → no audit row (same guard as the reply buffer)."""
+    """Empty delta → no buffer append."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -87,13 +85,31 @@ async def test_streaming_delta_audit_is_optional():
     assert turn.reply_chunks == ["thinking..."]
 
 
-# ─── completed agent_message → missed-delta fallback ──────────────
+# ─── completed agent_message → single assistant.text row ──────────
+
+
+@pytest.mark.asyncio
+async def test_completed_agent_message_emits_one_audit_row_from_buffer():
+    """Streaming chunks land in reply_chunks; completion fires a
+    single ``assistant.text`` row with the assembled text."""
+    audit = _AuditSpy()
+    session = _make_session(audit)
+    turn = _make_turn()
+    turn.reply_chunks = ["[", "S", "IL", "ENT", "]"]
+
+    await session._handle_item_event(
+        "item/completed",
+        {"item": {"type": "agentMessage", "text": "[SILENT]"}},
+        turn,
+    )
+
+    assert audit.calls == [("assistant.text", {"text": "[SILENT]"})]
 
 
 @pytest.mark.asyncio
 async def test_completed_agent_message_writes_when_delta_buffer_diverges():
-    """Missed-delta path replaces the buffer; emit a synthetic row
-    so audit.log carries the authoritative final text."""
+    """Missed-delta path replaces the buffer with the authoritative
+    text; the completion row uses that text."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -112,16 +128,15 @@ async def test_completed_agent_message_writes_when_delta_buffer_diverges():
 
 
 @pytest.mark.asyncio
-async def test_completed_agent_message_no_audit_when_buffer_matches():
-    """Buffer already matches → no synthetic row, no duplicate."""
+async def test_completed_agent_message_with_empty_text_writes_nothing():
+    """Empty completion + empty buffer → no audit row."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
-    turn.reply_chunks = ["authoritative final"]
 
     await session._handle_item_event(
         "item/completed",
-        {"item": {"type": "agentMessage", "text": "authoritative final"}},
+        {"item": {"type": "agentMessage", "text": ""}},
         turn,
     )
 
