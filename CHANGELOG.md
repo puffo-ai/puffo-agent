@@ -9,17 +9,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Codex agents now write to the per-agent audit log.** The
-  `ClaudeSession.audit` contract already captured `assistant.text`
-  / `tool` rows from claude-code; the codex adapter was
+  `ClaudeSession.audit` contract already captured the per-turn
+  envelope (`session.start` / `turn.input` / `assistant.text` /
+  `tool` / `turn.end`) from claude-code; the codex adapter was
   un-instrumented, so operators tailing
   `<workspace>/.puffo-agent/audit.log` saw nothing for codex-driven
-  agents' replies + tool calls. `CodexSession` now emits one
+  agents. `CodexSession` now emits the matching shape: one
+  `session.start` row at thread start / resume; one `turn.input`
+  row carrying the user message before each turn dispatches; one
   `assistant.text` row per assistant message at completion (not per
   streaming delta — earlier drafts split a single `[SILENT]` reply
-  into four rows) and one `tool` row per `tool_use` / `mcpToolCall`
-  completion. The `mcpToolCall` `name` uses the
-  `mcp__server__tool` shape that claude-code already emits, so a
-  cross-adapter `grep` on the audit log matches both surfaces.
+  into four rows); one `tool` row per `tool_use` / `mcpToolCall`
+  completion; one `turn.end` row with reply_len / tool_calls /
+  tokens / duration after the turn finishes. The `mcpToolCall`
+  `name` uses the `mcp__server__tool` shape that claude-code
+  already emits, so a cross-adapter `grep` on the audit log
+  matches both surfaces.
 - **Per-agent Logs tab in the desktop UI surfaces audit.log.** The
   `Logs` tab inside an agent's pane previously only showed the
   daemon-wide Python logger ring filtered by agent id (mostly spawn

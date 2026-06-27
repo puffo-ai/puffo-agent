@@ -702,6 +702,12 @@ class CodexSession:
                     "agent %s: resumed codex thread %s",
                     self.agent_id, self._conversation_id,
                 )
+                if self.audit is not None:
+                    self.audit.write(
+                        "session.start",
+                        resume=True,
+                        session_id=self._conversation_id,
+                    )
                 return
             except Exception as exc:
                 logger.warning(
@@ -755,6 +761,12 @@ class CodexSession:
             "agent %s: started codex thread %s",
             self.agent_id, self._conversation_id,
         )
+        if self.audit is not None:
+            self.audit.write(
+                "session.start",
+                resume=False,
+                session_id=self._conversation_id,
+            )
 
 
     async def _teardown_locked(self) -> None:
