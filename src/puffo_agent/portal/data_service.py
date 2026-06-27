@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 class DataServiceConfig:
     enabled: bool = True
     bind_host: str = "127.0.0.1"
-    port: int = 63386
+    # 63388 leaves 63387 free for the pinned bridge service.
+    port: int = 63388
 
 
 # Set by the daemon at startup so the new POST profile-cache route

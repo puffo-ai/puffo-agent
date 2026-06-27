@@ -123,7 +123,7 @@ def test_puffo_core_mcp_env():
     # MCP reads SQLite via the daemon's data service at
     # PUFFO_DATA_SERVICE_URL, not by opening the DB directly.
     assert "PUFFO_CORE_DB_PATH" not in env
-    assert env["PUFFO_DATA_SERVICE_URL"] == "http://127.0.0.1:63386"
+    assert env["PUFFO_DATA_SERVICE_URL"] == "http://127.0.0.1:63388"
     assert env["PUFFO_AGENT_ID"] == "bot-0001"
     assert env["PUFFO_WORKSPACE"] == "/workspace"
     assert env["PUFFO_RUNTIME_KIND"] == "cli-local"

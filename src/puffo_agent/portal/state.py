@@ -776,10 +776,14 @@ class ProviderConfig:
 @dataclass
 class DataServiceConfig:
     """Loopback HTTP service used by MCP subprocesses to read the
-    per-agent ``messages.db``. See ``portal/data_service.py``."""
+    per-agent ``messages.db``. See ``portal/data_service.py``.
+
+    Default 63388 sits one above the pinned bridge port (63387) so a
+    cold start never collides with bridge; fallback scans forward from
+    here on conflict."""
     enabled: bool = True
     bind_host: str = "127.0.0.1"
-    port: int = 63386
+    port: int = 63388
 
 
 @dataclass
