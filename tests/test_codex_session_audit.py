@@ -1,19 +1,4 @@
-"""Per-agent audit-log capture for the codex adapter (PUF-324).
-
-Operator-direct intake (Vase msg_9f82bfa2) — daemon audit-log was
-missing the agent's intermediate "searching web", "updating code..."
-narrative for codex-driven agents. The claude-code adapter already
-captured these via ``ClaudeSession.audit`` (cli_session.py:746); the
-codex path's ``_handle_item_event`` was un-instrumented, so the
-streaming ``item/agentMessage/delta`` chunks flowed into the reply
-buffer without ever hitting ``audit.write``.
-
-These tests pin the cross-adapter contract: a CodexSession given an
-``audit`` parameter emits the same NDJSON event shape
-(``assistant.text`` for narrative, ``tool`` for tool invocations) so
-operators can tail ``<workspace>/.puffo-agent/audit.log`` and see
-agent activity regardless of which adapter the agent runs on.
-"""
+"""Audit-log capture in the codex adapter (cross-adapter contract with ClaudeSession)."""
 
 from __future__ import annotations
 
@@ -33,9 +18,6 @@ from puffo_agent.agent.adapters.codex_session import (
 
 
 class _AuditSpy:
-    """Stub matching ``AuditLog.write(event, **fields)``. Captures
-    every call so tests can assert exact event names + payloads."""
-
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -44,10 +26,6 @@ class _AuditSpy:
 
 
 def _make_session(audit: Any = None) -> CodexSession:
-    """Bare CodexSession with just enough state to drive
-    ``_handle_item_event`` directly. Skips the on-disk
-    session-id load + the asyncio subprocess wiring — they
-    aren't on the per-event audit path under test."""
     session = CodexSession.__new__(CodexSession)
     session.agent_id = "agent-test"
     session.audit = audit
@@ -55,9 +33,6 @@ def _make_session(audit: Any = None) -> CodexSession:
 
 
 def _make_turn() -> _PendingTurn:
-    """``_PendingTurn`` mirrors the in-flight ``sendUserTurn`` state
-    (``reply_chunks`` / ``tool_calls`` / ``send_message_targets``).
-    A bare instance is enough for the per-event handler."""
     return _PendingTurn(request_id=1, started_at=0.0)
 
 
@@ -86,9 +61,7 @@ async def test_streaming_delta_writes_assistant_text_to_audit():
 
 @pytest.mark.asyncio
 async def test_streaming_delta_with_empty_string_writes_nothing():
-    """The reply-buffer guard at line 1094 already drops empty
-    deltas; the audit tee respects the same guard so we don't get
-    noise rows in audit.log."""
+    """Empty delta → no audit row (same guard as the reply buffer)."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -103,8 +76,7 @@ async def test_streaming_delta_with_empty_string_writes_nothing():
 
 @pytest.mark.asyncio
 async def test_streaming_delta_audit_is_optional():
-    """``audit=None`` path (the default before PUF-324 wired it) must
-    still work — no AttributeError, no behaviour change vs main."""
+    """``audit=None`` must not crash."""
     session = _make_session(audit=None)
     turn = _make_turn()
 
@@ -120,15 +92,12 @@ async def test_streaming_delta_audit_is_optional():
 
 @pytest.mark.asyncio
 async def test_completed_agent_message_writes_when_delta_buffer_diverges():
-    """codex_session.py:1109-1111 replaces ``turn.reply_chunks`` with
-    the authoritative ``item.text`` when the concatenated deltas
-    don't match it. In that case the streaming-delta audit rows are
-    stale; emit a synthetic ``assistant.text`` so the audit log
-    carries the operator-observable final narrative."""
+    """Missed-delta path replaces the buffer; emit a synthetic row
+    so audit.log carries the authoritative final text."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
-    turn.reply_chunks = ["partial"]  # a missed-delta scenario
+    turn.reply_chunks = ["partial"]
 
     await session._handle_item_event(
         "item/completed",
@@ -144,9 +113,7 @@ async def test_completed_agent_message_writes_when_delta_buffer_diverges():
 
 @pytest.mark.asyncio
 async def test_completed_agent_message_no_audit_when_buffer_matches():
-    """When the delta buffer DOES match the authoritative final text,
-    the streaming-delta rows in audit.log are already correct — don't
-    duplicate the row."""
+    """Buffer already matches → no synthetic row, no duplicate."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -198,11 +165,7 @@ async def test_completed_tool_use_writes_tool_audit_row():
 
 @pytest.mark.asyncio
 async def test_completed_mcp_tool_call_writes_tool_audit_row_with_namespaced_name():
-    """Real codex mcpToolCall events split tool name across two
-    fields (server + tool). Audit row mirrors the claude-code shape
-    by joining them with ``__`` — so a downstream grep of
-    ``audit.log`` for ``puffo__send_message`` lights up on both
-    adapters."""
+    """mcpToolCall → mcp__server__tool, matching the claude-code adapter."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -224,7 +187,7 @@ async def test_completed_mcp_tool_call_writes_tool_audit_row_with_namespaced_nam
 
     assert audit.calls == [
         ("tool", {
-            "name": "puffo__send_message",
+            "name": "mcp__puffo__send_message",
             "input": {"channel": "ch_test", "text": "hi"},
             "id": "tu_002",
         }),
@@ -237,8 +200,7 @@ async def test_completed_mcp_tool_call_writes_tool_audit_row_with_namespaced_nam
 
 @pytest.mark.asyncio
 async def test_completed_paths_tolerate_audit_none():
-    """Every audit.write site in the handler is guarded; ensure
-    none accidentally regress to an unguarded call."""
+    """No audit.write site can unguard-fail when audit=None."""
     session = _make_session(audit=None)
     turn = _make_turn()
 

@@ -408,11 +408,6 @@ class LocalCLIAdapter(Adapter):
             )
         argv = [codex_bin, "app-server"]
 
-        # PUF-324: per-agent audit log — mirrors the hermes wiring
-        # below and the ClaudeSession path's audit hookup. Without
-        # this, codex agents' intermediate ``assistant.text`` deltas
-        # never reach ``<workspace>/.puffo-agent/audit.log`` and the
-        # operator can't reconstruct mid-session activity from disk.
         codex_audit = AuditLog(
             Path(self.workspace_dir) / ".puffo-agent" / "audit.log",
             self.agent_id,
