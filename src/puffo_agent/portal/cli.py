@@ -936,6 +936,9 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.permission_mode is not None:
         cfg.runtime.permission_mode = args.permission_mode
         touched = True
+    if args.sandbox is not None:
+        cfg.runtime.sandbox = args.sandbox
+        touched = True
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
@@ -958,6 +961,7 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  allowed_tools:    {cfg.runtime.allowed_tools or '[]'}")
         print(f"  docker_image:     {cfg.runtime.docker_image or '(bundled default)'}")
         print(f"  permission_mode:  {cfg.runtime.permission_mode}  (cli-local only)")
+        print(f"  sandbox:          {cfg.runtime.sandbox}  (codex only)")
         print(f"  max_turns:        {cfg.runtime.max_turns}  (sdk-local only)")
         return 0
 
@@ -1521,6 +1525,15 @@ def build_parser() -> argparse.ArgumentParser:
             "'bypassPermissions' is supported today — the proxy "
             "modes (default / acceptEdits / auto / dontAsk) need "
             "more work on the permission DM flow."
+        ),
+    )
+    runtime.add_argument(
+        "--sandbox",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        help=(
+            "codex (cli-local): file-system policy. Note "
+            "``workspace-write`` is silently downgraded to read-only "
+            "on Windows; use ``danger-full-access`` there."
         ),
     )
     runtime.add_argument(
