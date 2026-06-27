@@ -1,6 +1,4 @@
-"""Tail the agent's per-workspace audit.log (NDJSON written by
-``cli_session.AuditLog``) and surface it through the LogView's
-snapshot/counter contract."""
+"""Tail the agent's audit.log for the LogView snapshot/counter contract."""
 
 from __future__ import annotations
 
@@ -10,17 +8,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Tail window: 64 KiB / 500 lines is plenty for an operator scrolling
-# through recent activity; the full file lives on disk under the
-# workspace dir for forensic dives.
 _AUDIT_TAIL_BYTES = 64 * 1024
 _AUDIT_MAX_LINES = 500
 _SUMMARY_CAP = 200
 
 
 def _format_audit_extras(event: str, extras: dict) -> str:
-    """Per-event-type formatter so the row reads as ordinary text
-    rather than a JSON blob."""
+    """Per-event-type formatter — keeps the row readable as plain text."""
     if event == "assistant.text":
         text = extras.get("text", "")
         if isinstance(text, str):
@@ -76,10 +70,8 @@ def _read_audit_tail(path: Path) -> list[str]:
 
 
 class PerAgentLogSource:
-    """Snapshot+counter pair for the LogView. Single source: the
-    agent's audit.log tail. Counter is the file's cumulative line
-    count (cached incrementally on file size) — monotonic, never
-    bumps for activity in other agents."""
+    """LogView snapshot+counter pair, sourced from audit.log.
+    Counter is the file's cumulative line count (incrementally cached)."""
 
     def __init__(self, audit_path: Path) -> None:
         self._audit_path = audit_path

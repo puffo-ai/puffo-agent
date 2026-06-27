@@ -60,9 +60,7 @@ class AgentWorkspace(QWidget):
         outer.addWidget(self._tabs)
 
     def _build_logs_tab(self) -> QWidget:
-        # Start empty; bind() swaps in a PerAgentLogSource once an
-        # agent id is known so the tab can merge daemon-side Python
-        # log lines with the agent's audit.log NDJSON entries.
+        # bind() swaps in a PerAgentLogSource once an agent id is known.
         self._agent_log = LogView(lambda: [], lambda: 0)
         return self._agent_log
 

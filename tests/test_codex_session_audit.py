@@ -41,9 +41,7 @@ def _make_turn() -> _PendingTurn:
 
 @pytest.mark.asyncio
 async def test_streaming_delta_buffers_but_does_not_write_audit():
-    """Per-token deltas accumulate into reply_chunks; we wait until
-    the completion event to emit a single audit row (matches the
-    claude-code adapter's per-message granularity)."""
+    """Deltas accumulate in reply_chunks; audit row waits for completion."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -90,8 +88,7 @@ async def test_streaming_delta_audit_is_optional():
 
 @pytest.mark.asyncio
 async def test_completed_agent_message_emits_one_audit_row_from_buffer():
-    """Streaming chunks land in reply_chunks; completion fires a
-    single ``assistant.text`` row with the assembled text."""
+    """Completion fires one ``assistant.text`` row with the assembled text."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -108,8 +105,7 @@ async def test_completed_agent_message_emits_one_audit_row_from_buffer():
 
 @pytest.mark.asyncio
 async def test_completed_agent_message_writes_when_delta_buffer_diverges():
-    """Missed-delta path replaces the buffer with the authoritative
-    text; the completion row uses that text."""
+    """Missed-delta → buffer replaced + row uses authoritative text."""
     audit = _AuditSpy()
     session = _make_session(audit)
     turn = _make_turn()
@@ -242,5 +238,3 @@ async def test_completed_paths_tolerate_audit_none():
         },
         turn,
     )
-    # No assertion failure means none of the three branches raised
-    # AttributeError on the missing audit.

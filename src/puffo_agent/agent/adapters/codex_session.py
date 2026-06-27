@@ -240,7 +240,6 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
-        # Cross-adapter audit log; mirrors ClaudeSession.audit.
         self.audit = audit
 
         self._proc: asyncio.subprocess.Process | None = None
@@ -1113,9 +1112,7 @@ class CodexSession:
                     joined = "".join(turn.reply_chunks)
                     if joined.strip() != text.strip():
                         turn.reply_chunks = [text]
-                # Single audit row per assistant message — matches the
-                # claude-code adapter's shape (one ``assistant.text`` per
-                # text block, not one per streaming token).
+                # One row per assistant message (not per streaming token).
                 final_text = "".join(turn.reply_chunks) or (
                     text if isinstance(text, str) else ""
                 )
@@ -1153,9 +1150,8 @@ class CodexSession:
                         "channel": str(args.get("channel", "")),
                         "root_id": str(args.get("root_id", "")),
                     })
-                # ``mcp__server__tool`` matches the shape the
-                # claude-code adapter records (e.g. mcp__puffo__send_message)
-                # so an operator's audit-log grep crosses adapters.
+                # ``mcp__server__tool`` prefix matches claude-code's shape
+                # so a cross-adapter audit-log grep lights up on both.
                 if self.audit is not None:
                     self.audit.write(
                         "tool",

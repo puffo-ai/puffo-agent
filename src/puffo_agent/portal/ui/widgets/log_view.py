@@ -60,8 +60,7 @@ class LogView(QPlainTextEdit):
         snapshot_fn: Callable[[], list[str]],
         counter_fn: Callable[[], int],
     ) -> None:
-        """Swap the underlying source pair (e.g. when binding to a
-        different agent). Resets so the next poll renders from scratch."""
+        """Swap the source pair + reset (e.g. when binding to a new agent)."""
         self._snapshot_fn = snapshot_fn
         self._counter_fn = counter_fn
         self.reset()
