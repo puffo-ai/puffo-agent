@@ -299,6 +299,8 @@ class CodexSession:
             )
             self._active_turn = turn
 
+        if self.audit is not None:
+            self.audit.write("turn.input", content=user_message)
         logger.debug(
             "agent %s: codex turn/start sending (msg_len=%d, thread=%s)",
             self.agent_id, len(user_message), self._conversation_id,
@@ -392,6 +394,15 @@ class CodexSession:
             len(turn.send_message_targets),
             turn.input_tokens, turn.output_tokens,
         )
+        if self.audit is not None:
+            self.audit.write(
+                "turn.end",
+                reply_len=len(reply),
+                tool_calls=turn.tool_calls,
+                input_tokens=turn.input_tokens,
+                output_tokens=turn.output_tokens,
+                duration_ms=int((time.time() - turn.started_at) * 1000),
+            )
         self._propagate_turn_outcome(outcome="success")
         # core.py's reply-routing check: a non-empty
         # ``send_message_targets`` list means "agent already posted via
