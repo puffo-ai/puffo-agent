@@ -426,16 +426,10 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
 
 
 async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
-    """Start the data service. Returns ``None`` when disabled or the
-    socket bind fails (after the PUF-327 fallback window is
-    exhausted).
-
-    On port-bind conflict, scans forward from ``cfg.port`` up to
-    ``cfg.port + 99`` and mutates ``cfg.port`` to the bound value
-    so the daemon's later read for MCP-subprocess env vars
-    (``worker.py: data_service_url=...{cfg.port}``) sees the
-    resolved port without further plumbing.
-    """
+    """Start the data service. ``None`` when disabled or bind fails
+    (after the 100-port forward-scan window is exhausted). Mutates
+    ``cfg.port`` to the bound value on fallback so the MCP-subprocess
+    env-var passthrough sees the resolved port."""
     if not cfg.enabled:
         logger.info("data-service: disabled in daemon.yml; not starting")
         return None

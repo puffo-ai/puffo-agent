@@ -1,19 +1,7 @@
-"""PUF-327: auto-port-fallback on bind-failure.
+"""Auto-port-fallback on bind-failure for the daemon's loopback HTTP services.
 
-The daemon's loopback data + RPC services historically pinned
-63386 + 63385. On bind conflict (port taken by another process,
-Windows ``WSAEACCES`` permission denial, etc.) the daemon failed
-and the operator had to hand-edit ``daemon.yml``. The fallback
-helper scans forward up to 100 ports and mutates the in-memory
-config so the MCP-subprocess env-var passthrough sees the
-resolved port.
-
-These tests drive the helper directly via real socket binds on
-127.0.0.1 — no mocking — so they cover the actual OSError-class
-contract the helper relies on (POSIX ``EADDRINUSE`` here; the
-Windows ``WSAEACCES`` / ``winerror 10013`` symptom Jeremy_S
-surfaced in FB-338 is the same ``OSError`` shape on the Python
-side and would be caught by the same ``except`` clause).
+Real socket binds on 127.0.0.1 (no mocking) so the actual OSError
+shape the helper relies on is exercised end-to-end.
 """
 
 from __future__ import annotations
@@ -35,9 +23,7 @@ from puffo_agent.portal.state import RpcServiceConfig
 
 
 def _free_port() -> int:
-    """Return an unused port the OS just handed us. We don't bind
-    durably here — caller may re-bind the same number for an
-    occupation test."""
+    """Pick a free port; the caller may re-bind the same number."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -46,9 +32,7 @@ def _free_port() -> int:
 
 
 def _occupy(port: int) -> socket.socket:
-    """Bind a socket to ``127.0.0.1:port`` and leave it open so a
-    subsequent bind on the same port fails with EADDRINUSE. Caller
-    must close it."""
+    """Hold ``127.0.0.1:port`` so the next bind hits EADDRINUSE."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # No SO_REUSEADDR — we want the next bind to actually conflict.
     s.bind(("127.0.0.1", port))
@@ -114,9 +98,7 @@ async def test_helper_scans_across_multiple_busy_ports():
 
 @pytest.mark.asyncio
 async def test_helper_raises_oserror_when_window_exhausted():
-    """When every candidate in the scan window is occupied, the
-    helper re-raises the most recent ``OSError`` so the caller's
-    existing bind-failure path (warning log + return None) fires."""
+    """Exhausted window → re-raise so the caller's bind-failure path fires."""
     requested = _free_port()
     blockers = [_occupy(requested + i) for i in range(3)]
     runner = await _runner_for_empty_app()
@@ -139,11 +121,8 @@ async def test_helper_raises_oserror_when_window_exhausted():
 
 @pytest.mark.asyncio
 async def test_data_service_mutates_cfg_port_on_fallback(caplog):
-    """When the requested port is busy, ``start_data_service``
-    binds the next available port AND mutates ``cfg.port`` to it
-    so the MCP-subprocess env-var passthrough sees the resolved
-    value. Without the mutation, ``worker.py`` would tell MCPs to
-    talk to the wrong port."""
+    """Fallback must mutate cfg.port — otherwise the MCP env-vars
+    tell subprocesses to talk to the wrong port."""
     requested = _free_port()
     blocker = _occupy(requested)
     cfg = ds.DataServiceConfig(
@@ -155,9 +134,6 @@ async def test_data_service_mutates_cfg_port_on_fallback(caplog):
             runner = await ds.start_data_service(cfg)
         assert runner is not None
         assert cfg.port == requested + 1
-        # Loud info log surfaces the fallback for operator
-        # attention — operators searching their logs for
-        # "fell back" need to find it.
         assert any(
             "fell back to" in rec.message
             for rec in caplog.records
@@ -178,7 +154,6 @@ async def test_data_service_leaves_cfg_port_alone_when_default_works():
     try:
         runner = await ds.start_data_service(cfg)
         assert runner is not None
-        # No fallback fired → no mutation.
         assert cfg.port == requested
     finally:
         if runner is not None:

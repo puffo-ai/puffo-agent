@@ -123,13 +123,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
 async def start_rpc_service(
     cfg: RpcServiceConfig,
 ) -> web.AppRunner | None:
-    """Returns ``None`` when disabled or the bind fails (non-fatal).
-
-    PUF-327: on bind conflict, scans forward up to ``cfg.port + 99``
-    and mutates ``cfg.port`` to the bound value so the daemon's
-    later read for MCP-subprocess env vars
-    (``worker.py: rpc_url=...{cfg.port}``) sees the resolved port.
-    """
+    """``None`` when disabled or bind fails (non-fatal). On port
+    conflict, scans forward within a 100-port window and mutates
+    ``cfg.port`` to the bound value so the MCP-subprocess env-var
+    passthrough sees the resolved port."""
     if not cfg.enabled:
         logger.info("rpc-service: disabled in daemon.yml; not starting")
         return None
