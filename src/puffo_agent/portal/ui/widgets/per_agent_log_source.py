@@ -95,6 +95,12 @@ class PerAgentLogSource:
         self._audit_path = audit_path
         self._py_snapshot = py_snapshot
         self._py_counter = py_counter
+        # Incremental line-count cache: previous file size → cumulative
+        # newline count. Polled every tick; recounting from scratch a
+        # multi-MB audit.log would burn cycles, so we only walk the
+        # bytes added since the last poll.
+        self._audit_seen_size = 0
+        self._audit_line_count = 0
 
     def snapshot(self) -> list[str]:
         py = [
@@ -110,8 +116,28 @@ class PerAgentLogSource:
         return sorted(py + audit, key=lambda ln: ln[:23])
 
     def counter(self) -> int:
+        # Counter must be in LINE units to match the LogView delta-slice
+        # contract; mixing byte sizes with line counts double-renders
+        # already-shown audit rows every time the file grows.
+        return self._py_counter() + self._audit_line_count_cached()
+
+    def _audit_line_count_cached(self) -> int:
         try:
-            audit_size = self._audit_path.stat().st_size
+            size = self._audit_path.stat().st_size
         except OSError:
-            audit_size = 0
-        return self._py_counter() + audit_size
+            return self._audit_line_count
+        if size == self._audit_seen_size:
+            return self._audit_line_count
+        if size < self._audit_seen_size:
+            # Rotated / truncated → recount from scratch.
+            self._audit_seen_size = 0
+            self._audit_line_count = 0
+        try:
+            with self._audit_path.open("rb") as f:
+                f.seek(self._audit_seen_size)
+                content = f.read()
+        except OSError:
+            return self._audit_line_count
+        self._audit_line_count += content.count(b"\n")
+        self._audit_seen_size = size
+        return self._audit_line_count
