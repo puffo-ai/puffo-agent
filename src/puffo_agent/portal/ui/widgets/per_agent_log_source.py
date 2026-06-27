@@ -1,29 +1,26 @@
-"""Combine the daemon's Python-logger ring (filtered to a single
-agent) with the agent's per-workspace audit.log (NDJSON written by
-``cli_session.AuditLog``). Surfaces both streams in the same Logs
-tab — Python logging captures spawn / WS / supervisor events, audit
-captures the assistant's text + tool calls per turn."""
+"""Tail the agent's per-workspace audit.log (NDJSON written by
+``cli_session.AuditLog``) and surface it through the LogView's
+snapshot/counter contract."""
 
 from __future__ import annotations
 
 import json
 import logging
-from collections import deque
 from pathlib import Path
-from typing import Callable
 
 logger = logging.getLogger(__name__)
 
-# Bound the audit-log tail we read per poll; the file is unbounded and
-# rotation isn't implemented yet (cli_session.AuditLog.write appends).
+# Tail window: 64 KiB / 500 lines is plenty for an operator scrolling
+# through recent activity; the full file lives on disk under the
+# workspace dir for forensic dives.
 _AUDIT_TAIL_BYTES = 64 * 1024
 _AUDIT_MAX_LINES = 500
 _SUMMARY_CAP = 200
 
 
 def _format_audit_extras(event: str, extras: dict) -> str:
-    """One-line summary of an audit row's non-meta fields, shaped per
-    the most common event types so the Logs tab stays readable."""
+    """Per-event-type formatter so the row reads as ordinary text
+    rather than a JSON blob."""
     if event == "assistant.text":
         text = extras.get("text", "")
         if isinstance(text, str):
@@ -56,8 +53,7 @@ def _read_audit_tail(path: Path) -> list[str]:
         with path.open("rb") as f:
             if size > _AUDIT_TAIL_BYTES:
                 f.seek(size - _AUDIT_TAIL_BYTES)
-                # Discard the partial leading line; sizes >cap mean we
-                # almost certainly landed mid-record.
+                # Discard the partial leading line.
                 f.readline()
             content = f.read()
     except OSError:
@@ -80,65 +76,36 @@ def _read_audit_tail(path: Path) -> list[str]:
 
 
 class PerAgentLogSource:
-    """Snapshot+counter pair the LogView can poll. Merges the
-    daemon-wide Python logger ring (filtered to lines mentioning this
-    agent's id or slug) with the agent's audit.log tail.
+    """Snapshot+counter pair for the LogView. Single source: the
+    agent's audit.log tail. Counter is the file's cumulative line
+    count (cached incrementally on file size) — monotonic, never
+    bumps for activity in other agents."""
 
-    Dedup-by-content: tracks every distinct line ever emitted so the
-    LogView delta-slice contract can't double-render. Naive
-    ``py_counter + audit_line_count`` would bump the counter every
-    time ANOTHER agent writes a Python log line — none of those
-    deltas land in this snapshot, so the slice picks up the END of
-    the already-displayed merged view and re-appends duplicates."""
-
-    # Cap on the unique-line history we keep in memory. Bigger than the
-    # LogView's 500-line display so the user can scroll back through a
-    # ring that exceeds one screen.
-    _EMITTED_MAX = 1000
-
-    def __init__(
-        self,
-        agent_id: str,
-        slug: str,
-        audit_path: Path,
-        py_snapshot: Callable[[], list[str]],
-        py_counter: Callable[[], int],
-    ) -> None:
-        self._tokens = {t for t in (agent_id, slug) if t}
+    def __init__(self, audit_path: Path) -> None:
         self._audit_path = audit_path
-        self._py_snapshot = py_snapshot
-        self._py_counter = py_counter
-        self._emitted: deque[str] = deque(maxlen=self._EMITTED_MAX)
-        self._emitted_set: set[str] = set()
-        self._emit_count = 0
+        self._seen_size = 0
+        self._line_count = 0
 
     def snapshot(self) -> list[str]:
-        return list(self._emitted)
+        return _read_audit_tail(self._audit_path)
 
     def counter(self) -> int:
-        self._refresh()
-        return self._emit_count
-
-    def _refresh(self) -> None:
-        py = [
-            ln for ln in self._py_snapshot()
-            if any(t in ln for t in self._tokens)
-        ]
-        audit = _read_audit_tail(self._audit_path)
-        # Lex sort on the leading timestamp is good enough — Python
-        # ``YYYY-MM-DD HH:MM:SS,ms`` and audit ``YYYY-MM-DDTHH:MM:SS+TZ``
-        # both sort chronologically within the same day (' ' < 'T');
-        # cross-day comparisons are exact.
-        merged = sorted(py + audit, key=lambda ln: ln[:23])
-        for ln in merged:
-            if ln in self._emitted_set:
-                continue
-            if (
-                self._emitted.maxlen is not None
-                and len(self._emitted) == self._emitted.maxlen
-            ):
-                # Evict from the dedup set in lockstep with the deque.
-                self._emitted_set.discard(self._emitted[0])
-            self._emitted.append(ln)
-            self._emitted_set.add(ln)
-            self._emit_count += 1
+        try:
+            size = self._audit_path.stat().st_size
+        except OSError:
+            return self._line_count
+        if size == self._seen_size:
+            return self._line_count
+        if size < self._seen_size:
+            # Rotated / truncated → recount from scratch.
+            self._seen_size = 0
+            self._line_count = 0
+        try:
+            with self._audit_path.open("rb") as f:
+                f.seek(self._seen_size)
+                content = f.read()
+        except OSError:
+            return self._line_count
+        self._line_count += content.count(b"\n")
+        self._seen_size = size
+        return self._line_count

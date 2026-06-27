@@ -112,7 +112,6 @@ class AgentWorkspace(QWidget):
             self._cfg = AgentConfig.load(agent_id)
         except Exception:
             self._cfg = None
-        slug = self._cfg.puffo_core.slug if self._cfg else ""
 
         if self._cfg:
             from ...state import agent_dir
@@ -123,13 +122,7 @@ class AgentWorkspace(QWidget):
         else:
             audit_path = Path("/nonexistent")
 
-        source = PerAgentLogSource(
-            agent_id=agent_id,
-            slug=slug,
-            audit_path=audit_path,
-            py_snapshot=self._snapshot_fn,
-            py_counter=self._counter_fn,
-        )
+        source = PerAgentLogSource(audit_path=audit_path)
         self._agent_log.set_sources(source.snapshot, source.counter)
 
         self._reload_channels()
