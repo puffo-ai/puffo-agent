@@ -165,12 +165,22 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
     """Stamp this machine's ``machine_id`` onto every agent owned by the
     operator so puffo-server flips them from local to remote — a paused/running
     local agent becomes remotely manageable without re-creating it. Idempotent
-    and best-effort per agent. Returns the number reported."""
+    and best-effort per agent. Returns the number reported.
+
+    PUF-328: after the machine_id heartbeat lands, also sync the agent's
+    ``soul`` (profile.md contents) to ``/identities/self``. Without this
+    the web profile pane shows an empty soul-section for any agent the
+    operator hasn't manually edited via the bridge since linking
+    (FB-337 / FB-161 root). Idempotent and best-effort — the soul sync
+    failing doesn't unwind the machine_id stamp, mirroring the existing
+    per-agent best-effort contract.
+    """
     machine_id = current_machine_id()
     if not machine_id:
         return 0
     from ...crypto.http_client import HttpError, PuffoCoreHttpClient
     from ...crypto.keystore import KeyStore
+    from ..profile_sync import sync_agent_profile
 
     reported = 0
     for agent_id in discover_agents():
@@ -196,8 +206,52 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
             logger.warning(
                 "migrate %s: machine_id stamp rejected (HTTP %s)", cfg.id, exc.status
             )
+            # Skip the soul sync when the machine_id stamp failed — if
+            # /heartbeat refused us (auth, server down) the next PATCH
+            # would also fail. Reduces error-log volume on a degraded
+            # server.
+            await http.close()
+            continue
         except Exception as exc:  # noqa: BLE001 — best-effort; other agents proceed
             logger.warning("migrate %s: machine_id stamp failed: %s", cfg.id, exc)
+            await http.close()
+            continue
+        finally:
+            # ``http.close()`` is called in the success path right after
+            # the soul sync below; the failure branches above already
+            # closed + continued.
+            pass
+
+        # PUF-328: soul sync. Read profile.md and PATCH it onto the
+        # agent's server identity so the operator's web profile pane
+        # reflects the local soul. Best-effort — log + move on.
+        try:
+            profile_path = cfg.resolve_profile_path()
+            try:
+                soul_text = profile_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                logger.debug(
+                    "migrate %s: profile.md absent at %s; skipping soul sync",
+                    cfg.id, profile_path,
+                )
+                soul_text = None
+            if soul_text is not None:
+                await sync_agent_profile(cfg, {"soul": soul_text})
+                logger.debug("migrate %s: soul synced (%d chars)", cfg.id, len(soul_text))
+        except HttpError as exc:
+            logger.warning(
+                "migrate %s: soul sync rejected (HTTP %s); machine_id stamp "
+                "already succeeded so the agent is reachable but its soul "
+                "may render empty on the web profile pane",
+                cfg.id, exc.status,
+            )
+        except OSError as exc:
+            logger.warning(
+                "migrate %s: soul read failed (%s); skipping soul sync",
+                cfg.id, exc,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; other agents proceed
+            logger.warning("migrate %s: soul sync failed: %s", cfg.id, exc)
         finally:
             await http.close()
     return reported
