@@ -778,12 +778,12 @@ class DataServiceConfig:
     """Loopback HTTP service used by MCP subprocesses to read the
     per-agent ``messages.db``. See ``portal/data_service.py``.
 
-    Default 63388 sits one above the pinned bridge port (63387) so a
-    cold start never collides with bridge; fallback scans forward from
-    here on conflict."""
+    Default 63386 is the long-standing pin. On conflict the daemon
+    skips past the pinned bridge (63387) and the RPC service's bound
+    port — see ``daemon.py`` for the fallback-start computation."""
     enabled: bool = True
     bind_host: str = "127.0.0.1"
-    port: int = 63388
+    port: int = 63386
 
 
 @dataclass

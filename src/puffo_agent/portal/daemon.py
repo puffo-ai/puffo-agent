@@ -113,8 +113,18 @@ class Daemon:
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_rpc_resolver(self._resolve_host_mcp_context)
-        data_runner = await start_data_service(self.daemon_cfg.data_service)
-        rpc_runner = await start_rpc_service(self.daemon_cfg.rpc_service)
+        # Port allocation policy: bridge is pinned at 63387 (browser
+        # clients hard-code it); on conflict both services scan
+        # forward from 63388 so they never touch the bridge port. RPC
+        # starts first so data can route its fallback past whatever
+        # RPC ended up bound to.
+        rpc_runner = await start_rpc_service(
+            self.daemon_cfg.rpc_service, fallback_start=63388,
+        )
+        data_runner = await start_data_service(
+            self.daemon_cfg.data_service,
+            fallback_start=max(63388, self.daemon_cfg.rpc_service.port + 1),
+        )
         refresher_task = asyncio.ensure_future(
             self.refresher.run_loop(self._stop)
         )

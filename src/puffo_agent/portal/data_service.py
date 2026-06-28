@@ -27,8 +27,7 @@ logger = logging.getLogger(__name__)
 class DataServiceConfig:
     enabled: bool = True
     bind_host: str = "127.0.0.1"
-    # 63388 leaves 63387 free for the pinned bridge service.
-    port: int = 63388
+    port: int = 63386
 
 
 # Set by the daemon at startup so the new POST profile-cache route
@@ -426,11 +425,19 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     return app
 
 
-async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
+async def start_data_service(
+    cfg: DataServiceConfig,
+    *,
+    fallback_start: int | None = None,
+) -> web.AppRunner | None:
     """Start the data service. ``None`` when disabled or bind fails
     (after the 100-port forward-scan window is exhausted). Mutates
     ``cfg.port`` to the bound value on fallback so the MCP-subprocess
-    env-var passthrough sees the resolved port."""
+    env-var passthrough sees the resolved port.
+
+    ``fallback_start`` lets the daemon route the scan past reserved
+    ports (the pinned bridge port + whatever the RPC service ended up
+    bound to)."""
     if not cfg.enabled:
         logger.info("data-service: disabled in daemon.yml; not starting")
         return None
@@ -446,6 +453,7 @@ async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
     try:
         _, bound_port = await bind_tcp_with_fallback(
             runner, host=cfg.bind_host, port=requested_port,
+            fallback_start=fallback_start,
         )
     except OSError as exc:
         logger.warning(

@@ -122,11 +122,16 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
 
 async def start_rpc_service(
     cfg: RpcServiceConfig,
+    *,
+    fallback_start: int | None = None,
 ) -> web.AppRunner | None:
     """``None`` when disabled or bind fails (non-fatal). On port
     conflict, scans forward within a 100-port window and mutates
     ``cfg.port`` to the bound value so the MCP-subprocess env-var
-    passthrough sees the resolved port."""
+    passthrough sees the resolved port.
+
+    ``fallback_start`` lets the daemon route the scan past reserved
+    ports (the pinned bridge port + the default data-service port)."""
     if not cfg.enabled:
         logger.info("rpc-service: disabled in daemon.yml; not starting")
         return None
@@ -138,6 +143,7 @@ async def start_rpc_service(
         await runner.setup()
         _, bound_port = await bind_tcp_with_fallback(
             runner, host=cfg.bind_host, port=requested_port,
+            fallback_start=fallback_start,
         )
     except OSError as exc:
         logger.warning(

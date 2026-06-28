@@ -239,9 +239,9 @@ def _cfg_from_env() -> dict[str, str]:
     slug_value = required["slug"]
     agent_id = os.environ.get("PUFFO_AGENT_ID", slug_value)
     # Default targets the daemon's loopback data service. cli-docker
-    # overrides this with ``http://host.docker.internal:63388``.
+    # overrides this with ``http://host.docker.internal:63386``.
     data_service_url = os.environ.get(
-        "PUFFO_DATA_SERVICE_URL", "http://127.0.0.1:63388",
+        "PUFFO_DATA_SERVICE_URL", "http://127.0.0.1:63386",
     )
     return {
         **required,

@@ -19,10 +19,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   transparently), and log `requested port X in use; fell back to
   Y`. Bind-failure across the whole window still surfaces the
   pre-existing warning + non-fatal return, just with a wider net.
-  Data-service default also moves from `63386` to `63388` so it
-  sits one above the pinned bridge port (`63387`) — cold start
-  never collides with bridge regardless of order. Bridge stays
-  pinned at `63387` (browser clients hard-code the address).
+  The fallback scan *jumps* — it doesn't increment from the
+  primary. RPC's fallback starts at `63388`; data's fallback starts
+  at `max(63388, rpc_bound + 1)`. That keeps the pinned bridge port
+  (`63387`, browser clients hard-code it) and the sibling service's
+  bound port out of the scan window so a double-conflict never
+  collides with either.
 - **Codex agents now write to the per-agent audit log.** The
   `ClaudeSession.audit` contract already captured the per-turn
   envelope (`session.start` / `turn.input` / `assistant.text` /

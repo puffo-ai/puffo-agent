@@ -240,7 +240,7 @@ def puffo_core_mcp_env(
     keystore_dir: str,
     workspace: str,
     agent_id: str = "",
-    data_service_url: str = "http://127.0.0.1:63388",
+    data_service_url: str = "http://127.0.0.1:63386",
     rpc_url: str = "http://127.0.0.1:63385",
     runtime_kind: str = "",
     harness: str = "",

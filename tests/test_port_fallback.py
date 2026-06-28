@@ -97,6 +97,51 @@ async def test_helper_scans_across_multiple_busy_ports():
 
 
 @pytest.mark.asyncio
+async def test_helper_jumps_to_fallback_start_on_conflict():
+    """When primary is taken, scan begins at fallback_start — not at
+    primary+1 — so callers can route around reserved ports (pinned
+    bridge, sibling service's bound port)."""
+    primary = _free_port()
+    blocker = _occupy(primary)
+    fallback = _free_port()
+    while fallback == primary:
+        fallback = _free_port()
+    runner = await _runner_for_empty_app()
+    try:
+        _, bound = await bind_tcp_with_fallback(
+            runner, host="127.0.0.1", port=primary,
+            fallback_start=fallback,
+        )
+        assert bound == fallback
+    finally:
+        await runner.cleanup()
+        blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_helper_fallback_start_scans_forward_too():
+    """fallback_start is a *start* — if it's also taken, scan
+    continues from there (never falls back to primary+1)."""
+    primary = _free_port()
+    fallback = _free_port()
+    while fallback in (primary, primary + 1):
+        fallback = _free_port()
+    blockers = [_occupy(primary), _occupy(fallback)]
+    runner = await _runner_for_empty_app()
+    try:
+        _, bound = await bind_tcp_with_fallback(
+            runner, host="127.0.0.1", port=primary,
+            fallback_start=fallback,
+        )
+        assert bound > fallback
+        assert bound != primary + 1   # the load-bearing claim
+    finally:
+        await runner.cleanup()
+        for b in blockers:
+            b.close()
+
+
+@pytest.mark.asyncio
 async def test_helper_raises_oserror_when_window_exhausted():
     """Exhausted window → re-raise so the caller's bind-failure path fires."""
     requested = _free_port()
@@ -145,6 +190,29 @@ async def test_data_service_mutates_cfg_port_on_fallback(caplog):
 
 
 @pytest.mark.asyncio
+async def test_data_service_honors_fallback_start():
+    """data_service plumbs fallback_start through to the helper so
+    the daemon can route past the pinned bridge + the RPC port."""
+    requested = _free_port()
+    blocker = _occupy(requested)
+    fallback = _free_port()
+    while fallback == requested:
+        fallback = _free_port()
+    cfg = ds.DataServiceConfig(
+        enabled=True, bind_host="127.0.0.1", port=requested,
+    )
+    runner = None
+    try:
+        runner = await ds.start_data_service(cfg, fallback_start=fallback)
+        assert runner is not None
+        assert cfg.port == fallback
+    finally:
+        if runner is not None:
+            await ds.stop_data_service(runner)
+        blocker.close()
+
+
+@pytest.mark.asyncio
 async def test_data_service_leaves_cfg_port_alone_when_default_works():
     requested = _free_port()
     cfg = ds.DataServiceConfig(
@@ -180,6 +248,27 @@ async def test_rpc_service_mutates_cfg_port_on_fallback(caplog):
             "fell back to" in rec.message
             for rec in caplog.records
         )
+    finally:
+        if runner is not None:
+            await rs.stop_rpc_service(runner)
+        blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_rpc_service_honors_fallback_start():
+    requested = _free_port()
+    blocker = _occupy(requested)
+    fallback = _free_port()
+    while fallback == requested:
+        fallback = _free_port()
+    cfg = RpcServiceConfig(
+        enabled=True, bind_host="127.0.0.1", port=requested,
+    )
+    runner = None
+    try:
+        runner = await rs.start_rpc_service(cfg, fallback_start=fallback)
+        assert runner is not None
+        assert cfg.port == fallback
     finally:
         if runner is not None:
             await rs.stop_rpc_service(runner)
