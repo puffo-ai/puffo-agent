@@ -4,6 +4,71 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.3-unreleased]
+
+### Performance
+
+- **`runtime.json` heartbeat write throttle.** Each worker rewrote
+  its `runtime.json` every 5s via sync `open()+json.dump()+
+  os.replace()` on the event loop, regardless of state change. Now
+  skipped when only `updated_at` advanced AND the last disk write
+  was <25s ago (CLI staleness gate is 30s). Real state changes
+  (status / msg_count / health / error) still flush immediately.
+  Cache keyed by resolved path so test `tmp_path` reuse doesn't
+  collide; force-writes when the target file is missing.
+- **`agent.yml` mtime cache in the reconcile loop.** The 2s
+  reconcile tick re-parsed every agent's `agent.yml` via
+  `yaml.safe_load` on the event loop, regardless of file change.
+  Now reuses a cached `AgentConfig` when `(st_mtime_ns, st_size)`
+  is unchanged; no-change tick is one `stat()` + dict lookup per
+  agent. Cache evicts entries when an agent disappears from disk.
+- **Post-send `missing_devices` supplementation.** Ports the web
+  client's recovery flow: `send_message` /
+  `send_message_with_attachments` now inspect the
+  `POST /messages` response, and on a server-reported
+  `missing_devices` list, re-fetch `/certs/sync` for the recipient
+  slugs, build a same-`envelope_id` envelope re-wrapping the same
+  `content_key` for the missing device_ids, and fire-and-forget
+  POST. Best-effort — the original send is already durable; the
+  supplementation catches the race where a recipient added a
+  device between cert-cache freshness and our POST.
+  `encrypt_message`'s signature is unchanged (preserves the 14
+  existing tests); new `encrypt_message_with_content_key` returns
+  `(envelope, content_key)` and new `build_supplementation_envelope`
+  rebuilds the recipients[] for the missing devices.
+- **`idx_messages_dm_recipient` covers the inbound DM-history
+  arm.** `get_dm_history WHERE (sender_slug=? OR recipient_slug=?)`
+  was hitting a partial index on the first arm and a full scan on
+  the second. New `CREATE INDEX … ON messages (recipient_slug,
+  sent_at) WHERE envelope_kind='dm'` lets the planner index both
+  arms.
+- **SQLite tuning PRAGMAs on `messages.db`.** Default
+  `synchronous=FULL` paid a full fsync per group-commit;
+  `synchronous=NORMAL` is the recommended WAL pairing (crash may
+  lose the most-recent group-commit, never corrupt) and roughly
+  halves write latency. Also set `cache_size=-20000` (~20MB),
+  `temp_store=MEMORY`, `mmap_size=256MB` to cut paging churn for
+  MCP-side read traffic.
+- **Single `channel_exists`/`has_message` per HTTP request.** The
+  `list_channel_roots` / `list_thread_messages` data-service
+  routes called `store.channel_exists()` / `store.has_message()`
+  manually for the 404 mapping, then `store.get_channel_roots()` /
+  `store.get_thread_messages()` ran the same check internally —
+  two identical `SELECT 1` queries per request. Now the handler
+  catches `DataNotFound` from the store and maps to 404; one query.
+- **`_resolve_space_name` populates every returned space.** A
+  cache miss used to fetch `/spaces`, keep just the asked-for
+  entry, then re-fetch on the next miss for a different space.
+  Now every entry in the response lands in the in-memory cache
+  (and persists to disk if it carries a name) so the second
+  unknown-space resolve is a cache hit.
+- **`_resolve_channel_name` tries `/spaces/<sp>/channels` first.**
+  Previously walked `/spaces/<sp>/events` looking for a single
+  `create_channel` payload — an unbounded paginated scan on miss.
+  The channels endpoint returns every channel's name in one round-
+  trip; the event-replay is now the fallback for cases the
+  endpoint comes back empty / errors.
+
 ## [1.0.2] — 2026-06-27
 
 ### Added

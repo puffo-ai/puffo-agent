@@ -176,3 +176,46 @@ async def test_unknown_agent_returns_404() -> None:
     async with TestClient(TestServer(app)) as client:
         resp = await client.get("/v1/data/no-such-agent/channels/ch_1/space")
         assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_channel_roots_404_for_unknown_channel() -> None:
+    # Catches the DataNotFound → 404 mapping for list_channel_roots.
+    home = _isolated_home()
+    await _seed_agent(home, "agent-roots-404")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-roots-404/channels/roots?channel=ch_nope"
+        )
+        assert resp.status == 404
+        body = await resp.json()
+        assert body == {"error": "channel not found"}
+
+
+@pytest.mark.asyncio
+async def test_channel_roots_200_for_seen_channel() -> None:
+    home = _isolated_home()
+    await _seed_agent(home, "agent-roots-ok")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-roots-ok/channels/roots?channel=ch_1"
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert "roots" in body
+
+
+@pytest.mark.asyncio
+async def test_thread_messages_404_for_unknown_root() -> None:
+    home = _isolated_home()
+    await _seed_agent(home, "agent-thread-404")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-thread-404/threads/msg_nope"
+        )
+        assert resp.status == 404
+        body = await resp.json()
+        assert body == {"error": "thread root not found"}

@@ -1222,11 +1222,31 @@ class RuntimeState:
         import json
         self.updated_at = int(time.time())
         path = runtime_json_path(agent_id)
+        # CLI staleness gate is 30s; throttle pure-updated_at writes
+        # to <25s gives the reader 5s slack and kills the heartbeat
+        # write-storm. Force-write on missing file.
+        d = asdict(self)
+        d.pop("updated_at", None)
+        sig = json.dumps(d, sort_keys=True)
+        key = str(path)
+        prev = _RUNTIME_LAST_SAVE.get(key)
+        if (
+            prev is not None
+            and sig == prev[0]
+            and (self.updated_at - prev[1]) < 25
+            and path.exists()
+        ):
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(asdict(self), f, indent=2)
         os.replace(tmp, path)
+        _RUNTIME_LAST_SAVE[key] = (sig, self.updated_at)
+
+
+# Keyed by resolved path so test tmp_path reuse doesn't collide.
+_RUNTIME_LAST_SAVE: dict[str, tuple[str, int]] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

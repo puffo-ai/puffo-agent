@@ -30,6 +30,9 @@ CREATE INDEX IF NOT EXISTS idx_messages_channel
     ON messages (channel_id, sent_at) WHERE channel_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_dm
     ON messages (sender_slug, sent_at) WHERE envelope_kind = 'dm';
+-- Covers the inbound (recipient_slug=?) arm of get_dm_history's OR.
+CREATE INDEX IF NOT EXISTS idx_messages_dm_recipient
+    ON messages (recipient_slug, sent_at) WHERE envelope_kind = 'dm';
 CREATE INDEX IF NOT EXISTS idx_messages_received
     ON messages (received_at);
 CREATE INDEX IF NOT EXISTS idx_messages_thread_root
@@ -127,7 +130,15 @@ class MessageStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
         self._db.row_factory = aiosqlite.Row
-        await self._db.execute("PRAGMA journal_mode=WAL")
+        # synchronous=NORMAL is WAL-safe (crash may lose the last
+        # group-commit, never corrupt) and halves write latency.
+        await self._db.executescript(
+            "PRAGMA journal_mode=WAL;"
+            "PRAGMA synchronous=NORMAL;"
+            "PRAGMA temp_store=MEMORY;"
+            "PRAGMA cache_size=-20000;"
+            "PRAGMA mmap_size=268435456;"
+        )
         await self._db.executescript(_SCHEMA)
 
     async def close(self) -> None:

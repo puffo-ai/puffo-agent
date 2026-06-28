@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 from aiohttp import web
 
-from ..agent.message_store import MessageStore
+from ..agent.message_store import DataNotFound, MessageStore
 from ._port import bind_tcp_with_fallback
 from .state import agent_dir
 
@@ -223,20 +223,16 @@ async def list_channel_roots(request: web.Request) -> web.Response:
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
-        # Distinguish "channel never seen" (true 404) from "channel
-        # seen but window after filters is empty" (200 + []). The
-        # latter is a routine case for ``since=<last_id>`` polling
-        # and must NOT look the same to the MCP tool.
-        if not await store.channel_exists(channel_id):
-            return web.json_response(
-                {"error": "channel not found"}, status=404,
-            )
         roots = await store.get_channel_roots(
             channel_id,
             limit=limit,
             since_envelope_id=since,
             before_ts=before_ts,
             after_ts=after_ts,
+        )
+    except DataNotFound:
+        return web.json_response(
+            {"error": "channel not found"}, status=404,
         )
     except Exception as exc:
         logger.exception(
@@ -275,20 +271,16 @@ async def list_thread_messages(request: web.Request) -> web.Response:
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
-        # Mirrors ``list_channel_roots``: 404 when the agent has
-        # never recorded anything for ``root_id`` (the root message
-        # itself isn't in the store), 200 + [] when the root is
-        # known but the requested window is empty.
-        if not await store.has_message(root_id):
-            return web.json_response(
-                {"error": "thread root not found"}, status=404,
-            )
         msgs = await store.get_thread_messages(
             root_id,
             limit=limit,
             since_envelope_id=since,
             before_ts=before_ts,
             after_ts=after_ts,
+        )
+    except DataNotFound:
+        return web.json_response(
+            {"error": "thread root not found"}, status=404,
         )
     except Exception as exc:
         logger.exception(

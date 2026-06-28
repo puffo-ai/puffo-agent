@@ -2341,30 +2341,48 @@ class PuffoCoreMessageClient:
         except Exception:
             self._space_name_cache[space_id] = space_id
             return space_id
-        name = space_id
+        # Populate every returned space so the next unknown-space
+        # resolve is a cache hit.
         for entry in data.get("spaces") or []:
-            if entry.get("space_id") == space_id:
-                name = (entry.get("name") or "").strip() or space_id
-                break
-        self._space_name_cache[space_id] = name
-        if name and name != space_id:
-            disk_cache.persist_space(space_id, name)
-        return name
+            sid = entry.get("space_id")
+            if not sid or sid in self._space_name_cache:
+                continue
+            entry_name = (entry.get("name") or "").strip() or sid
+            self._space_name_cache[sid] = entry_name
+            if entry_name != sid:
+                disk_cache.persist_space(sid, entry_name)
+        if space_id not in self._space_name_cache:
+            self._space_name_cache[space_id] = space_id
+        return self._space_name_cache[space_id]
 
     async def _resolve_channel_name(
         self, space_id: str, channel_id: str,
     ) -> str:
-        """Channel name by replaying ``create_channel`` events under
-        ``/spaces/<space_id>/events``. Cached per session; returns
-        bare ``channel_id`` on miss/failure or when ``space_id`` is
-        absent (DMs)."""
+        """Channel name via ``/spaces/<sp>/channels`` (returns every
+        name in one shot), falling back to a ``create_channel``
+        event-replay only on miss. Cached per session; returns bare
+        ``channel_id`` on miss/failure or for DMs (no space_id)."""
         if not channel_id or not space_id:
             return channel_id
         if channel_id in self._channel_name_cache:
             return self._channel_name_cache[channel_id]
+        name = channel_id
+        try:
+            ch_data = await self.http.get(f"/spaces/{space_id}/channels")
+            for entry in ch_data.get("channels") or []:
+                cid = entry.get("channel_id")
+                if not cid or cid in self._channel_name_cache:
+                    continue
+                entry_name = (entry.get("name") or "").strip() or cid
+                self._channel_name_cache[cid] = entry_name
+                if entry_name != cid:
+                    disk_cache.persist_channel(cid, entry_name, space_id)
+            if channel_id in self._channel_name_cache:
+                return self._channel_name_cache[channel_id]
+        except Exception:
+            pass
         cursor: str | None = None
         prev_cursor: str | None = None
-        name = channel_id
         try:
             while True:
                 # Server expects ``?since=``, not ``?cursor=``.
