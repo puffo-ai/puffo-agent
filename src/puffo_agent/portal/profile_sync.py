@@ -12,16 +12,11 @@ from .state import AgentConfig
 
 
 async def sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
-    """Push ``patch`` (display_name / avatar_url / role / role_short)
-    to the agent's server-side identity profile. The PATCH is signed
-    by the AGENT's subkey (not the operator's) — both the bridge
-    handler and the CLI call this with the same shape; the bridge
-    enforces operator-only authorization before reaching this point,
-    and the CLI relies on the operator already controlling the local
-    keystore.
-
-    Raises any HTTP / network failure to the caller so they can decide
-    whether to fail loud (CLI) or warn and continue (bridge)."""
+    """Push ``patch`` (any subset of display_name / avatar_url /
+    role / role_short / soul) to the agent's server identity. Signed
+    by the AGENT's subkey — callers (bridge / CLI / link-migrate)
+    own their own authorization gating before reaching here. Raises
+    on HTTP / network failure."""
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
