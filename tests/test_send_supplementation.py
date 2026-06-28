@@ -1,7 +1,4 @@
-"""Server-reported ``missing_devices`` → re-fetch certs → POST a
-same-``envelope_id`` supplementation envelope. Ports the web
-client's post-send recovery pattern (FB-shape: a recipient added a
-device between cert-cache freshness and our POST)."""
+"""Post-send ``missing_devices`` supplementation."""
 
 from __future__ import annotations
 
@@ -45,9 +42,6 @@ def _channel_input(devices: list[RecipientDevice]) -> EncryptInput:
     )
 
 
-# ── build_supplementation_envelope ────────────────────────────────
-
-
 class TestBuildSupplementationEnvelope:
     def test_preserves_envelope_identity(self):
         sk = Ed25519KeyPair.generate()
@@ -58,12 +52,9 @@ class TestBuildSupplementationEnvelope:
         dev_new, _ = _make_recipient()
         supp = build_supplementation_envelope(env, ckey, [dev_new])
 
-        # envelope_id, content_nonce, content_ciphertext must be
-        # byte-identical — server merges on envelope_id.
         assert supp["envelope_id"] == env["envelope_id"]
         assert supp["content_nonce"] == env["content_nonce"]
         assert supp["content_ciphertext"] == env["content_ciphertext"]
-        # Everything else is also copied — only recipients differs.
         assert supp["envelope_kind"] == env["envelope_kind"]
         assert supp["space_id"] == env["space_id"]
         assert supp["channel_id"] == env["channel_id"]
@@ -91,7 +82,6 @@ class TestBuildSupplementationEnvelope:
         dev_new, kp_new = _make_recipient()
         supp = build_supplementation_envelope(env, ckey, [dev_new])
 
-        # Decrypt original via dev0, supplementation via dev_new — same body.
         orig_msg = decrypt_message(env, dev0.device_id, kp0, sk.public_key_bytes())
         supp_msg = decrypt_message(supp, dev_new.device_id, kp_new, sk.public_key_bytes())
         assert orig_msg.content == supp_msg.content
@@ -107,12 +97,7 @@ class TestBuildSupplementationEnvelope:
             build_supplementation_envelope(env, ckey, [])
 
 
-# ── _supplement_missing_devices end-to-end ───────────────────────
-
-
 class _FakeHttp:
-    """Tracks POSTs and stubs /certs/sync responses."""
-
     def __init__(self, fresh_devices: list[RecipientDevice]) -> None:
         self.posts: list[tuple[str, dict]] = []
         self.gets: list[str] = []
@@ -173,9 +158,8 @@ async def test_supplementation_posts_only_missing_devices():
 
 @pytest.mark.asyncio
 async def test_supplementation_silent_when_missing_id_not_in_fresh_certs():
-    """Server claimed device X is missing, but /certs/sync no longer
-    lists it (rotated out between calls). Don't POST garbage — log
-    + drop. Avoids a 4xx loop on a vanished device."""
+    # Device rotated out between the server's missing_devices report
+    # and our /certs/sync refetch — drop, don't POST garbage.
     sk = Ed25519KeyPair.generate()
     dev_known, _ = _make_recipient()
     env, ckey = encrypt_message_with_content_key(
@@ -194,8 +178,6 @@ async def test_supplementation_silent_when_missing_id_not_in_fresh_certs():
 
 @pytest.mark.asyncio
 async def test_supplementation_swallows_http_failure():
-    """Best-effort — a failed supplementation POST must not propagate
-    (the original send already landed)."""
     sk = Ed25519KeyPair.generate()
     dev_known, _ = _make_recipient()
     env, ckey = encrypt_message_with_content_key(
@@ -208,7 +190,6 @@ async def test_supplementation_swallows_http_failure():
             raise RuntimeError("server unavailable")
 
     http = _BoomHttp(fresh_devices=[dev_known, dev_added])
-    # Should not raise.
     await _supplement_missing_devices(
         http, env, ckey,
         recipient_slugs=["alice-0001"],

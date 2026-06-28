@@ -1222,12 +1222,9 @@ class RuntimeState:
         import json
         self.updated_at = int(time.time())
         path = runtime_json_path(agent_id)
-        # Throttle pure heartbeat writes: when only ``updated_at``
-        # advanced and the last disk write was <25s ago, skip. CLI's
-        # staleness check is 30s (cli.py:569), so 25s leaves slack.
-        # Real state changes (status / msg_count / health / error)
-        # always flush. Force-write when the file is missing — covers
-        # tmp_path reuse in tests and operator-side rm.
+        # CLI staleness gate is 30s; throttle pure-updated_at writes
+        # to <25s gives the reader 5s slack and kills the heartbeat
+        # write-storm. Force-write on missing file.
         d = asdict(self)
         d.pop("updated_at", None)
         sig = json.dumps(d, sort_keys=True)
@@ -1248,9 +1245,7 @@ class RuntimeState:
         _RUNTIME_LAST_SAVE[key] = (sig, self.updated_at)
 
 
-# Key is the resolved runtime.json path so test tmp_path reuse of
-# agent_id doesn't cross-pollute. Value: (signature_excluding_
-# updated_at, updated_at_of_last_write).
+# Keyed by resolved path so test tmp_path reuse doesn't collide.
 _RUNTIME_LAST_SAVE: dict[str, tuple[str, int]] = {}
 
 

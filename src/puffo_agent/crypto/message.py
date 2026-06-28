@@ -123,10 +123,8 @@ def encrypt_message_with_content_key(
     *,
     now_ms: int | None = None,
 ) -> tuple[dict, bytes]:
-    """Same as ``encrypt_message`` but also returns the symmetric
-    ``content_key`` so the caller can build a supplementation
-    envelope later (re-wrapping the same content_key for additional
-    devices that the server reports as ``missing_devices``)."""
+    """Like ``encrypt_message`` but exposes ``content_key`` so the
+    caller can supplement later via ``build_supplementation_envelope``."""
     if not inp.recipients:
         raise ValueError("no recipients")
 
@@ -220,13 +218,10 @@ def build_supplementation_envelope(
     content_key: bytes,
     devices: list[RecipientDevice],
 ) -> dict:
-    """Build a same-``envelope_id`` envelope re-wrapping ``content_key``
-    for ``devices`` (devices the server reported as ``missing_devices``
-    on the original send). All envelope fields are reused verbatim
-    EXCEPT ``recipients[]``, which carries only the new HPKE wraps.
-    Server treats this as a delivery-list extension keyed by the
-    repeated ``envelope_id`` — the content_nonce + content_ciphertext
-    must be byte-identical for the merge to land."""
+    """Re-wrap ``content_key`` for ``devices`` under the same
+    ``envelope_id`` + ``content_nonce`` + ``content_ciphertext``;
+    server merges on envelope_id, so those three MUST be byte-
+    identical or the supplementation lands as a separate envelope."""
     if not devices:
         raise ValueError("no recipients")
     envelope_id = base_envelope["envelope_id"]

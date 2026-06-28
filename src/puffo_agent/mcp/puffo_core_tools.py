@@ -146,12 +146,9 @@ async def _supplement_missing_devices(
     recipient_slugs: list[str],
     missing_device_ids: list[str],
 ) -> None:
-    """Re-fetch certs for ``recipient_slugs``, filter to devices the
-    server reported as missing, and POST a same-``envelope_id``
-    supplementation envelope. Best-effort — the original send already
-    landed delivery to known devices; this catches the race where a
-    recipient added a device between cert-cache freshness and our
-    POST. Logs + swallows on failure."""
+    """Best-effort: re-fetch certs, build a same-``envelope_id``
+    envelope for the missing device_ids, POST. Logs + swallows on
+    failure (original send is already durable)."""
     envelope_id = envelope.get("envelope_id", "?")
     try:
         fresh = await _fetch_device_keys(http_client, recipient_slugs)

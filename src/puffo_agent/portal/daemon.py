@@ -70,11 +70,8 @@ class Daemon:
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
-        # mtime-cache for agent.yml so the reconcile tick doesn't
-        # re-parse YAML for every agent every interval when nothing
-        # changed. Key: agent_id → (st_mtime_ns, st_size, AgentConfig).
-        # Sentinel flags (archive/delete/restart) provide event-driven
-        # signal for the cases that actually need a fresh read.
+        # agent.yml mtime cache; reconcile tick skips yaml.safe_load
+        # when (mtime_ns, size) is unchanged.
         self._agent_cfg_cache: dict[str, tuple[int, int, "AgentConfig"]] = {}
         # PUF-221: daemon owns Claude OAuth refresh — single writer to
         # the canonical credential store so Anthropic's single-use
@@ -193,10 +190,8 @@ class Daemon:
         self._stop.set()
 
     def _load_agent_cfg_cached(self, agent_id: str) -> "AgentConfig":
-        """Return ``AgentConfig`` for ``agent_id``, reusing a cached
-        parse when ``agent.yml``'s mtime + size are unchanged. Raises
-        the same exceptions as ``AgentConfig.load`` on parse failure;
-        the caller is responsible for the try/except."""
+        """Reuses a cached parse when (mtime_ns, size) is unchanged.
+        Same exceptions as ``AgentConfig.load`` on parse failure."""
         path = agent_yml_path(agent_id)
         st = path.stat()
         key = (st.st_mtime_ns, st.st_size)
@@ -211,9 +206,8 @@ class Daemon:
         on_disk = set(discover_agents())
         running = set(self.workers.keys())
 
-        # Evict cached AgentConfig for any agent that's no longer on
-        # disk — release memory, avoid serving a stale parse if the
-        # id is later re-created with a fresh file.
+        # Drop cached parses for ids that vanished — guards against a
+        # re-created id serving a stale config.
         for stale_id in list(self._agent_cfg_cache.keys() - on_disk):
             self._agent_cfg_cache.pop(stale_id, None)
 
