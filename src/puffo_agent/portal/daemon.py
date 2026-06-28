@@ -109,6 +109,9 @@ class Daemon:
         # Re-assert machine_id for already-linked operators' agents so agents
         # created/paused before linking show as remote without a re-link.
         asyncio.ensure_future(_migrate_linked_agents_at_startup())
+        # Re-push every owned agent's profile to the server in case
+        # the operator hand-edited agent.yml / profile.md offline.
+        asyncio.ensure_future(_full_sync_all_owned_agents_at_startup())
 
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
@@ -532,6 +535,42 @@ async def _migrate_linked_agents_at_startup() -> None:
                 "startup machine_id migration failed for %s: %s",
                 pairing.operator_slug, exc,
             )
+
+
+async def _full_sync_all_owned_agents_at_startup() -> None:
+    """Push every owned agent's profile to puffo-server on boot —
+    defends against offline hand-edits. Independent of link state."""
+    from ..crypto.keystore import KeyStore
+    from .profile_sync import sync_full_profile
+
+    async def _sync_one(agent_id: str) -> str | None:
+        try:
+            cfg = AgentConfig.load(agent_id)
+        except Exception as exc:  # noqa: BLE001
+            return f"{agent_id}: load failed: {exc}"
+        if not cfg.puffo_core.is_configured():
+            return None
+        try:
+            KeyStore.for_agent(agent_id).load_session(cfg.puffo_core.slug)
+        except Exception:
+            return None
+        try:
+            await sync_full_profile(cfg)
+        except Exception as exc:  # noqa: BLE001
+            return f"{agent_id}: {exc}"
+        return None
+
+    ids = discover_agents()
+    if not ids:
+        return
+    results = await asyncio.gather(
+        *(_sync_one(aid) for aid in ids), return_exceptions=False,
+    )
+    failures = [r for r in results if r]
+    ok = len(ids) - len(failures)
+    logger.info("startup: full-profile sync — ok=%d failed=%d", ok, len(failures))
+    for line in failures:
+        logger.warning("startup full-sync: %s", line)
 
 
 async def _log_outdated_version_warning() -> None:

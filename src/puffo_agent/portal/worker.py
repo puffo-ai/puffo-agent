@@ -1107,6 +1107,21 @@ class Worker:
             # to verify anyway since the adapter never came up.
             self._warm_done.set()
 
+        # Per-agent counterpart to daemon-startup full-sync: covers
+        # paused→running flips + restart.flag respawns. Fire-and-
+        # forget; never blocks listen().
+        async def _post_warm_sync() -> None:
+            from .profile_sync import sync_full_profile
+            try:
+                await sync_full_profile(self.agent_cfg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: post-warm profile sync failed: %s",
+                    agent_id, exc,
+                )
+
+        asyncio.ensure_future(_post_warm_sync())
+
         reload_flag_path = Path(workspace_path) / ".puffo-agent" / "reload.flag"
         refresh_flag_path = Path(workspace_path) / ".puffo-agent" / "refresh.flag"
         # Per-turn context for the cli-local permission hook. The hook

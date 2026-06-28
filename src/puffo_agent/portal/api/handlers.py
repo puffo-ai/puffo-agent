@@ -295,8 +295,23 @@ async def pair(request: web.Request) -> web.Response:
 # ────────────────────────────────────────────────────────────────────
 
 
+def _operator_has_active_link(paired_root_pubkey: str) -> bool:
+    """True if this operator already has a machine-link pairing."""
+    if not paired_root_pubkey:
+        return False
+    from ..control.store import load_pairings
+    return any(
+        p.operator_root_pubkey == paired_root_pubkey
+        for p in load_pairings().values()
+    )
+
+
 async def list_agents(request: web.Request) -> web.Response:
     paired_root = request["paired_root_pubkey"]
+    # Linked operators see agents via the server's link channel;
+    # bridge returns empty to avoid double-listing.
+    if _operator_has_active_link(paired_root):
+        return web.json_response({"agents": []})
     items: list[dict] = []
     for aid in discover_agents():
         # Skip agents pending tear-down — the reconcile loop runs
@@ -702,8 +717,56 @@ async def update_profile(request: web.Request) -> web.Response:
     if isinstance(new_role_short, str):
         profile_patch["role_short"] = new_role_short
 
-    # Best-effort server sync; failure logs but doesn't fail the
-    # request since agent.yml is still updated locally.
+    new_profile_summary = payload.get("profile_summary")
+    stripped_summary: str | None = None
+    if isinstance(new_profile_summary, str):
+        stripped_summary = new_profile_summary.strip()
+        summary_bytes = len(stripped_summary.encode("utf-8"))
+        if summary_bytes > MAX_PROFILE_SUMMARY_BYTES:
+            return _bad(
+                f"profile_summary is {summary_bytes} bytes; cap is "
+                f"{MAX_PROFILE_SUMMARY_BYTES}"
+            )
+
+    # Disk-first so a sync failure can't drop the operator's edit.
+    if isinstance(new_display_name, str):
+        cfg.display_name = new_display_name.strip() or cfg.display_name
+    if new_avatar_url is not None:
+        cfg.avatar_url = new_avatar_url
+    if isinstance(new_role, str):
+        cfg.role = new_role
+        if not isinstance(new_role_short, str):
+            cfg.role_short = _derive_role_short(new_role)
+    if isinstance(new_role_short, str):
+        cfg.role_short = new_role_short
+    cfg.save()
+    if stripped_summary is not None:
+        _update_profile_summary(cfg, stripped_summary)
+        profile_patch["soul"] = stripped_summary
+    renamed = (
+        isinstance(new_display_name, str)
+        and cfg.display_name != old_display_name
+        and old_display_name
+        and cfg.display_name
+    )
+    if renamed:
+        rewrite_profile_name(
+            cfg.resolve_profile_path(), old_display_name, cfg.display_name,
+        )
+    logger.info(
+        "bridge: updated profile for agent=%s display_name=%r avatar=%s role_short=%r",
+        agent_id, cfg.display_name,
+        "(set)" if cfg.avatar_url else "(empty)",
+        cfg.role_short,
+    )
+
+    # reload.flag is lazy + session-preserving; right primitive for
+    # any prompt-affecting change.
+    if renamed or stripped_summary is not None or isinstance(new_role, str):
+        from ..profile_sync import write_reload_flag
+        write_reload_flag(cfg, reason="bridge profile edit")
+
+    # Server sync LAST so a failure can't drop the local edit.
     if profile_patch:
         try:
             await _sync_agent_profile(cfg, profile_patch)
@@ -714,86 +777,6 @@ async def update_profile(request: web.Request) -> web.Response:
             logger.warning(
                 "bridge: profile sync failed for agent=%s: %s", agent_id, exc,
             )
-
-    new_profile_summary = payload.get("profile_summary")
-    if isinstance(new_profile_summary, str):
-        # PUF-208 v2: cap before write so a stale UI / future automation
-        # client can't drop a multi-megabyte soul on disk + into the
-        # next CLAUDE.md sync. UTF-8 byte count matches storage. Cap
-        # the STRIPPED payload so the gate sees what storage actually
-        # writes — otherwise 10010 bytes of content surrounded by
-        # whitespace (strips to 9990) would 400 even though the disk
-        # write would have landed under the cap.
-        stripped_summary = new_profile_summary.strip()
-        summary_bytes = len(stripped_summary.encode("utf-8"))
-        if summary_bytes > MAX_PROFILE_SUMMARY_BYTES:
-            return _bad(
-                f"profile_summary is {summary_bytes} bytes; cap is "
-                f"{MAX_PROFILE_SUMMARY_BYTES}"
-            )
-        _update_profile_summary(cfg, stripped_summary)
-
-    # Write agent.yml last so local state reflects what we asked
-    # the server for, even if the sync warned.
-    if isinstance(new_display_name, str):
-        cfg.display_name = new_display_name.strip() or cfg.display_name
-    if new_avatar_url is not None:
-        cfg.avatar_url = new_avatar_url
-    if isinstance(new_role, str):
-        cfg.role = new_role
-        # If the caller didn't override role_short, mirror the
-        # server-side derive locally so agent.yml stays consistent
-        # with what the server stores. The server is still
-        # authoritative — this is a best-effort local cache.
-        if not isinstance(new_role_short, str):
-            cfg.role_short = _derive_role_short(new_role)
-    if isinstance(new_role_short, str):
-        cfg.role_short = new_role_short
-    cfg.save()
-    logger.info(
-        "bridge: updated profile for agent=%s display_name=%r avatar=%s role_short=%r",
-        agent_id, cfg.display_name,
-        "(set)" if cfg.avatar_url else "(empty)",
-        cfg.role_short,
-    )
-
-    # On an actual rename, rewrite profile.md (the prose CLAUDE.md /
-    # AGENTS.md are assembled from) then drop reload.flag so the worker
-    # re-assembles on its next message. Not locked — rapid renames may
-    # interleave; tolerated given UI debounce + the worker reloads
-    # whatever profile.md settles to.
-    if (
-        cfg.display_name != old_display_name
-        and old_display_name
-        and cfg.display_name
-    ):
-        replacements = rewrite_profile_name(
-            cfg.resolve_profile_path(), old_display_name, cfg.display_name,
-        )
-        flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
-        try:
-            flag_path.parent.mkdir(parents=True, exist_ok=True)
-            flag_path.write_text(
-                json.dumps({
-                    "version": 1,
-                    "requested_at": int(datetime.now(tz=timezone.utc).timestamp()),
-                    "reason": "agent rename",
-                }) + "\n",
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            # Flag is best-effort: agent.yml + profile.md already wrote,
-            # so a restart still picks up the new name. Don't fail PATCH.
-            logger.warning(
-                "bridge: failed to write reload.flag for agent=%s after "
-                "rename: %s (agent will pick up new name on next restart)",
-                agent_id, exc,
-            )
-        logger.info(
-            "bridge: rename agent=%s %r → %r — profile.md replacements=%d, "
-            "reload.flag written",
-            agent_id, old_display_name, cfg.display_name, replacements,
-        )
     body: dict[str, Any] = {
         "agent_id": agent_id,
         "display_name": cfg.display_name,

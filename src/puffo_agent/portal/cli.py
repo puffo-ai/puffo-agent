@@ -725,11 +725,12 @@ def _set_agent_state(agent_id: str, new_state: str) -> int:
 
 
 def cmd_agent_rename(args: argparse.Namespace) -> int:
-    """Change the operator-facing display_name in agent.yml.
+    """Change display_name on disk, in profile.md heading, on the
+    server identity, and drop reload.flag (mirrors bridge edit)."""
+    import asyncio
+    from ..agent.shared_content import rewrite_profile_name
+    from .profile_sync import sync_agent_profile, write_reload_flag
 
-    The chat-visible identity profile lives on puffo-core under the
-    agent's slug; manage that via ``puffo-cli``.
-    """
     agent_id = args.id
     new_name = (args.display_name or "").strip()
     if not new_name:
@@ -739,13 +740,31 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
     cfg = AgentConfig.load(agent_id)
+    old_name = cfg.display_name
+    if new_name == old_name:
+        print(f"agent {agent_id!r} display_name already {new_name!r}")
+        return 0
     cfg.display_name = new_name
     cfg.save()
-    print(f"agent {agent_id!r} display_name set to {new_name!r}")
-    print(
-        "note: this updates the local agent.yml only. "
-        "use puffo-cli to change the puffo-core identity profile."
-    )
+    if old_name:
+        try:
+            rewrite_profile_name(cfg.resolve_profile_path(), old_name, new_name)
+        except Exception as exc:
+            print(
+                f"warning: profile.md heading rewrite failed: {exc}",
+                file=sys.stderr,
+            )
+    write_reload_flag(cfg, reason="cli agent rename")
+    try:
+        asyncio.run(sync_agent_profile(cfg, {"display_name": new_name}))
+    except Exception as exc:
+        print(
+            f"warning: server profile sync failed: {exc} "
+            f"(local agent.yml is updated; retry via the UI / linked "
+            f"operator if you need the puffo-core identity to match)",
+            file=sys.stderr,
+        )
+    print(f"agent {agent_id!r} display_name {old_name!r} → {new_name!r}")
     return 0
 
 

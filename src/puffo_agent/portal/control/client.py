@@ -130,12 +130,16 @@ async def execute_command(
     if op == "edit":
         cfg = AgentConfig.load(agent_slug)
         patch: dict = {}
+        prompt_changed = False
+        runtime_changed = False
         if isinstance(params.get("display_name"), str):
             cfg.display_name = params["display_name"]
             patch["display_name"] = params["display_name"]
+            prompt_changed = True
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
             patch["role"] = params["role"]
+            prompt_changed = True
         # avatar_url points to a blob the operator already uploaded; sync it to
         # the server identity (avatars are public, so no gating needed).
         if isinstance(params.get("avatar_url"), str):
@@ -145,6 +149,7 @@ async def execute_command(
         # agent.yml); the profile.md body carries it for the worker.
         if isinstance(params.get("soul"), str):
             patch["soul"] = params["soul"]
+            prompt_changed = True
         # Runtime block (kind/provider/harness/model) — same fields the local
         # bridge's update_runtime accepts; reject invalid triples before saving.
         rt_in = params.get("runtime")
@@ -153,6 +158,7 @@ async def execute_command(
             for key in ("kind", "provider", "harness", "model"):
                 if isinstance(rt_in.get(key), str):
                     setattr(rt, key, rt_in[key])
+                    runtime_changed = True
             from ..runtime_matrix import validate_triple
 
             result = validate_triple(rt.kind, rt.provider, rt.harness)
@@ -163,8 +169,7 @@ async def execute_command(
             (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
                 params["profile"], encoding="utf-8"
             )
-        # Sync display_name/role to the server identity so the operator's portal
-        # reflects the edit — agent.yml alone isn't visible server-side.
+            prompt_changed = True
         if patch:
             try:
                 from ..api.handlers import _sync_agent_profile
@@ -172,10 +177,14 @@ async def execute_command(
                 await _sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
-        # Restart a running worker so profile.md / runtime / identity edits take
-        # effect now rather than on the next manual restart.
+        # restart.flag for runtime (spawn-args change); reload.flag
+        # for prompt-only (lazy, preserves the AI session).
         if cfg.state == "running":
-            _touch_flag(restart_flag_path(agent_slug))
+            if runtime_changed:
+                _touch_flag(restart_flag_path(agent_slug))
+            elif prompt_changed:
+                from ..profile_sync import write_reload_flag
+                write_reload_flag(cfg, reason="control-ws edit")
         return {"ok": True}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)

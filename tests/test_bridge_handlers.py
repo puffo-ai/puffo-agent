@@ -129,6 +129,57 @@ async def test_list_agents_empty(client):
     assert j["agents"] == []
 
 
+async def test_list_returns_empty_when_paired_operator_has_active_link():
+    # The bridge-paired operator also has a machine-link pairing —
+    # they manage agents through puffo-server's control channel,
+    # so the local bridge hides /agents to avoid double-reporting.
+    user = make_user()
+    home = isolated_home()
+    user_root_pk = base64url_encode(user.root_key.public_key_bytes())
+    write_test_agent(home, "linked-op-bot", owner_root_pubkey=user_root_pk)
+
+    # Stand up a matching link pairing for the same operator root.
+    from puffo_agent.portal.control.store import ControlPairing, save_pairing
+    save_pairing(ControlPairing(
+        operator_slug="op-slug",
+        operator_root_pubkey=user_root_pk,
+        control_cert={},
+        server_url="https://example.test",
+        name="test-machine",
+        created_at=0,
+    ))
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        h = signed_headers(user, "GET", "/v1/agents"); h.update(_HOST)
+        r = await c.get("/v1/agents", headers=h)
+        j = await r.json()
+    assert j["agents"] == []
+
+
+async def test_list_returned_normally_when_paired_operator_is_unlinked():
+    # Same setup minus the pairing — non-linked operators see their
+    # agents as usual.
+    user = make_user()
+    home = isolated_home()
+    user_root_pk = base64url_encode(user.root_key.public_key_bytes())
+    write_test_agent(home, "free-op-bot", owner_root_pubkey=user_root_pk)
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        h = signed_headers(user, "GET", "/v1/agents"); h.update(_HOST)
+        r = await c.get("/v1/agents", headers=h)
+        j = await r.json()
+    ids = [a["id"] for a in j["agents"]]
+    assert "free-op-bot" in ids
+
+
 async def test_list_marks_owned_correctly(client):
     user = make_user()
     home = isolated_home()  # fresh home so we control which agents exist
@@ -359,6 +410,52 @@ async def test_update_profile_accepts_summary_at_cap():
         assert r.status == 200, await r.text()
 
 
+async def test_soul_edit_writes_profile_md_and_drops_reload_flag(monkeypatch):
+    # Soul-only edit (no display_name) must rewrite profile.md AND
+    # drop reload.flag — earlier the flag was rename-only and pure
+    # soul edits never reloaded.
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "soul-only-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    agent_dir = Path(home) / "agents" / "soul-only-bot"
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+    captured_patch: dict = {}
+
+    async def _spy_sync(cfg, patch):
+        captured_patch.update(patch)
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.api.handlers._sync_agent_profile", _spy_sync,
+    )
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({
+            "profile_summary": "# Bot\n\nfresh prompt\n",
+        }).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/soul-only-bot/profile", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/soul-only-bot/profile", data=body, headers=h)
+        assert r.status == 200, await r.text()
+
+    # profile.md updated to the new soul
+    md = (agent_dir / "profile.md").read_text(encoding="utf-8")
+    assert "fresh prompt" in md
+    # reload.flag dropped (the load-bearing fix)
+    assert flag_path.exists()
+    # soul made it into the server PATCH (Bug 1 fix). Handler strips
+    # trailing whitespace before sending.
+    assert captured_patch.get("soul") == "# Bot\n\nfresh prompt"
+
+
 async def test_update_profile_rejects_summary_over_cap():
     # MAX + 1 byte must reject with 400 + a body that fingers the
     # offending byte count + the configured cap, so the UI can map
@@ -502,7 +599,7 @@ async def test_rename_rewrites_profile_md_and_drops_reload_flag():
     flag_body = json.loads(flag_path.read_text(encoding="utf-8"))
     assert flag_body.get("version") == 1
     assert "requested_at" in flag_body
-    assert flag_body.get("reason") == "agent rename"
+    assert flag_body.get("reason") == "bridge profile edit"
 
 
 async def test_unchanged_display_name_is_a_noop():
