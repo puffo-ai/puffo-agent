@@ -11,6 +11,11 @@ chose to defer.
 | 4 | `runtime.json` rewritten ~12×/min per agent (`portal/state.py:1221`) | Throttle: skip the disk write when only `updated_at` changed AND last write was <25s ago (CLI staleness gate is 30s). Cache keyed by resolved path to survive test `tmp_path` reuse. |
 | 5 | Reconcile tick re-parses every `agent.yml` every 2s (`portal/daemon.py:235`) | `_load_agent_cfg_cached`: stat the file, return cached `AgentConfig` if (mtime_ns, size) unchanged. Cache evicted when agent disappears from disk. |
 | 3 | `send_message` drops server-reported `missing_devices` (`mcp/puffo_core_tools.py:432-485, 1037-1095`) | Port the web client's post-send supplementation: capture POST response, re-fetch `/certs/sync` for the recipient slugs, build a same-`envelope_id` envelope wrapping the same `content_key` for the missing device_ids, fire-and-forget POST. Best-effort (the original send is already durable). Applied to `send_message` + `send_message_with_attachments`. |
+| DB index | `idx_messages_dm` doesn't cover the `recipient_slug` arm of `get_dm_history` (`agent/message_store.py:31-32`) | New partial index `idx_messages_dm_recipient ON messages (recipient_slug, sent_at) WHERE envelope_kind='dm'`. SQLite's OR-decomposer now hits an index on both arms. |
+| DB PRAGMAs | Default `synchronous=FULL` + no cache/mmap tuning (`agent/message_store.py:130-131`) | Set `synchronous=NORMAL` (WAL-safe; halves write latency), `cache_size=-20000` (~20MB), `temp_store=MEMORY`, `mmap_size=256MB`. |
+| DB double-exists | `channel_exists`/`has_message` ran twice per `get_channel_roots`/`get_thread_messages` (`portal/data_service.py:230,282` + `agent/message_store.py:437,499`) | Removed the handler-side pre-check; the store still raises `DataNotFound` and the handler catches it to map → 404. One SELECT instead of two per HTTP request. |
+| `_resolve_space_name` | Re-fetched full `/spaces` per unknown space_id, caching only one entry (`agent/puffo_core_client.py:2332-2352`) | Populate every space in the response into `_space_name_cache`; second unknown-space resolve is now a cache hit. |
+| `_resolve_channel_name` | Unbounded event-replay of `create_channel` per unknown channel (`agent/puffo_core_client.py:2354-2393`) | Try `/spaces/<sp>/channels` first (one round-trip, returns every name); fall back to the event-replay only if that comes back empty / errors. |
 
 Not addressed (scoped out per operator):
 
@@ -23,16 +28,8 @@ Not addressed (scoped out per operator):
 
 ### Server access
 
-- **`_fetch_user_profile` ignores disk cache on miss** (`agent/puffo_core_client.py:2098-2137`) — also `_resolve_space_name` (`:2340`), `_resolve_channel_name` (`:2354-2393`). Cold-start re-fetches names already on disk. Fix: consult `disk_cache.load_profile/load_space/load_channel` before HTTP.
-- **`_resolve_space_name` fetches full `/spaces` per unknown space_id** (`agent/puffo_core_client.py:2340`) — and only caches one entry. Fix: populate every returned entry; share a single in-flight task to coalesce concurrent callers.
-- **`_resolve_channel_name` event-replay per unknown channel** (`agent/puffo_core_client.py:2354-2393`) — `/spaces/X/channels` returns every name in one shot. Fix: try the channels endpoint first; fall back to the events scan only on empty.
-- **`whoami` MCP tool fetches own profile every call** (`mcp/puffo_core_tools.py:351`) — Fix: route through `data_client`/profile cache.
-
-### DB
-
-- **`idx_messages_dm` doesn't cover the `recipient_slug` arm** of `get_dm_history WHERE (sender_slug=? OR recipient_slug=?)` (`agent/message_store.py:31-32, 333-344`). Full-scan on inbound DMs. Fix: add `idx_messages_dm_recipient ON messages (recipient_slug, sent_at) WHERE envelope_kind='dm'`.
-- **Missing PRAGMAs** (`agent/message_store.py:130-131`) — default `synchronous=FULL` halves write latency vs `NORMAL` under WAL. Fix: add `synchronous=NORMAL`, `cache_size=-20000`, `temp_store=MEMORY`, `mmap_size=256MB`.
-- **Double `channel_exists` round-trip** per `get_channel_roots` / `get_thread_messages` (`portal/data_service.py:230` + `agent/message_store.py:437`). Same `SELECT 1 … LIMIT 1` runs twice.
+- **`_fetch_user_profile` ignores disk cache on miss** (`agent/puffo_core_client.py:2098-2137`). Cold-start re-fetches names already on disk. Fix: consult `disk_cache.load_profile` before HTTP. (`_resolve_space_name` + `_resolve_channel_name` got the in-memory cache fix above but still bypass disk_cache on first miss — same shape, deferred together.)
+- **`whoami` MCP tool fetches own profile every call** (`mcp/puffo_core_tools.py:351`). Needs proper plumbing — a `GET /v1/data/<agent>/profile-cache` endpoint on the data service + invalidation hooks from the bridge `edit` flow and the server's `WsPush::ProfileUpdate`. A simple in-process cache is unsafe (no invalidation channel when operator changes display_name out-of-band).
 
 ### Async parallelism
 
