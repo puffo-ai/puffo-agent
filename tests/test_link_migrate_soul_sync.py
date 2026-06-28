@@ -74,7 +74,8 @@ async def test_migrate_syncs_soul_after_machine_id(monkeypatch):
     home = isolated_home()
     write_test_agent(home, "scout", owner_root_pubkey=_OWNER_PK)
     Path(home, "agents", "scout", "profile.md").write_text(
-        "# Scout\n\nA fast scout agent.\n", encoding="utf-8",
+        "# Scout\n\nName header.\n\n# Soul\n\nA fast scout agent.\n",
+        encoding="utf-8",
     )
 
     _patch_machine_id(monkeypatch)
@@ -92,7 +93,8 @@ async def test_migrate_syncs_soul_after_machine_id(monkeypatch):
     assert len(soul_calls) == 1
     agent_id, patch = soul_calls[0]
     assert agent_id == "scout"
-    assert patch == {"soul": "# Scout\n\nA fast scout agent.\n"}
+    # Just the # Soul section body — not the entire profile.md.
+    assert patch == {"soul": "A fast scout agent."}
     assert _FakeHttp.close_calls == 1
 
 
@@ -143,6 +145,9 @@ async def test_migrate_handles_missing_profile_md_gracefully(monkeypatch):
 async def test_soul_sync_failure_logs_but_machine_id_remains(monkeypatch, caplog):
     home = isolated_home()
     write_test_agent(home, "scout", owner_root_pubkey=_OWNER_PK)
+    Path(home, "agents", "scout", "profile.md").write_text(
+        "# Soul\n\nscout soul body\n", encoding="utf-8",
+    )
 
     _patch_machine_id(monkeypatch)
     _patch_http(monkeypatch)
@@ -189,10 +194,10 @@ async def test_migrate_syncs_soul_for_every_owned_agent(monkeypatch):
     write_test_agent(home, "ranger", owner_root_pubkey=_OWNER_PK)
 
     Path(home, "agents", "scout", "profile.md").write_text(
-        "Scout body", encoding="utf-8",
+        "# Soul\n\nScout body\n", encoding="utf-8",
     )
     Path(home, "agents", "ranger", "profile.md").write_text(
-        "Ranger body", encoding="utf-8",
+        "# Soul\n\nRanger body\n", encoding="utf-8",
     )
 
     _patch_machine_id(monkeypatch)

@@ -16,10 +16,44 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from _bridge_support import isolated_home, write_test_agent  # noqa: E402
 
 from puffo_agent.portal.profile_sync import (  # noqa: E402
+    extract_soul_body,
     sync_full_profile,
     write_reload_flag,
 )
 from puffo_agent.portal.state import AgentConfig  # noqa: E402
+
+
+class TestExtractSoulBody:
+    def test_returns_section_only_not_whole_file(self):
+        # The regression that motivated the helper extraction —
+        # earlier sync paths sent the WHOLE profile.md as soul.
+        md = (
+            "# Bot Name\n\nHeader content.\n\n"
+            "# Soul\n\nThe agent's soul.\n\n"
+            "# Notes\n\nOperator notes that aren't soul.\n"
+        )
+        assert extract_soul_body(md) == "The agent's soul."
+
+    def test_returns_empty_when_no_soul_heading(self):
+        assert extract_soul_body("# Misc\n\nNo soul here.\n") == ""
+
+    def test_accepts_description_about_summary_aliases(self):
+        for alias in ("description", "about", "summary"):
+            md = f"# {alias.title()}\n\nbody\n"
+            assert extract_soul_body(md) == "body"
+
+    def test_preserves_subheadings_inside_section(self):
+        md = "# Soul\n\nintro line\n\n## Tone\n\nfriendly\n"
+        assert extract_soul_body(md) == (
+            "intro line\n\n## Tone\n\nfriendly"
+        )
+
+    def test_opening_heading_in_soul_body_is_kept(self):
+        # The "after real content" gate in _soul_section_span: the
+        # soul body opening with its own heading must not be mistaken
+        # for the section end.
+        md = "# Soul\n\n# Inner\n\nbody\n"
+        assert extract_soul_body(md) == "# Inner\n\nbody"
 
 
 # ── write_reload_flag ─────────────────────────────────────────────
@@ -52,7 +86,15 @@ async def test_sync_full_profile_sends_every_field_plus_soul(tmp_path, monkeypat
     cfg.avatar_url = "https://example.test/avatar.png"
     cfg.save()
     profile_path = cfg.resolve_profile_path()
-    profile_path.write_text("# Full Bot\n\nfull system prompt\n", encoding="utf-8")
+    profile_path.write_text(
+        "# Full Bot\n\n"
+        "Header section the agent uses internally.\n\n"
+        "# Soul\n\n"
+        "I am Full Bot. I help with testing.\n\n"
+        "# Notes\n\n"
+        "Some unrelated section operators added.\n",
+        encoding="utf-8",
+    )
 
     posted: list[tuple[str, dict]] = []
 
@@ -80,7 +122,47 @@ async def test_sync_full_profile_sends_every_field_plus_soul(tmp_path, monkeypat
     assert body["role"] == "Dev: tester"
     assert body["role_short"] == "Dev"
     assert body["avatar_url"] == "https://example.test/avatar.png"
-    assert body["soul"] == "# Full Bot\n\nfull system prompt\n"
+    # ONLY the # Soul section body — not the "# Full Bot" header, not
+    # the "# Notes" trailing section.
+    assert body["soul"] == "I am Full Bot. I help with testing."
+
+
+@pytest.mark.asyncio
+async def test_sync_full_profile_skips_soul_when_no_soul_section(monkeypatch):
+    # profile.md exists but has no # Soul / description / about /
+    # summary heading. Don't clobber whatever soul the server has.
+    home = isolated_home()
+    write_test_agent(home, "no-soul-bot")
+    cfg = AgentConfig.load("no-soul-bot")
+    cfg.display_name = "No Soul"
+    cfg.save()
+    cfg.resolve_profile_path().write_text(
+        "# Random Heading\n\nThis has no soul section.\n",
+        encoding="utf-8",
+    )
+
+    posted: list[tuple[str, dict]] = []
+
+    class _FakeHttp:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def patch(self, path: str, body: dict) -> dict:
+            posted.append((path, body))
+            return {}
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient", _FakeHttp,
+    )
+    await sync_full_profile(cfg)
+
+    assert len(posted) == 1
+    _, body = posted[0]
+    assert "soul" not in body  # omitted, not empty — preserves server-side soul
+    assert body["display_name"] == "No Soul"
 
 
 @pytest.mark.asyncio

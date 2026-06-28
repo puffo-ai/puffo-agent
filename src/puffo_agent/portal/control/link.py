@@ -219,8 +219,19 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
                 )
                 soul_text = None
             if soul_text is not None:
-                await sync_agent_profile(cfg, {"soul": soul_text})
-                logger.debug("migrate %s: soul synced (%d chars)", cfg.id, len(soul_text))
+                from ..profile_sync import extract_soul_body
+                soul_body = extract_soul_body(soul_text)
+                if soul_body:
+                    await sync_agent_profile(cfg, {"soul": soul_body})
+                    logger.debug(
+                        "migrate %s: soul synced (%d chars)",
+                        cfg.id, len(soul_body),
+                    )
+                else:
+                    logger.debug(
+                        "migrate %s: profile.md has no soul section; skipping",
+                        cfg.id,
+                    )
         except HttpError as exc:
             logger.warning(
                 "migrate %s: soul sync rejected (HTTP %s); machine_id "

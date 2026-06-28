@@ -38,6 +38,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   updated `agent.yml` only — didn't rewrite the `profile.md`
   heading, didn't PATCH the new name to the server, didn't reload
   the running worker. Now mirrors the bridge edit flow exactly.
+- **Server sync used to ship the entire `profile.md` as `soul`.**
+  Both startup full-sync (`sync_full_profile`) and link-migrate
+  (`migrate_owned_agents`) read the file with
+  `path.read_text(...)` and passed the whole body as the soul
+  patch. The bridge's `update_profile` correctly handled just the
+  `# Soul` section, so server-side soul kept getting flipped
+  between "section body" (from bridge edits) and "whole file"
+  (from daemon restarts / link-migrates). Extracted the
+  `# Soul` (or description / about / summary) section helper into
+  `profile_sync.extract_soul_body`, single source of truth, and
+  both sync paths now ship only the section body. When the file
+  has no soul-style heading the server's stored soul is preserved
+  rather than clobbered.
 
 ### Changed
 
