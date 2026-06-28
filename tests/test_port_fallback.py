@@ -35,6 +35,25 @@ def _occupy(port: int) -> socket.socket:
     return s
 
 
+def _occupy_contiguous(n: int) -> tuple[int, list[socket.socket]]:
+    """Hold n contiguous ports starting at some free base. Retries
+    because `_free_port()` only guarantees the base is free —
+    adjacent ports may be in use under CI ephemeral-port contention.
+    Skips the test on persistent contention rather than failing."""
+    for _ in range(30):
+        base = _free_port()
+        socks: list[socket.socket] = []
+        try:
+            for i in range(n):
+                socks.append(_occupy(base + i))
+        except OSError:
+            for s in socks:
+                s.close()
+            continue
+        return base, socks
+    pytest.skip(f"could not find {n} contiguous free ports under load")
+
+
 async def _runner_for_empty_app() -> web.AppRunner:
     app = web.Application()
     runner = web.AppRunner(app)
@@ -73,8 +92,7 @@ async def test_helper_falls_back_one_port_when_requested_taken():
 
 @pytest.mark.asyncio
 async def test_helper_scans_across_multiple_busy_ports():
-    requested = _free_port()
-    blockers = [_occupy(requested), _occupy(requested + 1)]
+    requested, blockers = _occupy_contiguous(2)
     runner = await _runner_for_empty_app()
     try:
         _, bound = await bind_tcp_with_fallback(
@@ -131,8 +149,7 @@ async def test_helper_fallback_start_scans_forward_too():
 
 @pytest.mark.asyncio
 async def test_helper_raises_oserror_when_window_exhausted():
-    requested = _free_port()
-    blockers = [_occupy(requested + i) for i in range(3)]
+    requested, blockers = _occupy_contiguous(3)
     runner = await _runner_for_empty_app()
     try:
         with pytest.raises(OSError):
