@@ -1,8 +1,5 @@
-"""Auto-port-fallback on bind-failure for the daemon's loopback HTTP services.
-
-Real socket binds on 127.0.0.1 (no mocking) so the actual OSError
-shape the helper relies on is exercised end-to-end.
-"""
+"""Auto-port-fallback for the daemon's loopback HTTP services.
+Real socket binds (no mocking) — exercises the real OSError shape."""
 
 from __future__ import annotations
 
@@ -23,7 +20,6 @@ from puffo_agent.portal.state import RpcServiceConfig
 
 
 def _free_port() -> int:
-    """Pick a free port; the caller may re-bind the same number."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
@@ -32,9 +28,8 @@ def _free_port() -> int:
 
 
 def _occupy(port: int) -> socket.socket:
-    """Hold ``127.0.0.1:port`` so the next bind hits EADDRINUSE."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # No SO_REUSEADDR — we want the next bind to actually conflict.
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", port))
     s.listen(1)
     return s
@@ -45,9 +40,6 @@ async def _runner_for_empty_app() -> web.AppRunner:
     runner = web.AppRunner(app)
     await runner.setup()
     return runner
-
-
-# ─── helper: baseline + fallback contract ────────────────────────
 
 
 @pytest.mark.asyncio
@@ -81,7 +73,6 @@ async def test_helper_falls_back_one_port_when_requested_taken():
 
 @pytest.mark.asyncio
 async def test_helper_scans_across_multiple_busy_ports():
-    """Block requested + requested+1; helper should land on +2."""
     requested = _free_port()
     blockers = [_occupy(requested), _occupy(requested + 1)]
     runner = await _runner_for_empty_app()
@@ -98,9 +89,6 @@ async def test_helper_scans_across_multiple_busy_ports():
 
 @pytest.mark.asyncio
 async def test_helper_jumps_to_fallback_start_on_conflict():
-    """When primary is taken, scan begins at fallback_start — not at
-    primary+1 — so callers can route around reserved ports (pinned
-    bridge, sibling service's bound port)."""
     primary = _free_port()
     blocker = _occupy(primary)
     fallback = _free_port()
@@ -120,8 +108,8 @@ async def test_helper_jumps_to_fallback_start_on_conflict():
 
 @pytest.mark.asyncio
 async def test_helper_fallback_start_scans_forward_too():
-    """fallback_start is a *start* — if it's also taken, scan
-    continues from there (never falls back to primary+1)."""
+    # If fallback_start is also taken, scan from there — never fall
+    # back to primary+1 (the load-bearing claim).
     primary = _free_port()
     fallback = _free_port()
     while fallback in (primary, primary + 1):
@@ -134,7 +122,7 @@ async def test_helper_fallback_start_scans_forward_too():
             fallback_start=fallback,
         )
         assert bound > fallback
-        assert bound != primary + 1   # the load-bearing claim
+        assert bound != primary + 1
     finally:
         await runner.cleanup()
         for b in blockers:
@@ -143,7 +131,6 @@ async def test_helper_fallback_start_scans_forward_too():
 
 @pytest.mark.asyncio
 async def test_helper_raises_oserror_when_window_exhausted():
-    """Exhausted window → re-raise so the caller's bind-failure path fires."""
     requested = _free_port()
     blockers = [_occupy(requested + i) for i in range(3)]
     runner = await _runner_for_empty_app()
@@ -161,13 +148,10 @@ async def test_helper_raises_oserror_when_window_exhausted():
             b.close()
 
 
-# ─── data_service: cfg mutation + log surface ────────────────────
-
-
 @pytest.mark.asyncio
 async def test_data_service_mutates_cfg_port_on_fallback(caplog):
-    """Fallback must mutate cfg.port — otherwise the MCP env-vars
-    tell subprocesses to talk to the wrong port."""
+    # Fallback must mutate cfg.port — else the MCP env-vars point
+    # subprocesses at the wrong port.
     requested = _free_port()
     blocker = _occupy(requested)
     cfg = ds.DataServiceConfig(
@@ -191,8 +175,6 @@ async def test_data_service_mutates_cfg_port_on_fallback(caplog):
 
 @pytest.mark.asyncio
 async def test_data_service_honors_fallback_start():
-    """data_service plumbs fallback_start through to the helper so
-    the daemon can route past the pinned bridge + the RPC port."""
     requested = _free_port()
     blocker = _occupy(requested)
     fallback = _free_port()
@@ -226,9 +208,6 @@ async def test_data_service_leaves_cfg_port_alone_when_default_works():
     finally:
         if runner is not None:
             await ds.stop_data_service(runner)
-
-
-# ─── rpc_service: cfg mutation symmetric to data_service ─────────
 
 
 @pytest.mark.asyncio

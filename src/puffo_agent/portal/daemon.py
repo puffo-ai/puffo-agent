@@ -113,11 +113,10 @@ class Daemon:
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_rpc_resolver(self._resolve_host_mcp_context)
-        # Port allocation policy: bridge is pinned at 63387 (browser
-        # clients hard-code it); on conflict both services scan
-        # forward from 63388 so they never touch the bridge port. RPC
-        # starts first so data can route its fallback past whatever
-        # RPC ended up bound to.
+        # Bridge pins 63387 (browser clients hard-code it). Both
+        # fallbacks scan from 63388 onward so neither collides with
+        # bridge; data starts after rpc so its fallback can route
+        # past rpc's resolved port.
         rpc_runner = await start_rpc_service(
             self.daemon_cfg.rpc_service, fallback_start=63388,
         )

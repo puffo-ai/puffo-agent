@@ -430,14 +430,9 @@ async def start_data_service(
     *,
     fallback_start: int | None = None,
 ) -> web.AppRunner | None:
-    """Start the data service. ``None`` when disabled or bind fails
-    (after the 100-port forward-scan window is exhausted). Mutates
-    ``cfg.port`` to the bound value on fallback so the MCP-subprocess
-    env-var passthrough sees the resolved port.
-
-    ``fallback_start`` lets the daemon route the scan past reserved
-    ports (the pinned bridge port + whatever the RPC service ended up
-    bound to)."""
+    """``None`` on disabled / bind-window-exhausted. On fallback,
+    mutates ``cfg.port`` so the MCP-subprocess env-var passthrough
+    sees the resolved port."""
     if not cfg.enabled:
         logger.info("data-service: disabled in daemon.yml; not starting")
         return None
@@ -457,17 +452,15 @@ async def start_data_service(
         )
     except OSError as exc:
         logger.warning(
-            "data-service: failed to bind %s:%d (or any of the next "
-            "99 ports) (%s); cli-docker MCP tools will see disk I/O "
-            "errors on the bind-mounted DB",
+            "data-service: bind %s:%d (+99 fallback) failed (%s); "
+            "cli-docker MCP tools will see disk I/O errors",
             cfg.bind_host, requested_port, exc,
         )
         await runner.cleanup()
         return None
     if bound_port != requested_port:
         logger.info(
-            "data-service: requested port %d in use; fell back to %d "
-            "(MCP subprocess env vars will use the resolved port)",
+            "data-service: port %d in use; fell back to %d",
             requested_port, bound_port,
         )
         cfg.port = bound_port

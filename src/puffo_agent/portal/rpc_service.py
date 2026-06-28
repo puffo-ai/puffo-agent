@@ -125,13 +125,9 @@ async def start_rpc_service(
     *,
     fallback_start: int | None = None,
 ) -> web.AppRunner | None:
-    """``None`` when disabled or bind fails (non-fatal). On port
-    conflict, scans forward within a 100-port window and mutates
-    ``cfg.port`` to the bound value so the MCP-subprocess env-var
-    passthrough sees the resolved port.
-
-    ``fallback_start`` lets the daemon route the scan past reserved
-    ports (the pinned bridge port + the default data-service port)."""
+    """``None`` on disabled / bind-window-exhausted. On fallback,
+    mutates ``cfg.port`` so the MCP-subprocess env-var passthrough
+    sees the resolved port."""
     if not cfg.enabled:
         logger.info("rpc-service: disabled in daemon.yml; not starting")
         return None
@@ -147,9 +143,8 @@ async def start_rpc_service(
         )
     except OSError as exc:
         logger.warning(
-            "rpc-service: bind %s:%d (or any of the next 99 ports) "
-            "failed (%s); host-touching MCP ops will return errors "
-            "to agents",
+            "rpc-service: bind %s:%d (+99 fallback) failed (%s); "
+            "host-touching MCP ops will return errors to agents",
             cfg.bind_host, requested_port, exc,
         )
         try:
@@ -159,8 +154,7 @@ async def start_rpc_service(
         return None
     if bound_port != requested_port:
         logger.info(
-            "rpc-service: requested port %d in use; fell back to %d "
-            "(MCP subprocess env vars will use the resolved port)",
+            "rpc-service: port %d in use; fell back to %d",
             requested_port, bound_port,
         )
         cfg.port = bound_port
