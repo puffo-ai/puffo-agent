@@ -775,8 +775,8 @@ class ProviderConfig:
 
 @dataclass
 class DataServiceConfig:
-    """Loopback HTTP service used by MCP subprocesses to read the
-    per-agent ``messages.db``. See ``portal/data_service.py``."""
+    """Loopback HTTP service MCP subprocesses use to read each
+    agent's ``messages.db``. See ``portal/data_service.py``."""
     enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63386

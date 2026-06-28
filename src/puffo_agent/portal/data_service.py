@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from aiohttp import web
 
 from ..agent.message_store import MessageStore
+from ._port import bind_tcp_with_fallback
 from .state import agent_dir
 
 logger = logging.getLogger(__name__)
@@ -424,9 +425,14 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     return app
 
 
-async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
-    """Start the data service. Returns ``None`` when disabled or the
-    socket bind fails."""
+async def start_data_service(
+    cfg: DataServiceConfig,
+    *,
+    fallback_start: int | None = None,
+) -> web.AppRunner | None:
+    """``None`` on disabled / bind-window-exhausted. On fallback,
+    mutates ``cfg.port`` so the MCP-subprocess env-var passthrough
+    sees the resolved port."""
     if not cfg.enabled:
         logger.info("data-service: disabled in daemon.yml; not starting")
         return None
@@ -438,17 +444,26 @@ async def start_data_service(cfg: DataServiceConfig) -> web.AppRunner | None:
         access_log_format='%r -> %s (%Tf s)',
     )
     await runner.setup()
-    site = web.TCPSite(runner, host=cfg.bind_host, port=cfg.port)
+    requested_port = cfg.port
     try:
-        await site.start()
+        _, bound_port = await bind_tcp_with_fallback(
+            runner, host=cfg.bind_host, port=requested_port,
+            fallback_start=fallback_start,
+        )
     except OSError as exc:
         logger.warning(
-            "data-service: failed to bind %s:%d (%s); cli-docker MCP "
-            "tools will see disk I/O errors on the bind-mounted DB",
-            cfg.bind_host, cfg.port, exc,
+            "data-service: bind %s:%d (+99 fallback) failed (%s); "
+            "cli-docker MCP tools will see disk I/O errors",
+            cfg.bind_host, requested_port, exc,
         )
         await runner.cleanup()
         return None
+    if bound_port != requested_port:
+        logger.info(
+            "data-service: port %d in use; fell back to %d",
+            requested_port, bound_port,
+        )
+        cfg.port = bound_port
     logger.info("data-service: listening on http://%s:%d", cfg.bind_host, cfg.port)
     return runner
 

@@ -14,6 +14,7 @@ from typing import Awaitable, Callable, Optional
 from aiohttp import web
 
 from . import host_mcp_handler
+from ._port import bind_tcp_with_fallback
 from .host_mcp_handler import HostMcpContext
 from .state import RpcServiceConfig
 
@@ -121,29 +122,42 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
 
 async def start_rpc_service(
     cfg: RpcServiceConfig,
+    *,
+    fallback_start: int | None = None,
 ) -> web.AppRunner | None:
-    """Returns ``None`` when disabled or the bind fails (non-fatal)."""
+    """``None`` on disabled / bind-window-exhausted. On fallback,
+    mutates ``cfg.port`` so the MCP-subprocess env-var passthrough
+    sees the resolved port."""
     if not cfg.enabled:
         logger.info("rpc-service: disabled in daemon.yml; not starting")
         return None
     app = build_app(cfg)
     access_logger = logging.getLogger("puffo_agent.portal.rpc_service.access")
     runner = web.AppRunner(app, access_log=access_logger)
+    requested_port = cfg.port
     try:
         await runner.setup()
-        site = web.TCPSite(runner, cfg.bind_host, cfg.port)
-        await site.start()
+        _, bound_port = await bind_tcp_with_fallback(
+            runner, host=cfg.bind_host, port=requested_port,
+            fallback_start=fallback_start,
+        )
     except OSError as exc:
         logger.warning(
-            "rpc-service: bind %s:%d failed (%s); host-touching MCP "
-            "ops will return errors to agents",
-            cfg.bind_host, cfg.port, exc,
+            "rpc-service: bind %s:%d (+99 fallback) failed (%s); "
+            "host-touching MCP ops will return errors to agents",
+            cfg.bind_host, requested_port, exc,
         )
         try:
             await runner.cleanup()
         except Exception:
             pass
         return None
+    if bound_port != requested_port:
+        logger.info(
+            "rpc-service: port %d in use; fell back to %d",
+            requested_port, bound_port,
+        )
+        cfg.port = bound_port
     logger.info("rpc-service: listening on %s:%d", cfg.bind_host, cfg.port)
     return runner
 

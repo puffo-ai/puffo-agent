@@ -8,6 +8,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Auto-port-fallback for the daemon's loopback HTTP services.**
+  The data + RPC services historically pinned `127.0.0.1:63386` /
+  `:63385`. On bind conflict (another process holds the port,
+  another puffo-agent in a cleanup window, Windows `WSAEACCES` /
+  `winerror 10013` on an OS-reserved-range port) the daemon failed
+  and the operator had to hand-edit `daemon.yml`. Both services
+  now scan forward up to 100 ports, mutate `cfg.port` to the bound
+  value (the MCP-subprocess env-var passthrough picks it up
+  transparently), and log `requested port X in use; fell back to
+  Y`. Bind-failure across the whole window still surfaces the
+  pre-existing warning + non-fatal return, just with a wider net.
+  The fallback scan *jumps* — it doesn't increment from the
+  primary. RPC's fallback starts at `63388`; data's fallback starts
+  at `max(63388, rpc_bound + 1)`. That keeps the pinned bridge port
+  (`63387`, browser clients hard-code it) and the sibling service's
+  bound port out of the scan window so a double-conflict never
+  collides with either.
 - **Codex agents now write to the per-agent audit log.** The
   `ClaudeSession.audit` contract already captured the per-turn
   envelope (`session.start` / `turn.input` / `assistant.text` /
