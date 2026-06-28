@@ -22,6 +22,7 @@ RUNTIME_SDK_LOCAL   = "sdk-local"
 RUNTIME_CLI_LOCAL   = "cli-local"
 RUNTIME_CLI_DOCKER  = "cli-docker"
 RUNTIME_WS_LOCAL    = "ws-local"  # external tool consumes over localhost WS
+RUNTIME_API_PUFFO   = "api-puffo"  # cloud-hosted; bearer session_token, no subkey signing
 RUNTIME_CLI_SANDBOX = "cli-sandbox"  # reserved; not yet implemented
 
 VALID_RUNTIMES: frozenset[str] = frozenset({
@@ -30,6 +31,7 @@ VALID_RUNTIMES: frozenset[str] = frozenset({
     RUNTIME_CLI_LOCAL,
     RUNTIME_CLI_DOCKER,
     RUNTIME_WS_LOCAL,
+    RUNTIME_API_PUFFO,
 })
 
 RESERVED_RUNTIMES: frozenset[str] = frozenset({
@@ -100,6 +102,7 @@ DEFAULT_PROVIDER_FOR_RUNTIME: dict[str, str] = {
     RUNTIME_CLI_LOCAL:  PROVIDER_ANTHROPIC,
     RUNTIME_CLI_DOCKER: PROVIDER_ANTHROPIC,
     RUNTIME_WS_LOCAL:   PROVIDER_ANTHROPIC,
+    RUNTIME_API_PUFFO:  PROVIDER_ANTHROPIC,
 }
 
 DEFAULT_HARNESS_FOR_PROVIDER: dict[str, str] = {
