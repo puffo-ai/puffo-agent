@@ -4,7 +4,55 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.3-unreleased]
+## [1.0.3] — 2026-06-27
+
+### Added
+
+- **Startup full-sync of agent profiles.** On daemon boot the
+  daemon now PATCHes every owned agent's `display_name` + `role` +
+  `role_short` + `avatar_url` + `soul` (full `profile.md` body) to
+  `/identities/self`, in parallel, independent of link state. Each
+  worker also fires a fire-and-forget sync after `adapter.warm()`
+  completes. Together these defend against the operator
+  hand-editing `agent.yml` / `profile.md` while the daemon was
+  offline — the server-side view would otherwise stay stale until
+  the next manual edit through the bridge.
+- **Bridge `list_agents` is empty for linked operators.** When the
+  bridge-paired operator is also one of the entries in
+  `control/pairings.json` (the operator has run
+  `puffo-agent machine link`), `GET /v1/agents` returns
+  `{"agents": []}`. The operator already sees the same agents
+  through the server's link channel; the bridge would otherwise
+  double-list them in the web UI.
+
+### Fixed
+
+- **Bridge UI soul edit silently no-op'd the agent.** The
+  `update_profile` handler wrote `profile.md` on disk but never
+  PATCHed `soul` to `/identities/self` — server-side soul stayed
+  stale on any UI soul edit. It also dropped `reload.flag` only on
+  display_name rename, so pure soul edits never refreshed the
+  running worker's system prompt. Both fixed; `reload.flag` now
+  fires on any prompt-affecting change (soul, display_name, role).
+- **CLI `agent rename` drifted from the bridge.** Previously
+  updated `agent.yml` only — didn't rewrite the `profile.md`
+  heading, didn't PATCH the new name to the server, didn't reload
+  the running worker. Now mirrors the bridge edit flow exactly.
+
+### Changed
+
+- **Disk-first ordering across every edit path.** Bridge
+  `update_profile`, control-WS `op=edit`, and CLI `agent profile` /
+  `agent rename` now all write `agent.yml` + `profile.md` BEFORE
+  pushing to the server. A sync failure leaves the local edit
+  intact instead of silently dropping it.
+- **Control-WS `op=edit` no longer always restart.flag-bombs.**
+  Runtime block changes (provider/model/harness/kind) still write
+  `restart.flag` (the CLI spawn args differ; full worker respawn
+  is required). Prompt-only changes (display_name, role, soul,
+  avatar_url, raw profile body) now write `reload.flag` instead —
+  lazy on next batch, preserves the AI session via
+  `claude --resume` / `codex thread/resume`.
 
 ### Performance
 
