@@ -4,10 +4,25 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.2-unreleased]
+## [1.0.2] — 2026-06-27
 
 ### Added
 
+- **Soul sync on link-mode migrate.** The daemon's link-mode
+  migrate (`control/link.migrate_owned_agents`) historically only
+  stamped each owned agent's `machine_id` via
+  `POST /agents/me/heartbeat` — the server's identity `soul` field
+  stayed empty for any agent the operator hadn't manually edited
+  via the bridge since linking, so the web profile pane rendered an
+  empty soul-section. Migrate now also PATCHes the agent's
+  `profile.md` body onto its server identity (re-using the existing
+  `sync_agent_profile` → `PATCH /identities/self` path that the
+  bridge `edit` flow already uses; soul is owner-gated and not
+  broadcast). Fires on link-approval and on every daemon-startup
+  re-assert. Best-effort: a soul PATCH failure (HTTP, missing
+  `profile.md`, OS read error) logs a warning but doesn't unwind
+  the machine_id stamp. Note: server caps soul at 16000 chars —
+  profiles longer than that get HTTP 400 and a warn-then-skip.
 - **Auto-port-fallback for the daemon's loopback HTTP services.**
   The data + RPC services historically pinned `127.0.0.1:63386` /
   `:63385`. On bind conflict (another process holds the port,
