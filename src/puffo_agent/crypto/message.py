@@ -111,6 +111,22 @@ def encrypt_message(
     *,
     now_ms: int | None = None,
 ) -> dict:
+    envelope, _ = encrypt_message_with_content_key(
+        inp, signing_key, now_ms=now_ms,
+    )
+    return envelope
+
+
+def encrypt_message_with_content_key(
+    inp: EncryptInput,
+    signing_key: Ed25519KeyPair,
+    *,
+    now_ms: int | None = None,
+) -> tuple[dict, bytes]:
+    """Same as ``encrypt_message`` but also returns the symmetric
+    ``content_key`` so the caller can build a supplementation
+    envelope later (re-wrapping the same content_key for additional
+    devices that the server reports as ``missing_devices``)."""
     if not inp.recipients:
         raise ValueError("no recipients")
 
@@ -196,7 +212,38 @@ def encrypt_message(
         "recipients": recipient_entries,
     }
 
-    return envelope
+    return envelope, content_key
+
+
+def build_supplementation_envelope(
+    base_envelope: dict,
+    content_key: bytes,
+    devices: list[RecipientDevice],
+) -> dict:
+    """Build a same-``envelope_id`` envelope re-wrapping ``content_key``
+    for ``devices`` (devices the server reported as ``missing_devices``
+    on the original send). All envelope fields are reused verbatim
+    EXCEPT ``recipients[]``, which carries only the new HPKE wraps.
+    Server treats this as a delivery-list extension keyed by the
+    repeated ``envelope_id`` — the content_nonce + content_ciphertext
+    must be byte-identical for the merge to land."""
+    if not devices:
+        raise ValueError("no recipients")
+    envelope_id = base_envelope["envelope_id"]
+    recipient_entries = []
+    for device in devices:
+        wrap_aad = compute_wrap_aad(envelope_id, device.device_id)
+        hpke_out = hpke_seal(
+            device.kem_public_key, MESSAGE_HPKE_INFO, wrap_aad, content_key,
+        )
+        recipient_entries.append({
+            "device_id": device.device_id,
+            "hpke_enc": base64url_encode(hpke_out.enc),
+            "wrapped_content_key": base64url_encode(hpke_out.ciphertext),
+        })
+    supp: dict[str, Any] = dict(base_envelope)
+    supp["recipients"] = recipient_entries
+    return supp
 
 
 def decrypt_message(

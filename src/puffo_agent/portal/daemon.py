@@ -36,6 +36,7 @@ from .state import (
     DaemonConfig,
     agent_dir,
     agent_home_dir,
+    agent_yml_path,
     agents_dir,
     archive_flag_path,
     archived_dir,
@@ -69,6 +70,12 @@ class Daemon:
         # Cap on per-worker warm wait so a wedged warm can't pin the
         # whole reconciler. The worker keeps retrying in the background.
         self._warm_serialise_timeout = 120.0
+        # mtime-cache for agent.yml so the reconcile tick doesn't
+        # re-parse YAML for every agent every interval when nothing
+        # changed. Key: agent_id → (st_mtime_ns, st_size, AgentConfig).
+        # Sentinel flags (archive/delete/restart) provide event-driven
+        # signal for the cases that actually need a fresh read.
+        self._agent_cfg_cache: dict[str, tuple[int, int, "AgentConfig"]] = {}
         # PUF-221: daemon owns Claude OAuth refresh — single writer to
         # the canonical credential store so Anthropic's single-use
         # refresh-token rotation can't be raced by N agent workers.
@@ -185,9 +192,30 @@ class Daemon:
     def request_stop(self) -> None:
         self._stop.set()
 
+    def _load_agent_cfg_cached(self, agent_id: str) -> "AgentConfig":
+        """Return ``AgentConfig`` for ``agent_id``, reusing a cached
+        parse when ``agent.yml``'s mtime + size are unchanged. Raises
+        the same exceptions as ``AgentConfig.load`` on parse failure;
+        the caller is responsible for the try/except."""
+        path = agent_yml_path(agent_id)
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        cached = self._agent_cfg_cache.get(agent_id)
+        if cached is not None and (cached[0], cached[1]) == key:
+            return cached[2]
+        cfg = AgentConfig.load(agent_id)
+        self._agent_cfg_cache[agent_id] = (st.st_mtime_ns, st.st_size, cfg)
+        return cfg
+
     async def _reconcile_once(self) -> None:
         on_disk = set(discover_agents())
         running = set(self.workers.keys())
+
+        # Evict cached AgentConfig for any agent that's no longer on
+        # disk — release memory, avoid serving a stale parse if the
+        # id is later re-created with a fresh file.
+        for stale_id in list(self._agent_cfg_cache.keys() - on_disk):
+            self._agent_cfg_cache.pop(stale_id, None)
 
         # Agents that disappeared from disk → stop.
         for agent_id in running - on_disk:
@@ -232,7 +260,7 @@ class Daemon:
         # Agents on disk → check state and (start | stop | leave alone).
         for agent_id in sorted(on_disk):
             try:
-                agent_cfg = AgentConfig.load(agent_id)
+                agent_cfg = self._load_agent_cfg_cached(agent_id)
             except Exception as exc:
                 logger.warning("agent %s: failed to load agent.yml: %s", agent_id, exc)
                 continue

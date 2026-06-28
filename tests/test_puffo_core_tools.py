@@ -1040,16 +1040,25 @@ async def test_resolve_root_id_depth_cap_preserves_root_id_with_warning():
 def _spy_encrypt_input(monkeypatch):
     """Capture the EncryptInput so tests can assert on the payload's
     thread_root_id (which lives inside the ciphertext, not on the
-    outer envelope dict)."""
+    outer envelope dict). Patches both ``encrypt_message`` and
+    ``encrypt_message_with_content_key`` — send paths use the latter
+    for post-send supplementation; legacy callers still use the
+    former."""
     import puffo_agent.mcp.puffo_core_tools as pct
     captured: dict = {}
     real = pct.encrypt_message
+    real_with_key = pct.encrypt_message_with_content_key
 
     def spy(inp, signing_key, **kw):
         captured["inp"] = inp
         return real(inp, signing_key, **kw)
 
+    def spy_with_key(inp, signing_key, **kw):
+        captured["inp"] = inp
+        return real_with_key(inp, signing_key, **kw)
+
     monkeypatch.setattr(pct, "encrypt_message", spy)
+    monkeypatch.setattr(pct, "encrypt_message_with_content_key", spy_with_key)
     return captured
 
 

@@ -8,6 +8,7 @@ local tools live in ``host_tools.py``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import urllib.parse
@@ -25,7 +26,13 @@ from ..crypto.attachments import (
 from ..crypto.encoding import base64url_decode, base64url_encode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
-from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
+from ..crypto.message import (
+    EncryptInput,
+    RecipientDevice,
+    build_supplementation_envelope,
+    encrypt_message,
+    encrypt_message_with_content_key,
+)
 from ..crypto.primitives import Ed25519KeyPair
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
@@ -130,6 +137,46 @@ async def _fetch_device_keys(
         if not data.get("has_more"):
             break
     return devices
+
+
+async def _supplement_missing_devices(
+    http_client: PuffoCoreHttpClient,
+    envelope: dict,
+    content_key: bytes,
+    recipient_slugs: list[str],
+    missing_device_ids: list[str],
+) -> None:
+    """Re-fetch certs for ``recipient_slugs``, filter to devices the
+    server reported as missing, and POST a same-``envelope_id``
+    supplementation envelope. Best-effort — the original send already
+    landed delivery to known devices; this catches the race where a
+    recipient added a device between cert-cache freshness and our
+    POST. Logs + swallows on failure."""
+    envelope_id = envelope.get("envelope_id", "?")
+    try:
+        fresh = await _fetch_device_keys(http_client, recipient_slugs)
+        wanted = set(missing_device_ids)
+        supp_devices = [d for d in fresh if d.device_id in wanted]
+        if not supp_devices:
+            logger.warning(
+                "supplementation: server reported %d missing device(s) "
+                "for %s but fresh /certs/sync returned none of them; "
+                "those devices won't receive this message",
+                len(missing_device_ids), envelope_id,
+            )
+            return
+        supp_env = build_supplementation_envelope(
+            envelope, content_key, supp_devices,
+        )
+        await http_client.post("/messages", supp_env)
+        logger.debug(
+            "supplementation: re-posted %s to %d device(s)",
+            envelope_id, len(supp_devices),
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "supplementation: failed for %s: %s", envelope_id, exc,
+        )
 
 
 def _coerce_root_visibility(
@@ -474,9 +521,17 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             content=text,
             recipients=devices,
         )
-        envelope = encrypt_message(inp, signing_key)
+        envelope, content_key = encrypt_message_with_content_key(
+            inp, signing_key,
+        )
         # Server expects the envelope at the top level, not wrapped.
-        await cfg.http_client.post("/messages", envelope)
+        resp = await cfg.http_client.post("/messages", envelope) or {}
+        missing = resp.get("missing_devices") or []
+        if missing:
+            asyncio.create_task(_supplement_missing_devices(
+                cfg.http_client, envelope, content_key,
+                recipient_slugs, missing,
+            ))
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
             f"{fold_note}"
@@ -1081,8 +1136,16 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             content=body_content,
             recipients=devices,
         )
-        envelope = encrypt_message(inp, signing_key)
-        await cfg.http_client.post("/messages", envelope)
+        envelope, content_key = encrypt_message_with_content_key(
+            inp, signing_key,
+        )
+        resp = await cfg.http_client.post("/messages", envelope) or {}
+        missing = resp.get("missing_devices") or []
+        if missing:
+            asyncio.create_task(_supplement_missing_devices(
+                cfg.http_client, envelope, content_key,
+                recipient_slugs, missing,
+            ))
         names = ", ".join(t.name for t in targets)
         thread_note = f" in thread {resolved_root}" if resolved_root else ""
         return (
