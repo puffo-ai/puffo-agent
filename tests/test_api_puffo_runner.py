@@ -21,16 +21,16 @@ from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.api_puffo.bundle import (
+from puffo_agent_cloud.bundle import (
     ApiPuffoBundle,
     materialise_agent_dir,
 )
-from puffo_agent.agent.api_puffo.cloud_client import (
+from puffo_agent_cloud.cloud_client import (
     BridgeError,
     CloudBridgeClient,
     CloudLlmClient,
 )
-from puffo_agent.agent.api_puffo.tools import dispatch_tool
+from puffo_agent_cloud.tools import dispatch_tool
 
 
 def _isolated_home() -> str:
@@ -62,7 +62,7 @@ def _valid_bundle(slug: str, cloud_url: str) -> ApiPuffoBundle:
 
 
 def test_tool_schemas_match_bridge_protocol_surface():
-    from puffo_agent.agent.api_puffo.tools import TOOL_SCHEMAS
+    from puffo_agent_cloud.tools import TOOL_SCHEMAS
     names = {t["name"] for t in TOOL_SCHEMAS}
     assert names == {"send_message", "list_spaces"}
 
@@ -316,7 +316,7 @@ async def test_runner_end_to_end_message_llm_tool_ack():
         bundle = _valid_bundle(slug="rb-bot", cloud_url=url)
         materialise_agent_dir(bundle)
 
-        from puffo_agent.agent.api_puffo.runner import ApiPuffoRunner
+        from puffo_agent_cloud.runner import ApiPuffoRunner
         stop = asyncio.Event()
         runner = ApiPuffoRunner("rb-bot", stop)
 

@@ -32,17 +32,18 @@ from typing import Any
 import psutil
 import yaml
 
-
-# Where daemon.yml, agents/, etc. live.
-def home_dir() -> Path:
-    override = os.environ.get("PUFFO_AGENT_HOME")
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".puffo-agent"
-
-
-def agents_dir() -> Path:
-    return home_dir() / "agents"
+# home/agent path resolution + agent-id validation now live in the
+# stdlib-only kernel so the slim cloud runtime can reuse them; we
+# re-export here so every existing ``from ..portal.state import
+# home_dir / agents_dir / agent_dir / agent_yml_path /
+# is_valid_agent_id`` call site keeps resolving unchanged.
+from puffo_agent_core.paths import (  # noqa: F401
+    agent_dir,
+    agent_yml_path,
+    agents_dir,
+    home_dir,
+    is_valid_agent_id,
+)
 
 
 def archived_dir() -> Path:
@@ -727,14 +728,6 @@ def pairing_path() -> Path:
     return home_dir() / "pairing.json"
 
 
-def agent_dir(agent_id: str) -> Path:
-    return agents_dir() / agent_id
-
-
-def agent_yml_path(agent_id: str) -> Path:
-    return agent_dir(agent_id) / "agent.yml"
-
-
 def runtime_json_path(agent_id: str) -> Path:
     return agent_dir(agent_id) / "runtime.json"
 
@@ -1252,13 +1245,6 @@ _RUNTIME_LAST_SAVE: dict[str, tuple[str, int]] = {}
 # ─────────────────────────────────────────────────────────────────────────────
 # Discovery + helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-_AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
-
-
-def is_valid_agent_id(agent_id: str) -> bool:
-    return bool(_AGENT_ID_RE.match(agent_id)) and len(agent_id) <= 64
 
 
 def discover_agents() -> list[str]:

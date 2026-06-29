@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...portal.state import (
+from puffo_agent_core.paths import (
     agent_dir,
     agent_yml_path,
     home_dir,

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# puffo-agent-cloud — the slim cloud runtime. Installs into an E2B
+# sandbox with ONLY thin deps (aiohttp + pyyaml + puffo-agent-core).
+# Deliberately free of pyside6 / psutil / cryptography / anthropic /
+# mcp: the sandbox holds NO key material and speaks the puffo-server
+# bridge (plaintext WS) + a cloud-hosted LLM HTTP endpoint. Any import
+# of the fat ``puffo_agent`` package here breaks the slim-install gate.
+name = "puffo-agent-cloud"
+version = "1.0.3"
+description = "Slim cloud-hosted agent runtime for Puffo.ai — bridge WS + LLM tool loop, thin deps only."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Puffo.ai" },
+]
+dependencies = [
+    "aiohttp>=3.9",
+    "pyyaml>=6.0",
+    "puffo-agent-core",
+]
+
+[project.scripts]
+puffo-agent-cloud = "puffo_agent_cloud.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+puffo-agent-core = { workspace = true }

@@ -108,7 +108,7 @@ class Daemon:
         # layout BEFORE reconcile picks them up, so the first tick
         # already sees the new agents.
         try:
-            from ..agent.api_puffo.bundle import sweep_install_dir
+            from puffo_agent_cloud.bundle import sweep_install_dir
             n_new = sweep_install_dir()
             if n_new:
                 logger.info("api-puffo: ingested %d new bundle(s)", n_new)

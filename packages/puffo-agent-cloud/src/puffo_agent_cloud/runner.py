@@ -11,8 +11,8 @@ import asyncio
 import logging
 from typing import Any
 
-from ...portal.profile_sync import extract_soul_body
-from ...portal.state import AgentConfig
+from puffo_agent_core.profile import extract_soul_body
+from .config import CloudAgentConfig
 from .cloud_client import (
     BridgeClosed,
     BridgeError,
@@ -36,7 +36,7 @@ class ApiPuffoRunner:
         self.agent_id = agent_id
         self._stop = stop_event
         self._keys: ApiPuffoKeystore | None = None
-        self._cfg: AgentConfig | None = None
+        self._cfg: CloudAgentConfig | None = None
         self._llm: CloudLlmClient | None = None
         # Set during each connection epoch.
         self._bridge: CloudBridgeClient | None = None
@@ -48,7 +48,7 @@ class ApiPuffoRunner:
     async def run(self) -> None:
         try:
             self._keys = ApiPuffoKeystore.for_agent(self.agent_id)
-            self._cfg = AgentConfig.load(self.agent_id)
+            self._cfg = CloudAgentConfig.load(self.agent_id)
         except FileNotFoundError:
             logger.error(
                 "api-puffo runner %s: keystore missing; bundle ingestion failed?",

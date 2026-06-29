@@ -33,6 +33,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    # Workspace members. puffo-agent-core is the stdlib-only shared
+    # kernel (paths/profile); puffo-agent-cloud is the slim cloud
+    # runtime the daemon/worker launch locally for api-puffo agents.
+    "puffo-agent-core",
+    "puffo-agent-cloud",
     "aiohttp>=3.9",
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
@@ -80,3 +85,14 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "puffo_agent.portal.ui.assets" = ["*.png"]
+
+# ── uv workspace ─────────────────────────────────────────────────
+# Three members: the fat `puffo-agent` (this root), the stdlib-only
+# `puffo-agent-core`, and the slim `puffo-agent-cloud`. The dependency
+# edge is acyclic: core ← cloud ← fat. `uv sync` resolves all three.
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+puffo-agent-core = { workspace = true }
+puffo-agent-cloud = { workspace = true }

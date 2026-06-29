@@ -13,14 +13,17 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.api_puffo.bundle import (
+from puffo_agent_cloud.bundle import (
     ApiPuffoBundle,
     ingest_bundle,
     install_dir,
     materialise_agent_dir,
     sweep_install_dir,
 )
-from puffo_agent.agent.api_puffo.keystore import ApiPuffoKeystore
+from puffo_agent_cloud.keystore import ApiPuffoKeystore
+# Deliberately the FAT loader: the bundle writes an agent.yml that the
+# full puffo-agent AgentConfig must still parse (cloud + local agree on
+# the on-disk schema).
 from puffo_agent.portal.state import AgentConfig, agent_dir, agent_yml_path
 
 
