@@ -789,6 +789,29 @@ class CredentialRefresher:
     def expires_in_seconds(self) -> int | None:
         return self.backend.expires_in_seconds()
 
+    async def ensure_fresh(self) -> bool:
+        """Blocking version of the refresh path: return True iff the
+        backend currently has a credential with >0s remaining. Uses
+        the same single-writer mutex + re-check-after-lock pattern as
+        ``_refresh_now``, so N concurrent callers coalesce into one
+        backend.refresh() per actually-expired credential.
+
+        ``by_agent=False`` so ``_refresh_now``'s post-lock re-check
+        fires — N concurrent ensure_fresh() callers see "another
+        caller already refreshed" and return without re-invoking the
+        backend.
+
+        Intended for pre-delivery gating: a Worker calls this right
+        before handing a batch to its adapter, and skips the dispatch
+        if False so the agent's own claude never has to discover the
+        401 itself."""
+        expires = self.expires_in_seconds()
+        if expires is not None and expires > REFRESH_SAFETY_MARGIN_SECONDS:
+            return True
+        await self._refresh_now(expires_in=expires, by_agent=False)
+        expires = self.expires_in_seconds()
+        return expires is not None and expires > 0
+
     async def run_loop(self, stop_event: asyncio.Event) -> None:
         """Main daemon coroutine. Polls every REFRESH_POLL_SECONDS or
         wakes early when an agent reports a 401. macOS backend also
