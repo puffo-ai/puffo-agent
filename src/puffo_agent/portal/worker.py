@@ -1265,6 +1265,12 @@ class Worker:
                 turn_succeeded = False
                 turn_error = f"{type(exc).__name__}: {exc}"
             finally:
+                if turn_error:
+                    from .control.reporter import get_reporter
+
+                    asyncio.ensure_future(
+                        get_reporter().emit(agent_id, "error", {"error": turn_error})
+                    )
                 if run_id is not None and first_post_id:
                     # Build the batch payload: first row reuses the
                     # /start run_id (server UPDATEs its row); the

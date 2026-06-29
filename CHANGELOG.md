@@ -16,8 +16,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   client renders this as a per-agent activity log. Covers both the
   claude-code and codex harnesses. Best-effort and ephemeral: the
   updates no-op when the operator isn't linked and never affect the
-  agent's own processing. `[SILENT]` turns and the cached portion of
-  codex's input token count are excluded.
+  agent's own processing. `[SILENT]` turns are excluded, and the
+  reported input token count excludes the re-sent cached context on
+  both harnesses so it reflects the turn's new work.
+- **Turn errors reported to the operator.** When a turn fails (auth
+  error, API error, or an unexpected exception), the daemon streams
+  an `agent.status` error event so it surfaces in the operator's
+  activity log, not only in the heartbeat status.
 
 ## [1.0.3] — 2026-06-27
 
