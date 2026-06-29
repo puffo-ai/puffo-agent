@@ -4,6 +4,27 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.4a0] — 2026-06-29
+
+Pre-release alpha for testing PR #103 (macOS credential-refresh
+race fix). Not for production.
+
+### Fixed
+
+- **macOS: pre-delivery token gate.** On macOS, before handing a
+  message batch to a `cli-local` / `cli-docker` claude agent, the
+  worker now blocks on the daemon's `CredentialRefresher.ensure_fresh()`
+  through the same single-writer mutex the daemon uses internally.
+  If the post-refresh credential still has 0s remaining (refresh
+  failed at the system level — e.g. expired refresh token,
+  keychain split-brain), the worker flips the agent to `auth_failed`
+  and raises `AgentAPIError` so the batch is deferred via the
+  consumer's redelivery path instead of being handed to an adapter
+  that will 401. PUF-221 had wired the daemon-owned refresh + mutex
+  but agents never actually called it; this closes that gap. The
+  pre-existing `_auth_failed_notification_sent` dedup ensures the
+  operator DM fires at most once per expiration episode.
+
 ## [1.0.3] — 2026-06-27
 
 ### Added
