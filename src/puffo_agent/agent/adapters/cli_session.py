@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from .base import TurnResult
+from .base import TurnResult, is_silent
 
 logger = logging.getLogger(__name__)
 
@@ -704,6 +704,11 @@ class ClaudeSession:
         output_tokens = 0
         event_types_seen: list[str] = []
 
+        # Stream tool calls to the operator over the portal reverse channel.
+        from ...portal.control.reporter import get_reporter
+
+        reporter = get_reporter()
+
         while True:
             try:
                 line = await self._proc.stdout.readline()
@@ -742,6 +747,14 @@ class ClaudeSession:
                     if bt == "text":
                         text = block.get("text", "") or ""
                         reply_parts.append(text)
+                        # A block containing the silent marker is the agent's
+                        # "don't reply" signal, not content — skip it. Real
+                        # narration blocks still stream; fallback (core.py)
+                        # reports the auto-posted reply separately.
+                        if text and not is_silent(text):
+                            asyncio.ensure_future(
+                                reporter.emit(self.agent_id, "assistant_text", {"text": text})
+                            )
                         if self.audit is not None and text:
                             self.audit.write("assistant.text", text=text)
                     elif bt == "tool_use":
@@ -749,6 +762,14 @@ class ClaudeSession:
                         name = block.get("name", "")
                         tool_input = block.get("input") or {}
                         tool_names_used.append(name)
+                        tool_event = {"tool": name}
+                        if "send_message" in name:
+                            body = tool_input.get("text")
+                            if isinstance(body, str):
+                                tool_event["content"] = body[:200]
+                        asyncio.ensure_future(
+                            reporter.emit(self.agent_id, "tool_use", tool_event)
+                        )
                         if name == "mcp__puffo__send_message":
                             send_message_targets.append({
                                 "channel": str(tool_input.get("channel", "")),

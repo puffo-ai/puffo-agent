@@ -292,6 +292,7 @@ class MachineControlClient:
                     )
 
                 get_reporter().set_sender(_report)
+                log.info("control: WS connected; agent.status sender ready")
                 try:
                     async for msg in ws:
                         if stop.is_set():

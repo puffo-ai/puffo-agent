@@ -58,6 +58,13 @@ class AgentStatusReporter:
             sender = self._sender
             if sender is not None:
                 await sender(operator_slug, envelope)
+                log.info(
+                    "reporter: agent.status '%s' for %s → %s (%d device(s))",
+                    event,
+                    agent_slug,
+                    operator_slug,
+                    len(recipients),
+                )
         except Exception as exc:  # noqa: BLE001 — best-effort; never break a turn.
             log.debug("reporter: emit failed: %s", exc)
 

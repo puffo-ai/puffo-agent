@@ -5,6 +5,7 @@ from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
+from .adapters.base import is_silent
 from .memory import MemoryManager
 
 MAX_LOG_ENTRIES = 60
@@ -251,7 +252,7 @@ class PuffoAgent:
                 )
             return None
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
-        if "[SILENT]" in joined:
+        if is_silent(joined):
             return None
         if "API Error" in joined:
             is_auth = looks_like_auth_error(joined)
@@ -288,29 +289,34 @@ class PuffoAgent:
             memory_dir=self.memory_dir,
             on_progress=on_progress,
         )
-        # Portal reverse channel: a lifecycle ping at the start so the operator
-        # sees processing begin, the rich summary at the end. Best-effort +
-        # ephemeral — the reporter no-ops if the WS is down / owner unlinked and
-        # never raises. (Per-tool / per-token streaming is a planned follow-up.)
+        # Portal reverse channel: turn_start (with the message being worked on),
+        # then the adapter streams assistant_text / tool_use, then turn_complete
+        # carries the token usage. Best-effort + ephemeral — the reporter no-ops
+        # if the WS is down / owner unlinked and never raises.
         from ..portal.control.reporter import get_reporter
 
-        asyncio.ensure_future(get_reporter().emit(self.agent_id, "turn_start", {}))
+        # The log entry is a metadata block; surface just the message body
+        # (multi-line, whitespace collapsed), dropping any followups section.
+        message_preview = ""
+        for m in reversed(ctx.messages):
+            content = m.get("content")
+            if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
+                body = content.split("- message: ", 1)[1]
+                cut = body.find("\n- followup_messages_since:")
+                if cut != -1:
+                    body = body[:cut]
+                message_preview = " ".join(body.split())[:200]
+                break
+        asyncio.ensure_future(
+            get_reporter().emit(self.agent_id, "turn_start", {"message": message_preview})
+        )
         result = await self.adapter.run_turn(ctx)
 
         asyncio.ensure_future(
             get_reporter().emit(
                 self.agent_id,
                 "turn_complete",
-                {
-                    "assistant_text": result.reply or "",
-                    "tools": result.metadata.get("tool_names") or [],
-                    "tokens": {
-                        "input": result.input_tokens,
-                        "output": result.output_tokens,
-                        "tool_calls": result.tool_calls,
-                    },
-                    "harness": result.metadata.get("harness"),
-                },
+                {"tokens": {"input": result.input_tokens, "output": result.output_tokens}},
             )
         )
 
@@ -335,7 +341,7 @@ class PuffoAgent:
         # doesn't matter. Real replies go via send_message, so a
         # prose-only turn mentioning the marker is correctly silent.
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
-        if "[SILENT]" in joined:
+        if is_silent(joined):
             self.logger.debug(
                 f"[silent] [{channel_name}] @{sender}: agent chose not to reply"
             )
@@ -368,6 +374,11 @@ class PuffoAgent:
             f"[fallback] [{channel_name}] @{sender}: agent skipped both "
             f"send_message and [SILENT] markers; posting "
             f"{len(text_parts) or 1}-frame fallback"
+        )
+        asyncio.ensure_future(
+            get_reporter().emit(
+                self.agent_id, "tool_use", {"tool": "fallback", "content": fallback[:200]}
+            )
         )
         self._append_assistant(channel_name, fallback)
         return fallback
