@@ -1,22 +1,9 @@
 """api-puffo worker loop.
 
-Replaces the regular ``PuffoCoreMessageClient`` + adapter flow for
-cloud-hosted agents. Per the bridge wire-protocol spec:
-
-  1. Connect WS at ``<cloud>/v2/cloud-agents/subscribe`` with
-     ``x-sandbox-token`` on the upgrade. Wait for ``connected``.
-  2. ``fetch_pending`` → drain ``message`` + ``pending_delivered``
-     frames → ack the batch. Loop on ``more = true``.
-  3. Main loop: every inbound ``message`` frame fires one LLM turn;
-     the LLM's tool calls dispatch to bridge frames (``send``,
-     ``list_spaces``); ack the envelope after the turn returns
-     (success OR failure — server already routes; ack just stops
-     re-delivery). Heartbeat is handled by the bridge client
-     background task.
-
-Single-turn per envelope for now (no thread queue / no local DB).
-Conversation history is the live WS stream; ``fetch_pending`` is
-the only backfill primitive."""
+Single-turn per envelope (no thread queue / no local DB) —
+conversation history is the live WS stream, ``fetch_pending`` is
+the only backfill primitive. On-connect / dispatch / ack cadence
+follows BRIDGE-WIRE-PROTOCOL.md §5."""
 
 from __future__ import annotations
 
@@ -88,9 +75,6 @@ class ApiPuffoRunner:
             await self._cleanup()
 
     async def _connect_and_serve_loop(self) -> None:
-        """Reconnect with exponential backoff on transport errors.
-        Authentication failures (BridgeError code=HANDSHAKE on 401)
-        log loud + back off — operator action required."""
         backoff = _RECONNECT_BACKOFF_MIN
         while not self._stop.is_set():
             try:
@@ -149,18 +133,13 @@ class ApiPuffoRunner:
             backoff = min(backoff * 2, _RECONNECT_BACKOFF_MAX)
 
     async def _on_connect_flow(self) -> None:
-        """Spec §5.4: backfill via ``fetch_pending`` → process →
-        ack. Reader/worker split so frame consumption never blocks
-        on the LLM turn (``send_send``'s ack needs the iterator
-        free). Both reader + worker run as concurrent tasks; the
-        reader puts ALL relevant frames on the inbox and the worker
-        is the single state owner (backfill batch accumulator + ack
-        cadence)."""
+        # Reader + worker split: send_send's ack arrives on the same
+        # WS the reader is pumping, so the reader must never block on
+        # LLM-turn work or dispatch_tool deadlocks.
         assert self._bridge is not None
         self._inbox_consumer = asyncio.create_task(self._inbox_loop())
         self._reader_task = asyncio.create_task(self._reader_loop())
         await self._bridge.send_fetch_pending()
-        # Wait until the worker reports "backfill drained" or stop fires.
         try:
             await asyncio.wait_for(
                 self._backfill_done.wait(), timeout=300.0,
@@ -172,8 +151,6 @@ class ApiPuffoRunner:
             )
 
     async def _reader_loop(self) -> None:
-        """Pulls every relevant frame off the bridge into the inbox.
-        Errors are logged inline (they don't tear down the WS)."""
         assert self._bridge is not None
         try:
             async for frame in self._bridge.frames():
@@ -204,10 +181,8 @@ class ApiPuffoRunner:
                 pass
 
     async def _inbox_loop(self) -> None:
-        """Serial worker: process frames in arrival order. Accumulates
-        backfill envelope_ids and acks them in one shot when
-        ``pending_delivered`` lands; live messages are acked one at a
-        time after each turn."""
+        # Backfill envelopes batch into one ack on pending_delivered;
+        # live messages ack one at a time after each turn.
         assert self._bridge is not None
         in_backfill = True
         backfill_ids: list[str] = []
@@ -258,8 +233,6 @@ class ApiPuffoRunner:
                 self._inbox.task_done()
 
     async def _consume_frames(self) -> None:
-        """Main loop wait — the reader + inbox tasks do the work.
-        Block until stop or reader exits."""
         if self._reader_task is None:
             return
         stop_task = asyncio.create_task(self._stop.wait())
@@ -288,8 +261,6 @@ class ApiPuffoRunner:
         await self._run_turn(text)
 
     async def _run_turn(self, user_text: str) -> None:
-        """One LLM turn with tool-loop. Caps at ``_MAX_TOOL_ROUNDS``
-        rounds before logging a hard cap warning + returning."""
         assert (
             self._llm is not None and self._cfg is not None
             and self._keys is not None and self._bridge is not None

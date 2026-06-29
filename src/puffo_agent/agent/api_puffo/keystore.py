@@ -1,10 +1,5 @@
-"""Keystore loader for api-puffo agents.
-
-Server-side ``puffo-server/cloud_agent`` holds all crypto; the
-runtime needs only the sandbox_token (bearer for the WS upgrade)
-and the cloud server URL. ``slug`` is included for symmetry with
-the legacy keystore + as a sanity check when constructing WS URLs.
-"""
+"""Keystore loader for api-puffo agents — sandbox_token + cloud
+URL only; server-side holds the actual crypto."""
 
 from __future__ import annotations
 

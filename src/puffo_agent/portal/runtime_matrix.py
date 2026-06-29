@@ -221,7 +221,7 @@ __all__ = [
     # runtime constants
     "RUNTIME_CHAT_LOCAL", "RUNTIME_SDK_LOCAL",
     "RUNTIME_CLI_LOCAL", "RUNTIME_CLI_DOCKER", "RUNTIME_WS_LOCAL",
-    "RUNTIME_CLI_SANDBOX",
+    "RUNTIME_API_PUFFO", "RUNTIME_CLI_SANDBOX",
     # provider constants
     "PROVIDER_ANTHROPIC", "PROVIDER_OPENAI", "PROVIDER_GOOGLE",
     # harness constants

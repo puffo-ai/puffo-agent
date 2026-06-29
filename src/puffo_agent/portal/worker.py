@@ -1007,9 +1007,10 @@ class Worker:
             self.runtime.save(agent_id)
 
     async def _run_api_puffo(self) -> None:
-        """api-puffo agents skip the PuffoCoreMessageClient entirely
-        and run an in-process loop against puffo-cloud-server. Bearer
-        auth, cloud-mediated LLM + outbound, KEM-decrypt inbound."""
+        """Cloud-hosted runner: bypasses PuffoCoreMessageClient and
+        speaks the puffo-server bridge directly. Server holds all
+        crypto; runtime exchanges plaintext WS frames + cloud-hosted
+        LLM HTTP."""
         from ..agent.api_puffo.runner import ApiPuffoRunner
         agent_id = self.agent_cfg.id
         self.runtime.status = "running"

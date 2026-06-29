@@ -1,23 +1,8 @@
 """Tool schemas + dispatch for the api-puffo runtime.
 
-The LLM (Anthropic messages API shape) returns tool_use blocks
-naming one of these tools; the runner dispatches each call into a
-WebSocket bridge frame and waits for the matching ack / spaces
-reply. Cloud does all crypto + persistence + delivery.
-
-Day-1 surface (bounded by what the bridge protocol exposes):
-
-  - ``send_message``   → bridge ``send`` (DM via recipient_slug;
-                         channel via space_id + channel_id)
-  - ``list_spaces``    → bridge ``list_spaces``
-
-History / whoami tools from the legacy MCP surface are NOT here.
-The bridge spec doesn't expose a history query (cloud-agents are
-expected to ride ``fetch_pending`` backfill at connect + react to
-live ``message`` frames; persistent per-thread storage will land
-in a later spec revision). Adding them now would route through a
-separate REST surface that doesn't exist yet.
-"""
+Day-1 surface is what BRIDGE-WIRE-PROTOCOL.md exposes: send_message
+(bridge ``send``) and list_spaces (bridge ``list_spaces``). History /
+whoami land when the spec grows the matching frames."""
 
 from __future__ import annotations
 
@@ -82,10 +67,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 async def dispatch_tool(
     bridge: CloudBridgeClient, name: str, args: dict[str, Any],
 ) -> str:
-    """Translate a tool_use block into a bridge frame, await reply,
-    return a string for the LLM tool_result block. All transport /
-    server errors are normalised to a leading ``error:`` so the LLM
-    can react inside its tool loop."""
+    # Errors normalised to a leading "error:" so the LLM can react
+    # inside its tool loop instead of crashing the turn.
     if name == "send_message":
         plaintext = args.get("plaintext", "")
         if not isinstance(plaintext, str) or not plaintext:
@@ -93,8 +76,8 @@ async def dispatch_tool(
         recipient_slug = args.get("recipient_slug") or None
         space_id = args.get("space_id") or None
         channel_id = args.get("channel_id") or None
-        # Enforce the spec's one-shape-only rule client-side too so
-        # the operator sees a clean message rather than BAD_FRAME.
+        # Mirror the spec's one-shape-only rule client-side for a
+        # cleaner error than the server's BAD_FRAME.
         if recipient_slug and (space_id or channel_id):
             return (
                 "error: send_message accepts EITHER recipient_slug "

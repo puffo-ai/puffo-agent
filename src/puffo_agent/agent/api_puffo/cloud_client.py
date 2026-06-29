@@ -1,26 +1,8 @@
-"""Cloud-agent bridge WebSocket client + LLM HTTP client.
+"""Cloud-agent bridge WS client + LLM HTTP client.
 
-Bridge implementation per
-``puffo-server/roadmap/cloud-agent/BRIDGE-WIRE-PROTOCOL.md``:
-
-  - URL:    ``<cloud>/v2/cloud-agents/subscribe`` (ws/wss)
-  - Auth:   ``x-sandbox-token`` header on the HTTP upgrade. The
-            runtime sets it itself in dev; in production E2B's
-            egress proxy injects it (we still set it to keep dev
-            self-contained).
-  - Frames: plaintext JSON, ``serde``-tagged on ``"type"``. Server
-            does ALL E2E crypto — runtime never sees ciphertext.
-  - Cadence: client-side ``heartbeat`` every 30s
-            (``HEARTBEAT_TIMEOUT_SECS = 90`` server-side).
-  - On-connect: wait ``connected`` → ``fetch_pending`` → drain
-            ``message``+``pending_delivered`` → ``ack`` envelopes →
-            enter main loop.
-
-This module covers the WS protocol + the request/response
-correlation needed to make WS frames look like RPC for the LLM
-tool loop. The LLM HTTP endpoint (``/v1/llm/complete``) lives
-alongside but is structurally separate — the bridge spec is mute
-on inference."""
+Bridge wire spec: ``puffo-server/roadmap/cloud-agent/BRIDGE-WIRE-PROTOCOL.md``.
+Server holds all crypto — frames are plaintext JSON. LLM HTTP
+is a separate endpoint (the spec is mute on inference)."""
 
 from __future__ import annotations
 
@@ -51,9 +33,7 @@ class CloudHttpError(Exception):
 
 
 class CloudLlmClient:
-    """Thin HTTP client for ``POST /v1/llm/complete``. The bridge
-    spec does not cover inference; this is its own endpoint, also
-    bearer-authed by the sandbox_token (placeholder convention)."""
+    """Bearer-authed HTTP client for ``POST /v1/llm/complete``."""
 
     def __init__(self, base_url: str, sandbox_token: str) -> None:
         self.base_url = base_url.rstrip("/")
@@ -75,9 +55,9 @@ class CloudLlmClient:
         messages: list[dict],
         tools: list[dict] | None = None,
     ) -> dict:
-        """One LLM turn. Cloud forwards to the named provider using
-        the bundle's ``api_key``. Response shape mirrors Anthropic's
-        tool-using messages API (cloud normalises across providers)."""
+        # Cloud forwards to the named provider using the bundle's
+        # api_key; response shape is Anthropic's tool-using messages
+        # API (cloud normalises across providers).
         body: dict[str, Any] = {
             "api_key": api_key,
             "provider": provider,
@@ -125,27 +105,11 @@ class BridgeClosed(Exception):
 
 
 class CloudBridgeClient:
-    """One-WS-per-agent bidirectional plaintext bridge.
-
-    Public surface for the runner:
-      - ``connect()`` — open + wait for the ``connected`` frame
-      - ``frames()`` async iterator — yields ``message`` /
-        ``pending_delivered`` / ``error`` frames the runner needs
-        to react to. ``ping`` is swallowed (no client reply per
-        spec §5.1). ``ack`` / ``ack_result`` / ``spaces`` go to
-        request/response correlation instead and are NOT yielded.
-      - ``send_send(...)`` — fire a ``send`` frame, await the
-        matching ``ack`` by ``client_ref``
-      - ``send_fetch_pending(limit)`` — fire ``fetch_pending``;
-        message + pending_delivered frames surface via frames()
-      - ``send_ack(envelope_ids)`` — fire ``ack``, await
-        ``ack_result``
-      - ``send_list_spaces()`` — fire ``list_spaces``, await the
-        ``spaces`` reply
-      - ``close()``
-
-    A background heartbeat coroutine pumps ``{"type":"heartbeat"}``
-    every 30s while the WS is open (server's recv-timeout is 90s)."""
+    """One-WS-per-agent plaintext bridge. ``send_*`` methods are
+    request/response (correlated by ``client_ref`` or FIFO);
+    ``frames()`` yields the inbound stream (``message`` /
+    ``pending_delivered`` / uncorrelated ``error``). A background
+    task pumps a heartbeat every 30s (server recv-timeout = 90s)."""
 
     def __init__(
         self, cloud_url: str, sandbox_token: str, agent_slug: str,
@@ -165,8 +129,6 @@ class CloudBridgeClient:
         self._spaces_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
 
     async def connect(self) -> None:
-        """Open the WS + heartbeat task. Raises on 401 / handshake
-        failure; the caller decides whether to retry."""
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None),
         )
@@ -205,10 +167,9 @@ class CloudBridgeClient:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def frames(self) -> AsyncIterator[dict]:
-        """Yield frames the runner needs to react to: ``message``,
-        ``pending_delivered``, ``error`` (uncorrelated). Swallow
-        ``ping`` (no reply per spec). Route ``ack`` / ``ack_result``
-        / ``spaces`` to their correlation futures."""
+        # Yields message / pending_delivered / uncorrelated error.
+        # ping swallowed (no reply per spec §5.1); ack / ack_result /
+        # spaces routed to send_*() futures.
         if self._ws is None:
             return
         async for msg in self._ws:
@@ -309,11 +270,8 @@ class CloudBridgeClient:
         channel_id: Optional[str] = None,
         timeout: float = 30.0,
     ) -> dict:
-        """Send a plaintext message + await the matching ack. Pass
-        EITHER ``recipient_slug`` (DM) OR ``space_id``+``channel_id``
-        (channel) — spec rejects mixed-shape frames as ``BAD_FRAME``.
-        Returns the ack frame as-is. Raises ``BridgeError`` on
-        server-side rejection or ``TimeoutError`` on missing ack."""
+        # Pass EITHER recipient_slug (DM) OR space_id+channel_id
+        # (channel); spec rejects mixed-shape frames as BAD_FRAME.
         ws = await self._require_ws()
         client_ref = f"r_{uuid.uuid4().hex[:12]}"
         frame: dict[str, Any] = {
@@ -327,7 +285,7 @@ class CloudBridgeClient:
             frame["space_id"] = space_id
         if channel_id:
             frame["channel_id"] = channel_id
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._send_acks[client_ref] = fut
         await ws.send_json(frame)
         try:
@@ -336,8 +294,7 @@ class CloudBridgeClient:
             self._send_acks.pop(client_ref, None)
 
     async def send_fetch_pending(self, *, limit: Optional[int] = None) -> None:
-        """Fire the request; the resulting ``message`` +
-        ``pending_delivered`` frames surface via ``frames()``."""
+        # Resulting message + pending_delivered surface via frames().
         ws = await self._require_ws()
         frame: dict[str, Any] = {"type": "fetch_pending"}
         if limit is not None:
@@ -347,18 +304,15 @@ class CloudBridgeClient:
     async def send_ack(
         self, envelope_ids: list[str], *, timeout: float = 30.0,
     ) -> dict:
-        """Mark envelopes read; await ``ack_result``. Empty list and
-        oversized batches are rejected server-side as BAD_FRAME — we
-        let the server enforce."""
         ws = await self._require_ws()
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         await self._ack_result_waiters.put(fut)
         await ws.send_json({"type": "ack", "envelope_ids": envelope_ids})
         return await asyncio.wait_for(fut, timeout=timeout)
 
     async def send_list_spaces(self, *, timeout: float = 30.0) -> dict:
         ws = await self._require_ws()
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
         await self._spaces_waiters.put(fut)
         await ws.send_json({"type": "list_spaces"})
         return await asyncio.wait_for(fut, timeout=timeout)

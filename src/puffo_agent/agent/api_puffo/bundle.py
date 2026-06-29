@@ -1,27 +1,11 @@
 """Install-bundle ingestion for api-puffo agents.
 
-A bundle is a one-shot JSON file (placed by an installer / web-side
-flow) that contains everything a cloud-hosted agent needs.
-
-**The thin model.** The runtime holds NO key material. Server-side
-``puffo-server/cloud_agent`` loads the agent's KMS-sealed keystore
-once per WS connection and drives all seal/open. Per
-``BRIDGE-WIRE-PROTOCOL.md`` the runtime only needs:
-
-  - identity:    agent_slug, operator_slug
-  - auth:        sandbox_token (bearer for the WS upgrade; in E2B
-                 the egress proxy injects it, in local dev we set
-                 it ourselves)
-  - cloud URL:   puffo_cloud_server_url
-  - profile:     display_name, role, role_short, soul, avatar_url
-  - runtime:     api_key, provider, model (LLM HTTP — separate from
-                 the bridge, scope unchanged)
-
-On daemon startup we sweep ``~/.puffo-agent/api-puffo-install/`` for
-``<slug>.json`` files. Each is materialised into the standard
-agent_dir layout (agent.yml + profile.md + keys/<slug>.json) so the
-existing reconcile loop picks it up.
-"""
+A bundle is a one-shot JSON file dropped by the installer / web-side
+flow. The runtime holds NO key material; the bundle only carries
+identity, the sandbox_token (WS bearer), the cloud URL, the profile,
+and LLM credentials. Daemon startup sweeps
+``~/.puffo-agent/api-puffo-install/<slug>.json`` and materialises each
+into the standard agent_dir so the reconcile loop picks them up."""
 
 from __future__ import annotations
 
@@ -110,8 +94,6 @@ def discover_bundles() -> list[Path]:
 
 
 def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
-    """Write agent.yml + profile.md + keys/<slug>.json. Returns the
-    agent directory path."""
     adir = agent_dir(bundle.agent_slug)
     adir.mkdir(parents=True, exist_ok=True)
     (adir / "workspace").mkdir(parents=True, exist_ok=True)
@@ -119,8 +101,8 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
     keys_dir = adir / "keys"
     keys_dir.mkdir(parents=True, exist_ok=True)
 
-    # profile.md — bundle's full soul into a single # Soul section so
-    # the standard extract_soul_body / _profile_summary readers work.
+    # Soul lands in a single # Soul section so the standard
+    # extract_soul_body / _profile_summary readers work.
     if bundle.role:
         profile_md = f"# {bundle.display_name}\n\n{bundle.role}\n\n"
     else:
@@ -128,8 +110,6 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
     profile_md += f"# Soul\n\n{bundle.soul.strip()}\n"
     (adir / "profile.md").write_text(profile_md, encoding="utf-8")
 
-    # keys/<slug>.json — only auth state. Server resolves identity
-    # from sandbox_token on every WS upgrade.
     keys = {
         "slug": bundle.agent_slug,
         "sandbox_token": bundle.sandbox_token,
@@ -140,7 +120,6 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
     tmp.write_text(json.dumps(keys, indent=2), encoding="utf-8")
     tmp.replace(keys_path)
 
-    # agent.yml — minimal shape consumed by AgentConfig.load.
     cfg: dict[str, Any] = {
         "id": bundle.agent_slug,
         "state": "running",
