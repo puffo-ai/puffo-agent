@@ -104,6 +104,17 @@ class Daemon:
         logger.info("puffo-agent portal starting; home=%s", home_dir())
         interval = max(0.5, self.daemon_cfg.reconcile_interval_seconds)
 
+        # api-puffo: ingest any pending install bundles into agent_dir
+        # layout BEFORE reconcile picks them up, so the first tick
+        # already sees the new agents.
+        try:
+            from ..agent.api_puffo.bundle import sweep_install_dir
+            n_new = sweep_install_dir()
+            if n_new:
+                logger.info("api-puffo: ingested %d new bundle(s)", n_new)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("api-puffo: install sweep failed: %s", exc)
+
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
         # Re-assert machine_id for already-linked operators' agents so agents

@@ -22,7 +22,7 @@ from typing import Callable, Optional
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
-from .runtime_matrix import RUNTIME_WS_LOCAL
+from .runtime_matrix import RUNTIME_API_PUFFO, RUNTIME_WS_LOCAL
 from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
     looks_like_managed_claude_md,
@@ -1006,9 +1006,35 @@ class Worker:
             self.runtime.status = "stopped"
             self.runtime.save(agent_id)
 
+    async def _run_api_puffo(self) -> None:
+        """Cloud-hosted runner: bypasses PuffoCoreMessageClient and
+        speaks the puffo-server bridge directly. Server holds all
+        crypto; runtime exchanges plaintext WS frames + cloud-hosted
+        LLM HTTP."""
+        from ..agent.api_puffo.runner import ApiPuffoRunner
+        agent_id = self.agent_cfg.id
+        self.runtime.status = "running"
+        self.runtime.save(agent_id)
+        self._warm_done.set()
+        runner = ApiPuffoRunner(agent_id, self._stop)
+        try:
+            await runner.run()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "agent %s: api-puffo runner crashed: %s",
+                agent_id, exc, exc_info=True,
+            )
+            self.runtime.error = str(exc)
+        finally:
+            self.runtime.status = "stopped"
+            self.runtime.save(agent_id)
+
     async def _run(self) -> None:
         if (self.agent_cfg.runtime.kind or "") == RUNTIME_WS_LOCAL:
             await self._run_ws_local()
+            return
+        if (self.agent_cfg.runtime.kind or "") == RUNTIME_API_PUFFO:
+            await self._run_api_puffo()
             return
         agent_id = self.agent_cfg.id
         try:
