@@ -281,8 +281,7 @@ class MachineControlClient:
                 await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
                 sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
 
-                # Register the reverse-channel sender so the agent processing
-                # path can stream agent.status up this live socket.
+                # Register the reverse-channel sender on this live socket.
                 from .reporter import get_reporter
 
                 async def _report(operator_slug: str, envelope: dict) -> None:

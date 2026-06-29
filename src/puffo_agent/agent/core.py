@@ -42,9 +42,7 @@ def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
 
 
 def _user_message_preview(messages: list[dict]) -> str:
-    """Body of the latest user message (whitespace-collapsed, followups
-    dropped) for the turn_start status — the log entry is otherwise a
-    metadata block."""
+    """Body of the latest user message (the log entry is a metadata block)."""
     for m in reversed(messages):
         content = m.get("content")
         if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
@@ -304,9 +302,8 @@ class PuffoAgent:
             memory_dir=self.memory_dir,
             on_progress=on_progress,
         )
-        # Reverse channel: turn_start, then the adapter streams
-        # assistant_text / tool_use, then turn_complete carries the tokens.
-        # Best-effort — the reporter no-ops if the WS is down / owner unlinked.
+        # Reverse channel: turn_start → adapter streams assistant_text/tool_use
+        # → turn_complete (tokens). Best-effort; no-ops if the owner isn't linked.
         from ..portal.control.reporter import get_reporter
 
         asyncio.ensure_future(

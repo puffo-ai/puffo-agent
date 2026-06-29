@@ -1,14 +1,7 @@
-"""Machine → operator reverse-channel messages (Agent Portal v0.4).
-
-Mirrors the puffo message envelope: one content-key AEAD-seals the Layer-2
-payload, the content-key is HPKE-wrapped per operator device, and the machine
-signs the canonical envelope. The relay only sees opaque ciphertext. Used to
-stream ``agent.status`` (LLM logs) to the agent's owner operator.
-
-AAD contract (the web receiver must mirror it):
-  * content AEAD aad = ``message_id`` (utf-8)
-  * per-device wrap aad = ``f"{message_id}:{device_id}"`` (utf-8)
-  * HPKE info = ``MACHINE_MSG_HPKE_INFO``
+"""Machine → operator reverse-channel envelope: content-key AEAD over the
+payload + per-device HPKE wrap + machine signature (the relay sees only
+ciphertext). AAD must match the web receiver: content aad = message_id, wrap
+aad = f"{message_id}:{device_id}", HPKE info = MACHINE_MSG_HPKE_INFO.
 """
 
 from __future__ import annotations
@@ -44,8 +37,7 @@ class Recipient:
 def recipients_from_device_list(
     devices: list[dict], operator_root_pubkey: str
 ) -> list[Recipient]:
-    """KEM keys from ``/devices/active``, keeping only certs that chain to the
-    pinned operator root — so the relay can't inject a rogue recipient."""
+    """KEM keys from active device certs that chain to the pinned root."""
     try:
         root_pk = base64url_decode(operator_root_pubkey)
     except Exception:  # noqa: BLE001
@@ -86,8 +78,7 @@ def build_machine_message_envelope(
     message_id: str | None = None,
     ts: int | None = None,
 ) -> dict:
-    """Layer-1 transport envelope: content-key AEAD over ``payload`` + per-device
-    HPKE-wrapped content-key + machine signature."""
+    """Build the Layer-1 transport envelope."""
     if not recipients:
         raise ValueError("no recipients")
     message_id = message_id or f"mmsg_{uuid.uuid4()}"
@@ -131,8 +122,7 @@ async def fetch_active_recipients(
     operator_slug: str,
     operator_root_pubkey: str,
 ) -> list[Recipient]:
-    """GET the operator's active device certs (machine-authed) → verified
-    recipients. Returns [] on any error so callers can no-op cleanly."""
+    """Machine-authed GET of the operator's active devices → recipients ([] on error)."""
     path = f"/v2/machines/{machine.machine_id}/operators/{operator_slug}/devices/active"
     headers = machine_auth.signed_headers(machine, "GET", path)
     try:

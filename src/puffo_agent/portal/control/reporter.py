@@ -1,9 +1,6 @@
-"""Daemon-wide singleton that streams ``agent.status`` messages up the control
-WS to an agent's owner operator.
-
-The agent processing path calls ``emit(agent_slug, event, payload)``; the control
-client registers its WS sender while connected. Best-effort + ephemeral: if the
-WS is down, the owner isn't linked, or no active devices, the event is dropped.
+"""Daemon-wide singleton: streams agent.status events up the control WS to an
+agent's owner. Best-effort + ephemeral — drops the event if the WS is down, the
+owner isn't linked, or there are no active devices.
 """
 
 from __future__ import annotations

@@ -788,9 +788,8 @@ class ClaudeSession:
                 if sid and sid != self._session_id:
                     self._save_session_id(sid)
                 usage = event.get("usage") or {}
-                # input_tokens is only the uncached delta (often single digits);
-                # add the newly-cached input for the real non-cache-read figure,
-                # matching codex's cache-excluded input.
+                # input_tokens is just the uncached delta; add newly-cached input
+                # for the real non-cache-read figure (matches codex).
                 input_tokens = int(usage.get("input_tokens", 0) or 0) + int(
                     usage.get("cache_creation_input_tokens", 0) or 0
                 )

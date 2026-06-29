@@ -1069,13 +1069,11 @@ class CodexSession:
         turn = self._active_turn
 
         if m.startswith("thread/tokenusage/updated") and turn is not None:
-            # codex reports per-turn tokens here, NOT on turn/completed.
-            # ``last`` is the current turn; it refreshes a few times — the
-            # value standing when turn/completed fires is the final tally.
+            # codex reports per-turn tokens here (not turn/completed); ``last``
+            # refreshes during the turn, final value stands at turn/completed.
             last = ((params or {}).get("tokenUsage") or {}).get("last") or {}
             try:
-                # ``inputTokens`` includes the (re-sent) cached context; subtract
-                # it so the figure matches claude-code's cache-excluded input.
+                # Subtract the re-sent cached context (matches claude-code).
                 inp = int(last.get("inputTokens") or 0)
                 cached = int(last.get("cachedInputTokens") or 0)
                 turn.input_tokens = max(0, inp - cached)
