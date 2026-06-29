@@ -273,6 +273,7 @@ class Daemon:
                         self.daemon_cfg,
                         agent_cfg,
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                        ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
                         ws_local_hub=self.ws_local_hub,
                     )
                     self.workers[agent_id] = worker
@@ -290,6 +291,7 @@ class Daemon:
                         self.daemon_cfg,
                         agent_cfg,
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                        ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
                         ws_local_hub=self.ws_local_hub,
                     )
                     self.workers[agent_id] = worker
@@ -361,6 +363,9 @@ class Daemon:
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         return self._refresher_for(agent_cfg).notify_refresh_needed
+
+    def _ensure_fresh_for(self, agent_cfg: AgentConfig):
+        return self._refresher_for(agent_cfg).ensure_fresh
 
     def _set_worker_profile_cache(
         self, agent_id: str, slug: str, display_name: str, avatar_url: str,
