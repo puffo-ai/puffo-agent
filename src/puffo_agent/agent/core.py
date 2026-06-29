@@ -289,10 +289,9 @@ class PuffoAgent:
             memory_dir=self.memory_dir,
             on_progress=on_progress,
         )
-        # Portal reverse channel: turn_start (with the message being worked on),
-        # then the adapter streams assistant_text / tool_use, then turn_complete
-        # carries the token usage. Best-effort + ephemeral — the reporter no-ops
-        # if the WS is down / owner unlinked and never raises.
+        # Reverse channel: turn_start, then the adapter streams
+        # assistant_text / tool_use, then turn_complete carries the tokens.
+        # Best-effort — the reporter no-ops if the WS is down / owner unlinked.
         from ..portal.control.reporter import get_reporter
 
         # The log entry is a metadata block; surface just the message body

@@ -704,7 +704,6 @@ class ClaudeSession:
         output_tokens = 0
         event_types_seen: list[str] = []
 
-        # Stream tool calls to the operator over the portal reverse channel.
         from ...portal.control.reporter import get_reporter
 
         reporter = get_reporter()
@@ -747,10 +746,8 @@ class ClaudeSession:
                     if bt == "text":
                         text = block.get("text", "") or ""
                         reply_parts.append(text)
-                        # A block containing the silent marker is the agent's
-                        # "don't reply" signal, not content — skip it. Real
-                        # narration blocks still stream; fallback (core.py)
-                        # reports the auto-posted reply separately.
+                        # The silent marker is a control signal, not content;
+                        # a fallback auto-post is reported separately by core.py.
                         if text and not is_silent(text):
                             asyncio.ensure_future(
                                 reporter.emit(self.agent_id, "assistant_text", {"text": text})

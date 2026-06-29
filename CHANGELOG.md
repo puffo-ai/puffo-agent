@@ -4,6 +4,21 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.4] — 2026-06-29
+
+### Added
+
+- **Live agent activity streamed to the operator.** As an agent
+  processes a turn, the daemon now sends end-to-end-encrypted
+  `agent.status` updates up the machine control channel to the
+  agent's owner — the message being worked on, each tool / MCP call,
+  the assistant's reply, and the turn's token usage. The operator's
+  client renders this as a per-agent activity log. Covers both the
+  claude-code and codex harnesses. Best-effort and ephemeral: the
+  updates no-op when the operator isn't linked and never affect the
+  agent's own processing. `[SILENT]` turns and the cached portion of
+  codex's input token count are excluded.
+
 ## [1.0.3] — 2026-06-27
 
 ### Added
