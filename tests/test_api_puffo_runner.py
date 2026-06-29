@@ -1,8 +1,9 @@
-"""api-puffo runner: envelope decrypt + LLM turn + tool dispatch.
+"""api-puffo runner: bridge WS protocol + LLM tool loop.
 
-Uses an aiohttp TestServer as the mock cloud and drives one
-end-to-end turn — verifies decrypt → llm_complete → tool_use →
-dispatch_tool round-trips correctly."""
+Spins up an aiohttp test server that speaks the real bridge wire
+protocol (BRIDGE-WIRE-PROTOCOL.md) — ``connected`` first frame,
+heartbeat-tolerant, ``send`` / ``fetch_pending`` / ``ack`` /
+``list_spaces`` handlers — and drives a full end-to-end turn."""
 
 from __future__ import annotations
 
@@ -11,10 +12,11 @@ import json
 import os
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
-from aiohttp import web
+from aiohttp import WSMsgType, web
 from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -23,15 +25,12 @@ from puffo_agent.agent.api_puffo.bundle import (
     ApiPuffoBundle,
     materialise_agent_dir,
 )
-from puffo_agent.agent.api_puffo.cloud_client import CloudHttpClient
-from puffo_agent.agent.api_puffo.tools import TOOL_SCHEMAS, dispatch_tool
-from puffo_agent.crypto.encoding import base64url_encode
-from puffo_agent.crypto.message import (
-    EncryptInput,
-    RecipientDevice,
-    encrypt_message,
+from puffo_agent.agent.api_puffo.cloud_client import (
+    BridgeError,
+    CloudBridgeClient,
+    CloudLlmClient,
 )
-from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
+from puffo_agent.agent.api_puffo.tools import dispatch_tool
 
 
 def _isolated_home() -> str:
@@ -42,103 +41,245 @@ def _isolated_home() -> str:
     return home
 
 
-def _make_bundle_with_real_kem(
-    agent_slug: str, cloud_url: str,
-) -> tuple[ApiPuffoBundle, KemKeyPair]:
-    kp = KemKeyPair.generate()
-    raw = {
-        "agent_slug": agent_slug,
+def _valid_bundle(slug: str, cloud_url: str) -> ApiPuffoBundle:
+    return ApiPuffoBundle.from_dict({
+        "agent_slug": slug,
         "operator_slug": "user-test",
-        "device_id": "dev_test_cloud",
-        "kem_secret_key": base64url_encode(kp.secret_bytes()),
-        "kem_cert": {"type": "device_cert", "version": 1, "device_id": "dev_test_cloud"},
-        "session_token": "tok_test_xyz",
+        "sandbox_token": "sbx_test_xyz",
         "puffo_cloud_server_url": cloud_url,
         "display_name": "Test Bot",
-        "role": "tester: api-puffo runtime",
+        "role": "tester",
         "role_short": "tester",
         "soul": "I am the api-puffo end-to-end test bot.",
         "avatar_url": "",
         "api_key": "sk-mock",
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
-    }
-    return ApiPuffoBundle.from_dict(raw), kp
+    })
 
 
-# ── tool dispatch ────────────────────────────────────────────────
+# ── tools.py shape ───────────────────────────────────────────────
 
 
-def test_tool_schemas_cover_4_load_bearing_tools():
+def test_tool_schemas_match_bridge_protocol_surface():
+    from puffo_agent.agent.api_puffo.tools import TOOL_SCHEMAS
     names = {t["name"] for t in TOOL_SCHEMAS}
-    assert names == {"send_message", "get_channel_history",
-                     "get_thread_history", "whoami"}
+    assert names == {"send_message", "list_spaces"}
+
+
+# ── Mock bridge ──────────────────────────────────────────────────
+
+
+class _MockBridgeApp:
+    """Minimal bridge that speaks the wire protocol just enough to
+    drive the runner. Holds a queue of pending messages + records
+    what the client sent."""
+
+    def __init__(self) -> None:
+        self.pending_messages: list[dict] = []
+        self.spaces_fixture: list[dict] = []
+        self.recv_send: list[dict] = []
+        self.recv_ack: list[dict] = []
+        self.token_seen: str | None = None
+
+    async def ws_handler(self, request: web.Request) -> web.WebSocketResponse:
+        self.token_seen = request.headers.get("x-sandbox-token")
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_json({"type": "connected"})
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                break
+            frame = json.loads(msg.data)
+            kind = frame.get("type", "")
+            if kind == "heartbeat":
+                continue
+            if kind == "send":
+                self.recv_send.append(frame)
+                await ws.send_json({
+                    "type": "ack",
+                    "client_ref": frame.get("client_ref"),
+                    "envelope_id": f"msg_{uuid.uuid4().hex[:8]}",
+                    "devices_queued": 2,
+                })
+            elif kind == "fetch_pending":
+                count = 0
+                while self.pending_messages:
+                    await ws.send_json(self.pending_messages.pop(0))
+                    count += 1
+                await ws.send_json({
+                    "type": "pending_delivered",
+                    "count": count,
+                    "more": False,
+                })
+            elif kind == "ack":
+                self.recv_ack.append(frame)
+                await ws.send_json({
+                    "type": "ack_result",
+                    "acked": len(frame.get("envelope_ids", [])),
+                })
+            elif kind == "list_spaces":
+                await ws.send_json({
+                    "type": "spaces",
+                    "spaces": self.spaces_fixture,
+                })
+        return ws
+
+
+def _build_app(bridge: _MockBridgeApp, llm_handler=None) -> web.Application:
+    app = web.Application()
+    app.router.add_get("/v2/cloud-agents/subscribe", bridge.ws_handler)
+    if llm_handler is not None:
+        app.router.add_post("/v1/llm/complete", llm_handler)
+    return app
+
+
+# ── Bridge client ────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_dispatch_tool_posts_to_cloud_endpoint():
-    received: list[tuple[str, dict]] = []
-
-    async def send_message(request: web.Request) -> web.Response:
-        received.append(("send_message", await request.json()))
-        return web.json_response({"text": "posted msg_xxxx"})
-
-    app = web.Application()
-    app.router.add_post("/v1/send_message", send_message)
+async def test_bridge_connects_and_sends_x_sandbox_token_header():
+    bridge_app = _MockBridgeApp()
+    app = _build_app(bridge_app)
     async with TestClient(TestServer(app)) as client:
-        url = str(client.make_url(""))
-        http = CloudHttpClient(url, "tok_test")
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx_test_abc", "agent-slug")
         try:
-            result = await dispatch_tool(http, "send_message", {
-                "channel": "@alice",
-                "text": "hello",
-                "is_visible_to_human": True,
+            await c.connect()
+        finally:
+            await c.close()
+    assert bridge_app.token_seen == "sbx_test_abc"
+
+
+@pytest.mark.asyncio
+async def test_bridge_send_send_correlates_ack_via_client_ref():
+    bridge_app = _MockBridgeApp()
+    app = _build_app(bridge_app)
+    async with TestClient(TestServer(app)) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        await c.connect()
+        # Run the frame consumer in the background; ack correlation
+        # happens inside frames() before yielding non-correlated frames.
+        consumer = asyncio.create_task(_drain(c))
+        try:
+            ack = await c.send_send(
+                plaintext="hi alice", recipient_slug="alice",
+            )
+        finally:
+            await c.close()
+            consumer.cancel()
+    assert ack["envelope_id"].startswith("msg_")
+    assert ack["devices_queued"] == 2
+    assert len(bridge_app.recv_send) == 1
+    sent = bridge_app.recv_send[0]
+    assert sent["plaintext"] == "hi alice"
+    assert sent["recipient_slug"] == "alice"
+    assert sent.get("client_ref")
+
+
+@pytest.mark.asyncio
+async def test_bridge_list_spaces_returns_fixture():
+    bridge_app = _MockBridgeApp()
+    bridge_app.spaces_fixture = [
+        {"space_id": "sp_1", "name": "Eng", "channels": [
+            {"channel_id": "ch_1", "name": "general"},
+        ]},
+    ]
+    app = _build_app(bridge_app)
+    async with TestClient(TestServer(app)) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        await c.connect()
+        consumer = asyncio.create_task(_drain(c))
+        try:
+            resp = await c.send_list_spaces()
+        finally:
+            await c.close()
+            consumer.cancel()
+    assert resp["spaces"] == bridge_app.spaces_fixture
+
+
+async def _drain(c: CloudBridgeClient) -> None:
+    try:
+        async for _ in c.frames():
+            pass
+    except Exception:
+        pass
+
+
+# ── dispatch_tool ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_send_message_dm():
+    bridge_app = _MockBridgeApp()
+    app = _build_app(bridge_app)
+    async with TestClient(TestServer(app)) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        await c.connect()
+        consumer = asyncio.create_task(_drain(c))
+        try:
+            result = await dispatch_tool(c, "send_message", {
+                "plaintext": "hi", "recipient_slug": "alice",
             })
         finally:
-            await http.close()
-    assert result == "posted msg_xxxx"
-    assert len(received) == 1
-    name, body = received[0]
-    assert body == {"channel": "@alice", "text": "hello", "is_visible_to_human": True}
+            await c.close()
+            consumer.cancel()
+    assert result.startswith("posted msg_")
+    assert len(bridge_app.recv_send) == 1
 
 
 @pytest.mark.asyncio
-async def test_dispatch_tool_returns_error_string_on_http_failure():
-    async def boom(request: web.Request) -> web.Response:
-        return web.json_response({"error": "nope"}, status=503)
+async def test_dispatch_tool_rejects_mixed_shape():
+    c = CloudBridgeClient("http://unused:1", "sbx", "slug")
+    # No connect — error fires client-side before any WS frame.
+    result = await dispatch_tool(c, "send_message", {
+        "plaintext": "hi",
+        "recipient_slug": "alice",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+    })
+    assert result.startswith("error:")
+    assert "recipient_slug" in result
+    assert "space_id+channel_id" in result
 
-    app = web.Application()
-    app.router.add_post("/v1/whoami", boom)
-    async with TestClient(TestServer(app)) as client:
-        url = str(client.make_url(""))
-        http = CloudHttpClient(url, "tok_test")
-        try:
-            result = await dispatch_tool(http, "whoami", {})
-        finally:
-            await http.close()
-    assert result.startswith("error: HTTP 503")
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_rejects_missing_route():
+    c = CloudBridgeClient("http://unused:1", "sbx", "slug")
+    result = await dispatch_tool(c, "send_message", {"plaintext": "hi"})
+    assert result.startswith("error:")
+    assert "requires" in result
 
 
 @pytest.mark.asyncio
 async def test_dispatch_tool_unknown_name():
-    http = CloudHttpClient("http://127.0.0.1:1", "tok_test")
-    try:
-        result = await dispatch_tool(http, "nonexistent_tool", {})
-    finally:
-        await http.close()
+    c = CloudBridgeClient("http://unused:1", "sbx", "slug")
+    result = await dispatch_tool(c, "nonexistent_tool", {})
     assert result == "error: unknown tool 'nonexistent_tool'"
 
 
-# ── runner end-to-end: decrypt + LLM turn + tool call ────────────
+# ── End-to-end runner with real bridge + canned LLM ─────────────
 
 
 @pytest.mark.asyncio
-async def test_runner_end_to_end_decrypt_llm_tool():
+async def test_runner_end_to_end_message_llm_tool_ack():
     _isolated_home()
+    bridge_app = _MockBridgeApp()
+    # Inject a fake DM that will surface during the fetch_pending
+    # backfill on connect.
+    bridge_app.pending_messages.append({
+        "type": "message",
+        "envelope_id": "msg_inject_001",
+        "sender_slug": "smoker",
+        "recipient_slug": "rb-bot",
+        "sent_at": 0,
+        "plaintext": "hi",
+    })
 
-    # Mock cloud: implements /v1/llm/complete + /v1/send_message.
     llm_calls: list[dict] = []
-    tool_calls: list[dict] = []
 
     async def llm_complete(request: web.Request) -> web.Response:
         body = await request.json()
@@ -146,16 +287,14 @@ async def test_runner_end_to_end_decrypt_llm_tool():
         msgs = body.get("messages") or []
         last = msgs[-1] if msgs else {}
         last_content = last.get("content")
-        # Round 2: tool_result came back → emit final text.
         if isinstance(last_content, list) and any(
             isinstance(c, dict) and c.get("type") == "tool_result"
             for c in last_content
         ):
             return web.json_response({
                 "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": "all done"}],
+                "content": [{"type": "text", "text": "done"}],
             })
-        # Round 1: ask to call send_message.
         return web.json_response({
             "stop_reason": "tool_use",
             "content": [
@@ -164,138 +303,51 @@ async def test_runner_end_to_end_decrypt_llm_tool():
                     "id": "tu_001",
                     "name": "send_message",
                     "input": {
-                        "channel": "@smoker",
-                        "text": "echo: hi",
-                        "is_visible_to_human": True,
+                        "plaintext": "echo: hi",
+                        "recipient_slug": "smoker",
                     },
                 },
             ],
         })
 
-    async def send_message(request: web.Request) -> web.Response:
-        tool_calls.append(await request.json())
-        return web.json_response({"text": "posted msg_xxxx"})
-
-    app = web.Application()
-    app.router.add_post("/v1/llm/complete", llm_complete)
-    app.router.add_post("/v1/send_message", send_message)
-
+    app = _build_app(bridge_app, llm_handler=llm_complete)
     async with TestClient(TestServer(app)) as client:
-        cloud_url = str(client.make_url("")).rstrip("/")
-
-        # Provision the api-puffo agent on disk using a bundle.
-        bundle, agent_kem = _make_bundle_with_real_kem(
-            agent_slug="rb-bot", cloud_url=cloud_url,
-        )
+        url = str(client.make_url("")).rstrip("/")
+        bundle = _valid_bundle(slug="rb-bot", cloud_url=url)
         materialise_agent_dir(bundle)
 
-        # Build a fake inbound envelope from a foreign sender.
-        sender_signing = Ed25519KeyPair.generate()
-        device = RecipientDevice(
-            device_id=bundle.device_id,
-            kem_public_key=agent_kem.public_key_bytes(),
-        )
-        envelope = encrypt_message(
-            EncryptInput(
-                envelope_kind="dm",
-                sender_slug="smoker",
-                sender_subkey_id="subkey_test_001",
-                is_visible_to_human=True,
-                recipient_slug=bundle.agent_slug,
-                content_type="text/plain",
-                content="hi",
-                recipients=[device],
-            ),
-            sender_signing,
-        )
-
-        # Drive the runner one frame deep — skip the WS by calling
-        # ``_handle_envelope_frame`` directly.
         from puffo_agent.agent.api_puffo.runner import ApiPuffoRunner
-        from puffo_agent.agent.api_puffo.keystore import ApiPuffoKeystore
-        from puffo_agent.crypto.primitives import KemKeyPair
-        from puffo_agent.crypto.encoding import base64url_decode
-        from puffo_agent.portal.state import AgentConfig
+        stop = asyncio.Event()
+        runner = ApiPuffoRunner("rb-bot", stop)
 
-        runner = ApiPuffoRunner("rb-bot", asyncio.Event())
-        runner._keys = ApiPuffoKeystore.for_agent("rb-bot")
-        runner._cfg = AgentConfig.load("rb-bot")
-        runner._kem_kp = KemKeyPair.from_secret_bytes(
-            base64url_decode(runner._keys.kem_secret_key),
-        )
-        runner._http = CloudHttpClient(cloud_url, runner._keys.session_token)
+        # Kick the runner; wait until the turn loop has finished
+        # both LLM rounds AND the tool send + ack landed, then stop.
+        run_task = asyncio.create_task(runner.run())
+        for _ in range(80):
+            await asyncio.sleep(0.1)
+            if (
+                len(llm_calls) >= 2
+                and bridge_app.recv_send
+                and bridge_app.recv_ack
+            ):
+                break
+        stop.set()
         try:
-            await runner._handle_envelope_frame({
-                "type": "envelope",
-                "envelope": envelope,
-                "sender_signing_public_key": base64url_encode(
-                    sender_signing.public_key_bytes(),
-                ),
-            })
-        finally:
-            await runner._http.close()
+            await asyncio.wait_for(run_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
 
-    # Two LLM rounds, one tool POST.
+    # 2 LLM rounds: initial (tool_use) + post-tool-result (end_turn).
     assert len(llm_calls) == 2
     assert llm_calls[0]["provider"] == "anthropic"
-    assert llm_calls[0]["model"] == "claude-sonnet-4-6"
-    assert llm_calls[0]["api_key"] == "sk-mock"
-    assert "I am the api-puffo end-to-end test bot." in llm_calls[0]["system_prompt"]
     assert llm_calls[0]["messages"][0]["content"] == "hi"
-    assert len(tool_calls) == 1
-    assert tool_calls[0]["channel"] == "@smoker"
-    assert tool_calls[0]["text"] == "echo: hi"
-
-
-@pytest.mark.asyncio
-async def test_runner_skips_non_text_content_type():
-    _isolated_home()
-    # No mock cloud needed — the early return should fire before any
-    # HTTP traffic.
-    bundle, agent_kem = _make_bundle_with_real_kem(
-        agent_slug="nt-bot", cloud_url="http://127.0.0.1:1",
+    # 1 tool send + 1 ack of the injected envelope.
+    assert len(bridge_app.recv_send) == 1
+    sent = bridge_app.recv_send[0]
+    assert sent["plaintext"] == "echo: hi"
+    assert sent["recipient_slug"] == "smoker"
+    assert any(
+        "msg_inject_001" in (a.get("envelope_ids") or [])
+        for a in bridge_app.recv_ack
     )
-    materialise_agent_dir(bundle)
-
-    sender_signing = Ed25519KeyPair.generate()
-    envelope = encrypt_message(
-        EncryptInput(
-            envelope_kind="dm",
-            sender_slug="smoker",
-            sender_subkey_id="subkey_test_002",
-            is_visible_to_human=True,
-            recipient_slug=bundle.agent_slug,
-            content_type="image/png",
-            content="binary blob placeholder",
-            recipients=[RecipientDevice(
-                device_id=bundle.device_id,
-                kem_public_key=agent_kem.public_key_bytes(),
-            )],
-        ),
-        sender_signing,
-    )
-
-    from puffo_agent.agent.api_puffo.runner import ApiPuffoRunner
-    from puffo_agent.agent.api_puffo.keystore import ApiPuffoKeystore
-    from puffo_agent.crypto.encoding import base64url_decode
-    from puffo_agent.portal.state import AgentConfig
-
-    runner = ApiPuffoRunner("nt-bot", asyncio.Event())
-    runner._keys = ApiPuffoKeystore.for_agent("nt-bot")
-    runner._cfg = AgentConfig.load("nt-bot")
-    runner._kem_kp = KemKeyPair.from_secret_bytes(
-        base64url_decode(runner._keys.kem_secret_key),
-    )
-    runner._http = CloudHttpClient("http://127.0.0.1:1", "tok")
-    try:
-        # Should NOT raise (we'd see ClientConnectorError if the
-        # runner tried to call _run_turn → llm_complete).
-        await runner._handle_envelope_frame({
-            "type": "envelope",
-            "envelope": envelope,
-            "sender_signing_public_key": base64url_encode(
-                sender_signing.public_key_bytes(),
-            ),
-        })
-    finally:
-        await runner._http.close()

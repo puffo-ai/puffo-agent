@@ -1,19 +1,43 @@
-"""HTTP + WS client to puffo-cloud-server, authenticated by a
-bearer ``session_token``."""
+"""Cloud-agent bridge WebSocket client + LLM HTTP client.
+
+Bridge implementation per
+``puffo-server/roadmap/cloud-agent/BRIDGE-WIRE-PROTOCOL.md``:
+
+  - URL:    ``<cloud>/v2/cloud-agents/subscribe`` (ws/wss)
+  - Auth:   ``x-sandbox-token`` header on the HTTP upgrade. The
+            runtime sets it itself in dev; in production E2B's
+            egress proxy injects it (we still set it to keep dev
+            self-contained).
+  - Frames: plaintext JSON, ``serde``-tagged on ``"type"``. Server
+            does ALL E2E crypto — runtime never sees ciphertext.
+  - Cadence: client-side ``heartbeat`` every 30s
+            (``HEARTBEAT_TIMEOUT_SECS = 90`` server-side).
+  - On-connect: wait ``connected`` → ``fetch_pending`` → drain
+            ``message``+``pending_delivered`` → ``ack`` envelopes →
+            enter main loop.
+
+This module covers the WS protocol + the request/response
+correlation needed to make WS frames look like RPC for the LLM
+tool loop. The LLM HTTP endpoint (``/v1/llm/complete``) lives
+alongside but is structurally separate — the bridge spec is mute
+on inference."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-from typing import Any, AsyncIterator
+import uuid
+from typing import Any, AsyncIterator, Callable, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
-_TIMEOUT = aiohttp.ClientTimeout(total=60)
+_LLM_TIMEOUT = aiohttp.ClientTimeout(total=120)
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 class CloudHttpError(Exception):
@@ -23,39 +47,53 @@ class CloudHttpError(Exception):
         self.body = body
 
 
-class CloudHttpClient:
-    """``Authorization: Bearer <session_token>`` wrapper. One session
-    per agent, shared across the worker's lifetime."""
+# ── LLM HTTP (separate from the bridge) ──────────────────────────
 
-    def __init__(self, base_url: str, session_token: str) -> None:
+
+class CloudLlmClient:
+    """Thin HTTP client for ``POST /v1/llm/complete``. The bridge
+    spec does not cover inference; this is its own endpoint, also
+    bearer-authed by the sandbox_token (placeholder convention)."""
+
+    def __init__(self, base_url: str, sandbox_token: str) -> None:
         self.base_url = base_url.rstrip("/")
-        self._token = session_token
+        self._token = sandbox_token
         self._session: aiohttp.ClientSession | None = None
-
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-        }
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=_TIMEOUT)
+            self._session = aiohttp.ClientSession(timeout=_LLM_TIMEOUT)
         return self._session
 
-    async def post(self, path: str, body: dict) -> dict:
+    async def complete(
+        self,
+        *,
+        api_key: str,
+        provider: str,
+        model: str,
+        system_prompt: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+    ) -> dict:
+        """One LLM turn. Cloud forwards to the named provider using
+        the bundle's ``api_key``. Response shape mirrors Anthropic's
+        tool-using messages API (cloud normalises across providers)."""
+        body: dict[str, Any] = {
+            "api_key": api_key,
+            "provider": provider,
+            "model": model,
+            "system_prompt": system_prompt,
+            "messages": messages,
+        }
+        if tools:
+            body["tools"] = tools
         sess = await self._ensure_session()
-        url = f"{self.base_url}{path}"
-        async with sess.post(url, json=body, headers=self._headers()) as resp:
-            text = await resp.text()
-            if resp.status >= 400:
-                raise CloudHttpError(resp.status, text)
-            return json.loads(text) if text else {}
-
-    async def get(self, path: str) -> dict:
-        sess = await self._ensure_session()
-        url = f"{self.base_url}{path}"
-        async with sess.get(url, headers=self._headers()) as resp:
+        url = f"{self.base_url}/v1/llm/complete"
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Content-Type": "application/json",
+        }
+        async with sess.post(url, json=body, headers=headers) as resp:
             text = await resp.text()
             if resp.status >= 400:
                 raise CloudHttpError(resp.status, text)
@@ -67,113 +105,288 @@ class CloudHttpClient:
         self._session = None
 
 
-class CloudWsClient:
-    """WS connection that forwards inbound envelopes. Auth via
-    ``Authorization: Bearer`` on the connect handshake (same shape
-    aiohttp ws_connect accepts via ``headers=``). Exponential
-    reconnect on disconnect; ``listen()`` yields raw frames."""
+# ── Bridge WS protocol ───────────────────────────────────────────
 
-    def __init__(self, base_url: str, session_token: str, agent_slug: str) -> None:
-        # http→ws / https→wss
-        ws_base = base_url.replace("http", "ws", 1)
-        self._url = f"{ws_base}/v1/ws/{agent_slug}"
-        self._token = session_token
-        self._stop = asyncio.Event()
 
-    def stop(self) -> None:
-        self._stop.set()
+class BridgeError(Exception):
+    """Server-emitted ``error`` frame (code + message). Categories:
+    ``NO_SUBKEY``, ``NOT_AUTHORIZED``, ``DECRYPT_FAILED``,
+    ``BAD_FRAME``, ``INTERNAL``."""
 
-    async def listen(self) -> AsyncIterator[dict]:
-        """Yield each inbound JSON frame. Auto-reconnects on
-        transport errors with exponential backoff up to 30s."""
-        backoff = 1.0
-        while not self._stop.is_set():
-            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class BridgeClosed(Exception):
+    """Raised when ``send_*`` is called after the WS closed and
+    before reconnect."""
+
+
+class CloudBridgeClient:
+    """One-WS-per-agent bidirectional plaintext bridge.
+
+    Public surface for the runner:
+      - ``connect()`` — open + wait for the ``connected`` frame
+      - ``frames()`` async iterator — yields ``message`` /
+        ``pending_delivered`` / ``error`` frames the runner needs
+        to react to. ``ping`` is swallowed (no client reply per
+        spec §5.1). ``ack`` / ``ack_result`` / ``spaces`` go to
+        request/response correlation instead and are NOT yielded.
+      - ``send_send(...)`` — fire a ``send`` frame, await the
+        matching ``ack`` by ``client_ref``
+      - ``send_fetch_pending(limit)`` — fire ``fetch_pending``;
+        message + pending_delivered frames surface via frames()
+      - ``send_ack(envelope_ids)`` — fire ``ack``, await
+        ``ack_result``
+      - ``send_list_spaces()`` — fire ``list_spaces``, await the
+        ``spaces`` reply
+      - ``close()``
+
+    A background heartbeat coroutine pumps ``{"type":"heartbeat"}``
+    every 30s while the WS is open (server's recv-timeout is 90s)."""
+
+    def __init__(
+        self, cloud_url: str, sandbox_token: str, agent_slug: str,
+    ) -> None:
+        ws_base = cloud_url.replace("http", "ws", 1)
+        self._url = f"{ws_base.rstrip('/')}/v2/cloud-agents/subscribe"
+        self._token = sandbox_token
+        self._slug = agent_slug
+        self._session: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        # client_ref → Future for ack correlation (one ack per send).
+        self._send_acks: dict[str, asyncio.Future] = {}
+        # FIFO of futures awaiting ack_result / spaces (no client_ref
+        # in the spec — only one in-flight at a time).
+        self._ack_result_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._spaces_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+
+    async def connect(self) -> None:
+        """Open the WS + heartbeat task. Raises on 401 / handshake
+        failure; the caller decides whether to retry."""
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None),
+        )
+        headers = {"x-sandbox-token": self._token}
+        try:
+            self._ws = await self._session.ws_connect(
+                self._url, headers=headers, heartbeat=None,
+            )
+        except aiohttp.WSServerHandshakeError as exc:
+            await self._session.close()
+            self._session = None
+            raise BridgeError(
+                "HANDSHAKE",
+                f"WS upgrade failed (status={exc.status}): {exc.message}",
+            ) from exc
+        # Wait for the first frame — must be 'connected'.
+        first = await self._ws.receive(timeout=10.0)
+        if first.type != aiohttp.WSMsgType.TEXT:
+            await self.close()
+            raise BridgeError(
+                "HANDSHAKE",
+                f"expected text 'connected', got {first.type!r}",
+            )
+        try:
+            frame = json.loads(first.data)
+        except json.JSONDecodeError as exc:
+            await self.close()
+            raise BridgeError("HANDSHAKE", f"bad first frame: {exc}") from exc
+        if frame.get("type") != "connected":
+            await self.close()
+            raise BridgeError(
+                "HANDSHAKE",
+                f"expected 'connected', got {frame.get('type')!r}",
+            )
+        logger.info("api-puffo bridge: WS connected (slug=%s)", self._slug)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    async def frames(self) -> AsyncIterator[dict]:
+        """Yield frames the runner needs to react to: ``message``,
+        ``pending_delivered``, ``error`` (uncorrelated). Swallow
+        ``ping`` (no reply per spec). Route ``ack`` / ``ack_result``
+        / ``spaces`` to their correlation futures."""
+        if self._ws is None:
+            return
+        async for msg in self._ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    logger.info(
+                        "api-puffo bridge: WS closing (%s)", msg.type,
+                    )
+                    break
+                continue
             try:
-                async with session.ws_connect(
-                    self._url,
-                    headers={"Authorization": f"Bearer {self._token}"},
-                    heartbeat=30,
-                ) as ws:
-                    logger.info("api-puffo: WS connected to %s", self._url)
-                    backoff = 1.0
-                    async for msg in ws:
-                        if self._stop.is_set():
-                            break
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                yield json.loads(msg.data)
-                            except json.JSONDecodeError as exc:
-                                logger.warning(
-                                    "api-puffo: dropped malformed WS frame: %s", exc,
-                                )
-                        elif msg.type in (
-                            aiohttp.WSMsgType.CLOSE,
-                            aiohttp.WSMsgType.CLOSING,
-                            aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.ERROR,
-                        ):
-                            break
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                frame = json.loads(msg.data)
+            except json.JSONDecodeError:
                 logger.warning(
-                    "api-puffo: WS disconnected (%s: %s); reconnect in %.1fs",
-                    type(exc).__name__, exc, backoff,
+                    "api-puffo bridge: dropped non-JSON WS frame",
                 )
-            finally:
-                await session.close()
-            if self._stop.is_set():
+                continue
+            kind = frame.get("type", "")
+            if kind == "ping":
+                # Server keepalive — no reply per spec §5.1.
+                continue
+            if kind == "ack":
+                client_ref = frame.get("client_ref")
+                if client_ref and client_ref in self._send_acks:
+                    fut = self._send_acks.pop(client_ref)
+                    if not fut.done():
+                        fut.set_result(frame)
+                    continue
+                # Unsolicited ack (e.g. server-side resend / lost
+                # correlation) — surface it for diagnostics.
+                logger.debug(
+                    "api-puffo bridge: ack with unknown client_ref=%r",
+                    client_ref,
+                )
+                continue
+            if kind == "ack_result":
+                if not self._ack_result_waiters.empty():
+                    fut = self._ack_result_waiters.get_nowait()
+                    if not fut.done():
+                        fut.set_result(frame)
+                    continue
+                logger.debug("api-puffo bridge: ack_result with no waiter")
+                continue
+            if kind == "spaces":
+                if not self._spaces_waiters.empty():
+                    fut = self._spaces_waiters.get_nowait()
+                    if not fut.done():
+                        fut.set_result(frame)
+                    continue
+                logger.debug("api-puffo bridge: spaces with no waiter")
+                continue
+            if kind == "error" and frame.get("client_ref"):
+                # An error correlated to a send — route to that future
+                # as an exception.
+                client_ref = frame["client_ref"]
+                if client_ref in self._send_acks:
+                    fut = self._send_acks.pop(client_ref)
+                    if not fut.done():
+                        fut.set_exception(BridgeError(
+                            frame.get("code", "ERROR"),
+                            frame.get("message", ""),
+                        ))
+                    continue
+            yield frame
+
+    async def _heartbeat_loop(self) -> None:
+        while self._ws is not None and not self._ws.closed:
+            try:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                return
+            if self._ws is None or self._ws.closed:
                 return
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=backoff)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * 2, 30.0)
+                await self._ws.send_json({"type": "heartbeat"})
+            except (aiohttp.ClientError, ConnectionError) as exc:
+                logger.warning(
+                    "api-puffo bridge: heartbeat send failed: %s", exc,
+                )
+                return
 
+    async def _require_ws(self) -> aiohttp.ClientWebSocketResponse:
+        if self._ws is None or self._ws.closed:
+            raise BridgeClosed("WS is not connected")
+        return self._ws
 
-# ── Cloud endpoint shapes (placeholders) ─────────────────────────────
+    async def send_send(
+        self,
+        *,
+        plaintext: str,
+        recipient_slug: Optional[str] = None,
+        space_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Send a plaintext message + await the matching ack. Pass
+        EITHER ``recipient_slug`` (DM) OR ``space_id``+``channel_id``
+        (channel) — spec rejects mixed-shape frames as ``BAD_FRAME``.
+        Returns the ack frame as-is. Raises ``BridgeError`` on
+        server-side rejection or ``TimeoutError`` on missing ack."""
+        ws = await self._require_ws()
+        client_ref = f"r_{uuid.uuid4().hex[:12]}"
+        frame: dict[str, Any] = {
+            "type": "send",
+            "plaintext": plaintext,
+            "client_ref": client_ref,
+        }
+        if recipient_slug:
+            frame["recipient_slug"] = recipient_slug
+        if space_id:
+            frame["space_id"] = space_id
+        if channel_id:
+            frame["channel_id"] = channel_id
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._send_acks[client_ref] = fut
+        await ws.send_json(frame)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._send_acks.pop(client_ref, None)
 
+    async def send_fetch_pending(self, *, limit: Optional[int] = None) -> None:
+        """Fire the request; the resulting ``message`` +
+        ``pending_delivered`` frames surface via ``frames()``."""
+        ws = await self._require_ws()
+        frame: dict[str, Any] = {"type": "fetch_pending"}
+        if limit is not None:
+            frame["limit"] = limit
+        await ws.send_json(frame)
 
-async def llm_complete(
-    http: CloudHttpClient,
-    *,
-    api_key: str,
-    provider: str,
-    model: str,
-    system_prompt: str,
-    messages: list[dict],
-    tools: list[dict] | None = None,
-) -> dict:
-    """``POST /v1/llm/complete`` — forward an LLM call. Cloud uses
-    the provided api_key against the named provider. Response shape
-    mirrors Anthropic's tool-using messages API for now (cloud is
-    expected to normalise across providers)."""
-    body: dict[str, Any] = {
-        "api_key": api_key,
-        "provider": provider,
-        "model": model,
-        "system_prompt": system_prompt,
-        "messages": messages,
-    }
-    if tools:
-        body["tools"] = tools
-    return await http.post("/v1/llm/complete", body)
+    async def send_ack(
+        self, envelope_ids: list[str], *, timeout: float = 30.0,
+    ) -> dict:
+        """Mark envelopes read; await ``ack_result``. Empty list and
+        oversized batches are rejected server-side as BAD_FRAME — we
+        let the server enforce."""
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        await self._ack_result_waiters.put(fut)
+        await ws.send_json({"type": "ack", "envelope_ids": envelope_ids})
+        return await asyncio.wait_for(fut, timeout=timeout)
 
+    async def send_list_spaces(self, *, timeout: float = 30.0) -> dict:
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        await self._spaces_waiters.put(fut)
+        await ws.send_json({"type": "list_spaces"})
+        return await asyncio.wait_for(fut, timeout=timeout)
 
-async def send_message(
-    http: CloudHttpClient,
-    *,
-    channel: str,
-    text: str,
-    root_id: str = "",
-    is_visible_to_human: bool = True,
-) -> dict:
-    """``POST /v1/send_message`` — cloud handles encrypt + sign +
-    post. ``channel`` is either ``@<slug>`` for DM or ``ch_<uuid>``
-    for a channel."""
-    body = {
-        "channel": channel,
-        "text": text,
-        "root_id": root_id,
-        "is_visible_to_human": is_visible_to_human,
-    }
-    return await http.post("/v1/send_message", body)
+    async def close(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+        if self._ws is not None and not self._ws.closed:
+            with contextlib.suppress(Exception):
+                await self._ws.close()
+        self._ws = None
+        if self._session is not None and not self._session.closed:
+            with contextlib.suppress(Exception):
+                await self._session.close()
+        self._session = None
+        # Cancel pending waiters with a clean BridgeClosed.
+        for fut in list(self._send_acks.values()):
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        self._send_acks.clear()
+        while not self._ack_result_waiters.empty():
+            fut = self._ack_result_waiters.get_nowait()
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        while not self._spaces_waiters.empty():
+            fut = self._spaces_waiters.get_nowait()
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))

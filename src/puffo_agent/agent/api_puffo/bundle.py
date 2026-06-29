@@ -1,13 +1,21 @@
 """Install-bundle ingestion for api-puffo agents.
 
 A bundle is a one-shot JSON file (placed by an installer / web-side
-flow) that contains everything a cloud-hosted agent needs:
+flow) that contains everything a cloud-hosted agent needs.
 
-  - identity:    agent_slug, operator_slug, device_id
-  - crypto:      kem_secret_key, kem_cert
-  - auth:        session_token, puffo_cloud_server_url
+**The thin model.** The runtime holds NO key material. Server-side
+``puffo-server/cloud_agent`` loads the agent's KMS-sealed keystore
+once per WS connection and drives all seal/open. Per
+``BRIDGE-WIRE-PROTOCOL.md`` the runtime only needs:
+
+  - identity:    agent_slug, operator_slug
+  - auth:        sandbox_token (bearer for the WS upgrade; in E2B
+                 the egress proxy injects it, in local dev we set
+                 it ourselves)
+  - cloud URL:   puffo_cloud_server_url
   - profile:     display_name, role, role_short, soul, avatar_url
-  - runtime:     api_key, provider, model
+  - runtime:     api_key, provider, model (LLM HTTP — separate from
+                 the bridge, scope unchanged)
 
 On daemon startup we sweep ``~/.puffo-agent/api-puffo-install/`` for
 ``<slug>.json`` files. Each is materialised into the standard
@@ -38,10 +46,7 @@ logger = logging.getLogger(__name__)
 _BUNDLE_REQUIRED_FIELDS = (
     "agent_slug",
     "operator_slug",
-    "device_id",
-    "kem_secret_key",
-    "kem_cert",
-    "session_token",
+    "sandbox_token",
     "puffo_cloud_server_url",
     "display_name",
     "soul",
@@ -55,10 +60,7 @@ _BUNDLE_REQUIRED_FIELDS = (
 class ApiPuffoBundle:
     agent_slug: str
     operator_slug: str
-    device_id: str
-    kem_secret_key: str
-    kem_cert: dict
-    session_token: str
+    sandbox_token: str
     puffo_cloud_server_url: str
     display_name: str
     role: str
@@ -79,10 +81,7 @@ class ApiPuffoBundle:
         return cls(
             agent_slug=raw["agent_slug"],
             operator_slug=raw["operator_slug"],
-            device_id=raw["device_id"],
-            kem_secret_key=raw["kem_secret_key"],
-            kem_cert=raw["kem_cert"],
-            session_token=raw["session_token"],
+            sandbox_token=raw["sandbox_token"],
             puffo_cloud_server_url=raw["puffo_cloud_server_url"].rstrip("/"),
             display_name=raw["display_name"],
             role=raw.get("role", ""),
@@ -120,22 +119,20 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
     keys_dir = adir / "keys"
     keys_dir.mkdir(parents=True, exist_ok=True)
 
-    # profile.md — write the full soul into a single # Soul section so
+    # profile.md — bundle's full soul into a single # Soul section so
     # the standard extract_soul_body / _profile_summary readers work.
-    profile_md = (
-        f"# {bundle.display_name}\n\n"
-        f"{bundle.role}\n\n" if bundle.role else f"# {bundle.display_name}\n\n"
-    )
+    if bundle.role:
+        profile_md = f"# {bundle.display_name}\n\n{bundle.role}\n\n"
+    else:
+        profile_md = f"# {bundle.display_name}\n\n"
     profile_md += f"# Soul\n\n{bundle.soul.strip()}\n"
     (adir / "profile.md").write_text(profile_md, encoding="utf-8")
 
-    # keys/<slug>.json — KEM key + session token + cloud server URL.
+    # keys/<slug>.json — only auth state. Server resolves identity
+    # from sandbox_token on every WS upgrade.
     keys = {
         "slug": bundle.agent_slug,
-        "device_id": bundle.device_id,
-        "kem_secret_key": bundle.kem_secret_key,
-        "kem_cert_json": json.dumps(bundle.kem_cert),
-        "session_token": bundle.session_token,
+        "sandbox_token": bundle.sandbox_token,
         "puffo_cloud_server_url": bundle.puffo_cloud_server_url,
     }
     keys_path = keys_dir / f"{bundle.agent_slug}.json"
@@ -143,10 +140,7 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
     tmp.write_text(json.dumps(keys, indent=2), encoding="utf-8")
     tmp.replace(keys_path)
 
-    # agent.yml — minimal shape consumed by AgentConfig.load. We reuse
-    # puffo_core{slug, device_id, server_url} so existing helpers
-    # (resolve_workspace_dir, owner checks, etc.) work without
-    # special-casing api-puffo.
+    # agent.yml — minimal shape consumed by AgentConfig.load.
     cfg: dict[str, Any] = {
         "id": bundle.agent_slug,
         "state": "running",
@@ -156,11 +150,9 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
         "role_short": bundle.role_short,
         "created_at": int(time.time()),
         "puffo_core": {
-            # Cloud server URL doubles as the "server_url" — the
-            # ApiPuffoMessageClient uses it as the bearer-auth target.
             "server_url": bundle.puffo_cloud_server_url,
             "slug": bundle.agent_slug,
-            "device_id": bundle.device_id,
+            "device_id": "",
             "space_id": "",
             "operator_slug": bundle.operator_slug,
         },
@@ -196,8 +188,6 @@ def ingest_bundle(bundle_path: Path) -> tuple[bool, str]:
     except ValueError as exc:
         return False, f"invalid bundle: {exc}"
     if agent_yml_path(bundle.agent_slug).exists():
-        # Already provisioned — archive the bundle without re-write so
-        # a re-issued bundle doesn't clobber operator-edited state.
         _archive(bundle_path)
         return True, f"already provisioned: {bundle.agent_slug}"
     try:

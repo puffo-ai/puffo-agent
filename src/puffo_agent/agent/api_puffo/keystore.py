@@ -1,15 +1,15 @@
 """Keystore loader for api-puffo agents.
 
-The on-disk shape (``<agent_dir>/keys/<slug>.json``) is a strict
-superset of the legacy puffo-core keystore: KEM secret + session
-token + cloud server URL replace the Ed25519 signing material.
+Server-side ``puffo-server/cloud_agent`` holds all crypto; the
+runtime needs only the sandbox_token (bearer for the WS upgrade)
+and the cloud server URL. ``slug`` is included for symmetry with
+the legacy keystore + as a sanity check when constructing WS URLs.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from pathlib import Path
 
 from ...portal.state import agent_dir
 
@@ -17,10 +17,7 @@ from ...portal.state import agent_dir
 @dataclass
 class ApiPuffoKeystore:
     slug: str
-    device_id: str
-    kem_secret_key: str  # base64url-encoded 32 bytes
-    kem_cert: dict
-    session_token: str
+    sandbox_token: str
     puffo_cloud_server_url: str
 
     @classmethod
@@ -29,9 +26,6 @@ class ApiPuffoKeystore:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return cls(
             slug=raw["slug"],
-            device_id=raw["device_id"],
-            kem_secret_key=raw["kem_secret_key"],
-            kem_cert=json.loads(raw["kem_cert_json"]),
-            session_token=raw["session_token"],
+            sandbox_token=raw["sandbox_token"],
             puffo_cloud_server_url=raw["puffo_cloud_server_url"],
         )
