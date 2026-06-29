@@ -277,6 +277,49 @@ def test_single_turn_roundtrip(tmp_path):
     assert persisted["conversation_id"] == "conv_42"
 
 
+def test_token_usage_from_thread_event(tmp_path):
+    """Live codex reports per-turn tokens via ``thread/tokenUsage/updated``,
+    not on ``turn/completed`` — and ``inputTokens`` bundles the re-sent cached
+    history, so the recorded input must exclude ``cachedInputTokens``."""
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+msg = r()  # turn/start
+turn_id = msg["id"]
+
+w({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
+   "params": {"threadId": "c1", "turnId": "u1", "tokenUsage": {
+       "last": {"inputTokens": 76544, "cachedInputTokens": 74624, "outputTokens": 21},
+   }}})
+
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        result = await cs.run_turn("hi", "system prompt")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    assert result.input_tokens == 76544 - 74624  # cached history excluded
+    assert result.output_tokens == 21
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Resume happy path — second instance picks up the persisted id
 # ─────────────────────────────────────────────────────────────────────────────

@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .base import TurnResult
+from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
 from .cli_session import AuditLog
 
 logger = logging.getLogger(__name__)
@@ -1068,6 +1068,22 @@ class CodexSession:
         m = method.replace(".", "/").lower()
         turn = self._active_turn
 
+        if m.startswith("thread/tokenusage/updated") and turn is not None:
+            # codex reports per-turn tokens here, NOT on turn/completed.
+            # ``last`` is the current turn; it refreshes a few times — the
+            # value standing when turn/completed fires is the final tally.
+            last = ((params or {}).get("tokenUsage") or {}).get("last") or {}
+            try:
+                # ``inputTokens`` includes the (re-sent) cached context; subtract
+                # it so the figure matches claude-code's cache-excluded input.
+                inp = int(last.get("inputTokens") or 0)
+                cached = int(last.get("cachedInputTokens") or 0)
+                turn.input_tokens = max(0, inp - cached)
+                turn.output_tokens = int(last.get("outputTokens") or 0)
+            except (TypeError, ValueError):
+                pass
+            return
+
         if m.startswith("item/") and turn is not None:
             await self._handle_item_event(m, params, turn)
             return
@@ -1139,14 +1155,18 @@ class CodexSession:
                 final_text = "".join(turn.reply_chunks) or (
                     text if isinstance(text, str) else ""
                 )
+                if final_text and not is_silent(final_text):
+                    self._report_status("assistant_text", {"text": final_text})
                 if self.audit is not None and final_text:
                     self.audit.write("assistant.text", text=final_text)
             elif kind in ("tool_use", "tooluse", "tool_call", "toolcall"):
                 turn.tool_calls += 1
+                name = str(item.get("name") or kind)
+                self._report_status("tool_use", {"tool": name})
                 if self.audit is not None:
                     self.audit.write(
                         "tool",
-                        name=str(item.get("name") or kind),
+                        name=name,
                         input=item.get("input") or item.get("arguments") or {},
                         id=str(item.get("id") or ""),
                     )
@@ -1161,11 +1181,8 @@ class CodexSession:
                 server = item.get("server") or ""
                 tool = item.get("tool") or ""
                 args = item.get("arguments") or {}
-                if (
-                    server == "puffo"
-                    and tool in _PUFFO_SEND_MESSAGE_TOOLS
-                    and status == "completed"
-                ):
+                is_send = server == "puffo" and tool in _PUFFO_SEND_MESSAGE_TOOLS
+                if is_send and status == "completed":
                     # Shape mirrors the claude-code adapter so core.py's
                     # ``send_message_called`` check is identical
                     # regardless of harness.
@@ -1175,17 +1192,35 @@ class CodexSession:
                     })
                 # ``mcp__server__tool`` prefix matches claude-code's shape
                 # so a cross-adapter audit-log grep lights up on both.
+                name = f"mcp__{server}__{tool}" if server and tool else (tool or "mcp")
+                tool_event = {"tool": name}
+                if is_send and isinstance(args.get("text"), str):
+                    tool_event["content"] = args["text"][:STATUS_PREVIEW_CHARS]
+                self._report_status("tool_use", tool_event)
                 if self.audit is not None:
-                    self.audit.write(
-                        "tool",
-                        name=f"mcp__{server}__{tool}" if server and tool else (tool or "mcp"),
-                        input=args,
-                        id=str(item.get("id") or ""),
-                    )
+                    self.audit.write("tool", name=name, input=args, id=str(item.get("id") or ""))
             return
 
+    def _report_status(self, event: str, payload: dict) -> None:
+        """Fire-and-forget an agent.status event up the reverse channel.
+        Best-effort — must never break the notification reader."""
+        try:
+            from ...portal.control.reporter import get_reporter
+
+            asyncio.ensure_future(get_reporter().emit(self.agent_id, event, payload))
+        except Exception:  # noqa: BLE001
+            pass
+
     def _absorb_turn_usage(self, turn: _PendingTurn, params: dict) -> None:
-        usage = params.get("usage") or {}
+        # Fallback for builds that DO inline usage on turn/completed (top-level
+        # or nested under ``turn``). Live codex reports it via
+        # ``thread/tokenUsage/updated`` instead — so don't clobber a value
+        # already captured there with a zero.
+        usage = params.get("usage")
+        if not usage and isinstance(params.get("turn"), dict):
+            usage = params["turn"].get("usage")
+        if not usage:
+            return
         try:
             turn.input_tokens = int(usage.get("input_tokens") or 0)
             turn.output_tokens = int(usage.get("output_tokens") or 0)

@@ -20,6 +20,20 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[str], Awaitable[None]]
 
 
+# Agent-emitted marker meaning "I'm deliberately not replying". The shell
+# suppresses both the auto-post fallback and the reverse-channel report when it
+# appears anywhere in the assistant text.
+SILENT_MARKER = "[SILENT]"
+
+# Cap on text previews (message body, send content) put in agent.status
+# payloads — the operator UI truncates further for display.
+STATUS_PREVIEW_CHARS = 200
+
+
+def is_silent(text: str) -> bool:
+    return SILENT_MARKER in text
+
+
 # Refresh when fewer than this many seconds remain on the access
 @dataclass
 class TurnContext:

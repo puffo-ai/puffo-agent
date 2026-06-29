@@ -1,9 +1,11 @@
+import asyncio
 import os
 
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
+from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
 from .memory import MemoryManager
 
 MAX_LOG_ENTRIES = 60
@@ -37,6 +39,21 @@ def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
     if len(cleaned) == 1:
         return cleaned[0]
     return "\n".join(f"- {p}" for p in cleaned)
+
+
+def _user_message_preview(messages: list[dict]) -> str:
+    """Body of the latest user message (whitespace-collapsed, followups
+    dropped) for the turn_start status — the log entry is otherwise a
+    metadata block."""
+    for m in reversed(messages):
+        content = m.get("content")
+        if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
+            body = content.split("- message: ", 1)[1]
+            cut = body.find("\n- followup_messages_since:")
+            if cut != -1:
+                body = body[:cut]
+            return " ".join(body.split())[:STATUS_PREVIEW_CHARS]
+    return ""
 
 
 def _origin_for_compressed(path: str) -> str | None:
@@ -250,7 +267,7 @@ class PuffoAgent:
                 )
             return None
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
-        if "[SILENT]" in joined:
+        if is_silent(joined):
             return None
         if "API Error" in joined:
             is_auth = looks_like_auth_error(joined)
@@ -287,7 +304,25 @@ class PuffoAgent:
             memory_dir=self.memory_dir,
             on_progress=on_progress,
         )
+        # Reverse channel: turn_start, then the adapter streams
+        # assistant_text / tool_use, then turn_complete carries the tokens.
+        # Best-effort — the reporter no-ops if the WS is down / owner unlinked.
+        from ..portal.control.reporter import get_reporter
+
+        asyncio.ensure_future(
+            get_reporter().emit(
+                self.agent_id, "turn_start", {"message": _user_message_preview(ctx.messages)}
+            )
+        )
         result = await self.adapter.run_turn(ctx)
+
+        asyncio.ensure_future(
+            get_reporter().emit(
+                self.agent_id,
+                "turn_complete",
+                {"tokens": {"input": result.input_tokens, "output": result.output_tokens}},
+            )
+        )
 
         # Reply routing:
         #   a. send_message called → return None (MCP already posted).
@@ -310,7 +345,7 @@ class PuffoAgent:
         # doesn't matter. Real replies go via send_message, so a
         # prose-only turn mentioning the marker is correctly silent.
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
-        if "[SILENT]" in joined:
+        if is_silent(joined):
             self.logger.debug(
                 f"[silent] [{channel_name}] @{sender}: agent chose not to reply"
             )
@@ -343,6 +378,11 @@ class PuffoAgent:
             f"[fallback] [{channel_name}] @{sender}: agent skipped both "
             f"send_message and [SILENT] markers; posting "
             f"{len(text_parts) or 1}-frame fallback"
+        )
+        asyncio.ensure_future(
+            get_reporter().emit(
+                self.agent_id, "tool_use", {"tool": "fallback", "content": fallback[:STATUS_PREVIEW_CHARS]}
+            )
         )
         self._append_assistant(channel_name, fallback)
         return fallback
