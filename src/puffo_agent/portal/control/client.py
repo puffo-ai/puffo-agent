@@ -280,6 +280,18 @@ class MachineControlClient:
                 last_caps = await asyncio.to_thread(build_capabilities)
                 await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
                 sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
+
+                # Register the reverse-channel sender so the agent processing
+                # path can stream agent.status up this live socket.
+                from .reporter import get_reporter
+
+                async def _report(operator_slug: str, envelope: dict) -> None:
+                    await self._send(
+                        ws,
+                        {"type": "message", "operator_slug": operator_slug, "envelope": envelope},
+                    )
+
+                get_reporter().set_sender(_report)
                 try:
                     async for msg in ws:
                         if stop.is_set():
@@ -298,6 +310,7 @@ class MachineControlClient:
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
                 finally:
+                    get_reporter().set_sender(None)
                     sender.cancel()
                     try:
                         await sender

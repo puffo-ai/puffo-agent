@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 from ._auth_markers import looks_like_auth_error
@@ -287,7 +288,31 @@ class PuffoAgent:
             memory_dir=self.memory_dir,
             on_progress=on_progress,
         )
+        # Portal reverse channel: a lifecycle ping at the start so the operator
+        # sees processing begin, the rich summary at the end. Best-effort +
+        # ephemeral — the reporter no-ops if the WS is down / owner unlinked and
+        # never raises. (Per-tool / per-token streaming is a planned follow-up.)
+        from ..portal.control.reporter import get_reporter
+
+        asyncio.ensure_future(get_reporter().emit(self.agent_id, "turn_start", {}))
         result = await self.adapter.run_turn(ctx)
+
+        asyncio.ensure_future(
+            get_reporter().emit(
+                self.agent_id,
+                "turn_complete",
+                {
+                    "assistant_text": result.reply or "",
+                    "tools": result.metadata.get("tool_names") or [],
+                    "tokens": {
+                        "input": result.input_tokens,
+                        "output": result.output_tokens,
+                        "tool_calls": result.tool_calls,
+                    },
+                    "harness": result.metadata.get("harness"),
+                },
+            )
+        )
 
         # Reply routing:
         #   a. send_message called → return None (MCP already posted).
