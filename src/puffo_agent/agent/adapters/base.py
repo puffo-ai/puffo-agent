@@ -25,6 +25,10 @@ ProgressCallback = Callable[[str], Awaitable[None]]
 # appears anywhere in the assistant text.
 SILENT_MARKER = "[SILENT]"
 
+# Cap on text previews (message body, send content) put in agent.status
+# payloads — the operator UI truncates further for display.
+STATUS_PREVIEW_CHARS = 200
+
 
 def is_silent(text: str) -> bool:
     return SILENT_MARKER in text

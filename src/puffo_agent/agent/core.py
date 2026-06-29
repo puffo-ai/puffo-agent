@@ -5,7 +5,7 @@ from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
-from .adapters.base import is_silent
+from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
 from .memory import MemoryManager
 
 MAX_LOG_ENTRIES = 60
@@ -39,6 +39,21 @@ def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
     if len(cleaned) == 1:
         return cleaned[0]
     return "\n".join(f"- {p}" for p in cleaned)
+
+
+def _user_message_preview(messages: list[dict]) -> str:
+    """Body of the latest user message (whitespace-collapsed, followups
+    dropped) for the turn_start status — the log entry is otherwise a
+    metadata block."""
+    for m in reversed(messages):
+        content = m.get("content")
+        if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
+            body = content.split("- message: ", 1)[1]
+            cut = body.find("\n- followup_messages_since:")
+            if cut != -1:
+                body = body[:cut]
+            return " ".join(body.split())[:STATUS_PREVIEW_CHARS]
+    return ""
 
 
 def _origin_for_compressed(path: str) -> str | None:
@@ -294,20 +309,10 @@ class PuffoAgent:
         # Best-effort — the reporter no-ops if the WS is down / owner unlinked.
         from ..portal.control.reporter import get_reporter
 
-        # The log entry is a metadata block; surface just the message body
-        # (multi-line, whitespace collapsed), dropping any followups section.
-        message_preview = ""
-        for m in reversed(ctx.messages):
-            content = m.get("content")
-            if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
-                body = content.split("- message: ", 1)[1]
-                cut = body.find("\n- followup_messages_since:")
-                if cut != -1:
-                    body = body[:cut]
-                message_preview = " ".join(body.split())[:200]
-                break
         asyncio.ensure_future(
-            get_reporter().emit(self.agent_id, "turn_start", {"message": message_preview})
+            get_reporter().emit(
+                self.agent_id, "turn_start", {"message": _user_message_preview(ctx.messages)}
+            )
         )
         result = await self.adapter.run_turn(ctx)
 
@@ -376,7 +381,7 @@ class PuffoAgent:
         )
         asyncio.ensure_future(
             get_reporter().emit(
-                self.agent_id, "tool_use", {"tool": "fallback", "content": fallback[:200]}
+                self.agent_id, "tool_use", {"tool": "fallback", "content": fallback[:STATUS_PREVIEW_CHARS]}
             )
         )
         self._append_assistant(channel_name, fallback)

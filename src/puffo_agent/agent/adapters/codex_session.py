@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .base import TurnResult, is_silent
+from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
 from .cli_session import AuditLog
 
 logger = logging.getLogger(__name__)
@@ -1195,7 +1195,7 @@ class CodexSession:
                 name = f"mcp__{server}__{tool}" if server and tool else (tool or "mcp")
                 tool_event = {"tool": name}
                 if is_send and isinstance(args.get("text"), str):
-                    tool_event["content"] = args["text"][:200]
+                    tool_event["content"] = args["text"][:STATUS_PREVIEW_CHARS]
                 self._report_status("tool_use", tool_event)
                 if self.audit is not None:
                     self.audit.write("tool", name=name, input=args, id=str(item.get("id") or ""))

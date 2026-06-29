@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from .base import TurnResult, is_silent
+from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
 
 logger = logging.getLogger(__name__)
 
@@ -763,7 +763,7 @@ class ClaudeSession:
                         if "send_message" in name:
                             body = tool_input.get("text")
                             if isinstance(body, str):
-                                tool_event["content"] = body[:200]
+                                tool_event["content"] = body[:STATUS_PREVIEW_CHARS]
                         asyncio.ensure_future(
                             reporter.emit(self.agent_id, "tool_use", tool_event)
                         )

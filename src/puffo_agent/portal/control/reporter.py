@@ -48,10 +48,8 @@ class AgentStatusReporter:
             recipients = await self._recipients(operator_slug, pairing)
             if not recipients:
                 return
-            machine = self._machine or load_or_create_machine()
-            self._machine = machine
             envelope = agent_message.build_machine_message_envelope(
-                machine,
+                self._machine_identity(),
                 recipients,
                 {"type": "agent.status", "agent_slug": agent_slug, "event": event, "payload": payload},
             )
@@ -68,6 +66,11 @@ class AgentStatusReporter:
         except Exception as exc:  # noqa: BLE001 — best-effort; never break a turn.
             log.debug("reporter: emit failed: %s", exc)
 
+    def _machine_identity(self):
+        if self._machine is None:
+            self._machine = load_or_create_machine()
+        return self._machine
+
     def _owner(self, agent_slug: str) -> str | None:
         try:
             return AgentConfig.load(agent_slug).puffo_core.operator_slug or None
@@ -79,10 +82,8 @@ class AgentStatusReporter:
         hit = self._cache.get(operator_slug)
         if hit and hit[0] > now:
             return hit[1]
-        machine = self._machine or load_or_create_machine()
-        self._machine = machine
         recips = await agent_message.fetch_active_recipients(
-            pairing.server_url, machine, operator_slug, pairing.operator_root_pubkey
+            pairing.server_url, self._machine_identity(), operator_slug, pairing.operator_root_pubkey
         )
         self._cache[operator_slug] = (now + _RECIPIENT_TTL_SECONDS, recips)
         return recips
