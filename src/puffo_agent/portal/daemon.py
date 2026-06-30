@@ -611,14 +611,23 @@ async def _retry_move(src: Path, dest: Path) -> OSError | None:
     # SHM handles can take a moment to release on Windows after
     # stop_worker, and shutil.move's copy-then-delete fallback would
     # otherwise leave a half-moved tree in both paths.
+    #
+    # Between attempts, scrub any partial ``dest`` left by the prior
+    # failed copy. Without this, the second ``shutil.move`` sees
+    # ``dest`` as an existing directory and helpfully nests the
+    # whole src under it (``dest/<src.name>``) instead of replacing it.
     last_err: OSError | None = None
     for _ in range(8):
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
         try:
             shutil.move(str(src), str(dest))
             return None
         except (OSError, PermissionError) as exc:
             last_err = exc
             await asyncio.sleep(0.5)
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
     return last_err
 
 
