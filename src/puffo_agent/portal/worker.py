@@ -997,6 +997,19 @@ class Worker:
         self._warm_done.set()
         if self._ws_local_hub is not None:
             self._ws_local_hub.register(point)
+
+        # Push display_name / avatar_url / role / soul to the server identity.
+        # The regular runtimes do this post-warm; ws-local idle skips that path,
+        # so without this a freshly-created ws-local agent shows blank in the UI.
+        async def _ws_local_profile_sync() -> None:
+            from .profile_sync import sync_full_profile
+
+            try:
+                await sync_full_profile(self.agent_cfg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent %s: ws-local profile sync failed: %s", agent_id, exc)
+
+        asyncio.ensure_future(_ws_local_profile_sync())
         logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
         try:
             await self._stop.wait()
