@@ -1,46 +1,16 @@
-# Publish the two split workspace packages — puffo-agent-core and
-# puffo-agent-cloud — on every GitHub Release (and on demand via the
-# Actions "Run workflow" button). Separate from the fat puffo-agent
-# workflows (publish-pypi.yml / publish-testpypi.yml), which are left
-# untouched: those bind to the `pypi` / `testpypi` environments and the
-# `puffo-agent` PyPI project, this one owns the two split packages.
+# Publishes the split workspace packages (puffo-agent-core +
+# puffo-agent-cloud) on every GitHub Release. Two paths:
 #
-# Two delivery paths, by design:
+#   1. release-assets — always runs, GITHUB_TOKEN only. Wheels + sdists
+#      attach to the Release; installable via the asset URL with no PyPI
+#      project required.
+#   2. pypi-core / pypi-cloud — gated on `vars.PUBLISH_PYPI == 'true'`
+#      AND the per-package Trusted Publisher + GitHub Environment having
+#      been created (one binding per package). SKIPPED (not failed)
+#      until then, so a release stays green pre-config.
 #
-#   1. GitHub Release assets — ALWAYS runs, ZERO external setup. `uv
-#      build` produces standalone wheels + sdists which are attached to
-#      the Release using the built-in GITHUB_TOKEN. Installable straight
-#      from the release with no PyPI project in existence:
-#        pip install \
-#          https://github.com/puffo-ai/puffo-agent/releases/download/<tag>/puffo_agent_cloud-1.0.3-py3-none-any.whl
-#      or point pip at the release's asset listing:
-#        pip install puffo-agent-cloud puffo-agent-core \
-#          --find-links https://github.com/puffo-ai/puffo-agent/releases/expanded_assets/<tag>
-#
-#   2. PyPI Trusted Publishing — GATED, INERT until configured. The
-#      `pypi-core` / `pypi-cloud` jobs run only when the repo variable
-#      PUBLISH_PYPI is set to 'true' (Settings → Secrets and variables →
-#      Actions → Variables). Until then they are SKIPPED — so a release
-#      stays green even though no PyPI project / publisher exists yet.
-#
-# One-time setup before flipping PUBLISH_PYPI=true (see packages/PUBLISH.md):
-#
-#   For EACH of puffo-agent-core and puffo-agent-cloud, on pypi.org:
-#     Account settings → Publishing → "Add a new pending publisher":
-#       PyPI project name:  puffo-agent-core      (resp. puffo-agent-cloud)
-#       Owner:              puffo-ai
-#       Repository name:    puffo-agent
-#       Workflow filename:  publish-cloud-pkgs.yml
-#       Environment name:   pypi-core             (resp. pypi-cloud)
-#   Then in repo Settings → Environments create `pypi-core` and
-#   `pypi-cloud` (add a "Required reviewers" rule — a PyPI version can
-#   never be re-uploaded, so the approval is the last cheap safety gate),
-#   and set the repo variable PUBLISH_PYPI=true.
-#
-# Each PyPI project binds to exactly ONE (owner + repo + workflow
-# filename + environment) tuple, which is why core and cloud get their
-# own environment and each publish job uploads only its own package's
-# dist dir.
+# Setup steps for flipping PUBLISH_PYPI on, and the rationale for the
+# per-package environment split, live in packages/PUBLISH.md.
 
 name: Publish cloud packages
 
