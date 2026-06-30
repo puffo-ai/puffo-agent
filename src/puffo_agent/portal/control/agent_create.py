@@ -257,6 +257,53 @@ async def finalize_and_pack(
     }
 
 
+async def post_slug_binding(server_url: str, slug_binding: dict, pending_token: str) -> None:
+    """POST /certs/slug_binding to finalize the pending agent identity (the
+    token + self-signature are the gate; no auth header)."""
+    import aiohttp
+
+    url = f"{server_url.rstrip('/')}/certs/slug_binding"
+    body = {"pending_token": pending_token, "slug_binding": slug_binding}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        async with session.post(url, json=body) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(f"slug_binding finalize HTTP {resp.status}: {text[:200]}")
+
+
+async def run_create(
+    operator_slug: str, passcode: str, *, display_name: str = "", timeout: float = 300.0
+) -> dict:
+    """Daemon-internal entry point: wire the live reverse-channel impls (reporter
+    send, pending-approval wait, slug_binding finalize) and run the full flow."""
+    from .reporter import get_reporter
+    from .store import get_pairing
+
+    pairing = get_pairing(operator_slug)
+    if pairing is None:
+        raise ValueError(f"operator {operator_slug!r} is not linked to this machine")
+    reporter = get_reporter()
+    pending = get_pending_approvals()
+
+    async def _send(op_slug: str, payload: dict) -> None:
+        await reporter.send_to_operator(op_slug, payload)
+
+    async def _await(request_id: str) -> dict:
+        return await pending.wait(request_id, timeout)
+
+    async def _finalize(slug_binding: dict, pending_token: str) -> None:
+        await post_slug_binding(pairing.server_url, slug_binding, pending_token)
+
+    return await create_ws_local_agent(
+        operator_slug,
+        passcode,
+        send_request_fn=_send,
+        await_approval_fn=_await,
+        finalize_fn=_finalize,
+        display_name=display_name,
+    )
+
+
 def build_slug_binding(root: Ed25519KeyPair, slug: str) -> dict:
     """Agent-root-signed binding of ``slug`` to the agent root — built once the
     server assigns the slug, then POSTed to /certs/slug_binding to finalize."""

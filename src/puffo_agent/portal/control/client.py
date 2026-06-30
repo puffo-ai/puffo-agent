@@ -188,6 +188,16 @@ async def execute_command(
         return {"ok": True}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
+    if op == "agent_create_approved":
+        # The operator approved a machine-initiated ws-local create — hand the
+        # server-minted slug + pending_token to the waiting create flow.
+        from .agent_create import get_pending_approvals
+
+        resolved = get_pending_approvals().resolve(
+            str(params.get("request_id") or ""),
+            {"agent_slug": params.get("agent_slug"), "pending_token": params.get("pending_token")},
+        )
+        return {"ok": resolved, "error": None if resolved else "no pending create request"}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 

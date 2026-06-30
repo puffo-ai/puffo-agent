@@ -63,6 +63,23 @@ class AgentStatusReporter:
         except Exception as exc:  # noqa: BLE001 — best-effort; never break a turn.
             log.debug("reporter: emit failed: %s", exc)
 
+    async def send_to_operator(self, operator_slug: str, payload: dict) -> None:
+        """Send an arbitrary machine_message payload to a specific linked
+        operator. Unlike ``emit`` this raises on failure — callers (e.g. the
+        ws-local create flow) need to surface a non-delivery."""
+        if self._sender is None:
+            raise RuntimeError("control WS not connected")
+        pairing = load_pairings().get(operator_slug)
+        if pairing is None:
+            raise RuntimeError(f"operator {operator_slug!r} is not linked")
+        recipients = await self._recipients(operator_slug, pairing)
+        if not recipients:
+            raise RuntimeError(f"operator {operator_slug!r} has no active devices")
+        envelope = agent_message.build_machine_message_envelope(
+            self._machine_identity(), recipients, payload
+        )
+        await self._sender(operator_slug, envelope)
+
     def _machine_identity(self):
         if self._machine is None:
             self._machine = load_or_create_machine()
