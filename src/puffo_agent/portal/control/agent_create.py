@@ -285,7 +285,9 @@ async def finalize_and_pack(
             # auto-accepted by default (is_from_operator); the flag would over-
             # broadly accept invites from anyone.
         ),
-        runtime=RuntimeConfig(kind="ws-local"),
+        # ws-local is driven by the attached tool — no provider/harness/model
+        # (the RuntimeConfig defaults would otherwise stamp it "claude-code").
+        runtime=RuntimeConfig(kind="ws-local", provider="", harness="", model=""),
         created_at=int(time.time()),
     ).save()
 
