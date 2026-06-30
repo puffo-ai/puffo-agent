@@ -200,6 +200,14 @@ below is the authoritative reference.
   operator gets a DM and replies `y` (you leave) or `n` (you stay). Use
   sparingly, and give an honest `reason`.
 
+**Suggesting team-shape changes (NOT taking action):**
+When conversation surfaces the need for a new agent, a new channel,
+or pulling someone into a channel, post the matching `/agent`,
+`/channel`, or `/invite` block via `send_message` — the web client
+renders an actionable card a human taps to open the existing modal
+pre-filled. Skill docs: `suggest-agent`, `suggest-channel`,
+`suggest-invite`. Don't try to provision these yourself.
+
 Use write tools with intent — proactive messages surprise people.
 Read tools are cheap.
 
@@ -739,6 +747,228 @@ server. After this, calls to the MCP's tools should succeed.
 """
 
 
+DEFAULT_SKILL_SUGGEST_AGENT = """\
+# Skill: suggest a new Puffo agent
+
+You want a human in the current channel to consider creating a new
+agent. Don't try to provision it yourself — instead, post a message
+containing an `/agent` block and the puffo web client renders it as
+an actionable card with an **Add as my agent** button that opens the
+existing create-agent modal pre-filled with your fields.
+
+## When to use
+
+- A conversation surfaces a recurring task that doesn't have a
+  dedicated agent ("we should have someone watching the Sentry
+  stream", "a release-notes drafter would unblock the PM").
+- You want to recommend a specific agent shape (name + role +
+  description) rather than hand-waving "you should add an agent."
+- A human is the right approver — this skill is for *suggesting*,
+  not for taking action.
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/agent` is shown
+above the card as plain text.
+
+```
+<optional preamble — your reasoning, context, prompt for the human>
+
+/agent
+name: <display name>
+role: <short role label, e.g. "QA reviewer" or "release coordinator">
+description: <plain-text purpose, MAX 108 BYTES>
+message: <one-liner the agent should kick off with after it joins>
+```
+
+### Field rules
+
+- **`name`** — what the operator sees in the agent picker (e.g.
+  `Scout`, `Eli the Editor`). Keep it short.
+- **`role`** — a short pill-chip label. Two or three words max
+  ("API reviewer", "support triage").
+- **`description`** — **≤ 108 bytes UTF-8**. ASCII = 1 byte; CJK /
+  emoji = 3–4 bytes. The web parser truncates anything longer and
+  warns the operator. If you need more rationale, put it in the
+  preamble above `/agent`.
+- **`message`** — optional one-line greeting / first prompt the
+  agent uses after the human accepts.
+
+## Example
+
+```
+We've been triaging Sentry alerts manually in #ops for two weeks;
+a dedicated agent would close the loop faster.
+
+/agent
+name: Sentry Triage
+role: Incident watcher
+description: Watches Sentry's high-severity stream and pings the on-call when a new error class appears.
+message: Hi! I'll watch Sentry and surface unknown error classes. Acking the first one now.
+```
+
+## What NOT to do
+
+- Don't omit any of `name` / `role` / `description` — the card
+  renders with placeholders and looks broken.
+- Don't try to create the agent yourself.
+- Don't send the same suggestion twice in quick succession.
+- Don't put markdown inside the `/agent` fields. Strict
+  `key: value` per line.
+"""
+
+
+DEFAULT_SKILL_SUGGEST_CHANNEL = """\
+# Skill: suggest a new channel
+
+You want a human in the current space to consider creating a new
+channel. Post a message containing a `/channel` block and the puffo
+web client renders it as an actionable card with a **Create channel**
+button that opens the existing create-channel modal pre-filled with
+your fields.
+
+## When to use
+
+- A subtopic is taking over the parent channel and would benefit
+  from its own room (`#api-design` splitting from `#engineering`).
+- You want to recommend a specific channel name + description
+  rather than just say "let's make a channel for this."
+- A human owns the channel-create decision.
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/channel` is shown
+above the card as plain text.
+
+```
+<optional preamble — reasoning, who should join, what it'll discuss>
+
+/channel
+name: <channel name without the leading #>
+description: <one-line purpose, MAX ~100 chars>
+message: <optional one-liner shown above the card>
+```
+
+### Field rules
+
+- **`name`** — the channel name as it'll appear in the sidebar.
+  Lowercase ASCII letters / digits / hyphens are safest (matches
+  the server's slug shape).
+- **`description`** — short blurb under the name; the parser
+  truncates anything longer than ~100 chars and warns the human.
+- **`message`** — optional one-liner shown above the card. Good
+  place to suggest who should join and why now.
+
+## Suggested members
+
+The `/channel` block has no `members:` field. List proposed members
+in the preamble; the human adds them in the existing modal's
+picker after accepting.
+
+## Example
+
+```
+We've covered the new ingestion pipeline in #engineering for three
+days running. Splitting it out keeps the parent channel readable.
+Probably want @alice-1234, @bob-9999, @sentry-bot in there to start.
+
+/channel
+name: ingestion-pipeline
+description: Design + rollout of the new ingestion pipeline. Status updates, decisions, blockers.
+message: Spun out of #engineering to keep the parent thread reading-friendly.
+```
+
+## What NOT to do
+
+- Don't try to create the channel yourself via space-events.
+- Don't suggest a channel name that already exists in the active
+  space; the modal rejects duplicates.
+- Don't put markdown inside the `/channel` fields. Strict
+  `key: value` per line.
+- Don't suggest a new channel for every topic that wanders for
+  ten minutes — wait until the conversation is clearly its own.
+"""
+
+
+DEFAULT_SKILL_SUGGEST_INVITE = """\
+# Skill: suggest inviting a member to a channel
+
+You want a human to invite someone into a channel where they aren't
+currently a member. Post a message containing an `/invite` block and
+the puffo web client renders it as an actionable card with a
+**Send invite** button that opens the existing add-member modal with
+the suggested slug pre-selected.
+
+## When to use
+
+- A member's expertise (or a stakeholder's interest) comes up in
+  conversation and they aren't in the channel yet ("Alice has been
+  working on this exact problem", "let's loop in @bob-9999").
+- You want to recommend a *specific* invite rather than just say
+  "we should bring someone in."
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/invite` is shown
+above the card as plain text.
+
+```
+<optional preamble — why this person should join, what they'd contribute>
+
+/invite
+member: <slug, e.g. alice-1234>
+channel: <target channel — display name OR ch_<uuid>>
+message: <optional one-liner shown alongside the card>
+```
+
+### Field rules
+
+- **`member`** — the **slug** of the person to invite
+  (e.g. `alice-1234`). Slugs only, not display names. Look up the
+  slug from a recent message author or via `get_user_info`.
+- **`channel`** — either the channel display name (without `#`) or
+  a raw `ch_<uuid>`. **Always name the target explicitly** — if
+  omitted, the card defaults to the current channel which is
+  usually wrong for `/invite`.
+- **`message`** — optional rationale for the human; renders above
+  the card.
+
+## Permissions
+
+The card doesn't enforce channel-admin permissions — the underlying
+add-member modal rejects the invite at submit time if the human
+reviewer isn't allowed to invite. If you know the reviewer isn't an
+admin, suggest someone who is in your preamble.
+
+## Example
+
+```
+@alice-1234 has been shipping the OAuth refactor for a month — she'd
+catch the auth-token race we just hit.
+
+/invite
+member: alice-1234
+channel: oauth-rollout
+message: Alice can sanity-check our token-refresh discussion.
+```
+
+## What NOT to do
+
+- Don't try to send the invite yourself via space-events.
+- Don't use display names in `member` — slugs only.
+- Don't put markdown inside the `/invite` fields. Strict
+  `key: value` per line.
+- Don't suggest an invite for someone already in the target channel.
+  Spot-check with `list_channel_members` first if unsure.
+- Don't fire multiple `/invite` cards in a row for the same person
+  across multiple channels — pick the right one and let the human
+  accept that first.
+"""
+
+
 # Each entry: skill id → (one-line description, body).
 # The description goes into the YAML frontmatter Claude Code reads
 # for skill discovery; the body is everything below the frontmatter.
@@ -783,6 +1013,18 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         "Bring an MCP that needs operator-side OAuth/credentials from "
         "host into your own agent config.",
         DEFAULT_SKILL_USE_HOST_MCP,
+    ),
+    "suggest-agent": (
+        "Post a /agent card so a human can spawn a new Puffo agent.",
+        DEFAULT_SKILL_SUGGEST_AGENT,
+    ),
+    "suggest-channel": (
+        "Post a /channel card so a human can spin up a new channel.",
+        DEFAULT_SKILL_SUGGEST_CHANNEL,
+    ),
+    "suggest-invite": (
+        "Post an /invite card so a human can add a member to a channel.",
+        DEFAULT_SKILL_SUGGEST_INVITE,
     ),
 }
 
