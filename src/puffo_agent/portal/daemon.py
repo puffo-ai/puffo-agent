@@ -405,17 +405,10 @@ class Daemon:
         await asyncio.gather(*(self._stop_worker(i) for i in ids), return_exceptions=True)
 
     async def _archive_on_flag(self, agent_id: str) -> None:
-        """Stop the worker, revoke its device server-side, and move its
-        dir to ``archived/<id>-ws-<stamp>/``. The ``-ws-`` suffix marks
-        WS-cascade archives (operator-initiated has no suffix,
-        sync-driven uses ``-sync-``).
-
-        Revoke is best-effort: a failure drops a ``pending_revoke.json``
-        marker into the archived dir + leaves the archive itself
-        completed, so a daemon-startup sweep (or manual retry) can
-        finish the revoke later. Without this an archived agent's
-        device cert would stay valid on puffo-server forever — anyone
-        who restored the dir would resurrect the agent."""
+        """Stop the worker, revoke its device server-side, and move
+        its dir to ``archived/<id>-ws-<stamp>/``. Revoke is
+        best-effort — failure drops a pending marker in the archived
+        dir for the next startup sweep."""
         logger.warning(
             "agent %s: archive.flag detected, stopping worker + archiving",
             agent_id,
@@ -482,13 +475,10 @@ class Daemon:
                 )
 
     async def _delete_on_flag(self, agent_id: str) -> None:
-        """Stop the worker, revoke the agent's device server-side, and
-        remove the agent dir. On revoke failure, downgrade to archive
-        (keys preserved in ``archived/<id>-del-<stamp>/`` + a
-        ``pending_revoke.json`` marker) so the next daemon-startup
-        sweep can finish the revoke — otherwise the device cert would
-        stay valid forever and a recovered backup of the deleted dir
-        would resurrect the agent."""
+        """Stop the worker, revoke the agent's device server-side,
+        rmtree the dir. Revoke failure → downgrade to archive so the
+        next startup sweep can retry; otherwise we'd rmtree the keys
+        needed for retry and the device cert would stay valid forever."""
         logger.warning(
             "agent %s: delete.flag detected, stopping worker + removing dir",
             agent_id,
@@ -620,9 +610,6 @@ async def _drain_codex_tmp(src: Path) -> None:
 
 
 async def _sweep_archived_pending_revokes_at_startup() -> None:
-    """Retry any ``archived/.../pending_revoke.json`` markers left by
-    a previous run's archive/delete where the server-side revoke
-    failed transiently."""
     from .import_agents import sweep_archived_pending_revokes
     try:
         n = await sweep_archived_pending_revokes()

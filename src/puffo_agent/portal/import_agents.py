@@ -586,10 +586,8 @@ async def self_revoke_device(
     device_signing_key: Ed25519KeyPair,
     root_signing_key: Ed25519KeyPair,
 ) -> None:
-    """Revoke this device's own cert. Root-signed revocation body +
-    POST envelope signed by a freshly-registered subkey of this
-    device (still valid at request-time; the revoke applies after
-    the server records it)."""
+    # POST envelope uses a fresh subkey of THIS device — still valid
+    # at request-time even though the revoke is about to apply.
     revocation = create_device_revocation(root_signing_key, device_id)
     async with _remote_http_session(server_url) as session:
         subkey, cert = await _register_subkey_via_device(
@@ -611,10 +609,8 @@ async def self_revoke_device(
 
 
 async def revoke_agent_device(agent_id: str) -> None:
-    """High-level wrapper: load the agent's identity from its active
-    keystore and self-revoke. Must be called while ``agent_dir`` is
-    still in the active path (before archive/delete moves it).
-    Raises on any failure — caller logs + writes a pending marker."""
+    # Must run before the agent_dir gets moved — keys still in the
+    # active KeyStore path. Raises on failure.
     from .state import AgentConfig
 
     cfg = AgentConfig.load(agent_id)
@@ -649,8 +645,6 @@ def write_archived_pending_revoke(
     device_id: str,
     last_error: str,
 ) -> None:
-    """Drop a marker into a freshly-archived dir so the daemon's
-    next-startup sweep (or a manual retry) can finish the revoke."""
     path = archived_pending_revoke_path(archived_agent_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -670,11 +664,8 @@ def write_archived_pending_revoke(
 
 
 async def _retry_archived_pending_revoke(archived_path: Path) -> bool:
-    """Load the marker + per-agent keystore from an archived dir and
-    retry the self-revoke. Returns True on success (marker removed) or
-    when the marker is unparseable / missing fields (treated as
-    permanently un-retryable). Returns False on transient failure
-    (marker left in place for the next sweep)."""
+    # Returns True on success (marker removed) or when the marker /
+    # keystore is permanently un-retryable; False on transient failure.
     marker = archived_pending_revoke_path(archived_path)
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -725,10 +716,8 @@ async def _retry_archived_pending_revoke(archived_path: Path) -> bool:
 
 
 async def sweep_archived_pending_revokes() -> int:
-    """Scan ``archived/<id>-*-<stamp>/.puffo-agent/pending_revoke.json``
-    and retry each. Called at daemon startup so a previous-run
-    transient revoke failure doesn't leave the server-side device
-    cert live forever."""
+    # Called at daemon startup so a prior-run transient revoke
+    # failure doesn't leave the server-side device cert live forever.
     from .state import archived_dir
 
     root = archived_dir()

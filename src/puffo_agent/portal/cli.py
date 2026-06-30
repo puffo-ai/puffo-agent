@@ -1023,10 +1023,9 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
                 break
             time.sleep(1)
 
-    # Revoke the device server-side before moving keys out of the
-    # active path. Best-effort: failure → log + drop a pending marker
-    # into the archived dir after the move so the daemon's startup
-    # sweep can retry.
+    # Revoke before moving keys out of the active path. Best-effort:
+    # failure drops a pending marker that the daemon's startup sweep
+    # will retry.
     from .import_agents import (
         revoke_agent_device,
         write_archived_pending_revoke,
