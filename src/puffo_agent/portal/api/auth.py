@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 # /v1/info is public discovery; /v1/pair handles its own crypto;
 # /v1/ws-local authenticates by ``.puffoagent`` decryption in its own
 # handshake.
-PUBLIC_PATHS = {"/v1/info", "/v1/providers", "/v1/ws-local"}
+# create-ws-local is a bootstrap call from a not-yet-provisioned agent (no
+# bridge credentials yet); the operator's Approve is the real security gate.
+PUBLIC_PATHS = {"/v1/info", "/v1/providers", "/v1/ws-local", "/v1/agents/create-ws-local"}
 PAIR_PATH = "/v1/pair"
 
 

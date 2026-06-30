@@ -541,6 +541,44 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
+    """Create a ws-local agent via operator approval (the machine requests it,
+    the operator Approves in the app), then print the result JSON to stdout so
+    the calling agent can attach. Requires the daemon running with the bridge."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps(
+        {
+            "operator": args.operator,
+            "passcode": args.passcode,
+            "display_name": getattr(args, "display_name", "") or "",
+        }
+    ).encode("utf-8")
+    url = f"{args.bridge_url.rstrip('/')}/v1/agents/create-ws-local"
+    req = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        # Generous timeout — the call blocks on the operator's Approve.
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"error: create failed (HTTP {exc.code}): {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(
+            f"error: cannot reach the daemon bridge at {args.bridge_url} ({exc.reason}). "
+            "Is the daemon running with --with-local-bridge?",
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
 def cmd_agent_list(args: argparse.Namespace) -> int:
     agents = discover_agents()
     if not agents:
@@ -1483,6 +1521,19 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--no-mention", action="store_true", help="Don't reply on @mention")
     create.add_argument("--no-dm", action="store_true", help="Don't reply on DM")
     create.set_defaults(func=cmd_agent_create)
+
+    create_wsl = agent_sub.add_parser(
+        "create-ws-local",
+        help="Create a ws-local agent via operator approval over the machine channel.",
+    )
+    create_wsl.add_argument(
+        "--operator", required=True, help="Linked operator slug to request approval from"
+    )
+    create_wsl.add_argument(
+        "--passcode", required=True, help="Passcode for the .puffoagent bundle + ws-local attach"
+    )
+    create_wsl.add_argument("--display-name", default="", help="Friendly name for the new agent")
+    create_wsl.set_defaults(func=cmd_agent_create_ws_local)
 
     lst = agent_sub.add_parser("list", help="List registered agents")
     lst.set_defaults(func=cmd_agent_list)

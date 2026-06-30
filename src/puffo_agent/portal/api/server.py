@@ -44,6 +44,7 @@ def build_app(cfg: BridgeConfig, ws_local_hub=None) -> web.Application:
     app.router.add_delete("/v1/pairing", h.disconnect)
     app.router.add_get("/v1/agents", h.list_agents)
     app.router.add_post("/v1/agents", h.create_agent)
+    app.router.add_post("/v1/agents/create-ws-local", h.create_ws_local_agent)
     app.router.add_get("/v1/agents/{id}", h.get_agent)
     app.router.add_delete("/v1/agents/{id}", h.delete_agent)
     app.router.add_get("/v1/agents/{id}/runtime", h.get_runtime_state)

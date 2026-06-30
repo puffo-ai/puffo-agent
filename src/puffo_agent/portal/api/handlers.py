@@ -1906,3 +1906,30 @@ async def agent_revoke_pending(request: web.Request) -> web.Response:
     }
     status = 200 if result.status in ("imported", "skipped") else 502
     return web.json_response(body, status=status)
+
+
+async def create_ws_local_agent(request: web.Request) -> web.Response:
+    """Bridge entry for ``puffo-agent agent create ws-local``: run the
+    machine-initiated, operator-approved create flow and return the result
+    (agent_slug, bundle_path, passcode) so the caller can attach."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    operator = body.get("operator")
+    passcode = body.get("passcode")
+    if not isinstance(operator, str) or not operator:
+        return web.json_response({"error": "operator required"}, status=400)
+    if not isinstance(passcode, str) or not passcode:
+        return web.json_response({"error": "passcode required"}, status=400)
+    from ..control.agent_create import run_create
+
+    try:
+        result = await run_create(
+            operator, passcode, display_name=str(body.get("display_name") or "")
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"error": str(exc)}, status=502)
+    return web.json_response(result, status=201)
