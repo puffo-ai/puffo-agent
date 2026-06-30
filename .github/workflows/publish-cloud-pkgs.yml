@@ -1,0 +1,128 @@
+# Publishes the split workspace packages (puffo-agent-core +
+# puffo-agent-cloud) on every GitHub Release. Two paths:
+#
+#   1. release-assets — always runs, GITHUB_TOKEN only. Wheels + sdists
+#      attach to the Release; installable via the asset URL with no PyPI
+#      project required.
+#   2. pypi-core / pypi-cloud — gated on `vars.PUBLISH_PYPI == 'true'`
+#      AND the per-package Trusted Publisher + GitHub Environment having
+#      been created (one binding per package). SKIPPED (not failed)
+#      until then, so a release stays green pre-config.
+#
+# Setup steps for flipping PUBLISH_PYPI on, and the rationale for the
+# per-package environment split, live in packages/PUBLISH.md.
+
+name: Publish cloud packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+# Least privilege at the top level; each job raises only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # Build both members once. Downstream jobs reuse these exact bytes via
+  # the uploaded artifact rather than rebuilding (so the wheels uploaded
+  # to the Release are byte-identical to the ones pushed to PyPI).
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.23"
+
+      # Separate out-dirs so each gated PyPI job can publish exactly one
+      # project (gh-action-pypi-publish uploads EVERYTHING in packages-dir).
+      - name: Build puffo-agent-core (wheel + sdist) into dist/core
+        run: uv build --wheel --sdist --package puffo-agent-core -o dist/core
+
+      - name: Build puffo-agent-cloud (wheel + sdist) into dist/cloud
+        run: uv build --wheel --sdist --package puffo-agent-cloud -o dist/cloud
+
+      - name: Upload built distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-pkg-dist
+          path: dist/
+          if-no-files-found: error
+
+  # ── Zero-setup path ──────────────────────────────────────────────
+  # Attach the wheels + sdists to the GitHub Release. Runs on every
+  # published release using only the built-in GITHUB_TOKEN — no PyPI
+  # account, no secret, nothing to configure.
+  release-assets:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-pkg-dist
+          path: dist
+
+      # softprops/action-gh-release reads github.token (the built-in
+      # GITHUB_TOKEN) by default — no external secret is referenced.
+      - name: Attach distributions to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/core/*
+            dist/cloud/*
+
+  # ── Gated PyPI path ──────────────────────────────────────────────
+  # One job per package, one GitHub Environment per package, one
+  # packages-dir per package — so each Trusted-Publisher binding only
+  # ever sees its own project's files. Inert (SKIPPED, not failed) until
+  # vars.PUBLISH_PYPI == 'true' AND the pending publishers + environments
+  # have been created.
+  pypi-core:
+    needs: build
+    runs-on: ubuntu-latest
+    if: vars.PUBLISH_PYPI == 'true'
+    environment:
+      name: pypi-core
+      url: https://pypi.org/p/puffo-agent-core
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-pkg-dist
+          path: dist
+
+      - name: Publish puffo-agent-core to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/core
+
+  pypi-cloud:
+    needs: build
+    runs-on: ubuntu-latest
+    if: vars.PUBLISH_PYPI == 'true'
+    environment:
+      name: pypi-cloud
+      url: https://pypi.org/p/puffo-agent-cloud
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: cloud-pkg-dist
+          path: dist
+
+      - name: Publish puffo-agent-cloud to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/cloud

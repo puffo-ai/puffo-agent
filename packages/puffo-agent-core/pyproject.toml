@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# puffo-agent-core — the stdlib-only shared kernel. Holds the pure
+# path/identity/profile helpers that BOTH the fat local agent
+# (``puffo-agent``) and the slim cloud runtime (``puffo-agent-cloud``)
+# need, so the cloud package can depend on them without dragging in
+# psutil / pyside6 / crypto. NO third-party dependencies — if a helper
+# needs one, it does not belong here.
+name = "puffo-agent-core"
+version = "1.0.3"
+description = "Stdlib-only shared kernel for puffo-agent (paths, agent-id validation, profile parsing)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Puffo.ai" },
+]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]

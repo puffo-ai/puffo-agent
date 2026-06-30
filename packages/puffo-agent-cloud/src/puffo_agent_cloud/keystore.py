@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from ...portal.state import agent_dir
+from puffo_agent_core.paths import agent_dir
 
 
 @dataclass

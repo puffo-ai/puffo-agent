@@ -1011,7 +1011,7 @@ class Worker:
         speaks the puffo-server bridge directly. Server holds all
         crypto; runtime exchanges plaintext WS frames + cloud-hosted
         LLM HTTP."""
-        from ..agent.api_puffo.runner import ApiPuffoRunner
+        from puffo_agent_cloud.runner import ApiPuffoRunner
         agent_id = self.agent_cfg.id
         self.runtime.status = "running"
         self.runtime.save(agent_id)

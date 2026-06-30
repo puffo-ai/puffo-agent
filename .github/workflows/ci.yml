@@ -55,3 +55,37 @@ jobs:
 
       - name: pytest
         run: pytest -p no:warnings
+
+  # Slim-import gate: the cloud runtime must install + import with ONLY
+  # thin deps (aiohttp + pyyaml + puffo-agent-core). A clean env, NO fat
+  # extras, NO pyside6 / psutil / fat puffo_agent — if any leak in, the
+  # `import puffo_agent_cloud.__main__` below fails and the gate is red.
+  slim-import:
+    name: slim-import (cloud thin-deps gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # Both paths in one command so the cloud package's puffo-agent-core
+      # dependency resolves to the local member, not PyPI. No fat package.
+      - name: install thin packages only
+        run: pip install ./packages/puffo-agent-core ./packages/puffo-agent-cloud
+
+      - name: import puffo_agent_cloud (THE gate)
+        run: python -c "import puffo_agent_cloud.__main__"
+
+      # Belt-and-suspenders: assert the heavy/fat modules are genuinely
+      # absent, so the gate above can't pass with them silently present.
+      - name: assert fat modules absent
+        run: |
+          python - <<'PY'
+          import importlib.util
+          for mod in ("puffo_agent", "psutil", "PySide6"):
+              assert importlib.util.find_spec(mod) is None, f"{mod} leaked into the slim env"
+          print("slim env confirmed: no puffo_agent / psutil / PySide6")
+          PY
