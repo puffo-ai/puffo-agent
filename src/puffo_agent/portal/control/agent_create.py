@@ -281,9 +281,9 @@ async def finalize_and_pack(
             device_id=ident.device_id,
             operator_slug=operator_slug,
             space_id=str(profile.get("space_id") or ""),
-            # The operator invites the new agent to the space; auto-accept so it
-            # actually joins (otherwise the invite sits pending).
-            auto_accept_space_invitations=True,
+            # No auto_accept_space_invitations: the operator's own invite is
+            # auto-accepted by default (is_from_operator); the flag would over-
+            # broadly accept invites from anyone.
         ),
         runtime=RuntimeConfig(kind="ws-local"),
         created_at=int(time.time()),
