@@ -9,6 +9,7 @@ puffo-server `core-v2/crates/types/src/cert.rs` producer.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -25,6 +26,37 @@ _CERT_VERSION = 1
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+class PendingApprovals:
+    """Bridges the create flow's ``await_approval`` to the inbound
+    ``agent_create_approved`` command: the flow waits on a request_id, the
+    command handler resolves it. Daemon-wide singleton (one control loop)."""
+
+    def __init__(self) -> None:
+        self._waiters: dict[str, asyncio.Future] = {}
+
+    async def wait(self, request_id: str, timeout: float) -> dict:
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._waiters[request_id] = fut
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._waiters.pop(request_id, None)
+
+    def resolve(self, request_id: str, result: dict) -> bool:
+        fut = self._waiters.get(request_id)
+        if fut is not None and not fut.done():
+            fut.set_result(result)
+            return True
+        return False
+
+
+_PENDING = PendingApprovals()
+
+
+def get_pending_approvals() -> PendingApprovals:
+    return _PENDING
 
 
 def _self_sign(cert: dict, root: Ed25519KeyPair, field: str) -> dict:

@@ -72,3 +72,32 @@ def test_unlinked_operator_rejected(tmp_path, monkeypatch):
                 finalize_fn=noop,
             )
         )
+
+
+def test_pending_approvals_resolve():
+    from puffo_agent.portal.control.agent_create import PendingApprovals
+
+    async def go():
+        p = PendingApprovals()
+
+        async def resolver():
+            await asyncio.sleep(0.01)
+            assert p.resolve("r1", {"agent_slug": "s", "pending_token": "t"})
+
+        task = asyncio.ensure_future(resolver())
+        result = await p.wait("r1", timeout=1.0)
+        await task
+        return result
+
+    assert asyncio.run(go())["agent_slug"] == "s"
+
+
+def test_pending_approvals_timeout():
+    from puffo_agent.portal.control.agent_create import PendingApprovals
+
+    async def go():
+        p = PendingApprovals()
+        with pytest.raises(asyncio.TimeoutError):
+            await p.wait("r2", timeout=0.05)
+
+    asyncio.run(go())
