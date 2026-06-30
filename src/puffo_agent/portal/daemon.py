@@ -405,12 +405,9 @@ class Daemon:
         await asyncio.gather(*(self._stop_worker(i) for i in ids), return_exceptions=True)
 
     async def _archive_on_flag(self, agent_id: str) -> None:
-        """Stop worker → lifecycle heartbeat → move dir → revoke from
-        archived path. Move-before-revoke means a move failure (the
-        Windows aiosqlite WAL-handle case) leaves the agent in the
-        active path with no revoked device — daemon retries on the
-        next tick. Revoke failure drops a pending marker in the
-        archived dir for the next startup sweep."""
+        # stop_worker → lifecycle heartbeat → move → revoke. Move
+        # failure ⇒ flag stays, no half-state. Revoke failure ⇒
+        # pending marker for the next startup sweep.
         logger.warning(
             "agent %s: archive.flag detected, stopping worker + archiving",
             agent_id,
@@ -479,11 +476,9 @@ class Daemon:
                 )
 
     async def _delete_on_flag(self, agent_id: str) -> None:
-        """Stop worker → move dir → revoke. Revoke success ⇒ rmtree
-        the moved dir. Revoke failure ⇒ keep it as an archive +
-        pending marker for the startup sweep (rmtree-ing would lose
-        the keys needed for retry). Move failure ⇒ daemon retries
-        next tick."""
+        # stop_worker → move → revoke → rmtree. Revoke failure
+        # downgrades to archive + pending marker; rmtree-ing would
+        # destroy the keys needed for the sweep retry.
         logger.warning(
             "agent %s: delete.flag detected, stopping worker + removing dir",
             agent_id,
@@ -610,28 +605,11 @@ _ARCHIVE_RETRY_BACKOFF_SECONDS = (3.0, 6.0, 12.0, 12.0)
 
 
 async def _retry_move(src: Path, dest: Path) -> OSError | None:
-    # ``shutil.move`` is NOT atomic on Windows when src has held child
-    # file handles (aiosqlite WAL/SHM after ``stop_worker``).
-    # os.rename fails, shutil falls back to copytree + rmtree, copytree
-    # usually completes, rmtree fails midway on the locked sqlite —
-    # and by then it has already deleted the unlocked ones (agent.yml,
-    # keys/, ...), hollowing out src with no recovery path.
-    #
-    # Split into two phases:
-    #   1. copytree(src → dest) — only reads src; safe even when
-    #      sqlite is locked. Archive is "logically done" once dest
-    #      holds a complete copy.
-    #   2. best-effort rmtree(src) — Windows can take many seconds to
-    #      release aiosqlite WAL/SHM handles after worker.stop(). The
-    #      3/6/12/12s backoff gives 33s for the OS to drop them.
-    #      Any leftover orphan stays on disk; the daemon ignores it
-    #      (no agent.yml, reconcile skips), and the operator clears it
-    #      manually when convenient.
-    #
-    # In practice the lock window is "pause → archive within seconds";
-    # an agent paused for any meaningful duration releases its handles
-    # long before the archive flag fires, and the first attempt of
-    # each phase succeeds.
+    # ``shutil.move`` falls back to copytree+rmtree on Windows when
+    # src has held child handles (aiosqlite WAL/SHM after stop_worker),
+    # and a mid-rmtree failure hollows out src with no recovery. Split
+    # into copytree (only reads src) + best-effort rmtree (locked
+    # remnants stay as orphans; daemon ignores them since no agent.yml).
     copy_err: OSError | None = None
     for delay in _ARCHIVE_RETRY_BACKOFF_SECONDS:
         if dest.exists():

@@ -590,10 +590,6 @@ async def self_revoke_device(
 ) -> None:
     # POST envelope uses a fresh subkey of THIS device — still valid
     # at request-time even though the revoke is about to apply.
-    # ``preregistered_subkey`` lets the caller reuse a subkey already
-    # registered earlier in the same archive flow (e.g. the one
-    # ``PuffoCoreHttpClient`` rotated for the lifecycle heartbeat),
-    # avoiding a second ``/devices/subkeys`` POST per archive.
     revocation = create_device_revocation(root_signing_key, device_id)
     async with _remote_http_session(server_url) as session:
         if preregistered_subkey is not None:
@@ -618,12 +614,10 @@ async def self_revoke_device(
 
 
 async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
-    # Operates on a keystore at any path (active OR archived). The
-    # archive/delete flow calls this AFTER the dir is moved, so a
-    # move failure can't leave a revoked device sitting alongside a
-    # still-active agent dir (the prior order — revoke-then-move —
-    # had no rollback path for Windows aiosqlite WAL-handle move
-    # failures).
+    # Loads the keystore from ``archived_dir/keys/`` (works on both
+    # active and archived paths). The archive flow calls this AFTER
+    # the move so a move failure can't leave a revoked device next to
+    # a still-active agent dir.
     keystore = KeyStore(archived_dir / "keys")
     identity = keystore.load_identity(slug)
     root_signing = Ed25519KeyPair.from_secret_bytes(
@@ -632,10 +626,8 @@ async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
     device_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.device_signing_secret_key)
     )
-    # Reuse the cached session subkey if it's still fresh — the
-    # lifecycle heartbeat just rotated it (PuffoCoreHttpClient's
-    # _ensure_subkey / 401-retry), so a second registration would
-    # be redundant.
+    # Skip the redundant /devices/subkeys POST when the lifecycle
+    # heartbeat already rotated a fresh session subkey we can reuse.
     preregistered: tuple[Ed25519KeyPair, dict] | None = None
     try:
         from ..crypto.certs import needs_rotation
@@ -657,19 +649,6 @@ async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
         root_signing_key=root_signing,
         preregistered_subkey=preregistered,
     )
-
-
-async def revoke_agent_device(agent_id: str) -> None:
-    # Thin shim retained for the existing test surface + any
-    # legacy active-path callers. Production archive/delete now
-    # calls ``revoke_archived_device`` directly after the move.
-    from .state import AgentConfig, agent_dir as _agent_dir
-
-    cfg = AgentConfig.load(agent_id)
-    pc = cfg.puffo_core
-    if not pc.is_configured():
-        return
-    await revoke_archived_device(_agent_dir(agent_id), slug=pc.slug)
 
 
 def archived_pending_revoke_path(archived_agent_dir: Path) -> Path:

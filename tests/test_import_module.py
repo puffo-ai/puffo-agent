@@ -374,8 +374,9 @@ async def test_list_pending_revokes_and_cleanup_staging():
 # ────────────────────────────────────────────────────────────────────
 
 
-async def test_revoke_agent_device_posts_to_revoke_endpoint(mock_server):
+async def test_revoke_archived_device_posts_to_revoke_endpoint(mock_server):
     from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
 
     server, state = mock_server
     url = str(server.make_url("/")).rstrip("/")
@@ -383,7 +384,7 @@ async def test_revoke_agent_device_posts_to_revoke_endpoint(mock_server):
         os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
     )
 
-    await imp.revoke_agent_device("alpha")
+    await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
 
     revoke_calls = [
         (m, p) for (m, p) in state["calls"]
@@ -396,23 +397,22 @@ async def test_revoke_agent_device_posts_to_revoke_endpoint(mock_server):
     assert len(subkey_calls) == 1
 
 
-async def test_revoke_agent_device_propagates_server_failure(mock_server):
+async def test_revoke_archived_device_propagates_server_failure(mock_server):
     from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
 
     server, state = mock_server
     state["fail"] = {"revoke"}
     url = str(server.make_url("/")).rstrip("/")
-    _seed_source_agent(
+    info = _seed_source_agent(
         os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
     )
     with pytest.raises(Exception):
-        await imp.revoke_agent_device("alpha")
+        await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
 
 
-async def test_revoke_archived_device_loads_keys_from_arbitrary_path(mock_server):
-    """The archive flow moves the dir first, then calls
-    ``revoke_archived_device`` on the moved path. Verify the helper
-    loads identity from the archived ``keys/`` subdir and POSTs revoke."""
+async def test_revoke_archived_device_works_from_moved_archived_path(mock_server):
+    """Archive moves the dir first, then revokes from the moved path."""
     from puffo_agent.portal import import_agents as imp
     from puffo_agent.portal.state import agent_dir, archived_dir
 
@@ -434,12 +434,11 @@ async def test_revoke_archived_device_loads_keys_from_arbitrary_path(mock_server
     assert revoke_posts == [("POST", f"/devices/{info['old_device_id']}/revoke")]
 
 
-async def test_revoke_agent_device_reuses_fresh_session_subkey(mock_server):
-    """A fresh ``<slug>.session.json`` already on disk (typically left by
-    the lifecycle-heartbeat path running first) should be reused for
-    the revoke POST — exactly one ``/devices/subkeys`` registration per
-    archive instead of two."""
+async def test_revoke_archived_device_reuses_fresh_session_subkey(mock_server):
+    # Fresh <slug>.session.json on disk (left by the lifecycle-heartbeat
+    # rotation just before revoke) should skip the redundant subkey POST.
     from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
     from puffo_agent.crypto.keystore import KeyStore, Session, encode_secret
     from puffo_agent.crypto.primitives import Ed25519KeyPair
 
@@ -456,7 +455,7 @@ async def test_revoke_agent_device_reuses_fresh_session_subkey(mock_server):
         expires_at=int(time.time() * 1000) + 24 * 3600 * 1000,
     ))
 
-    await imp.revoke_agent_device("alpha")
+    await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
 
     subkey_posts = [
         (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
@@ -469,10 +468,11 @@ async def test_revoke_agent_device_reuses_fresh_session_subkey(mock_server):
     assert len(revoke_posts) == 1
 
 
-async def test_revoke_agent_device_registers_fresh_when_session_expired(
+async def test_revoke_archived_device_registers_fresh_when_session_expired(
     mock_server,
 ):
     from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
     from puffo_agent.crypto.keystore import KeyStore, Session, encode_secret
     from puffo_agent.crypto.primitives import Ed25519KeyPair
 
@@ -489,33 +489,12 @@ async def test_revoke_agent_device_registers_fresh_when_session_expired(
         expires_at=1,
     ))
 
-    await imp.revoke_agent_device("alpha")
+    await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
 
     subkey_posts = [
         (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
     ]
     assert len(subkey_posts) == 1
-
-
-async def test_revoke_agent_device_noop_when_puffo_core_unconfigured(tmp_path):
-    """Chat-local / standalone agents with no ``puffo_core`` block
-    can't be revoked (no server). Helper returns cleanly, no error."""
-    from puffo_agent.portal import import_agents as imp
-    from puffo_agent.portal.state import agent_dir
-    import yaml
-
-    adir = agent_dir("standalone")
-    adir.mkdir(parents=True, exist_ok=True)
-    (adir / "agent.yml").write_text(
-        yaml.safe_dump({
-            "id": "standalone",
-            "state": "paused",
-            "display_name": "standalone",
-            "runtime": {"kind": "chat-local"},
-        }),
-        encoding="utf-8",
-    )
-    await imp.revoke_agent_device("standalone")
 
 
 async def test_sweep_archived_pending_revokes_retries_and_clears(mock_server):

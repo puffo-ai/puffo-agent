@@ -40,16 +40,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   recovered a backup of a deleted one) could resurrect the agent
   using the still-trusted keys. All three archive entry points (HTTP
   API, control WS, `puffo-agent agent archive` CLI) and the delete
-  path now fire `POST /devices/<id>/revoke` before moving / removing
-  the dir, signed by a fresh subkey of the device against a
-  root-signed revocation cert. Revoke is best-effort: on transient
-  failure a `pending_revoke.json` marker is left in the archived dir
-  and the daemon's startup sweep retries it. Delete falls back to
-  archive when revoke fails, so the keys needed for the retry are
-  preserved. Recovery of an archived agent now requires re-signing a
-  new device cert against the enrollment endpoint with the still-
-  on-disk root + device_signing keys (same primitives as a
-  multi-machine transfer).
+  path now fire `POST /devices/<id>/revoke` immediately after the
+  agent dir lands at `archived/<id>-*-<stamp>/`, signed by a fresh
+  subkey of the device against a root-signed revocation cert.
+  Move-before-revoke means a move failure (Windows aiosqlite
+  WAL/SHM handles outliving worker stop) leaves the agent in the
+  active path with no revoked device — daemon retries on the next
+  reconcile tick. Revoke is best-effort: on transient failure a
+  `pending_revoke.json` marker is left in the archived dir and the
+  daemon's startup sweep retries it. Delete falls back to archive
+  when revoke fails, so the keys needed for the retry are preserved.
+  Recovery of an archived agent now requires re-signing a new device
+  cert against the enrollment endpoint with the still-on-disk root +
+  device_signing keys (same primitives as a multi-machine transfer).
 
 ## [1.0.4] — 2026-06-29
 
