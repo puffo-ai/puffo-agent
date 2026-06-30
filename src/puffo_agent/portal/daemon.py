@@ -606,26 +606,34 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
         await http.close()
 
 
+_ARCHIVE_RETRY_BACKOFF_SECONDS = (3.0, 6.0, 12.0, 12.0)
+
+
 async def _retry_move(src: Path, dest: Path) -> OSError | None:
-    # ``shutil.move`` on Windows is NOT atomic on a directory whose
-    # child files are still held (aiosqlite WAL/SHM handles after
-    # ``stop_worker``). It tries ``os.rename`` first, then falls back
-    # to ``copytree(src, dest)`` + ``rmtree(src)``. copytree usually
-    # finishes (it only reads ``src``), but rmtree fails midway on the
-    # locked sqlite files — and by then it has already deleted the
-    # unlocked ones (agent.yml, keys/, .puffo-agent/...), hollowing
-    # out src with no way to recover.
+    # ``shutil.move`` is NOT atomic on Windows when src has held child
+    # file handles (aiosqlite WAL/SHM after ``stop_worker``).
+    # os.rename fails, shutil falls back to copytree + rmtree, copytree
+    # usually completes, rmtree fails midway on the locked sqlite —
+    # and by then it has already deleted the unlocked ones (agent.yml,
+    # keys/, ...), hollowing out src with no recovery path.
     #
     # Split into two phases:
-    #   1. copytree(src → dest), retried until success
-    #   2. best-effort rmtree(src) — locked sqlite remnants stay
-    #      behind as orphans; the daemon ignores them (no agent.yml,
-    #      reconcile loop skips), and a later attempt or manual rm
-    #      clears them once the OS releases the handle.
+    #   1. copytree(src → dest) — only reads src; safe even when
+    #      sqlite is locked. Archive is "logically done" once dest
+    #      holds a complete copy.
+    #   2. best-effort rmtree(src) — Windows can take many seconds to
+    #      release aiosqlite WAL/SHM handles after worker.stop(). The
+    #      3/6/12/12s backoff gives 33s for the OS to drop them.
+    #      Any leftover orphan stays on disk; the daemon ignores it
+    #      (no agent.yml, reconcile skips), and the operator clears it
+    #      manually when convenient.
     #
-    # The archive is "done" the moment dest holds a complete copy.
+    # In practice the lock window is "pause → archive within seconds";
+    # an agent paused for any meaningful duration releases its handles
+    # long before the archive flag fires, and the first attempt of
+    # each phase succeeds.
     copy_err: OSError | None = None
-    for _ in range(8):
+    for delay in _ARCHIVE_RETRY_BACKOFF_SECONDS:
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         try:
@@ -634,17 +642,17 @@ async def _retry_move(src: Path, dest: Path) -> OSError | None:
             break
         except (OSError, PermissionError) as exc:
             copy_err = exc
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(delay)
     if copy_err is not None:
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         return copy_err
-    for _ in range(8):
+    for delay in _ARCHIVE_RETRY_BACKOFF_SECONDS:
         try:
             shutil.rmtree(str(src))
             return None
         except (OSError, PermissionError):
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(delay)
     shutil.rmtree(str(src), ignore_errors=True)
     return None
 
