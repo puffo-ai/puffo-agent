@@ -9,8 +9,11 @@ puffo-server `core-v2/crates/types/src/cert.rs` producer.
 
 from __future__ import annotations
 
+import json
 import time
+import uuid
 from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.certs import derive_public_key_id
@@ -103,6 +106,123 @@ def gen_agent_identity(operator_root_pubkey: str) -> AgentIdentity:
         identity_cert=identity_cert,
         device_cert=device_cert,
     )
+
+
+_DEFAULT_WS_LOCAL_PROFILE = "# {name}\n\nA ws-local agent driven by an attached tool.\n"
+
+# async (slug_binding, pending_token) -> None; raises on failure.
+FinalizeFn = Callable[[dict, str], Awaitable[None]]
+# async (operator_slug, payload) -> None — sends the request machine_message.
+SendRequestFn = Callable[[str, dict], Awaitable[None]]
+# async (request_id) -> {agent_slug, pending_token} — resolves on the approval command.
+AwaitApprovalFn = Callable[[str], Awaitable[dict]]
+
+
+async def create_ws_local_agent(
+    operator_slug: str,
+    passcode: str,
+    *,
+    send_request_fn: SendRequestFn,
+    await_approval_fn: AwaitApprovalFn,
+    finalize_fn: FinalizeFn,
+    display_name: str = "",
+) -> dict:
+    """Full daemon-side flow: validate the operator is linked, mint the agent
+    identity, request the operator's approval over the reverse channel, then
+    register + write + pack on approval. All I/O is injected for testability."""
+    from .store import get_pairing
+
+    pairing = get_pairing(operator_slug)
+    if pairing is None:
+        raise ValueError(f"operator {operator_slug!r} is not linked to this machine")
+
+    ident = gen_agent_identity(pairing.operator_root_pubkey)
+    request_id = f"acr_{uuid.uuid4().hex}"
+    await send_request_fn(
+        operator_slug,
+        {
+            "type": "agent.create_request",
+            "request_id": request_id,
+            "username": display_name or "agent",
+            "identity_cert": ident.identity_cert,
+            "device_cert": ident.device_cert,
+            "agent_root_public_key": ident.root_public_key,
+        },
+    )
+    approval = await await_approval_fn(request_id)
+    return await finalize_and_pack(
+        ident,
+        slug=str(approval["agent_slug"]),
+        pending_token=str(approval["pending_token"]),
+        operator_slug=operator_slug,
+        server_url=pairing.server_url,
+        passcode=passcode,
+        finalize_fn=finalize_fn,
+        display_name=display_name,
+    )
+
+
+async def finalize_and_pack(
+    ident: AgentIdentity,
+    *,
+    slug: str,
+    pending_token: str,
+    operator_slug: str,
+    server_url: str,
+    passcode: str,
+    finalize_fn: FinalizeFn,
+    display_name: str = "",
+) -> dict:
+    """After the operator approves and the server mints ``slug`` + ``pending_token``:
+    sign + register the slug_binding, write the ws-local agent.yml + keystore, and
+    pack the ``.puffoagent`` bundle. Returns the stdout result for the caller."""
+    from ...crypto.keystore import KeyStore, StoredIdentity
+    from ..export import pack
+    from ..state import AgentConfig, PuffoCoreConfig, RuntimeConfig, agent_dir
+
+    agent_id = slug
+    binding = build_slug_binding(ident.root_keypair, slug)
+    await finalize_fn(binding, pending_token)  # POST /certs/slug_binding; raises on failure
+
+    target = agent_dir(agent_id)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "memory").mkdir(exist_ok=True)
+    (target / "profile.md").write_text(
+        _DEFAULT_WS_LOCAL_PROFILE.format(name=display_name or slug), encoding="utf-8"
+    )
+
+    KeyStore.for_agent(agent_id).save_identity(
+        StoredIdentity(
+            slug=slug,
+            device_id=ident.device_id,
+            root_secret_key=base64url_encode(ident.root_keypair.secret_bytes()),
+            device_signing_secret_key=base64url_encode(ident.device_signing_keypair.secret_bytes()),
+            kem_secret_key=base64url_encode(ident.device_kem_keypair.secret_bytes()),
+            server_url=server_url,
+            slug_binding_json=json.dumps(binding),
+            identity_cert_json=json.dumps(ident.identity_cert),
+        )
+    )
+
+    AgentConfig(
+        id=agent_id,
+        display_name=display_name or slug,
+        puffo_core=PuffoCoreConfig(
+            server_url=server_url, slug=slug, device_id=ident.device_id, operator_slug=operator_slug
+        ),
+        runtime=RuntimeConfig(kind="ws-local"),
+        created_at=int(time.time()),
+    ).save()
+
+    bundle_path = target.parent.parent / f"{agent_id}.puffoagent"
+    bundle_path.write_bytes(pack([agent_id], passcode, exported_by_slug=slug))
+
+    return {
+        "agent_slug": slug,
+        "agent_id": agent_id,
+        "bundle_path": str(bundle_path),
+        "passcode": passcode,
+    }
 
 
 def build_slug_binding(root: Ed25519KeyPair, slug: str) -> dict:
