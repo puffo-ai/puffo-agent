@@ -588,8 +588,8 @@ async def self_revoke_device(
     root_signing_key: Ed25519KeyPair,
     preregistered_subkey: tuple[Ed25519KeyPair, dict] | None = None,
 ) -> None:
-    # POST envelope uses a fresh subkey of THIS device — still valid
-    # at request-time even though the revoke is about to apply.
+    # POST signed by a subkey of THIS device — valid at request-time
+    # even though the revoke is about to apply.
     revocation = create_device_revocation(root_signing_key, device_id)
     async with _remote_http_session(server_url) as session:
         if preregistered_subkey is not None:
@@ -614,10 +614,6 @@ async def self_revoke_device(
 
 
 async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
-    # Loads the keystore from ``archived_dir/keys/`` (works on both
-    # active and archived paths). The archive flow calls this AFTER
-    # the move so a move failure can't leave a revoked device next to
-    # a still-active agent dir.
     keystore = KeyStore(archived_dir / "keys")
     identity = keystore.load_identity(slug)
     root_signing = Ed25519KeyPair.from_secret_bytes(
@@ -626,8 +622,8 @@ async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
     device_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.device_signing_secret_key)
     )
-    # Skip the redundant /devices/subkeys POST when the lifecycle
-    # heartbeat already rotated a fresh session subkey we can reuse.
+    # Reuse a fresh session subkey if one's already on disk to skip a
+    # redundant /devices/subkeys POST.
     preregistered: tuple[Ed25519KeyPair, dict] | None = None
     try:
         from ..crypto.certs import needs_rotation
@@ -742,8 +738,8 @@ async def _retry_archived_pending_revoke(
 
 
 def _mark_pending_revoke_broken(marker: Path, reason: str) -> None:
-    """Move the marker aside so subsequent sweeps don't keep warning
-    on it. The .broken file is left for operator inspection."""
+    # Rename so the next sweep doesn't keep warning; left on disk for
+    # operator inspection.
     broken = marker.with_suffix(marker.suffix + ".broken")
     try:
         marker.replace(broken)
@@ -756,10 +752,7 @@ def _mark_pending_revoke_broken(marker: Path, reason: str) -> None:
 
 
 async def sweep_archived_pending_revokes() -> int:
-    """Returns the count of markers we actually retried successfully —
-    ``UNRETRYABLE`` (bad schema / missing keys) is renamed to
-    ``.broken`` and excluded; ``TRANSIENT`` failures stay for the
-    next sweep but aren't counted as a retry."""
+    # Returns count of markers actually retried successfully.
     from .state import archived_dir
 
     root = archived_dir()

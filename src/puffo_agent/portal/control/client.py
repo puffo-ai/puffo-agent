@@ -35,9 +35,7 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 def _is_already_archived(agent_slug: str) -> bool:
-    """True iff ``archived/`` contains a dir whose name starts with
-    ``<agent_slug>-`` (matches all -ws-<stamp> / -del-<stamp> /
-    -<stamp> suffixes produced by the archive paths)."""
+    # Matches any archived/<slug>-* suffix (-ws-/-del-/bare-stamp).
     root = archived_dir()
     if not root.exists():
         return False
@@ -125,9 +123,7 @@ async def execute_command(
     pairing context)."""
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
-            # Distinguish "never existed" from "already archived" so
-            # the operator's UI can render a sensible state instead of
-            # surfacing "unknown agent" on a re-archive click.
+            # Re-archive of an already-archived agent is idempotent OK.
             if op == "archive" and agent_slug and _is_already_archived(agent_slug):
                 return {
                     "ok": True,

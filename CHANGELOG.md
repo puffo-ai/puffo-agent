@@ -4,6 +4,21 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Security
+
+- **Archive and delete revoke the agent's device server-side.**
+  Previously the device cert stayed valid forever, so restoring an
+  archived dir resurrected the agent. The archive / delete paths
+  (HTTP API, control WS, CLI) now POST `/devices/<id>/revoke` after
+  moving the dir to `archived/<id>-*-<stamp>/`. Revoke is best-
+  effort: transient failure leaves a `pending_revoke.json` marker
+  that the daemon's startup sweep retries; delete falls back to
+  archive on revoke failure so the keys for retry survive. Recovery
+  needs re-signing a new device cert against the enrollment
+  endpoint with the on-disk root + device_signing keys.
+
 ## [1.0.5] — 2026-06-30
 
 ### Added
@@ -31,28 +46,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   requests now reports the whole turn's tokens (taken from the thread
   total's delta) instead of only the last request, so the figure no
   longer looks far too small for multi-step turns.
-
-### Security
-
-- **Archive and delete now revoke the agent's device server-side.**
-  Previously, an archived agent's device cert stayed valid on
-  puffo-server forever — anyone who restored the archived dir (or
-  recovered a backup of a deleted one) could resurrect the agent
-  using the still-trusted keys. All three archive entry points (HTTP
-  API, control WS, `puffo-agent agent archive` CLI) and the delete
-  path now fire `POST /devices/<id>/revoke` immediately after the
-  agent dir lands at `archived/<id>-*-<stamp>/`, signed by a fresh
-  subkey of the device against a root-signed revocation cert.
-  Move-before-revoke means a move failure (Windows aiosqlite
-  WAL/SHM handles outliving worker stop) leaves the agent in the
-  active path with no revoked device — daemon retries on the next
-  reconcile tick. Revoke is best-effort: on transient failure a
-  `pending_revoke.json` marker is left in the archived dir and the
-  daemon's startup sweep retries it. Delete falls back to archive
-  when revoke fails, so the keys needed for the retry are preserved.
-  Recovery of an archived agent now requires re-signing a new device
-  cert against the enrollment endpoint with the still-on-disk root +
-  device_signing keys (same primitives as a multi-machine transfer).
 
 ## [1.0.4] — 2026-06-29
 

@@ -405,9 +405,6 @@ class Daemon:
         await asyncio.gather(*(self._stop_worker(i) for i in ids), return_exceptions=True)
 
     async def _archive_on_flag(self, agent_id: str) -> None:
-        # stop_worker → lifecycle heartbeat → move → revoke. Move
-        # failure ⇒ flag stays, no half-state. Revoke failure ⇒
-        # pending marker for the next startup sweep.
         logger.warning(
             "agent %s: archive.flag detected, stopping worker + archiving",
             agent_id,
@@ -422,8 +419,7 @@ class Daemon:
             cfg_for_revoke = AgentConfig.load(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
-        # Heartbeat first while keystore is still in the active path
-        # AND while the device is still valid (revoke would 401 it).
+        # Heartbeat must precede revoke — afterwards the device is 401'd.
         if cfg_for_revoke is not None:
             try:
                 await _report_lifecycle(cfg_for_revoke, "archived")
@@ -476,9 +472,6 @@ class Daemon:
                 )
 
     async def _delete_on_flag(self, agent_id: str) -> None:
-        # stop_worker → move → revoke → rmtree. Revoke failure
-        # downgrades to archive + pending marker; rmtree-ing would
-        # destroy the keys needed for the sweep retry.
         logger.warning(
             "agent %s: delete.flag detected, stopping worker + removing dir",
             agent_id,
@@ -605,11 +598,9 @@ _ARCHIVE_RETRY_BACKOFF_SECONDS = (3.0, 6.0, 12.0, 12.0)
 
 
 async def _retry_move(src: Path, dest: Path) -> OSError | None:
-    # ``shutil.move`` falls back to copytree+rmtree on Windows when
-    # src has held child handles (aiosqlite WAL/SHM after stop_worker),
-    # and a mid-rmtree failure hollows out src with no recovery. Split
-    # into copytree (only reads src) + best-effort rmtree (locked
-    # remnants stay as orphans; daemon ignores them since no agent.yml).
+    # shutil.move's copytree+rmtree fallback hollows out src when a
+    # child file is locked (Windows aiosqlite WAL/SHM after stop_worker).
+    # Split: copy (read-only on src) then best-effort rmtree.
     copy_err: OSError | None = None
     for delay in _ARCHIVE_RETRY_BACKOFF_SECONDS:
         if dest.exists():
