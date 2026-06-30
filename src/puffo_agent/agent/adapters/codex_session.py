@@ -187,9 +187,12 @@ class _PendingTurn:
     # posted; don't run the [SILENT]-fallback path". Each entry mirrors
     # the claude-code adapter's shape: ``{channel, root_id}``.
     send_message_targets: list[dict] = field(default_factory=list)
-    # Usage stats lifted from the final ``turn/completed`` envelope.
+    # Per-turn usage = delta of codex's per-thread cumulative totals from the
+    # value standing when this turn's first request completed.
     input_tokens: int = 0
     output_tokens: int = 0
+    _in_base: int | None = None
+    _out_base: int | None = None
     # ``turn/completed`` resolves this; ``turn/failed`` rejects it.
     completed: asyncio.Future = field(default_factory=asyncio.Future)
     # Optional progress callback for in-turn UI updates.
@@ -1071,13 +1074,20 @@ class CodexSession:
         if m.startswith("thread/tokenusage/updated") and turn is not None:
             # codex reports per-turn tokens here (not turn/completed); ``last``
             # refreshes during the turn, final value stands at turn/completed.
-            last = ((params or {}).get("tokenUsage") or {}).get("last") or {}
+            tu = (params or {}).get("tokenUsage") or {}
+            last = tu.get("last") or {}
+            total = tu.get("total") or {}
             try:
-                # Subtract the re-sent cached context (matches claude-code).
-                inp = int(last.get("inputTokens") or 0)
-                cached = int(last.get("cachedInputTokens") or 0)
-                turn.input_tokens = max(0, inp - cached)
-                turn.output_tokens = int(last.get("outputTokens") or 0)
+                # ``last`` is a single request; sum the whole turn via the
+                # thread total's delta. Input excludes the re-sent cached read.
+                cum_out = int(total.get("outputTokens") or 0)
+                cum_in = max(0, int(total.get("inputTokens") or 0) - int(total.get("cachedInputTokens") or 0))
+                if turn._out_base is None:
+                    last_in = max(0, int(last.get("inputTokens") or 0) - int(last.get("cachedInputTokens") or 0))
+                    turn._out_base = cum_out - int(last.get("outputTokens") or 0)
+                    turn._in_base = cum_in - last_in
+                turn.output_tokens = max(0, cum_out - turn._out_base)
+                turn.input_tokens = max(0, cum_in - turn._in_base)
             except (TypeError, ValueError):
                 pass
             return
