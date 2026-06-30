@@ -1955,7 +1955,7 @@ async def wait_until_command(request: web.Request) -> web.Response:
 
     try:
         result = await get_registry().wait_result(command_id, timeout)
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         return web.json_response({"error": "timeout", "pending": True}, status=504)
     status = 200 if result.get("ok", True) else 502
     return web.json_response(result, status=status)
