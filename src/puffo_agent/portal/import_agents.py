@@ -571,3 +571,176 @@ def cleanup_staging_dir() -> None:
     root = agents_dir() / ".import-staging"
     if root.exists():
         shutil.rmtree(root, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Self-revoke for archive / delete
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def self_revoke_device(
+    *,
+    server_url: str,
+    slug: str,
+    device_id: str,
+    device_signing_key: Ed25519KeyPair,
+    root_signing_key: Ed25519KeyPair,
+) -> None:
+    """Revoke this device's own cert. Root-signed revocation body +
+    POST envelope signed by a freshly-registered subkey of this
+    device (still valid at request-time; the revoke applies after
+    the server records it)."""
+    revocation = create_device_revocation(root_signing_key, device_id)
+    async with _remote_http_session(server_url) as session:
+        subkey, cert = await _register_subkey_via_device(
+            session,
+            server_url=server_url,
+            slug=slug,
+            device_id=device_id,
+            device_signing_key=device_signing_key,
+        )
+        await _signed_post(
+            session,
+            server_url=server_url,
+            path=f"/devices/{device_id}/revoke",
+            signer_key=subkey,
+            signer_id=cert["subkey_id"],
+            slug=slug,
+            body_dict=revocation,
+        )
+
+
+async def revoke_agent_device(agent_id: str) -> None:
+    """High-level wrapper: load the agent's identity from its active
+    keystore and self-revoke. Must be called while ``agent_dir`` is
+    still in the active path (before archive/delete moves it).
+    Raises on any failure — caller logs + writes a pending marker."""
+    from .state import AgentConfig
+
+    cfg = AgentConfig.load(agent_id)
+    pc = cfg.puffo_core
+    if not pc.is_configured():
+        return
+    identity = KeyStore.for_agent(agent_id).load_identity(pc.slug)
+    root_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.root_secret_key)
+    )
+    device_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.device_signing_secret_key)
+    )
+    await self_revoke_device(
+        server_url=identity.server_url,
+        slug=identity.slug,
+        device_id=identity.device_id,
+        device_signing_key=device_signing,
+        root_signing_key=root_signing,
+    )
+
+
+def archived_pending_revoke_path(archived_agent_dir: Path) -> Path:
+    return archived_agent_dir / ".puffo-agent" / "pending_revoke.json"
+
+
+def write_archived_pending_revoke(
+    archived_agent_dir: Path,
+    *,
+    server_url: str,
+    slug: str,
+    device_id: str,
+    last_error: str,
+) -> None:
+    """Drop a marker into a freshly-archived dir so the daemon's
+    next-startup sweep (or a manual retry) can finish the revoke."""
+    path = archived_pending_revoke_path(archived_agent_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "archive_self_revoke",
+                "server_url": server_url,
+                "slug": slug,
+                "device_id": device_id,
+                "last_error": last_error,
+                "attempted_at": int(time.time() * 1000),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+async def _retry_archived_pending_revoke(archived_path: Path) -> bool:
+    """Load the marker + per-agent keystore from an archived dir and
+    retry the self-revoke. Returns True on success (marker removed) or
+    when the marker is unparseable / missing fields (treated as
+    permanently un-retryable). Returns False on transient failure
+    (marker left in place for the next sweep)."""
+    marker = archived_pending_revoke_path(archived_path)
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        server_url = payload["server_url"]
+        slug = payload["slug"]
+        device_id = payload["device_id"]
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning(
+            "pending revoke at %s is unparseable (%s); leaving in place",
+            marker, exc,
+        )
+        return True
+    keystore = KeyStore(archived_path / "keys")
+    try:
+        identity = keystore.load_identity(slug)
+    except FileNotFoundError as exc:
+        logger.warning(
+            "pending revoke at %s: keystore missing (%s); leaving in place",
+            marker, exc,
+        )
+        return True
+    root_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.root_secret_key)
+    )
+    device_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.device_signing_secret_key)
+    )
+    try:
+        await self_revoke_device(
+            server_url=server_url,
+            slug=slug,
+            device_id=device_id,
+            device_signing_key=device_signing,
+            root_signing_key=root_signing,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pending revoke retry for %s failed: %s; will try again",
+            archived_path.name, exc,
+        )
+        return False
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    logger.info("pending revoke retry for %s ok", archived_path.name)
+    return True
+
+
+async def sweep_archived_pending_revokes() -> int:
+    """Scan ``archived/<id>-*-<stamp>/.puffo-agent/pending_revoke.json``
+    and retry each. Called at daemon startup so a previous-run
+    transient revoke failure doesn't leave the server-side device
+    cert live forever."""
+    from .state import archived_dir
+
+    root = archived_dir()
+    if not root.exists():
+        return 0
+    retried = 0
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        if not archived_pending_revoke_path(entry).exists():
+            continue
+        ok = await _retry_archived_pending_revoke(entry)
+        if ok:
+            retried += 1
+    return retried

@@ -16,6 +16,7 @@ import shutil
 import signal
 import threading
 import time
+from typing import Optional
 
 from pathlib import Path
 
@@ -106,6 +107,8 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+        # Retry any archived-dir pending revokes from a previous run.
+        asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup())
         # Re-assert machine_id for already-linked operators' agents so agents
         # created/paused before linking show as remote without a re-link.
         asyncio.ensure_future(_migrate_linked_agents_at_startup())
@@ -402,15 +405,43 @@ class Daemon:
         await asyncio.gather(*(self._stop_worker(i) for i in ids), return_exceptions=True)
 
     async def _archive_on_flag(self, agent_id: str) -> None:
-        """Stop the worker and move its dir to
-        ``archived/<id>-ws-<stamp>/``. The ``-ws-`` suffix marks
+        """Stop the worker, revoke its device server-side, and move its
+        dir to ``archived/<id>-ws-<stamp>/``. The ``-ws-`` suffix marks
         WS-cascade archives (operator-initiated has no suffix,
-        sync-driven uses ``-sync-``)."""
+        sync-driven uses ``-sync-``).
+
+        Revoke is best-effort: a failure drops a ``pending_revoke.json``
+        marker into the archived dir + leaves the archive itself
+        completed, so a daemon-startup sweep (or manual retry) can
+        finish the revoke later. Without this an archived agent's
+        device cert would stay valid on puffo-server forever — anyone
+        who restored the dir would resurrect the agent."""
         logger.warning(
             "agent %s: archive.flag detected, stopping worker + archiving",
             agent_id,
         )
         await self._stop_worker(agent_id)
+        from .import_agents import (
+            revoke_agent_device,
+            write_archived_pending_revoke,
+        )
+        cfg_for_revoke = None
+        try:
+            cfg_for_revoke = AgentConfig.load(agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
+        revoke_failure_reason: Optional[str] = None
+        if cfg_for_revoke is not None and cfg_for_revoke.puffo_core.is_configured():
+            try:
+                await revoke_agent_device(agent_id)
+                logger.info("agent %s: device revoked server-side", agent_id)
+            except Exception as exc:  # noqa: BLE001
+                revoke_failure_reason = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "agent %s: revoke failed (%s); pending marker will be "
+                    "left in the archived dir for retry",
+                    agent_id, revoke_failure_reason,
+                )
         # Report archived before the dir (+ keystore) moves out from under us.
         try:
             await _report_lifecycle(AgentConfig.load(agent_id), "archived")
@@ -431,21 +462,93 @@ class Daemon:
                 "agent %s: archive failed: %s (flag still present — will retry next tick)",
                 agent_id, exc,
             )
+            return
+        if revoke_failure_reason is not None and cfg_for_revoke is not None:
+            pc = cfg_for_revoke.puffo_core
+            try:
+                from ..crypto.keystore import KeyStore
+                identity = KeyStore(dest / "keys").load_identity(pc.slug)
+                write_archived_pending_revoke(
+                    dest,
+                    server_url=identity.server_url,
+                    slug=identity.slug,
+                    device_id=identity.device_id,
+                    last_error=revoke_failure_reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: failed to write pending_revoke marker: %s",
+                    agent_id, exc,
+                )
 
     async def _delete_on_flag(self, agent_id: str) -> None:
-        """Stop the worker and remove the agent dir entirely
-        (destructive — no archived/ copy). On removal failure the
-        flag stays so the next tick retries; the worker remains
-        stopped."""
+        """Stop the worker, revoke the agent's device server-side, and
+        remove the agent dir. On revoke failure, downgrade to archive
+        (keys preserved in ``archived/<id>-del-<stamp>/`` + a
+        ``pending_revoke.json`` marker) so the next daemon-startup
+        sweep can finish the revoke — otherwise the device cert would
+        stay valid forever and a recovered backup of the deleted dir
+        would resurrect the agent."""
         logger.warning(
             "agent %s: delete.flag detected, stopping worker + removing dir",
             agent_id,
         )
         await self._stop_worker(agent_id)
+        from .import_agents import (
+            revoke_agent_device,
+            write_archived_pending_revoke,
+        )
+        cfg_for_revoke = None
+        try:
+            cfg_for_revoke = AgentConfig.load(agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
+        revoke_failure_reason: Optional[str] = None
+        if cfg_for_revoke is not None and cfg_for_revoke.puffo_core.is_configured():
+            try:
+                await revoke_agent_device(agent_id)
+                logger.info("agent %s: device revoked server-side", agent_id)
+            except Exception as exc:  # noqa: BLE001
+                revoke_failure_reason = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "agent %s: revoke failed (%s); will downgrade delete to "
+                    "archive so the next sweep can retry",
+                    agent_id, revoke_failure_reason,
+                )
         src = agent_dir(agent_id)
         if not src.exists():
             return
         await _drain_codex_tmp(src)
+        if revoke_failure_reason is not None and cfg_for_revoke is not None:
+            archived_dir().mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            dest = archived_dir() / f"{agent_id}-del-{stamp}"
+            try:
+                shutil.move(str(src), str(dest))
+            except OSError as exc:
+                logger.error(
+                    "agent %s: delete-downgrade-to-archive move failed: %s "
+                    "(flag still present — will retry next tick)",
+                    agent_id, exc,
+                )
+                return
+            pc = cfg_for_revoke.puffo_core
+            try:
+                from ..crypto.keystore import KeyStore
+                identity = KeyStore(dest / "keys").load_identity(pc.slug)
+                write_archived_pending_revoke(
+                    dest,
+                    server_url=identity.server_url,
+                    slug=identity.slug,
+                    device_id=identity.device_id,
+                    last_error=revoke_failure_reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: failed to write pending_revoke marker: %s",
+                    agent_id, exc,
+                )
+            return
         try:
             shutil.rmtree(src)
             logger.info("agent %s: deleted", agent_id)
@@ -514,6 +617,21 @@ async def _drain_codex_tmp(src: Path) -> None:
         except OSError:
             await asyncio.sleep(0.5)
     shutil.rmtree(codex_tmp, ignore_errors=True)
+
+
+async def _sweep_archived_pending_revokes_at_startup() -> None:
+    """Retry any ``archived/.../pending_revoke.json`` markers left by
+    a previous run's archive/delete where the server-side revoke
+    failed transiently."""
+    from .import_agents import sweep_archived_pending_revokes
+    try:
+        n = await sweep_archived_pending_revokes()
+        if n:
+            logger.info(
+                "archived pending revokes: retried %d marker(s)", n,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("archived pending revoke sweep errored: %s", exc)
 
 
 async def _migrate_linked_agents_at_startup() -> None:

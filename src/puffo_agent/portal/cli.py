@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from .api.pairing import clear_pairing, load_pairing
 from .daemon import run_daemon
@@ -1022,6 +1023,28 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
                 break
             time.sleep(1)
 
+    # Revoke the device server-side before moving keys out of the
+    # active path. Best-effort: failure → log + drop a pending marker
+    # into the archived dir after the move so the daemon's startup
+    # sweep can retry.
+    from .import_agents import (
+        revoke_agent_device,
+        write_archived_pending_revoke,
+    )
+    revoke_failure_reason: Optional[str] = None
+    if cfg.puffo_core.is_configured():
+        try:
+            asyncio.run(revoke_agent_device(agent_id))
+            print(f"revoked {agent_id!r} device server-side")
+        except Exception as exc:  # noqa: BLE001
+            revoke_failure_reason = f"{type(exc).__name__}: {exc}"
+            print(
+                f"warning: device revoke failed ({revoke_failure_reason}); "
+                "will leave a pending_revoke.json marker in the archived "
+                "dir — the daemon's next startup sweep will retry",
+                file=sys.stderr,
+            )
+
     archived_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = archived_dir() / f"{agent_id}-{stamp}"
@@ -1046,6 +1069,22 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if revoke_failure_reason is not None and cfg.puffo_core.is_configured():
+        try:
+            from ..crypto.keystore import KeyStore
+            identity = KeyStore(dest / "keys").load_identity(cfg.puffo_core.slug)
+            write_archived_pending_revoke(
+                dest,
+                server_url=identity.server_url,
+                slug=identity.slug,
+                device_id=identity.device_id,
+                last_error=revoke_failure_reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"warning: failed to write pending_revoke marker into {dest}: {exc}",
+                file=sys.stderr,
+            )
     print(f"archived {agent_id!r} → {dest}")
     return 0
 

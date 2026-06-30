@@ -366,3 +366,160 @@ async def test_list_pending_revokes_and_cleanup_staging():
     assert staging.exists()
     imp.cleanup_staging_dir()
     assert not (agents_dir() / ".import-staging").exists()
+
+
+# ────────────────────────────────────────────────────────────────────
+# Self-revoke for archive / delete: ensure POST /devices/<id>/revoke
+# fires, and that pending markers in the archived dir get swept.
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_revoke_agent_device_posts_to_revoke_endpoint(mock_server):
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+
+    await imp.revoke_agent_device("alpha")
+
+    revoke_calls = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert revoke_calls == [("POST", f"/devices/{info['old_device_id']}/revoke")]
+    subkey_calls = [
+        (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
+    ]
+    assert len(subkey_calls) == 1
+
+
+async def test_revoke_agent_device_propagates_server_failure(mock_server):
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    state["fail"] = {"revoke"}
+    url = str(server.make_url("/")).rstrip("/")
+    _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    with pytest.raises(Exception):
+        await imp.revoke_agent_device("alpha")
+
+
+async def test_revoke_agent_device_noop_when_puffo_core_unconfigured(tmp_path):
+    """Chat-local / standalone agents with no ``puffo_core`` block
+    can't be revoked (no server). Helper returns cleanly, no error."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
+    import yaml
+
+    adir = agent_dir("standalone")
+    adir.mkdir(parents=True, exist_ok=True)
+    (adir / "agent.yml").write_text(
+        yaml.safe_dump({
+            "id": "standalone",
+            "state": "paused",
+            "display_name": "standalone",
+            "runtime": {"kind": "chat-local"},
+        }),
+        encoding="utf-8",
+    )
+    await imp.revoke_agent_device("standalone")
+
+
+async def test_sweep_archived_pending_revokes_retries_and_clears(mock_server):
+    """Drop a freshly-archived agent dir + pending_revoke marker into
+    ``archived/``; the sweep should retry the revoke against the
+    healthy mock server and unlink the marker."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+
+    # Simulate a completed archive (move to archived dir + drop marker).
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-20260629-120000"
+    Path(agent_dir("alpha")).rename(dest)
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url=url,
+        slug=info["slug"],
+        device_id=info["old_device_id"],
+        last_error="transient: 503",
+    )
+    assert imp.archived_pending_revoke_path(dest).exists()
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 1
+    assert not imp.archived_pending_revoke_path(dest).exists()
+    revoke_calls = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert revoke_calls == [("POST", f"/devices/{info['old_device_id']}/revoke")]
+
+
+async def test_sweep_archived_pending_revokes_leaves_marker_on_transient_failure(
+    mock_server,
+):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, state = mock_server
+    state["fail"] = {"revoke"}
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-20260629-120000"
+    Path(agent_dir("alpha")).rename(dest)
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url=url,
+        slug=info["slug"],
+        device_id=info["old_device_id"],
+        last_error="initial: 500",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    assert imp.archived_pending_revoke_path(dest).exists()
+
+
+async def test_sweep_archived_pending_revokes_handles_empty_archived_dir():
+    from puffo_agent.portal import import_agents as imp
+
+    # ``archived/`` may not exist yet on a fresh install.
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+
+
+async def test_write_archived_pending_revoke_schema(tmp_path):
+    from puffo_agent.portal import import_agents as imp
+
+    dest = tmp_path / "alpha-20260629-120000"
+    dest.mkdir()
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url="http://example",
+        slug="alpha-bot",
+        device_id="dev_xyz",
+        last_error="boom",
+    )
+    payload = json.loads(
+        imp.archived_pending_revoke_path(dest).read_text(encoding="utf-8"),
+    )
+    assert payload["kind"] == "archive_self_revoke"
+    assert payload["server_url"] == "http://example"
+    assert payload["slug"] == "alpha-bot"
+    assert payload["device_id"] == "dev_xyz"
+    assert payload["last_error"] == "boom"
+    assert isinstance(payload["attempted_at"], int)
