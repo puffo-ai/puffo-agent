@@ -423,6 +423,14 @@ class Daemon:
             cfg_for_revoke = AgentConfig.load(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
+        # Lifecycle heartbeat first — must run BEFORE the revoke, otherwise
+        # the heartbeat's subkey signature lands on a just-revoked device
+        # and the server 401s it (chain validation failed).
+        if cfg_for_revoke is not None:
+            try:
+                await _report_lifecycle(cfg_for_revoke, "archived")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent %s: archived report failed: %s", agent_id, exc)
         revoke_failure_reason: Optional[str] = None
         if cfg_for_revoke is not None and cfg_for_revoke.puffo_core.is_configured():
             try:
@@ -435,11 +443,6 @@ class Daemon:
                     "left in the archived dir for retry",
                     agent_id, revoke_failure_reason,
                 )
-        # Report archived before the dir (+ keystore) moves out from under us.
-        try:
-            await _report_lifecycle(AgentConfig.load(agent_id), "archived")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("agent %s: archived report failed: %s", agent_id, exc)
         src = agent_dir(agent_id)
         if not src.exists():
             return
