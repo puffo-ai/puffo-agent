@@ -4,10 +4,12 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.4a0] — 2026-06-29
+## [1.0.4a1] — 2026-06-29
 
-Pre-release alpha for testing PR #103 (macOS credential-refresh
-race fix). Not for production.
+Pre-release alpha for testing PR #103. Not for production. Supersedes
+1.0.4a0 — that build would false-block agents on macOS hosts where
+Claude Code's Keychain write silently fails (launchd session-context)
+but the disk credential file is fresh.
 
 ### Fixed
 
@@ -24,6 +26,33 @@ race fix). Not for production.
   but agents never actually called it; this closes that gap. The
   pre-existing `_auth_failed_notification_sent` dedup ensures the
   operator DM fires at most once per expiration episode.
+- **macOS: `KeychainBackend` falls through to the disk credentials
+  file when the Keychain entry is missing.** Claude Code 2.x under a
+  launchd session-context can silently fail Keychain writes while
+  still writing `~/.claude/.credentials.json` successfully. The
+  Keychain backend's `expires_in_seconds`, `refresh`, `bootstrap`,
+  `sync_to_agent`, and `poll_external_rotation` all now use the
+  disk file as a fallback so the daemon can serve agents on those
+  hosts (matches the existing `_sync_credentials_from_keychain`
+  invariant in `portal/state.py`). Without this, 1.0.4a0 would have
+  false-blocked every batch on hosts where the Keychain entry was
+  absent.
+
+### Changed
+
+- **`ensure_fresh()` fans canonical credentials out to every
+  registered agent before returning True.** Closes the split-brain
+  window where the daemon's view of the token is fresh but an
+  agent's per-agent credentials file is stale (copy-mode drift on
+  macOS, or a post-refresh fan-out the daemon hasn't done yet).
+  `KeychainBackend.sync_to_agent` is now idempotent — skips the
+  atomic write when the target file already matches — so the
+  fan-out from concurrent `ensure_fresh` callers stays cheap.
+
+## [1.0.4a0] — 2026-06-29
+
+Withdrawn — see 1.0.4a1 above. Would false-block agents on macOS
+hosts where the Keychain entry is missing.
 
 ## [1.0.3] — 2026-06-27
 

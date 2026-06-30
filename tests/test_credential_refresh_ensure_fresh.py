@@ -120,3 +120,72 @@ async def test_ensure_fresh_returns_false_on_missing_credentials(tmp_path):
 
     r.backend.refresh = _fake_refresh  # type: ignore[assignment]
     assert await r.ensure_fresh() is False
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_fans_out_to_agents_in_fresh_path(tmp_path):
+    """Daemon view says fresh → ensure_fresh still syncs canonical
+    credentials to every registered agent. Closes the split-brain
+    window where the agent's per-agent credentials file is stale
+    while the daemon's view is fresh (macOS copy-mode drift, or a
+    post-refresh fan-out the daemon hasn't done yet)."""
+    _write_creds(tmp_path, expires_in_seconds=7200)
+    r = CredentialRefresher(host_home=tmp_path)
+
+    agent_a = tmp_path / "agent-a"
+    agent_b = tmp_path / "agent-b"
+    for agent in (agent_a, agent_b):
+        agent.mkdir()
+        r.register_agent(agent)
+
+    assert await r.ensure_fresh() is True
+    # FileBackend.sync_to_agent → link_host_credentials → either
+    # symlink or copy into <agent>/.claude/.credentials.json.
+    for agent in (agent_a, agent_b):
+        assert (agent / ".claude" / ".credentials.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_fans_out_after_successful_refresh(tmp_path):
+    """Refresh-path also fans out — verifies the post-refresh _sync_views
+    call lands when ensure_fresh had to drive an actual refresh."""
+    _write_creds(tmp_path, expires_in_seconds=60)  # below safety margin
+    r = CredentialRefresher(host_home=tmp_path)
+
+    async def _fake_refresh() -> RefreshOutcome:
+        _write_creds(tmp_path, expires_in_seconds=3600)
+        return RefreshOutcome.REFRESHED
+
+    r.backend.refresh = _fake_refresh  # type: ignore[assignment]
+    agent = tmp_path / "agent-x"
+    agent.mkdir()
+    r.register_agent(agent)
+
+    assert await r.ensure_fresh() is True
+    assert (agent / ".claude" / ".credentials.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_ensure_fresh_does_not_fan_out_when_refresh_fails(tmp_path):
+    """Refresh failure path returns False before any fan-out — agents
+    don't get stamped with stale/empty creds."""
+    _write_creds(tmp_path, expires_in_seconds=-10)
+    r = CredentialRefresher(host_home=tmp_path)
+
+    async def _fake_refresh() -> RefreshOutcome:
+        return RefreshOutcome.FAILED
+
+    r.backend.refresh = _fake_refresh  # type: ignore[assignment]
+    agent = tmp_path / "agent-y"
+    agent.mkdir()
+    r.register_agent(agent)
+
+    sync_calls = 0
+
+    def _spy_sync_to_agent(home):
+        nonlocal sync_calls
+        sync_calls += 1
+
+    r.backend.sync_to_agent = _spy_sync_to_agent  # type: ignore[assignment]
+    assert await r.ensure_fresh() is False
+    assert sync_calls == 0

@@ -201,6 +201,35 @@ def _jwt_exp_unix(token: str) -> int | None:
     return int(exp)
 
 
+def _read_disk_credentials_blob(host_home: Path) -> Optional[str]:
+    """Read ``<host_home>/.claude/.credentials.json`` as a raw blob.
+    None on missing / unreadable / non-JSON. Used as the macOS
+    fallback when Claude Code's Keychain write silently fails under
+    launchd session-context but the disk file still gets written."""
+    path = host_home / ".claude" / ".credentials.json"
+    try:
+        blob = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        json.loads(blob)
+    except ValueError:
+        return None
+    return blob
+
+
+def _disk_expires_in_seconds(host_home: Path) -> Optional[int]:
+    blob = _read_disk_credentials_blob(host_home)
+    if blob is None:
+        return None
+    try:
+        data = json.loads(blob)
+        ms = int((data.get("claudeAiOauth") or {}).get("expiresAt"))
+    except (ValueError, TypeError):
+        return None
+    return int(ms / 1000 - time.time())
+
+
 class RefreshOutcome(enum.Enum):
     """Result of a single backend refresh attempt."""
     REFRESHED = "refreshed"
@@ -533,48 +562,43 @@ class KeychainBackend:
         self._last_propagated_blob: Optional[str] = None
 
     def expires_in_seconds(self) -> int | None:
-        """Pull expiry from the cache first (hot path; no subprocess).
-        Cache miss → fall back to a Keychain read so the daemon's
-        first-tick decision isn't blocked on bootstrap completion."""
-        # Lazy import to keep the module-level import graph light.
+        """Cache → Keychain → disk file. The disk fallthrough handles
+        macOS hosts where Claude Code's Keychain write silently fails
+        under launchd session-context but the disk file at
+        ``~/.claude/.credentials.json`` still gets written."""
         from ..macos.keychain import read_keychain_blob
 
         expires_at = self.cache.expires_at_seconds()
         if expires_at is not None:
             return int(expires_at - time.time())
-        # Cache miss — try Keychain. Don't write the cache here; that's
-        # ``bootstrap``'s job. We only want a TTL value.
         kr = read_keychain_blob()
-        if not kr.ok or not kr.blob:
-            return None
-        try:
-            data = json.loads(kr.blob)
-            ms = int((data.get("claudeAiOauth") or {}).get("expiresAt"))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        # Opportunistically warm the cache so subsequent ticks are fast.
-        try:
-            self.cache.write(kr.blob)
-        except OSError:
-            pass
-        return int(ms / 1000 - time.time())
+        if kr.ok and kr.blob:
+            try:
+                data = json.loads(kr.blob)
+                ms = int((data.get("claudeAiOauth") or {}).get("expiresAt"))
+                try:
+                    self.cache.write(kr.blob)
+                except OSError:
+                    pass
+                return int(ms / 1000 - time.time())
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        disk_blob = _read_disk_credentials_blob(Path.home())
+        if disk_blob is not None:
+            try:
+                self.cache.write(disk_blob)
+            except OSError:
+                pass
+        return _disk_expires_in_seconds(Path.home())
 
     async def refresh(self) -> RefreshOutcome:
         from ..macos.keychain import read_keychain_blob
 
-        # Snapshot Keychain before claude runs so we can byte-compare
-        # after. Cache.read() is not enough — agent processes may have
-        # rotated Keychain externally between ticks and the cache is a
-        # lagging mirror.
+        host_home = Path.home()
         kr_before = read_keychain_blob()
         before_blob = kr_before.blob if kr_before.ok else None
+        disk_before = _read_disk_credentials_blob(host_home)
 
-        # Real user HOME — claude reads Keychain, refreshes if expired,
-        # writes back to Keychain. Identical pattern to FileBackend.
-        # cwd=host_home so claude's project-resolution lands in the
-        # operator's normal working dir (matches single-process /login
-        # UX) instead of wherever the daemon was launched from.
-        host_home = Path.home()
         env = {**os.environ, "HOME": str(host_home)}
         cmd = _build_probe_cmd()
         started = time.time()
@@ -612,56 +636,79 @@ class KeychainBackend:
                 log_prefix="claude credential refresh",
             )
 
-        # Pull the post-refresh blob straight from Keychain — that's
-        # where claude wrote it. Then sync our cache so agent fan-out
-        # has fresh bytes.
         kr_after = read_keychain_blob()
-        if not kr_after.ok or not kr_after.blob:
+        if kr_after.ok and kr_after.blob:
+            try:
+                self.cache.write(kr_after.blob)
+            except OSError as exc:
+                logger.warning(
+                    "claude credential refresh: cache write failed: %s", exc,
+                )
+            if before_blob is not None and before_blob == kr_after.blob:
+                logger.info(
+                    "claude credential refresh ok in %.1fs but Keychain "
+                    "unchanged — token was still fresh; claude skipped the "
+                    "OAuth round-trip",
+                    elapsed,
+                )
+                return RefreshOutcome.UNCHANGED
+            self._last_propagated_blob = kr_after.blob
+            logger.info(
+                "claude credential refresh ok in %.1fs (Keychain rotated)",
+                elapsed,
+            )
+            return RefreshOutcome.REFRESHED
+
+        # Keychain post-refresh read failed — fall through to disk file.
+        # Claude Code 2.x may write the disk file successfully even when
+        # the Keychain write silently fails under launchd session-context.
+        disk_after = _read_disk_credentials_blob(host_home)
+        if disk_after is None:
             logger.warning(
-                "claude credential refresh exit=0 but Keychain re-read "
-                "failed (%s); cache untouched",
+                "claude credential refresh exit=0 but neither Keychain "
+                "(%s) nor disk file is readable; cache untouched",
                 kr_after.error,
             )
             return RefreshOutcome.FAILED
         try:
-            self.cache.write(kr_after.blob)
+            self.cache.write(disk_after)
         except OSError as exc:
             logger.warning(
                 "claude credential refresh: cache write failed: %s", exc,
             )
-
-        # Byte-compare the Keychain blob before and after. Anything
-        # else (e.g. comparing int(expires_in_seconds)) loses
-        # sub-second resolution to time.time()'s fractional part.
-        if before_blob is not None and before_blob == kr_after.blob:
+        if disk_before is not None and disk_before == disk_after:
             logger.info(
-                "claude credential refresh ok in %.1fs but Keychain "
-                "unchanged — token was still fresh; claude skipped the "
-                "OAuth round-trip",
+                "claude credential refresh ok in %.1fs (Keychain dead; "
+                "disk file unchanged — token was still fresh)",
                 elapsed,
             )
             return RefreshOutcome.UNCHANGED
-
-        self._last_propagated_blob = kr_after.blob
+        self._last_propagated_blob = disk_after
         logger.info(
-            "claude credential refresh ok in %.1fs (Keychain rotated)",
+            "claude credential refresh ok in %.1fs (Keychain dead; "
+            "disk file rotated)",
             elapsed,
         )
         return RefreshOutcome.REFRESHED
 
     def sync_to_agent(self, agent_home: Path) -> None:
-        """Atomic-write the cache blob to the agent's per-agent
-        ``.credentials.json``. No symlinking — Keychain ACL is on UID
-        + signing identity, not HOME, so a symlink to the host file
-        gives no benefit and the per-agent file diverges anyway when
-        claude self-refreshes inside the agent's process."""
-        blob = self.cache.read()
+        """Atomic-write the canonical blob to the agent's per-agent
+        ``.credentials.json``. Cache → disk file fallthrough so this
+        works even when the Keychain entry is missing. Idempotent —
+        skips the write when the target already matches, so fan-out
+        from concurrent ``ensure_fresh`` callers stays cheap."""
+        blob = self.cache.read() or _read_disk_credentials_blob(Path.home())
         if not blob:
             return
         agent_claude = agent_home / ".claude"
+        target = agent_claude / ".credentials.json"
+        try:
+            if target.read_text(encoding="utf-8") == blob:
+                return
+        except OSError:
+            pass
         try:
             agent_claude.mkdir(parents=True, exist_ok=True)
-            target = agent_claude / ".credentials.json"
             tmp = agent_claude / f".{target.name}.tmp.{os.getpid()}"
             tmp.write_text(blob, encoding="utf-8")
             try:
@@ -682,28 +729,42 @@ class KeychainBackend:
         ok, reason = bootstrap_from_keychain(self.cache)
         if ok:
             self._last_propagated_blob = self.cache.read()
-        return (ok, reason)
+            return (ok, reason)
+        # Keychain bootstrap failed — fall through to disk file so the
+        # daemon can still serve agents on hosts where Claude Code's
+        # Keychain write silently fails (launchd session-context).
+        disk_blob = _read_disk_credentials_blob(Path.home())
+        if disk_blob is None:
+            return (False, reason)
+        try:
+            self.cache.write(disk_blob)
+        except OSError as exc:
+            return (False, f"{reason}; disk-fallback cache write: {exc}")
+        self._last_propagated_blob = disk_blob
+        return (True, f"{reason}; using disk-file fallback")
 
     async def poll_external_rotation(self) -> bool:
-        """Read Keychain and compare to the last-propagated blob.
-        Returns True when a rotation was detected and the cache was
-        updated; the caller (``CredentialRefresher``) then fans the
-        new blob to every registered agent via ``_sync_views``.
-        """
+        """Detect a token rotation (Keychain or disk file) since the
+        last fan-out. Returns True when the canonical blob changed and
+        the cache was updated; the caller fans out via ``_sync_views``."""
         from ..macos.keychain import read_keychain_blob
 
         kr = read_keychain_blob()
-        if not kr.ok or not kr.blob:
+        blob: Optional[str] = kr.blob if kr.ok and kr.blob else None
+        if blob is None:
+            blob = _read_disk_credentials_blob(Path.home())
+        if blob is None:
             logger.debug(
-                "keychain poll: read failed (%s); will retry next tick",
+                "keychain poll: neither Keychain (%s) nor disk file "
+                "readable; will retry next tick",
                 kr.error,
             )
             return False
-        if kr.blob == self._last_propagated_blob:
+        if blob == self._last_propagated_blob:
             return False
-        self._last_propagated_blob = kr.blob
+        self._last_propagated_blob = blob
         try:
-            self.cache.write(kr.blob)
+            self.cache.write(blob)
         except OSError as exc:
             logger.warning("keychain poll: cache write failed: %s", exc)
             return False
@@ -796,21 +857,27 @@ class CredentialRefresher:
         ``_refresh_now``, so N concurrent callers coalesce into one
         backend.refresh() per actually-expired credential.
 
-        ``by_agent=False`` so ``_refresh_now``'s post-lock re-check
-        fires — N concurrent ensure_fresh() callers see "another
-        caller already refreshed" and return without re-invoking the
-        backend.
+        Always fans the canonical blob out to every registered agent
+        before returning True. Closes the split-brain window where
+        the daemon's view says fresh but an agent's per-agent
+        credentials file is stale (copy-mode drift on macOS, or a
+        post-refresh fan-out the daemon hasn't done yet). The
+        backend's ``sync_to_agent`` is idempotent so the call is
+        cheap when nothing has actually drifted.
 
-        Intended for pre-delivery gating: a Worker calls this right
-        before handing a batch to its adapter, and skips the dispatch
-        if False so the agent's own claude never has to discover the
-        401 itself."""
+        ``by_agent=False`` so ``_refresh_now``'s post-lock re-check
+        fires — N concurrent callers see "another caller already
+        refreshed" and skip the backend invocation."""
         expires = self.expires_in_seconds()
         if expires is not None and expires > REFRESH_SAFETY_MARGIN_SECONDS:
+            self._sync_views()
             return True
         await self._refresh_now(expires_in=expires, by_agent=False)
         expires = self.expires_in_seconds()
-        return expires is not None and expires > 0
+        if expires is not None and expires > 0:
+            self._sync_views()
+            return True
+        return False
 
     async def run_loop(self, stop_event: asyncio.Event) -> None:
         """Main daemon coroutine. Polls every REFRESH_POLL_SECONDS or
