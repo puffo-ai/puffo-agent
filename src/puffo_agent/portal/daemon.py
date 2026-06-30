@@ -125,6 +125,20 @@ class Daemon:
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_rpc_resolver(self._resolve_host_mcp_context)
+        # PUF-335: bind the remote-auth-refresh coordinator to the
+        # daemon's reporter (operator-DM relay) + restart-all-owned
+        # helper (touches restart.flag on every owned agent so a
+        # fresh credentials file actually gets picked up).
+        from ..agent.auth_refresh import AuthRefreshCoordinator, set_auth_refresh_coordinator
+        from .control.reporter import get_reporter as _get_reporter
+
+        _reporter = _get_reporter()
+        set_auth_refresh_coordinator(
+            AuthRefreshCoordinator(
+                emit=_reporter.send_to_operator,
+                restart_all_owned=_restart_all_owned_agents,
+            )
+        )
         # Bridge pins 63387 (browser clients hard-code it). Both
         # fallbacks scan from 63388 onward so neither collides with
         # bridge; data starts after rpc so its fallback can route
@@ -188,6 +202,11 @@ class Daemon:
             await stop_api_server(api_runner)
             set_profile_setter(None)
             set_rpc_resolver(None)
+            # PUF-335: clear the auth-refresh coordinator so tests +
+            # restart paths don't see a stale singleton.
+            from ..agent.auth_refresh import set_auth_refresh_coordinator
+
+            set_auth_refresh_coordinator(None)
             await stop_data_service(data_runner)
             await stop_rpc_service(rpc_runner)
             clear_daemon_pid()
@@ -658,6 +677,22 @@ async def _sweep_archived_pending_revokes_at_startup() -> None:
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("archived pending revoke sweep errored: %s", exc)
+
+
+async def _restart_all_owned_agents() -> int:
+    """PUF-335: touch restart.flag on every locally-discovered agent
+    so the reconciler picks up freshly-written credentials on the
+    next tick. Returns the number of restart flags written."""
+    count = 0
+    for agent_id in discover_agents():
+        try:
+            flag = restart_flag_path(agent_id)
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text("auth-refresh", encoding="utf-8")
+            count += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return count
 
 
 async def _migrate_linked_agents_at_startup() -> None:

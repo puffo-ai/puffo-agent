@@ -301,6 +301,40 @@ async def execute_command(
         request_id = command_id or str(params.get("request_id") or "")
         result = await finalize_from_command(request_id, params)
         return {"ok": True, **result}
+    if op in (
+        "auth-claude",
+        "auth-codex",
+        "auth-claude-token",
+        "auth-codex-token",
+        "cancel-auth-claude",
+        "cancel-auth-codex",
+    ):
+        # PUF-335: interactive remote-auth refresh. ``params`` carries
+        # the token on the ``-token`` ops; ``paired_root_pubkey`` →
+        # ``operator_slug`` lookup happens inside the coordinator's
+        # emit callback (the singleton holds the per-operator
+        # reporter binding from daemon init).
+        from ...agent.auth_refresh import (
+            Provider,
+            get_auth_refresh_coordinator,
+            parse_provider_from_op,
+        )
+
+        provider = parse_provider_from_op(op)
+        if provider is None:
+            return {"ok": False, "error": f"unknown auth provider in op {op!r}"}
+        coord = get_auth_refresh_coordinator()
+        if coord is None:
+            return {"ok": False, "error": "auth-refresh coordinator not initialised"}
+        operator_slug = str(params.get("operator_slug") or "")
+        if op.startswith("cancel-"):
+            return await coord.cancel(provider)
+        if op.endswith("-token"):
+            token = str(params.get("token") or "")
+            if not token:
+                return {"ok": False, "error": "token required"}
+            return await coord.submit_token(provider, token, operator_slug)
+        return await coord.start(provider, operator_slug)
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
