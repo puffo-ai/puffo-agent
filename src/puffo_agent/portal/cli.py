@@ -1533,6 +1533,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--passcode", required=True, help="Passcode for the .puffoagent bundle + ws-local attach"
     )
     create_wsl.add_argument("--display-name", default="", help="Friendly name for the new agent")
+    create_wsl.add_argument(
+        "--bridge-url",
+        default="http://127.0.0.1:63387",
+        help="Bridge HTTP base URL (default: %(default)s).",
+    )
     create_wsl.set_defaults(func=cmd_agent_create_ws_local)
 
     lst = agent_sub.add_parser("list", help="List registered agents")
