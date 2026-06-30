@@ -607,28 +607,46 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
 
 
 async def _retry_move(src: Path, dest: Path) -> OSError | None:
-    # Mirrors CLI cmd_agent_archive's 8 x 0.5s retry — aiosqlite WAL /
-    # SHM handles can take a moment to release on Windows after
-    # stop_worker, and shutil.move's copy-then-delete fallback would
-    # otherwise leave a half-moved tree in both paths.
+    # ``shutil.move`` on Windows is NOT atomic on a directory whose
+    # child files are still held (aiosqlite WAL/SHM handles after
+    # ``stop_worker``). It tries ``os.rename`` first, then falls back
+    # to ``copytree(src, dest)`` + ``rmtree(src)``. copytree usually
+    # finishes (it only reads ``src``), but rmtree fails midway on the
+    # locked sqlite files — and by then it has already deleted the
+    # unlocked ones (agent.yml, keys/, .puffo-agent/...), hollowing
+    # out src with no way to recover.
     #
-    # Between attempts, scrub any partial ``dest`` left by the prior
-    # failed copy. Without this, the second ``shutil.move`` sees
-    # ``dest`` as an existing directory and helpfully nests the
-    # whole src under it (``dest/<src.name>``) instead of replacing it.
-    last_err: OSError | None = None
+    # Split into two phases:
+    #   1. copytree(src → dest), retried until success
+    #   2. best-effort rmtree(src) — locked sqlite remnants stay
+    #      behind as orphans; the daemon ignores them (no agent.yml,
+    #      reconcile loop skips), and a later attempt or manual rm
+    #      clears them once the OS releases the handle.
+    #
+    # The archive is "done" the moment dest holds a complete copy.
+    copy_err: OSError | None = None
     for _ in range(8):
         if dest.exists():
             shutil.rmtree(dest, ignore_errors=True)
         try:
-            shutil.move(str(src), str(dest))
-            return None
+            shutil.copytree(str(src), str(dest))
+            copy_err = None
+            break
         except (OSError, PermissionError) as exc:
-            last_err = exc
+            copy_err = exc
             await asyncio.sleep(0.5)
-    if dest.exists():
-        shutil.rmtree(dest, ignore_errors=True)
-    return last_err
+    if copy_err is not None:
+        if dest.exists():
+            shutil.rmtree(dest, ignore_errors=True)
+        return copy_err
+    for _ in range(8):
+        try:
+            shutil.rmtree(str(src))
+            return None
+        except (OSError, PermissionError):
+            await asyncio.sleep(0.5)
+    shutil.rmtree(str(src), ignore_errors=True)
+    return None
 
 
 async def _drain_codex_tmp(src: Path) -> None:
