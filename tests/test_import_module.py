@@ -590,6 +590,108 @@ async def test_sweep_archived_pending_revokes_handles_empty_archived_dir():
     assert n == 0
 
 
+async def test_sweep_renames_unparseable_marker_to_broken_and_does_not_count():
+    """Markers from a different schema (e.g. an older PR that wrote
+    a different field shape) should be renamed to .broken so the
+    daemon stops warning on every restart, and they should NOT count
+    toward the "retried N marker(s)" tally."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    entry = archived_dir() / "ghost-20260101-000000"
+    entry.mkdir()
+    (entry / ".puffo-agent").mkdir()
+    (entry / ".puffo-agent" / "pending_revoke.json").write_text(
+        json.dumps({
+            # Old-schema marker: missing ``server_url`` / ``slug`` /
+            # ``device_id`` that the new sweep needs.
+            "old_device_id": "dev_legacy",
+            "last_error": "boom",
+            "attempted_at": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    assert not (entry / ".puffo-agent" / "pending_revoke.json").exists()
+    assert (entry / ".puffo-agent" / "pending_revoke.json.broken").exists()
+
+
+async def test_sweep_renames_marker_when_keystore_is_missing():
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    entry = archived_dir() / "ghost-20260101-000000"
+    entry.mkdir()
+    imp.write_archived_pending_revoke(
+        entry,
+        server_url="http://example",
+        slug="ghost",
+        device_id="dev_ghost",
+        last_error="boom",
+    )
+    # No keys/ subdir — keystore.load_identity will raise.
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    assert (entry / ".puffo-agent" / "pending_revoke.json.broken").exists()
+
+
+def test_is_already_archived_matches_ws_del_and_plain_stamps():
+    """``_is_already_archived`` should fire on any ``<slug>-...`` dir
+    under ``archived/`` — the daemon path uses ``-ws-<stamp>``, the
+    delete-downgrade path uses ``-del-<stamp>``, and CLI's
+    ``cmd_agent_archive`` uses just ``-<stamp>``."""
+    from puffo_agent.portal.control.client import _is_already_archived
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    (archived_dir() / "alpha-20260101-000000").mkdir()
+    (archived_dir() / "beta-ws-20260101-000000").mkdir()
+    (archived_dir() / "gamma-del-20260101-000000").mkdir()
+
+    assert _is_already_archived("alpha") is True
+    assert _is_already_archived("beta") is True
+    assert _is_already_archived("gamma") is True
+    assert _is_already_archived("delta") is False
+    # Don't false-match a slug that's a prefix of an archived dir but
+    # not separated by '-'.
+    assert _is_already_archived("alp") is False
+
+
+async def test_control_archive_returns_already_archived_when_dir_in_archived():
+    from puffo_agent.portal.control.client import execute_command
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    (archived_dir() / "alpha-ws-20260101-000000").mkdir()
+
+    result = await execute_command(
+        op="archive", agent_slug="alpha", params={},
+    )
+    assert result["ok"] is True
+    assert result.get("note") == "already archived"
+
+
+async def test_control_archive_still_unknown_when_neither_active_nor_archived():
+    from puffo_agent.portal.control.client import execute_command
+
+    isolated_home()
+
+    result = await execute_command(
+        op="archive", agent_slug="ghost", params={},
+    )
+    assert result["ok"] is False
+    assert "unknown agent" in result["error"]
+
+
 async def test_write_archived_pending_revoke_schema(tmp_path):
     from puffo_agent.portal import import_agents as imp
 

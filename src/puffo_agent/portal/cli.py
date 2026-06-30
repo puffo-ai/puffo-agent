@@ -1087,6 +1087,10 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     agent_id = args.id
     src = agent_dir(agent_id)
     if not src.exists():
+        from .control.client import _is_already_archived
+        if _is_already_archived(agent_id):
+            print(f"{agent_id!r} is already archived")
+            return 0
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
     # Pause first so the worker exits cleanly before we move the dir.

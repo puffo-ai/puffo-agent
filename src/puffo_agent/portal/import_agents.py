@@ -22,6 +22,7 @@ handled by the separate ``revoke_pending`` helper.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import shutil
@@ -701,9 +702,15 @@ def write_archived_pending_revoke(
     )
 
 
-async def _retry_archived_pending_revoke(archived_path: Path) -> bool:
-    # Returns True on success (marker removed) or when the marker /
-    # keystore is permanently un-retryable; False on transient failure.
+class _RetryOutcome(enum.Enum):
+    SUCCEEDED = "succeeded"          # revoke posted; marker removed
+    TRANSIENT = "transient"          # server/network blip; retry next sweep
+    UNRETRYABLE = "unretryable"      # bad schema / missing keys; renamed to .broken
+
+
+async def _retry_archived_pending_revoke(
+    archived_path: Path,
+) -> _RetryOutcome:
     marker = archived_pending_revoke_path(archived_path)
     try:
         payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -712,19 +719,21 @@ async def _retry_archived_pending_revoke(archived_path: Path) -> bool:
         device_id = payload["device_id"]
     except (OSError, ValueError, KeyError) as exc:
         logger.warning(
-            "pending revoke at %s is unparseable (%s); leaving in place",
+            "pending revoke at %s is unparseable (%s); renaming to .broken",
             marker, exc,
         )
-        return True
+        _mark_pending_revoke_broken(marker, str(exc))
+        return _RetryOutcome.UNRETRYABLE
     keystore = KeyStore(archived_path / "keys")
     try:
         identity = keystore.load_identity(slug)
     except FileNotFoundError as exc:
         logger.warning(
-            "pending revoke at %s: keystore missing (%s); leaving in place",
+            "pending revoke at %s: keystore missing (%s); renaming to .broken",
             marker, exc,
         )
-        return True
+        _mark_pending_revoke_broken(marker, f"keystore missing: {exc}")
+        return _RetryOutcome.UNRETRYABLE
     root_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.root_secret_key)
     )
@@ -744,18 +753,34 @@ async def _retry_archived_pending_revoke(archived_path: Path) -> bool:
             "pending revoke retry for %s failed: %s; will try again",
             archived_path.name, exc,
         )
-        return False
+        return _RetryOutcome.TRANSIENT
     try:
         marker.unlink()
     except OSError:
         pass
     logger.info("pending revoke retry for %s ok", archived_path.name)
-    return True
+    return _RetryOutcome.SUCCEEDED
+
+
+def _mark_pending_revoke_broken(marker: Path, reason: str) -> None:
+    """Move the marker aside so subsequent sweeps don't keep warning
+    on it. The .broken file is left for operator inspection."""
+    broken = marker.with_suffix(marker.suffix + ".broken")
+    try:
+        marker.replace(broken)
+    except OSError as exc:
+        logger.warning(
+            "could not rename %s to .broken: %s; leaving in place "
+            "(will warn again next sweep)",
+            marker, exc,
+        )
 
 
 async def sweep_archived_pending_revokes() -> int:
-    # Called at daemon startup so a prior-run transient revoke
-    # failure doesn't leave the server-side device cert live forever.
+    """Returns the count of markers we actually retried successfully —
+    ``UNRETRYABLE`` (bad schema / missing keys) is renamed to
+    ``.broken`` and excluded; ``TRANSIENT`` failures stay for the
+    next sweep but aren't counted as a retry."""
     from .state import archived_dir
 
     root = archived_dir()
@@ -767,7 +792,7 @@ async def sweep_archived_pending_revokes() -> int:
             continue
         if not archived_pending_revoke_path(entry).exists():
             continue
-        ok = await _retry_archived_pending_revoke(entry)
-        if ok:
+        outcome = await _retry_archived_pending_revoke(entry)
+        if outcome is _RetryOutcome.SUCCEEDED:
             retried += 1
     return retried
