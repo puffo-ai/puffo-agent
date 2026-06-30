@@ -409,6 +409,69 @@ async def test_revoke_agent_device_propagates_server_failure(mock_server):
         await imp.revoke_agent_device("alpha")
 
 
+async def test_revoke_agent_device_reuses_fresh_session_subkey(mock_server):
+    """A fresh ``<slug>.session.json`` already on disk (typically left by
+    the lifecycle-heartbeat path running first) should be reused for
+    the revoke POST — exactly one ``/devices/subkeys`` registration per
+    archive instead of two."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.crypto.keystore import KeyStore, Session, encode_secret
+    from puffo_agent.crypto.primitives import Ed25519KeyPair
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    fresh_subkey = Ed25519KeyPair.generate()
+    KeyStore.for_agent("alpha").save_session(Session(
+        slug=info["slug"],
+        subkey_id="sk_preregistered",
+        subkey_secret_key=encode_secret(fresh_subkey.secret_bytes()),
+        expires_at=int(time.time() * 1000) + 24 * 3600 * 1000,
+    ))
+
+    await imp.revoke_agent_device("alpha")
+
+    subkey_posts = [
+        (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
+    ]
+    revoke_posts = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert subkey_posts == []
+    assert len(revoke_posts) == 1
+
+
+async def test_revoke_agent_device_registers_fresh_when_session_expired(
+    mock_server,
+):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.crypto.keystore import KeyStore, Session, encode_secret
+    from puffo_agent.crypto.primitives import Ed25519KeyPair
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    stale_subkey = Ed25519KeyPair.generate()
+    KeyStore.for_agent("alpha").save_session(Session(
+        slug=info["slug"],
+        subkey_id="sk_stale",
+        subkey_secret_key=encode_secret(stale_subkey.secret_bytes()),
+        expires_at=1,
+    ))
+
+    await imp.revoke_agent_device("alpha")
+
+    subkey_posts = [
+        (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
+    ]
+    assert len(subkey_posts) == 1
+
+
 async def test_revoke_agent_device_noop_when_puffo_core_unconfigured(tmp_path):
     """Chat-local / standalone agents with no ``puffo_core`` block
     can't be revoked (no server). Helper returns cleanly, no error."""

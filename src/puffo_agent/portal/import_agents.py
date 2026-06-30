@@ -585,18 +585,26 @@ async def self_revoke_device(
     device_id: str,
     device_signing_key: Ed25519KeyPair,
     root_signing_key: Ed25519KeyPair,
+    preregistered_subkey: tuple[Ed25519KeyPair, dict] | None = None,
 ) -> None:
     # POST envelope uses a fresh subkey of THIS device — still valid
     # at request-time even though the revoke is about to apply.
+    # ``preregistered_subkey`` lets the caller reuse a subkey already
+    # registered earlier in the same archive flow (e.g. the one
+    # ``PuffoCoreHttpClient`` rotated for the lifecycle heartbeat),
+    # avoiding a second ``/devices/subkeys`` POST per archive.
     revocation = create_device_revocation(root_signing_key, device_id)
     async with _remote_http_session(server_url) as session:
-        subkey, cert = await _register_subkey_via_device(
-            session,
-            server_url=server_url,
-            slug=slug,
-            device_id=device_id,
-            device_signing_key=device_signing_key,
-        )
+        if preregistered_subkey is not None:
+            subkey, cert = preregistered_subkey
+        else:
+            subkey, cert = await _register_subkey_via_device(
+                session,
+                server_url=server_url,
+                slug=slug,
+                device_id=device_id,
+                device_signing_key=device_signing_key,
+            )
         await _signed_post(
             session,
             server_url=server_url,
@@ -617,19 +625,38 @@ async def revoke_agent_device(agent_id: str) -> None:
     pc = cfg.puffo_core
     if not pc.is_configured():
         return
-    identity = KeyStore.for_agent(agent_id).load_identity(pc.slug)
+    keystore = KeyStore.for_agent(agent_id)
+    identity = keystore.load_identity(pc.slug)
     root_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.root_secret_key)
     )
     device_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.device_signing_secret_key)
     )
+    # Reuse the cached session subkey if it's still fresh — the
+    # lifecycle heartbeat just rotated it (PuffoCoreHttpClient's
+    # _ensure_subkey / 401-retry), so a second registration would
+    # be redundant.
+    preregistered: tuple[Ed25519KeyPair, dict] | None = None
+    try:
+        from ..crypto.certs import needs_rotation
+        sess = keystore.load_session(pc.slug)
+        if not needs_rotation(sess.expires_at):
+            preregistered = (
+                Ed25519KeyPair.from_secret_bytes(
+                    decode_secret(sess.subkey_secret_key)
+                ),
+                {"subkey_id": sess.subkey_id},
+            )
+    except FileNotFoundError:
+        pass
     await self_revoke_device(
         server_url=identity.server_url,
         slug=identity.slug,
         device_id=identity.device_id,
         device_signing_key=device_signing,
         root_signing_key=root_signing,
+        preregistered_subkey=preregistered,
     )
 
 
