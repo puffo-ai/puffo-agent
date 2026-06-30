@@ -4,6 +4,24 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.0.5] — 2026-06-29
+
+### Added
+
+- **Activity log for ws-local agents.** Agents driven by an attached
+  tool (the ws-local runtime) now report their turns and tool calls
+  to the operator's activity log — the message being worked on, each
+  tool call (with the message body for sends), and turn completion.
+  These agents have no token usage to report, so only the activity is
+  shown.
+
+### Fixed
+
+- **codex per-turn token count.** A turn that makes several model
+  requests now reports the whole turn's tokens (taken from the thread
+  total's delta) instead of only the last request, so the figure no
+  longer looks far too small for multi-step turns.
+
 ## [1.0.4] — 2026-06-29
 
 ### Added
