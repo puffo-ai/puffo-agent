@@ -1101,32 +1101,11 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
                 break
             time.sleep(1)
 
-    # Revoke before moving keys out of the active path. Best-effort:
-    # failure drops a pending marker that the daemon's startup sweep
-    # will retry.
-    from .import_agents import (
-        revoke_agent_device,
-        write_archived_pending_revoke,
-    )
-    revoke_failure_reason: Optional[str] = None
-    if cfg.puffo_core.is_configured():
-        try:
-            asyncio.run(revoke_agent_device(agent_id))
-            print(f"revoked {agent_id!r} device server-side")
-        except Exception as exc:  # noqa: BLE001
-            revoke_failure_reason = f"{type(exc).__name__}: {exc}"
-            print(
-                f"warning: device revoke failed ({revoke_failure_reason}); "
-                "will leave a pending_revoke.json marker in the archived "
-                "dir — the daemon's next startup sweep will retry",
-                file=sys.stderr,
-            )
-
     archived_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = archived_dir() / f"{agent_id}-{stamp}"
-    # Retry briefly: aiosqlite WAL handles can take a moment to
-    # release after client.stop() returns on Windows.
+    # Move first so a Windows aiosqlite WAL-handle failure can't leave
+    # a revoked device sitting alongside a still-active agent dir.
     last_err: OSError | None = None
     for attempt in range(8):
         try:
@@ -1137,7 +1116,6 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
             last_err = exc
             time.sleep(0.5)
     if last_err is not None:
-        # Surface a clear error so the operator can clean up by hand.
         print(
             f"error: archive partially failed after retries: {last_err}\n"
             f"       source: {src}\n"
@@ -1146,22 +1124,43 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    if revoke_failure_reason is not None and cfg.puffo_core.is_configured():
+    # Revoke from the archived path. Best-effort: failure leaves a
+    # pending_revoke marker for the daemon's startup sweep.
+    from .import_agents import (
+        revoke_archived_device,
+        write_archived_pending_revoke,
+    )
+    if cfg.puffo_core.is_configured():
         try:
-            from ..crypto.keystore import KeyStore
-            identity = KeyStore(dest / "keys").load_identity(cfg.puffo_core.slug)
-            write_archived_pending_revoke(
-                dest,
-                server_url=identity.server_url,
-                slug=identity.slug,
-                device_id=identity.device_id,
-                last_error=revoke_failure_reason,
+            asyncio.run(
+                revoke_archived_device(dest, slug=cfg.puffo_core.slug)
             )
+            print(f"revoked {agent_id!r} device server-side")
         except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
             print(
-                f"warning: failed to write pending_revoke marker into {dest}: {exc}",
+                f"warning: device revoke failed ({reason}); pending marker "
+                "will be left for the daemon's next startup sweep",
                 file=sys.stderr,
             )
+            try:
+                from ..crypto.keystore import KeyStore
+                identity = KeyStore(dest / "keys").load_identity(
+                    cfg.puffo_core.slug
+                )
+                write_archived_pending_revoke(
+                    dest,
+                    server_url=identity.server_url,
+                    slug=identity.slug,
+                    device_id=identity.device_id,
+                    last_error=reason,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"warning: failed to write pending_revoke marker into "
+                    f"{dest}: {exc}",
+                    file=sys.stderr,
+                )
     print(f"archived {agent_id!r} → {dest}")
     return 0
 

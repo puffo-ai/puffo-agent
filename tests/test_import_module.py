@@ -409,6 +409,31 @@ async def test_revoke_agent_device_propagates_server_failure(mock_server):
         await imp.revoke_agent_device("alpha")
 
 
+async def test_revoke_archived_device_loads_keys_from_arbitrary_path(mock_server):
+    """The archive flow moves the dir first, then calls
+    ``revoke_archived_device`` on the moved path. Verify the helper
+    loads identity from the archived ``keys/`` subdir and POSTs revoke."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-ws-20260630-104747"
+    Path(agent_dir("alpha")).rename(dest)
+
+    await imp.revoke_archived_device(dest, slug=info["slug"])
+
+    revoke_posts = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert revoke_posts == [("POST", f"/devices/{info['old_device_id']}/revoke")]
+
+
 async def test_revoke_agent_device_reuses_fresh_session_subkey(mock_server):
     """A fresh ``<slug>.session.json`` already on disk (typically left by
     the lifecycle-heartbeat path running first) should be reused for

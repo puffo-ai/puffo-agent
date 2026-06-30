@@ -616,17 +616,15 @@ async def self_revoke_device(
         )
 
 
-async def revoke_agent_device(agent_id: str) -> None:
-    # Must run before the agent_dir gets moved — keys still in the
-    # active KeyStore path. Raises on failure.
-    from .state import AgentConfig
-
-    cfg = AgentConfig.load(agent_id)
-    pc = cfg.puffo_core
-    if not pc.is_configured():
-        return
-    keystore = KeyStore.for_agent(agent_id)
-    identity = keystore.load_identity(pc.slug)
+async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
+    # Operates on a keystore at any path (active OR archived). The
+    # archive/delete flow calls this AFTER the dir is moved, so a
+    # move failure can't leave a revoked device sitting alongside a
+    # still-active agent dir (the prior order — revoke-then-move —
+    # had no rollback path for Windows aiosqlite WAL-handle move
+    # failures).
+    keystore = KeyStore(archived_dir / "keys")
+    identity = keystore.load_identity(slug)
     root_signing = Ed25519KeyPair.from_secret_bytes(
         decode_secret(identity.root_secret_key)
     )
@@ -640,7 +638,7 @@ async def revoke_agent_device(agent_id: str) -> None:
     preregistered: tuple[Ed25519KeyPair, dict] | None = None
     try:
         from ..crypto.certs import needs_rotation
-        sess = keystore.load_session(pc.slug)
+        sess = keystore.load_session(slug)
         if not needs_rotation(sess.expires_at):
             preregistered = (
                 Ed25519KeyPair.from_secret_bytes(
@@ -658,6 +656,19 @@ async def revoke_agent_device(agent_id: str) -> None:
         root_signing_key=root_signing,
         preregistered_subkey=preregistered,
     )
+
+
+async def revoke_agent_device(agent_id: str) -> None:
+    # Thin shim retained for the existing test surface + any
+    # legacy active-path callers. Production archive/delete now
+    # calls ``revoke_archived_device`` directly after the move.
+    from .state import AgentConfig, agent_dir as _agent_dir
+
+    cfg = AgentConfig.load(agent_id)
+    pc = cfg.puffo_core
+    if not pc.is_configured():
+        return
+    await revoke_archived_device(_agent_dir(agent_id), slug=pc.slug)
 
 
 def archived_pending_revoke_path(archived_agent_dir: Path) -> Path:

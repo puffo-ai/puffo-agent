@@ -405,17 +405,19 @@ class Daemon:
         await asyncio.gather(*(self._stop_worker(i) for i in ids), return_exceptions=True)
 
     async def _archive_on_flag(self, agent_id: str) -> None:
-        """Stop the worker, revoke its device server-side, and move
-        its dir to ``archived/<id>-ws-<stamp>/``. Revoke is
-        best-effort — failure drops a pending marker in the archived
-        dir for the next startup sweep."""
+        """Stop worker → lifecycle heartbeat → move dir → revoke from
+        archived path. Move-before-revoke means a move failure (the
+        Windows aiosqlite WAL-handle case) leaves the agent in the
+        active path with no revoked device — daemon retries on the
+        next tick. Revoke failure drops a pending marker in the
+        archived dir for the next startup sweep."""
         logger.warning(
             "agent %s: archive.flag detected, stopping worker + archiving",
             agent_id,
         )
         await self._stop_worker(agent_id)
         from .import_agents import (
-            revoke_agent_device,
+            revoke_archived_device,
             write_archived_pending_revoke,
         )
         cfg_for_revoke = None
@@ -423,26 +425,13 @@ class Daemon:
             cfg_for_revoke = AgentConfig.load(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
-        # Lifecycle heartbeat first — must run BEFORE the revoke, otherwise
-        # the heartbeat's subkey signature lands on a just-revoked device
-        # and the server 401s it (chain validation failed).
+        # Heartbeat first while keystore is still in the active path
+        # AND while the device is still valid (revoke would 401 it).
         if cfg_for_revoke is not None:
             try:
                 await _report_lifecycle(cfg_for_revoke, "archived")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("agent %s: archived report failed: %s", agent_id, exc)
-        revoke_failure_reason: Optional[str] = None
-        if cfg_for_revoke is not None and cfg_for_revoke.puffo_core.is_configured():
-            try:
-                await revoke_agent_device(agent_id)
-                logger.info("agent %s: device revoked server-side", agent_id)
-            except Exception as exc:  # noqa: BLE001
-                revoke_failure_reason = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "agent %s: revoke failed (%s); pending marker will be "
-                    "left in the archived dir for retry",
-                    agent_id, revoke_failure_reason,
-                )
         src = agent_dir(agent_id)
         if not src.exists():
             return
@@ -450,17 +439,29 @@ class Daemon:
         archived_dir().mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         dest = archived_dir() / f"{agent_id}-ws-{stamp}"
-        try:
-            shutil.move(str(src), str(dest))
-            logger.info("agent %s: archived to %s", agent_id, dest)
-        except OSError as exc:
+        move_err = await _retry_move(src, dest)
+        if move_err is not None:
             logger.error(
-                "agent %s: archive failed: %s (flag still present — will retry next tick)",
-                agent_id, exc,
+                "agent %s: archive move failed after retries: %s "
+                "(flag still present — will retry next tick)",
+                agent_id, move_err,
             )
             return
-        if revoke_failure_reason is not None and cfg_for_revoke is not None:
-            pc = cfg_for_revoke.puffo_core
+        logger.info("agent %s: archived to %s", agent_id, dest)
+        if cfg_for_revoke is None or not cfg_for_revoke.puffo_core.is_configured():
+            return
+        pc = cfg_for_revoke.puffo_core
+        try:
+            await revoke_archived_device(dest, slug=pc.slug)
+            logger.info("agent %s: device revoked server-side", agent_id)
+            return
+        except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "agent %s: revoke failed (%s); pending marker will be "
+                "left in %s for the next startup sweep",
+                agent_id, reason, dest,
+            )
             try:
                 from ..crypto.keystore import KeyStore
                 identity = KeyStore(dest / "keys").load_identity(pc.slug)
@@ -469,7 +470,7 @@ class Daemon:
                     server_url=identity.server_url,
                     slug=identity.slug,
                     device_id=identity.device_id,
-                    last_error=revoke_failure_reason,
+                    last_error=reason,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -478,17 +479,18 @@ class Daemon:
                 )
 
     async def _delete_on_flag(self, agent_id: str) -> None:
-        """Stop the worker, revoke the agent's device server-side,
-        rmtree the dir. Revoke failure → downgrade to archive so the
-        next startup sweep can retry; otherwise we'd rmtree the keys
-        needed for retry and the device cert would stay valid forever."""
+        """Stop worker → move dir → revoke. Revoke success ⇒ rmtree
+        the moved dir. Revoke failure ⇒ keep it as an archive +
+        pending marker for the startup sweep (rmtree-ing would lose
+        the keys needed for retry). Move failure ⇒ daemon retries
+        next tick."""
         logger.warning(
             "agent %s: delete.flag detected, stopping worker + removing dir",
             agent_id,
         )
         await self._stop_worker(agent_id)
         from .import_agents import (
-            revoke_agent_device,
+            revoke_archived_device,
             write_archived_pending_revoke,
         )
         cfg_for_revoke = None
@@ -496,36 +498,42 @@ class Daemon:
             cfg_for_revoke = AgentConfig.load(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
-        revoke_failure_reason: Optional[str] = None
-        if cfg_for_revoke is not None and cfg_for_revoke.puffo_core.is_configured():
-            try:
-                await revoke_agent_device(agent_id)
-                logger.info("agent %s: device revoked server-side", agent_id)
-            except Exception as exc:  # noqa: BLE001
-                revoke_failure_reason = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "agent %s: revoke failed (%s); will downgrade delete to "
-                    "archive so the next sweep can retry",
-                    agent_id, revoke_failure_reason,
-                )
         src = agent_dir(agent_id)
         if not src.exists():
             return
         await _drain_codex_tmp(src)
-        if revoke_failure_reason is not None and cfg_for_revoke is not None:
-            archived_dir().mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            dest = archived_dir() / f"{agent_id}-del-{stamp}"
+        archived_dir().mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = archived_dir() / f"{agent_id}-del-{stamp}"
+        move_err = await _retry_move(src, dest)
+        if move_err is not None:
+            logger.error(
+                "agent %s: delete move failed after retries: %s "
+                "(flag still present — will retry next tick)",
+                agent_id, move_err,
+            )
+            return
+        if cfg_for_revoke is None or not cfg_for_revoke.puffo_core.is_configured():
             try:
-                shutil.move(str(src), str(dest))
+                shutil.rmtree(dest)
+                logger.info("agent %s: deleted", agent_id)
             except OSError as exc:
-                logger.error(
-                    "agent %s: delete-downgrade-to-archive move failed: %s "
-                    "(flag still present — will retry next tick)",
-                    agent_id, exc,
+                logger.warning(
+                    "agent %s: delete rmtree failed: %s (leftover at %s)",
+                    agent_id, exc, dest,
                 )
-                return
-            pc = cfg_for_revoke.puffo_core
+            return
+        pc = cfg_for_revoke.puffo_core
+        try:
+            await revoke_archived_device(dest, slug=pc.slug)
+            logger.info("agent %s: device revoked server-side", agent_id)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "agent %s: revoke failed (%s); keeping as archive + "
+                "pending marker for the next sweep",
+                agent_id, reason,
+            )
             try:
                 from ..crypto.keystore import KeyStore
                 identity = KeyStore(dest / "keys").load_identity(pc.slug)
@@ -534,7 +542,7 @@ class Daemon:
                     server_url=identity.server_url,
                     slug=identity.slug,
                     device_id=identity.device_id,
-                    last_error=revoke_failure_reason,
+                    last_error=reason,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -543,12 +551,13 @@ class Daemon:
                 )
             return
         try:
-            shutil.rmtree(src)
+            shutil.rmtree(dest)
             logger.info("agent %s: deleted", agent_id)
         except OSError as exc:
-            logger.error(
-                "agent %s: delete failed: %s (flag still present — will retry next tick)",
-                agent_id, exc,
+            logger.warning(
+                "agent %s: delete rmtree failed after revoke: %s "
+                "(leftover at %s)",
+                agent_id, exc, dest,
             )
 
 
@@ -595,6 +604,22 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
         return False
     finally:
         await http.close()
+
+
+async def _retry_move(src: Path, dest: Path) -> OSError | None:
+    # Mirrors CLI cmd_agent_archive's 8 x 0.5s retry — aiosqlite WAL /
+    # SHM handles can take a moment to release on Windows after
+    # stop_worker, and shutil.move's copy-then-delete fallback would
+    # otherwise leave a half-moved tree in both paths.
+    last_err: OSError | None = None
+    for _ in range(8):
+        try:
+            shutil.move(str(src), str(dest))
+            return None
+        except (OSError, PermissionError) as exc:
+            last_err = exc
+            await asyncio.sleep(0.5)
+    return last_err
 
 
 async def _drain_codex_tmp(src: Path) -> None:
