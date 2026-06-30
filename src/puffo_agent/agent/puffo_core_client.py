@@ -451,6 +451,7 @@ class PuffoCoreMessageClient:
         message_store: MessageStore,
         operator_slug: str = "",
         auto_accept_space_invitations: bool = False,
+        auto_accept_dm: bool = True,
         workspace: str = "",
         max_inline_chars: int = 4000,
         segment_chars: int = 2000,
@@ -466,6 +467,7 @@ class PuffoCoreMessageClient:
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
         self.auto_accept_space_invitations = bool(auto_accept_space_invitations)
+        self.auto_accept_dm = bool(auto_accept_dm)
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
         self.workspace = workspace
@@ -525,6 +527,18 @@ class PuffoCoreMessageClient:
         # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
+        # Foreign-sender DM approval gate (auto_accept_dm=False path).
+        # Keyed by the operator-facing prompt DM's envelope_id so an
+        # in-thread y/n from the operator routes back to the buffered
+        # message. Survives daemon restart via disk persistence.
+        from .dm_approvals import load_pending_dm_approvals
+        self._pending_dm_approvals: dict[str, dict[str, Any]] = (
+            load_pending_dm_approvals(self.slug)
+        )
+        # Senders the operator has already allowlisted in this session.
+        # Server-side allowlist is the source of truth; this is a hot-path
+        # cache to skip the per-DM /allowlists check.
+        self._dm_allowlisted_senders: set[str] = set()
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
@@ -731,6 +745,13 @@ class PuffoCoreMessageClient:
                 ):
                     self._last_dm_sender = payload.sender_slug
                     return
+                # auto_accept_dm=False foreign-sender approval reply.
+                if await self._maybe_handle_dm_approval_reply(
+                    thread_root_id=payload_thread_root_id or "",
+                    text=text_raw,
+                ):
+                    self._last_dm_sender = payload.sender_slug
+                    return
 
             channel_id = payload.channel_id or ""
             is_dm = payload.envelope_kind == "dm"
@@ -749,6 +770,26 @@ class PuffoCoreMessageClient:
                     )
             else:
                 raw_text = str(payload.content) if payload.content else ""
+
+            # auto_accept_dm=False foreign-DM gate. Buffer + DM operator
+            # for approval before the LLM sees the message. Allowlisted
+            # senders bypass — server allowlist is the source of truth.
+            if (
+                is_dm
+                and not self.auto_accept_dm
+                and self._is_foreign_dm_sender(payload.sender_slug)
+                and payload.sender_slug not in self._dm_allowlisted_senders
+            ):
+                gated = await self._maybe_gate_foreign_dm(
+                    sender_slug=payload.sender_slug,
+                    text=raw_text,
+                    envelope_id=payload.envelope_id,
+                    sent_at=payload.sent_at,
+                    thread_root_id=payload_thread_root_id or "",
+                    attachment_paths=attachment_paths,
+                )
+                if gated:
+                    return
 
             # Stash the sender so `send_fallback_message("")` can route replies.
             # Always overwrite — first-write would pin replies to a
@@ -3176,6 +3217,217 @@ class PuffoCoreMessageClient:
                 "failed to confirm leave-reply outcome to operator",
             )
         return True
+
+    # ─── auto_accept_dm gate ──────────────────────────────────────
+
+    def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
+        # Operator is always trusted; self can't sender-DM itself (already
+        # short-circuited upstream). Anyone else is "foreign" for v1 —
+        # this conservatively gates same-operator agents too. A future
+        # extension can lookup sender.operator_slug via /identities/profiles
+        # to bypass for co-owned agents.
+        if not sender_slug:
+            return False
+        if sender_slug == self.operator_slug:
+            return False
+        if sender_slug == self.slug:
+            return False
+        return True
+
+    async def _maybe_gate_foreign_dm(
+        self,
+        *,
+        sender_slug: str,
+        text: str,
+        envelope_id: str,
+        sent_at: int,
+        thread_root_id: str,
+        attachment_paths: list[str],
+    ) -> bool:
+        """Foreign DM with ``auto_accept_dm=False``: buffer + prompt
+        operator. Returns True when intercepted (caller skips dispatch).
+
+        Drops a second DM from the same sender while the first is still
+        pending operator review (one prompt per sender at a time).
+        """
+        for entry in self._pending_dm_approvals.values():
+            if entry.get("sender_slug") == sender_slug:
+                self._log.info(
+                    "auto_accept_dm: dropping additional DM from %s "
+                    "while prior approval is pending",
+                    sender_slug,
+                )
+                return True
+        if not self.operator_slug:
+            self._log.warning(
+                "auto_accept_dm=False but no operator_slug configured; "
+                "delivering DM from %s without approval",
+                sender_slug,
+            )
+            return False
+        sender_display, _ = await self._fetch_user_profile(sender_slug)
+        label = sender_display or sender_slug
+        preview = text if len(text) <= 280 else text[:277] + "…"
+        prompt = (
+            f"**{label}** ({sender_slug}) is DM-ing me. Reply `y` in "
+            f"this thread to allow (server allowlist + deliver), or "
+            f"`n` to block (server blocklist + drop).\n\n"
+            f"> {preview}"
+        )
+        try:
+            envelope = await self._send_dm(self.operator_slug, prompt, root_id="")
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to send approval prompt for %s: %s; "
+                "delivering DM without approval",
+                sender_slug, exc,
+            )
+            return False
+        prompt_env_id = envelope.get("envelope_id", "") if envelope else ""
+        if not prompt_env_id:
+            self._log.warning(
+                "auto_accept_dm: approval prompt for %s got no envelope_id; "
+                "delivering DM without approval",
+                sender_slug,
+            )
+            return False
+        self._pending_dm_approvals[prompt_env_id] = {
+            "sender_slug": sender_slug,
+            "sender_display_name": sender_display,
+            "buffered_text": text,
+            "buffered_envelope_id": envelope_id,
+            "buffered_sent_at": int(sent_at),
+            "buffered_root_id": thread_root_id,
+            "buffered_attachment_paths": list(attachment_paths or []),
+        }
+        from .dm_approvals import save_pending_dm_approvals
+        try:
+            save_pending_dm_approvals(self.slug, self._pending_dm_approvals)
+        except OSError as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to persist pending state: %s", exc,
+            )
+        self._log.info(
+            "auto_accept_dm: buffered DM from %s (envelope=%s) pending "
+            "operator approval in thread %s",
+            sender_slug, envelope_id, prompt_env_id,
+        )
+        return True
+
+    async def _maybe_handle_dm_approval_reply(
+        self, *, thread_root_id: str, text: str,
+    ) -> bool:
+        meta = self._pending_dm_approvals.get(thread_root_id)
+        if meta is None:
+            return False
+        normalized = text.strip().lower()
+        if normalized in ("y", "yes"):
+            approved = True
+        elif normalized in ("n", "no"):
+            approved = False
+        else:
+            return False
+
+        sender_slug = meta.get("sender_slug", "")
+        sender_label = meta.get("sender_display_name") or sender_slug
+        try:
+            if approved:
+                await self.http.post(
+                    "/allowlists", {"slugs": [sender_slug]},
+                )
+                self._dm_allowlisted_senders.add(sender_slug)
+                await self._deliver_approved_dm(meta)
+                confirm = (
+                    f"Allowed DMs from **{sender_label}** ({sender_slug}). ✓"
+                )
+            else:
+                await self.http.post(
+                    "/blocklists", {"target": "user", "id": sender_slug},
+                )
+                confirm = (
+                    f"Blocked **{sender_label}** ({sender_slug}). "
+                    "Server will drop future messages from this sender."
+                )
+        except Exception as exc:
+            self._log.exception(
+                "auto_accept_dm: %s reply for %s failed",
+                "approve" if approved else "block", sender_slug,
+            )
+            confirm = (
+                f"{'Approval' if approved else 'Block'} for "
+                f"**{sender_label}** failed: {exc}. The pending entry is "
+                "kept; reply again once the server is reachable."
+            )
+            try:
+                await self._send_dm(
+                    self.operator_slug, confirm, root_id=thread_root_id,
+                )
+            except Exception:
+                self._log.exception(
+                    "auto_accept_dm: failed to send error confirmation",
+                )
+            return True
+
+        self._pending_dm_approvals.pop(thread_root_id, None)
+        from .dm_approvals import save_pending_dm_approvals
+        try:
+            save_pending_dm_approvals(self.slug, self._pending_dm_approvals)
+        except OSError as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to persist pending state: %s", exc,
+            )
+        try:
+            await self._send_dm(
+                self.operator_slug, confirm, root_id=thread_root_id,
+            )
+        except Exception:
+            self._log.exception(
+                "auto_accept_dm: failed to confirm outcome to operator",
+            )
+        return True
+
+    async def _deliver_approved_dm(self, meta: dict) -> None:
+        sender_slug = meta.get("sender_slug", "")
+        text = meta.get("buffered_text", "")
+        envelope_id = meta.get("buffered_envelope_id", "") or (
+            f"approved_{int(time.time() * 1000)}"
+        )
+        sent_at = int(meta.get("buffered_sent_at", 0)) or int(time.time())
+        sender_display = (
+            meta.get("sender_display_name", "") or sender_slug
+        )
+        msg_dict = {
+            "channel_id": "",
+            "channel_name": "Direct message",
+            "space_id": "",
+            "space_name": "",
+            "sender_slug": sender_slug,
+            "sender_display_name": sender_display,
+            "sender_email": "",
+            "text": text,
+            "root_id": meta.get("buffered_root_id", "") or "",
+            "is_dm": True,
+            "attachments": list(meta.get("buffered_attachment_paths") or []),
+            "sender_is_bot": False,
+            "mentions": [],
+            "envelope_id": envelope_id,
+            "sent_at": sent_at,
+            "is_visible_to_human": True,
+        }
+        channel_meta = {
+            "channel_id": "",
+            "channel_name": "Direct message",
+            "space_id": "",
+            "space_name": "",
+            "is_dm": True,
+        }
+        self._last_dm_sender = sender_slug
+        await self._admit_thread_message(
+            root_id=envelope_id,
+            priority=_compute_priority(direct=True, sender_is_bot=False),
+            msg_dict=msg_dict,
+            channel_meta=channel_meta,
+        )
 
     @staticmethod
     def _leave_target_label(meta: dict) -> str:

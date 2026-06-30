@@ -1294,3 +1294,43 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             reason=reason,
         )
 
+    @mcp.tool()
+    async def add_dm_allowlist(slug: str) -> str:
+        """Mark a user as DM-allowed for your operator. Future DMs from
+        this sender skip the ``auto_accept_dm`` approval prompt and
+        deliver directly. Idempotent: re-allowlisting an entry is a
+        no-op. Operator-scoped on the server — all of the operator's
+        agents share one allowlist.
+
+        slug: peer to allow (e.g. ``alice-1234``).
+        """
+        target = (slug or "").strip()
+        if not target:
+            raise RuntimeError("slug is required")
+        await cfg.http_client.post("/allowlists", {"slugs": [target]})
+        return f"allowlisted {target}"
+
+    @mcp.tool()
+    async def update_dm_blocklist(slug: str, on: bool) -> str:
+        """Block (``on=True``) or unblock (``on=False``) a sender for
+        your operator. Server-enforced — blocked senders' messages are
+        silently dropped at the server, so the agent never sees them.
+        Operator-scoped: all of the operator's agents share one
+        blocklist.
+
+        slug: peer to (un)block (e.g. ``alice-1234``).
+        on: ``True`` adds to blocklist, ``False`` removes.
+        """
+        target = (slug or "").strip()
+        if not target:
+            raise RuntimeError("slug is required")
+        if on:
+            await cfg.http_client.post(
+                "/blocklists", {"target": "user", "id": target},
+            )
+            return f"blocked {target}"
+        await cfg.http_client.delete(
+            "/blocklists", body={"id": target},
+        )
+        return f"unblocked {target}"
+

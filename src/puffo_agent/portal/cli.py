@@ -1004,6 +1004,25 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_dm_accept(args: argparse.Namespace) -> int:
+    agent_id = args.id
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return 2
+    cfg = AgentConfig.load(agent_id)
+    desired = args.mode == "on"
+    if cfg.puffo_core.auto_accept_dm == desired:
+        print(f"{agent_id!r} auto_accept_dm already {args.mode}")
+        return 0
+    cfg.puffo_core.auto_accept_dm = desired
+    cfg.save()
+    if cfg.state == "running":
+        from ..profile_sync import write_reload_flag
+        write_reload_flag(cfg, reason=f"cli dm-accept {args.mode}")
+    print(f"{agent_id!r} auto_accept_dm set to {args.mode}")
+    return 0
+
+
 def cmd_agent_archive(args: argparse.Namespace) -> int:
     agent_id = args.id
     src = agent_dir(agent_id)
@@ -1635,6 +1654,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-accept channel invites from the space owner",
     )
     autoaccept.set_defaults(func=cmd_agent_autoaccept)
+
+    dm_accept = agent_sub.add_parser(
+        "dm-accept",
+        help=(
+            "Toggle auto-accept-DM. When off, DMs from anyone other "
+            "than the operator are buffered and the operator is "
+            "prompted (per-sender threaded y/n DM) before the agent "
+            "sees the message."
+        ),
+    )
+    dm_accept.add_argument("id")
+    dm_accept.add_argument(
+        "mode", choices=["on", "off"],
+        help="on = legacy behavior (deliver all DMs); off = prompt operator",
+    )
+    dm_accept.set_defaults(func=cmd_agent_dm_accept)
 
     archive = agent_sub.add_parser("archive", help="Stop and archive an agent to ~/.puffo-agent/archived/")
     archive.add_argument("id")
