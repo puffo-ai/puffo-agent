@@ -28,37 +28,6 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-class PendingApprovals:
-    """Bridges the create flow's ``await_approval`` to the inbound
-    ``agent_create_approved`` command: the flow waits on a request_id, the
-    command handler resolves it. Daemon-wide singleton (one control loop)."""
-
-    def __init__(self) -> None:
-        self._waiters: dict[str, asyncio.Future] = {}
-
-    async def wait(self, request_id: str, timeout: float) -> dict:
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._waiters[request_id] = fut
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        finally:
-            self._waiters.pop(request_id, None)
-
-    def resolve(self, request_id: str, result: dict) -> bool:
-        fut = self._waiters.get(request_id)
-        if fut is not None and not fut.done():
-            fut.set_result(result)
-            return True
-        return False
-
-
-_PENDING = PendingApprovals()
-
-
-def get_pending_approvals() -> PendingApprovals:
-    return _PENDING
-
-
 def _self_sign(cert: dict, root: Ed25519KeyPair, field: str) -> dict:
     """Fill ``cert[field]`` with the agent root's signature over the
     canonical (signature-stripped) cert."""
@@ -144,53 +113,111 @@ _DEFAULT_WS_LOCAL_PROFILE = "# {name}\n\nA ws-local agent driven by an attached 
 
 # async (slug_binding, pending_token) -> None; raises on failure.
 FinalizeFn = Callable[[dict, str], Awaitable[None]]
-# async (operator_slug, payload) -> None — sends the request machine_message.
-SendRequestFn = Callable[[str, dict], Awaitable[None]]
-# async (request_id) -> {agent_slug, pending_token} — resolves on the approval command.
-AwaitApprovalFn = Callable[[str], Awaitable[dict]]
 
 
-async def create_ws_local_agent(
-    operator_slug: str,
-    passcode: str,
-    *,
-    send_request_fn: SendRequestFn,
-    await_approval_fn: AwaitApprovalFn,
-    finalize_fn: FinalizeFn,
-    display_name: str = "",
+@dataclass
+class _PendingCreate:
+    identity: AgentIdentity
+    operator_slug: str
+    server_url: str
+    passcode: str
+
+
+class CreateRegistry:
+    """request_id-keyed pending creates + command_id-keyed results. A
+    machine-initiated create returns immediately with a request_id; the
+    operator's later approval command (command_id == request_id) finalizes it,
+    and ``wait_result`` lets a caller block on completion."""
+
+    def __init__(self) -> None:
+        self._pending: dict[str, _PendingCreate] = {}
+        self._results: dict[str, dict] = {}
+        self._waiters: dict[str, list[asyncio.Future]] = {}
+
+    def put_pending(self, request_id: str, pc: _PendingCreate) -> None:
+        self._pending[request_id] = pc
+
+    def pop_pending(self, request_id: str) -> "_PendingCreate | None":
+        return self._pending.pop(request_id, None)
+
+    def record_result(self, command_id: str, result: dict) -> None:
+        self._results[command_id] = result
+        for fut in self._waiters.pop(command_id, []):
+            if not fut.done():
+                fut.set_result(result)
+
+    def peek_result(self, command_id: str) -> "dict | None":
+        return self._results.get(command_id)
+
+    async def wait_result(self, command_id: str, timeout: float) -> dict:
+        existing = self._results.get(command_id)
+        if existing is not None:
+            return existing
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._waiters.setdefault(command_id, []).append(fut)
+        return await asyncio.wait_for(fut, timeout)
+
+
+_REGISTRY = CreateRegistry()
+
+
+def get_registry() -> CreateRegistry:
+    return _REGISTRY
+
+
+async def start_create(
+    operator_slug: str, passcode: str, *, username: str = "", message: str = ""
 ) -> dict:
-    """Full daemon-side flow: validate the operator is linked, mint the agent
-    identity, request the operator's approval over the reverse channel, then
-    register + write + pack on approval. All I/O is injected for testability."""
+    """Mint the agent identity, stash it under a fresh request_id, send the
+    operator the approval request, and return immediately (non-blocking). The
+    operator's approval command (command_id == request_id) finalizes it.
+    ``message`` is free text the requesting agent shows the operator for context."""
+    from .reporter import get_reporter
     from .store import get_pairing
 
     pairing = get_pairing(operator_slug)
     if pairing is None:
         raise ValueError(f"operator {operator_slug!r} is not linked to this machine")
-
     ident = gen_agent_identity(pairing.operator_root_pubkey)
     request_id = f"acr_{uuid.uuid4().hex}"
-    await send_request_fn(
+    get_registry().put_pending(
+        request_id, _PendingCreate(ident, operator_slug, pairing.server_url, passcode)
+    )
+    await get_reporter().send_to_operator(
         operator_slug,
         {
             "type": "agent.create_request",
             "request_id": request_id,
-            "username": display_name or "agent",
+            "username": username or "agent",
+            "message": message,
             "identity_cert": ident.identity_cert,
             "device_cert": ident.device_cert,
             "agent_root_public_key": ident.root_public_key,
         },
     )
-    approval = await await_approval_fn(request_id)
+    return {"request_id": request_id, "agent_root_public_key": ident.root_public_key}
+
+
+async def finalize_from_command(request_id: str, params: dict) -> dict:
+    """Run on the operator's approval command (command_id == request_id): pull the
+    stashed identity, finalize against the server, write + pack. ``params`` carry
+    the operator-chosen profile + the server-minted slug + pending_token."""
+    pc = get_registry().pop_pending(request_id)
+    if pc is None:
+        raise ValueError(f"no pending create for request {request_id!r}")
+
+    async def _finalize(binding: dict, pending_token: str) -> None:
+        await post_slug_binding(pc.server_url, binding, pending_token)
+
     return await finalize_and_pack(
-        ident,
-        slug=str(approval["agent_slug"]),
-        pending_token=str(approval["pending_token"]),
-        operator_slug=operator_slug,
-        server_url=pairing.server_url,
-        passcode=passcode,
-        finalize_fn=finalize_fn,
-        display_name=display_name,
+        pc.identity,
+        slug=str(params["agent_slug"]),
+        pending_token=str(params["pending_token"]),
+        operator_slug=pc.operator_slug,
+        server_url=pc.server_url,
+        passcode=pc.passcode,
+        finalize_fn=_finalize,
+        profile=params,
     )
 
 
@@ -204,13 +231,20 @@ async def finalize_and_pack(
     passcode: str,
     finalize_fn: FinalizeFn,
     display_name: str = "",
+    profile: dict | None = None,
 ) -> dict:
     """After the operator approves and the server mints ``slug`` + ``pending_token``:
     sign + register the slug_binding, write the ws-local agent.yml + keystore, and
-    pack the ``.puffoagent`` bundle. Returns the stdout result for the caller."""
+    pack the ``.puffoagent`` bundle. ``profile`` carries the operator-chosen
+    name / avatar / role / soul / space_id from the approval. Returns the stdout
+    result for the caller."""
     from ...crypto.keystore import KeyStore, StoredIdentity
     from ..export import pack
     from ..state import AgentConfig, PuffoCoreConfig, RuntimeConfig, agent_dir
+
+    profile = profile or {}
+    name = str(profile.get("name") or display_name or slug)
+    soul = str(profile.get("soul") or "")
 
     agent_id = slug
     binding = build_slug_binding(ident.root_keypair, slug)
@@ -220,7 +254,7 @@ async def finalize_and_pack(
     target.mkdir(parents=True, exist_ok=True)
     (target / "memory").mkdir(exist_ok=True)
     (target / "profile.md").write_text(
-        _DEFAULT_WS_LOCAL_PROFILE.format(name=display_name or slug), encoding="utf-8"
+        soul or _DEFAULT_WS_LOCAL_PROFILE.format(name=name), encoding="utf-8"
     )
 
     KeyStore.for_agent(agent_id).save_identity(
@@ -238,9 +272,15 @@ async def finalize_and_pack(
 
     AgentConfig(
         id=agent_id,
-        display_name=display_name or slug,
+        display_name=name,
+        avatar_url=str(profile.get("avatar") or ""),
+        role=str(profile.get("role") or ""),
         puffo_core=PuffoCoreConfig(
-            server_url=server_url, slug=slug, device_id=ident.device_id, operator_slug=operator_slug
+            server_url=server_url,
+            slug=slug,
+            device_id=ident.device_id,
+            operator_slug=operator_slug,
+            space_id=str(profile.get("space_id") or ""),
         ),
         runtime=RuntimeConfig(kind="ws-local"),
         created_at=int(time.time()),
@@ -269,39 +309,6 @@ async def post_slug_binding(server_url: str, slug_binding: dict, pending_token: 
             if resp.status >= 400:
                 text = await resp.text()
                 raise RuntimeError(f"slug_binding finalize HTTP {resp.status}: {text[:200]}")
-
-
-async def run_create(
-    operator_slug: str, passcode: str, *, display_name: str = "", timeout: float = 300.0
-) -> dict:
-    """Daemon-internal entry point: wire the live reverse-channel impls (reporter
-    send, pending-approval wait, slug_binding finalize) and run the full flow."""
-    from .reporter import get_reporter
-    from .store import get_pairing
-
-    pairing = get_pairing(operator_slug)
-    if pairing is None:
-        raise ValueError(f"operator {operator_slug!r} is not linked to this machine")
-    reporter = get_reporter()
-    pending = get_pending_approvals()
-
-    async def _send(op_slug: str, payload: dict) -> None:
-        await reporter.send_to_operator(op_slug, payload)
-
-    async def _await(request_id: str) -> dict:
-        return await pending.wait(request_id, timeout)
-
-    async def _finalize(slug_binding: dict, pending_token: str) -> None:
-        await post_slug_binding(pairing.server_url, slug_binding, pending_token)
-
-    return await create_ws_local_agent(
-        operator_slug,
-        passcode,
-        send_request_fn=_send,
-        await_approval_fn=_await,
-        finalize_fn=_finalize,
-        display_name=display_name,
-    )
 
 
 def build_slug_binding(root: Ed25519KeyPair, slug: str) -> dict:

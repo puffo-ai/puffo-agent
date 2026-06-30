@@ -541,32 +541,64 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bridge_wait_until_command(base: str, command_id: str, timeout: float) -> int:
+    """GET the bridge's wait-until-command and print its result JSON to stdout."""
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = (
+        f"{base}/v1/machine/wait-until-command?"
+        f"id={urllib.parse.quote(command_id)}&timeout={int(timeout)}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=timeout + 10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 504:
+            print(f"pending: operator hasn't approved yet ({detail})", file=sys.stderr)
+        else:
+            print(f"error: wait failed (HTTP {exc.code}): {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach the daemon bridge ({exc.reason})", file=sys.stderr)
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
 def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
-    """Create a ws-local agent via operator approval (the machine requests it,
-    the operator Approves in the app), then print the result JSON to stdout so
-    the calling agent can attach. Requires the daemon running with the bridge."""
+    """Request a ws-local agent via operator approval. Non-blocking: prints the
+    ``request_id`` and returns. Poll completion with
+    ``machine wait-until-command --id <request_id>`` (or pass ``--wait`` to block
+    here). Requires the daemon running with the bridge."""
     import json
     import urllib.error
     import urllib.request
 
+    base = args.bridge_url.rstrip("/")
     body = json.dumps(
         {
             "operator": args.operator,
             "passcode": args.passcode,
             "display_name": getattr(args, "display_name", "") or "",
+            "message": getattr(args, "message", "") or "",
         }
     ).encode("utf-8")
-    url = f"{args.bridge_url.rstrip('/')}/v1/agents/create-ws-local"
     req = urllib.request.Request(
-        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        f"{base}/v1/agents/create-ws-local",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
     )
     try:
-        # Generous timeout — the call blocks on the operator's Approve.
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            started = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        print(f"error: create failed (HTTP {exc.code}): {detail}", file=sys.stderr)
+        print(f"error: request failed (HTTP {exc.code}): {detail}", file=sys.stderr)
         return 1
     except urllib.error.URLError as exc:
         print(
@@ -575,8 +607,16 @@ def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print(json.dumps(result))
-    return 0
+
+    if not getattr(args, "wait", False):
+        print(json.dumps(started))
+        return 0
+    return _bridge_wait_until_command(base, str(started.get("request_id") or ""), args.wait_timeout)
+
+
+def cmd_machine_wait_until_command(args: argparse.Namespace) -> int:
+    """Block until the command with ``--id`` has been processed, print its result."""
+    return _bridge_wait_until_command(args.bridge_url.rstrip("/"), args.id, args.timeout)
 
 
 def cmd_agent_list(args: argparse.Namespace) -> int:
@@ -1532,7 +1572,20 @@ def build_parser() -> argparse.ArgumentParser:
     create_wsl.add_argument(
         "--passcode", required=True, help="Passcode for the .puffoagent bundle + ws-local attach"
     )
-    create_wsl.add_argument("--display-name", default="", help="Friendly name for the new agent")
+    create_wsl.add_argument("--display-name", default="", help="Suggested name for the new agent")
+    create_wsl.add_argument(
+        "--message",
+        default="",
+        help="Free-text note shown to the operator for context (why this agent is needed).",
+    )
+    create_wsl.add_argument(
+        "--wait",
+        action="store_true",
+        help="Block until the operator approves and print the final result (slug/bundle/passcode).",
+    )
+    create_wsl.add_argument(
+        "--wait-timeout", type=float, default=600.0, help="Seconds to wait with --wait (default 600)."
+    )
     create_wsl.add_argument(
         "--bridge-url",
         default="http://127.0.0.1:63387",
@@ -1809,6 +1862,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only unlink the pairing on this server URL (default: match by operator).",
     )
     machine_unlink.set_defaults(func=cmd_unlink)
+
+    machine_wait = machine_sub.add_parser(
+        "wait-until-command",
+        help="Block until a machine command (by id) is processed; print its result.",
+    )
+    machine_wait.add_argument("--id", required=True, help="Command id to wait for (e.g. a create request_id).")
+    machine_wait.add_argument(
+        "--timeout", type=float, default=600.0, help="Seconds to wait (default 600)."
+    )
+    machine_wait.add_argument(
+        "--bridge-url",
+        default="http://127.0.0.1:63387",
+        help="Bridge HTTP base URL (default: %(default)s).",
+    )
+    machine_wait.set_defaults(func=cmd_machine_wait_until_command)
 
     api = sub.add_parser(
         "api",

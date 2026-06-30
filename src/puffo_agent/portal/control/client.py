@@ -101,6 +101,7 @@ async def execute_command(
     *,
     server_url: str | None = None,
     paired_root_pubkey: str | None = None,
+    command_id: str | None = None,
 ) -> dict:
     """Apply a decrypted command to local agent state, the same way the local
     bridge handlers do (flip ``agent.yml`` state, drop sentinel flags) so the
@@ -189,15 +190,13 @@ async def execute_command(
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
     if op == "agent_create_approved":
-        # The operator approved a machine-initiated ws-local create — hand the
-        # server-minted slug + pending_token to the waiting create flow.
-        from .agent_create import get_pending_approvals
+        # The operator approved a machine-initiated ws-local create. command_id ==
+        # request_id ties this command to the stashed identity; finalize + pack.
+        from .agent_create import finalize_from_command
 
-        resolved = get_pending_approvals().resolve(
-            str(params.get("request_id") or ""),
-            {"agent_slug": params.get("agent_slug"), "pending_token": params.get("pending_token")},
-        )
-        return {"ok": resolved, "error": None if resolved else "no pending create request"}
+        request_id = command_id or str(params.get("request_id") or "")
+        result = await finalize_from_command(request_id, params)
+        return {"ok": True, **result}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
@@ -372,17 +371,27 @@ class MachineControlClient:
                 decrypted["params"],
                 server_url=pairing.server_url,
                 paired_root_pubkey=pairing.operator_root_pubkey,
+                command_id=command_id,
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
+            # Publish the result so `wait-until-command --id <command_id>` returns.
+            if command_id and isinstance(result, dict):
+                from .agent_create import get_registry
+
+                get_registry().record_result(command_id, result)
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
+            if command_id:
+                from .agent_create import get_registry
+
+                get_registry().record_result(command_id, {"ok": False, "error": str(exc)})
 
         if command_id:
             try:

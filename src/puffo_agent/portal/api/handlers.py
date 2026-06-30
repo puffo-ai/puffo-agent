@@ -1909,9 +1909,10 @@ async def agent_revoke_pending(request: web.Request) -> web.Response:
 
 
 async def create_ws_local_agent(request: web.Request) -> web.Response:
-    """Bridge entry for ``puffo-agent agent create ws-local``: run the
-    machine-initiated, operator-approved create flow and return the result
-    (agent_slug, bundle_path, passcode) so the caller can attach."""
+    """Bridge entry for ``puffo-agent agent create-ws-local``: send the operator
+    the approval request and return immediately with the ``request_id`` (the flow
+    is non-blocking — the operator approves whenever). Poll completion with
+    ``wait-until-command --id <request_id>``."""
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -1922,14 +1923,39 @@ async def create_ws_local_agent(request: web.Request) -> web.Response:
         return web.json_response({"error": "operator required"}, status=400)
     if not isinstance(passcode, str) or not passcode:
         return web.json_response({"error": "passcode required"}, status=400)
-    from ..control.agent_create import run_create
+    from ..control.agent_create import start_create
 
     try:
-        result = await run_create(
-            operator, passcode, display_name=str(body.get("display_name") or "")
+        result = await start_create(
+            operator,
+            passcode,
+            username=str(body.get("display_name") or ""),
+            message=str(body.get("message") or ""),
         )
     except ValueError as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:  # noqa: BLE001
         return web.json_response({"error": str(exc)}, status=502)
-    return web.json_response(result, status=201)
+    return web.json_response(result, status=202)
+
+
+async def wait_until_command(request: web.Request) -> web.Response:
+    """Bridge entry for ``puffo-agent machine wait-until-command --id X``: block
+    until the command with id X has been processed, return its result. For a
+    ws-local create this is the operator's approval → {agent_slug, bundle_path,
+    passcode}."""
+    command_id = request.query.get("id", "")
+    if not command_id:
+        return web.json_response({"error": "id required"}, status=400)
+    try:
+        timeout = float(request.query.get("timeout", "600"))
+    except ValueError:
+        timeout = 600.0
+    from ..control.agent_create import get_registry
+
+    try:
+        result = await get_registry().wait_result(command_id, timeout)
+    except (TimeoutError, asyncio.TimeoutError):
+        return web.json_response({"error": "timeout", "pending": True}, status=504)
+    status = 200 if result.get("ok", True) else 502
+    return web.json_response(result, status=status)

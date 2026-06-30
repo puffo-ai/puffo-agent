@@ -29,7 +29,13 @@ logger = logging.getLogger(__name__)
 # handshake.
 # create-ws-local is a bootstrap call from a not-yet-provisioned agent (no
 # bridge credentials yet); the operator's Approve is the real security gate.
-PUBLIC_PATHS = {"/v1/info", "/v1/providers", "/v1/ws-local", "/v1/agents/create-ws-local"}
+PUBLIC_PATHS = {
+    "/v1/info",
+    "/v1/providers",
+    "/v1/ws-local",
+    "/v1/agents/create-ws-local",
+    "/v1/machine/wait-until-command",
+}
 PAIR_PATH = "/v1/pair"
 
 

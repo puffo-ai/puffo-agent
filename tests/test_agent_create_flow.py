@@ -1,4 +1,5 @@
-"""create_ws_local_agent ties validate → mint → request → approval → finalize."""
+"""Non-blocking create: start_create stashes + sends; finalize_from_command
+finalizes on the approval command; CreateRegistry bridges request → result."""
 
 import asyncio
 
@@ -6,98 +7,111 @@ import pytest
 
 from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.primitives import Ed25519KeyPair
+from puffo_agent.portal.control import agent_create
+from puffo_agent.portal.control import reporter as reporter_mod
 from puffo_agent.portal.control import store as store_mod
-from puffo_agent.portal.control.agent_create import create_ws_local_agent
+
+OPERATOR_ROOT = base64url_encode(Ed25519KeyPair.generate().public_key_bytes())
 
 
-def test_create_ws_local_agent_flow(tmp_path, monkeypatch):
+class _FakePairing:
+    operator_root_pubkey = OPERATOR_ROOT
+    server_url = "https://chat.puffo.ai/relay"
+
+
+def test_start_create_stashes_and_sends(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    operator_root = base64url_encode(Ed25519KeyPair.generate().public_key_bytes())
-
-    class FakePairing:
-        operator_root_pubkey = operator_root
-        server_url = "https://chat.puffo.ai/relay"
-
     monkeypatch.setattr(
-        store_mod, "get_pairing", lambda slug: FakePairing() if slug == "op-99" else None
+        store_mod, "get_pairing", lambda slug: _FakePairing() if slug == "op-99" else None
     )
 
     sent: dict = {}
 
-    async def send_request(op_slug, payload):
-        sent["op_slug"] = op_slug
-        sent["payload"] = payload
+    class FakeReporter:
+        async def send_to_operator(self, op_slug, payload):
+            sent["op_slug"] = op_slug
+            sent["payload"] = payload
 
-    async def await_approval(request_id):
-        sent["awaited_id"] = request_id
-        return {"agent_slug": "helper-1234", "pending_token": "ptok"}
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: FakeReporter())
 
-    async def finalize(binding, token):
-        sent["finalize_token"] = token
-
-    result = asyncio.run(
-        create_ws_local_agent(
-            "op-99",
-            "12345678",
-            send_request_fn=send_request,
-            await_approval_fn=await_approval,
-            finalize_fn=finalize,
-            display_name="Helper",
-        )
+    started = asyncio.run(
+        agent_create.start_create("op-99", "12345678", username="Helper", message="need a coder")
     )
-
+    assert started["request_id"].startswith("acr_")
     assert sent["op_slug"] == "op-99"
     assert sent["payload"]["type"] == "agent.create_request"
-    assert "identity_cert" in sent["payload"] and "device_cert" in sent["payload"]
-    # the request_id sent is the one awaited
-    assert sent["payload"]["request_id"] == sent["awaited_id"]
-    assert sent["finalize_token"] == "ptok"
-    assert result["agent_slug"] == "helper-1234"
+    assert sent["payload"]["message"] == "need a coder"
+    # identity stashed under the request_id, retrievable by the approval command
+    assert agent_create.get_registry().pop_pending(started["request_id"]) is not None
 
 
-def test_unlinked_operator_rejected(tmp_path, monkeypatch):
+def test_start_create_rejects_unlinked(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
     monkeypatch.setattr(store_mod, "get_pairing", lambda slug: None)
-
-    async def noop(*a, **k):
-        return {}
-
     with pytest.raises(ValueError, match="not linked"):
-        asyncio.run(
-            create_ws_local_agent(
-                "nope",
-                "x",
-                send_request_fn=noop,
-                await_approval_fn=noop,
-                finalize_fn=noop,
-            )
-        )
+        asyncio.run(agent_create.start_create("nope", "x"))
 
 
-def test_pending_approvals_resolve():
-    from puffo_agent.portal.control.agent_create import PendingApprovals
-
+def test_registry_record_then_wait():
     async def go():
-        p = PendingApprovals()
+        reg = agent_create.CreateRegistry()
 
         async def resolver():
             await asyncio.sleep(0.01)
-            assert p.resolve("r1", {"agent_slug": "s", "pending_token": "t"})
+            reg.record_result("cmd1", {"ok": True, "agent_slug": "s"})
 
         task = asyncio.ensure_future(resolver())
-        result = await p.wait("r1", timeout=1.0)
+        result = await reg.wait_result("cmd1", timeout=1.0)
         await task
         return result
 
     assert asyncio.run(go())["agent_slug"] == "s"
 
 
-def test_pending_approvals_timeout():
-    from puffo_agent.portal.control.agent_create import PendingApprovals
-
+def test_registry_wait_timeout():
     async def go():
-        p = PendingApprovals()
+        reg = agent_create.CreateRegistry()
         with pytest.raises(asyncio.TimeoutError):
-            await p.wait("r2", timeout=0.05)
+            await reg.wait_result("nope", timeout=0.05)
 
     asyncio.run(go())
+
+
+def test_finalize_from_command_writes_profile(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    ident = agent_create.gen_agent_identity(OPERATOR_ROOT)
+    agent_create.get_registry().put_pending(
+        "acr_x",
+        agent_create._PendingCreate(ident, "op-99", "https://chat.puffo.ai/relay", "12345678"),
+    )
+
+    async def fake_post(server_url, binding, token):
+        return None
+
+    monkeypatch.setattr(agent_create, "post_slug_binding", fake_post)
+
+    result = asyncio.run(
+        agent_create.finalize_from_command(
+            "acr_x",
+            {
+                "agent_slug": "helper-1234",
+                "pending_token": "ptok",
+                "name": "Helper",
+                "role": "coder",
+                "space_id": "sp_1",
+            },
+        )
+    )
+    assert result["agent_slug"] == "helper-1234"
+
+    from puffo_agent.portal.state import AgentConfig
+
+    ac = AgentConfig.load("helper-1234")
+    assert ac.puffo_core.space_id == "sp_1"
+    assert ac.role == "coder"
+    assert ac.runtime.kind == "ws-local"
+
+
+def test_finalize_from_command_unknown_request():
+    with pytest.raises(ValueError, match="no pending create"):
+        asyncio.run(agent_create.finalize_from_command("acr_missing", {}))
