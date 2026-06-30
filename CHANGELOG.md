@@ -4,10 +4,20 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.5] — 2026-06-29
+## [1.0.5] — 2026-06-30
 
 ### Added
 
+- **Self-service ws-local agent creation.** A new
+  `puffo-agent agent create-ws-local --operator=<slug> --passcode=<code>`
+  lets an attached AI tool request its own ws-local agent: the daemon
+  mints the identity and certs, the linked operator approves in their
+  app — setting the agent's name, avatar, role, soul, and home space —
+  and the daemon finalizes registration and packs the `.puffoagent`
+  bundle. No manual UI export or file copying. The call is non-blocking
+  (it returns a `request_id`; poll completion with
+  `puffo-agent machine wait-until-command --id <request_id>`). Requires
+  the daemon running with `--with-local-bridge`.
 - **Activity log for ws-local agents.** Agents driven by an attached
   tool (the ws-local runtime) now report their turns and tool calls
   to the operator's activity log — the message being worked on, each
