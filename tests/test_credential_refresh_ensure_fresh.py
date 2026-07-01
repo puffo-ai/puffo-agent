@@ -189,3 +189,57 @@ async def test_ensure_fresh_does_not_fan_out_when_refresh_fails(tmp_path):
     r.backend.sync_to_agent = _spy_sync_to_agent  # type: ignore[assignment]
     assert await r.ensure_fresh() is False
     assert sync_calls == 0
+
+
+# ── AUTH_FAILED classification + propagation ─────────────────────────
+
+
+def test_classify_failed_refresh_detects_401_as_auth_failed():
+    from puffo_agent.portal.credential_refresh import _classify_failed_refresh
+
+    outcome = _classify_failed_refresh(
+        out_tail="", err_tail='API Error: 401 {"type":"authentication_error"}',
+        rc=1, elapsed=1.2, log_prefix="test",
+    )
+    assert outcome is RefreshOutcome.AUTH_FAILED
+
+
+def test_classify_failed_refresh_detects_invalid_grant_as_auth_failed():
+    from puffo_agent.portal.credential_refresh import _classify_failed_refresh
+
+    outcome = _classify_failed_refresh(
+        out_tail="", err_tail="OAuth refresh: invalid_grant",
+        rc=1, elapsed=1.2, log_prefix="test",
+    )
+    assert outcome is RefreshOutcome.AUTH_FAILED
+
+
+def test_classify_failed_refresh_prefers_auth_failed_over_rate_limit():
+    """When both markers are present (Anthropic sometimes returns 401
+    with rate-limit-adjacent wording on rotated-and-revoked tokens),
+    AUTH_FAILED wins so the DM path fires instead of the fast-retry."""
+    from puffo_agent.portal.credential_refresh import _classify_failed_refresh
+
+    outcome = _classify_failed_refresh(
+        out_tail="",
+        err_tail=(
+            "API Error: 401 authentication_error "
+            'rate_limit_error "type":"rate_limit_error"'
+        ),
+        rc=1, elapsed=1.2, log_prefix="test",
+    )
+    assert outcome is RefreshOutcome.AUTH_FAILED
+
+
+def test_propagate_auth_failed_does_not_bump_streak(tmp_path):
+    """AUTH_FAILED skips the consecutive_non_success streak so a later
+    RATE_LIMITED / FAILED outcome starts fresh at 1, not N+1."""
+    _write_creds(tmp_path, expires_in_seconds=7200)
+    r = CredentialRefresher(host_home=tmp_path)
+    r._consecutive_non_success = 0
+
+    r._propagate_outcome(RefreshOutcome.AUTH_FAILED)
+    assert r._consecutive_non_success == 0
+
+    r._propagate_outcome(RefreshOutcome.FAILED)
+    assert r._consecutive_non_success == 1

@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
+from ..agent._auth_markers import looks_like_auth_error
 from .state import link_host_codex_auth, link_host_credentials
 
 
@@ -160,6 +161,22 @@ def _classify_failed_refresh(
     # state change, so it should latch even when the response also
     # happens to look rate-limit-shaped.
     _maybe_disable_probe_model(out_tail, err_tail)
+    # Auth-failed BEFORE rate-limit: Anthropic sometimes hands back a
+    # 401 with rate-limit-adjacent phrasing on rotated-and-revoked
+    # refresh_tokens (the "rotating-refresh-token silent-fail" mode —
+    # both disk and Keychain retain the pre-rotation token). The
+    # refresher can't recover from that; only the operator's re-login
+    # can. Flag as AUTH_FAILED so the worker's DM path fires now
+    # instead of on the 2-tick refresh_broken streak.
+    if looks_like_auth_error(out_tail) or looks_like_auth_error(err_tail):
+        logger.error(
+            "%s auth failed rc=%d in %.1fs — refresh_token likely "
+            "revoked (probable rotating-refresh-token silent-fail); "
+            "operator needs to `claude auth login` | "
+            "stdout: %s | stderr: %s",
+            log_prefix, rc, elapsed, out_tail, err_tail,
+        )
+        return RefreshOutcome.AUTH_FAILED
     if _looks_like_rate_limit(out_tail, err_tail):
         logger.warning(
             "%s rate-limited rc=%d in %.1fs | stdout: %s | stderr: %s",
@@ -238,6 +255,10 @@ class RefreshOutcome(enum.Enum):
     # Counts toward refresh_broken streak like FAILED but additionally
     # schedules a fast retry (RATE_LIMIT_FAST_RETRY_{MIN,MAX}_SECONDS).
     RATE_LIMITED = "rate_limited"
+    # Anthropic rejected the refresh_token (401 / invalid_grant). Flips
+    # ``auth_failed`` immediately (no 2-tick streak, no fast retry) so
+    # the worker's operator-DM path fires — the loop can't self-recover.
+    AUTH_FAILED = "auth_failed"
 
 
 class CredentialBackend(Protocol):
@@ -565,12 +586,18 @@ class KeychainBackend:
         """Cache → Keychain → disk file. The disk fallthrough handles
         macOS hosts where Claude Code's Keychain write silently fails
         under launchd session-context but the disk file at
-        ``~/.claude/.credentials.json`` still gets written."""
+        ``~/.claude/.credentials.json`` still gets written.
+
+        Logs which source served the read at DEBUG so a split-brain is
+        visible in the daemon log — matches the log axis in the
+        kai-8670-da37 disk-flip proposal."""
         from ..macos.keychain import read_keychain_blob
 
         expires_at = self.cache.expires_at_seconds()
         if expires_at is not None:
-            return int(expires_at - time.time())
+            secs = int(expires_at - time.time())
+            logger.debug("keychain-backend expires_in read: source=cache secs=%d", secs)
+            return secs
         kr = read_keychain_blob()
         if kr.ok and kr.blob:
             try:
@@ -580,16 +607,37 @@ class KeychainBackend:
                     self.cache.write(kr.blob)
                 except OSError:
                     pass
-                return int(ms / 1000 - time.time())
+                secs = int(ms / 1000 - time.time())
+                logger.debug(
+                    "keychain-backend expires_in read: source=keychain secs=%d",
+                    secs,
+                )
+                return secs
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         disk_blob = _read_disk_credentials_blob(Path.home())
         if disk_blob is not None:
+            logger.warning(
+                "keychain-backend expires_in read: falling through to disk "
+                "file (Keychain miss: %s)",
+                kr.error if not kr.ok else "unparseable-blob",
+            )
             try:
                 self.cache.write(disk_blob)
             except OSError:
                 pass
-        return _disk_expires_in_seconds(Path.home())
+        else:
+            logger.warning(
+                "keychain-backend expires_in read: neither Keychain (%s) "
+                "nor disk file readable",
+                kr.error if not kr.ok else "unparseable-blob",
+            )
+        secs = _disk_expires_in_seconds(Path.home())
+        if secs is not None:
+            logger.debug(
+                "keychain-backend expires_in read: source=disk secs=%d", secs,
+            )
+        return secs
 
     async def refresh(self) -> RefreshOutcome:
         from ..macos.keychain import read_keychain_blob
@@ -697,9 +745,16 @@ class KeychainBackend:
         works even when the Keychain entry is missing. Idempotent —
         skips the write when the target already matches, so fan-out
         from concurrent ``ensure_fresh`` callers stays cheap."""
-        blob = self.cache.read() or _read_disk_credentials_blob(Path.home())
+        cache_blob = self.cache.read()
+        blob = cache_blob or _read_disk_credentials_blob(Path.home())
         if not blob:
             return
+        if cache_blob is None:
+            logger.debug(
+                "keychain-backend sync_to_agent: source=disk (cache empty) "
+                "target=%s",
+                agent_home,
+            )
         agent_claude = agent_home / ".claude"
         target = agent_claude / ".credentials.json"
         try:
@@ -729,18 +784,30 @@ class KeychainBackend:
         ok, reason = bootstrap_from_keychain(self.cache)
         if ok:
             self._last_propagated_blob = self.cache.read()
+            logger.info(
+                "keychain-backend bootstrap: source=keychain reason=%s", reason,
+            )
             return (ok, reason)
         # Keychain bootstrap failed — fall through to disk file so the
         # daemon can still serve agents on hosts where Claude Code's
         # Keychain write silently fails (launchd session-context).
         disk_blob = _read_disk_credentials_blob(Path.home())
         if disk_blob is None:
+            logger.warning(
+                "keychain-backend bootstrap: no Keychain (%s) and no "
+                "disk file — operator needs to `claude auth login`",
+                reason,
+            )
             return (False, reason)
         try:
             self.cache.write(disk_blob)
         except OSError as exc:
             return (False, f"{reason}; disk-fallback cache write: {exc}")
         self._last_propagated_blob = disk_blob
+        logger.warning(
+            "keychain-backend bootstrap: source=disk (Keychain miss: %s)",
+            reason,
+        )
         return (True, f"{reason}; using disk-file fallback")
 
     async def poll_external_rotation(self) -> bool:
@@ -1071,6 +1138,14 @@ class CredentialRefresher:
             self._clear_refresh_broken()
             self._consecutive_non_success = 0
             return
+        if outcome is RefreshOutcome.AUTH_FAILED:
+            # Skip the 2-tick refresh_broken streak: Anthropic revoked
+            # the refresh_token, so continued 120s retries just log the
+            # same 401. Flip agents directly to ``auth_failed`` so the
+            # worker's DM path surfaces re-login instructions to the
+            # operator.
+            self._flip_auth_failed()
+            return
         self._consecutive_non_success += 1
         if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
             self._flip_refresh_broken(outcome)
@@ -1162,6 +1237,45 @@ class CredentialRefresher:
             except Exception as exc:
                 logger.warning(
                     "refresh_broken clear: failed to save runtime for %s: %s",
+                    agent_id, exc,
+                )
+
+    def _flip_auth_failed(self) -> None:
+        """AUTH_FAILED outcome — Anthropic revoked the refresh_token
+        (rotating-refresh-token silent-fail). Flip every registered
+        agent that isn't already in a terminal state so the worker's
+        auth_failed DM path fires with re-login instructions. Refresh
+        counter untouched so a subsequent RATE_LIMITED / FAILED tick
+        still tracks its own streak."""
+        from .state import RuntimeState
+        msg = (
+            "Anthropic rejected the refresh_token (probable rotating-"
+            "refresh-token silent-fail — the on-disk token was revoked "
+            "server-side but the new one was silently dropped). Run "
+            "`claude auth login` on this host to re-authorise, then "
+            "send the agent a message to recover."
+        )
+        for agent_home in self._agent_homes:
+            agent_id = Path(agent_home).name
+            try:
+                rs = RuntimeState.load(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "auth_failed flip: failed to load runtime for %s: %s",
+                    agent_id, exc,
+                )
+                continue
+            if rs is None:
+                continue
+            if rs.health in ("auth_failed", "api_error_abandoned", "in_progress"):
+                continue
+            rs.health = "auth_failed"
+            rs.error = msg
+            try:
+                rs.save(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "auth_failed flip: failed to save runtime for %s: %s",
                     agent_id, exc,
                 )
 
