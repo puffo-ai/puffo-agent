@@ -14,6 +14,7 @@ from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encod
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
+    _coerce_dm_and_human_reply_visibility,
     _coerce_root_visibility,
     _resolve_root_id,
     _validate_root_same_channel,
@@ -1385,3 +1386,192 @@ async def test_validate_root_dm_envelope_no_channel_id_passes_through():
     )
     assert out == "msg_dm_root"
     assert note == ""
+
+
+# PUF-345: belt-and-suspenders visibility floor for send_message. The
+# helper is what the tool body calls right after _coerce_root_visibility;
+# these tests cover the two contexts named by the canonical spec (DM +
+# threaded reply rooted at a human) plus every branch that must NOT
+# false-positive coerce.
+
+
+class _FloorHttp:
+    """Minimal http client stub for the profile lookup — the helper only
+    calls ``get('/identities/profiles?slugs=<slug>')`` and reads
+    ``profiles[0].identity_type``."""
+
+    def __init__(self, identity_type: str, *, raise_error: bool = False):
+        self.identity_type = identity_type
+        self.raise_error = raise_error
+        self.calls: list[str] = []
+
+    async def get(self, path: str):
+        self.calls.append(path)
+        if self.raise_error:
+            raise RuntimeError("simulated transport failure")
+        return {"profiles": [{"slug": "alice-1234", "identity_type": self.identity_type}]}
+
+
+class _FloorData:
+    """Minimal data client stub — the helper only calls
+    ``get_message_by_envelope(root_id)`` and reads
+    ``sender_slug``."""
+
+    def __init__(self, sender_slug: str | None):
+        self.sender_slug = sender_slug
+        self.calls: list[str] = []
+
+    async def get_message_by_envelope(self, envelope_id: str):
+        self.calls.append(envelope_id)
+        if self.sender_slug is None:
+            return None
+        class _Msg:
+            pass
+        m = _Msg()
+        m.sender_slug = self.sender_slug
+        return m
+
+
+@pytest.mark.asyncio
+async def test_floor_dm_forces_visible():
+    http = _FloorHttp("agent")  # identity type unused in DM branch
+    data = _FloorData(None)
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="@alice-1234",
+        root_id="",
+        is_visible_to_human=False,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is True
+    assert "DMs force visible" in note
+    # DM branch decides before consulting the profile / root lookup — no
+    # http round-trip should have happened.
+    assert http.calls == []
+    assert data.calls == []
+
+
+@pytest.mark.asyncio
+async def test_floor_dm_agent_only_passes_through():
+    http = _FloorHttp("agent")
+    data = _FloorData(None)
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="@another-agent-9999",
+        root_id="",
+        is_visible_to_human=False,
+        agent_only=True,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is False
+    assert note == ""
+
+
+@pytest.mark.asyncio
+async def test_floor_threaded_reply_human_root_forces_visible():
+    http = _FloorHttp("human")
+    data = _FloorData(sender_slug="alice-1234")
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="ch_abcd",
+        root_id="msg_root",
+        is_visible_to_human=False,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is True
+    assert "human" in note.lower()
+    assert data.calls == ["msg_root"]
+    assert http.calls and "alice-1234" in http.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_floor_threaded_reply_agent_root_passes_through():
+    http = _FloorHttp("agent")
+    data = _FloorData(sender_slug="scout-5678")
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="ch_abcd",
+        root_id="msg_root",
+        is_visible_to_human=False,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is False
+    assert note == ""
+
+
+@pytest.mark.asyncio
+async def test_floor_root_lookup_miss_passes_through():
+    http = _FloorHttp("human")  # would coerce if reached
+    data = _FloorData(sender_slug=None)  # root not in store
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="ch_abcd",
+        root_id="msg_unknown",
+        is_visible_to_human=False,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is False
+    assert note == ""
+    # Profile lookup never fires when the root isn't resolvable.
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_floor_profile_lookup_error_passes_through():
+    http = _FloorHttp("human", raise_error=True)
+    data = _FloorData(sender_slug="alice-1234")
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="ch_abcd",
+        root_id="msg_root",
+        is_visible_to_human=False,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is False
+    assert note == ""
+
+
+@pytest.mark.asyncio
+async def test_floor_already_visible_short_circuits():
+    """When the caller already passed True, the floor is a no-op and
+    doesn't burn the two lookups even for a threaded reply."""
+    http = _FloorHttp("human")
+    data = _FloorData(sender_slug="alice-1234")
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="ch_abcd",
+        root_id="msg_root",
+        is_visible_to_human=True,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is True
+    assert note == ""
+    assert http.calls == []
+    assert data.calls == []
+
+
+@pytest.mark.asyncio
+async def test_floor_channel_root_level_passes_through():
+    """A root-level (no root_id) channel post is _coerce_root_visibility's
+    job — the floor helper must leave it alone so the two notes don't
+    stack."""
+    http = _FloorHttp("human")
+    data = _FloorData(sender_slug="alice-1234")
+    visible, note = await _coerce_dm_and_human_reply_visibility(
+        channel_ref="ch_abcd",
+        root_id="",
+        is_visible_to_human=False,
+        agent_only=False,
+        data_client=data,
+        http_client=http,
+    )
+    assert visible is False
+    assert note == ""
+    assert http.calls == []
+    assert data.calls == []
