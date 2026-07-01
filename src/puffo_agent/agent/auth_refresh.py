@@ -157,7 +157,7 @@ class SubprocessLoginRunner:
 
 
 def claude_login_runner() -> SubprocessLoginRunner:
-    cmd = os.environ.get("PUFFO_CLAUDE_LOGIN_CMD", "claude /login")
+    cmd = os.environ.get("PUFFO_CLAUDE_LOGIN_CMD", "claude auth login --claudeai")
     return SubprocessLoginRunner(
         command=shlex.split(cmd),
         credentials_path=Path.home() / ".claude" / "auth.json",
@@ -165,7 +165,10 @@ def claude_login_runner() -> SubprocessLoginRunner:
 
 
 def codex_login_runner() -> SubprocessLoginRunner:
-    cmd = os.environ.get("PUFFO_CODEX_LOGIN_CMD", "codex login")
+    # ``codex login`` (bare) redirects to a local-callback URL on the
+    # daemon host; ``--device-auth`` prints an operator-enterable code
+    # instead so no daemon-side callback is needed.
+    cmd = os.environ.get("PUFFO_CODEX_LOGIN_CMD", "codex login --device-auth")
     return SubprocessLoginRunner(
         command=shlex.split(cmd),
         credentials_path=Path.home() / ".codex" / "auth.json",
