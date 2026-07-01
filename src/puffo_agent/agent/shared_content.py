@@ -2,7 +2,8 @@
 
 The shared platform primer (``~/.puffo-agent/docker/shared/CLAUDE.md``)
 is folded into each agent's generated CLAUDE.md at worker startup.
-``ensure_shared_primer`` seeds defaults on first use; ``assemble_claude_md``
+``ensure_shared_primer`` syncs the baked-in primer to disk on every worker
+startup; ``assemble_claude_md``
 combines primer + profile + memory snapshot into the per-agent prompt.
 """
 
@@ -1056,8 +1057,7 @@ def _skill_body_with_frontmatter(skill_id: str, description: str, body: str) -> 
 
 
 def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
-    """Single source of truth for ``ensure_shared_primer`` (seed-if-missing)
-    and ``reseed_shared_primer`` (force back to this version)."""
+    """Every managed file ``ensure_shared_primer`` owns."""
     yield shared_dir / "CLAUDE.md", DEFAULT_SHARED_CLAUDE_MD
     yield shared_dir / "README.md", DEFAULT_SHARED_README
     for skill_id, (description, body) in DEFAULT_SKILLS.items():
@@ -1068,33 +1068,26 @@ def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
         yield skill_dir / _MANAGED_MARKER, _MANAGED_MARKER_BODY
 
 
-def ensure_shared_primer(shared_dir: Path) -> None:
-    """Create ``shared_dir`` and seed defaults. Idempotent — never
-    overwrites existing files so operator edits survive. Use
-    ``reseed_shared_primer`` to force the files back to this install's
-    version (e.g. after a ``puffo-agent`` upgrade).
+def ensure_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
+    """Sync the managed shared-primer files (``CLAUDE.md``,
+    ``README.md``, ``skills/<id>/SKILL.md``) to this install's baked-in
+    versions. Called on every worker startup so primer code changes
+    propagate without an operator-run reset.
+
+    Operator-authored skill dirs (no ``.puffo-managed`` marker) are
+    left alone; managed dirs whose skill id disappeared from
+    ``DEFAULT_SKILLS`` are pruned.
+
+    Returns ``[(relative_path, action)]`` sorted by path; action is
+    one of ``"created"``, ``"updated"``, ``"unchanged"``, ``"pruned"``.
     """
+    import shutil
+
     shared_dir.mkdir(parents=True, exist_ok=True)
-    (shared_dir / "skills").mkdir(exist_ok=True)
-    for path, body in _managed_primer_files(shared_dir):
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body, encoding="utf-8")
-
-
-def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
-    """Force the managed shared-primer files (CLAUDE.md, README.md,
-    skills/*) back to the versions baked into this install. Unlike
-    ``ensure_shared_primer`` this DOES overwrite — but only files
-    whose content differs, and it saves a ``.bak`` of anything it
-    replaces so operator edits are recoverable.
-
-    Returns ``[(relative_path, action)]`` sorted by path, where action
-    is ``"created"``, ``"updated (backed up)"``, or ``"unchanged"``.
-    """
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    (shared_dir / "skills").mkdir(exist_ok=True)
+    skills_root = shared_dir / "skills"
+    skills_root.mkdir(exist_ok=True)
     results: list[tuple[str, str]] = []
+
     for path, body in _managed_primer_files(shared_dir):
         rel = path.relative_to(shared_dir).as_posix()
         if not path.exists():
@@ -1109,17 +1102,20 @@ def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
         if current == body:
             results.append((rel, "unchanged"))
             continue
-        # Content differs (operator edit, or a stale pre-upgrade
-        # version) — keep a recoverable copy, then overwrite.
-        if current is not None:
+        path.write_text(body, encoding="utf-8")
+        results.append((rel, "updated"))
+
+    current_ids = set(DEFAULT_SKILLS.keys())
+    for entry in skills_root.iterdir():
+        if not entry.is_dir() or entry.name in current_ids:
+            continue
+        if (entry / _MANAGED_MARKER).exists():
             try:
-                path.with_suffix(path.suffix + ".bak").write_text(
-                    current, encoding="utf-8",
-                )
+                shutil.rmtree(entry)
+                results.append((f"skills/{entry.name}", "pruned"))
             except OSError:
                 pass
-        path.write_text(body, encoding="utf-8")
-        results.append((rel, "updated (backed up)"))
+
     results.sort()
     return results
 

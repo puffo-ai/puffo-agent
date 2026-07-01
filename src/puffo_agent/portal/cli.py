@@ -1497,21 +1497,21 @@ def cmd_agent_refresh(args: argparse.Namespace) -> int:
 
 
 def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
-    """Re-seed the shared platform primer to this install's version,
-    then rebuild the listed agents' managed CLAUDE.md from it.
+    """Re-sync the shared platform primer + rebuild the listed
+    agents' managed CLAUDE.md.
 
-    The shared primer is a single file shared by every agent, so the
-    re-seed is global — the agent id list only scopes which agents'
-    CLAUDE.md gets rebuilt. Running workers keep their already-loaded
-    prompt; the rebuilt file takes effect on their next restart.
+    Since ``ensure_shared_primer`` now runs on every worker startup,
+    reset-primer is only needed to force a rebuild on an already-
+    running worker WITHOUT waiting for a message (which is what
+    ``refresh_agent.flag`` would do). Handy for testing primer edits.
     """
     from ..agent.shared_content import (
+        ensure_shared_primer,
         rebuild_agent_claude_md,
-        reseed_shared_primer,
     )
 
     shared_dir = docker_shared_dir()
-    actions = reseed_shared_primer(shared_dir)
+    actions = ensure_shared_primer(shared_dir)
     print(f"shared primer ({shared_dir}):")
     for rel, action in actions:
         print(f"  {rel}: {action}")
