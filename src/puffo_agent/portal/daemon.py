@@ -125,17 +125,12 @@ class Daemon:
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_rpc_resolver(self._resolve_host_mcp_context)
-        # PUF-335: bind the remote-auth-refresh coordinator to the
-        # daemon's reporter (operator-DM relay) + restart-all-owned
-        # helper (touches restart.flag on every owned agent so a
-        # fresh credentials file actually gets picked up).
         from ..agent.auth_refresh import AuthRefreshCoordinator, set_auth_refresh_coordinator
         from .control.reporter import get_reporter as _get_reporter
 
-        _reporter = _get_reporter()
         set_auth_refresh_coordinator(
             AuthRefreshCoordinator(
-                emit=_reporter.send_to_operator,
+                emit=_get_reporter().send_to_operator,
                 restart_all_owned=_restart_all_owned_agents,
             )
         )
@@ -202,8 +197,6 @@ class Daemon:
             await stop_api_server(api_runner)
             set_profile_setter(None)
             set_rpc_resolver(None)
-            # PUF-335: clear the auth-refresh coordinator so tests +
-            # restart paths don't see a stale singleton.
             from ..agent.auth_refresh import set_auth_refresh_coordinator
 
             set_auth_refresh_coordinator(None)
@@ -680,9 +673,8 @@ async def _sweep_archived_pending_revokes_at_startup() -> None:
 
 
 async def _restart_all_owned_agents() -> int:
-    """PUF-335: touch restart.flag on every locally-discovered agent
-    so the reconciler picks up freshly-written credentials on the
-    next tick. Returns the number of restart flags written."""
+    """Touch restart.flag on every locally-discovered agent so the
+    reconciler picks up freshly-written credentials on the next tick."""
     count = 0
     for agent_id in discover_agents():
         try:

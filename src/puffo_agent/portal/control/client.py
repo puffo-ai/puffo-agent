@@ -309,13 +309,7 @@ async def execute_command(
         "cancel-auth-claude",
         "cancel-auth-codex",
     ):
-        # PUF-335: interactive remote-auth refresh. ``params`` carries
-        # the token on the ``-token`` ops; ``paired_root_pubkey`` →
-        # ``operator_slug`` lookup happens inside the coordinator's
-        # emit callback (the singleton holds the per-operator
-        # reporter binding from daemon init).
         from ...agent.auth_refresh import (
-            Provider,
             get_auth_refresh_coordinator,
             parse_provider_from_op,
         )
