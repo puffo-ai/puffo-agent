@@ -1,8 +1,9 @@
-"""AuthRefreshCoordinator state machine — stubbed LoginRunner so
-the suite doesn't need real ``claude`` / ``codex`` binaries."""
+"""ClaudeAuthFlow (paste-back) + CodexAuthFlow (device-poll) state
+machines — stubbed runners so the suite doesn't need real CLI binaries."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from dataclasses import dataclass, field
@@ -17,21 +18,17 @@ from puffo_agent.agent.auth_refresh import (
     AuthRefreshCoordinator,
     FlowState,
     LoginResult,
-    LoginRunner,
     Provider,
-    parse_provider_from_op,
 )
 
 
 @dataclass
-class StubLoginRunner:
+class StubClaudeRunner:
     spawn_result: LoginResult = field(
         default_factory=lambda: LoginResult(ok=True, url="https://login.example/abc"),
     )
     submit_result: LoginResult = field(
-        default_factory=lambda: LoginResult(
-            ok=True, credentials_path=Path("/tmp/test-creds")
-        ),
+        default_factory=lambda: LoginResult(ok=True, credentials_path=Path("/tmp/x")),
     )
     spawn_calls: int = 0
     submit_calls: list[str] = field(default_factory=list)
@@ -49,9 +46,38 @@ class StubLoginRunner:
         self.cancel_calls += 1
 
 
+@dataclass
+class StubCodexRunner:
+    spawn_result: LoginResult = field(
+        default_factory=lambda: LoginResult(
+            ok=True, url="https://auth.example/device", device_code="ABCD-1234",
+        ),
+    )
+    complete_result: LoginResult = field(
+        default_factory=lambda: LoginResult(ok=True, credentials_path=Path("/tmp/x")),
+    )
+    complete_delay: float = 0.0
+    spawn_calls: int = 0
+    wait_calls: int = 0
+    cancel_calls: int = 0
+
+    async def spawn(self) -> LoginResult:
+        self.spawn_calls += 1
+        return self.spawn_result
+
+    async def wait_until_complete(self) -> LoginResult:
+        self.wait_calls += 1
+        if self.complete_delay:
+            await asyncio.sleep(self.complete_delay)
+        return self.complete_result
+
+    async def cancel(self) -> None:
+        self.cancel_calls += 1
+
+
 def _make_coord(
-    runner_claude: Optional[LoginRunner] = None,
-    runner_codex: Optional[LoginRunner] = None,
+    claude_runner: Optional[StubClaudeRunner] = None,
+    codex_runner: Optional[StubCodexRunner] = None,
     *,
     restart_returns: int = 3,
 ) -> tuple[AuthRefreshCoordinator, list[tuple[str, dict]], list[int]]:
@@ -68,35 +94,21 @@ def _make_coord(
     coord = AuthRefreshCoordinator(
         emit=fake_emit,
         restart_all_owned=fake_restart,
-        runner_factory_claude=lambda: runner_claude or StubLoginRunner(),
-        runner_factory_codex=lambda: runner_codex or StubLoginRunner(),
+        claude_factory=lambda: claude_runner or StubClaudeRunner(),
+        codex_factory=lambda: codex_runner or StubCodexRunner(),
     )
     return coord, emit_calls, restart_calls
 
 
-def test_parse_provider_claude_variants():
-    assert parse_provider_from_op("auth-claude") == Provider.CLAUDE
-    assert parse_provider_from_op("auth-claude-token") == Provider.CLAUDE
-    assert parse_provider_from_op("cancel-auth-claude") == Provider.CLAUDE
-
-
-def test_parse_provider_codex_variants():
-    assert parse_provider_from_op("auth-codex") == Provider.CODEX
-    assert parse_provider_from_op("auth-codex-token") == Provider.CODEX
-    assert parse_provider_from_op("cancel-auth-codex") == Provider.CODEX
-
-
-def test_parse_provider_unknown_returns_none():
-    assert parse_provider_from_op("pause") is None
-    assert parse_provider_from_op("auth-other") is None
+# ── Claude flow ─────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_start_emits_url_and_transitions_to_awaiting_token():
-    runner = StubLoginRunner()
-    coord, emits, _ = _make_coord(runner_claude=runner)
+async def test_claude_start_emits_url_and_awaits_token():
+    runner = StubClaudeRunner()
+    coord, emits, _ = _make_coord(claude_runner=runner)
 
-    result = await coord.start(Provider.CLAUDE, operator_slug="op-1")
+    result = await coord.start_claude("op-1")
 
     assert result == {"ok": True, "url": "https://login.example/abc"}
     assert coord.state(Provider.CLAUDE) == FlowState.AWAITING_TOKEN
@@ -104,153 +116,213 @@ async def test_start_emits_url_and_transitions_to_awaiting_token():
     assert len(emits) == 1
     slug, payload = emits[0]
     assert slug == "op-1"
-    assert payload["type"] == "auth-refresh.url"
-    assert payload["provider"] == "claude"
-    assert payload["url"] == "https://login.example/abc"
+    assert payload == {
+        "type": "auth-refresh.url", "provider": "claude",
+        "url": "https://login.example/abc",
+    }
 
 
 @pytest.mark.asyncio
-async def test_submit_token_applies_credentials_and_restarts_agents():
-    runner = StubLoginRunner()
-    coord, emits, restarts = _make_coord(runner_claude=runner, restart_returns=5)
-    await coord.start(Provider.CLAUDE, operator_slug="op-1")
+async def test_claude_submit_applies_and_restarts():
+    runner = StubClaudeRunner()
+    coord, emits, restarts = _make_coord(claude_runner=runner, restart_returns=5)
+    await coord.start_claude("op-1")
     emits.clear()
 
-    result = await coord.submit_token(Provider.CLAUDE, "my-token", "op-1")
+    result = await coord.submit_claude_token("my-token", "op-1")
 
     assert result == {"ok": True, "agents_restarted": 5}
     assert coord.state(Provider.CLAUDE) == FlowState.DONE
     assert runner.submit_calls == ["my-token"]
     assert restarts == [1]
-    assert len(emits) == 1
-    slug, payload = emits[0]
-    assert slug == "op-1"
-    assert payload["type"] == "auth-refresh.done"
-    assert payload["agents_restarted"] == 5
+    assert emits[-1][1]["type"] == "auth-refresh.done"
 
 
 @pytest.mark.asyncio
-async def test_second_start_while_in_flight_returns_already_in_progress():
-    coord, _, _ = _make_coord(runner_claude=StubLoginRunner())
-    await coord.start(Provider.CLAUDE, operator_slug="op-1")
-
-    second = await coord.start(Provider.CLAUDE, operator_slug="op-1")
-
+async def test_claude_second_start_rejected_while_in_flight():
+    coord, _, _ = _make_coord(claude_runner=StubClaudeRunner())
+    await coord.start_claude("op-1")
+    second = await coord.start_claude("op-1")
     assert second == {"ok": False, "error": "claude login already in progress"}
 
 
 @pytest.mark.asyncio
-async def test_codex_and_claude_run_independently():
-    coord, _, _ = _make_coord(
-        runner_claude=StubLoginRunner(),
-        runner_codex=StubLoginRunner(),
-    )
-    a = await coord.start(Provider.CLAUDE, operator_slug="op-1")
-    b = await coord.start(Provider.CODEX, operator_slug="op-1")
-
-    assert a["ok"] is True
-    assert b["ok"] is True
-    assert coord.state(Provider.CLAUDE) == FlowState.AWAITING_TOKEN
-    assert coord.state(Provider.CODEX) == FlowState.AWAITING_TOKEN
-
-
-@pytest.mark.asyncio
-async def test_spawn_failure_emits_error_and_marks_failed():
-    runner = StubLoginRunner(
+async def test_claude_spawn_failure_marks_failed():
+    runner = StubClaudeRunner(
         spawn_result=LoginResult(ok=False, error="CLI not found: 'claude'"),
     )
-    coord, emits, _ = _make_coord(runner_claude=runner)
-
-    result = await coord.start(Provider.CLAUDE, operator_slug="op-1")
-
-    assert result == {"ok": False, "error": "CLI not found: 'claude'"}
+    coord, emits, _ = _make_coord(claude_runner=runner)
+    result = await coord.start_claude("op-1")
+    assert result["ok"] is False
     assert coord.state(Provider.CLAUDE) == FlowState.FAILED
-    assert len(emits) == 1
-    _, payload = emits[0]
-    assert payload["type"] == "auth-refresh.error"
-    assert payload["stage"] == "spawn"
+    assert emits[-1][1]["stage"] == "spawn"
 
 
 @pytest.mark.asyncio
-async def test_submit_failure_emits_error_and_skips_restart():
-    runner = StubLoginRunner(
-        submit_result=LoginResult(ok=False, error="login subprocess exited with code 1"),
+async def test_claude_submit_failure_skips_restart():
+    runner = StubClaudeRunner(
+        submit_result=LoginResult(ok=False, error="bad token"),
     )
-    coord, emits, restarts = _make_coord(runner_claude=runner)
-    await coord.start(Provider.CLAUDE, operator_slug="op-1")
+    coord, emits, restarts = _make_coord(claude_runner=runner)
+    await coord.start_claude("op-1")
     emits.clear()
-
-    result = await coord.submit_token(Provider.CLAUDE, "bad-token", "op-1")
-
+    result = await coord.submit_claude_token("bad", "op-1")
     assert result["ok"] is False
     assert coord.state(Provider.CLAUDE) == FlowState.FAILED
     assert restarts == []
-    assert len(emits) == 1
-    _, payload = emits[0]
-    assert payload["stage"] == "apply"
+    assert emits[-1][1]["stage"] == "apply"
 
 
 @pytest.mark.asyncio
-async def test_submit_without_in_flight_returns_no_flow_error():
+async def test_claude_submit_without_in_flight_rejected():
     coord, _, _ = _make_coord()
-    result = await coord.submit_token(Provider.CLAUDE, "tok", "op-1")
-    assert result == {
-        "ok": False,
-        "error": "no claude login awaiting a token",
-    }
+    result = await coord.submit_claude_token("tok", "op-1")
+    assert result == {"ok": False, "error": "no claude login awaiting a token"}
 
 
 @pytest.mark.asyncio
-async def test_submit_from_wrong_operator_rejected():
-    coord, _, _ = _make_coord(runner_claude=StubLoginRunner())
-    await coord.start(Provider.CLAUDE, operator_slug="op-1")
-    result = await coord.submit_token(Provider.CLAUDE, "tok", "op-OTHER")
-    assert result == {
-        "ok": False,
-        "error": "different operator owns this flow",
-    }
+async def test_claude_submit_wrong_operator_rejected():
+    coord, _, _ = _make_coord(claude_runner=StubClaudeRunner())
+    await coord.start_claude("op-1")
+    result = await coord.submit_claude_token("tok", "op-OTHER")
+    assert result == {"ok": False, "error": "different operator owns this flow"}
 
 
 @pytest.mark.asyncio
-async def test_cancel_collapses_in_flight_back_to_idle():
-    runner = StubLoginRunner()
-    coord, _, _ = _make_coord(runner_claude=runner)
-    await coord.start(Provider.CLAUDE, operator_slug="op-1")
-
+async def test_claude_cancel_resets_to_idle():
+    runner = StubClaudeRunner()
+    coord, _, _ = _make_coord(claude_runner=runner)
+    await coord.start_claude("op-1")
     result = await coord.cancel(Provider.CLAUDE)
-
     assert result == {"ok": True, "state": "idle"}
     assert coord.state(Provider.CLAUDE) == FlowState.IDLE
     assert runner.cancel_calls == 1
 
 
 @pytest.mark.asyncio
-async def test_cancel_on_idle_is_noop():
+async def test_claude_cancel_idle_is_noop():
     coord, _, _ = _make_coord()
     result = await coord.cancel(Provider.CLAUDE)
     assert result == {"ok": True, "state": "idle"}
 
 
+# ── Codex flow ──────────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_retry_after_cancel_works():
-    runner_a = StubLoginRunner()
-    runner_b = StubLoginRunner(
-        spawn_result=LoginResult(ok=True, url="https://login.example/second"),
+async def test_codex_start_emits_url_and_device_code():
+    runner = StubCodexRunner()
+    coord, emits, _ = _make_coord(codex_runner=runner)
+
+    result = await coord.start_codex("op-1")
+
+    assert result == {
+        "ok": True, "url": "https://auth.example/device",
+        "device_code": "ABCD-1234",
+    }
+    assert coord.state(Provider.CODEX) == FlowState.POLLING
+    assert runner.spawn_calls == 1
+    assert emits[0][1] == {
+        "type": "auth-refresh.url", "provider": "codex",
+        "url": "https://auth.example/device", "device_code": "ABCD-1234",
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_watcher_completes_and_restarts():
+    runner = StubCodexRunner()
+    coord, emits, restarts = _make_coord(codex_runner=runner, restart_returns=4)
+    await coord.start_codex("op-1")
+
+    await asyncio.wait_for(coord.codex._watcher, timeout=1.0)
+
+    assert coord.state(Provider.CODEX) == FlowState.DONE
+    assert runner.wait_calls == 1
+    assert restarts == [1]
+    assert emits[-1][1] == {
+        "type": "auth-refresh.done", "provider": "codex", "agents_restarted": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_polling_failure_marks_failed_and_skips_restart():
+    runner = StubCodexRunner(
+        complete_result=LoginResult(ok=False, error="device-auth polling timed out"),
     )
-    factories = iter([runner_a, runner_b])
-    coord, _, _ = _make_coord()
-    coord.runner_factory_claude = lambda: next(factories)
+    coord, emits, restarts = _make_coord(codex_runner=runner)
+    await coord.start_codex("op-1")
 
-    await coord.start(Provider.CLAUDE, operator_slug="op-1")
-    await coord.cancel(Provider.CLAUDE)
-    result = await coord.start(Provider.CLAUDE, operator_slug="op-1")
+    await asyncio.wait_for(coord.codex._watcher, timeout=1.0)
 
-    assert result["url"] == "https://login.example/second"
+    assert coord.state(Provider.CODEX) == FlowState.FAILED
+    assert restarts == []
+    assert emits[-1][1]["stage"] == "poll"
+
+
+@pytest.mark.asyncio
+async def test_codex_second_start_rejected_while_polling():
+    runner = StubCodexRunner(complete_delay=0.5)
+    coord, _, _ = _make_coord(codex_runner=runner)
+    await coord.start_codex("op-1")
+
+    second = await coord.start_codex("op-1")
+
+    assert second == {"ok": False, "error": "codex login already in progress"}
+    await coord.cancel(Provider.CODEX)
+
+
+@pytest.mark.asyncio
+async def test_codex_cancel_stops_watcher():
+    runner = StubCodexRunner(complete_delay=1.0)
+    coord, _, restarts = _make_coord(codex_runner=runner)
+    await coord.start_codex("op-1")
+
+    result = await coord.cancel(Provider.CODEX)
+
+    assert result == {"ok": True, "state": "idle"}
+    assert coord.state(Provider.CODEX) == FlowState.IDLE
+    assert runner.cancel_calls == 1
+    assert restarts == []
+
+
+@pytest.mark.asyncio
+async def test_codex_spawn_failure_no_watcher_started():
+    runner = StubCodexRunner(
+        spawn_result=LoginResult(ok=False, error="CLI not found: 'codex'"),
+    )
+    coord, emits, _ = _make_coord(codex_runner=runner)
+    result = await coord.start_codex("op-1")
+    assert result["ok"] is False
+    assert coord.state(Provider.CODEX) == FlowState.FAILED
+    assert coord.codex._watcher is None
+    assert emits[-1][1]["stage"] == "spawn"
+
+
+# ── Independent providers ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_claude_and_codex_run_independently():
+    coord, _, _ = _make_coord(
+        claude_runner=StubClaudeRunner(),
+        codex_runner=StubCodexRunner(complete_delay=0.5),
+    )
+    a = await coord.start_claude("op-1")
+    b = await coord.start_codex("op-1")
+
+    assert a["ok"] is True
+    assert b["ok"] is True
+    assert coord.state(Provider.CLAUDE) == FlowState.AWAITING_TOKEN
+    assert coord.state(Provider.CODEX) == FlowState.POLLING
+    await coord.cancel(Provider.CODEX)
+
+
+# ── Emit best-effort ─────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_emit_failure_does_not_break_state_transition():
-    runner = StubLoginRunner()
+    runner = StubClaudeRunner()
 
     async def failing_emit(_slug: str, _payload: dict) -> None:
         raise RuntimeError("control WS dropped")
@@ -261,9 +333,8 @@ async def test_emit_failure_does_not_break_state_transition():
     coord = AuthRefreshCoordinator(
         emit=failing_emit,
         restart_all_owned=fake_restart,
-        runner_factory_claude=lambda: runner,
+        claude_factory=lambda: runner,
     )
-
-    result = await coord.start(Provider.CLAUDE, operator_slug="op-1")
+    result = await coord.start_claude("op-1")
     assert result["ok"] is True
     assert coord.state(Provider.CLAUDE) == FlowState.AWAITING_TOKEN
