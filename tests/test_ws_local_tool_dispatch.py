@@ -45,7 +45,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
 def test_harness_and_host_tools_excluded():
     """Harness/host/identity ops must NOT be reachable over ws-local."""
     for t in (
-        "refresh", "reload_system_prompt", "install_skill", "list_skills",
+        "refresh", "install_skill", "list_skills",
         "install_mcp_server", "list_mcp_servers", "install_host_mcp",
         "sync_host_mcp",
     ):

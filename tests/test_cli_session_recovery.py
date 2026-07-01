@@ -159,6 +159,32 @@ def test_one_turn_reads_line_larger_than_default_asyncio_limit(tmp_path):
     assert out.output_tokens == 20
 
 
+def test_input_tokens_include_cache_creation(tmp_path):
+    """``input_tokens`` alone is just the uncached delta (often single digits);
+    the recorded figure adds newly-cached input, excluding the cache read."""
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "usage": {
+            "input_tokens": 3,
+            "cache_creation_input_tokens": 331,
+            "cache_read_input_tokens": 142928,
+            "output_tokens": 26,
+        },
+    }
+    lines = [(json.dumps(result) + "\n").encode("utf-8")]
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=lines)
+        return await session._one_turn("hi")
+
+    out = asyncio.run(drive())
+    assert out.input_tokens == 3 + 331  # cache read (142928) excluded
+    assert out.output_tokens == 26
+
+
 # ── Test 2: stream overflow recovery ─────────────────────────────────────────
 
 

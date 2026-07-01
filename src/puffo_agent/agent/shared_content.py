@@ -2,7 +2,8 @@
 
 The shared platform primer (``~/.puffo-agent/docker/shared/CLAUDE.md``)
 is folded into each agent's generated CLAUDE.md at worker startup.
-``ensure_shared_primer`` seeds defaults on first use; ``assemble_claude_md``
+``ensure_shared_primer`` syncs the baked-in primer to disk on every worker
+startup; ``assemble_claude_md``
 combines primer + profile + memory snapshot into the per-agent prompt.
 """
 
@@ -181,12 +182,15 @@ below is the authoritative reference.
   daemon's profile cache. Use when the operator mentions someone
   renamed themselves or you see a stale name in the prompt.
 
-**Self-management (claude-code only):**
-- `reload_system_prompt()` — rebuild system prompt from disk +
-  restart subprocess after editing profile/memory/CLAUDE.md.
-- `refresh(model=None)` — respawn subprocess; optional model switch.
-  Valid models: `claude-opus-4-7`, `claude-sonnet-4-6`,
-  `claude-haiku-4-5`.
+**Self-management (cli-local + cli-docker):**
+- `refresh(harness=None, model=None, host_sync=False, session=False)` —
+  four orthogonal axes. No args → rebuild CLAUDE.md + re-sync puffo
+  skills. `host_sync=True` also re-syncs the operator's host skills
+  + MCP. `session=True` drops your CLI session so the next spawn
+  starts fresh (no `--resume`). Pass `harness` + `model` together
+  to swap harness (`claude-code`, `codex`) or model — a full worker
+  respawn follows automatically. See the `refresh` skill for the
+  full flag matrix.
 - `install_host_mcp(template_id)` — lay a catalog MCP spec into the
   operator's host `~/.claude.json` so they can complete OAuth there.
   Pair with `sync_host_mcp` once they confirm. See the
@@ -199,6 +203,14 @@ below is the authoritative reference.
   reason="")` — *request* to leave; does NOT leave immediately. Your
   operator gets a DM and replies `y` (you leave) or `n` (you stay). Use
   sparingly, and give an honest `reason`.
+
+**Suggesting team-shape changes (NOT taking action):**
+When conversation surfaces the need for a new agent, a new channel,
+or pulling someone into a channel, post the matching `/agent`,
+`/channel`, or `/invite` block via `send_message` — the web client
+renders an actionable card a human taps to open the existing modal
+pre-filled. Skill docs: `suggest-agent`, `suggest-channel`,
+`suggest-invite`. Don't try to provision these yourself.
 
 Use write tools with intent — proactive messages surprise people.
 Read tools are cheap.
@@ -575,48 +587,53 @@ has a 10-min TTL so repeated calls inside that window are stable.
 """
 
 
-DEFAULT_SKILL_RELOAD = """\
-# Skill: reload_system_prompt
+DEFAULT_SKILL_REFRESH = """\
+# Skill: refresh
 
-Rebuild your system prompt from disk and restart your claude
-subprocess so fresh edits to your `profile.md`, `memory/*.md`, or
-project-level `CLAUDE.md` take effect on your NEXT message.
+Bring your on-disk state (system prompt, skills, MCP registry, CLI
+session, harness+model) into your live process. Four orthogonal
+axes; combine them freely.
 
-**Tool:** `mcp__puffo__reload_system_prompt`
+**Tool:** `mcp__puffo__refresh`
 
-**Arguments:** none.
+**Arguments:**
+- `harness` (optional) — `"claude-code"` or `"codex"`
+- `model` (optional) — a model id valid for `harness`
+- `host_sync` (optional, bool) — also re-sync operator's host
+  `~/.claude/skills/` + host MCP registrations
+- `session` (optional, bool) — drop CLI session token so next spawn
+  starts a fresh conversation (no `--resume`)
+
+`harness` and `model` must be provided together (or both omitted).
+
+**Behaviour matrix:**
+
+| Call | What happens |
+|------|--------------|
+| `refresh()` | Rebuild `CLAUDE.md` + re-sync puffo default skills. Subprocess respawns on next turn, session preserved. |
+| `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
+| `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
+| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
 
 **When to use:**
-- You just edited your workspace `CLAUDE.md` and want the change in
-  your next system prompt rather than waiting for a daemon restart.
-- You wrote a new `memory/<topic>.md` and want it folded in now.
-- You (or the operator) edited `profile.md` and want the new role
-  live immediately.
-
-**How it works:**
-1. Your current reply goes through normally — the subprocess stays
-   alive until the turn ends.
-2. When the next message arrives, the daemon regenerates your
-   managed `~/.claude/CLAUDE.md` (shared primer + profile + memory),
-   closes your claude subprocess, spawns a new one with `--resume`
-   pointing at your existing session id, and then runs the turn.
-3. Conversation history is preserved; the system prompt is fresh.
-
-**Caveat:** the reload does NOT run retroactively on the message you
-used to call it. Expect one "free" message between edit and effect.
+- Edited `CLAUDE.md`, `profile.md`, `memory/*.md` → `refresh()`.
+- Installed a new skill / MCP → `refresh()`.
+- Operator added a new skill to their `~/.claude/skills/` → tell them
+  to call it "host-sync" and use `refresh(host_sync=True[, session=True])`.
+- Conversation feels stuck / context is polluted → `refresh(session=True)`.
+- Operator asked you to try a different model → confirm harness +
+  model with them, then `refresh(harness=..., model=...)`.
 
 **When NOT to use:**
-- Every turn — the reload has a real cost (tear down + re-spawn ~5s
-  for cli-docker). Batch your edits and call reload once.
-- To force a fresh conversation — this preserves history via
-  `--resume`. Ask the operator if you actually want a new session.
+- Every turn — worker-scope refresh is cheap (~1s), but the
+  harness+model swap is a full respawn (~5-10s for cli-docker).
+  Batch your edits.
+- To change `runtime.kind` (cli-local ↔ cli-docker) — MCP tool cannot
+  do this; only `puffo-agent agent refresh --kind` or the tray UI.
 
-**Sibling tool: `refresh`.** A lighter-weight alternative when you
-only want to pick up new skills / MCP servers / a model override
-WITHOUT a full prompt rebuild. The `refresh` tool just respawns the
-subprocess; it doesn't regenerate `CLAUDE.md` from disk. Reach for
-`reload_system_prompt` when you've changed the prompt content;
-reach for `refresh` after `install_skill` / `install_mcp_server`.
+**Caveat:** the refresh does NOT apply retroactively to the message
+that called it. Expect one "free" message between the call and its
+effect.
 """
 
 
@@ -739,6 +756,232 @@ server. After this, calls to the MCP's tools should succeed.
 """
 
 
+DEFAULT_SKILL_SUGGEST_AGENT = """\
+# Skill: suggest a new Puffo agent
+
+You want a human in the current channel to consider creating a new
+agent. Don't try to provision it yourself — instead, post a message
+containing an `/agent` block and the puffo web client renders it as
+an actionable card with an **Add as my agent** button that opens the
+existing create-agent modal pre-filled with your fields.
+
+## When to use
+
+- A conversation surfaces a recurring task that doesn't have a
+  dedicated agent ("we should have someone watching the Sentry
+  stream", "a release-notes drafter would unblock the PM").
+- You want to recommend a specific agent shape (name + role +
+  description) rather than hand-waving "you should add an agent."
+- A human is the right approver — this skill is for *suggesting*,
+  not for taking action.
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/agent` is shown
+above the card as plain text.
+
+```
+<optional preamble — your reasoning, context, prompt for the human>
+
+/agent
+name: <display name>
+role: <short role label, e.g. "QA reviewer" or "release coordinator">
+description: <plain-text purpose, MAX 108 BYTES>
+message: <one-liner the agent should kick off with after it joins>
+```
+
+### Field rules
+
+- **`name`** — what the operator sees in the agent picker (e.g.
+  `Scout`, `Eli the Editor`). Keep it short.
+- **`role`** — a short pill-chip label. Two or three words max
+  ("API reviewer", "support triage").
+- **`description`** — **≤ 108 bytes UTF-8**. ASCII = 1 byte; CJK /
+  emoji = 3–4 bytes. The web parser truncates anything longer and
+  warns the operator. If you need more rationale, put it in the
+  preamble above `/agent`.
+- **`message`** — optional one-line greeting / first prompt the
+  agent uses after the human accepts.
+
+## Example
+
+```
+We've been triaging Sentry alerts manually in #ops for two weeks;
+a dedicated agent would close the loop faster.
+
+/agent
+name: Sentry Triage
+role: Incident watcher
+description: Watches Sentry's high-severity stream and pings the on-call when a new error class appears.
+message: Hi! I'll watch Sentry and surface unknown error classes. Acking the first one now.
+```
+
+## What NOT to do
+
+- Don't omit any of `name` / `role` / `description` — the card
+  renders with placeholders and looks broken.
+- Don't try to create the agent yourself.
+- Don't send the same suggestion twice in quick succession.
+- Don't put markdown inside the `/agent` fields. Strict
+  `key: value` per line.
+"""
+
+
+DEFAULT_SKILL_SUGGEST_CHANNEL = """\
+# Skill: suggest a new channel
+
+You want a human in the current space to consider creating a new
+channel. Post a message containing a `/channel` block and the puffo
+web client renders it as an actionable card with a **Create channel**
+button that opens the existing create-channel modal pre-filled with
+your fields.
+
+## When to use
+
+- A subtopic is taking over the parent channel and would benefit
+  from its own room (`#api-design` splitting from `#engineering`).
+- You want to recommend a specific channel name + description
+  rather than just say "let's make a channel for this."
+- A human owns the channel-create decision.
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/channel` is shown
+above the card as plain text.
+
+```
+<optional preamble — reasoning, who should join, what it'll discuss>
+
+/channel
+name: <channel name without the leading #>
+description: <one-line purpose, MAX 108 BYTES>
+message: <optional one-liner shown above the card>
+```
+
+### Field rules
+
+- **`name`** — the channel name as it'll appear in the sidebar.
+  Lowercase ASCII letters / digits / hyphens are safest (matches
+  the server's slug shape); the modal accepts any Unicode.
+- **`description`** — **≤ 108 bytes UTF-8** (same as `suggest-agent`).
+  ASCII = 1 byte; CJK / emoji = 3–4 bytes. The web parser truncates
+  anything longer and warns the human.
+- **`message`** — optional one-liner shown above the card. Good
+  place to suggest who should join and why now.
+
+## Suggested members
+
+The `/channel` block has no `members:` field. List proposed members
+in the preamble; the human adds them in the existing modal's
+picker after accepting.
+
+## Example
+
+```
+We've covered the new ingestion pipeline in #engineering for three
+days running. Splitting it out keeps the parent channel readable.
+Probably want @alice-1234, @bob-9999, @sentry-bot in there to start.
+
+/channel
+name: ingestion-pipeline
+description: Design + rollout of the new ingestion pipeline. Status updates, decisions, blockers.
+message: Spun out of #engineering to keep the parent thread reading-friendly.
+```
+
+## What NOT to do
+
+- Don't try to create the channel yourself via space-events.
+- Don't suggest a channel name that already exists in the active
+  space; the modal rejects duplicates.
+- Don't put markdown inside the `/channel` fields. Strict
+  `key: value` per line.
+- Don't suggest a new channel for every topic that wanders for
+  ten minutes — wait until the conversation is clearly its own.
+"""
+
+
+DEFAULT_SKILL_SUGGEST_INVITE = """\
+# Skill: suggest inviting a member to a channel
+
+You want a human to invite someone into a channel where they aren't
+currently a member. Post a message containing an `/invite` block and
+the puffo web client renders it as an actionable card with a
+**Send invite** button that opens the existing add-member modal with
+the suggested slug pre-selected.
+
+## When to use
+
+- A member's expertise (or a stakeholder's interest) comes up in
+  conversation and they aren't in the channel yet ("Alice has been
+  working on this exact problem", "let's loop in @bob-9999").
+- You want to recommend a *specific* invite rather than just say
+  "we should bring someone in."
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/invite` is shown
+above the card as plain text.
+
+```
+<optional preamble — why this person should join, what they'd contribute>
+
+/invite
+member: <slug, e.g. alice-1234>
+channel: <target channel — display name OR ch_<uuid>>
+message: <optional one-liner shown alongside the card>
+```
+
+### Field rules
+
+- **`member`** — the **slug** of the person to invite
+  (e.g. `alice-1234`). Slugs only, not display names. Look up the
+  slug from a recent message author or via `get_user_info`.
+- **`channel`** — either the channel display name (without `#`,
+  Unicode OK: `测试0630`, `marketing`, `oauth-rollout`) **or** a raw
+  `ch_<uuid>`. **Prefer `ch_<uuid>` when you have it** — names
+  collide across spaces and Unicode names can render
+  inconsistently in the operator's modal. **Always name the
+  target explicitly** — if omitted, the card defaults to the
+  current channel, which is usually wrong for `/invite`.
+- **`message`** — optional rationale for the human; renders above
+  the card.
+
+## Permissions
+
+The card doesn't enforce channel-admin permissions — the underlying
+add-member modal rejects the invite at submit time if the human
+reviewer isn't allowed to invite. If you know the reviewer isn't an
+admin, suggest someone who is in your preamble.
+
+## Example
+
+```
+@alice-1234 has been shipping the OAuth refactor for a month — she'd
+catch the auth-token race we just hit.
+
+/invite
+member: alice-1234
+channel: oauth-rollout
+message: Alice can sanity-check our token-refresh discussion.
+```
+
+## What NOT to do
+
+- Don't try to send the invite yourself via space-events.
+- Don't use display names in `member` — slugs only.
+- Don't put markdown inside the `/invite` fields. Strict
+  `key: value` per line.
+- Don't suggest an invite for someone already in the target channel.
+  Spot-check with `list_channel_members` first if unsure.
+- Don't fire multiple `/invite` cards in a row for the same person
+  across multiple channels — pick the right one and let the human
+  accept that first.
+"""
+
+
 # Each entry: skill id → (one-line description, body).
 # The description goes into the YAML frontmatter Claude Code reads
 # for skill discovery; the body is everything below the frontmatter.
@@ -775,14 +1018,26 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         "Look up a user's slug, display_name, and avatar_url.",
         DEFAULT_SKILL_GET_USER_INFO,
     ),
-    "reload-system-prompt": (
-        "Rebuild your system prompt from disk after editing profile/memory.",
-        DEFAULT_SKILL_RELOAD,
+    "refresh": (
+        "Bring on-disk state (CLAUDE.md, skills, MCP, session, harness+model) into your live process.",
+        DEFAULT_SKILL_REFRESH,
     ),
     "use-host-mcp": (
         "Bring an MCP that needs operator-side OAuth/credentials from "
         "host into your own agent config.",
         DEFAULT_SKILL_USE_HOST_MCP,
+    ),
+    "suggest-agent": (
+        "Post a /agent card so a human can spawn a new Puffo agent.",
+        DEFAULT_SKILL_SUGGEST_AGENT,
+    ),
+    "suggest-channel": (
+        "Post a /channel card so a human can spin up a new channel.",
+        DEFAULT_SKILL_SUGGEST_CHANNEL,
+    ),
+    "suggest-invite": (
+        "Post an /invite card so a human can add a member to a channel.",
+        DEFAULT_SKILL_SUGGEST_INVITE,
     ),
 }
 
@@ -802,8 +1057,7 @@ def _skill_body_with_frontmatter(skill_id: str, description: str, body: str) -> 
 
 
 def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
-    """Single source of truth for ``ensure_shared_primer`` (seed-if-missing)
-    and ``reseed_shared_primer`` (force back to this version)."""
+    """Every managed file ``ensure_shared_primer`` owns."""
     yield shared_dir / "CLAUDE.md", DEFAULT_SHARED_CLAUDE_MD
     yield shared_dir / "README.md", DEFAULT_SHARED_README
     for skill_id, (description, body) in DEFAULT_SKILLS.items():
@@ -814,33 +1068,26 @@ def _managed_primer_files(shared_dir: Path) -> Iterator[tuple[Path, str]]:
         yield skill_dir / _MANAGED_MARKER, _MANAGED_MARKER_BODY
 
 
-def ensure_shared_primer(shared_dir: Path) -> None:
-    """Create ``shared_dir`` and seed defaults. Idempotent — never
-    overwrites existing files so operator edits survive. Use
-    ``reseed_shared_primer`` to force the files back to this install's
-    version (e.g. after a ``puffo-agent`` upgrade).
+def ensure_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
+    """Sync the managed shared-primer files (``CLAUDE.md``,
+    ``README.md``, ``skills/<id>/SKILL.md``) to this install's baked-in
+    versions. Called on every worker startup so primer code changes
+    propagate without an operator-run reset.
+
+    Operator-authored skill dirs (no ``.puffo-managed`` marker) are
+    left alone; managed dirs whose skill id disappeared from
+    ``DEFAULT_SKILLS`` are pruned.
+
+    Returns ``[(relative_path, action)]`` sorted by path; action is
+    one of ``"created"``, ``"updated"``, ``"unchanged"``, ``"pruned"``.
     """
+    import shutil
+
     shared_dir.mkdir(parents=True, exist_ok=True)
-    (shared_dir / "skills").mkdir(exist_ok=True)
-    for path, body in _managed_primer_files(shared_dir):
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(body, encoding="utf-8")
-
-
-def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
-    """Force the managed shared-primer files (CLAUDE.md, README.md,
-    skills/*) back to the versions baked into this install. Unlike
-    ``ensure_shared_primer`` this DOES overwrite — but only files
-    whose content differs, and it saves a ``.bak`` of anything it
-    replaces so operator edits are recoverable.
-
-    Returns ``[(relative_path, action)]`` sorted by path, where action
-    is ``"created"``, ``"updated (backed up)"``, or ``"unchanged"``.
-    """
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    (shared_dir / "skills").mkdir(exist_ok=True)
+    skills_root = shared_dir / "skills"
+    skills_root.mkdir(exist_ok=True)
     results: list[tuple[str, str]] = []
+
     for path, body in _managed_primer_files(shared_dir):
         rel = path.relative_to(shared_dir).as_posix()
         if not path.exists():
@@ -855,17 +1102,20 @@ def reseed_shared_primer(shared_dir: Path) -> list[tuple[str, str]]:
         if current == body:
             results.append((rel, "unchanged"))
             continue
-        # Content differs (operator edit, or a stale pre-upgrade
-        # version) — keep a recoverable copy, then overwrite.
-        if current is not None:
+        path.write_text(body, encoding="utf-8")
+        results.append((rel, "updated"))
+
+    current_ids = set(DEFAULT_SKILLS.keys())
+    for entry in skills_root.iterdir():
+        if not entry.is_dir() or entry.name in current_ids:
+            continue
+        if (entry / _MANAGED_MARKER).exists():
             try:
-                path.with_suffix(path.suffix + ".bak").write_text(
-                    current, encoding="utf-8",
-                )
+                shutil.rmtree(entry)
+                results.append((f"skills/{entry.name}", "pruned"))
             except OSError:
                 pass
-        path.write_text(body, encoding="utf-8")
-        results.append((rel, "updated (backed up)"))
+
     results.sort()
     return results
 

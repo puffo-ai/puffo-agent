@@ -641,14 +641,25 @@ class DockerCLIAdapter(Adapter):
             return
         await session.warm(system_prompt)
 
-    async def reload(self, new_system_prompt: str) -> None:
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
         """Close the in-container claude subprocess so the next turn
-        spawns one that re-reads CLAUDE.md. Container stays up.
-        No-op for hermes (each turn is already fresh).
-        """
+        re-reads CLAUDE.md; container stays up. No-op for hermes.
+        ``with_session=True`` also unlinks ``cli_session.json``."""
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if with_session:
+            try:
+                self.session_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't unlink session file %s: %s",
+                    self.agent_id, self.session_file, exc,
+                )
 
     async def aclose(self) -> None:
         if self._session is not None:

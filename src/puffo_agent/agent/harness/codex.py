@@ -19,9 +19,8 @@ class CodexHarness(Harness):
 
     def supports_claude_specific_tools(self) -> bool:
         # codex has no ``.claude/skills/`` concept; ``install_skill`` /
-        # ``refresh`` / etc. would have nowhere to write. Self-update
-        # for codex agents in v1 is limited to ``reload_system_prompt``
-        # (re-investigating AGENTS.md).
+        # etc. would have nowhere to write. Self-update for codex
+        # agents is limited to ``refresh`` (re-reads AGENTS.md).
         return False
 
     def supported_providers(self) -> frozenset[str]:

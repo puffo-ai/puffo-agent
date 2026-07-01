@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from .base import TurnResult
+from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
 
 logger = logging.getLogger(__name__)
 
@@ -704,6 +704,10 @@ class ClaudeSession:
         output_tokens = 0
         event_types_seen: list[str] = []
 
+        from ...portal.control.reporter import get_reporter
+
+        reporter = get_reporter()
+
         while True:
             try:
                 line = await self._proc.stdout.readline()
@@ -742,6 +746,12 @@ class ClaudeSession:
                     if bt == "text":
                         text = block.get("text", "") or ""
                         reply_parts.append(text)
+                        # The silent marker is a control signal, not content;
+                        # a fallback auto-post is reported separately by core.py.
+                        if text and not is_silent(text):
+                            asyncio.ensure_future(
+                                reporter.emit(self.agent_id, "assistant_text", {"text": text})
+                            )
                         if self.audit is not None and text:
                             self.audit.write("assistant.text", text=text)
                     elif bt == "tool_use":
@@ -749,6 +759,14 @@ class ClaudeSession:
                         name = block.get("name", "")
                         tool_input = block.get("input") or {}
                         tool_names_used.append(name)
+                        tool_event = {"tool": name}
+                        if "send_message" in name:
+                            body = tool_input.get("text")
+                            if isinstance(body, str):
+                                tool_event["content"] = body[:STATUS_PREVIEW_CHARS]
+                        asyncio.ensure_future(
+                            reporter.emit(self.agent_id, "tool_use", tool_event)
+                        )
                         if name == "mcp__puffo__send_message":
                             send_message_targets.append({
                                 "channel": str(tool_input.get("channel", "")),
@@ -770,7 +788,11 @@ class ClaudeSession:
                 if sid and sid != self._session_id:
                     self._save_session_id(sid)
                 usage = event.get("usage") or {}
-                input_tokens = int(usage.get("input_tokens", 0) or 0)
+                # input_tokens is just the uncached delta; add newly-cached input
+                # for the real non-cache-read figure (matches codex).
+                input_tokens = int(usage.get("input_tokens", 0) or 0) + int(
+                    usage.get("cache_creation_input_tokens", 0) or 0
+                )
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
                 # Fallback for CLI versions where the assembled text
                 # reply only appears on ``result.result``.

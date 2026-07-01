@@ -4,12 +4,12 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.4a1] — 2026-06-29
+## [1.0.5a1] — 2026-07-01
 
-Pre-release alpha for testing PR #103. Not for production. Supersedes
-1.0.4a0 — that build would false-block agents on macOS hosts where
-Claude Code's Keychain write silently fails (launchd session-context)
-but the disk credential file is fresh.
+Pre-release alpha for testing PR #103 on top of merged 1.0.5.
+Rebased from 1.0.4a1 onto 1.0.5. Not for production. Semver note:
+`1.0.5a1` orders BEFORE `1.0.5` in pip's default resolver — install
+with `pip install --pre puffo-agent==1.0.5a1` to opt in explicitly.
 
 ### Fixed
 
@@ -34,9 +34,17 @@ but the disk credential file is fresh.
   `sync_to_agent`, and `poll_external_rotation` all now use the
   disk file as a fallback so the daemon can serve agents on those
   hosts (matches the existing `_sync_credentials_from_keychain`
-  invariant in `portal/state.py`). Without this, 1.0.4a0 would have
-  false-blocked every batch on hosts where the Keychain entry was
-  absent.
+  invariant in `portal/state.py`).
+- **Rotating-refresh-token silent-fail visibility.** If Anthropic
+  rotates the refresh_token but Claude Code's write of the new one
+  silently drops (both disk and Keychain retain the pre-rotation
+  token, revoked server-side), `claude --print` starts returning
+  401 `authentication_failed`. `CredentialRefresher._refresh_now`
+  now inspects the probe's stdout/stderr for that marker and, when
+  matched, flips `auth_failed` + DMs the operator with re-login
+  instructions instead of silently retrying every 120s. Distinct
+  from the disk-fallthrough fix above (different failure mode —
+  same architectural family).
 
 ### Changed
 
@@ -49,10 +57,153 @@ but the disk credential file is fresh.
   atomic write when the target file already matches — so the
   fan-out from concurrent `ensure_fresh` callers stays cheap.
 
+### Added
+
+- **Verbose per-source credential-read logs.** `KeychainBackend`
+  now logs which source served each read (`source=cache` /
+  `source=keychain` / `source=disk`) at DEBUG level, plus WARN
+  when it falls through disk after a Keychain miss. Makes the
+  disk-vs-keychain split-brain visible from the daemon log
+  without needing to attach a debugger. Matches the log axis in
+  kai-8670-da37's disk-flip proposal for the launchd refresher.
+
+## [1.0.4a1] — 2026-06-29
+
+Superseded by 1.0.5a1 above.
+
 ## [1.0.4a0] — 2026-06-29
 
-Withdrawn — see 1.0.4a1 above. Would false-block agents on macOS
-hosts where the Keychain entry is missing.
+Withdrawn — see 1.0.4a1 / 1.0.5a1 above.
+
+## [Unreleased]
+
+### Added
+
+- **Three `suggest-*` default skills so agents nudge humans instead
+  of provisioning.** `suggest-agent`, `suggest-channel`, and
+  `suggest-invite` teach every agent to post a puffo-web-app
+  actionable card (from PUF-332) when the conversation surfaces the
+  need for a new agent, channel, or channel member. Bodies live in
+  `agent/shared_content.py::DEFAULT_SKILLS`, so they seed into every
+  cli-local / cli-docker agent's `.claude/skills/` on the next
+  worker startup.
+
+- **Unified `refresh()` MCP tool with four orthogonal axes,
+  replacing `reload_system_prompt` and the old
+  `refresh(model=None)`.** `refresh(harness=None, model=None,
+  host_sync=False, session=False)` backed by five flag files at
+  `<workspace>/.puffo-agent/`: `refresh_agent`, `refresh_host_sync`,
+  `refresh_session`, `refresh_model`, `refresh_runtime`. The worker
+  batches the first three into a single `adapter.reload(prompt,
+  with_session=…)`; the daemon consumes the last two, validates the
+  payload against the installed harness + model catalog, mutates
+  `agent.yml`, and lets the config-changed check drive the respawn.
+  Invalid payloads rename to `.broken`. `refresh_runtime` (kind
+  swap) is CLI + tray-UI only — MCP + control-ws reject `kind`
+  defensively.
+
+- **`puffo-agent agent refresh <id> [--host-sync] [--session]
+  [--model=H:M] [--kind=K]`.** CLI mirror of the MCP tool plus the
+  CLI-only `--kind` axis.
+
+### Changed
+
+- **`ensure_shared_primer` now syncs from code on every worker
+  startup instead of seed-if-missing.** The old idempotent guard
+  protected an operator-edit path nobody used, and silently pinned
+  every install to whatever primer it was first seeded with —
+  visible as agents referencing MCP tools that had been renamed or
+  removed. Managed shared-primer files (`CLAUDE.md`, `README.md`,
+  `skills/<id>/SKILL.md`) now overwrite when content differs, and
+  managed skill dirs whose id disappeared from `DEFAULT_SKILLS` are
+  pruned. Operator-authored skill dirs (no `.puffo-managed` marker)
+  are untouched. `reseed_shared_primer` folded into
+  `ensure_shared_primer`; `puffo-agent agent reset-primer` still
+  exists for forcing a rebuild without waiting for a message.
+
+- **Web-UI + tray-UI Restart routes drop `refresh_agent.flag`
+  instead of `restart.flag`.** The operator-facing "Restart" button
+  wants a CLAUDE.md rebuild + adapter reload, not the daemon-
+  internal teardown-and-recreate. `restart.flag` is now reserved
+  for the credential-refresh success callback. Adapter.reload
+  grows a `with_session=True` kwarg; each adapter unlinks its own
+  session sentinel (`cli_session.json` / `codex_session.json`) so
+  the worker doesn't have to know per-harness paths.
+
+- **Control-WS `op=edit` runtime block no longer drops
+  `restart.flag`.** The daemon's `_worker_needs_restart` check
+  already respawns the worker whenever agent.yml runtime changes;
+  the extra flag was redundant. Prompt-only edits still drop
+  `refresh_agent.flag`.
+
+### Removed
+
+- `reload_system_prompt` MCP tool (replaced by `refresh()`); old
+  `reload.flag` and `refresh.flag` file paths (replaced by
+  `refresh_agent.flag` and `refresh_model.flag` respectively);
+  `write_reload_flag` helper (renamed `write_refresh_agent_flag`);
+  `reseed_shared_primer` (folded into `ensure_shared_primer`).
+
+### Security
+
+- **Archive and delete revoke the agent's device server-side.**
+  Previously the device cert stayed valid forever, so restoring an
+  archived dir resurrected the agent. The archive / delete paths
+  (HTTP API, control WS, CLI) now POST `/devices/<id>/revoke` after
+  moving the dir to `archived/<id>-*-<stamp>/`. Revoke is best-
+  effort: transient failure leaves a `pending_revoke.json` marker
+  that the daemon's startup sweep retries; delete falls back to
+  archive on revoke failure so the keys for retry survive. Recovery
+  needs re-signing a new device cert against the enrollment
+  endpoint with the on-disk root + device_signing keys.
+
+## [1.0.5] — 2026-06-30
+
+### Added
+
+- **Self-service ws-local agent creation.** A new
+  `puffo-agent agent create-ws-local --operator=<slug> --passcode=<code>`
+  lets an attached AI tool request its own ws-local agent: the daemon
+  mints the identity and certs, the linked operator approves in their
+  app — setting the agent's name, avatar, role, soul, and home space —
+  and the daemon finalizes registration and packs the `.puffoagent`
+  bundle. No manual UI export or file copying. The call is non-blocking
+  (it returns a `request_id`; poll completion with
+  `puffo-agent machine wait-until-command --id <request_id>`). Requires
+  the daemon running with `--with-local-bridge`.
+- **Activity log for ws-local agents.** Agents driven by an attached
+  tool (the ws-local runtime) now report their turns and tool calls
+  to the operator's activity log — the message being worked on, each
+  tool call (with the message body for sends), and turn completion.
+  These agents have no token usage to report, so only the activity is
+  shown.
+
+### Fixed
+
+- **codex per-turn token count.** A turn that makes several model
+  requests now reports the whole turn's tokens (taken from the thread
+  total's delta) instead of only the last request, so the figure no
+  longer looks far too small for multi-step turns.
+
+## [1.0.4] — 2026-06-29
+
+### Added
+
+- **Live agent activity streamed to the operator.** As an agent
+  processes a turn, the daemon now sends end-to-end-encrypted
+  `agent.status` updates up the machine control channel to the
+  agent's owner — the message being worked on, each tool / MCP call,
+  the assistant's reply, and the turn's token usage. The operator's
+  client renders this as a per-agent activity log. Covers both the
+  claude-code and codex harnesses. Best-effort and ephemeral: the
+  updates no-op when the operator isn't linked and never affect the
+  agent's own processing. `[SILENT]` turns are excluded, and the
+  reported input token count excludes the re-sent cached context on
+  both harnesses so it reflects the turn's new work.
+- **Turn errors reported to the operator.** When a turn fails (auth
+  error, API error, or an unexpected exception), the daemon streams
+  an `agent.status` error event so it surfaces in the operator's
+  activity log, not only in the heartbeat status.
 
 ## [1.0.3] — 2026-06-27
 

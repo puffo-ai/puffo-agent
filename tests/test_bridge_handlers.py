@@ -412,7 +412,7 @@ async def test_update_profile_accepts_summary_at_cap():
 
 async def test_soul_edit_writes_profile_md_and_drops_reload_flag(monkeypatch):
     # Soul-only edit (no display_name) must rewrite profile.md AND
-    # drop reload.flag — earlier the flag was rename-only and pure
+    # drop refresh_agent.flag — earlier the flag was rename-only and pure
     # soul edits never reloaded.
     user = make_user()
     home = isolated_home()
@@ -422,7 +422,7 @@ async def test_soul_edit_writes_profile_md_and_drops_reload_flag(monkeypatch):
         owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
     )
     agent_dir = Path(home) / "agents" / "soul-only-bot"
-    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "refresh_agent.flag"
     captured_patch: dict = {}
 
     async def _spy_sync(cfg, patch):
@@ -449,7 +449,7 @@ async def test_soul_edit_writes_profile_md_and_drops_reload_flag(monkeypatch):
     # profile.md updated to the new soul
     md = (agent_dir / "profile.md").read_text(encoding="utf-8")
     assert "fresh prompt" in md
-    # reload.flag dropped (the load-bearing fix)
+    # refresh_agent.flag dropped (the load-bearing fix)
     assert flag_path.exists()
     # soul made it into the server PATCH (Bug 1 fix). Handler strips
     # trailing whitespace before sending.
@@ -551,7 +551,7 @@ async def test_update_profile_caps_post_strip():
 
 # ────────────────────────────────────────────────────────────────────
 # Rename folds into PATCH /profile — profile.md is rewritten with the
-# new display_name and a reload.flag is dropped so the worker
+# new display_name and a refresh_agent.flag is dropped so the worker
 # re-assembles the system prompt on the next message.
 # ────────────────────────────────────────────────────────────────────
 
@@ -581,7 +581,7 @@ async def test_rename_rewrites_profile_md_and_drops_reload_flag():
         "docs and pings rename-bot's teammates when stuck.\n",
         encoding="utf-8",
     )
-    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "refresh_agent.flag"
     assert not flag_path.exists()
 
     cfg = DaemonConfig().bridge
@@ -615,7 +615,7 @@ async def test_unchanged_display_name_is_a_noop():
         "# Your role\n\nYou are stay-bot.\n", encoding="utf-8",
     )
     profile_mtime_before = (agent_dir / "profile.md").stat().st_mtime_ns
-    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "refresh_agent.flag"
 
     cfg = DaemonConfig().bridge
     app = build_app(cfg)
@@ -623,7 +623,7 @@ async def test_unchanged_display_name_is_a_noop():
     async with TestClient(server) as c:
         await _pair(c, user)
         # PATCH with the SAME display_name → no rename → no rewrite +
-        # no reload.flag.
+        # no refresh_agent.flag.
         r = await _rename_agent(c, user, "stay-bot", "stay-bot")
         assert r.status == 200, await r.text()
 
@@ -633,7 +633,7 @@ async def test_unchanged_display_name_is_a_noop():
 
 async def test_rename_drops_reload_flag_even_when_profile_md_has_no_old_name():
     # The agent's profile.md doesn't reference the old name at all —
-    # the rewrite is a no-op (0 replacements) but the reload.flag still
+    # the rewrite is a no-op (0 replacements) but the refresh_agent.flag still
     # fires because agent.yml's display_name changed and we want the
     # next reload to pick up the new state.
     user = make_user()
@@ -649,7 +649,7 @@ async def test_rename_drops_reload_flag_even_when_profile_md_has_no_old_name():
         encoding="utf-8",
     )
     profile_before = (agent_dir / "profile.md").read_text(encoding="utf-8")
-    flag_path = agent_dir / "workspace" / ".puffo-agent" / "reload.flag"
+    flag_path = agent_dir / "workspace" / ".puffo-agent" / "refresh_agent.flag"
 
     cfg = DaemonConfig().bridge
     app = build_app(cfg)
@@ -661,7 +661,7 @@ async def test_rename_drops_reload_flag_even_when_profile_md_has_no_old_name():
 
     # profile.md content unchanged (the old name wasn't there to find)
     assert (agent_dir / "profile.md").read_text(encoding="utf-8") == profile_before
-    # reload.flag still dropped so the next reload picks up agent.yml's
+    # refresh_agent.flag still dropped so the next reload picks up agent.yml's
     # new display_name in case other surfaces (banner, agent list, etc)
     # read it.
     assert flag_path.exists()
@@ -738,7 +738,7 @@ async def test_rename_doesnt_overreach_other_fields():
 
 async def test_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
     # PR #82 polish: the rename PATCH must still return 200 even when
-    # the reload.flag write hits a transient OSError (read-only
+    # the refresh_agent.flag write hits a transient OSError (read-only
     # workspace / disk-full / cross-uid ``.puffo-agent/``). The agent
     # still picks up the new name on the worker's next restart;
     # ``logger.warning`` carries the diagnostic. Lock the contract so a
@@ -755,7 +755,7 @@ async def test_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
         "You are ro-bot.\n", encoding="utf-8",
     )
 
-    # Patch ``Path.write_text`` so the reload.flag write blows up, but
+    # Patch ``Path.write_text`` so the refresh_agent.flag write blows up, but
     # the profile.md rewrite (which uses the same method) still
     # succeeds. We branch by the path's basename so only the flag is
     # affected.
@@ -763,7 +763,7 @@ async def test_rename_succeeds_when_reload_flag_write_fails(monkeypatch):
     flag_calls = {"n": 0}
 
     def fake_write_text(self, *args, **kwargs):
-        if self.name == "reload.flag":
+        if self.name == "refresh_agent.flag":
             flag_calls["n"] += 1
             raise PermissionError("simulated readonly workspace")
         return real_write_text(self, *args, **kwargs)

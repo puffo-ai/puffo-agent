@@ -762,6 +762,31 @@ def delete_flag_path(agent_id: str) -> Path:
     return agent_dir(agent_id) / ".puffo-agent" / "delete.flag"
 
 
+# Refresh flags — 5 axes touched by MCP refresh() / CLI / control-ws.
+# All under ``<workspace>/.puffo-agent/`` so the location is reachable
+# from both the worker and the MCP subprocess in cli-docker.
+
+
+def refresh_agent_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_agent.flag"
+
+
+def refresh_host_sync_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_host_sync.flag"
+
+
+def refresh_session_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_session.flag"
+
+
+def refresh_model_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_model.flag"
+
+
+def refresh_runtime_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_runtime.flag"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataclasses
 # ─────────────────────────────────────────────────────────────────────────────

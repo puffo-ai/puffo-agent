@@ -152,6 +152,15 @@ class WsLocalSession:
         elif isinstance(frame, Pong):
             pass
 
+    def _report_status(self, event: str, payload: dict) -> None:
+        """Best-effort agent.status to the operator — never break the loop."""
+        try:
+            from ..control.reporter import get_reporter
+
+            asyncio.ensure_future(get_reporter().emit(self.slug, event, payload))
+        except Exception:  # noqa: BLE001
+            pass
+
     async def _run_tool_call(self, call: ToolCall) -> None:
         handler = self._tool_dispatch.get(call.tool)
         if handler is None:
@@ -160,6 +169,10 @@ class WsLocalSession:
                 error=f"unknown tool: {call.tool!r}",
             )))
             return
+        tool_event = {"tool": call.tool}
+        if "send_message" in call.tool and isinstance(call.params.get("text"), str):
+            tool_event["content"] = call.params["text"][:200]
+        self._report_status("tool_use", tool_event)
         try:
             result = await handler(**call.params)
         except Exception as exc:
@@ -199,6 +212,10 @@ class WsLocalSession:
         first = inflight.envelope_ids()[0] if inflight.messages else ""
         if first:
             self._inflight_run_id = await self._reporter.begin_turn(first)
+            text = inflight.messages[0].get("text") if inflight.messages else ""
+            self._report_status(
+                "turn_start", {"message": text[:200] if isinstance(text, str) else ""}
+            )
 
     async def _on_end(self, bundle_id: str) -> None:
         """Close the turn, advance the cursor, pump next. Mints
@@ -212,6 +229,7 @@ class WsLocalSession:
             if first:
                 self._inflight_run_id = await self._reporter.begin_turn(first)
         await self._reporter.end_turn_batch(self._runs_for(bundle))
+        self._report_status("turn_complete", {})  # ws-local has no token usage
         await self._on_acked(bundle)
         self._inflight_run_id = None
         await self._pump()

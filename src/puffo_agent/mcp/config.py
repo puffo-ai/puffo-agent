@@ -38,7 +38,6 @@ PUFFO_CORE_TOOL_NAMES = (
     "get_post_segment",
     "get_user_info",
     "whoami",
-    "reload_system_prompt",
     "install_skill",
     "uninstall_skill",
     "list_skills",

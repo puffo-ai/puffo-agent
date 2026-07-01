@@ -15,7 +15,12 @@ from ..state import (
     AgentConfig,
     agent_yml_path,
     archive_flag_path,
+    archived_dir,
     discover_agents,
+    refresh_agent_flag_path,
+    refresh_host_sync_flag_path,
+    refresh_model_flag_path,
+    refresh_session_flag_path,
     restart_flag_path,
 )
 from . import machine_auth
@@ -33,9 +38,103 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
+def _is_already_archived(agent_slug: str) -> bool:
+    # Matches any archived/<slug>-* suffix (-ws-/-del-/bare-stamp).
+    root = archived_dir()
+    if not root.exists():
+        return False
+    prefix = f"{agent_slug}-"
+    return any(
+        child.is_dir() and child.name.startswith(prefix)
+        for child in root.iterdir()
+    )
+
+
 def _touch_flag(path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
+
+
+def _write_flag_payload(path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _apply_refresh(agent_slug: str, params: dict) -> dict:
+    """Control-ws mirror of the MCP ``refresh()`` tool; ``kind`` is
+    rejected here (CLI + tray UI only)."""
+    import time as _time
+
+    if "kind" in params:
+        return {
+            "ok": False,
+            "error": (
+                "refresh over control-ws cannot change runtime kind; "
+                "use puffo-agent CLI or the tray UI."
+            ),
+        }
+    harness = params.get("harness")
+    model = params.get("model")
+    host_sync = bool(params.get("host_sync", False))
+    session = bool(params.get("session", False))
+    if (harness is None) != (model is None):
+        return {
+            "ok": False,
+            "error": "harness and model must be provided together (or both omitted)",
+        }
+
+    try:
+        cfg = AgentConfig.load(agent_slug)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    runtime_kind = cfg.runtime.kind
+    if runtime_kind not in ("cli-local", "cli-docker"):
+        return {
+            "ok": False,
+            "error": (
+                f"refresh requires cli-local or cli-docker; agent is "
+                f"kind={runtime_kind!r}"
+            ),
+        }
+    if (
+        host_sync
+        and runtime_kind == "cli-docker"
+        and not session
+        and harness is None
+    ):
+        return {
+            "ok": False,
+            "error": (
+                "refresh(host_sync=True) on cli-docker requires "
+                "session=True or a harness+model swap"
+            ),
+        }
+
+    workspace = cfg.resolve_workspace_dir()
+    now = int(_time.time())
+    touched: list[str] = []
+    if harness is not None:
+        _write_flag_payload(
+            refresh_model_flag_path(workspace),
+            {"harness": str(harness), "model": str(model), "requested_at": now},
+        )
+        touched.append("refresh_model")
+    else:
+        _write_flag_payload(
+            refresh_agent_flag_path(workspace), {"requested_at": now},
+        )
+        touched.append("refresh_agent")
+        if host_sync:
+            _write_flag_payload(
+                refresh_host_sync_flag_path(workspace), {"requested_at": now},
+            )
+            touched.append("refresh_host_sync")
+        if session:
+            _write_flag_payload(
+                refresh_session_flag_path(workspace), {"requested_at": now},
+            )
+            touched.append("refresh_session")
+    return {"ok": True, "touched": touched}
 
 
 async def _materialize_slug_binding(
@@ -101,6 +200,7 @@ async def execute_command(
     *,
     server_url: str | None = None,
     paired_root_pubkey: str | None = None,
+    command_id: str | None = None,
 ) -> dict:
     """Apply a decrypted command to local agent state, the same way the local
     bridge handlers do (flip ``agent.yml`` state, drop sentinel flags) so the
@@ -109,6 +209,13 @@ async def execute_command(
     pairing context)."""
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
+            # Re-archive of an already-archived agent is idempotent OK.
+            if op == "archive" and agent_slug and _is_already_archived(agent_slug):
+                return {
+                    "ok": True,
+                    "note": "already archived",
+                    "agent_slug": agent_slug,
+                }
             return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
 
     if op == "pause":
@@ -125,8 +232,7 @@ async def execute_command(
         _touch_flag(archive_flag_path(agent_slug))
         return {"ok": True}
     if op == "refresh":
-        _touch_flag(restart_flag_path(agent_slug))
-        return {"ok": True}
+        return _apply_refresh(agent_slug, params)
     if op == "edit":
         cfg = AgentConfig.load(agent_slug)
         patch: dict = {}
@@ -177,17 +283,24 @@ async def execute_command(
                 await _sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
-        # restart.flag for runtime (spawn-args change); reload.flag
-        # for prompt-only (lazy, preserves the AI session).
-        if cfg.state == "running":
-            if runtime_changed:
-                _touch_flag(restart_flag_path(agent_slug))
-            elif prompt_changed:
-                from ..profile_sync import write_reload_flag
-                write_reload_flag(cfg, reason="control-ws edit")
+        # Prompt-only edits drop refresh_agent.flag; runtime edits
+        # ride the daemon's config-changed respawn.
+        if cfg.state == "running" and prompt_changed and not runtime_changed:
+            _write_flag_payload(
+                refresh_agent_flag_path(cfg.resolve_workspace_dir()),
+                {"requested_at": int(__import__("time").time())},
+            )
         return {"ok": True}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
+    if op == "agent_create_approved":
+        # The operator approved a machine-initiated ws-local create. command_id ==
+        # request_id ties this command to the stashed identity; finalize + pack.
+        from .agent_create import finalize_from_command
+
+        request_id = command_id or str(params.get("request_id") or "")
+        result = await finalize_from_command(request_id, params)
+        return {"ok": True, **result}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
@@ -280,6 +393,18 @@ class MachineControlClient:
                 last_caps = await asyncio.to_thread(build_capabilities)
                 await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
                 sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
+
+                # Register the reverse-channel sender on this live socket.
+                from .reporter import get_reporter
+
+                async def _report(operator_slug: str, envelope: dict) -> None:
+                    await self._send(
+                        ws,
+                        {"type": "message", "operator_slug": operator_slug, "envelope": envelope},
+                    )
+
+                get_reporter().set_sender(_report)
+                log.info("control: WS connected; agent.status sender ready")
                 try:
                     async for msg in ws:
                         if stop.is_set():
@@ -298,6 +423,7 @@ class MachineControlClient:
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
                 finally:
+                    get_reporter().set_sender(None)
                     sender.cancel()
                     try:
                         await sender
@@ -349,17 +475,27 @@ class MachineControlClient:
                 decrypted["params"],
                 server_url=pairing.server_url,
                 paired_root_pubkey=pairing.operator_root_pubkey,
+                command_id=command_id,
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
+            # Publish the result so `wait-until-command --id <command_id>` returns.
+            if command_id and isinstance(result, dict):
+                from .agent_create import get_registry
+
+                get_registry().record_result(command_id, result)
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
+            if command_id:
+                from .agent_create import get_registry
+
+                get_registry().record_result(command_id, {"ok": False, "error": str(exc)})
 
         if command_id:
             try:

@@ -1,5 +1,5 @@
-"""Profile sync — reload.flag drop, control-WS flag differentiation,
-sync_full_profile."""
+"""Profile sync — refresh_agent.flag drop, control-WS flag
+differentiation, sync_full_profile."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from _bridge_support import isolated_home, write_test_agent  # noqa: E402
 from puffo_agent.portal.profile_sync import (  # noqa: E402
     extract_soul_body,
     sync_full_profile,
-    write_reload_flag,
+    write_refresh_agent_flag,
 )
 from puffo_agent.portal.state import AgentConfig  # noqa: E402
 
@@ -56,15 +56,17 @@ class TestExtractSoulBody:
         assert extract_soul_body(md) == "# Inner\n\nbody"
 
 
-# ── write_reload_flag ─────────────────────────────────────────────
+# ── write_refresh_agent_flag ──────────────────────────────────────
 
 
-def test_write_reload_flag_drops_versioned_json():
+def test_write_refresh_agent_flag_drops_versioned_json():
     home = isolated_home()
     write_test_agent(home, "flag-bot")
     cfg = AgentConfig.load("flag-bot")
-    write_reload_flag(cfg, reason="unit test")
-    flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
+    write_refresh_agent_flag(cfg, reason="unit test")
+    flag_path = (
+        cfg.resolve_workspace_dir() / ".puffo-agent" / "refresh_agent.flag"
+    )
     assert flag_path.exists()
     payload = json.loads(flag_path.read_text(encoding="utf-8"))
     assert payload["version"] == 1
@@ -220,7 +222,7 @@ def _patch_sync(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_control_edit_profile_only_writes_reload_flag(monkeypatch):
+async def test_control_edit_profile_only_writes_refresh_agent_flag(monkeypatch):
     home = isolated_home()
     write_test_agent(home, "edit-bot")
     cfg = AgentConfig.load("edit-bot")
@@ -241,14 +243,16 @@ async def test_control_edit_profile_only_writes_reload_flag(monkeypatch):
     assert result == {"ok": True}
 
     workspace = AgentConfig.load("edit-bot").resolve_workspace_dir()
-    reload_flag = workspace / ".puffo-agent" / "reload.flag"
+    refresh_agent_flag = workspace / ".puffo-agent" / "refresh_agent.flag"
     restart_flag = Path(home) / "agents" / "edit-bot" / ".puffo-agent" / "restart.flag"
-    assert reload_flag.exists()
+    assert refresh_agent_flag.exists()
     assert not restart_flag.exists()
 
 
 @pytest.mark.asyncio
-async def test_control_edit_runtime_writes_restart_flag(monkeypatch):
+async def test_control_edit_runtime_no_flag_needed(monkeypatch):
+    """Runtime edits mutate agent.yml — daemon's config-changed
+    check triggers respawn on its own. No sentinel flag required."""
     home = isolated_home()
     write_test_agent(home, "rt-bot")
     cfg = AgentConfig.load("rt-bot")
@@ -267,11 +271,12 @@ async def test_control_edit_runtime_writes_restart_flag(monkeypatch):
     )
     assert result == {"ok": True}
 
+    assert AgentConfig.load("rt-bot").runtime.model == "claude-sonnet-4-7"
     workspace = AgentConfig.load("rt-bot").resolve_workspace_dir()
-    reload_flag = workspace / ".puffo-agent" / "reload.flag"
+    refresh_agent_flag = workspace / ".puffo-agent" / "refresh_agent.flag"
     restart_flag = Path(home) / "agents" / "rt-bot" / ".puffo-agent" / "restart.flag"
-    assert restart_flag.exists()
-    assert not reload_flag.exists()
+    assert not refresh_agent_flag.exists()
+    assert not restart_flag.exists()
 
 
 @pytest.mark.asyncio

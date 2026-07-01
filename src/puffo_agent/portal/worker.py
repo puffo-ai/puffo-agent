@@ -1008,6 +1008,19 @@ class Worker:
         self._warm_done.set()
         if self._ws_local_hub is not None:
             self._ws_local_hub.register(point)
+
+        # Push display_name / avatar_url / role / soul to the server identity.
+        # The regular runtimes do this post-warm; ws-local idle skips that path,
+        # so without this a freshly-created ws-local agent shows blank in the UI.
+        async def _ws_local_profile_sync() -> None:
+            from .profile_sync import sync_full_profile
+
+            try:
+                await sync_full_profile(self.agent_cfg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent %s: ws-local profile sync failed: %s", agent_id, exc)
+
+        asyncio.ensure_future(_ws_local_profile_sync())
         logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
         try:
             await self._stop.wait()
@@ -1133,8 +1146,10 @@ class Worker:
 
         asyncio.ensure_future(_post_warm_sync())
 
-        reload_flag_path = Path(workspace_path) / ".puffo-agent" / "reload.flag"
-        refresh_flag_path = Path(workspace_path) / ".puffo-agent" / "refresh.flag"
+        pa_dir = Path(workspace_path) / ".puffo-agent"
+        refresh_agent_flag_path = pa_dir / "refresh_agent.flag"
+        refresh_host_sync_flag_path = pa_dir / "refresh_host_sync.flag"
+        refresh_session_flag_path = pa_dir / "refresh_session.flag"
         # Per-turn context for the cli-local permission hook. The hook
         # is a separate subprocess and reads this file to learn which
         # channel + root to reply to.
@@ -1179,32 +1194,19 @@ class Worker:
             first_post_id = batch[0].get("envelope_id", "")
             channel_id = channel_meta.get("channel_id", "")
 
-            # Honour reload before the turn so the first batch after
-            # a flag-drop picks up fresh CLAUDE.md / profile / memory.
-            if reload_flag_path.exists():
-                await _reload_from_disk(
-                    agent_id=agent_id,
-                    harness_name=(self.agent_cfg.runtime.harness or "").strip(),
-                    shared_path=shared_path,
-                    profile_path=profile_path,
-                    memory_path=memory_path,
-                    workspace_path=workspace_path,
-                    puffo=puffo,
-                    adapter=self._adapter,
-                    flag_path=reload_flag_path,
-                )
-                # Reload subsumes refresh; drop any sibling flag so
-                # we don't double-restart.
-                try:
-                    refresh_flag_path.unlink()
-                except OSError:
-                    pass
-            elif refresh_flag_path.exists():
-                await _refresh_from_disk(
-                    agent_id=agent_id,
-                    adapter=self._adapter,
-                    flag_path=refresh_flag_path,
-                )
+            await _process_refresh_flags(
+                agent_id=agent_id,
+                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
+                puffo=puffo,
+                adapter=self._adapter,
+                refresh_agent_flag=refresh_agent_flag_path,
+                refresh_host_sync_flag=refresh_host_sync_flag_path,
+                refresh_session_flag=refresh_session_flag_path,
+            )
             try:
                 current_turn_path.parent.mkdir(parents=True, exist_ok=True)
                 current_turn_path.write_text(
@@ -1308,6 +1310,12 @@ class Worker:
                 turn_succeeded = False
                 turn_error = f"{type(exc).__name__}: {exc}"
             finally:
+                if turn_error:
+                    from .control.reporter import get_reporter
+
+                    asyncio.ensure_future(
+                        get_reporter().emit(agent_id, "error", {"error": turn_error})
+                    )
                 if run_id is not None and first_post_id:
                     # Build the batch payload: first row reuses the
                     # /start run_id (server UPDATEs its row); the
@@ -1564,86 +1572,83 @@ class Worker:
             self.runtime.save(agent_id)
 
 
-async def _reload_from_disk(
+async def _process_refresh_flags(
     *,
     agent_id: str,
-    harness_name: str = "",
+    harness_name: str,
     shared_path: Path,
     profile_path: str,
     memory_path: str,
     workspace_path: str,
     puffo,
     adapter,
-    flag_path: Path,
+    refresh_agent_flag: Path,
+    refresh_host_sync_flag: Path,
+    refresh_session_flag: Path,
 ) -> None:
-    """Rebuild managed system-prompt file(s) from disk and ask the
-    adapter to drop any cached subprocess. Failures are logged but
-    don't drop the turn — a stale prompt beats a dropped message.
+    """Consume any worker-scope refresh flags into a single
+    ``adapter.reload(prompt, with_session=…)`` call at turn start.
+    Order: host sync → CLAUDE.md rebuild → session drop."""
+    host_sync_seen = refresh_host_sync_flag.exists()
+    agent_seen = refresh_agent_flag.exists()
+    session_seen = refresh_session_flag.exists()
+    if not (host_sync_seen or agent_seen or session_seen):
+        return
 
-    Dispatches on ``harness_name``: codex writes ``$CODEX_HOME/
-    AGENTS.md``; every other harness goes through the legacy claude-
-    code path.
-    """
-    try:
-        new_md = _rebuild_managed_system_prompt(
-            harness_name=harness_name,
-            agent_id=agent_id,
-            shared_path=shared_path,
-            profile_path=profile_path,
-            memory_path=memory_path,
-            workspace_path=workspace_path,
-        )
-        puffo.system_prompt = new_md
-        await adapter.reload(new_md)
-        logger.info("agent %s: reloaded system prompt from disk", agent_id)
-    except Exception as exc:
-        logger.warning("agent %s: reload failed: %s", agent_id, exc)
-    finally:
+    if host_sync_seen:
         try:
-            flag_path.unlink()
-        except OSError:
-            pass
-
-
-async def _refresh_from_disk(
-    *,
-    agent_id: str,
-    adapter,
-    flag_path: Path,
-) -> None:
-    """Drop the cached subprocess so the next turn re-reads skills,
-    .mcp.json, .claude.json — without rebuilding CLAUDE.md. The flag
-    payload may include a ``model`` override.
-
-    Cheaper than ``_reload_from_disk``; use this for config churn
-    (new skills, model switch) and reload for CLAUDE.md edits.
-    """
-    try:
-        try:
-            raw = flag_path.read_text(encoding="utf-8")
-            payload = json.loads(raw) if raw.strip() else {}
-        except (OSError, ValueError):
-            payload = {}
-        new_model = payload.get("model") if isinstance(payload, dict) else None
-        if new_model is not None and hasattr(adapter, "model"):
-            old_model = getattr(adapter, "model", "")
-            adapter.model = str(new_model)
-            logger.info(
-                "agent %s: model override via refresh: %r -> %r",
-                agent_id, old_model, adapter.model,
+            from .state import (
+                agent_home_dir,
+                sync_host_mcp_servers,
+                sync_host_skills,
             )
-        # reload() ignores its argument — both adapters just tear
-        # down the subprocess; next turn re-reads all on-disk config.
-        await adapter.reload("")
-        logger.info(
-            "agent %s: refreshed (subprocess will respawn next turn)",
-            agent_id,
+            host_home = Path.home()
+            ah = agent_home_dir(agent_id)
+            skill_count = sync_host_skills(host_home, ah)
+            merged_mcp, _unreach = sync_host_mcp_servers(host_home, ah)
+            logger.info(
+                "agent %s: refresh_host_sync (skills=%d mcp=%d)",
+                agent_id, skill_count, merged_mcp,
+            )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: refresh_host_sync failed: %s", agent_id, exc,
+            )
+
+    new_prompt: str | None = None
+    if agent_seen:
+        try:
+            new_prompt = _rebuild_managed_system_prompt(
+                harness_name=harness_name,
+                agent_id=agent_id,
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
+            )
+            puffo.system_prompt = new_prompt
+            logger.info(
+                "agent %s: system prompt rebuilt from disk", agent_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: refresh_agent failed: %s", agent_id, exc,
+            )
+
+    try:
+        await adapter.reload(
+            new_prompt if new_prompt is not None else puffo.system_prompt,
+            with_session=session_seen,
         )
     except Exception as exc:
-        logger.warning("agent %s: refresh failed: %s", agent_id, exc)
-    finally:
+        logger.warning(
+            "agent %s: adapter.reload after refresh failed: %s",
+            agent_id, exc,
+        )
+
+    for flag in (refresh_host_sync_flag, refresh_agent_flag, refresh_session_flag):
         try:
-            flag_path.unlink()
+            flag.unlink()
         except OSError:
             pass
 

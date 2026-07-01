@@ -291,17 +291,34 @@ class LocalCLIAdapter(Adapter):
             return
         await session.warm(system_prompt)
 
-    async def reload(self, new_system_prompt: str) -> None:
-        """Drop cached runtime state so the next turn re-reads everything from disk
-        — instructions, skills, and config. For codex we drop the session cache
-        entirely so the next ``_ensure_codex_session`` re-runs the host→agent
-        config.toml merge."""
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
+        """Drop the cached subprocess so the next turn re-reads
+        instructions, skills, config. ``with_session=True`` also
+        unlinks the session sentinel."""
+        codex_session_file = (
+            self._codex_session.session_file if self._codex_session is not None else None
+        )
         if self._session is not None:
             await self._session.aclose()
             self._session = None
         if self._codex_session is not None:
             await self._codex_session.aclose()
             self._codex_session = None
+        if with_session:
+            for path in (self.session_file, codex_session_file):
+                if path is None:
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        "agent %s: couldn't unlink session file %s: %s",
+                        self.agent_id, path, exc,
+                    )
 
     async def aclose(self) -> None:
         if self._session is not None:
@@ -329,8 +346,8 @@ class LocalCLIAdapter(Adapter):
         # AGENTS.md investment goes here so codex picks it up on
         # ``newConversation``; the file body itself is written by
         # ``profile_sync.rebuild_agent_codex_md`` (worker startup +
-        # reload_system_prompt). Writing the dir is just to make sure
-        # codex has a HOME to read from.
+        # refresh). Writing the dir is just to make sure codex has a
+        # HOME to read from.
         agents_md = codex_home / "AGENTS.md"
         if not agents_md.exists():
             agents_md.write_text("", encoding="utf-8")

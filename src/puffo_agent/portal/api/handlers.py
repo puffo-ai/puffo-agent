@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,7 @@ from ..state import (
     delete_flag_path,
     discover_agents,
     is_valid_agent_id,
+    refresh_agent_flag_path,
     restart_flag_path,
 )
 from .certs import (
@@ -325,10 +327,11 @@ async def list_agents(request: web.Request) -> web.Response:
             items.append({"id": aid, "error": str(exc)})
             continue
         rs = RuntimeState.load(aid)
-        # Override runtime_status to ``restarting`` while a restart
-        # flag is pending so the UI shows a busy state immediately
-        # instead of the pre-flag ``running`` snapshot.
-        restart_pending = restart_flag_path(aid).exists()
+        workspace = cfg.resolve_workspace_dir()
+        restart_pending = (
+            refresh_agent_flag_path(workspace).exists()
+            or restart_flag_path(aid).exists()
+        )
         rs_status = "restarting" if restart_pending else (rs.status if rs else "unknown")
         items.append({
             "id": aid,
@@ -668,11 +671,11 @@ async def update_profile(request: web.Request) -> web.Response:
         cfg.role_short,
     )
 
-    # reload.flag is lazy + session-preserving; right primitive for
-    # any prompt-affecting change.
+    # refresh_agent.flag is lazy + session-preserving; right primitive
+    # for any prompt-affecting change.
     if renamed or stripped_summary is not None or isinstance(new_role, str):
-        from ..profile_sync import write_reload_flag
-        write_reload_flag(cfg, reason="bridge profile edit")
+        from ..profile_sync import write_refresh_agent_flag
+        write_refresh_agent_flag(cfg, reason="bridge profile edit")
 
     # Server sync LAST so a failure can't drop the local edit.
     if profile_patch:
@@ -822,12 +825,8 @@ def _runtime_state_dict(rs: RuntimeState | None) -> dict | None:
     }
 
 
-# ────────────────────────────────────────────────────────────────────
-# /v1/agents/{id}/restart (POST) — drops a ``restart.flag`` sentinel
-# in the agent dir; the daemon reconciler picks it up on the next
-# tick, stops the worker (which auto-respawns because desired_state
-# stays ``running``), and removes the flag.
-# ────────────────────────────────────────────────────────────────────
+# /v1/agents/{id}/restart drops refresh_agent.flag — the daemon-
+# internal restart.flag is reserved for auth-recovery.
 
 
 async def restart_agent(request: web.Request) -> web.Response:
@@ -842,20 +841,29 @@ async def restart_agent(request: web.Request) -> web.Response:
             {"error": "only the agent's operator can restart it"},
             status=403,
         )
-    flag = restart_flag_path(agent_id)
+    try:
+        cfg = AgentConfig.load(agent_id)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response(
+            {"error": f"could not load agent config: {exc}"}, status=500,
+        )
+    flag = refresh_agent_flag_path(cfg.resolve_workspace_dir())
     try:
         flag.parent.mkdir(parents=True, exist_ok=True)
-        flag.write_text("requested", encoding="utf-8")
+        flag.write_text(
+            json.dumps({"requested_at": int(time.time())}),
+            encoding="utf-8",
+        )
     except OSError as exc:
         return web.json_response(
-            {"error": f"could not write restart flag: {exc}"},
+            {"error": f"could not write refresh_agent flag: {exc}"},
             status=500,
         )
-    logger.info("bridge: restart requested for agent=%s", agent_id)
+    logger.info("bridge: restart (refresh_agent) requested for agent=%s", agent_id)
     return web.json_response({
         "agent_id": agent_id,
         "ok": True,
-        "note": "daemon will stop + respawn this agent on the next reconcile tick (~2s)",
+        "note": "worker will rebuild CLAUDE.md + reload on its next turn",
     })
 
 
@@ -1906,3 +1914,56 @@ async def agent_revoke_pending(request: web.Request) -> web.Response:
     }
     status = 200 if result.status in ("imported", "skipped") else 502
     return web.json_response(body, status=status)
+
+
+async def create_ws_local_agent(request: web.Request) -> web.Response:
+    """Bridge entry for ``puffo-agent agent create-ws-local``: send the operator
+    the approval request and return immediately with the ``request_id`` (the flow
+    is non-blocking — the operator approves whenever). Poll completion with
+    ``wait-until-command --id <request_id>``."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+    operator = body.get("operator")
+    passcode = body.get("passcode")
+    if not isinstance(operator, str) or not operator:
+        return web.json_response({"error": "operator required"}, status=400)
+    if not isinstance(passcode, str) or not passcode:
+        return web.json_response({"error": "passcode required"}, status=400)
+    from ..control.agent_create import start_create
+
+    try:
+        result = await start_create(
+            operator,
+            passcode,
+            username=str(body.get("display_name") or ""),
+            message=str(body.get("message") or ""),
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response({"error": str(exc)}, status=502)
+    return web.json_response(result, status=202)
+
+
+async def wait_until_command(request: web.Request) -> web.Response:
+    """Bridge entry for ``puffo-agent machine wait-until-command --id X``: block
+    until the command with id X has been processed, return its result. For a
+    ws-local create this is the operator's approval → {agent_slug, bundle_path,
+    passcode}."""
+    command_id = request.query.get("id", "")
+    if not command_id:
+        return web.json_response({"error": "id required"}, status=400)
+    try:
+        timeout = float(request.query.get("timeout", "600"))
+    except ValueError:
+        timeout = 600.0
+    from ..control.agent_create import get_registry
+
+    try:
+        result = await get_registry().wait_result(command_id, timeout)
+    except TimeoutError:
+        return web.json_response({"error": "timeout", "pending": True}, status=504)
+    status = 200 if result.get("ok", True) else 502
+    return web.json_response(result, status=status)

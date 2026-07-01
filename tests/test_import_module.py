@@ -366,3 +366,329 @@ async def test_list_pending_revokes_and_cleanup_staging():
     assert staging.exists()
     imp.cleanup_staging_dir()
     assert not (agents_dir() / ".import-staging").exists()
+
+
+# ────────────────────────────────────────────────────────────────────
+# Self-revoke for archive / delete: ensure POST /devices/<id>/revoke
+# fires, and that pending markers in the archived dir get swept.
+# ────────────────────────────────────────────────────────────────────
+
+
+async def test_revoke_archived_device_posts_to_revoke_endpoint(mock_server):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+
+    await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
+
+    revoke_calls = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert revoke_calls == [("POST", f"/devices/{info['old_device_id']}/revoke")]
+    subkey_calls = [
+        (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
+    ]
+    assert len(subkey_calls) == 1
+
+
+async def test_revoke_archived_device_propagates_server_failure(mock_server):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
+
+    server, state = mock_server
+    state["fail"] = {"revoke"}
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    with pytest.raises(Exception):
+        await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
+
+
+async def test_revoke_archived_device_works_from_moved_archived_path(mock_server):
+    """Archive moves the dir first, then revokes from the moved path."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-ws-20260630-104747"
+    Path(agent_dir("alpha")).rename(dest)
+
+    await imp.revoke_archived_device(dest, slug=info["slug"])
+
+    revoke_posts = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert revoke_posts == [("POST", f"/devices/{info['old_device_id']}/revoke")]
+
+
+async def test_revoke_archived_device_reuses_fresh_session_subkey(mock_server):
+    # Fresh <slug>.session.json on disk (left by the lifecycle-heartbeat
+    # rotation just before revoke) should skip the redundant subkey POST.
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
+    from puffo_agent.crypto.keystore import KeyStore, Session, encode_secret
+    from puffo_agent.crypto.primitives import Ed25519KeyPair
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    fresh_subkey = Ed25519KeyPair.generate()
+    KeyStore.for_agent("alpha").save_session(Session(
+        slug=info["slug"],
+        subkey_id="sk_preregistered",
+        subkey_secret_key=encode_secret(fresh_subkey.secret_bytes()),
+        expires_at=int(time.time() * 1000) + 24 * 3600 * 1000,
+    ))
+
+    await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
+
+    subkey_posts = [
+        (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
+    ]
+    revoke_posts = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert subkey_posts == []
+    assert len(revoke_posts) == 1
+
+
+async def test_revoke_archived_device_registers_fresh_when_session_expired(
+    mock_server,
+):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir
+    from puffo_agent.crypto.keystore import KeyStore, Session, encode_secret
+    from puffo_agent.crypto.primitives import Ed25519KeyPair
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    stale_subkey = Ed25519KeyPair.generate()
+    KeyStore.for_agent("alpha").save_session(Session(
+        slug=info["slug"],
+        subkey_id="sk_stale",
+        subkey_secret_key=encode_secret(stale_subkey.secret_bytes()),
+        expires_at=1,
+    ))
+
+    await imp.revoke_archived_device(agent_dir("alpha"), slug=info["slug"])
+
+    subkey_posts = [
+        (m, p) for (m, p) in state["calls"] if p == "/devices/subkeys"
+    ]
+    assert len(subkey_posts) == 1
+
+
+async def test_sweep_archived_pending_revokes_retries_and_clears(mock_server):
+    """Drop a freshly-archived agent dir + pending_revoke marker into
+    ``archived/``; the sweep should retry the revoke against the
+    healthy mock server and unlink the marker."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+
+    # Simulate a completed archive (move to archived dir + drop marker).
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-20260629-120000"
+    Path(agent_dir("alpha")).rename(dest)
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url=url,
+        slug=info["slug"],
+        device_id=info["old_device_id"],
+        last_error="transient: 503",
+    )
+    assert imp.archived_pending_revoke_path(dest).exists()
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 1
+    assert not imp.archived_pending_revoke_path(dest).exists()
+    revoke_calls = [
+        (m, p) for (m, p) in state["calls"]
+        if f"/devices/{info['old_device_id']}/revoke" in p
+    ]
+    assert revoke_calls == [("POST", f"/devices/{info['old_device_id']}/revoke")]
+
+
+async def test_sweep_archived_pending_revokes_leaves_marker_on_transient_failure(
+    mock_server,
+):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    server, state = mock_server
+    state["fail"] = {"revoke"}
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-20260629-120000"
+    Path(agent_dir("alpha")).rename(dest)
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url=url,
+        slug=info["slug"],
+        device_id=info["old_device_id"],
+        last_error="initial: 500",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    assert imp.archived_pending_revoke_path(dest).exists()
+
+
+async def test_sweep_archived_pending_revokes_handles_empty_archived_dir():
+    from puffo_agent.portal import import_agents as imp
+
+    # ``archived/`` may not exist yet on a fresh install.
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+
+
+async def test_sweep_renames_unparseable_marker_to_broken_and_does_not_count():
+    """Markers from a different schema (e.g. an older PR that wrote
+    a different field shape) should be renamed to .broken so the
+    daemon stops warning on every restart, and they should NOT count
+    toward the "retried N marker(s)" tally."""
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    entry = archived_dir() / "ghost-20260101-000000"
+    entry.mkdir()
+    (entry / ".puffo-agent").mkdir()
+    (entry / ".puffo-agent" / "pending_revoke.json").write_text(
+        json.dumps({
+            # Old-schema marker: missing ``server_url`` / ``slug`` /
+            # ``device_id`` that the new sweep needs.
+            "old_device_id": "dev_legacy",
+            "last_error": "boom",
+            "attempted_at": 0,
+        }),
+        encoding="utf-8",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    assert not (entry / ".puffo-agent" / "pending_revoke.json").exists()
+    assert (entry / ".puffo-agent" / "pending_revoke.json.broken").exists()
+
+
+async def test_sweep_renames_marker_when_keystore_is_missing():
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    entry = archived_dir() / "ghost-20260101-000000"
+    entry.mkdir()
+    imp.write_archived_pending_revoke(
+        entry,
+        server_url="http://example",
+        slug="ghost",
+        device_id="dev_ghost",
+        last_error="boom",
+    )
+    # No keys/ subdir — keystore.load_identity will raise.
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    assert (entry / ".puffo-agent" / "pending_revoke.json.broken").exists()
+
+
+def test_is_already_archived_matches_ws_del_and_plain_stamps():
+    """``_is_already_archived`` should fire on any ``<slug>-...`` dir
+    under ``archived/`` — the daemon path uses ``-ws-<stamp>``, the
+    delete-downgrade path uses ``-del-<stamp>``, and CLI's
+    ``cmd_agent_archive`` uses just ``-<stamp>``."""
+    from puffo_agent.portal.control.client import _is_already_archived
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    (archived_dir() / "alpha-20260101-000000").mkdir()
+    (archived_dir() / "beta-ws-20260101-000000").mkdir()
+    (archived_dir() / "gamma-del-20260101-000000").mkdir()
+
+    assert _is_already_archived("alpha") is True
+    assert _is_already_archived("beta") is True
+    assert _is_already_archived("gamma") is True
+    assert _is_already_archived("delta") is False
+    # Don't false-match a slug that's a prefix of an archived dir but
+    # not separated by '-'.
+    assert _is_already_archived("alp") is False
+
+
+async def test_control_archive_returns_already_archived_when_dir_in_archived():
+    from puffo_agent.portal.control.client import execute_command
+    from puffo_agent.portal.state import archived_dir
+
+    isolated_home()
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    (archived_dir() / "alpha-ws-20260101-000000").mkdir()
+
+    result = await execute_command(
+        op="archive", agent_slug="alpha", params={},
+    )
+    assert result["ok"] is True
+    assert result.get("note") == "already archived"
+
+
+async def test_control_archive_still_unknown_when_neither_active_nor_archived():
+    from puffo_agent.portal.control.client import execute_command
+
+    isolated_home()
+
+    result = await execute_command(
+        op="archive", agent_slug="ghost", params={},
+    )
+    assert result["ok"] is False
+    assert "unknown agent" in result["error"]
+
+
+async def test_write_archived_pending_revoke_schema(tmp_path):
+    from puffo_agent.portal import import_agents as imp
+
+    dest = tmp_path / "alpha-20260629-120000"
+    dest.mkdir()
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url="http://example",
+        slug="alpha-bot",
+        device_id="dev_xyz",
+        last_error="boom",
+    )
+    payload = json.loads(
+        imp.archived_pending_revoke_path(dest).read_text(encoding="utf-8"),
+    )
+    assert payload["kind"] == "archive_self_revoke"
+    assert payload["server_url"] == "http://example"
+    assert payload["slug"] == "alpha-bot"
+    assert payload["device_id"] == "dev_xyz"
+    assert payload["last_error"] == "boom"
+    assert isinstance(payload["attempted_at"], int)

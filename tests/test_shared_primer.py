@@ -3,9 +3,9 @@ from pathlib import Path
 
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
+    ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
-    reseed_shared_primer,
     sync_shared_skills_codex,
 )
 from puffo_agent.portal.cli import build_parser
@@ -15,46 +15,66 @@ def _tmp() -> Path:
     return Path(tempfile.mkdtemp())
 
 
-# ── reseed_shared_primer ────────────────────────────────────────────
+# ── ensure_shared_primer ────────────────────────────────────────────
 
 
-def test_reseed_creates_on_fresh_dir():
+def test_ensure_creates_on_fresh_dir():
     shared = _tmp() / "shared"
-    actions = reseed_shared_primer(shared)
+    actions = ensure_shared_primer(shared)
     assert actions, "expected managed files to be reported"
     assert all(action == "created" for _, action in actions)
-    # CLAUDE.md landed with this install's content.
     assert (
         (shared / "CLAUDE.md").read_text(encoding="utf-8")
         == DEFAULT_SHARED_CLAUDE_MD
     )
-    # skill files are reported with a posix-style relative path.
     assert any(rel.startswith("skills/") for rel, _ in actions)
 
 
-def test_reseed_is_noop_when_already_current():
+def test_ensure_is_noop_when_already_current():
     shared = _tmp() / "shared"
-    reseed_shared_primer(shared)
-    actions = reseed_shared_primer(shared)
+    ensure_shared_primer(shared)
+    actions = ensure_shared_primer(shared)
     assert all(action == "unchanged" for _, action in actions)
 
 
-def test_reseed_overwrites_edited_file_and_backs_it_up():
+def test_ensure_overwrites_stale_content_without_backup():
+    """No operator-edit protection — stale content is replaced in
+    place. No ``.bak`` is written."""
     shared = _tmp() / "shared"
-    reseed_shared_primer(shared)
+    ensure_shared_primer(shared)
     primer = shared / "CLAUDE.md"
-    primer.write_text("operator's local edit", encoding="utf-8")
+    primer.write_text("stale content", encoding="utf-8")
 
-    by_rel = dict(reseed_shared_primer(shared))
-    assert by_rel["CLAUDE.md"] == "updated (backed up)"
-    # Untouched files aren't churned.
+    by_rel = dict(ensure_shared_primer(shared))
+    assert by_rel["CLAUDE.md"] == "updated"
     assert by_rel["README.md"] == "unchanged"
-    # The edit is recoverable, and the file is back to the install version.
-    assert (
-        (shared / "CLAUDE.md.bak").read_text(encoding="utf-8")
-        == "operator's local edit"
-    )
     assert primer.read_text(encoding="utf-8") == DEFAULT_SHARED_CLAUDE_MD
+    assert not (shared / "CLAUDE.md.bak").exists()
+
+
+def test_ensure_prunes_stale_managed_skills():
+    """A managed skill dir whose id is no longer in ``DEFAULT_SKILLS``
+    is deleted on the next sync. Operator-authored dirs (no
+    ``.puffo-managed`` marker) are preserved."""
+    from puffo_agent.agent.shared_content import _MANAGED_MARKER
+
+    shared = _tmp() / "shared"
+    ensure_shared_primer(shared)
+
+    stale = shared / "skills" / "removed-in-v2"
+    stale.mkdir()
+    (stale / "SKILL.md").write_text("old body", encoding="utf-8")
+    (stale / _MANAGED_MARKER).write_text("m", encoding="utf-8")
+
+    custom = shared / "skills" / "operator-authored"
+    custom.mkdir()
+    (custom / "SKILL.md").write_text("keep me", encoding="utf-8")
+
+    by_rel = dict(ensure_shared_primer(shared))
+    assert by_rel.get("skills/removed-in-v2") == "pruned"
+    assert not stale.exists()
+    assert custom.exists()
+    assert (custom / "SKILL.md").read_text(encoding="utf-8") == "keep me"
 
 
 # ── rebuild_agent_claude_md ─────────────────────────────────────────
@@ -133,9 +153,9 @@ def test_sync_shared_skills_codex_strips_prefix_in_skill_bodies():
     workspace = root / "workspace"
     workspace.mkdir()
 
-    # Reseed populates shared/skills/<id>/SKILL.md with the
-    # DEFAULT_SKILLS bodies (which include mcp__puffo__ refs).
-    reseed_shared_primer(shared)
+    # ensure_shared_primer populates shared/skills/<id>/SKILL.md with
+    # the DEFAULT_SKILLS bodies (which include mcp__puffo__ refs).
+    ensure_shared_primer(shared)
 
     sync_shared_skills_codex(shared, workspace)
 

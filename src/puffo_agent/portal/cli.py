@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from .api.pairing import clear_pairing, load_pairing
 from .daemon import run_daemon
@@ -44,6 +45,11 @@ from .state import (
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
+    refresh_agent_flag_path,
+    refresh_host_sync_flag_path,
+    refresh_model_flag_path,
+    refresh_runtime_flag_path,
+    refresh_session_flag_path,
     write_refresh_token_request,
     write_stop_request,
 )
@@ -541,6 +547,84 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bridge_wait_until_command(base: str, command_id: str, timeout: float) -> int:
+    """GET the bridge's wait-until-command and print its result JSON to stdout."""
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = (
+        f"{base}/v1/machine/wait-until-command?"
+        f"id={urllib.parse.quote(command_id)}&timeout={int(timeout)}"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=timeout + 10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 504:
+            print(f"pending: operator hasn't approved yet ({detail})", file=sys.stderr)
+        else:
+            print(f"error: wait failed (HTTP {exc.code}): {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"error: cannot reach the daemon bridge ({exc.reason})", file=sys.stderr)
+        return 1
+    print(json.dumps(result))
+    return 0
+
+
+def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
+    """Request a ws-local agent via operator approval. Non-blocking: prints the
+    ``request_id`` and returns. Poll completion with
+    ``machine wait-until-command --id <request_id>`` (or pass ``--wait`` to block
+    here). Requires the daemon running with the bridge."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    base = args.bridge_url.rstrip("/")
+    body = json.dumps(
+        {
+            "operator": args.operator,
+            "passcode": args.passcode,
+            "display_name": getattr(args, "display_name", "") or "",
+            "message": getattr(args, "message", "") or "",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/v1/agents/create-ws-local",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            started = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"error: request failed (HTTP {exc.code}): {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(
+            f"error: cannot reach the daemon bridge at {args.bridge_url} ({exc.reason}). "
+            "Is the daemon running with --with-local-bridge?",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not getattr(args, "wait", False):
+        print(json.dumps(started))
+        return 0
+    return _bridge_wait_until_command(base, str(started.get("request_id") or ""), args.wait_timeout)
+
+
+def cmd_machine_wait_until_command(args: argparse.Namespace) -> int:
+    """Block until the command with ``--id`` has been processed, print its result."""
+    return _bridge_wait_until_command(args.bridge_url.rstrip("/"), args.id, args.timeout)
+
+
 def cmd_agent_list(args: argparse.Namespace) -> int:
     agents = discover_agents()
     if not agents:
@@ -726,10 +810,10 @@ def _set_agent_state(agent_id: str, new_state: str) -> int:
 
 def cmd_agent_rename(args: argparse.Namespace) -> int:
     """Change display_name on disk, in profile.md heading, on the
-    server identity, and drop reload.flag (mirrors bridge edit)."""
+    server identity, and drop refresh_agent.flag (mirrors bridge edit)."""
     import asyncio
     from ..agent.shared_content import rewrite_profile_name
-    from .profile_sync import sync_agent_profile, write_reload_flag
+    from .profile_sync import sync_agent_profile, write_refresh_agent_flag
 
     agent_id = args.id
     new_name = (args.display_name or "").strip()
@@ -754,7 +838,7 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
                 f"warning: profile.md heading rewrite failed: {exc}",
                 file=sys.stderr,
             )
-    write_reload_flag(cfg, reason="cli agent rename")
+    write_refresh_agent_flag(cfg, reason="cli agent rename")
     try:
         asyncio.run(sync_agent_profile(cfg, {"display_name": new_name}))
     except Exception as exc:
@@ -1008,6 +1092,10 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     agent_id = args.id
     src = agent_dir(agent_id)
     if not src.exists():
+        from .control.client import _is_already_archived
+        if _is_already_archived(agent_id):
+            print(f"{agent_id!r} is already archived")
+            return 0
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
     # Pause first so the worker exits cleanly before we move the dir.
@@ -1025,29 +1113,55 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     archived_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = archived_dir() / f"{agent_id}-{stamp}"
-    # Retry briefly: aiosqlite WAL handles can take a moment to
-    # release after client.stop() returns on Windows.
-    last_err: OSError | None = None
-    for attempt in range(8):
-        try:
-            shutil.move(str(src), str(dest))
-            last_err = None
-            break
-        except (OSError, PermissionError) as exc:
-            last_err = exc
-            time.sleep(0.5)
-    if last_err is not None:
-        # Surface a clear error so the operator can clean up by hand.
-        print(
-            f"error: archive partially failed after retries: {last_err}\n"
-            f"       source: {src}\n"
-            f"       dest:   {dest}\n"
-            "       inspect both dirs and remove the source by hand if dest looks complete.",
-            file=sys.stderr,
-        )
-        return 1
-    print(f"archived {agent_id!r} → {dest}")
-    return 0
+    from .daemon import _retry_move
+    from .import_agents import (
+        revoke_archived_device,
+        write_archived_pending_revoke,
+    )
+
+    async def _archive_async() -> int:
+        move_err = await _retry_move(src, dest)
+        if move_err is not None:
+            print(
+                f"error: archive move failed after retries: {move_err}\n"
+                f"       source: {src}\n"
+                f"       dest:   {dest}",
+                file=sys.stderr,
+            )
+            return 1
+        if cfg.puffo_core.is_configured():
+            try:
+                await revoke_archived_device(dest, slug=cfg.puffo_core.slug)
+                print(f"revoked {agent_id!r} device server-side")
+            except Exception as exc:  # noqa: BLE001
+                reason = f"{type(exc).__name__}: {exc}"
+                print(
+                    f"warning: device revoke failed ({reason}); pending "
+                    "marker left for the daemon's next startup sweep",
+                    file=sys.stderr,
+                )
+                try:
+                    from ..crypto.keystore import KeyStore
+                    identity = KeyStore(dest / "keys").load_identity(
+                        cfg.puffo_core.slug
+                    )
+                    write_archived_pending_revoke(
+                        dest,
+                        server_url=identity.server_url,
+                        slug=identity.slug,
+                        device_id=identity.device_id,
+                        last_error=reason,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"warning: failed to write pending_revoke marker "
+                        f"into {dest}: {exc}",
+                        file=sys.stderr,
+                    )
+        print(f"archived {agent_id!r} → {dest}")
+        return 0
+
+    return asyncio.run(_archive_async())
 
 
 def cmd_agent_edit(args: argparse.Namespace) -> int:
@@ -1271,22 +1385,126 @@ def _prompt_password_twice(prompt: str) -> str | None:
     return pw
 
 
-def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
-    """Re-seed the shared platform primer to this install's version,
-    then rebuild the listed agents' managed CLAUDE.md from it.
+def cmd_agent_refresh(args: argparse.Namespace) -> int:
+    """CLI mirror of the MCP ``refresh()`` tool plus the CLI-only
+    ``--kind`` axis."""
+    import json
 
-    The shared primer is a single file shared by every agent, so the
-    re-seed is global — the agent id list only scopes which agents'
-    CLAUDE.md gets rebuilt. Running workers keep their already-loaded
-    prompt; the rebuilt file takes effect on their next restart.
-    """
+    agent_id = args.id
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return 2
+    try:
+        cfg = AgentConfig.load(agent_id)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    model_swap: tuple[str, str] | None = None
+    if args.model is not None:
+        raw = args.model.strip()
+        if ":" not in raw:
+            print("error: --model must be harness:model (e.g. codex:gpt-5)", file=sys.stderr)
+            return 2
+        harness, model_id = raw.split(":", 1)
+        harness = harness.strip()
+        model_id = model_id.strip()
+        if not harness or not model_id:
+            print("error: --model must be non-empty harness:model", file=sys.stderr)
+            return 2
+        model_swap = (harness, model_id)
+
+    kind = args.kind.strip() if args.kind is not None else None
+    swap_requested = bool(model_swap or kind)
+    if swap_requested and (args.host_sync or args.session):
+        print(
+            "error: --host-sync / --session are worker-scope; they're "
+            "subsumed by the full respawn from --model / --kind. Drop "
+            "them or drop the swap flag.",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        cfg.runtime.kind == "cli-docker"
+        and args.host_sync
+        and not args.session
+        and not swap_requested
+    ):
+        print(
+            "error: --host-sync on cli-docker requires --session (the "
+            "container has to restart to pick up new host skills/MCP).",
+            file=sys.stderr,
+        )
+        return 2
+
+    workspace = cfg.resolve_workspace_dir()
+    (workspace / ".puffo-agent").mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    touched: list[str] = []
+
+    if kind is not None:
+        payload: dict[str, str | int] = {"kind": kind, "requested_at": now}
+        if model_swap is not None:
+            payload["harness"], payload["model"] = model_swap
+        refresh_runtime_flag_path(workspace).write_text(
+            json.dumps(payload), encoding="utf-8",
+        )
+        touched.append(
+            f"refresh_runtime.flag (kind={kind!r}"
+            + (
+                f" harness={model_swap[0]!r} model={model_swap[1]!r}"
+                if model_swap else ""
+            )
+            + ")"
+        )
+    elif model_swap is not None:
+        refresh_model_flag_path(workspace).write_text(
+            json.dumps({
+                "harness": model_swap[0],
+                "model": model_swap[1],
+                "requested_at": now,
+            }),
+            encoding="utf-8",
+        )
+        touched.append(
+            f"refresh_model.flag (harness={model_swap[0]!r} "
+            f"model={model_swap[1]!r})"
+        )
+    else:
+        refresh_agent_flag_path(workspace).write_text(
+            json.dumps({"requested_at": now}), encoding="utf-8",
+        )
+        touched.append("refresh_agent.flag")
+        if args.host_sync:
+            refresh_host_sync_flag_path(workspace).write_text(
+                json.dumps({"requested_at": now}), encoding="utf-8",
+            )
+            touched.append("refresh_host_sync.flag")
+        if args.session:
+            refresh_session_flag_path(workspace).write_text(
+                json.dumps({"requested_at": now}), encoding="utf-8",
+            )
+            touched.append("refresh_session.flag")
+
+    print(f"agent {agent_id!r}: dropped " + ", ".join(touched))
+    if is_daemon_alive():
+        print(
+            "daemon + worker will pick up the flags on the next tick / turn."
+        )
+    return 0
+
+
+def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
+    """Re-sync the shared primer + rebuild the listed agents' CLAUDE.md.
+    ensure_shared_primer runs on every worker startup, so this is only
+    needed to force a rebuild without waiting for a message."""
     from ..agent.shared_content import (
+        ensure_shared_primer,
         rebuild_agent_claude_md,
-        reseed_shared_primer,
     )
 
     shared_dir = docker_shared_dir()
-    actions = reseed_shared_primer(shared_dir)
+    actions = ensure_shared_primer(shared_dir)
     print(f"shared primer ({shared_dir}):")
     for rel, action in actions:
         print(f"  {rel}: {action}")
@@ -1320,7 +1538,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
             print(
                 "note: a running worker keeps its already-loaded prompt — "
                 "the rebuilt CLAUDE.md takes effect when the agent's worker "
-                "next restarts (or it calls reload_system_prompt)."
+                "next restarts (or it calls refresh())."
             )
         else:
             print(
@@ -1483,6 +1701,37 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--no-mention", action="store_true", help="Don't reply on @mention")
     create.add_argument("--no-dm", action="store_true", help="Don't reply on DM")
     create.set_defaults(func=cmd_agent_create)
+
+    create_wsl = agent_sub.add_parser(
+        "create-ws-local",
+        help="Create a ws-local agent via operator approval over the machine channel.",
+    )
+    create_wsl.add_argument(
+        "--operator", required=True, help="Linked operator slug to request approval from"
+    )
+    create_wsl.add_argument(
+        "--passcode", required=True, help="Passcode for the .puffoagent bundle + ws-local attach"
+    )
+    create_wsl.add_argument("--display-name", default="", help="Suggested name for the new agent")
+    create_wsl.add_argument(
+        "--message",
+        default="",
+        help="Free-text note shown to the operator for context (why this agent is needed).",
+    )
+    create_wsl.add_argument(
+        "--wait",
+        action="store_true",
+        help="Block until the operator approves and print the final result (slug/bundle/passcode).",
+    )
+    create_wsl.add_argument(
+        "--wait-timeout", type=float, default=600.0, help="Seconds to wait with --wait (default 600)."
+    )
+    create_wsl.add_argument(
+        "--bridge-url",
+        default="http://127.0.0.1:63387",
+        help="Bridge HTTP base URL (default: %(default)s).",
+    )
+    create_wsl.set_defaults(func=cmd_agent_create_ws_local)
 
     lst = agent_sub.add_parser("list", help="List registered agents")
     lst.set_defaults(func=cmd_agent_list)
@@ -1698,6 +1947,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reset_primer.set_defaults(func=cmd_agent_reset_primer)
 
+    refresh = agent_sub.add_parser(
+        "refresh",
+        help=(
+            "Drop one or more refresh flags. No flags = rebuild CLAUDE.md "
+            "+ re-sync shared skills."
+        ),
+    )
+    refresh.add_argument("id", help="agent id")
+    refresh.add_argument(
+        "--host-sync",
+        action="store_true",
+        help="also re-sync ~/.claude/skills + host MCP registrations",
+    )
+    refresh.add_argument(
+        "--session",
+        action="store_true",
+        help="also drop the CLI session token (fresh conversation on next spawn)",
+    )
+    refresh.add_argument(
+        "--model",
+        default=None,
+        metavar="HARNESS:MODEL",
+        help="swap (harness, model); e.g. codex:gpt-5, claude-code:sonnet-4-5",
+    )
+    refresh.add_argument(
+        "--kind",
+        default=None,
+        help="swap runtime kind; CLI-only (MCP + web app cannot change this)",
+    )
+    refresh.set_defaults(func=cmd_agent_refresh)
+
     # Bridge / local HTTP API admin.
     pairing = sub.add_parser(
         "pairing",
@@ -1753,6 +2033,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only unlink the pairing on this server URL (default: match by operator).",
     )
     machine_unlink.set_defaults(func=cmd_unlink)
+
+    machine_wait = machine_sub.add_parser(
+        "wait-until-command",
+        help="Block until a machine command (by id) is processed; print its result.",
+    )
+    machine_wait.add_argument("--id", required=True, help="Command id to wait for (e.g. a create request_id).")
+    machine_wait.add_argument(
+        "--timeout", type=float, default=600.0, help="Seconds to wait (default 600)."
+    )
+    machine_wait.add_argument(
+        "--bridge-url",
+        default="http://127.0.0.1:63387",
+        help="Bridge HTTP base URL (default: %(default)s).",
+    )
+    machine_wait.set_defaults(func=cmd_machine_wait_until_command)
 
     api = sub.add_parser(
         "api",
