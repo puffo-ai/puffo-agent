@@ -67,11 +67,18 @@ def test_reassert_flips_ok_back_to_auth_failed():
     )
 
     assert rt.health == "auth_failed"
-    assert "health probe failed" in rt.error
-    assert rt.saved == [("agent-a", "auth_failed",
-                         "post-recovery health probe failed — provider "
-                         "still unreachable; waiting for next credential "
-                         "refresh")]
+    # PUF-343: reassertion path shares the same user-facing shape as the
+    # rest of the auth-failed surfaces so the web pane / CLI status /
+    # DM copy stay aligned. The "post-warm probe failed" diagnostic lives
+    # in the daemon log (log.warning at the call site).
+    assert "Claude Code sign-in expired" in rt.error
+    assert "claude auth login" in rt.error
+    assert rt.saved == [(
+        "agent-a", "auth_failed",
+        "Claude Code sign-in expired. On the computer running "
+        "puffo-agent, open a terminal and run `claude auth "
+        "login`, then send this agent a message.",
+    )]
 
 
 def test_reassert_noop_when_already_auth_failed():

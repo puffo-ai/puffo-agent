@@ -533,24 +533,25 @@ def _handle_suppressed_reply(
                 )
     if scope == "api-error-retry":
         if is_auth:
+            # PUF-343: same shape as the operator DM copy (PUF-341) so the
+            # web pane + CLI status don't drift back into engineer-log
+            # voice. The suppressed-from-channel-post detail already lives
+            # in the daemon log.
             runtime.error = (
-                "Worker emitted an auth-error string after an API "
-                "error; suppressed from channel post. Run "
-                "`claude auth login`, then send the agent a message "
-                "to recover."
+                "Claude Code sign-in expired. On the computer running "
+                "puffo-agent, open a terminal and run `claude auth "
+                "login`, then send this agent a message."
             )
         else:
             runtime.error = (
-                "Worker emitted a rate-limit / quota / server-error "
-                "string after an API error; suppressed from channel "
-                "post. Usually self-recovers — investigate the daemon "
-                "log if persistent."
+                "Rate-limit / quota / server error — usually self-"
+                "recovers. Check the puffo-agent daemon log if it "
+                "persists."
             )
     else:
         runtime.error = (
             "Worker emitted an auth / rate-limit / quota error string "
-            "instead of a real reply; suppressed from channel post. "
-            "Check daemon logs."
+            "instead of a real reply. Check the puffo-agent daemon log."
         )
     runtime.save(agent_id)
     return True, backoff
@@ -657,9 +658,12 @@ class Worker:
         if runtime.health != "ok":
             return
         runtime.health = "auth_failed"
+        # PUF-343: even the post-probe reassertion path renders in the
+        # web pane's health card, so keep the user-facing shape.
         runtime.error = (
-            "post-recovery health probe failed — provider still "
-            "unreachable; waiting for next credential refresh"
+            "Claude Code sign-in expired. On the computer running "
+            "puffo-agent, open a terminal and run `claude auth "
+            "login`, then send this agent a message."
         )
         runtime.save(agent_id)
         log.warning(
@@ -675,7 +679,14 @@ class Worker:
         rt = self.runtime
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
-        rt.error = "auth error — run `claude auth login`, then send a message to recover"
+        # PUF-343: PUF-341's operator DM is the user's primary signal, but
+        # the same string surfaces in the web pane + CLI status; keep it
+        # user-facing so the two surfaces stay aligned.
+        rt.error = (
+            "Claude Code sign-in expired. On the computer running "
+            "puffo-agent, open a terminal and run `claude auth "
+            "login`, then send this agent a message."
+        )
         rt.save(agent_id)
         if self._notify_refresh_needed is not None:
             try:

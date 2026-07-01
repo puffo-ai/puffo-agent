@@ -347,20 +347,28 @@ def test_propagate_outcome_failed_increments_counter(tmp_path, monkeypatch):
     assert r._consecutive_non_success == 1
 
 
-def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch):
+def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.state import RuntimeState
+    import logging
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health != "refresh_broken"
     assert REFRESH_BROKEN_THRESHOLD == 2
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "refresh_broken"
+    # PUF-343: user-facing runtime.error shape mirrors PUF-341's DM;
+    # the outcome-class debug ("unchanged") lives in the daemon log.
+    assert "Claude Code sign-in couldn't be refreshed" in rs.error
     assert "claude auth login" in rs.error
-    assert "unchanged" in rs.error
+    assert any(
+        "flipping refresh_broken" in rec.getMessage() and "unchanged" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
@@ -569,16 +577,25 @@ def test_refreshed_outcome_does_not_lift_unrelated_health_to_ok(
     assert rs_after.error == ""
 
 
-def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch):
+def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.state import RuntimeState
+    import logging
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
-    r._propagate_outcome(RefreshOutcome.FAILED)
+    with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
     rs = RuntimeState.load(aid)
     assert rs.health == "refresh_broken"
-    # The flip message reports the LATEST outcome class — UNCHANGED
-    # then FAILED → "failed", not "unchanged".
-    assert "failed" in rs.error
+    # PUF-343: the user-visible runtime.error field is the operator-
+    # facing recovery instruction now (matching PUF-341's DM copy). The
+    # LATEST-outcome debug ("failed" vs "unchanged") lives in the daemon
+    # log where an engineer can see it without leaking into the UI.
+    assert "Claude Code sign-in couldn't be refreshed" in rs.error
+    assert "claude auth login" in rs.error
+    assert any(
+        "flipping refresh_broken" in rec.getMessage() and "failed" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 # ── PUF-265 v2: Haiku probe model + rate-limit fast retry ────────────
