@@ -847,7 +847,7 @@ above the card as plain text.
 
 /channel
 name: <channel name without the leading #>
-description: <one-line purpose, MAX ~100 chars>
+description: <one-line purpose, MAX 108 BYTES>
 message: <optional one-liner shown above the card>
 ```
 
@@ -855,9 +855,10 @@ message: <optional one-liner shown above the card>
 
 - **`name`** — the channel name as it'll appear in the sidebar.
   Lowercase ASCII letters / digits / hyphens are safest (matches
-  the server's slug shape).
-- **`description`** — short blurb under the name; the parser
-  truncates anything longer than ~100 chars and warns the human.
+  the server's slug shape); the modal accepts any Unicode.
+- **`description`** — **≤ 108 bytes UTF-8** (same as `suggest-agent`).
+  ASCII = 1 byte; CJK / emoji = 3–4 bytes. The web parser truncates
+  anything longer and warns the human.
 - **`message`** — optional one-liner shown above the card. Good
   place to suggest who should join and why now.
 
@@ -929,10 +930,13 @@ message: <optional one-liner shown alongside the card>
 - **`member`** — the **slug** of the person to invite
   (e.g. `alice-1234`). Slugs only, not display names. Look up the
   slug from a recent message author or via `get_user_info`.
-- **`channel`** — either the channel display name (without `#`) or
-  a raw `ch_<uuid>`. **Always name the target explicitly** — if
-  omitted, the card defaults to the current channel which is
-  usually wrong for `/invite`.
+- **`channel`** — either the channel display name (without `#`,
+  Unicode OK: `测试0630`, `marketing`, `oauth-rollout`) **or** a raw
+  `ch_<uuid>`. **Prefer `ch_<uuid>` when you have it** — names
+  collide across spaces and Unicode names can render
+  inconsistently in the operator's modal. **Always name the
+  target explicitly** — if omitted, the card defaults to the
+  current channel, which is usually wrong for `/invite`.
 - **`message`** — optional rationale for the human; renders above
   the card.
 
