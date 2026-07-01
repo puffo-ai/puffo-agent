@@ -668,11 +668,11 @@ async def update_profile(request: web.Request) -> web.Response:
         cfg.role_short,
     )
 
-    # reload.flag is lazy + session-preserving; right primitive for
-    # any prompt-affecting change.
+    # refresh_agent.flag is lazy + session-preserving; right primitive
+    # for any prompt-affecting change.
     if renamed or stripped_summary is not None or isinstance(new_role, str):
-        from ..profile_sync import write_reload_flag
-        write_reload_flag(cfg, reason="bridge profile edit")
+        from ..profile_sync import write_refresh_agent_flag
+        write_refresh_agent_flag(cfg, reason="bridge profile edit")
 
     # Server sync LAST so a failure can't drop the local edit.
     if profile_patch:

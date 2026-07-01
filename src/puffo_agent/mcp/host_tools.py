@@ -336,19 +336,80 @@ def _codex_mcp_server_names(home: Path) -> list[str]:
     return [name for name in raw.keys() if isinstance(name, str)]
 
 
-def _write_refresh_flag(workspace: Path, model: Optional[str]) -> Path:
-    """Drop the refresh-flag file the worker watches on next turn.
-    ``model``: None = no override, non-empty = switch to that model,
-    ``""`` = clear back to the daemon default."""
-    payload: dict[str, Any] = {"requested_at": int(time.time())}
-    if model is not None:
-        if not isinstance(model, str):
-            raise RuntimeError("model must be a string (or omitted)")
-        payload["model"] = model.strip()
-    flag_path = workspace / ".puffo-agent" / "refresh.flag"
+_WORKER_REFRESH_FLAGS: frozenset[str] = frozenset({
+    "refresh_agent", "refresh_host_sync", "refresh_session",
+})
+
+
+def _touch_refresh_flag(workspace: Path, name: str) -> Path:
+    """Drop a worker-scope refresh flag (``refresh_agent`` /
+    ``refresh_host_sync`` / ``refresh_session``) at
+    ``<workspace>/.puffo-agent/<name>.flag`` with a
+    ``{requested_at}`` payload."""
+    if name not in _WORKER_REFRESH_FLAGS:
+        raise RuntimeError(
+            f"unknown worker refresh flag {name!r}; "
+            f"expected one of {sorted(_WORKER_REFRESH_FLAGS)}"
+        )
+    flag_path = workspace / ".puffo-agent" / f"{name}.flag"
+    payload = {"requested_at": int(time.time())}
     try:
         flag_path.parent.mkdir(parents=True, exist_ok=True)
         flag_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     except OSError as exc:
-        raise RuntimeError(f"could not write refresh flag: {exc}") from exc
+        raise RuntimeError(
+            f"could not write {name}.flag: {exc}"
+        ) from exc
+    return flag_path
+
+
+def _write_refresh_model_flag(
+    workspace: Path, *, harness: str, model: str,
+) -> Path:
+    """Drop the daemon-scope ``refresh_model.flag`` with
+    ``{harness, model, requested_at}``. Daemon re-validates the
+    payload before persisting to agent.yml; invalid payload → flag
+    renamed ``.broken``."""
+    flag_path = workspace / ".puffo-agent" / "refresh_model.flag"
+    payload = {
+        "harness": harness,
+        "model": model,
+        "requested_at": int(time.time()),
+    }
+    try:
+        flag_path.parent.mkdir(parents=True, exist_ok=True)
+        flag_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not write refresh_model.flag: {exc}"
+        ) from exc
+    return flag_path
+
+
+def _write_refresh_runtime_flag(
+    workspace: Path,
+    *,
+    kind: str,
+    harness: Optional[str] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> Path:
+    """Drop the daemon-scope ``refresh_runtime.flag`` — used by CLI +
+    tray UI when ``runtime.kind`` changes. Payload can carry the full
+    runtime block delta; daemon re-validates before applying."""
+    flag_path = workspace / ".puffo-agent" / "refresh_runtime.flag"
+    payload: dict[str, Any] = {"kind": kind, "requested_at": int(time.time())}
+    if harness is not None:
+        payload["harness"] = harness
+    if model is not None:
+        payload["model"] = model
+    if provider is not None:
+        payload["provider"] = provider
+    try:
+        flag_path.parent.mkdir(parents=True, exist_ok=True)
+        flag_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not write refresh_runtime.flag: {exc}"
+        ) from exc
     return flag_path

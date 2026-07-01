@@ -423,12 +423,28 @@ class CodexSession:
             },
         )
 
-    async def reload(self, new_system_prompt: str) -> None:
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
         """Tear the codex App Server process down so the next turn
-        re-spawns it and re-reads config.toml + AGENTS.md."""
+        re-spawns it and re-reads config.toml + AGENTS.md.
+
+        ``with_session=True`` also unlinks ``codex_session.json`` so
+        the next spawn starts a new conversation."""
         self.current_instructions = new_system_prompt
         async with self._lock:
             await self._teardown_locked()
+        if with_session:
+            try:
+                self.session_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't unlink codex session file %s: %s",
+                    self.agent_id, self.session_file, exc,
+                )
+            self._conversation_id = ""
 
     async def aclose(self) -> None:
         async with self._lock:

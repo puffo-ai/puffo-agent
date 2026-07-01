@@ -1,6 +1,7 @@
-"""Shared helpers: PATCH ``/identities/self``, write reload.flag,
-push every server-tracked field in one shot (startup full-sync),
-and extract the soul section from a profile.md."""
+"""Shared helpers: PATCH ``/identities/self``, drop
+refresh_agent.flag, push every server-tracked field in one shot
+(startup full-sync), and extract the soul section from a
+profile.md."""
 
 from __future__ import annotations
 
@@ -96,10 +97,11 @@ async def sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
         await http.close()
 
 
-def write_reload_flag(cfg: AgentConfig, *, reason: str) -> None:
-    """Drop ``reload.flag`` so the worker rebuilds its system prompt
-    on the next batch. Best-effort."""
-    flag_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "reload.flag"
+def write_refresh_agent_flag(cfg: AgentConfig, *, reason: str) -> None:
+    """Drop ``refresh_agent.flag`` so the worker rebuilds its system
+    prompt on the next batch. Best-effort."""
+    from .state import refresh_agent_flag_path
+    flag_path = refresh_agent_flag_path(cfg.resolve_workspace_dir())
     try:
         flag_path.parent.mkdir(parents=True, exist_ok=True)
         flag_path.write_text(
@@ -112,7 +114,7 @@ def write_reload_flag(cfg: AgentConfig, *, reason: str) -> None:
         )
     except OSError as exc:
         logger.warning(
-            "reload.flag write failed for agent=%s (%s): %s",
+            "refresh_agent.flag write failed for agent=%s (%s): %s",
             cfg.id, reason, exc,
         )
 

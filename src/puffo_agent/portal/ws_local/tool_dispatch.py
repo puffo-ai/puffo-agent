@@ -3,10 +3,10 @@
 Reuses ``mcp.puffo_core_tools.register_core_tools`` by feeding it a
 FastMCP stand-in that captures handlers by name. ws-local exposes the
 message-shaped + read/navigation tools; harness/host/identity ops
-(``refresh``, ``reload_system_prompt``, ``install_*``, ``*_skill``,
-``*_mcp_server``, ``list_mcp_servers``, ``sync_host_mcp``) are filtered
-out — the harness, skills, and host config belong to the attached tool,
-not to puffo-agent.
+(``refresh``, ``install_*``, ``*_skill``, ``*_mcp_server``,
+``list_mcp_servers``, ``sync_host_mcp``) are filtered out — the
+harness, skills, and host config belong to the attached tool, not to
+puffo-agent.
 """
 
 from __future__ import annotations

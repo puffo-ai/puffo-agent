@@ -17,6 +17,10 @@ from ..state import (
     archive_flag_path,
     archived_dir,
     discover_agents,
+    refresh_agent_flag_path,
+    refresh_host_sync_flag_path,
+    refresh_model_flag_path,
+    refresh_session_flag_path,
     restart_flag_path,
 )
 from . import machine_auth
@@ -49,6 +53,88 @@ def _is_already_archived(agent_slug: str) -> bool:
 def _touch_flag(path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
+
+
+def _write_flag_payload(path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _apply_refresh(agent_slug: str, params: dict) -> dict:
+    """Control-ws mirror of the MCP ``refresh()`` tool. Same four
+    axes; ``kind`` is CLI + tray UI only and is rejected here."""
+    import time as _time
+
+    if "kind" in params:
+        return {
+            "ok": False,
+            "error": (
+                "refresh over control-ws cannot change runtime kind; "
+                "use puffo-agent CLI or the tray UI."
+            ),
+        }
+    harness = params.get("harness")
+    model = params.get("model")
+    host_sync = bool(params.get("host_sync", False))
+    session = bool(params.get("session", False))
+    if (harness is None) != (model is None):
+        return {
+            "ok": False,
+            "error": "harness and model must be provided together (or both omitted)",
+        }
+
+    try:
+        cfg = AgentConfig.load(agent_slug)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    runtime_kind = cfg.runtime.kind
+    if runtime_kind not in ("cli-local", "cli-docker"):
+        return {
+            "ok": False,
+            "error": (
+                f"refresh requires cli-local or cli-docker; agent is "
+                f"kind={runtime_kind!r}"
+            ),
+        }
+    if (
+        host_sync
+        and runtime_kind == "cli-docker"
+        and not session
+        and harness is None
+    ):
+        return {
+            "ok": False,
+            "error": (
+                "refresh(host_sync=True) on cli-docker requires "
+                "session=True or a harness+model swap"
+            ),
+        }
+
+    workspace = cfg.resolve_workspace_dir()
+    now = int(_time.time())
+    touched: list[str] = []
+    if harness is not None:
+        _write_flag_payload(
+            refresh_model_flag_path(workspace),
+            {"harness": str(harness), "model": str(model), "requested_at": now},
+        )
+        touched.append("refresh_model")
+    else:
+        _write_flag_payload(
+            refresh_agent_flag_path(workspace), {"requested_at": now},
+        )
+        touched.append("refresh_agent")
+        if host_sync:
+            _write_flag_payload(
+                refresh_host_sync_flag_path(workspace), {"requested_at": now},
+            )
+            touched.append("refresh_host_sync")
+        if session:
+            _write_flag_payload(
+                refresh_session_flag_path(workspace), {"requested_at": now},
+            )
+            touched.append("refresh_session")
+    return {"ok": True, "touched": touched}
 
 
 async def _materialize_slug_binding(
@@ -146,8 +232,7 @@ async def execute_command(
         _touch_flag(archive_flag_path(agent_slug))
         return {"ok": True}
     if op == "refresh":
-        _touch_flag(restart_flag_path(agent_slug))
-        return {"ok": True}
+        return _apply_refresh(agent_slug, params)
     if op == "edit":
         cfg = AgentConfig.load(agent_slug)
         patch: dict = {}
@@ -198,14 +283,15 @@ async def execute_command(
                 await _sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
-        # restart.flag for runtime (spawn-args change); reload.flag
-        # for prompt-only (lazy, preserves the AI session).
-        if cfg.state == "running":
-            if runtime_changed:
-                _touch_flag(restart_flag_path(agent_slug))
-            elif prompt_changed:
-                from ..profile_sync import write_reload_flag
-                write_reload_flag(cfg, reason="control-ws edit")
+        # Runtime changes flow through the daemon's config-changed
+        # respawn (agent.yml already saved above). Prompt-only edits
+        # drop refresh_agent.flag so the worker rebuilds CLAUDE.md
+        # on its next turn without a respawn.
+        if cfg.state == "running" and prompt_changed and not runtime_changed:
+            _write_flag_payload(
+                refresh_agent_flag_path(cfg.resolve_workspace_dir()),
+                {"requested_at": int(__import__("time").time())},
+            )
         return {"ok": True}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)

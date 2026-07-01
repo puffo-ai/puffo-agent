@@ -763,6 +763,39 @@ def delete_flag_path(agent_id: str) -> Path:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Refresh flags — 5 orthogonal axes touched by MCP refresh() / CLI /
+# control-ws. All live under ``<workspace>/.puffo-agent/`` so the
+# location is reachable from both the worker (host) and the MCP
+# subprocess (cli-docker container's bind-mounted workspace).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def refresh_agent_flag_path(workspace: Path) -> Path:
+    """Baseline: rebuild CLAUDE.md + re-sync shared skills/mcp."""
+    return workspace / ".puffo-agent" / "refresh_agent.flag"
+
+
+def refresh_host_sync_flag_path(workspace: Path) -> Path:
+    """Re-sync host ``~/.claude/skills/`` + host MCP registrations."""
+    return workspace / ".puffo-agent" / "refresh_host_sync.flag"
+
+
+def refresh_session_flag_path(workspace: Path) -> Path:
+    """Drop CLI session token — next spawn skips ``--resume``."""
+    return workspace / ".puffo-agent" / "refresh_session.flag"
+
+
+def refresh_model_flag_path(workspace: Path) -> Path:
+    """Daemon-scope: persist harness+model to agent.yml + full respawn."""
+    return workspace / ".puffo-agent" / "refresh_model.flag"
+
+
+def refresh_runtime_flag_path(workspace: Path) -> Path:
+    """Daemon-scope: persist runtime.kind change (CLI + tray UI only)."""
+    return workspace / ".puffo-agent" / "refresh_runtime.flag"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dataclasses
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -45,6 +45,11 @@ from .state import (
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
+    refresh_agent_flag_path,
+    refresh_host_sync_flag_path,
+    refresh_model_flag_path,
+    refresh_runtime_flag_path,
+    refresh_session_flag_path,
     write_refresh_token_request,
     write_stop_request,
 )
@@ -805,10 +810,10 @@ def _set_agent_state(agent_id: str, new_state: str) -> int:
 
 def cmd_agent_rename(args: argparse.Namespace) -> int:
     """Change display_name on disk, in profile.md heading, on the
-    server identity, and drop reload.flag (mirrors bridge edit)."""
+    server identity, and drop refresh_agent.flag (mirrors bridge edit)."""
     import asyncio
     from ..agent.shared_content import rewrite_profile_name
-    from .profile_sync import sync_agent_profile, write_reload_flag
+    from .profile_sync import sync_agent_profile, write_refresh_agent_flag
 
     agent_id = args.id
     new_name = (args.display_name or "").strip()
@@ -833,7 +838,7 @@ def cmd_agent_rename(args: argparse.Namespace) -> int:
                 f"warning: profile.md heading rewrite failed: {exc}",
                 file=sys.stderr,
             )
-    write_reload_flag(cfg, reason="cli agent rename")
+    write_refresh_agent_flag(cfg, reason="cli agent rename")
     try:
         asyncio.run(sync_agent_profile(cfg, {"display_name": new_name}))
     except Exception as exc:
@@ -1380,6 +1385,117 @@ def _prompt_password_twice(prompt: str) -> str | None:
     return pw
 
 
+def cmd_agent_refresh(args: argparse.Namespace) -> int:
+    """Composite refresh — the CLI mirror of the MCP ``refresh()``
+    tool plus the CLI-only ``--kind`` axis. Drops one or more flag
+    files under ``<workspace>/.puffo-agent/``; the daemon + worker
+    reconcile them on the next tick / turn."""
+    import json
+
+    agent_id = args.id
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return 2
+    try:
+        cfg = AgentConfig.load(agent_id)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    model_swap: tuple[str, str] | None = None
+    if args.model is not None:
+        raw = args.model.strip()
+        if ":" not in raw:
+            print("error: --model must be harness:model (e.g. codex:gpt-5)", file=sys.stderr)
+            return 2
+        harness, model_id = raw.split(":", 1)
+        harness = harness.strip()
+        model_id = model_id.strip()
+        if not harness or not model_id:
+            print("error: --model must be non-empty harness:model", file=sys.stderr)
+            return 2
+        model_swap = (harness, model_id)
+
+    kind = args.kind.strip() if args.kind is not None else None
+    swap_requested = bool(model_swap or kind)
+    if swap_requested and (args.host_sync or args.session):
+        print(
+            "error: --host-sync / --session are worker-scope; they're "
+            "subsumed by the full respawn from --model / --kind. Drop "
+            "them or drop the swap flag.",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        cfg.runtime.kind == "cli-docker"
+        and args.host_sync
+        and not args.session
+        and not swap_requested
+    ):
+        print(
+            "error: --host-sync on cli-docker requires --session (the "
+            "container has to restart to pick up new host skills/MCP).",
+            file=sys.stderr,
+        )
+        return 2
+
+    workspace = cfg.resolve_workspace_dir()
+    (workspace / ".puffo-agent").mkdir(parents=True, exist_ok=True)
+    now = int(time.time())
+    touched: list[str] = []
+
+    if kind is not None:
+        payload: dict[str, str | int] = {"kind": kind, "requested_at": now}
+        if model_swap is not None:
+            payload["harness"], payload["model"] = model_swap
+        refresh_runtime_flag_path(workspace).write_text(
+            json.dumps(payload), encoding="utf-8",
+        )
+        touched.append(
+            f"refresh_runtime.flag (kind={kind!r}"
+            + (
+                f" harness={model_swap[0]!r} model={model_swap[1]!r}"
+                if model_swap else ""
+            )
+            + ")"
+        )
+    elif model_swap is not None:
+        refresh_model_flag_path(workspace).write_text(
+            json.dumps({
+                "harness": model_swap[0],
+                "model": model_swap[1],
+                "requested_at": now,
+            }),
+            encoding="utf-8",
+        )
+        touched.append(
+            f"refresh_model.flag (harness={model_swap[0]!r} "
+            f"model={model_swap[1]!r})"
+        )
+    else:
+        refresh_agent_flag_path(workspace).write_text(
+            json.dumps({"requested_at": now}), encoding="utf-8",
+        )
+        touched.append("refresh_agent.flag")
+        if args.host_sync:
+            refresh_host_sync_flag_path(workspace).write_text(
+                json.dumps({"requested_at": now}), encoding="utf-8",
+            )
+            touched.append("refresh_host_sync.flag")
+        if args.session:
+            refresh_session_flag_path(workspace).write_text(
+                json.dumps({"requested_at": now}), encoding="utf-8",
+            )
+            touched.append("refresh_session.flag")
+
+    print(f"agent {agent_id!r}: dropped " + ", ".join(touched))
+    if is_daemon_alive():
+        print(
+            "daemon + worker will pick up the flags on the next tick / turn."
+        )
+    return 0
+
+
 def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
     """Re-seed the shared platform primer to this install's version,
     then rebuild the listed agents' managed CLAUDE.md from it.
@@ -1429,7 +1545,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
             print(
                 "note: a running worker keeps its already-loaded prompt — "
                 "the rebuilt CLAUDE.md takes effect when the agent's worker "
-                "next restarts (or it calls reload_system_prompt)."
+                "next restarts (or it calls refresh())."
             )
         else:
             print(
@@ -1837,6 +1953,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="agent id(s) whose CLAUDE.md to rebuild",
     )
     reset_primer.set_defaults(func=cmd_agent_reset_primer)
+
+    refresh = agent_sub.add_parser(
+        "refresh",
+        help=(
+            "Drop one or more refresh flags. No flags = rebuild CLAUDE.md "
+            "+ re-sync shared skills."
+        ),
+    )
+    refresh.add_argument("id", help="agent id")
+    refresh.add_argument(
+        "--host-sync",
+        action="store_true",
+        help="also re-sync ~/.claude/skills + host MCP registrations",
+    )
+    refresh.add_argument(
+        "--session",
+        action="store_true",
+        help="also drop the CLI session token (fresh conversation on next spawn)",
+    )
+    refresh.add_argument(
+        "--model",
+        default=None,
+        metavar="HARNESS:MODEL",
+        help="swap (harness, model); e.g. codex:gpt-5, claude-code:sonnet-4-5",
+    )
+    refresh.add_argument(
+        "--kind",
+        default=None,
+        help="swap runtime kind; CLI-only (MCP + web app cannot change this)",
+    )
+    refresh.set_defaults(func=cmd_agent_refresh)
 
     # Bridge / local HTTP API admin.
     pairing = sub.add_parser(

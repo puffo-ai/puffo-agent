@@ -49,6 +49,8 @@ from .state import (
     home_dir,
     is_daemon_alive,
     read_daemon_pid,
+    refresh_model_flag_path,
+    refresh_runtime_flag_path,
     refresh_token_request_path,
     restart_flag_path,
     stop_request_path,
@@ -256,6 +258,11 @@ class Daemon:
                         "agent %s: couldn't remove restart.flag: %s",
                         agent_id, exc,
                     )
+
+        # refresh_model.flag + refresh_runtime.flag → mutate agent.yml;
+        # the config-changed check further down triggers the restart.
+        for agent_id in sorted(on_disk):
+            _process_daemon_refresh_flags(agent_id)
 
         # Agents on disk → check state and (start | stop | leave alone).
         for agent_id in sorted(on_disk):
@@ -753,6 +760,158 @@ def _worker_needs_restart(old, new) -> bool:
         or old.profile != new.profile
         or old.runtime != new.runtime
     )
+
+
+_DAEMON_REFRESH_HARNESSES: tuple[str, ...] = ("claude-code", "codex")
+
+
+def _validate_daemon_refresh_model(harness: str, model: str) -> None:
+    if harness not in _DAEMON_REFRESH_HARNESSES:
+        raise ValueError(
+            f"harness={harness!r} not supported (choose one of "
+            f"{list(_DAEMON_REFRESH_HARNESSES)})"
+        )
+    from ..agent.cli_bin import resolve_claude_bin, resolve_codex_bin
+    resolver = {
+        "claude-code": resolve_claude_bin,
+        "codex": resolve_codex_bin,
+    }[harness]
+    if resolver() is None:
+        raise ValueError(f"harness={harness!r} CLI not installed on host")
+    from ..agent.model_catalog import provider_models
+    supported = [m.id for m in provider_models(harness) if m.id]
+    if model not in supported:
+        raise ValueError(
+            f"model={model!r} not supported by harness={harness!r}; "
+            f"supported: {supported}"
+        )
+
+
+def _mark_flag_broken(flag_path: Path, reason: str) -> None:
+    """Rename a refresh_*.flag to ``<name>.broken`` with a payload
+    the operator can inspect. Never touches agent.yml."""
+    import json
+    broken = flag_path.with_suffix(flag_path.suffix + ".broken")
+    try:
+        original = flag_path.read_text(encoding="utf-8")
+    except OSError:
+        original = ""
+    body = json.dumps({"error": reason, "original": original}, indent=2)
+    try:
+        broken.write_text(body, encoding="utf-8")
+    except OSError as exc:
+        logger.warning(
+            "couldn't write %s: %s", broken, exc,
+        )
+    try:
+        flag_path.unlink()
+    except OSError:
+        pass
+
+
+def _process_daemon_refresh_flags(agent_id: str) -> None:
+    """Consume ``refresh_model.flag`` + ``refresh_runtime.flag`` at
+    ``<workspace>/.puffo-agent/`` for one agent. Validates payload,
+    mutates ``agent.yml`` on success, renames to ``.broken`` on
+    failure. Restart is triggered separately by the reconcile loop's
+    config-changed check.
+    """
+    import json
+    try:
+        agent_cfg = AgentConfig.load(agent_id)
+    except Exception as exc:
+        logger.warning(
+            "agent %s: couldn't load agent.yml for refresh flags: %s",
+            agent_id, exc,
+        )
+        return
+    workspace = agent_cfg.resolve_workspace_dir()
+
+    model_flag = refresh_model_flag_path(workspace)
+    if model_flag.exists():
+        try:
+            payload = json.loads(model_flag.read_text(encoding="utf-8") or "{}")
+            harness = str(payload.get("harness") or "")
+            model = str(payload.get("model") or "")
+            _validate_daemon_refresh_model(harness, model)
+        except Exception as exc:
+            logger.warning(
+                "agent %s: refresh_model.flag invalid (%s); marking broken",
+                agent_id, exc,
+            )
+            _mark_flag_broken(model_flag, str(exc))
+        else:
+            agent_cfg.runtime.harness = harness
+            agent_cfg.runtime.model = model
+            try:
+                agent_cfg.save()
+                logger.info(
+                    "agent %s: refresh_model applied (harness=%r model=%r)",
+                    agent_id, harness, model,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: couldn't save agent.yml on refresh_model: %s",
+                    agent_id, exc,
+                )
+            try:
+                model_flag.unlink()
+            except OSError:
+                pass
+
+    runtime_flag = refresh_runtime_flag_path(workspace)
+    if runtime_flag.exists():
+        try:
+            payload = json.loads(runtime_flag.read_text(encoding="utf-8") or "{}")
+            kind = str(payload.get("kind") or "")
+            new_harness = payload.get("harness")
+            new_model = payload.get("model")
+            new_provider = payload.get("provider")
+            from .runtime_matrix import validate_triple
+            candidate_harness = (
+                str(new_harness) if new_harness is not None
+                else agent_cfg.runtime.harness
+            )
+            candidate_provider = (
+                str(new_provider) if new_provider is not None
+                else agent_cfg.runtime.provider
+            )
+            result = validate_triple(kind, candidate_provider, candidate_harness)
+            if not result.ok:
+                raise ValueError(result.error)
+            if new_model is not None and candidate_harness in _DAEMON_REFRESH_HARNESSES:
+                _validate_daemon_refresh_model(
+                    candidate_harness, str(new_model),
+                )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: refresh_runtime.flag invalid (%s); marking broken",
+                agent_id, exc,
+            )
+            _mark_flag_broken(runtime_flag, str(exc))
+        else:
+            agent_cfg.runtime.kind = kind
+            if new_harness is not None:
+                agent_cfg.runtime.harness = str(new_harness)
+            if new_provider is not None:
+                agent_cfg.runtime.provider = str(new_provider)
+            if new_model is not None:
+                agent_cfg.runtime.model = str(new_model)
+            try:
+                agent_cfg.save()
+                logger.info(
+                    "agent %s: refresh_runtime applied (kind=%r)",
+                    agent_id, kind,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: couldn't save agent.yml on refresh_runtime: %s",
+                    agent_id, exc,
+                )
+            try:
+                runtime_flag.unlink()
+            except OSError:
+                pass
 
 
 def _install_posix_stop_handlers(loop, handle_signal) -> bool:

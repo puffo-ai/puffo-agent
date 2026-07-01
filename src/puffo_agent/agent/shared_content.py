@@ -181,12 +181,15 @@ below is the authoritative reference.
   daemon's profile cache. Use when the operator mentions someone
   renamed themselves or you see a stale name in the prompt.
 
-**Self-management (claude-code only):**
-- `reload_system_prompt()` — rebuild system prompt from disk +
-  restart subprocess after editing profile/memory/CLAUDE.md.
-- `refresh(model=None)` — respawn subprocess; optional model switch.
-  Valid models: `claude-opus-4-7`, `claude-sonnet-4-6`,
-  `claude-haiku-4-5`.
+**Self-management (cli-local + cli-docker):**
+- `refresh(harness=None, model=None, host_sync=False, session=False)` —
+  four orthogonal axes. No args → rebuild CLAUDE.md + re-sync puffo
+  skills. `host_sync=True` also re-syncs the operator's host skills
+  + MCP. `session=True` drops your CLI session so the next spawn
+  starts fresh (no `--resume`). Pass `harness` + `model` together
+  to swap harness (`claude-code`, `codex`) or model — a full worker
+  respawn follows automatically. See the `refresh` skill for the
+  full flag matrix.
 - `install_host_mcp(template_id)` — lay a catalog MCP spec into the
   operator's host `~/.claude.json` so they can complete OAuth there.
   Pair with `sync_host_mcp` once they confirm. See the
@@ -583,48 +586,53 @@ has a 10-min TTL so repeated calls inside that window are stable.
 """
 
 
-DEFAULT_SKILL_RELOAD = """\
-# Skill: reload_system_prompt
+DEFAULT_SKILL_REFRESH = """\
+# Skill: refresh
 
-Rebuild your system prompt from disk and restart your claude
-subprocess so fresh edits to your `profile.md`, `memory/*.md`, or
-project-level `CLAUDE.md` take effect on your NEXT message.
+Bring your on-disk state (system prompt, skills, MCP registry, CLI
+session, harness+model) into your live process. Four orthogonal
+axes; combine them freely.
 
-**Tool:** `mcp__puffo__reload_system_prompt`
+**Tool:** `mcp__puffo__refresh`
 
-**Arguments:** none.
+**Arguments:**
+- `harness` (optional) — `"claude-code"` or `"codex"`
+- `model` (optional) — a model id valid for `harness`
+- `host_sync` (optional, bool) — also re-sync operator's host
+  `~/.claude/skills/` + host MCP registrations
+- `session` (optional, bool) — drop CLI session token so next spawn
+  starts a fresh conversation (no `--resume`)
+
+`harness` and `model` must be provided together (or both omitted).
+
+**Behaviour matrix:**
+
+| Call | What happens |
+|------|--------------|
+| `refresh()` | Rebuild `CLAUDE.md` + re-sync puffo default skills. Subprocess respawns on next turn, session preserved. |
+| `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
+| `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
+| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
 
 **When to use:**
-- You just edited your workspace `CLAUDE.md` and want the change in
-  your next system prompt rather than waiting for a daemon restart.
-- You wrote a new `memory/<topic>.md` and want it folded in now.
-- You (or the operator) edited `profile.md` and want the new role
-  live immediately.
-
-**How it works:**
-1. Your current reply goes through normally — the subprocess stays
-   alive until the turn ends.
-2. When the next message arrives, the daemon regenerates your
-   managed `~/.claude/CLAUDE.md` (shared primer + profile + memory),
-   closes your claude subprocess, spawns a new one with `--resume`
-   pointing at your existing session id, and then runs the turn.
-3. Conversation history is preserved; the system prompt is fresh.
-
-**Caveat:** the reload does NOT run retroactively on the message you
-used to call it. Expect one "free" message between edit and effect.
+- Edited `CLAUDE.md`, `profile.md`, `memory/*.md` → `refresh()`.
+- Installed a new skill / MCP → `refresh()`.
+- Operator added a new skill to their `~/.claude/skills/` → tell them
+  to call it "host-sync" and use `refresh(host_sync=True[, session=True])`.
+- Conversation feels stuck / context is polluted → `refresh(session=True)`.
+- Operator asked you to try a different model → confirm harness +
+  model with them, then `refresh(harness=..., model=...)`.
 
 **When NOT to use:**
-- Every turn — the reload has a real cost (tear down + re-spawn ~5s
-  for cli-docker). Batch your edits and call reload once.
-- To force a fresh conversation — this preserves history via
-  `--resume`. Ask the operator if you actually want a new session.
+- Every turn — worker-scope refresh is cheap (~1s), but the
+  harness+model swap is a full respawn (~5-10s for cli-docker).
+  Batch your edits.
+- To change `runtime.kind` (cli-local ↔ cli-docker) — MCP tool cannot
+  do this; only `puffo-agent agent refresh --kind` or the tray UI.
 
-**Sibling tool: `refresh`.** A lighter-weight alternative when you
-only want to pick up new skills / MCP servers / a model override
-WITHOUT a full prompt rebuild. The `refresh` tool just respawns the
-subprocess; it doesn't regenerate `CLAUDE.md` from disk. Reach for
-`reload_system_prompt` when you've changed the prompt content;
-reach for `refresh` after `install_skill` / `install_mcp_server`.
+**Caveat:** the refresh does NOT apply retroactively to the message
+that called it. Expect one "free" message between the call and its
+effect.
 """
 
 
@@ -1009,9 +1017,9 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         "Look up a user's slug, display_name, and avatar_url.",
         DEFAULT_SKILL_GET_USER_INFO,
     ),
-    "reload-system-prompt": (
-        "Rebuild your system prompt from disk after editing profile/memory.",
-        DEFAULT_SKILL_RELOAD,
+    "refresh": (
+        "Bring on-disk state (CLAUDE.md, skills, MCP, session, harness+model) into your live process.",
+        DEFAULT_SKILL_REFRESH,
     ),
     "use-host-mcp": (
         "Bring an MCP that needs operator-side OAuth/credentials from "
