@@ -14,6 +14,7 @@ import base64
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +37,7 @@ from ..state import (
     delete_flag_path,
     discover_agents,
     is_valid_agent_id,
+    refresh_agent_flag_path,
     restart_flag_path,
 )
 from .certs import (
@@ -325,10 +327,15 @@ async def list_agents(request: web.Request) -> web.Response:
             items.append({"id": aid, "error": str(exc)})
             continue
         rs = RuntimeState.load(aid)
-        # Override runtime_status to ``restarting`` while a restart
-        # flag is pending so the UI shows a busy state immediately
-        # instead of the pre-flag ``running`` snapshot.
-        restart_pending = restart_flag_path(aid).exists()
+        # Override runtime_status to ``restarting`` while any user-
+        # facing "restart" flag is pending (refresh_agent from the UI
+        # or the daemon-internal restart from auth recovery) so the
+        # UI shows a busy state immediately.
+        workspace = cfg.resolve_workspace_dir()
+        restart_pending = (
+            refresh_agent_flag_path(workspace).exists()
+            or restart_flag_path(aid).exists()
+        )
         rs_status = "restarting" if restart_pending else (rs.status if rs else "unknown")
         items.append({
             "id": aid,
@@ -823,10 +830,11 @@ def _runtime_state_dict(rs: RuntimeState | None) -> dict | None:
 
 
 # ────────────────────────────────────────────────────────────────────
-# /v1/agents/{id}/restart (POST) — drops a ``restart.flag`` sentinel
-# in the agent dir; the daemon reconciler picks it up on the next
-# tick, stops the worker (which auto-respawns because desired_state
-# stays ``running``), and removes the flag.
+# /v1/agents/{id}/restart (POST) — the operator-facing "Restart"
+# button. Semantically ``refresh()`` with no args: drop
+# ``refresh_agent.flag`` at ``<workspace>/.puffo-agent/`` and let the
+# worker rebuild CLAUDE.md + re-sync default skills on the next turn.
+# The daemon-internal ``restart.flag`` is reserved for auth-recovery.
 # ────────────────────────────────────────────────────────────────────
 
 
@@ -842,20 +850,29 @@ async def restart_agent(request: web.Request) -> web.Response:
             {"error": "only the agent's operator can restart it"},
             status=403,
         )
-    flag = restart_flag_path(agent_id)
+    try:
+        cfg = AgentConfig.load(agent_id)
+    except Exception as exc:  # noqa: BLE001
+        return web.json_response(
+            {"error": f"could not load agent config: {exc}"}, status=500,
+        )
+    flag = refresh_agent_flag_path(cfg.resolve_workspace_dir())
     try:
         flag.parent.mkdir(parents=True, exist_ok=True)
-        flag.write_text("requested", encoding="utf-8")
+        flag.write_text(
+            json.dumps({"requested_at": int(time.time())}),
+            encoding="utf-8",
+        )
     except OSError as exc:
         return web.json_response(
-            {"error": f"could not write restart flag: {exc}"},
+            {"error": f"could not write refresh_agent flag: {exc}"},
             status=500,
         )
-    logger.info("bridge: restart requested for agent=%s", agent_id)
+    logger.info("bridge: restart (refresh_agent) requested for agent=%s", agent_id)
     return web.json_response({
         "agent_id": agent_id,
         "ok": True,
-        "note": "daemon will stop + respawn this agent on the next reconcile tick (~2s)",
+        "note": "worker will rebuild CLAUDE.md + reload on its next turn",
     })
 
 

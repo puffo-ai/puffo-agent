@@ -48,11 +48,7 @@ from ...runtime_matrix import (
     harness_applies,
     validate_triple,
 )
-from ...state import (
-    AgentConfig,
-    cli_session_json_path,
-    restart_flag_path,
-)
+from ...state import AgentConfig
 from ..names import resolve_display_name
 from .avatar import initial_pixmap
 
@@ -481,7 +477,7 @@ class AgentDetail(QWidget):
         self._flip_state(target)
 
     def _on_refresh_session(self) -> None:
-        if not self._agent_id:
+        if not self._agent_id or not self._cfg:
             return
         confirm = QMessageBox.question(
             self,
@@ -492,16 +488,18 @@ class AgentDetail(QWidget):
         )
         if confirm != QMessageBox.Yes:
             return
-        session_path = cli_session_json_path(self._agent_id)
+        # refresh(session=True) semantics: drop refresh_agent.flag +
+        # refresh_session.flag; the worker unlinks cli_session.json
+        # via adapter.reload(with_session=True) on the next turn.
+        import json
+        import time
+        workspace = self._cfg.resolve_workspace_dir()
+        pa_dir = workspace / ".puffo-agent"
         try:
-            session_path.unlink(missing_ok=True)
-        except OSError as exc:
-            QMessageBox.warning(self, "Refresh session", f"could not clear session: {exc}")
-            return
-        try:
-            flag = restart_flag_path(self._agent_id)
-            flag.parent.mkdir(parents=True, exist_ok=True)
-            flag.write_text("refresh-session", encoding="utf-8")
+            pa_dir.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps({"requested_at": int(time.time())})
+            (pa_dir / "refresh_agent.flag").write_text(payload, encoding="utf-8")
+            (pa_dir / "refresh_session.flag").write_text(payload, encoding="utf-8")
         except OSError as exc:
             QMessageBox.warning(self, "Refresh session", f"could not write flag: {exc}")
 
