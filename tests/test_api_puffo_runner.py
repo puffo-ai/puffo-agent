@@ -26,9 +26,7 @@ from puffo_agent_cloud.bundle import (
     materialise_agent_dir,
 )
 from puffo_agent_cloud.cloud_client import (
-    BridgeError,
     CloudBridgeClient,
-    CloudLlmClient,
 )
 from puffo_agent_cloud.tools import dispatch_tool
 
@@ -351,3 +349,56 @@ async def test_runner_end_to_end_message_llm_tool_ack():
         "msg_inject_001" in (a.get("envelope_ids") or [])
         for a in bridge_app.recv_ack
     )
+
+
+@pytest.mark.asyncio
+async def test_runner_auto_replies_text_to_dm_sender():
+    """A plain-text (non-tool) LLM answer is auto-posted back to the DM sender.
+
+    A model that answers in text without calling ``send_message`` still gets its
+    reply delivered — the runner posts the text to the originating DM sender.
+    Guards the cloud-e2e auto-reply path (see CHANGES-cloud-e2e.md)."""
+    _isolated_home()
+    bridge_app = _MockBridgeApp()
+    bridge_app.pending_messages.append({
+        "type": "message",
+        "envelope_id": "msg_inject_txt",
+        "sender_slug": "human-user",
+        "recipient_slug": "rb-bot",
+        "sent_at": 0,
+        "plaintext": "what is 2 + 2?",
+    })
+
+    async def llm_complete(request: web.Request) -> web.Response:
+        # Plain text, no tool_use → the runner must auto-post it.
+        return web.json_response({
+            "stop_reason": "end_turn",
+            "content": [{"type": "text", "text": "4"}],
+        })
+
+    app = _build_app(bridge_app, llm_handler=llm_complete)
+    async with TestClient(TestServer(app)) as client:
+        url = str(client.make_url("")).rstrip("/")
+        bundle = _valid_bundle(slug="rb-bot", cloud_url=url)
+        materialise_agent_dir(bundle)
+
+        from puffo_agent_cloud.runner import ApiPuffoRunner
+        stop = asyncio.Event()
+        runner = ApiPuffoRunner("rb-bot", stop)
+        run_task = asyncio.create_task(runner.run())
+        for _ in range(80):
+            await asyncio.sleep(0.1)
+            if bridge_app.recv_send:
+                break
+        stop.set()
+        try:
+            await asyncio.wait_for(run_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+
+    # Exactly one send — the auto-reply — addressed to the DM sender.
+    assert len(bridge_app.recv_send) == 1
+    sent = bridge_app.recv_send[0]
+    assert sent["plaintext"] == "4"
+    assert sent["recipient_slug"] == "human-user"

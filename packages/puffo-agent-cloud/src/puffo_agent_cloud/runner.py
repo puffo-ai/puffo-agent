@@ -258,9 +258,54 @@ class ApiPuffoRunner:
             "api-puffo runner %s: turn (envelope_id=%s, sender=%s, %d chars)",
             self.agent_id, frame.get("envelope_id", "?"), sender, len(text),
         )
-        await self._run_turn(text)
+        reply, posted = await self._run_turn(text)
 
-    async def _run_turn(self, user_text: str) -> None:
+        # Auto-reply: if the model answered in text without calling send_message,
+        # deliver that text back to where the message came from — a DM to the
+        # sender, or the originating channel. Lets a plain (non-tool-using) model
+        # hold a conversation; a model that already sent via the tool set
+        # ``posted`` and is skipped here.
+        if reply and not posted and self._bridge is not None:
+            space_id = frame.get("space_id")
+            channel_id = frame.get("channel_id")
+            try:
+                if space_id and channel_id:
+                    await self._bridge.send_send(
+                        plaintext=reply, space_id=space_id, channel_id=channel_id,
+                    )
+                    logger.info(
+                        "api-puffo runner %s: auto-replied to channel %s/%s (%d chars)",
+                        self.agent_id, space_id, channel_id, len(reply),
+                    )
+                elif sender and sender != "?":
+                    await self._bridge.send_send(
+                        plaintext=reply, recipient_slug=sender,
+                    )
+                    logger.info(
+                        "api-puffo runner %s: auto-replied to %s (%d chars)",
+                        self.agent_id, sender, len(reply),
+                    )
+            except (BridgeError, BridgeClosed) as exc:
+                logger.warning(
+                    "api-puffo runner %s: auto-reply failed: %s",
+                    self.agent_id, exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "api-puffo runner %s: auto-reply error: %s",
+                    self.agent_id, exc,
+                )
+
+    async def _run_turn(self, user_text: str) -> tuple[str, bool]:
+        """Run the agentic loop for one inbound message.
+
+        Returns ``(reply_text, posted)`` — the final assistant text and whether
+        the agent already delivered a message this turn via the ``send_message``
+        tool. The caller (``_run_turn_for_frame``) uses this to auto-post a
+        plain-text reply back to the DM sender / channel when the model answered
+        in text without calling ``send_message`` (so a simple, non-tool-using
+        model still replies).
+        """
         assert (
             self._llm is not None and self._cfg is not None
             and self._keys is not None and self._bridge is not None
@@ -276,6 +321,7 @@ class ApiPuffoRunner:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": user_text},
         ]
+        posted = False  # set once a send_message tool_use delivers a message
         for round_idx in range(_MAX_TOOL_ROUNDS):
             try:
                 resp = await self._llm.complete(
@@ -291,13 +337,13 @@ class ApiPuffoRunner:
                     "api-puffo runner %s: LLM call failed (round %d): %s",
                     self.agent_id, round_idx, exc,
                 )
-                return
+                return "", posted
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "api-puffo runner %s: LLM transport (round %d): %s",
                     self.agent_id, round_idx, exc,
                 )
-                return
+                return "", posted
 
             content = resp.get("content") or []
             stop_reason = resp.get("stop_reason", "")
@@ -315,7 +361,7 @@ class ApiPuffoRunner:
                         "(rounds=%d, %d chars)",
                         self.agent_id, round_idx + 1, len(reply),
                     )
-                return
+                return reply, posted
 
             tool_results: list[dict[str, Any]] = []
             for tu in tool_uses:
@@ -326,6 +372,10 @@ class ApiPuffoRunner:
                     result = await dispatch_tool(self._bridge, name, args)
                 except BridgeClosed:
                     result = "error: bridge closed mid-turn"
+                # A successful send_message means the agent already delivered its
+                # reply this turn — don't also auto-post the text (avoid a dup).
+                if name == "send_message" and not result.startswith("error:"):
+                    posted = True
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu_id,
@@ -337,6 +387,7 @@ class ApiPuffoRunner:
             "api-puffo runner %s: turn hit %d-round cap without end_turn",
             self.agent_id, _MAX_TOOL_ROUNDS,
         )
+        return "", posted
 
     async def _cleanup(self) -> None:
         if self._bridge is not None:
