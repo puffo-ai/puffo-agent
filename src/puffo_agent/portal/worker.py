@@ -1183,10 +1183,6 @@ class Worker:
             first_post_id = batch[0].get("envelope_id", "")
             channel_id = channel_meta.get("channel_id", "")
 
-            # Honour any refresh_*.flag before the turn so the first
-            # batch after the flag drop picks up fresh state. Batched
-            # so a single call sets host_sync + rebuild + session
-            # burn into one adapter.reload().
             await _process_refresh_flags(
                 agent_id=agent_id,
                 harness_name=(self.agent_cfg.runtime.harness or "").strip(),
@@ -1547,13 +1543,9 @@ async def _process_refresh_flags(
     refresh_host_sync_flag: Path,
     refresh_session_flag: Path,
 ) -> None:
-    """Batch-process the 3 worker-scope refresh flags at turn start.
-    Any combination is legal: sync_host + agent + session all in one
-    turn → single ``adapter.reload()`` call.
-
-    Order: host sync → CLAUDE.md rebuild → session drop → adapter
-    reload with ``with_session=refresh_session_seen``. Failures are
-    logged but don't drop the turn (stale beats dropped)."""
+    """Consume any worker-scope refresh flags into a single
+    ``adapter.reload(prompt, with_session=…)`` call at turn start.
+    Order: host sync → CLAUDE.md rebuild → session drop."""
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()

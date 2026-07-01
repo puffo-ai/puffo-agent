@@ -1386,10 +1386,8 @@ def _prompt_password_twice(prompt: str) -> str | None:
 
 
 def cmd_agent_refresh(args: argparse.Namespace) -> int:
-    """Composite refresh — the CLI mirror of the MCP ``refresh()``
-    tool plus the CLI-only ``--kind`` axis. Drops one or more flag
-    files under ``<workspace>/.puffo-agent/``; the daemon + worker
-    reconcile them on the next tick / turn."""
+    """CLI mirror of the MCP ``refresh()`` tool plus the CLI-only
+    ``--kind`` axis."""
     import json
 
     agent_id = args.id
@@ -1497,14 +1495,9 @@ def cmd_agent_refresh(args: argparse.Namespace) -> int:
 
 
 def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
-    """Re-sync the shared platform primer + rebuild the listed
-    agents' managed CLAUDE.md.
-
-    Since ``ensure_shared_primer`` now runs on every worker startup,
-    reset-primer is only needed to force a rebuild on an already-
-    running worker WITHOUT waiting for a message (which is what
-    ``refresh_agent.flag`` would do). Handy for testing primer edits.
-    """
+    """Re-sync the shared primer + rebuild the listed agents' CLAUDE.md.
+    ensure_shared_primer runs on every worker startup, so this is only
+    needed to force a rebuild without waiting for a message."""
     from ..agent.shared_content import (
         ensure_shared_primer,
         rebuild_agent_claude_md,

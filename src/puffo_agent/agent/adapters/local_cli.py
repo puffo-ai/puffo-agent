@@ -294,13 +294,9 @@ class LocalCLIAdapter(Adapter):
     async def reload(
         self, new_system_prompt: str, *, with_session: bool = False,
     ) -> None:
-        """Drop cached runtime state so the next turn re-reads everything from disk
-        — instructions, skills, and config. For codex we drop the session cache
-        entirely so the next ``_ensure_codex_session`` re-runs the host→agent
-        config.toml merge.
-
-        ``with_session=True`` also unlinks the session sentinel so the next
-        spawn starts a brand-new conversation (no ``--resume``)."""
+        """Drop the cached subprocess so the next turn re-reads
+        instructions, skills, config. ``with_session=True`` also
+        unlinks the session sentinel."""
         codex_session_file = (
             self._codex_session.session_file if self._codex_session is not None else None
         )

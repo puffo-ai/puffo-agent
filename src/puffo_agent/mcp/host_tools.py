@@ -342,10 +342,7 @@ _WORKER_REFRESH_FLAGS: frozenset[str] = frozenset({
 
 
 def _touch_refresh_flag(workspace: Path, name: str) -> Path:
-    """Drop a worker-scope refresh flag (``refresh_agent`` /
-    ``refresh_host_sync`` / ``refresh_session``) at
-    ``<workspace>/.puffo-agent/<name>.flag`` with a
-    ``{requested_at}`` payload."""
+    """Drop a worker-scope refresh flag with a ``{requested_at}`` payload."""
     if name not in _WORKER_REFRESH_FLAGS:
         raise RuntimeError(
             f"unknown worker refresh flag {name!r}; "
@@ -366,10 +363,7 @@ def _touch_refresh_flag(workspace: Path, name: str) -> Path:
 def _write_refresh_model_flag(
     workspace: Path, *, harness: str, model: str,
 ) -> Path:
-    """Drop the daemon-scope ``refresh_model.flag`` with
-    ``{harness, model, requested_at}``. Daemon re-validates the
-    payload before persisting to agent.yml; invalid payload → flag
-    renamed ``.broken``."""
+    """Drop ``refresh_model.flag`` with ``{harness, model, requested_at}``."""
     flag_path = workspace / ".puffo-agent" / "refresh_model.flag"
     payload = {
         "harness": harness,
@@ -394,9 +388,7 @@ def _write_refresh_runtime_flag(
     model: Optional[str] = None,
     provider: Optional[str] = None,
 ) -> Path:
-    """Drop the daemon-scope ``refresh_runtime.flag`` — used by CLI +
-    tray UI when ``runtime.kind`` changes. Payload can carry the full
-    runtime block delta; daemon re-validates before applying."""
+    """Drop ``refresh_runtime.flag`` — CLI + tray UI only."""
     flag_path = workspace / ".puffo-agent" / "refresh_runtime.flag"
     payload: dict[str, Any] = {"kind": kind, "requested_at": int(time.time())}
     if harness is not None:

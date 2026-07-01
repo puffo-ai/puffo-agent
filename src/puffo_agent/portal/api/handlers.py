@@ -327,10 +327,6 @@ async def list_agents(request: web.Request) -> web.Response:
             items.append({"id": aid, "error": str(exc)})
             continue
         rs = RuntimeState.load(aid)
-        # Override runtime_status to ``restarting`` while any user-
-        # facing "restart" flag is pending (refresh_agent from the UI
-        # or the daemon-internal restart from auth recovery) so the
-        # UI shows a busy state immediately.
         workspace = cfg.resolve_workspace_dir()
         restart_pending = (
             refresh_agent_flag_path(workspace).exists()
@@ -829,13 +825,8 @@ def _runtime_state_dict(rs: RuntimeState | None) -> dict | None:
     }
 
 
-# ────────────────────────────────────────────────────────────────────
-# /v1/agents/{id}/restart (POST) — the operator-facing "Restart"
-# button. Semantically ``refresh()`` with no args: drop
-# ``refresh_agent.flag`` at ``<workspace>/.puffo-agent/`` and let the
-# worker rebuild CLAUDE.md + re-sync default skills on the next turn.
-# The daemon-internal ``restart.flag`` is reserved for auth-recovery.
-# ────────────────────────────────────────────────────────────────────
+# /v1/agents/{id}/restart drops refresh_agent.flag — the daemon-
+# internal restart.flag is reserved for auth-recovery.
 
 
 async def restart_agent(request: web.Request) -> web.Response:

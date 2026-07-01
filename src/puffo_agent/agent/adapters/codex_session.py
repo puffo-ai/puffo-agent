@@ -426,11 +426,9 @@ class CodexSession:
     async def reload(
         self, new_system_prompt: str, *, with_session: bool = False,
     ) -> None:
-        """Tear the codex App Server process down so the next turn
-        re-spawns it and re-reads config.toml + AGENTS.md.
-
-        ``with_session=True`` also unlinks ``codex_session.json`` so
-        the next spawn starts a new conversation."""
+        """Tear down the codex App Server so the next turn re-spawns
+        and re-reads config.toml + AGENTS.md. ``with_session=True``
+        also unlinks ``codex_session.json``."""
         self.current_instructions = new_system_prompt
         async with self._lock:
             await self._teardown_locked()

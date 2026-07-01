@@ -488,9 +488,8 @@ class AgentDetail(QWidget):
         )
         if confirm != QMessageBox.Yes:
             return
-        # refresh(session=True) semantics: drop refresh_agent.flag +
-        # refresh_session.flag; the worker unlinks cli_session.json
-        # via adapter.reload(with_session=True) on the next turn.
+        # refresh(session=True): worker unlinks cli_session.json via
+        # adapter.reload(with_session=True) on its next turn.
         import json
         import time
         workspace = self._cfg.resolve_workspace_dir()

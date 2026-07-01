@@ -61,8 +61,8 @@ def _write_flag_payload(path, payload: dict) -> None:
 
 
 def _apply_refresh(agent_slug: str, params: dict) -> dict:
-    """Control-ws mirror of the MCP ``refresh()`` tool. Same four
-    axes; ``kind`` is CLI + tray UI only and is rejected here."""
+    """Control-ws mirror of the MCP ``refresh()`` tool; ``kind`` is
+    rejected here (CLI + tray UI only)."""
     import time as _time
 
     if "kind" in params:
@@ -283,10 +283,8 @@ async def execute_command(
                 await _sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
-        # Runtime changes flow through the daemon's config-changed
-        # respawn (agent.yml already saved above). Prompt-only edits
-        # drop refresh_agent.flag so the worker rebuilds CLAUDE.md
-        # on its next turn without a respawn.
+        # Prompt-only edits drop refresh_agent.flag; runtime edits
+        # ride the daemon's config-changed respawn.
         if cfg.state == "running" and prompt_changed and not runtime_changed:
             _write_flag_payload(
                 refresh_agent_flag_path(cfg.resolve_workspace_dir()),

@@ -259,8 +259,8 @@ class Daemon:
                         agent_id, exc,
                     )
 
-        # refresh_model.flag + refresh_runtime.flag → mutate agent.yml;
-        # the config-changed check further down triggers the restart.
+        # refresh_model / refresh_runtime mutate agent.yml; the
+        # config-changed check below picks up the respawn.
         for agent_id in sorted(on_disk):
             _process_daemon_refresh_flags(agent_id)
 
@@ -788,8 +788,8 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
 
 
 def _mark_flag_broken(flag_path: Path, reason: str) -> None:
-    """Rename a refresh_*.flag to ``<name>.broken`` with a payload
-    the operator can inspect. Never touches agent.yml."""
+    """Rename a refresh_*.flag to ``<name>.broken`` for operator
+    inspection; agent.yml is untouched."""
     import json
     broken = flag_path.with_suffix(flag_path.suffix + ".broken")
     try:
@@ -810,12 +810,9 @@ def _mark_flag_broken(flag_path: Path, reason: str) -> None:
 
 
 def _process_daemon_refresh_flags(agent_id: str) -> None:
-    """Consume ``refresh_model.flag`` + ``refresh_runtime.flag`` at
-    ``<workspace>/.puffo-agent/`` for one agent. Validates payload,
-    mutates ``agent.yml`` on success, renames to ``.broken`` on
-    failure. Restart is triggered separately by the reconcile loop's
-    config-changed check.
-    """
+    """Consume ``refresh_model.flag`` + ``refresh_runtime.flag``:
+    validate payload, mutate agent.yml, ``.broken``-rename on
+    failure. Respawn is left to the config-changed check."""
     import json
     try:
         agent_cfg = AgentConfig.load(agent_id)

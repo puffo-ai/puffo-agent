@@ -6,6 +6,73 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Three `suggest-*` default skills so agents nudge humans instead
+  of provisioning.** `suggest-agent`, `suggest-channel`, and
+  `suggest-invite` teach every agent to post a puffo-web-app
+  actionable card (from PUF-332) when the conversation surfaces the
+  need for a new agent, channel, or channel member. Bodies live in
+  `agent/shared_content.py::DEFAULT_SKILLS`, so they seed into every
+  cli-local / cli-docker agent's `.claude/skills/` on the next
+  worker startup.
+
+- **Unified `refresh()` MCP tool with four orthogonal axes,
+  replacing `reload_system_prompt` and the old
+  `refresh(model=None)`.** `refresh(harness=None, model=None,
+  host_sync=False, session=False)` backed by five flag files at
+  `<workspace>/.puffo-agent/`: `refresh_agent`, `refresh_host_sync`,
+  `refresh_session`, `refresh_model`, `refresh_runtime`. The worker
+  batches the first three into a single `adapter.reload(prompt,
+  with_session=…)`; the daemon consumes the last two, validates the
+  payload against the installed harness + model catalog, mutates
+  `agent.yml`, and lets the config-changed check drive the respawn.
+  Invalid payloads rename to `.broken`. `refresh_runtime` (kind
+  swap) is CLI + tray-UI only — MCP + control-ws reject `kind`
+  defensively.
+
+- **`puffo-agent agent refresh <id> [--host-sync] [--session]
+  [--model=H:M] [--kind=K]`.** CLI mirror of the MCP tool plus the
+  CLI-only `--kind` axis.
+
+### Changed
+
+- **`ensure_shared_primer` now syncs from code on every worker
+  startup instead of seed-if-missing.** The old idempotent guard
+  protected an operator-edit path nobody used, and silently pinned
+  every install to whatever primer it was first seeded with —
+  visible as agents referencing MCP tools that had been renamed or
+  removed. Managed shared-primer files (`CLAUDE.md`, `README.md`,
+  `skills/<id>/SKILL.md`) now overwrite when content differs, and
+  managed skill dirs whose id disappeared from `DEFAULT_SKILLS` are
+  pruned. Operator-authored skill dirs (no `.puffo-managed` marker)
+  are untouched. `reseed_shared_primer` folded into
+  `ensure_shared_primer`; `puffo-agent agent reset-primer` still
+  exists for forcing a rebuild without waiting for a message.
+
+- **Web-UI + tray-UI Restart routes drop `refresh_agent.flag`
+  instead of `restart.flag`.** The operator-facing "Restart" button
+  wants a CLAUDE.md rebuild + adapter reload, not the daemon-
+  internal teardown-and-recreate. `restart.flag` is now reserved
+  for the credential-refresh success callback. Adapter.reload
+  grows a `with_session=True` kwarg; each adapter unlinks its own
+  session sentinel (`cli_session.json` / `codex_session.json`) so
+  the worker doesn't have to know per-harness paths.
+
+- **Control-WS `op=edit` runtime block no longer drops
+  `restart.flag`.** The daemon's `_worker_needs_restart` check
+  already respawns the worker whenever agent.yml runtime changes;
+  the extra flag was redundant. Prompt-only edits still drop
+  `refresh_agent.flag`.
+
+### Removed
+
+- `reload_system_prompt` MCP tool (replaced by `refresh()`); old
+  `reload.flag` and `refresh.flag` file paths (replaced by
+  `refresh_agent.flag` and `refresh_model.flag` respectively);
+  `write_reload_flag` helper (renamed `write_refresh_agent_flag`);
+  `reseed_shared_primer` (folded into `ensure_shared_primer`).
+
 ### Security
 
 - **Archive and delete revoke the agent's device server-side.**

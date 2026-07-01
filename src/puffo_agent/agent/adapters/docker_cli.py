@@ -645,12 +645,8 @@ class DockerCLIAdapter(Adapter):
         self, new_system_prompt: str, *, with_session: bool = False,
     ) -> None:
         """Close the in-container claude subprocess so the next turn
-        spawns one that re-reads CLAUDE.md. Container stays up.
-        No-op for hermes (each turn is already fresh).
-
-        ``with_session=True`` also unlinks ``cli_session.json`` so the
-        next spawn omits ``--resume`` and starts a fresh conversation.
-        """
+        re-reads CLAUDE.md; container stays up. No-op for hermes.
+        ``with_session=True`` also unlinks ``cli_session.json``."""
         if self._session is not None:
             await self._session.aclose()
             self._session = None

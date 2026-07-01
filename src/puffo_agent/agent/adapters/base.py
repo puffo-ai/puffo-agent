@@ -76,17 +76,10 @@ class Adapter(ABC):
     async def reload(
         self, new_system_prompt: str, *, with_session: bool = False,
     ) -> None:
-        """Drop cached runtime state so the next turn re-reads
-        CLAUDE.md / profile / memory from disk. Worker calls this
-        between turns after a ``refresh`` MCP tool call.
-
-        ``with_session=True`` additionally deletes the adapter's
-        session sentinel (``cli_session.json`` / codex
-        ``codex_session.json``) so the next spawn starts fresh with
-        no ``--resume``. CLI adapters override; SDK / chat-only
-        adapters pass system prompt per turn and have no cache, so
-        the default no-op is correct.
-        """
+        """Drop cached runtime state so the next turn re-reads config
+        from disk. ``with_session=True`` also unlinks the session
+        sentinel so the next spawn skips ``--resume``. SDK / chat-only
+        adapters have no cache — default no-op is correct."""
         return None
 
     async def run_retry_turn(

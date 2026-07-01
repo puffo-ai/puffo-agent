@@ -41,8 +41,6 @@ _REFRESH_HARNESSES: tuple[str, ...] = ("claude-code", "codex")
 
 
 def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
-    """Validate a (harness, model) pair before writing refresh_model.flag.
-    Raises ``RuntimeError`` with an actionable message on failure."""
     if harness not in _REFRESH_HARNESSES:
         raise RuntimeError(
             f"harness={harness!r} not supported by refresh; "
@@ -91,21 +89,14 @@ def _register_local_tools(
     ) -> str:
         """Refresh your agent state. Four orthogonal axes:
 
-        * no args — rebuild CLAUDE.md + re-sync puffo default skills
-          (baseline "minimum change").
-        * ``host_sync=True`` — also re-sync the operator's host
-          ``~/.claude/skills/`` + host MCP registrations into your
-          workspace.
-        * ``session=True`` — drop your CLI session token so your next
-          spawn starts a fresh conversation (no ``--resume``).
-        * ``harness`` + ``model`` — switch to a new (harness, model)
-          pair. Both required together. Persists to your agent.yml,
-          triggers a full worker respawn (implicit fresh session).
+        * no args — rebuild CLAUDE.md + re-sync puffo default skills.
+        * ``host_sync=True`` — also re-sync operator's host skills + MCP.
+        * ``session=True`` — drop CLI session so next spawn is fresh.
+        * ``harness`` + ``model`` (both required together) — swap
+          harness/model, persist to agent.yml, full worker respawn.
 
-        Only supported under ``cli-local`` / ``cli-docker`` runtimes.
-        On ``cli-docker``, ``host_sync=True`` REQUIRES ``session=True``
-        (or a harness+model swap) because the container has to restart
-        to pick up new host content.
+        Requires ``cli-local`` / ``cli-docker`` runtime. On cli-docker,
+        ``host_sync=True`` requires ``session=True`` (or harness+model).
         """
         if runtime_kind and runtime_kind not in ("cli-local", "cli-docker"):
             raise RuntimeError(
