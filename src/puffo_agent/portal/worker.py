@@ -17,12 +17,17 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
-from .runtime_matrix import RUNTIME_WS_LOCAL
+from ..macos.keychain import is_macos as _is_macos
+from .runtime_matrix import (
+    RUNTIME_CLI_DOCKER,
+    RUNTIME_CLI_LOCAL,
+    RUNTIME_WS_LOCAL,
+)
 from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
     looks_like_managed_claude_md,
@@ -813,6 +818,7 @@ class Worker:
         agent_cfg: AgentConfig,
         *,
         notify_refresh_needed: Optional[Callable[[], None]] = None,
+        ensure_fresh_token: Optional[Callable[[], Awaitable[bool]]] = None,
         ws_local_hub=None,
     ):
         self.daemon_cfg = daemon_cfg
@@ -825,6 +831,11 @@ class Worker:
         # 401 surfacing in a reply short-circuits the daemon's 2-min
         # poll instead of waiting for the next tick.
         self._notify_refresh_needed = notify_refresh_needed
+        # macOS pre-delivery gate: blocking refresh through the
+        # daemon's mutex. Returns True iff post-refresh the token has
+        # >0s remaining. ``None`` for runtimes that don't go through
+        # claude OAuth (api-puffo, ws-local).
+        self._ensure_fresh_token = ensure_fresh_token
         # In-memory dedup for the auth_failed ENTER operator DM;
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
@@ -1214,6 +1225,38 @@ class Worker:
             # New batch while auth_failed: wake the refresher to check
             # for a re-login now (the flip below would mask auth_failed).
             self._maybe_wake_refresher_if_auth_failed(agent_id)
+            # macOS pre-delivery gate: before handing the batch to the
+            # adapter, make sure the daemon-owned credential is fresh.
+            # Skips on non-macOS (Linux/Windows use a shared file —
+            # daemon's proactive refresh wins the race naturally) and
+            # on non-claude runtimes (ws-local, api-puffo).
+            if (
+                self._ensure_fresh_token is not None
+                and _is_macos()
+                and self.agent_cfg.runtime.kind in (
+                    RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
+                )
+            ):
+                ok = await self._ensure_fresh_token()
+                if not ok:
+                    # Mutex-guarded refresh failed → token is stuck.
+                    # ``_enter_auth_failed`` flips runtime.health,
+                    # wakes the refresher, and (via
+                    # ``_on_auth_failed_enter`` + the
+                    # ``_auth_failed_notification_sent`` dedup) DMs
+                    # the operator ONCE per expiration episode. Raise
+                    # to push the batch back into the consumer's
+                    # retry path so it redelivers once the operator
+                    # recovers.
+                    logger.warning(
+                        "agent %s: pre-delivery token refresh failed; "
+                        "flagging auth_failed and deferring batch",
+                        agent_id,
+                    )
+                    self._enter_auth_failed(agent_id)
+                    raise AgentAPIError(
+                        "credential refresh failed before delivery",
+                    )
             try:
                 Worker._flip_health_in_progress(self.runtime, agent_id, logger)
             except Exception as exc:  # noqa: BLE001

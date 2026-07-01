@@ -432,9 +432,11 @@ def test_keychain_backend_sync_to_agent_writes_per_agent_file(tmp_path, monkeypa
 
 
 def test_keychain_backend_sync_skips_when_cache_empty(tmp_path, monkeypatch):
-    """No cache → no per-agent file written. Avoids stamping an
-    empty-string file that claude would later read as "no auth"."""
+    """No cache AND no disk file → no per-agent file written. Avoids
+    stamping an empty-string file that claude would later read as "no
+    auth"."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(cr, "_read_disk_credentials_blob", lambda _home: None)
     backend = _make_keychain_backend(tmp_path)
     agent_home = tmp_path / "agent-a"
     agent_home.mkdir()
@@ -529,9 +531,9 @@ def test_keychain_backend_refresh_returns_failed_on_claude_exit_failure(
 def test_keychain_backend_refresh_returns_failed_on_post_keychain_read_failure(
     monkeypatch, tmp_path,
 ):
-    """claude exits 0 but the post-refresh Keychain re-read fails (e.g.
-    transient permission issue). Don't poison the cache — return
-    FAILED so the daemon retries on the next tick."""
+    """claude exits 0 but BOTH the Keychain re-read and the disk-file
+    fallthrough fail. Don't poison the cache — return FAILED so the
+    daemon retries on the next tick."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
 
     async def _fake_spawn(*args, **kwargs):
@@ -544,6 +546,7 @@ def test_keychain_backend_refresh_returns_failed_on_post_keychain_read_failure(
             False, None, "exit_code=44", None,
         ),
     )
+    monkeypatch.setattr(cr, "_read_disk_credentials_blob", lambda _home: None)
 
     backend = _make_keychain_backend(tmp_path)
     backend.cache.write(_BLOB)
@@ -595,6 +598,8 @@ def test_keychain_backend_poll_external_rotation_no_change_returns_false(
 def test_keychain_backend_poll_external_rotation_swallows_read_failure(
     monkeypatch, tmp_path,
 ):
+    """Keychain read fails AND disk-file fallthrough is empty → poll
+    returns False (no rotation to fan out)."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
     backend = _make_keychain_backend(tmp_path)
     monkeypatch.setattr(
@@ -603,6 +608,7 @@ def test_keychain_backend_poll_external_rotation_swallows_read_failure(
             False, None, "security_timeout", None,
         ),
     )
+    monkeypatch.setattr(cr, "_read_disk_credentials_blob", lambda _home: None)
     rotated = asyncio.run(backend.poll_external_rotation())
     assert rotated is False
 
@@ -685,3 +691,223 @@ def test_refresher_with_keychain_backend_refreshes_when_close_to_expiry(
     # Refresh uses real HOME — same model as FileBackend.
     env = spawned[0]
     assert env["HOME"] == str(Path.home())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KeychainBackend disk-file fallthrough — covers macOS hosts where
+# Claude Code 2.x silently fails Keychain writes under launchd
+# session-context but still writes ~/.claude/.credentials.json.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _patch_disk_blob(monkeypatch, blob):
+    monkeypatch.setattr(cr, "_read_disk_credentials_blob", lambda _home: blob)
+
+
+def _patch_disk_expires(monkeypatch, expires_in_seconds):
+    if expires_in_seconds is None:
+        monkeypatch.setattr(cr, "_disk_expires_in_seconds", lambda _home: None)
+    else:
+        monkeypatch.setattr(
+            cr, "_disk_expires_in_seconds",
+            lambda _home: expires_in_seconds,
+        )
+
+
+def test_expires_in_seconds_falls_through_to_disk_when_keychain_dead(
+    monkeypatch, tmp_path,
+):
+    """Keychain entry missing + cache empty → read expires from disk."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            False, None, "item_not_found", None,
+        ),
+    )
+    _patch_disk_blob(monkeypatch, _BLOB)
+    _patch_disk_expires(monkeypatch, 3600)
+
+    backend = _make_keychain_backend(tmp_path)
+    assert backend.expires_in_seconds() == 3600
+    # Disk blob is opportunistically warmed into the cache.
+    assert backend.cache.read() == _BLOB
+
+
+def test_expires_in_seconds_returns_none_when_both_dead(monkeypatch, tmp_path):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            False, None, "item_not_found", None,
+        ),
+    )
+    _patch_disk_blob(monkeypatch, None)
+    _patch_disk_expires(monkeypatch, None)
+
+    backend = _make_keychain_backend(tmp_path)
+    assert backend.expires_in_seconds() is None
+
+
+def test_refresh_treats_disk_rotation_as_refreshed_when_keychain_dead(
+    monkeypatch, tmp_path,
+):
+    """claude --print exits 0, Keychain read fails (entry missing), but
+    the disk file got rotated → REFRESHED, cache pulled from disk."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeAsyncProc(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            False, None, "item_not_found", None,
+        ),
+    )
+    disk_blobs = iter([_BLOB, _REFRESHED_BLOB])
+    monkeypatch.setattr(
+        cr, "_read_disk_credentials_blob",
+        lambda _home: next(disk_blobs),
+    )
+
+    backend = _make_keychain_backend(tmp_path)
+    outcome = asyncio.run(backend.refresh())
+    assert outcome == cr.RefreshOutcome.REFRESHED
+    assert backend.cache.read() == _REFRESHED_BLOB
+    assert backend._last_propagated_blob == _REFRESHED_BLOB
+
+
+def test_refresh_treats_disk_unchanged_as_unchanged_when_keychain_dead(
+    monkeypatch, tmp_path,
+):
+    """claude --print exits 0, Keychain dead, disk file byte-identical
+    before/after → UNCHANGED (token was still fresh, claude no-op'd
+    the OAuth round-trip)."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+
+    async def _fake_spawn(*args, **kwargs):
+        return _FakeAsyncProc(0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_spawn)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            False, None, "item_not_found", None,
+        ),
+    )
+    _patch_disk_blob(monkeypatch, _BLOB)
+
+    backend = _make_keychain_backend(tmp_path)
+    outcome = asyncio.run(backend.refresh())
+    assert outcome == cr.RefreshOutcome.UNCHANGED
+
+
+def test_bootstrap_falls_through_to_disk_when_keychain_dead(
+    monkeypatch, tmp_path,
+):
+    """Bootstrap on a host where the Keychain entry was never written
+    (Claude Code 2.x under launchd) but the disk file exists → ok=True
+    with a fallback reason, cache primed from disk."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(
+        cm, "bootstrap_from_keychain",
+        lambda cache: (False, "keychain_item_not_found"),
+    )
+    _patch_disk_blob(monkeypatch, _BLOB)
+
+    backend = _make_keychain_backend(tmp_path)
+    ok, reason = asyncio.run(backend.bootstrap())
+    assert ok is True
+    assert "fallback" in reason
+    assert backend.cache.read() == _BLOB
+    assert backend._last_propagated_blob == _BLOB
+
+
+def test_bootstrap_fails_when_both_keychain_and_disk_are_dead(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(
+        cm, "bootstrap_from_keychain",
+        lambda cache: (False, "keychain_item_not_found"),
+    )
+    _patch_disk_blob(monkeypatch, None)
+
+    backend = _make_keychain_backend(tmp_path)
+    ok, reason = asyncio.run(backend.bootstrap())
+    assert ok is False
+    assert reason == "keychain_item_not_found"
+
+
+def test_sync_to_agent_uses_disk_when_cache_empty(monkeypatch, tmp_path):
+    """Per-agent file written from disk when cache is empty — closes
+    the path where bootstrap hasn't warmed the cache yet but a worker
+    is already calling sync_to_agent via ensure_fresh fan-out."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    _patch_disk_blob(monkeypatch, _BLOB)
+
+    backend = _make_keychain_backend(tmp_path)
+    # Cache is empty.
+    assert backend.cache.read() is None
+    agent_home = tmp_path / "agent-a"
+    agent_home.mkdir()
+    backend.sync_to_agent(agent_home)
+    assert (agent_home / ".claude" / ".credentials.json").read_text() == _BLOB
+
+
+def test_sync_to_agent_is_idempotent_when_target_matches(
+    monkeypatch, tmp_path,
+):
+    """Repeated fan-out from concurrent ensure_fresh callers should
+    skip the atomic write when the target file already matches.
+    Verified by spying on os.replace."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    _patch_disk_blob(monkeypatch, None)
+
+    backend = _make_keychain_backend(tmp_path)
+    backend.cache.write(_BLOB)
+    agent_home = tmp_path / "agent-a"
+    agent_home.mkdir()
+    # First sync — file gets written.
+    backend.sync_to_agent(agent_home)
+    target = agent_home / ".claude" / ".credentials.json"
+    assert target.read_text() == _BLOB
+
+    import os as _os
+    replace_calls = 0
+    real_replace = _os.replace
+
+    def _spy_replace(src, dst):
+        nonlocal replace_calls
+        replace_calls += 1
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(_os, "replace", _spy_replace)
+    # Second sync — target already matches → no write.
+    backend.sync_to_agent(agent_home)
+    assert replace_calls == 0
+
+
+def test_poll_external_rotation_detects_disk_rotation_when_keychain_dead(
+    monkeypatch, tmp_path,
+):
+    """Operator runs `claude /login` on a host where Keychain is dead
+    — the rotation lands in ~/.claude/.credentials.json. Poll must
+    pick it up via disk fallthrough so agents get fanned out."""
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            False, None, "item_not_found", None,
+        ),
+    )
+    _patch_disk_blob(monkeypatch, _REFRESHED_BLOB)
+
+    backend = _make_keychain_backend(tmp_path)
+    backend._last_propagated_blob = _BLOB
+    rotated = asyncio.run(backend.poll_external_rotation())
+    assert rotated is True
+    assert backend._last_propagated_blob == _REFRESHED_BLOB
+    assert backend.cache.read() == _REFRESHED_BLOB

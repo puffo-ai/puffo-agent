@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
+from ..agent._auth_markers import looks_like_auth_error
 from .state import link_host_codex_auth, link_host_credentials
 
 
@@ -160,6 +161,22 @@ def _classify_failed_refresh(
     # state change, so it should latch even when the response also
     # happens to look rate-limit-shaped.
     _maybe_disable_probe_model(out_tail, err_tail)
+    # Auth-failed BEFORE rate-limit: Anthropic sometimes hands back a
+    # 401 with rate-limit-adjacent phrasing on rotated-and-revoked
+    # refresh_tokens (the "rotating-refresh-token silent-fail" mode —
+    # both disk and Keychain retain the pre-rotation token). The
+    # refresher can't recover from that; only the operator's re-login
+    # can. Flag as AUTH_FAILED so the worker's DM path fires now
+    # instead of on the 2-tick refresh_broken streak.
+    if looks_like_auth_error(out_tail) or looks_like_auth_error(err_tail):
+        logger.error(
+            "%s auth failed rc=%d in %.1fs — refresh_token likely "
+            "revoked (probable rotating-refresh-token silent-fail); "
+            "operator needs to `claude auth login` | "
+            "stdout: %s | stderr: %s",
+            log_prefix, rc, elapsed, out_tail, err_tail,
+        )
+        return RefreshOutcome.AUTH_FAILED
     if _looks_like_rate_limit(out_tail, err_tail):
         logger.warning(
             "%s rate-limited rc=%d in %.1fs | stdout: %s | stderr: %s",
@@ -201,6 +218,35 @@ def _jwt_exp_unix(token: str) -> int | None:
     return int(exp)
 
 
+def _read_disk_credentials_blob(host_home: Path) -> Optional[str]:
+    """Read ``<host_home>/.claude/.credentials.json`` as a raw blob.
+    None on missing / unreadable / non-JSON. Used as the macOS
+    fallback when Claude Code's Keychain write silently fails under
+    launchd session-context but the disk file still gets written."""
+    path = host_home / ".claude" / ".credentials.json"
+    try:
+        blob = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        json.loads(blob)
+    except ValueError:
+        return None
+    return blob
+
+
+def _disk_expires_in_seconds(host_home: Path) -> Optional[int]:
+    blob = _read_disk_credentials_blob(host_home)
+    if blob is None:
+        return None
+    try:
+        data = json.loads(blob)
+        ms = int((data.get("claudeAiOauth") or {}).get("expiresAt"))
+    except (ValueError, TypeError):
+        return None
+    return int(ms / 1000 - time.time())
+
+
 class RefreshOutcome(enum.Enum):
     """Result of a single backend refresh attempt."""
     REFRESHED = "refreshed"
@@ -209,6 +255,10 @@ class RefreshOutcome(enum.Enum):
     # Counts toward refresh_broken streak like FAILED but additionally
     # schedules a fast retry (RATE_LIMIT_FAST_RETRY_{MIN,MAX}_SECONDS).
     RATE_LIMITED = "rate_limited"
+    # Anthropic rejected the refresh_token (401 / invalid_grant). Flips
+    # ``auth_failed`` immediately (no 2-tick streak, no fast retry) so
+    # the worker's operator-DM path fires — the loop can't self-recover.
+    AUTH_FAILED = "auth_failed"
 
 
 class CredentialBackend(Protocol):
@@ -533,48 +583,70 @@ class KeychainBackend:
         self._last_propagated_blob: Optional[str] = None
 
     def expires_in_seconds(self) -> int | None:
-        """Pull expiry from the cache first (hot path; no subprocess).
-        Cache miss → fall back to a Keychain read so the daemon's
-        first-tick decision isn't blocked on bootstrap completion."""
-        # Lazy import to keep the module-level import graph light.
+        """Cache → Keychain → disk file. The disk fallthrough handles
+        macOS hosts where Claude Code's Keychain write silently fails
+        under launchd session-context but the disk file at
+        ``~/.claude/.credentials.json`` still gets written.
+
+        Logs which source served the read at DEBUG so a split-brain is
+        visible in the daemon log — matches the log axis in the
+        kai-8670-da37 disk-flip proposal."""
         from ..macos.keychain import read_keychain_blob
 
         expires_at = self.cache.expires_at_seconds()
         if expires_at is not None:
-            return int(expires_at - time.time())
-        # Cache miss — try Keychain. Don't write the cache here; that's
-        # ``bootstrap``'s job. We only want a TTL value.
+            secs = int(expires_at - time.time())
+            logger.debug("keychain-backend expires_in read: source=cache secs=%d", secs)
+            return secs
         kr = read_keychain_blob()
-        if not kr.ok or not kr.blob:
-            return None
-        try:
-            data = json.loads(kr.blob)
-            ms = int((data.get("claudeAiOauth") or {}).get("expiresAt"))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        # Opportunistically warm the cache so subsequent ticks are fast.
-        try:
-            self.cache.write(kr.blob)
-        except OSError:
-            pass
-        return int(ms / 1000 - time.time())
+        if kr.ok and kr.blob:
+            try:
+                data = json.loads(kr.blob)
+                ms = int((data.get("claudeAiOauth") or {}).get("expiresAt"))
+                try:
+                    self.cache.write(kr.blob)
+                except OSError:
+                    pass
+                secs = int(ms / 1000 - time.time())
+                logger.debug(
+                    "keychain-backend expires_in read: source=keychain secs=%d",
+                    secs,
+                )
+                return secs
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        disk_blob = _read_disk_credentials_blob(Path.home())
+        if disk_blob is not None:
+            logger.warning(
+                "keychain-backend expires_in read: falling through to disk "
+                "file (Keychain miss: %s)",
+                kr.error if not kr.ok else "unparseable-blob",
+            )
+            try:
+                self.cache.write(disk_blob)
+            except OSError:
+                pass
+        else:
+            logger.warning(
+                "keychain-backend expires_in read: neither Keychain (%s) "
+                "nor disk file readable",
+                kr.error if not kr.ok else "unparseable-blob",
+            )
+        secs = _disk_expires_in_seconds(Path.home())
+        if secs is not None:
+            logger.debug(
+                "keychain-backend expires_in read: source=disk secs=%d", secs,
+            )
+        return secs
 
     async def refresh(self) -> RefreshOutcome:
         from ..macos.keychain import read_keychain_blob
 
-        # Snapshot Keychain before claude runs so we can byte-compare
-        # after. Cache.read() is not enough — agent processes may have
-        # rotated Keychain externally between ticks and the cache is a
-        # lagging mirror.
+        host_home = Path.home()
         kr_before = read_keychain_blob()
         before_blob = kr_before.blob if kr_before.ok else None
+        disk_before = _read_disk_credentials_blob(host_home)
 
-        # Real user HOME — claude reads Keychain, refreshes if expired,
-        # writes back to Keychain. Identical pattern to FileBackend.
-        # cwd=host_home so claude's project-resolution lands in the
-        # operator's normal working dir (matches single-process /login
-        # UX) instead of wherever the daemon was launched from.
-        host_home = Path.home()
         env = {**os.environ, "HOME": str(host_home)}
         cmd = _build_probe_cmd()
         started = time.time()
@@ -612,56 +684,86 @@ class KeychainBackend:
                 log_prefix="claude credential refresh",
             )
 
-        # Pull the post-refresh blob straight from Keychain — that's
-        # where claude wrote it. Then sync our cache so agent fan-out
-        # has fresh bytes.
         kr_after = read_keychain_blob()
-        if not kr_after.ok or not kr_after.blob:
+        if kr_after.ok and kr_after.blob:
+            try:
+                self.cache.write(kr_after.blob)
+            except OSError as exc:
+                logger.warning(
+                    "claude credential refresh: cache write failed: %s", exc,
+                )
+            if before_blob is not None and before_blob == kr_after.blob:
+                logger.info(
+                    "claude credential refresh ok in %.1fs but Keychain "
+                    "unchanged — token was still fresh; claude skipped the "
+                    "OAuth round-trip",
+                    elapsed,
+                )
+                return RefreshOutcome.UNCHANGED
+            self._last_propagated_blob = kr_after.blob
+            logger.info(
+                "claude credential refresh ok in %.1fs (Keychain rotated)",
+                elapsed,
+            )
+            return RefreshOutcome.REFRESHED
+
+        # Keychain post-refresh read failed — fall through to disk file.
+        # Claude Code 2.x may write the disk file successfully even when
+        # the Keychain write silently fails under launchd session-context.
+        disk_after = _read_disk_credentials_blob(host_home)
+        if disk_after is None:
             logger.warning(
-                "claude credential refresh exit=0 but Keychain re-read "
-                "failed (%s); cache untouched",
+                "claude credential refresh exit=0 but neither Keychain "
+                "(%s) nor disk file is readable; cache untouched",
                 kr_after.error,
             )
             return RefreshOutcome.FAILED
         try:
-            self.cache.write(kr_after.blob)
+            self.cache.write(disk_after)
         except OSError as exc:
             logger.warning(
                 "claude credential refresh: cache write failed: %s", exc,
             )
-
-        # Byte-compare the Keychain blob before and after. Anything
-        # else (e.g. comparing int(expires_in_seconds)) loses
-        # sub-second resolution to time.time()'s fractional part.
-        if before_blob is not None and before_blob == kr_after.blob:
+        if disk_before is not None and disk_before == disk_after:
             logger.info(
-                "claude credential refresh ok in %.1fs but Keychain "
-                "unchanged — token was still fresh; claude skipped the "
-                "OAuth round-trip",
+                "claude credential refresh ok in %.1fs (Keychain dead; "
+                "disk file unchanged — token was still fresh)",
                 elapsed,
             )
             return RefreshOutcome.UNCHANGED
-
-        self._last_propagated_blob = kr_after.blob
+        self._last_propagated_blob = disk_after
         logger.info(
-            "claude credential refresh ok in %.1fs (Keychain rotated)",
+            "claude credential refresh ok in %.1fs (Keychain dead; "
+            "disk file rotated)",
             elapsed,
         )
         return RefreshOutcome.REFRESHED
 
     def sync_to_agent(self, agent_home: Path) -> None:
-        """Atomic-write the cache blob to the agent's per-agent
-        ``.credentials.json``. No symlinking — Keychain ACL is on UID
-        + signing identity, not HOME, so a symlink to the host file
-        gives no benefit and the per-agent file diverges anyway when
-        claude self-refreshes inside the agent's process."""
-        blob = self.cache.read()
+        """Atomic-write the canonical blob to the agent's per-agent
+        ``.credentials.json``. Cache → disk file fallthrough so this
+        works even when the Keychain entry is missing. Idempotent —
+        skips the write when the target already matches, so fan-out
+        from concurrent ``ensure_fresh`` callers stays cheap."""
+        cache_blob = self.cache.read()
+        blob = cache_blob or _read_disk_credentials_blob(Path.home())
         if not blob:
             return
+        if cache_blob is None:
+            logger.debug(
+                "keychain-backend sync_to_agent: source=disk (cache empty) "
+                "target=%s",
+                agent_home,
+            )
         agent_claude = agent_home / ".claude"
+        target = agent_claude / ".credentials.json"
+        try:
+            if target.read_text(encoding="utf-8") == blob:
+                return
+        except OSError:
+            pass
         try:
             agent_claude.mkdir(parents=True, exist_ok=True)
-            target = agent_claude / ".credentials.json"
             tmp = agent_claude / f".{target.name}.tmp.{os.getpid()}"
             tmp.write_text(blob, encoding="utf-8")
             try:
@@ -682,28 +784,54 @@ class KeychainBackend:
         ok, reason = bootstrap_from_keychain(self.cache)
         if ok:
             self._last_propagated_blob = self.cache.read()
-        return (ok, reason)
+            logger.info(
+                "keychain-backend bootstrap: source=keychain reason=%s", reason,
+            )
+            return (ok, reason)
+        # Keychain bootstrap failed — fall through to disk file so the
+        # daemon can still serve agents on hosts where Claude Code's
+        # Keychain write silently fails (launchd session-context).
+        disk_blob = _read_disk_credentials_blob(Path.home())
+        if disk_blob is None:
+            logger.warning(
+                "keychain-backend bootstrap: no Keychain (%s) and no "
+                "disk file — operator needs to `claude auth login`",
+                reason,
+            )
+            return (False, reason)
+        try:
+            self.cache.write(disk_blob)
+        except OSError as exc:
+            return (False, f"{reason}; disk-fallback cache write: {exc}")
+        self._last_propagated_blob = disk_blob
+        logger.warning(
+            "keychain-backend bootstrap: source=disk (Keychain miss: %s)",
+            reason,
+        )
+        return (True, f"{reason}; using disk-file fallback")
 
     async def poll_external_rotation(self) -> bool:
-        """Read Keychain and compare to the last-propagated blob.
-        Returns True when a rotation was detected and the cache was
-        updated; the caller (``CredentialRefresher``) then fans the
-        new blob to every registered agent via ``_sync_views``.
-        """
+        """Detect a token rotation (Keychain or disk file) since the
+        last fan-out. Returns True when the canonical blob changed and
+        the cache was updated; the caller fans out via ``_sync_views``."""
         from ..macos.keychain import read_keychain_blob
 
         kr = read_keychain_blob()
-        if not kr.ok or not kr.blob:
+        blob: Optional[str] = kr.blob if kr.ok and kr.blob else None
+        if blob is None:
+            blob = _read_disk_credentials_blob(Path.home())
+        if blob is None:
             logger.debug(
-                "keychain poll: read failed (%s); will retry next tick",
+                "keychain poll: neither Keychain (%s) nor disk file "
+                "readable; will retry next tick",
                 kr.error,
             )
             return False
-        if kr.blob == self._last_propagated_blob:
+        if blob == self._last_propagated_blob:
             return False
-        self._last_propagated_blob = kr.blob
+        self._last_propagated_blob = blob
         try:
-            self.cache.write(kr.blob)
+            self.cache.write(blob)
         except OSError as exc:
             logger.warning("keychain poll: cache write failed: %s", exc)
             return False
@@ -788,6 +916,35 @@ class CredentialRefresher:
 
     def expires_in_seconds(self) -> int | None:
         return self.backend.expires_in_seconds()
+
+    async def ensure_fresh(self) -> bool:
+        """Blocking version of the refresh path: return True iff the
+        backend currently has a credential with >0s remaining. Uses
+        the same single-writer mutex + re-check-after-lock pattern as
+        ``_refresh_now``, so N concurrent callers coalesce into one
+        backend.refresh() per actually-expired credential.
+
+        Always fans the canonical blob out to every registered agent
+        before returning True. Closes the split-brain window where
+        the daemon's view says fresh but an agent's per-agent
+        credentials file is stale (copy-mode drift on macOS, or a
+        post-refresh fan-out the daemon hasn't done yet). The
+        backend's ``sync_to_agent`` is idempotent so the call is
+        cheap when nothing has actually drifted.
+
+        ``by_agent=False`` so ``_refresh_now``'s post-lock re-check
+        fires — N concurrent callers see "another caller already
+        refreshed" and skip the backend invocation."""
+        expires = self.expires_in_seconds()
+        if expires is not None and expires > REFRESH_SAFETY_MARGIN_SECONDS:
+            self._sync_views()
+            return True
+        await self._refresh_now(expires_in=expires, by_agent=False)
+        expires = self.expires_in_seconds()
+        if expires is not None and expires > 0:
+            self._sync_views()
+            return True
+        return False
 
     async def run_loop(self, stop_event: asyncio.Event) -> None:
         """Main daemon coroutine. Polls every REFRESH_POLL_SECONDS or
@@ -981,6 +1138,14 @@ class CredentialRefresher:
             self._clear_refresh_broken()
             self._consecutive_non_success = 0
             return
+        if outcome is RefreshOutcome.AUTH_FAILED:
+            # Skip the 2-tick refresh_broken streak: Anthropic revoked
+            # the refresh_token, so continued 120s retries just log the
+            # same 401. Flip agents directly to ``auth_failed`` so the
+            # worker's DM path surfaces re-login instructions to the
+            # operator.
+            self._flip_auth_failed()
+            return
         self._consecutive_non_success += 1
         if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
             self._flip_refresh_broken(outcome)
@@ -1069,6 +1234,45 @@ class CredentialRefresher:
             except Exception as exc:
                 logger.warning(
                     "refresh_broken clear: failed to save runtime for %s: %s",
+                    agent_id, exc,
+                )
+
+    def _flip_auth_failed(self) -> None:
+        """AUTH_FAILED outcome — Anthropic revoked the refresh_token
+        (rotating-refresh-token silent-fail). Flip every registered
+        agent that isn't already in a terminal state so the worker's
+        auth_failed DM path fires with re-login instructions. Refresh
+        counter untouched so a subsequent RATE_LIMITED / FAILED tick
+        still tracks its own streak."""
+        from .state import RuntimeState
+        msg = (
+            "Anthropic rejected the refresh_token (probable rotating-"
+            "refresh-token silent-fail — the on-disk token was revoked "
+            "server-side but the new one was silently dropped). Run "
+            "`claude auth login` on this host to re-authorise, then "
+            "send the agent a message to recover."
+        )
+        for agent_home in self._agent_homes:
+            agent_id = Path(agent_home).name
+            try:
+                rs = RuntimeState.load(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "auth_failed flip: failed to load runtime for %s: %s",
+                    agent_id, exc,
+                )
+                continue
+            if rs is None:
+                continue
+            if rs.health in ("auth_failed", "api_error_abandoned", "in_progress"):
+                continue
+            rs.health = "auth_failed"
+            rs.error = msg
+            try:
+                rs.save(agent_id)
+            except Exception as exc:
+                logger.warning(
+                    "auth_failed flip: failed to save runtime for %s: %s",
                     agent_id, exc,
                 )
 
