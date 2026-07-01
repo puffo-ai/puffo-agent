@@ -28,27 +28,40 @@ from puffo_agent.portal.worker import _handle_suppressed_reply
 
 def test_oauth_copy_includes_english_and_chinese():
     text = format_oauth_expired("planner-1234", "Planner")
-    # English strand: `claude auth login` + send-a-message (auto-resume)
-    assert "Claude OAuth expired" in text
+    # English strand: signals what expired + the specific CLI command.
+    assert "Claude Code sign-in has expired" in text
     assert "claude auth login" in text
-    assert "send me a message" in text
+    # PUF-341: WHERE the operator should run the command.
+    assert "On the computer where puffo-agent is running" in text
+    # PUF-341: numbered ladder (open terminal → run → complete → send-back).
+    assert "1. Open a terminal" in text
+    assert "2. Run: `claude auth login`" in text
+    assert "send me any message" in text
+    # PUF-341: provider disambiguation — Sam explicitly asked
+    # "should I go to CodeX?" when he saw the old copy.
+    assert "not Codex" in text
     assert "agent resume" not in text   # no manual resume step anymore
     # Chinese strand
-    assert "Claude OAuth 已过期" in text
-    assert "发条消息" in text
-    # Bold display name format
-    assert "**Planner**" in text
+    assert "Claude Code 登录已过期" in text
+    assert "在运行 puffo-agent 的电脑上" in text
+    assert "1. 打开终端" in text
+    assert "发一条消息" in text
+    assert "不是 Codex" in text
+    # Bold display name format survives on both strands
+    assert text.count("**Planner**") == 2
 
 
 def test_oauth_copy_degrades_when_display_name_missing():
     text = format_oauth_expired("agent-5678", "")
     # Both strands still present
-    assert "Claude OAuth expired" in text
-    assert "Claude OAuth 已过期" in text
+    assert "Claude Code sign-in has expired" in text
+    assert "Claude Code 登录已过期" in text
     # Backtick-id (no bold display name) — degrades cleanly
     assert "`agent-5678`" in text
-    # No empty-bold artifact
-    assert "**" not in text or "**`agent-5678`**" in text
+    # No empty-bold artifact; the only `**` on the page comes from the
+    # bold section headers ("On the computer where puffo-agent is running").
+    assert "**`agent-5678`**" not in text
+    assert "****" not in text
 
 
 # ── (2) _handle_suppressed_reply on_auth_failed_enter edge ─────────
@@ -294,8 +307,8 @@ def test_notify_sends_dm_when_operator_slug_set(tmp_path, monkeypatch):
 
     assert captured["recipient"] == "@han-0001"
     assert captured["root_id"] == ""
-    assert "Claude OAuth expired" in captured["text"]
-    assert "Claude OAuth 已过期" in captured["text"]
+    assert "Claude Code sign-in has expired" in captured["text"]
+    assert "Claude Code 登录已过期" in captured["text"]
     assert "claude auth login" in captured["text"]
 
 
@@ -566,25 +579,30 @@ def test_codex_harness_dispatches_codex_copy():
     coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
     asyncio.new_event_loop().run_until_complete(coro)
 
-    assert "Codex OAuth expired" in captured["text"]
+    assert "Codex sign-in has expired" in captured["text"]
     assert "codex login" in captured["text"]
-    assert "Codex OAuth 已过期" in captured["text"]
-    assert "Claude OAuth" not in captured["text"]
+    assert "Codex 登录已过期" in captured["text"]
+    # PUF-341 note: the disambiguation clause DOES mention Claude Code
+    # ("not Claude Code — even if it's installed…"), but the imperative
+    # instruction step must never tell the operator to run the Claude CLI.
     assert "claude auth login" not in captured["text"]
 
 
 def test_claude_harness_keeps_claude_copy():
     """Regression-pin for PUF-283: explicit ``harness="claude-code"``
-    keeps the existing Claude bilingual copy unchanged."""
+    dispatches the Claude bilingual copy."""
     from puffo_agent.portal import worker as worker_module
 
     w, captured = _make_dispatch_stub("claude-code")
     coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
     asyncio.new_event_loop().run_until_complete(coro)
 
-    assert "Claude OAuth expired" in captured["text"]
+    assert "Claude Code sign-in has expired" in captured["text"]
     assert "claude auth login" in captured["text"]
-    assert "Codex" not in captured["text"]
+    # PUF-341 note: the disambiguation clause DOES mention Codex
+    # ("not Codex — even if it's installed…"), but the imperative
+    # instruction step must never tell the operator to run `codex login`.
+    assert "codex login" not in captured["text"]
 
 
 def test_missing_runtime_falls_back_to_claude_copy():
@@ -598,7 +616,7 @@ def test_missing_runtime_falls_back_to_claude_copy():
     coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
     asyncio.new_event_loop().run_until_complete(coro)
 
-    assert "Claude OAuth expired" in captured["text"]
+    assert "Claude Code sign-in has expired" in captured["text"]
 
 
 def test_unknown_harness_falls_back_to_claude_copy():
@@ -611,7 +629,7 @@ def test_unknown_harness_falls_back_to_claude_copy():
     coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
     asyncio.new_event_loop().run_until_complete(coro)
 
-    assert "Claude OAuth expired" in captured["text"]
+    assert "Claude Code sign-in has expired" in captured["text"]
 
 
 # ── PUF-310: format_codex_oauth_expired bilingual copy ─────────────
@@ -623,8 +641,8 @@ def test_format_codex_oauth_expired_bilingual_copy():
     from puffo_agent.agent._invite_strings import format_codex_oauth_expired
 
     text = format_codex_oauth_expired("planner-1234", "Planner")
-    assert "Codex OAuth expired" in text
-    assert "Codex OAuth 已过期" in text
+    assert "Codex sign-in has expired" in text
+    assert "Codex 登录已过期" in text
     assert "codex login" in text
     assert "Planner" in text
     assert "planner-1234" in text
@@ -637,8 +655,8 @@ def test_format_codex_oauth_expired_falls_back_to_id_when_no_name():
 
     text = format_codex_oauth_expired("agent-5678", "")
     assert "agent-5678" in text
-    assert "Codex OAuth expired" in text
-    assert "Codex OAuth 已过期" in text
+    assert "Codex sign-in has expired" in text
+    assert "Codex 登录已过期" in text
 
 
 def test_harness_read_snapshots_before_dm_dispatch():
@@ -696,7 +714,7 @@ def test_harness_read_snapshots_before_dm_dispatch():
     asyncio.new_event_loop().run_until_complete(coro)
 
     # The DM body is the Codex copy snapshotted before the mutation.
-    assert "Codex OAuth expired" in captured["text"]
+    assert "Codex sign-in has expired" in captured["text"]
     assert "codex login" in captured["text"]
     # Harness was read exactly once during the call (the property
     # getter recorded the read on the sequence list).
