@@ -54,6 +54,11 @@ class ApiPuffoBundle:
     api_key: str
     provider: str
     model: str
+    # LiteLLM gateway base the runtime calls DIRECTLY for inference
+    # (`{litellm_gateway_url}/v1/messages`, Anthropic-compatible). Optional so
+    # legacy bundles still ingest during rollout; the LLM plane is inert until
+    # it is set (AIM populates it at create alongside the api_key virtual key).
+    litellm_gateway_url: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict) -> "ApiPuffoBundle":
@@ -75,6 +80,7 @@ class ApiPuffoBundle:
             api_key=raw["api_key"],
             provider=raw["provider"],
             model=raw["model"],
+            litellm_gateway_url=raw.get("litellm_gateway_url", "").rstrip("/"),
         )
 
 
@@ -140,6 +146,7 @@ def materialise_agent_dir(bundle: ApiPuffoBundle) -> Path:
             "provider": bundle.provider,
             "model": bundle.model,
             "api_key": bundle.api_key,
+            "litellm_gateway_url": bundle.litellm_gateway_url,
             "harness": "",
             "permission_mode": "bypassPermissions",
             "max_turns": 10,

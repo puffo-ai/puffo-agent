@@ -11,7 +11,7 @@ import contextlib
 import json
 import logging
 import uuid
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Optional
 
 import aiohttp
 
@@ -32,12 +32,23 @@ class CloudHttpError(Exception):
 # ── LLM HTTP (separate from the bridge) ──────────────────────────
 
 
-class CloudLlmClient:
-    """Bearer-authed HTTP client for ``POST /v1/llm/complete``."""
+_ANTHROPIC_VERSION = "2023-06-01"
+_DEFAULT_MAX_TOKENS = 1024
 
-    def __init__(self, base_url: str, sandbox_token: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self._token = sandbox_token
+
+class CloudLlmClient:
+    """HTTP client that calls the LiteLLM gateway **directly** on its
+    Anthropic-compatible ``POST /v1/messages`` endpoint.
+
+    Auth is the per-agent LiteLLM **virtual key** (the bundle's ``api_key``)
+    sent as ``x-api-key`` — NOT the sandbox token (that authorises the WS
+    bridge, a separate plane). The request/response are the native Anthropic
+    Messages shape, so no server-side normalisation hop is involved.
+    """
+
+    def __init__(self, gateway_url: str, api_key: str) -> None:
+        self.gateway_url = gateway_url.rstrip("/")
+        self._api_key = api_key
         self._session: aiohttp.ClientSession | None = None
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
@@ -48,29 +59,28 @@ class CloudLlmClient:
     async def complete(
         self,
         *,
-        api_key: str,
-        provider: str,
         model: str,
         system_prompt: str,
         messages: list[dict],
         tools: list[dict] | None = None,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
     ) -> dict:
-        # Cloud forwards to the named provider using the bundle's
-        # api_key; response shape is Anthropic's tool-using messages
-        # API (cloud normalises across providers).
+        # Native Anthropic Messages body: system_prompt -> system, messages +
+        # tools passed through, max_tokens required by the API (injected).
         body: dict[str, Any] = {
-            "api_key": api_key,
-            "provider": provider,
             "model": model,
-            "system_prompt": system_prompt,
             "messages": messages,
+            "max_tokens": max_tokens,
         }
+        if system_prompt:
+            body["system"] = system_prompt
         if tools:
             body["tools"] = tools
         sess = await self._ensure_session()
-        url = f"{self.base_url}/v1/llm/complete"
+        url = f"{self.gateway_url}/v1/messages"
         headers = {
-            "Authorization": f"Bearer {self._token}",
+            "x-api-key": self._api_key,
+            "anthropic-version": _ANTHROPIC_VERSION,
             "Content-Type": "application/json",
         }
         async with sess.post(url, json=body, headers=headers) as resp:

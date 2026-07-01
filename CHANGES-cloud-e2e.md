@@ -1,45 +1,75 @@
 # Cloud-E2E thin-agent changes (`feat/cloud-e2e-thin`)
 
 Branch off `origin/fleet/puffo-agent-thin-refactor`. **Never merged to puffo-agent
-`main`/`dev`** — it exists only so the cloud-agent E2E (cloud-infra
-`docs/integration-board.md`, T2c) can pin its E2B template build to a ref where
-the thin runtime completes the messaging round-trip. The **full/local agent is
-untouched** — every change here is inside `packages/puffo-agent-cloud`.
+`main`/`dev` or the fleet branch's canonical state** — it exists only so the
+cloud-agent E2E (cloud-infra `docs/integration-board.md`) can pin its E2B template
+build (`build.sh` auto-pin) to a ref where the thin runtime completes the messaging
+round-trip. The **full/local agent is untouched** — every change is inside
+`packages/puffo-agent-cloud`.
 
 Owner: S3-messaging. Each change is listed with what + why.
 
 ---
 
-## 1. Auto-reply a text answer back to the DM sender / channel
+## Workstream A — direct-to-LiteLLM inference + MCP-only reply
 
-**Files:** `packages/puffo-agent-cloud/src/puffo_agent_cloud/runner.py`,
-`tests/test_api_puffo_runner.py`.
+Supersedes the earlier auto-reply-text experiment (commit `2d8422f`): the runtime
+now talks **directly** to the LiteLLM gateway and replies **only** by calling the
+`send_message` MCP tool. Files: `cloud_client.py`, `bundle.py`, `config.py`,
+`runner.py`, `tests/test_api_puffo_runner.py`.
 
-**What:** `ApiPuffoRunner._run_turn` now returns `(reply_text, posted)` — the final
-assistant text and whether a `send_message` tool_use already delivered a message
-this turn. `_run_turn_for_frame` uses that: if the model answered in **text** with
-**no** `send_message` tool_use, it posts that text back to where the message came
-from — a DM to the inbound `sender_slug`, or the originating `space_id`/`channel_id`
-for a channel message. A turn that already sent via the tool sets `posted=True` and
-is **not** double-posted.
+### A1 — `CloudLlmClient.complete()` hits the gateway directly
+`cloud_client.py`. The client is now constructed with `(gateway_url, api_key)` and
+calls **`{gateway_url}/v1/messages`** (LiteLLM's Anthropic-compatible endpoint)
+instead of puffo-server's `/v1/llm/complete`.
+- **Auth:** dropped `Authorization: Bearer <sandbox_token>`; now sends
+  `x-api-key: <api_key>` + `anthropic-version: 2023-06-01`.
+- **Body:** native Anthropic shape — `system` (from `system_prompt`), `messages`,
+  `tools`, `model`, and an injected `max_tokens` (default 1024). `provider` and
+  `api_key` are **no longer in the body**.
+- Response parsing unchanged (already Anthropic `content[]` / `stop_reason` /
+  `tool_use`).
+- **Why:** the agent's inference no longer needs the puffo-server proxy hop; it
+  authenticates to LiteLLM with its own per-agent virtual key. Simpler, and keeps
+  the LLM plane independent of the bridge plane.
 
-**Why:** the thin runner previously only delivered a reply when the LLM emitted a
-`send_message` **tool_use**; a plain-text `end_turn` answer was computed, logged,
-and dropped. In the E2E (and with the canned LLM stub, which returns text), that
-meant "the agent thinks but never replies." A DM to the agent has an obvious reply
-target (the sender), so auto-posting a text answer makes a simple, non-tool-using
-model conversational — closing the "reply comes back" leg of the round-trip. Tool-
-using models are unaffected (they set `posted` and keep full control of routing).
+### A2 — `litellm_gateway_url` bundle field
+`bundle.py` + `config.py`. New bundle field `litellm_gateway_url`, written into
+`agent.yml`'s `runtime` block and loaded onto `CloudRuntime`; `runner.py`
+constructs the LLM client from `runtime.litellm_gateway_url` + `runtime.api_key`
+(the existing `api_key` **is** the LiteLLM virtual key). Optional in `from_dict`
+(default `""`) so legacy bundles still ingest during rollout; the runner logs a
+clear warning when it is unset.
+- **⚠ Coordination:** AIM's create-bundle (S2-CRUD-template
+  `lifecycle._build_install_bundle`) must now populate `litellm_gateway_url` (the
+  public/tunnelled LiteLLM gateway the sandbox can reach) alongside the `api_key`
+  virtual key. Until it does, the LLM plane is inert (agent still boots + connects).
 
-**Proven:** unit test `test_runner_auto_replies_text_to_dm_sender` (text answer →
-one `send` to the DM sender; the existing tool-use E2E test still asserts exactly
-one send, i.e. no double-post). Live: modified runtime seeded as a human, DM'd via
-`bridge_client` against the standing puffo-server + canned stub → runner logged
-`auto-replied to <sender>` and the sender observed the reply.
+### A3 — MCP-only reply
+`runner.py`. Removed the `2d8422f` auto-reply text shim. `_run_turn` no longer
+returns `(reply, posted)` and never auto-posts text. The reply target (DM
+`sender_slug`, or the originating `space_id`/`channel_id`) is threaded into the
+turn, and the **system prompt** now instructs the model: *to reply you MUST call
+`send_message`* (with `recipient_slug=<sender>` for a DM, or the channel ids).
+`tools.py::send_message` → `bridge.send_send` is the sole reply path.
+- **Why:** make the reply an explicit MCP action (auditable, routable, matches the
+  fat-agent tool model) rather than an implicit text fallback. A plain-text answer
+  is intentionally **not** delivered.
 
-**Interaction with the deferred server gap:** for a human to *open* an operator-
-bound Agent's reply, puffo-server `bridge::handle_inbound` must pass the sender's
-operator attestation (it currently passes `None`). That is a **puffo-server**
-follow-up (integration-board "#2", deferred). For the PoC the E2B agent is seeded
-as a Human, so its reply opens with no attestation and this change is sufficient
-end-to-end.
+### Tests
+`tests/test_api_puffo_runner.py`:
+- E2E test updated: mock LLM served at `/v1/messages`; asserts the direct-gateway
+  Anthropic body (`system`, `max_tokens=1024`, no `provider`/`api_key`/
+  `system_prompt`), the `x-api-key` + `anthropic-version` headers, and that the
+  system prompt tells the model to `send_message` the DM sender.
+- New `test_runner_mcp_only_text_reply_not_delivered`: a text-only answer delivers
+  **nothing** (guards the shim removal).
+- 23 cloud-package tests pass; ruff clean on all changed files.
+
+### Proven live
+Ran the modified runtime locally against the standing puffo-server (bridge) + the
+LocalStack **LiteLLM** gateway (direct, `x-api-key` = master key), agent + sender
+seeded `--identity-kind human`: DM → `turn (sender=…)` → 2 LLM rounds
+(`send_message` tool_use then `end_turn`) → **sender observed the reply `"4"`**.
+Runtime log confirms `llm_gateway=http://localhost:<port>` (direct, not via
+puffo-server).

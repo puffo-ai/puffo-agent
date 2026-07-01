@@ -23,6 +23,8 @@ class CloudRuntime:
     provider: str = ""
     model: str = ""
     api_key: str = ""
+    # LiteLLM gateway base the runner calls directly for inference.
+    litellm_gateway_url: str = ""
 
 
 @dataclass
@@ -49,6 +51,7 @@ class CloudAgentConfig:
                 provider=rt.get("provider", ""),
                 model=rt.get("model", ""),
                 api_key=rt.get("api_key", ""),
+                litellm_gateway_url=rt.get("litellm_gateway_url", ""),
             ),
         )
 

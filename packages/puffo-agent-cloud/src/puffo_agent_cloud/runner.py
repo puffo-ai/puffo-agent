@@ -61,12 +61,22 @@ class ApiPuffoRunner:
             )
             return
 
+        # LLM plane: call the LiteLLM gateway directly with the per-agent
+        # virtual key (bundle api_key). Distinct from the WS bridge, which uses
+        # puffo_cloud_server_url + sandbox_token.
         self._llm = CloudLlmClient(
-            self._keys.puffo_cloud_server_url, self._keys.sandbox_token,
+            self._cfg.runtime.litellm_gateway_url, self._cfg.runtime.api_key,
         )
+        if not self._cfg.runtime.litellm_gateway_url:
+            logger.warning(
+                "api-puffo runner %s: runtime.litellm_gateway_url is unset — "
+                "LLM calls will fail; the create bundle must set it",
+                self.agent_id,
+            )
         logger.info(
-            "api-puffo runner %s: started (cloud=%s)",
+            "api-puffo runner %s: started (bridge=%s, llm_gateway=%s)",
             self.agent_id, self._keys.puffo_cloud_server_url,
+            self._cfg.runtime.litellm_gateway_url or "(unset)",
         )
 
         try:
@@ -246,7 +256,7 @@ class ApiPuffoRunner:
                 stop_task.cancel()
 
     async def _run_turn_for_frame(self, frame: dict[str, Any]) -> None:
-        sender = frame.get("sender_slug", "?")
+        sender = frame.get("sender_slug", "")
         text = frame.get("plaintext", "")
         if not isinstance(text, str) or not text:
             logger.info(
@@ -256,55 +266,53 @@ class ApiPuffoRunner:
             return
         logger.info(
             "api-puffo runner %s: turn (envelope_id=%s, sender=%s, %d chars)",
-            self.agent_id, frame.get("envelope_id", "?"), sender, len(text),
+            self.agent_id, frame.get("envelope_id", "?"), sender or "?", len(text),
         )
-        reply, posted = await self._run_turn(text)
+        # MCP-only reply: the model must call send_message to answer. Thread the
+        # reply target (DM sender, or the originating channel) into the turn so
+        # the system prompt can tell the model exactly how to address it.
+        await self._run_turn(
+            text,
+            sender=sender,
+            space_id=frame.get("space_id"),
+            channel_id=frame.get("channel_id"),
+        )
 
-        # Auto-reply: if the model answered in text without calling send_message,
-        # deliver that text back to where the message came from — a DM to the
-        # sender, or the originating channel. Lets a plain (non-tool-using) model
-        # hold a conversation; a model that already sent via the tool set
-        # ``posted`` and is skipped here.
-        if reply and not posted and self._bridge is not None:
-            space_id = frame.get("space_id")
-            channel_id = frame.get("channel_id")
-            try:
-                if space_id and channel_id:
-                    await self._bridge.send_send(
-                        plaintext=reply, space_id=space_id, channel_id=channel_id,
-                    )
-                    logger.info(
-                        "api-puffo runner %s: auto-replied to channel %s/%s (%d chars)",
-                        self.agent_id, space_id, channel_id, len(reply),
-                    )
-                elif sender and sender != "?":
-                    await self._bridge.send_send(
-                        plaintext=reply, recipient_slug=sender,
-                    )
-                    logger.info(
-                        "api-puffo runner %s: auto-replied to %s (%d chars)",
-                        self.agent_id, sender, len(reply),
-                    )
-            except (BridgeError, BridgeClosed) as exc:
-                logger.warning(
-                    "api-puffo runner %s: auto-reply failed: %s",
-                    self.agent_id, exc,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "api-puffo runner %s: auto-reply error: %s",
-                    self.agent_id, exc,
-                )
+    def _reply_instruction(
+        self, sender: str, space_id: str | None, channel_id: str | None,
+    ) -> str:
+        """The routing directive appended to the system prompt so the model
+        addresses ``send_message`` at whoever/whichever channel messaged it."""
+        if space_id and channel_id:
+            return (
+                "\n\nYou received a message in a channel. To reply, you MUST call "
+                f"the send_message tool with space_id={space_id!r} and "
+                f"channel_id={channel_id!r}. Do not answer in plain text — a "
+                "reply is only delivered when you call send_message."
+            )
+        if sender:
+            return (
+                "\n\nYou received a direct message. To reply, you MUST call the "
+                f"send_message tool with recipient_slug={sender!r}. Do not answer "
+                "in plain text — a reply is only delivered when you call "
+                "send_message."
+            )
+        return ""
 
-    async def _run_turn(self, user_text: str) -> tuple[str, bool]:
+    async def _run_turn(
+        self,
+        user_text: str,
+        *,
+        sender: str = "",
+        space_id: str | None = None,
+        channel_id: str | None = None,
+    ) -> None:
         """Run the agentic loop for one inbound message.
 
-        Returns ``(reply_text, posted)`` — the final assistant text and whether
-        the agent already delivered a message this turn via the ``send_message``
-        tool. The caller (``_run_turn_for_frame``) uses this to auto-post a
-        plain-text reply back to the DM sender / channel when the model answered
-        in text without calling ``send_message`` (so a simple, non-tool-using
-        model still replies).
+        Reply is **MCP-only**: the model answers by calling the ``send_message``
+        tool. The system prompt (see ``_reply_instruction``) tells it exactly how
+        to address the reply — a DM back to ``sender``, or the originating
+        channel. A plain-text answer is NOT auto-delivered.
         """
         assert (
             self._llm is not None and self._cfg is not None
@@ -317,16 +325,14 @@ class ApiPuffoRunner:
         except Exception:
             soul = ""
         system_prompt = soul or f"You are {self._cfg.display_name}."
+        system_prompt += self._reply_instruction(sender, space_id, channel_id)
 
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": user_text},
         ]
-        posted = False  # set once a send_message tool_use delivers a message
         for round_idx in range(_MAX_TOOL_ROUNDS):
             try:
                 resp = await self._llm.complete(
-                    api_key=self._cfg.runtime.api_key,
-                    provider=self._cfg.runtime.provider or "anthropic",
                     model=self._cfg.runtime.model,
                     system_prompt=system_prompt,
                     messages=messages,
@@ -337,31 +343,28 @@ class ApiPuffoRunner:
                     "api-puffo runner %s: LLM call failed (round %d): %s",
                     self.agent_id, round_idx, exc,
                 )
-                return "", posted
+                return
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "api-puffo runner %s: LLM transport (round %d): %s",
                     self.agent_id, round_idx, exc,
                 )
-                return "", posted
+                return
 
             content = resp.get("content") or []
             stop_reason = resp.get("stop_reason", "")
             tool_uses = [c for c in content if c.get("type") == "tool_use"]
-            text_blocks = [
-                c.get("text", "") for c in content if c.get("type") == "text"
-            ]
             messages.append({"role": "assistant", "content": content})
 
             if not tool_uses or stop_reason == "end_turn":
-                reply = "".join(text_blocks).strip()
-                if reply:
-                    logger.info(
-                        "api-puffo runner %s: turn complete "
-                        "(rounds=%d, %d chars)",
-                        self.agent_id, round_idx + 1, len(reply),
-                    )
-                return reply, posted
+                # End of turn. With MCP-only reply the answer was already
+                # delivered via send_message during a prior round; a bare
+                # text end_turn means the model chose not to reply.
+                logger.info(
+                    "api-puffo runner %s: turn complete (rounds=%d)",
+                    self.agent_id, round_idx + 1,
+                )
+                return
 
             tool_results: list[dict[str, Any]] = []
             for tu in tool_uses:
@@ -372,10 +375,6 @@ class ApiPuffoRunner:
                     result = await dispatch_tool(self._bridge, name, args)
                 except BridgeClosed:
                     result = "error: bridge closed mid-turn"
-                # A successful send_message means the agent already delivered its
-                # reply this turn — don't also auto-post the text (avoid a dup).
-                if name == "send_message" and not result.startswith("error:"):
-                    posted = True
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tu_id,
@@ -387,7 +386,6 @@ class ApiPuffoRunner:
             "api-puffo runner %s: turn hit %d-round cap without end_turn",
             self.agent_id, _MAX_TOOL_ROUNDS,
         )
-        return "", posted
 
     async def _cleanup(self) -> None:
         if self._bridge is not None:

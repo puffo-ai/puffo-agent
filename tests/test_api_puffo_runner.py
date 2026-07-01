@@ -40,6 +40,8 @@ def _isolated_home() -> str:
 
 
 def _valid_bundle(slug: str, cloud_url: str) -> ApiPuffoBundle:
+    # The one test app serves both the WS bridge and the LiteLLM-shaped
+    # /v1/messages endpoint, so the gateway URL is the same base.
     return ApiPuffoBundle.from_dict({
         "agent_slug": slug,
         "operator_slug": "user-test",
@@ -53,6 +55,7 @@ def _valid_bundle(slug: str, cloud_url: str) -> ApiPuffoBundle:
         "api_key": "sk-mock",
         "provider": "anthropic",
         "model": "claude-sonnet-4-6",
+        "litellm_gateway_url": cloud_url,
     })
 
 
@@ -128,7 +131,9 @@ def _build_app(bridge: _MockBridgeApp, llm_handler=None) -> web.Application:
     app = web.Application()
     app.router.add_get("/v2/cloud-agents/subscribe", bridge.ws_handler)
     if llm_handler is not None:
-        app.router.add_post("/v1/llm/complete", llm_handler)
+        # The runtime calls the LiteLLM gateway directly on its
+        # Anthropic-compatible /v1/messages endpoint.
+        app.router.add_post("/v1/messages", llm_handler)
     return app
 
 
@@ -278,8 +283,12 @@ async def test_runner_end_to_end_message_llm_tool_ack():
     })
 
     llm_calls: list[dict] = []
+    llm_api_keys: list[str | None] = []
+    llm_versions: list[str | None] = []
 
     async def llm_complete(request: web.Request) -> web.Response:
+        llm_api_keys.append(request.headers.get("x-api-key"))
+        llm_versions.append(request.headers.get("anthropic-version"))
         body = await request.json()
         llm_calls.append(body)
         msgs = body.get("messages") or []
@@ -338,8 +347,21 @@ async def test_runner_end_to_end_message_llm_tool_ack():
 
     # 2 LLM rounds: initial (tool_use) + post-tool-result (end_turn).
     assert len(llm_calls) == 2
-    assert llm_calls[0]["provider"] == "anthropic"
-    assert llm_calls[0]["messages"][0]["content"] == "hi"
+    # A1: direct-to-gateway Anthropic body — system (not system_prompt),
+    # max_tokens injected, and NO provider/api_key/system_prompt in the body.
+    first = llm_calls[0]
+    assert first["messages"][0]["content"] == "hi"
+    assert first["max_tokens"] == 1024
+    assert "provider" not in first
+    assert "api_key" not in first
+    assert "system_prompt" not in first
+    # A3: the system prompt tells the model to reply via send_message to the
+    # DM sender.
+    assert "send_message" in first["system"]
+    assert "smoker" in first["system"]
+    # A1: auth is the virtual key as x-api-key + the anthropic-version header.
+    assert llm_api_keys[0] == "sk-mock"
+    assert llm_versions[0] == "2023-06-01"
     # 1 tool send + 1 ack of the injected envelope.
     assert len(bridge_app.recv_send) == 1
     sent = bridge_app.recv_send[0]
@@ -352,12 +374,12 @@ async def test_runner_end_to_end_message_llm_tool_ack():
 
 
 @pytest.mark.asyncio
-async def test_runner_auto_replies_text_to_dm_sender():
-    """A plain-text (non-tool) LLM answer is auto-posted back to the DM sender.
+async def test_runner_mcp_only_text_reply_not_delivered():
+    """MCP-only reply: a plain-text answer is NOT delivered (no auto-post).
 
-    A model that answers in text without calling ``send_message`` still gets its
-    reply delivered — the runner posts the text to the originating DM sender.
-    Guards the cloud-e2e auto-reply path (see CHANGES-cloud-e2e.md)."""
+    The model must call send_message to reply; a bare text end_turn produces no
+    outbound send. Guards the removal of the auto-reply text shim (Workstream A3,
+    see CHANGES-cloud-e2e.md)."""
     _isolated_home()
     bridge_app = _MockBridgeApp()
     bridge_app.pending_messages.append({
@@ -369,8 +391,11 @@ async def test_runner_auto_replies_text_to_dm_sender():
         "plaintext": "what is 2 + 2?",
     })
 
+    llm_calls: list[dict] = []
+
     async def llm_complete(request: web.Request) -> web.Response:
-        # Plain text, no tool_use → the runner must auto-post it.
+        llm_calls.append(await request.json())
+        # Plain text, no tool_use → nothing should be delivered.
         return web.json_response({
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": "4"}],
@@ -386,9 +411,9 @@ async def test_runner_auto_replies_text_to_dm_sender():
         stop = asyncio.Event()
         runner = ApiPuffoRunner("rb-bot", stop)
         run_task = asyncio.create_task(runner.run())
-        for _ in range(80):
+        for _ in range(60):
             await asyncio.sleep(0.1)
-            if bridge_app.recv_send:
+            if llm_calls and bridge_app.recv_ack:
                 break
         stop.set()
         try:
@@ -397,8 +422,6 @@ async def test_runner_auto_replies_text_to_dm_sender():
             run_task.cancel()
             await asyncio.gather(run_task, return_exceptions=True)
 
-    # Exactly one send — the auto-reply — addressed to the DM sender.
-    assert len(bridge_app.recv_send) == 1
-    sent = bridge_app.recv_send[0]
-    assert sent["plaintext"] == "4"
-    assert sent["recipient_slug"] == "human-user"
+    # The model was called, but a text-only answer delivered NOTHING.
+    assert len(llm_calls) == 1
+    assert bridge_app.recv_send == []
