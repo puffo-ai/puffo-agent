@@ -280,22 +280,14 @@ async def _resolve_root_id(
     so the new message threads under the real root instead of
     silently disappearing into a sub-thread.
 
-    Runs *after* ``_coerce_root_visibility`` — the visibility
-    decision is keyed off the agent's *intent* (a non-empty
-    ``root_id`` means "threaded reply"), so a hidden-visibility
-    reply whose ``root_id`` is auto-corrected stays hidden. This
-    helper only retargets which thread the message lands in.
+    On healthy data ``thread_root_id`` is always a true root (its
+    own ``thread_root_id IS NULL`` per ``message_store.py``'s schema
+    contract), so the loop terminates after at most one hop. The
+    multi-step walk + cycle break are corruption defense for relay
+    data shapes the schema shouldn't produce.
 
-    On healthy data ``thread_root_id`` is always a true root
-    (its own ``thread_root_id IS NULL`` per ``message_store.py``'s
-    schema contract), so the loop terminates after at most one
-    hop. The multi-step walk + cycle break are corruption defense
-    for relay data shapes the schema shouldn't produce.
-
-    Returns ``(resolved_root_or_None, note)``. ``None`` is
-    returned only when ``root_id.strip()`` is empty. ``note`` is
-    empty unless a correction or warning happened — shape mirrors
-    ``_coerce_root_visibility``. Lookup miss / transport failure
+    Returns ``(resolved_root_or_None, note)`` — ``None`` only when
+    ``root_id.strip()`` is empty. Lookup miss / transport failure
     falls through with the original id plus a soft warning so the
     send still completes.
     """

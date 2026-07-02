@@ -1,11 +1,6 @@
-"""Shared visibility resolution for outbound messages.
-
-Both the MCP send_message tools (agent-driven) and the fallback path
-in ``puffo_core_client.send_fallback_message`` (worker posts when the
-LLM produced text but skipped the tool call) route through
-``resolve_visibility`` so all outbound sends honour the same floor
-and the same per-level guidance notes.
-"""
+"""Shared visibility resolution — the MCP send tools and the worker
+fallback both route through ``resolve_visibility`` so all outbound
+sends honour the same floor + per-level guidance notes."""
 
 from __future__ import annotations
 
@@ -58,8 +53,7 @@ async def resolve_visibility(
     if level == "human":
         return True, ""
 
-    # Root-level auto-coerce (can't fold either way; applies to both
-    # default and agent_only).
+    # Root-level can't fold, so hidden becomes a lie regardless of level.
     if not root_id.strip():
         return True, (
             "\nnote: hidden ignored — root-level messages can't fold, "

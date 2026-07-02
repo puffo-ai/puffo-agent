@@ -3702,10 +3702,8 @@ class PuffoCoreMessageClient:
             envelope_kind, recipient_slug or channel_id, len(devices),
         )
 
-        # Fallback path acts like visibility_level="default": hidden by
-        # default, but the floor forces visible on DMs, root-level, or
-        # @-mention-a-human sends. The note is dropped (no MCP tool
-        # channel to return it on).
+        # Fallback shares the visibility_level="default" floor; the
+        # note is dropped (no MCP return channel).
         from ._visibility import resolve_visibility
         channel_ref = (
             f"@{recipient_slug}" if envelope_kind == "dm" else (channel_id or "")
