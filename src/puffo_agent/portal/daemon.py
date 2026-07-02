@@ -427,11 +427,13 @@ class Daemon:
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
         # Heartbeat must precede revoke — afterwards the device is 401'd.
+        report_settled = True
         if cfg_for_revoke is not None:
             try:
-                await _report_lifecycle(cfg_for_revoke, "archived")
+                report_settled = await _report_lifecycle(cfg_for_revoke, "archived")
             except Exception as exc:  # noqa: BLE001
                 logger.warning("agent %s: archived report failed: %s", agent_id, exc)
+                report_settled = False
         src = agent_dir(agent_id)
         if not src.exists():
             return
@@ -451,6 +453,32 @@ class Daemon:
         if cfg_for_revoke is None or not cfg_for_revoke.puffo_core.is_configured():
             return
         pc = cfg_for_revoke.puffo_core
+        # PUF-350: revoking with the archived report unsettled would 401
+        # every future report attempt — the server row would stay stale
+        # forever. Defer the revoke; the startup sweep re-reports first.
+        if not report_settled:
+            logger.warning(
+                "agent %s: archived report unsettled; deferring revoke to "
+                "the startup sweep (marker in %s)",
+                agent_id, dest,
+            )
+            try:
+                from ..crypto.keystore import KeyStore
+                identity = KeyStore(dest / "keys").load_identity(pc.slug)
+                write_archived_pending_revoke(
+                    dest,
+                    server_url=identity.server_url,
+                    slug=identity.slug,
+                    device_id=identity.device_id,
+                    last_error="archived report unsettled",
+                    report_status="archived",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: failed to write pending_revoke marker: %s",
+                    agent_id, exc,
+                )
+            return
         try:
             await revoke_archived_device(dest, slug=pc.slug)
             logger.info("agent %s: device revoked server-side", agent_id)
@@ -493,6 +521,17 @@ class Daemon:
             cfg_for_revoke = AgentConfig.load(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("agent %s: cfg load for revoke failed: %s", agent_id, exc)
+        # PUF-350: deleted agents left their server status row stale too
+        # ('archived' is the closest lifecycle state — the dashboard
+        # filters it the same way). Same report-before-revoke ordering
+        # as _archive_on_flag.
+        report_settled = True
+        if cfg_for_revoke is not None:
+            try:
+                report_settled = await _report_lifecycle(cfg_for_revoke, "archived")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent %s: archived report failed: %s", agent_id, exc)
+                report_settled = False
         src = agent_dir(agent_id)
         if not src.exists():
             return
@@ -519,6 +558,29 @@ class Daemon:
                 )
             return
         pc = cfg_for_revoke.puffo_core
+        if not report_settled:
+            logger.warning(
+                "agent %s: archived report unsettled; deferring revoke + "
+                "delete to the startup sweep (marker in %s)",
+                agent_id, dest,
+            )
+            try:
+                from ..crypto.keystore import KeyStore
+                identity = KeyStore(dest / "keys").load_identity(pc.slug)
+                write_archived_pending_revoke(
+                    dest,
+                    server_url=identity.server_url,
+                    slug=identity.slug,
+                    device_id=identity.device_id,
+                    last_error="archived report unsettled",
+                    report_status="archived",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: failed to write pending_revoke marker: %s",
+                    agent_id, exc,
+                )
+            return
         try:
             await revoke_archived_device(dest, slug=pc.slug)
             logger.info("agent %s: device revoked server-side", agent_id)

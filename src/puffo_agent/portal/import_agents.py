@@ -658,23 +658,66 @@ def write_archived_pending_revoke(
     slug: str,
     device_id: str,
     last_error: str,
+    report_status: str | None = None,
 ) -> None:
+    """``report_status`` (PUF-350): a lifecycle state (``archived``)
+    that still needs reporting BEFORE the revoke — revoking first
+    would 401 the report forever. The sweep re-reports, drops the
+    field, then revokes."""
     path = archived_pending_revoke_path(archived_agent_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "kind": "archive_self_revoke",
-                "server_url": server_url,
-                "slug": slug,
-                "device_id": device_id,
-                "last_error": last_error,
-                "attempted_at": int(time.time() * 1000),
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    payload: dict = {
+        "kind": "archive_self_revoke",
+        "server_url": server_url,
+        "slug": slug,
+        "device_id": device_id,
+        "last_error": last_error,
+        "attempted_at": int(time.time() * 1000),
+    }
+    if report_status is not None:
+        payload["report_status"] = report_status
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+async def _report_lifecycle_from_dir(
+    archived_path: Path, *, server_url: str, slug: str, status: str,
+) -> bool:
+    """Report a lifecycle state from an archived agent dir's keystore.
+    Same settled semantics as ``daemon._report_lifecycle``: True when
+    delivered or rejected with a deterministic 4xx, False on a
+    transient failure worth retrying next sweep."""
+    from ..crypto.http_client import HttpError, PuffoCoreHttpClient
+    from .control.store import current_machine_id
+
+    http = PuffoCoreHttpClient(server_url, KeyStore(archived_path / "keys"), slug)
+    try:
+        body: dict = {"status": status}
+        machine_id = current_machine_id()
+        if machine_id:
+            body["machine_id"] = machine_id
+        await http.post("/agents/me/heartbeat", body)
+        return True
+    except HttpError as exc:
+        if 400 <= exc.status < 500:
+            logger.warning(
+                "pending lifecycle report %r for %s rejected (HTTP %s); "
+                "giving up: %s",
+                status, slug, exc.status, exc.body,
+            )
+            return True
+        logger.warning(
+            "pending lifecycle report %r for %s failed (HTTP %s); will retry",
+            status, slug, exc.status,
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001 — transient (network); retry
+        logger.warning(
+            "pending lifecycle report %r for %s failed; will retry: %s",
+            status, slug, exc,
+        )
+        return False
+    finally:
+        await http.close()
 
 
 class _RetryOutcome(enum.Enum):
@@ -699,6 +742,26 @@ async def _retry_archived_pending_revoke(
         )
         _mark_pending_revoke_broken(marker, str(exc))
         return _RetryOutcome.UNRETRYABLE
+    # PUF-350: a deferred lifecycle report must land (or settle on a
+    # 4xx) before the revoke kills the device's auth. Once settled the
+    # field is dropped so later sweeps go straight to the revoke.
+    report_status = payload.get("report_status")
+    if isinstance(report_status, str) and report_status:
+        settled = await _report_lifecycle_from_dir(
+            archived_path,
+            server_url=server_url,
+            slug=slug,
+            status=report_status,
+        )
+        if not settled:
+            return _RetryOutcome.TRANSIENT
+        write_archived_pending_revoke(
+            archived_path,
+            server_url=server_url,
+            slug=slug,
+            device_id=device_id,
+            last_error=str(payload.get("last_error", "")),
+        )
     keystore = KeyStore(archived_path / "keys")
     try:
         identity = keystore.load_identity(slug)

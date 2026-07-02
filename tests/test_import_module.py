@@ -53,6 +53,7 @@ def _make_mock_app(state):
     app.router.add_post("/devices/enroll/init", record)
     app.router.add_post("/devices/enroll/{nonce}/complete", record)
     app.router.add_post("/devices/{device_id}/revoke", record)
+    app.router.add_post("/agents/me/heartbeat", record)
     return app
 
 
@@ -559,6 +560,154 @@ async def test_sweep_archived_pending_revokes_leaves_marker_on_transient_failure
     n = await imp.sweep_archived_pending_revokes()
     assert n == 0
     assert imp.archived_pending_revoke_path(dest).exists()
+
+
+# ── PUF-350: deferred lifecycle report (report must precede revoke) ──
+
+
+def _seed_archived_with_marker(url, info, **marker_kwargs):
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import agent_dir, archived_dir
+
+    archived_dir().mkdir(parents=True, exist_ok=True)
+    dest = archived_dir() / "alpha-20260702-120000"
+    Path(agent_dir("alpha")).rename(dest)
+    imp.write_archived_pending_revoke(
+        dest,
+        server_url=url,
+        slug=info["slug"],
+        device_id=info["old_device_id"],
+        **marker_kwargs,
+    )
+    return dest
+
+
+async def test_sweep_reports_deferred_lifecycle_then_revokes(mock_server):
+    """A marker carrying ``report_status`` heartbeats the state first,
+    then revokes — the report would 401 after the revoke."""
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    dest = _seed_archived_with_marker(
+        url, info,
+        last_error="archived report unsettled",
+        report_status="archived",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 1
+    assert not imp.archived_pending_revoke_path(dest).exists()
+    ordered = [
+        p for (m, p) in state["calls"]
+        if p == "/agents/me/heartbeat"
+        or p == f"/devices/{info['old_device_id']}/revoke"
+    ]
+    assert ordered.index("/agents/me/heartbeat") < ordered.index(
+        f"/devices/{info['old_device_id']}/revoke"
+    )
+
+
+async def test_sweep_transient_report_failure_defers_revoke(mock_server):
+    """Heartbeat 500 → marker kept (report_status intact) and the
+    revoke is NOT attempted — auth must survive for the next retry."""
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    state["fail"] = {"heartbeat"}
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    dest = _seed_archived_with_marker(
+        url, info,
+        last_error="archived report unsettled",
+        report_status="archived",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    marker = imp.archived_pending_revoke_path(dest)
+    assert marker.exists()
+    assert json.loads(marker.read_text(encoding="utf-8"))["report_status"] == "archived"
+    assert not any("revoke" in p for (_, p) in state["calls"])
+
+
+async def test_sweep_drops_report_status_once_settled(mock_server):
+    """Report lands but the revoke 500s → the rewritten marker drops
+    ``report_status`` so the next sweep goes straight to the revoke
+    without a duplicate heartbeat."""
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    state["fail"] = {"revoke"}
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+    dest = _seed_archived_with_marker(
+        url, info,
+        last_error="archived report unsettled",
+        report_status="archived",
+    )
+
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 0
+    marker = imp.archived_pending_revoke_path(dest)
+    assert marker.exists()
+    assert "report_status" not in json.loads(marker.read_text(encoding="utf-8"))
+
+    state["fail"] = set()
+    heartbeats_before = sum(1 for (_, p) in state["calls"] if p == "/agents/me/heartbeat")
+    n = await imp.sweep_archived_pending_revokes()
+    assert n == 1
+    assert not marker.exists()
+    heartbeats_after = sum(1 for (_, p) in state["calls"] if p == "/agents/me/heartbeat")
+    assert heartbeats_after == heartbeats_before
+
+
+async def test_archive_on_flag_defers_revoke_when_report_unsettled(
+    mock_server, monkeypatch,
+):
+    """Daemon glue: an unsettled archived report writes the deferred
+    marker and skips the immediate revoke entirely."""
+    from puffo_agent.portal import daemon as daemon_mod
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import archived_dir
+
+    server, _ = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+
+    async def _unsettled(_cfg, _status):
+        return False
+
+    async def _must_not_revoke(*_a, **_k):
+        raise AssertionError("revoke must be deferred while the report is unsettled")
+
+    monkeypatch.setattr(daemon_mod, "_report_lifecycle", _unsettled)
+    monkeypatch.setattr(imp, "revoke_archived_device", _must_not_revoke)
+
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+
+    async def _noop_stop(_agent_id):
+        return None
+
+    d._stop_worker = _noop_stop
+    await d._archive_on_flag("alpha")
+
+    dests = [p for p in archived_dir().iterdir() if p.name.startswith("alpha-ws-")]
+    assert len(dests) == 1
+    marker = imp.archived_pending_revoke_path(dests[0])
+    assert marker.exists()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["report_status"] == "archived"
+    assert payload["slug"] == info["slug"]
 
 
 async def test_sweep_archived_pending_revokes_handles_empty_archived_dir():
