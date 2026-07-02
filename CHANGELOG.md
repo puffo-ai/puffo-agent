@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.6] — 2026-07-01
+
 ### Added
 
 - **Three `suggest-*` default skills so agents nudge humans instead
