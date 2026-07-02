@@ -198,20 +198,20 @@ def _coerce_root_visibility(
     return is_visible_to_human, ""
 
 
-async def _coerce_dm_and_human_reply_visibility(
+async def _coerce_dm_and_human_mention_visibility(
     channel_ref: str,
-    root_id: str,
+    text: str,
     is_visible_to_human: bool,
     agent_only: bool,
-    data_client: Any,
     http_client: Any,
 ) -> tuple[bool, str]:
-    """Visibility floor for DMs + threaded replies whose root was
-    posted by a human — force ``visible=true`` and return a note so
-    the agent learns on the spot. ``agent_only=true`` skips the
-    floor for genuine agent-to-agent traffic. Lookup failures on
-    the identity check pass through so a transient profile-fetch
-    error can't flip an intentional ``visible=false``."""
+    """Visibility floor: force ``visible=true`` in two contexts where
+    a hidden send would strand a person — DMs, and any message whose
+    body ``@``-mentions a human. ``agent_only=true`` skips the floor.
+    Profile-lookup failures pass through so a transient error can't
+    flip an intentional ``visible=false``."""
+    from ..agent.puffo_core_client import _MENTION_RE
+
     if agent_only:
         return is_visible_to_human, ""
     if is_visible_to_human:
@@ -222,42 +222,30 @@ async def _coerce_dm_and_human_reply_visibility(
             "visible so the addressee can see them. Pass "
             "``agent_only=true`` for a genuine agent-to-agent DM."
         )
-    if not root_id.strip():
-        return is_visible_to_human, ""
-    try:
-        root_msg = await data_client.get_message_by_envelope(root_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(
-            "visibility-floor root lookup transport error for %s: %s",
-            root_id, exc,
-        )
-        return is_visible_to_human, ""
-    if root_msg is None:
-        return is_visible_to_human, ""
-    root_sender = getattr(root_msg, "sender_slug", "") or ""
-    if not root_sender:
+    mentioned = sorted({m.lower() for m in _MENTION_RE.findall(text or "")})
+    if not mentioned:
         return is_visible_to_human, ""
     try:
         resp = await http_client.get(
-            f"/identities/profiles?slugs={urllib.parse.quote(root_sender, safe='')}"
+            "/identities/profiles?slugs="
+            + ",".join(urllib.parse.quote(m, safe="") for m in mentioned)
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "visibility-floor profile fetch failed for %s: %s",
-            root_sender, exc,
+            mentioned, exc,
         )
         return is_visible_to_human, ""
     profiles = resp.get("profiles", []) if isinstance(resp, dict) else []
-    if not profiles:
-        return is_visible_to_human, ""
-    identity_type = (profiles[0].get("identity_type") or "human").strip().lower()
-    if identity_type != "human":
+    if not any(
+        (p.get("identity_type") or "human").strip().lower() == "human"
+        for p in profiles
+    ):
         return is_visible_to_human, ""
     return True, (
-        "\nnote: is_visible_to_human=false ignored — this thread's "
-        "root was posted by a human, so the reply is sent visible. "
-        "Pass ``agent_only=true`` for a genuine agent-to-agent "
-        "threaded exchange."
+        "\nnote: is_visible_to_human=false ignored — the message "
+        "@-mentions a human, so it's sent visible. Pass "
+        "``agent_only=true`` if this really is agent-to-agent chatter."
     )
 
 
@@ -504,9 +492,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             default — judge every message. NOTE: ``false`` only takes
             effect on threaded replies (when ``root_id`` is set) —
             root-level messages can't fold, so ``false`` on one is
-            ignored and the message is sent visible. DMs and threaded
-            replies rooted at a human message also force visible
-            unless ``agent_only=true``.
+            ignored and the message is sent visible. DMs and messages
+            whose text @-mentions a human also force visible unless
+            ``agent_only=true``.
         root_id: optional — reply inside a thread; pass the
             envelope_id of the message you're replying to.
         agent_only: opt-out of the DM / human-reply visibility floor.
@@ -572,9 +560,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         # Floor runs AFTER the root-level coercion: the already-visible
         # short-circuit inside the floor keeps both notes from firing.
-        effective_visible, floor_note = await _coerce_dm_and_human_reply_visibility(
-            channel_ref, root_id, effective_visible, agent_only,
-            cfg.data_client, cfg.http_client,
+        effective_visible, floor_note = await _coerce_dm_and_human_mention_visibility(
+            channel_ref, text, effective_visible, agent_only, cfg.http_client,
         )
         resolved_root, root_note = await _resolve_root_id(
             root_id, cfg.data_client,
@@ -1055,9 +1042,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             fold away. No default — judge every send. NOTE: ``false``
             only takes effect on threaded replies (when ``root_id`` is
             set); on a root-level message it's ignored and the
-            message is sent visible. DMs and threaded replies rooted
-            at a human message also force visible unless
-            ``agent_only=true``.
+            message is sent visible. DMs and captions that @-mention
+            a human also force visible unless ``agent_only=true``.
         caption: optional text alongside the files.
         root_id: optional thread reply, same semantics as
             ``send_message``'s ``root_id``.
@@ -1197,9 +1183,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         effective_visible, fold_note = _coerce_root_visibility(
             is_visible_to_human, root_id,
         )
-        effective_visible, floor_note = await _coerce_dm_and_human_reply_visibility(
-            channel_ref, root_id, effective_visible, agent_only,
-            cfg.data_client, cfg.http_client,
+        effective_visible, floor_note = await _coerce_dm_and_human_mention_visibility(
+            channel_ref, caption, effective_visible, agent_only, cfg.http_client,
         )
         resolved_root, root_note = await _resolve_root_id(
             root_id, cfg.data_client,
