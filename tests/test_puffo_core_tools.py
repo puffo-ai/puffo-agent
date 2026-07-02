@@ -259,8 +259,9 @@ async def test_send_message_root_level_false_coerced():
 
 @pytest.mark.asyncio
 async def test_send_message_threaded_false_not_coerced():
-    """A threaded reply (root_id set) with visibility_level='default'
-    and no @-mention stays hidden — no coercion, no note."""
+    """A threaded reply with visibility_level='default' and no
+    @-mention stays hidden — no coerce; the tool result carries
+    the "be explicit" nudge note instead."""
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
     # Pre-cache the channel→space mapping the way an inbound message
@@ -295,6 +296,91 @@ async def test_send_message_threaded_false_not_coerced():
     )
     assert "posted" in result
     assert "ignored" not in result
+    # Nudge note fires: level was default with no signal.
+    assert "sent hidden" in result
+    assert "'human'" in result and "'agent_only'" in result
+
+
+@pytest.mark.asyncio
+async def test_send_message_human_no_notes():
+    """visibility_level='human' — visible send, no notes."""
+    cfg, http, ms = _setup()
+    recipient_kem = KemKeyPair.generate()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
+        "members": [{"slug": "alice-0001", "role": "owner"}],
+    }
+    http.responses["/certs/sync?slugs=alice-0001"] = {
+        "entries": [{
+            "seq": 1, "kind": "device_cert", "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_recipient_1",
+                "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp,
+        "send_message",
+        {
+            "channel": "ch_abc",
+            "text": "answer for the operator",
+            "visibility_level": "human",
+        },
+    )
+    assert "posted" in result
+    # No visibility note appended (level was explicit).
+    assert "sent visible" not in result
+    assert "sent hidden" not in result
+    assert "hidden ignored" not in result
+
+
+@pytest.mark.asyncio
+async def test_send_message_agent_only_dm_stays_hidden_with_warning():
+    """visibility_level='agent_only' + DM: floor respects the opt-out
+    (hidden) but the tool result warns that this looks human-targeted
+    so the agent can reconsider without being overridden."""
+    cfg, http, ms = _setup()
+    recipient_kem = KemKeyPair.generate()
+    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = {
+        "entries": [
+            {
+                "seq": 1, "kind": "device_cert", "slug": "agent-0001",
+                "cert": {
+                    "device_id": "dev_self",
+                    "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+                },
+            },
+            {
+                "seq": 2, "kind": "device_cert", "slug": "alice-0001",
+                "cert": {
+                    "device_id": "dev_recipient_1",
+                    "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+                },
+            },
+        ],
+        "has_more": False,
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp,
+        "send_message",
+        {
+            "channel": "@alice-0001",
+            "text": "internal ping",
+            "visibility_level": "agent_only",
+            "root_id": "msg_root_dm",
+        },
+    )
+    # NB: msg_root_dm isn't in local cache, so validate_root wipes it
+    # with its own warning note — assert the visibility warning is
+    # present alongside, don't insist on it being alone.
+    assert "posted" in result
+    assert "sent hidden per" in result
+    assert "DM" in result
+    assert "Double-check" in result
 
 
 @pytest.mark.asyncio
