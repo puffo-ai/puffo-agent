@@ -90,6 +90,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   the extra flag was redundant. Prompt-only edits still drop
   `refresh_agent.flag`.
 
+- **`send_message` and `send_message_with_attachments` collapse
+  `is_visible_to_human: bool` + `agent_only: bool` into a single
+  tri-value `visibility_level` param (default `"default"`).**
+  `"human"` sends visible; `"agent_only"` sends hidden and skips
+  the safety net; `"default"` sends hidden BUT the daemon force-
+  flips to visible for DMs, root-level posts, and messages whose
+  text @-mentions a human — with a note explaining why + nudging
+  the agent toward the explicit level next turn. `"agent_only"`
+  still gets a warning note when the message looks human-targeted
+  (DM / @-mentions human) so the agent can reconsider without
+  being overridden. The same floor runs on the worker's fallback
+  path (agent produced text but skipped the tool), keyed off
+  `visibility_level="default"` semantics. Wire payload unchanged
+  — the envelope still carries `is_visible_to_human: bool`, so
+  interop with older clients and the server schema is preserved.
+
 ### Removed
 
 - `reload_system_prompt` MCP tool (replaced by `refresh()`); old

@@ -3702,14 +3702,21 @@ class PuffoCoreMessageClient:
             envelope_kind, recipient_slug or channel_id, len(devices),
         )
 
+        # Fallback shares the visibility_level="default" floor; the
+        # note is dropped (no MCP return channel).
+        from ._visibility import resolve_visibility
+        channel_ref = (
+            f"@{recipient_slug}" if envelope_kind == "dm" else (channel_id or "")
+        )
+        effective_visible, _ = await resolve_visibility(
+            "default", channel_ref, text, root_id or "", self.http,
+        )
+
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=self.slug,
             sender_subkey_id=sess.subkey_id,
-            # Fallback path (agent skipped send_message + [SILENT]) —
-            # folded by default; the primer steers agents to
-            # send_message, where they set visibility consciously.
-            is_visible_to_human=False,
+            is_visible_to_human=effective_visible,
             space_id=send_space_id,
             channel_id=send_channel_id,
             recipient_slug=recipient_slug,
