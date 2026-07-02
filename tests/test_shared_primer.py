@@ -257,6 +257,12 @@ def test_primer_metadata_example_matches_builder():
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
     # The old, wrong relative form must be gone.
     assert "- attachments/<envelope_id>" not in DEFAULT_SHARED_CLAUDE_MD
+    # The attachments skill mirrors the same absolute-path convention.
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    description, body = DEFAULT_SKILLS["attachments"]
+    assert "<workspace>/.puffo/inbox/" in description
+    assert "<workspace>/.puffo/inbox/<envelope_id>/<filename>" in body
 
 
 def test_skills_do_not_reference_removed_send_params():

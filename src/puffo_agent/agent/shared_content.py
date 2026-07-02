@@ -440,9 +440,10 @@ DEFAULT_SKILL_ATTACHMENTS = """\
 # Skill: attachments (incoming files)
 
 When a user sends you a file, the daemon decrypts it before your
-turn starts and saves it under your workspace at
-``.puffo/inbox/<envelope_id>/<filename>``. The path shows up in the
-`attachments:` block of the message metadata — one line per file.
+turn starts and saves it at
+``<workspace>/.puffo/inbox/<envelope_id>/<filename>``. The absolute
+path shows up in the `attachments:` block of the message metadata —
+one line per file.
 
 **What to do with them:**
 - Read text-shaped files (`.md`, `.txt`, `.json`, source code, …)
@@ -1036,7 +1037,7 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
     ),
     "attachments": (
-        "Read inbound file attachments saved under .puffo/inbox/.",
+        "Read inbound file attachments saved under <workspace>/.puffo/inbox/.",
         DEFAULT_SKILL_ATTACHMENTS,
     ),
     "permissions": (
