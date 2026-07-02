@@ -361,10 +361,9 @@ def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch,
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "refresh_broken"
-    # PUF-343: user-facing runtime.error shape mirrors PUF-341's DM;
-    # the outcome-class debug ("unchanged") lives in the daemon log.
     assert "Claude Code sign-in couldn't be refreshed" in rs.error
     assert "claude auth login" in rs.error
+    # Outcome-class debug stays in the daemon log, not in runtime.error.
     assert any(
         "flipping refresh_broken" in rec.getMessage() and "unchanged" in rec.getMessage()
         for rec in caplog.records
@@ -586,12 +585,9 @@ def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch,
         r._propagate_outcome(RefreshOutcome.FAILED)
     rs = RuntimeState.load(aid)
     assert rs.health == "refresh_broken"
-    # PUF-343: the user-visible runtime.error field is the operator-
-    # facing recovery instruction now (matching PUF-341's DM copy). The
-    # LATEST-outcome debug ("failed" vs "unchanged") lives in the daemon
-    # log where an engineer can see it without leaking into the UI.
     assert "Claude Code sign-in couldn't be refreshed" in rs.error
     assert "claude auth login" in rs.error
+    # Latest-outcome class is logged, not written into runtime.error.
     assert any(
         "flipping refresh_broken" in rec.getMessage() and "failed" in rec.getMessage()
         for rec in caplog.records

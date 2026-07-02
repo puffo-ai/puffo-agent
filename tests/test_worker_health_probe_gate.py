@@ -67,10 +67,6 @@ def test_reassert_flips_ok_back_to_auth_failed():
     )
 
     assert rt.health == "auth_failed"
-    # PUF-343: reassertion path shares the same user-facing shape as the
-    # rest of the auth-failed surfaces so the web pane / CLI status /
-    # DM copy stay aligned. The "post-warm probe failed" diagnostic lives
-    # in the daemon log (log.warning at the call site).
     assert "Claude Code sign-in expired" in rt.error
     assert "claude auth login" in rt.error
     assert rt.saved == [(

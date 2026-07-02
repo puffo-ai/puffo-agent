@@ -533,10 +533,6 @@ def _handle_suppressed_reply(
                 )
     if scope == "api-error-retry":
         if is_auth:
-            # PUF-343: same shape as the operator DM copy (PUF-341) so the
-            # web pane + CLI status don't drift back into engineer-log
-            # voice. The suppressed-from-channel-post detail already lives
-            # in the daemon log.
             runtime.error = (
                 "Claude Code sign-in expired. On the computer running "
                 "puffo-agent, open a terminal and run `claude auth "
@@ -658,8 +654,6 @@ class Worker:
         if runtime.health != "ok":
             return
         runtime.health = "auth_failed"
-        # PUF-343: even the post-probe reassertion path renders in the
-        # web pane's health card, so keep the user-facing shape.
         runtime.error = (
             "Claude Code sign-in expired. On the computer running "
             "puffo-agent, open a terminal and run `claude auth "
@@ -679,9 +673,6 @@ class Worker:
         rt = self.runtime
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
-        # PUF-343: PUF-341's operator DM is the user's primary signal, but
-        # the same string surfaces in the web pane + CLI status; keep it
-        # user-facing so the two surfaces stay aligned.
         rt.error = (
             "Claude Code sign-in expired. On the computer running "
             "puffo-agent, open a terminal and run `claude auth "
