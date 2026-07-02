@@ -20,6 +20,45 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `model_catalog.prefetch()` from `Daemon.run()` at startup so both
   paths report identically.
 
+- **Distinct error when an agent passes a bare user slug where a
+  channel id belongs.** `send_message`, `send_message_with_attachments`,
+  `list_channel_members`, `leave_channel`, and `get_channel_history`
+  now return `"'<slug>' is not a channel id — prepend '@' to DM
+  them: send_message(channel='@<slug>', ...); to read a DM use
+  get_dm_history(peer='<slug>'). To find a channel id, call
+  list_channels_in_all_spaces."` instead of the generic membership
+  cache-miss error, which read as a stale-cache problem and never
+  hinted at the actual mistake. A genuine `ch_`-prefixed cache miss
+  keeps the original wording. Injected once in `_resolve_channel_space`
+  so all channel-taking tools share it.
+
+### Changed
+
+- **Agent primer + skill bodies audited for correctness.** Every
+  message sent to an agent stamps `msg_<uuid>` envelope ids, not
+  `env_<uuid>` — six documentation references corrected.
+  Attachment paths documented as absolute
+  `<workspace>/.puffo/inbox/<envelope_id>/<filename>` (the shape
+  `agent/core.py` actually emits), instead of the two prior
+  inconsistent forms. Metadata example now documents the separate
+  `sender` (display name) + `sender_slug` (structural id) fields,
+  the `(agent)` mention suffix, and `followup_messages_since:` — all
+  fields the builder emits and agents need for correct replies. The
+  DM reply rule (`channel="@<sender_slug>"`) moved into "How to
+  reply" next to the `channel_id` guidance, instead of only sitting
+  100+ lines below in "Spaces, channels, DMs". `list_channel_members`
+  and `get_user_info` skill bodies no longer claim `puffo-core has
+  no is_bot flag` — the reliable identity signal is metadata
+  `sender_type:` and the `(human)`/`(agent)` mention suffixes.
+
+- **Shared primer tightened.** `DEFAULT_SHARED_CLAUDE_MD` compressed
+  from 267 to 220 lines (roughly 440 tokens saved per turn, since
+  the primer folds into every agent's context on every turn). No
+  load-bearing information dropped — the metadata field list, tool
+  signatures, `[puffo-agent system message]` taxonomy, and
+  `@you(...)` self-mention mechanics are verbatim. Duplicative
+  prose and redundant section stubs removed.
+
 ## [1.0.6] — 2026-07-01
 
 ### Added
