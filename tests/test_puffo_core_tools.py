@@ -1388,11 +1388,9 @@ async def test_validate_root_dm_envelope_no_channel_id_passes_through():
     assert note == ""
 
 
-# PUF-345: belt-and-suspenders visibility floor for send_message. The
-# helper is what the tool body calls right after _coerce_root_visibility;
-# these tests cover the two contexts named by the canonical spec (DM +
-# threaded reply rooted at a human) plus every branch that must NOT
-# false-positive coerce.
+# _coerce_dm_and_human_reply_visibility — DM + human-rooted thread
+# floor. Covers the two coercion branches + every pass-through branch
+# that must NOT false-positive coerce.
 
 
 class _FloorHttp:

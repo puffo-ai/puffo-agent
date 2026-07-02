@@ -206,26 +206,12 @@ async def _coerce_dm_and_human_reply_visibility(
     data_client: Any,
     http_client: Any,
 ) -> tuple[bool, str]:
-    """PUF-345 belt-and-suspenders visibility floor for the two
-    contexts where a mistakenly-hidden reply strands a human waiting
-    for an answer:
-
-      1. DMs (``channel`` starts with ``@``) — DMs are meant for the
-         addressee to read.
-      2. Threaded replies whose thread root was posted by a human —
-         the human is the one waiting inside that thread.
-
-    In both cases we force ``is_visible_to_human=true`` and return a
-    note so the agent learns on the spot. The named ``agent_only``
-    override skips the floor for genuine agent-to-agent DMs / threaded
-    chatter (documented as the escape hatch in the tool docstring).
-
-    Returns ``(effective_visibility, note)`` — ``note`` is empty
-    unless a coercion happened. Lookup failures on the thread-root
-    identity check pass through without coercing so a transient
-    profile-fetch error can't silently flip an intentional
-    ``visible=false`` for the caller.
-    """
+    """Visibility floor for DMs + threaded replies whose root was
+    posted by a human — force ``visible=true`` and return a note so
+    the agent learns on the spot. ``agent_only=true`` skips the
+    floor for genuine agent-to-agent traffic. Lookup failures on
+    the identity check pass through so a transient profile-fetch
+    error can't flip an intentional ``visible=false``."""
     if agent_only:
         return is_visible_to_human, ""
     if is_visible_to_human:
@@ -240,9 +226,9 @@ async def _coerce_dm_and_human_reply_visibility(
         return is_visible_to_human, ""
     try:
         root_msg = await data_client.get_message_by_envelope(root_id)
-    except Exception as exc:  # noqa: BLE001 — soft-fail preserves caller intent
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
-            "PUF-345 root-sender lookup transport error for %s: %s",
+            "visibility-floor root lookup transport error for %s: %s",
             root_id, exc,
         )
         return is_visible_to_human, ""
@@ -257,7 +243,7 @@ async def _coerce_dm_and_human_reply_visibility(
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug(
-            "PUF-345 root-sender profile fetch failed for %s: %s",
+            "visibility-floor profile fetch failed for %s: %s",
             root_sender, exc,
         )
         return is_visible_to_human, ""
@@ -518,10 +504,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             default — judge every message. NOTE: ``false`` only takes
             effect on threaded replies (when ``root_id`` is set) —
             root-level messages can't fold, so ``false`` on one is
-            ignored and the message is sent visible. Additionally,
-            DMs and threaded replies rooted at a human message force
-            visible unless ``agent_only=true`` (PUF-345 belt-and-
-            suspenders floor).
+            ignored and the message is sent visible. DMs and threaded
+            replies rooted at a human message also force visible
+            unless ``agent_only=true``.
         root_id: optional — reply inside a thread; pass the
             envelope_id of the message you're replying to.
         agent_only: opt-out of the DM / human-reply visibility floor.
@@ -585,10 +570,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         effective_visible, fold_note = _coerce_root_visibility(
             is_visible_to_human, root_id,
         )
-        # PUF-345 belt-and-suspenders floor — DM or human-rooted
-        # threaded reply. Runs after the root-level coercion so the
-        # root-level note (which forces visible unconditionally) wins
-        # when both would apply.
+        # Floor runs AFTER the root-level coercion: the already-visible
+        # short-circuit inside the floor keeps both notes from firing.
         effective_visible, floor_note = await _coerce_dm_and_human_reply_visibility(
             channel_ref, root_id, effective_visible, agent_only,
             cfg.data_client, cfg.http_client,
@@ -1073,8 +1056,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             only takes effect on threaded replies (when ``root_id`` is
             set); on a root-level message it's ignored and the
             message is sent visible. DMs and threaded replies rooted
-            at a human message force visible unless
-            ``agent_only=true`` (PUF-345 belt-and-suspenders floor).
+            at a human message also force visible unless
+            ``agent_only=true``.
         caption: optional text alongside the files.
         root_id: optional thread reply, same semantics as
             ``send_message``'s ``root_id``.
@@ -1214,8 +1197,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         effective_visible, fold_note = _coerce_root_visibility(
             is_visible_to_human, root_id,
         )
-        # PUF-345 belt-and-suspenders floor — mirrors send_message so
-        # attachment sends can't slip past the same discipline.
         effective_visible, floor_note = await _coerce_dm_and_human_reply_visibility(
             channel_ref, root_id, effective_visible, agent_only,
             cfg.data_client, cfg.http_client,
