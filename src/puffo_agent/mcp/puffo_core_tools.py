@@ -558,8 +558,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         effective_visible, fold_note = _coerce_root_visibility(
             is_visible_to_human, root_id,
         )
-        # Floor runs AFTER the root-level coercion: the already-visible
-        # short-circuit inside the floor keeps both notes from firing.
+        # Floor runs after root-visibility so the two notes don't stack.
         effective_visible, floor_note = await _coerce_dm_and_human_mention_visibility(
             channel_ref, text, effective_visible, agent_only, cfg.http_client,
         )
