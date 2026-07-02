@@ -217,7 +217,7 @@ def test_cli_reset_primer_unknown_agent_returns_error(monkeypatch):
     assert (home / "docker" / "shared" / "CLAUDE.md").exists()
 
 
-# ── PUF-348: primer + skill correctness/consistency invariants ──────
+# ── primer + skill body correctness invariants ─────────────────────
 
 
 def test_docs_use_msg_envelope_id_format():
@@ -234,15 +234,12 @@ def test_docs_use_msg_envelope_id_format():
 
 
 def test_primer_dm_reply_rule_lives_in_how_to_reply():
-    """FB-353: the DM ``@<slug>`` rule must sit inside the section
-    agents actually read when replying, next to the ``channel_id``
-    guidance — not only 100+ lines below in 'Spaces, channels, DMs'."""
+    """The DM ``@<slug>`` rule sits inside 'How to reply' (where
+    agents actually read on reply), not only 100+ lines below."""
     start = DEFAULT_SHARED_CLAUDE_MD.index("## How to reply")
     end = DEFAULT_SHARED_CLAUDE_MD.index("## Spaces, channels, DMs")
     how_to_reply = DEFAULT_SHARED_CLAUDE_MD[start:end]
     assert "@<sender_slug>" in how_to_reply
-    # The metadata example's channel_id line must carry the DM
-    # counter-hint too (the pre-fix comment nudged toward bare slugs).
     metadata_block = DEFAULT_SHARED_CLAUDE_MD[:start]
     assert 'channel="@<sender_slug>"' in metadata_block
 

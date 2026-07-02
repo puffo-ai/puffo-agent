@@ -61,11 +61,8 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
     """
     space_id = await cfg.data_client.lookup_channel_space(channel_id)
     if not space_id:
-        # FB-353: a user slug passed bare (``channel="alice-1234"``)
-        # lands here and used to die with the membership error below,
-        # which reads as a stale-cache problem and never hints at the
-        # actual mistake. Channel ids are ``ch_``-prefixed, so a
-        # non-``ch_`` miss gets a distinct, actionable error instead.
+        # Non-``ch_`` miss is almost always a bare user slug — hint at
+        # the DM path instead of the membership-flavoured error below.
         if not channel_id.startswith("ch_"):
             raise RuntimeError(
                 f"'{channel_id}' is not a channel id (channel ids "
@@ -564,11 +561,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "'#<name>' channel addressing isn't supported; pass the "
                 "channel id directly."
             )
-        # FB-353 sweep: this tool reads the local store directly, so a
-        # bare user slug would just come back empty ("no root posts")
-        # instead of erroring. Route non-``ch_`` refs through the
-        # resolver purely for its distinct slug-hint error; a ref the
-        # cache does know keeps working.
+        # Local-store read would return empty on a slug — route non-
+        # ``ch_`` refs through the resolver purely for its hint error.
         if not channel_ref.startswith("ch_"):
             await _resolve_channel_space(cfg, channel_ref)
         channel_id = channel_ref

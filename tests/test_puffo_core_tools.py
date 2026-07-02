@@ -484,9 +484,8 @@ async def test_list_channel_members_fails_loud_on_cache_miss():
     ), "must not issue a members call when cache misses"
 
 
-# ── FB-353 / PUF-348: bare user slug passed where a channel id belongs
-# gets a distinct, actionable error (not the membership-sounding
-# cache-miss error), across every channel-taking tool.
+# ── bare user slug passed where a channel id belongs → distinct
+# actionable error (not the generic membership cache-miss).
 
 
 def _assert_dm_hint(exc: Exception, slug: str) -> None:
