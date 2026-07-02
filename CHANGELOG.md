@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.6] — 2026-07-01
+
 ### Added
 
 - **Three `suggest-*` default skills so agents nudge humans instead
@@ -36,6 +38,29 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   CLI-only `--kind` axis.
 
 ### Changed
+
+- **Auth-expired operator DM reads as instruction, not debug.** Both
+  `format_oauth_expired` (Claude Code) and `format_codex_oauth_expired`
+  now open with a plain-English "my sign-in has expired" header, pin
+  the surface with "On the computer where puffo-agent is running:",
+  and walk the operator through a 4-step ladder (open terminal → run
+  the CLI command → follow browser prompt → come back and message me).
+  Step 4 explicitly anchors on "Once you're signed in, come back here
+  and send me a message" so the operator isn't left wondering "any
+  message like what?". Bilingual (en + zh) preserved.
+
+- **`runtime.error` auth-recovery strings match the DM shape.** Five
+  sites in `credential_refresh.py` + `worker.py` used to render
+  engineer-log voice ("daemon CredentialRefresher saw N consecutive
+  X outcome(s)…", "suppressed from channel post — Check daemon
+  logs") through the `puffo-agent status` CLI + the web pane's
+  health card. All now use the same "Claude Code sign-in expired /
+  couldn't be refreshed. On the computer running puffo-agent, open
+  a terminal and run `claude auth login`, then send this agent a
+  message." shape as the DM. Consecutive-outcome counter moved to
+  a sibling `logger.warning` so the debug detail stays in the
+  daemon log. Rate-limit branch retains the "usually self-recovers,
+  check the daemon log" copy — never suggests `claude auth login`.
 
 - **`ensure_shared_primer` now syncs from code on every worker
   startup instead of seed-if-missing.** The old idempotent guard

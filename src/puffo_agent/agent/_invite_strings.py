@@ -104,19 +104,33 @@ def format_leave_error(exc: Exception) -> str:
 
 
 def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
-    """Bilingual (zh+en) operator DM for an OAuth-expired agent: run
-    ``claude auth login`` and just send a message (a new message
-    auto-resumes the agent). Falls back to a bare ``id`` when
-    ``agent_display_name`` is empty."""
+    """Bilingual (zh+en) operator DM for a Claude-Code OAuth-expired
+    agent. Numbered step ladder + WHERE-to-run clause reframe the DM
+    as instruction rather than debug output. Falls back to a bare
+    ``id`` when ``agent_display_name`` is empty."""
     label = (
         f"**{agent_display_name}** (`{agent_id}`)"
         if agent_display_name else f"`{agent_id}`"
     )
     return (
-        f"⚠️ {label} — Claude OAuth expired. Run `claude auth login`, "
-        "then send me a message and I'll pick up where I left off.\n"
-        "⚠️ Claude OAuth 已过期。请运行 `claude auth login`，"
-        "然后给我发条消息即可恢复。"
+        f"⚠️ {label} — my Claude Code sign-in has expired, so I can't "
+        "answer you until it's refreshed.\n"
+        "\n"
+        "**On the computer where puffo-agent is running:**\n"
+        "1. Open a terminal.\n"
+        "2. Run: `claude auth login`\n"
+        "3. Follow the browser prompt to sign in with your Claude account.\n"
+        "4. Once you're signed in, come back here and send me a message — "
+        "I'll pick up where I left off.\n"
+        "\n"
+        f"⚠️ {label} — 我的 Claude Code 登录已过期，需要刷新后我才能"
+        "继续回复。\n"
+        "\n"
+        "**在运行 puffo-agent 的电脑上：**\n"
+        "1. 打开终端。\n"
+        "2. 运行：`claude auth login`\n"
+        "3. 按浏览器提示用你的 Claude 账户登录。\n"
+        "4. 登录完成后回到这里发一条消息即可恢复。"
     )
 
 
@@ -132,8 +146,21 @@ def format_codex_oauth_expired(
         if agent_display_name else f"`{agent_id}`"
     )
     return (
-        f"⚠️ {label} — Codex OAuth expired. Run `codex login`, "
-        "then send me a message and I'll pick up where I left off.\n"
-        "⚠️ Codex OAuth 已过期。请运行 `codex login`，"
-        "然后给我发条消息即可恢复。"
+        f"⚠️ {label} — my Codex sign-in has expired, so I can't answer "
+        "you until it's refreshed.\n"
+        "\n"
+        "**On the computer where puffo-agent is running:**\n"
+        "1. Open a terminal.\n"
+        "2. Run: `codex login`\n"
+        "3. Follow the browser prompt to sign in with your Codex account.\n"
+        "4. Once you're signed in, come back here and send me a message — "
+        "I'll pick up where I left off.\n"
+        "\n"
+        f"⚠️ {label} — 我的 Codex 登录已过期，需要刷新后我才能继续回复。\n"
+        "\n"
+        "**在运行 puffo-agent 的电脑上：**\n"
+        "1. 打开终端。\n"
+        "2. 运行：`codex login`\n"
+        "3. 按浏览器提示用你的 Codex 账户登录。\n"
+        "4. 登录完成后回到这里发一条消息即可恢复。"
     )
