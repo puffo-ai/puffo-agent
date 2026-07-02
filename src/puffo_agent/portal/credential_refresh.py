@@ -1019,11 +1019,20 @@ class CredentialRefresher:
 
     def _flip_refresh_broken(self, outcome: RefreshOutcome) -> None:
         from .state import RuntimeState
+        # PUF-343: user-facing over engineer-log — same "run the CLI
+        # login command on the puffo-agent host" shape PUF-341 uses
+        # for the operator DM, so the CLI + web surfaces stay
+        # consistent with the DM the operator already saw. The debug
+        # counter belongs in the daemon log, not the runtime.error
+        # field the web pane renders verbatim.
+        logger.warning(
+            "flipping refresh_broken after %d consecutive %s outcome(s)",
+            self._consecutive_non_success, outcome.value,
+        )
         msg = (
-            f"daemon CredentialRefresher saw {self._consecutive_non_success} "
-            f"consecutive {outcome.value} outcome(s); on-disk token isn't "
-            f"advancing. Run `claude auth login`, then send the agent "
-            f"a message to recover."
+            "Claude Code sign-in couldn't be refreshed. On the computer "
+            "running puffo-agent, open a terminal and run "
+            "`claude auth login`, then send this agent a message."
         )
         for agent_home in self._agent_homes:
             agent_id = Path(agent_home).name

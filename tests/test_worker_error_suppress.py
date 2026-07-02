@@ -164,9 +164,9 @@ def test_handle_suppressed_reply_returns_true_on_leak_fallback_scope(tmp_path, m
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
     # Operator-facing surface: runtime.error populated, NOT a channel
-    # post. The "Check daemon logs" copy is the fallback-scope variant.
-    assert "suppressed from channel post" in runtime.error
-    assert "Check daemon logs" in runtime.error
+    # post. Fallback-scope variant points at the daemon log for triage
+    # (PUF-343: user-facing tone without leaking the debug detail).
+    assert "Check the puffo-agent daemon log" in runtime.error
     # Auth-class leak is definitive evidence regardless of scope —
     # flips health so puffo-agent status surfaces it.
     assert runtime.health == "auth_failed"
@@ -186,9 +186,12 @@ def test_handle_suppressed_reply_returns_true_on_leak_api_retry_scope(tmp_path, 
     )
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
-    # API-retry / auth-class branch: re-login + send-a-message copy.
+    # API-retry / auth-class branch: PUF-343 user-facing shape mirrors
+    # PUF-341's operator DM so the CLI/web + DM stay consistent.
+    assert "Claude Code sign-in expired" in runtime.error
     assert "claude auth login" in runtime.error
-    assert "send the agent a message" in runtime.error
+    assert "running puffo-agent" in runtime.error
+    assert "send this agent a message" in runtime.error
     assert runtime.health == "auth_failed"
 
 
@@ -207,8 +210,10 @@ def test_handle_suppressed_reply_api_retry_rate_limit_branches_message(tmp_path,
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
     assert runtime.health == "unknown"  # NOT auth_failed
-    assert "rate-limit" in runtime.error
+    assert "Rate-limit" in runtime.error
     assert "self-recovers" in runtime.error
+    # PUF-343: rate-limit branch must NEVER instruct the operator to
+    # relogin — that's the auth branch's shape only.
     assert "claude auth login" not in runtime.error
     assert "agent resume" not in runtime.error
 
@@ -465,9 +470,9 @@ def test_call_site_skips_send_on_suppressed_leak(tmp_path, monkeypatch):
         sleeps=sleeps,
     ))
     assert client.calls == []  # NEVER called when filter suppresses
-    # Operator-side surface populated.
+    # Operator-side surface populated (PUF-343 user-facing shape).
     assert runtime.health == "auth_failed"
-    assert "send the agent a message" in runtime.error
+    assert "send this agent a message" in runtime.error
     # And the call site DID sleep with a backoff in range.
     assert len(sleeps) == 1
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= sleeps[0] <= _SUPPRESSION_BACKOFF_MAX_SECONDS
