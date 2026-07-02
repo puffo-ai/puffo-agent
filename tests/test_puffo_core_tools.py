@@ -12,10 +12,9 @@ from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
+from puffo_agent.agent._visibility import resolve_visibility
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
-    _coerce_dm_and_human_mention_visibility,
-    _coerce_root_visibility,
     _resolve_root_id,
     _validate_root_same_channel,
     register_core_tools,
@@ -189,7 +188,7 @@ async def test_send_message_channel():
     result = await _call(
         mcp,
         "send_message",
-        {"channel": "ch_abc", "text": "hello world", "is_visible_to_human": True},
+        {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
     )
     assert "posted" in result
     assert "ch_abc" in result
@@ -219,26 +218,9 @@ async def test_send_message_channel():
     assert "wrapped_content_key" in r
 
 
-def test_coerce_root_visibility():
-    # Root-level false → coerced to visible + a note for the agent.
-    visible, note = _coerce_root_visibility(False, "")
-    assert visible is True
-    assert "ignored" in note and "root-level" in note
-    # Threaded false (root_id set) → left alone, no note.
-    visible, note = _coerce_root_visibility(False, "msg_root")
-    assert visible is False
-    assert note == ""
-    # true is never touched, root-level or threaded.
-    assert _coerce_root_visibility(True, "") == (True, "")
-    assert _coerce_root_visibility(True, "msg_root") == (True, "")
-    # Whitespace-only root_id counts as root-level.
-    visible, note = _coerce_root_visibility(False, "   ")
-    assert visible is True and note != ""
-
-
 @pytest.mark.asyncio
 async def test_send_message_root_level_false_coerced():
-    """A root-level send with is_visible_to_human=false still posts —
+    """A root-level send with visibility_level='default' still posts —
     the flag is coerced to visible and the tool response carries a
     note so the agent learns on the spot."""
     cfg, http, ms = _setup()
@@ -266,19 +248,19 @@ async def test_send_message_root_level_false_coerced():
     result = await _call(
         mcp,
         "send_message",
-        {"channel": "ch_abc", "text": "agent chatter", "is_visible_to_human": False},
+        {"channel": "ch_abc", "text": "agent chatter", "visibility_level": "default"},
     )
     # Message still went out (warning, not error).
     assert "posted" in result
     assert len([1 for m, _, _ in http.calls if m == "POST"]) == 1
     # ...and the agent is told the flag was ignored.
-    assert "is_visible_to_human=false ignored" in result
+    assert "hidden ignored" in result
 
 
 @pytest.mark.asyncio
 async def test_send_message_threaded_false_not_coerced():
-    """A threaded reply (root_id set) keeps is_visible_to_human=false
-    — no coercion, no note."""
+    """A threaded reply (root_id set) with visibility_level='default'
+    and no @-mention stays hidden — no coercion, no note."""
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
     # Pre-cache the channel→space mapping the way an inbound message
@@ -307,7 +289,7 @@ async def test_send_message_threaded_false_not_coerced():
         {
             "channel": "ch_abc",
             "text": "agent-to-agent reply",
-            "is_visible_to_human": False,
+            "visibility_level": "default",
             "root_id": "msg_root_abc",
         },
     )
@@ -347,7 +329,7 @@ async def test_send_message_uses_cached_space_for_cross_space_channel():
         {
             "channel": "ch_elsewhere",
             "text": "hello other space",
-            "is_visible_to_human": True,
+            "visibility_level": "human",
         },
     )
     assert "posted" in result, f"expected success, got: {result}"
@@ -385,7 +367,7 @@ async def test_send_message_fails_loud_on_cache_miss():
             {
                 "channel": "ch_nowhere",
                 "text": "should not send",
-                "is_visible_to_human": True,
+                "visibility_level": "human",
             },
         )
     assert "no record of channel" in str(excinfo.value), (
@@ -445,7 +427,7 @@ async def test_send_message_dm():
     result = await _call(
         mcp,
         "send_message",
-        {"channel": "@alice-0001", "text": "hey", "is_visible_to_human": True},
+        {"channel": "@alice-0001", "text": "hey", "visibility_level": "human"},
     )
     assert "posted" in result
 
@@ -471,7 +453,7 @@ async def test_send_message_rejects_named_channel():
         await _call(
             mcp,
             "send_message",
-            {"channel": "#general", "text": "hi", "is_visible_to_human": True},
+            {"channel": "#general", "text": "hi", "visibility_level": "human"},
         )
     assert "isn't supported" in str(excinfo.value) or "not supported" in str(excinfo.value)
 
@@ -880,7 +862,7 @@ async def test_send_message_with_attachments_requires_workspace():
         await _call(
             mcp,
             "send_message_with_attachments",
-            {"paths": ["test.txt"], "channel": "ch_1", "is_visible_to_human": True},
+            {"paths": ["test.txt"], "channel": "ch_1", "visibility_level": "human"},
         )
     assert "workspace" in str(exc_info.value).lower()
 
@@ -1132,7 +1114,7 @@ async def test_send_message_auto_corrects_real_live_failures(
     result = await _call(mcp, "send_message", {
         "channel": "ch_abc",
         "text": f"replaying {scenario}",
-        "is_visible_to_human": False,
+        "visibility_level": "default",
         "root_id": wrong_post_id,
     })
 
@@ -1161,7 +1143,7 @@ async def test_send_message_keeps_real_root_id_unchanged(monkeypatch):
     result = await _call(mcp, "send_message", {
         "channel": "ch_abc",
         "text": "correctly threaded reply",
-        "is_visible_to_human": False,
+        "visibility_level": "default",
         "root_id": "msg_root",
     })
 
@@ -1189,7 +1171,7 @@ async def test_send_message_unknown_root_id_wiped_to_null_with_warning(monkeypat
     result = await _call(mcp, "send_message", {
         "channel": "ch_abc",
         "text": "racing the inbound write",
-        "is_visible_to_human": False,
+        "visibility_level": "default",
         "root_id": "msg_never_seen",
     })
 
@@ -1211,7 +1193,7 @@ async def test_send_message_root_level_send_skips_resolve(monkeypatch):
 
     mcp = _build_tools(cfg)
     result = await _call(mcp, "send_message", {
-        "channel": "ch_abc", "text": "top-level", "is_visible_to_human": True,
+        "channel": "ch_abc", "text": "top-level", "visibility_level": "human",
     })
 
     assert "posted" in result
@@ -1250,7 +1232,7 @@ async def test_send_message_with_attachments_auto_corrects_reply_as_root_id(
     result = await _call(mcp, "send_message_with_attachments", {
         "paths": ["hello.txt"],
         "channel": "ch_abc",
-        "is_visible_to_human": False,
+        "visibility_level": "default",
         "root_id": "msg_reply",
         "caption": "files",
     })
@@ -1388,12 +1370,13 @@ async def test_validate_root_dm_envelope_no_channel_id_passes_through():
     assert note == ""
 
 
-# _coerce_dm_and_human_mention_visibility — DM + @-mention floor.
+# resolve_visibility — one entry point that combines level parsing,
+# root-level coerce, DM/@-mention detection, and the per-level note
+# wording.
 
 
-class _FloorHttp:
-    """Stub for ``/identities/profiles?slugs=<csv>``. Returns each
-    requested slug's identity_type from a caller-supplied mapping."""
+class _VisHttp:
+    """Stub for ``/identities/profiles?slugs=<csv>``."""
 
     def __init__(
         self,
@@ -1419,135 +1402,172 @@ class _FloorHttp:
         return {"profiles": profiles}
 
 
+# ── level="human" ────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_floor_dm_forces_visible_without_lookup():
-    http = _FloorHttp()
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="@alice-1234",
-        text="hi",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_human_returns_visible_no_note_no_lookup():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "human", "@alice-1234", "@alice-1234 hi", "msg_root", http,
     )
     assert visible is True
-    assert "DMs force visible" in note
-    assert http.calls == []
-
-
-@pytest.mark.asyncio
-async def test_floor_dm_agent_only_passes_through():
-    http = _FloorHttp()
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="@twinkle-abcd",
-        text="ping",
-        is_visible_to_human=False,
-        agent_only=True,
-        http_client=http,
-    )
-    assert visible is False
     assert note == ""
     assert http.calls == []
 
 
+# ── level="default" ─────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_floor_mention_human_forces_visible():
-    http = _FloorHttp({"alice-1234": "human"})
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="@alice-1234 here's the answer",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_default_dm_coerces_and_nudges_human():
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "default", "@alice-1234", "hi", "msg_root", http,
+    )
+    assert visible is True
+    assert "sent visible" in note
+    assert "DM" in note
+    assert "'human'" in note
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_mention_human_coerces():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@alice-1234 here's the answer", "msg_root", http,
     )
     assert visible is True
     assert "@-mentions a human" in note
+    assert "'human'" in note
     assert http.calls and "alice-1234" in http.calls[0]
 
 
 @pytest.mark.asyncio
-async def test_floor_mention_agent_only_passes_through():
-    http = _FloorHttp({"scout-5678": "agent"})
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="@scout-5678 fyi, pipeline done",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_default_mention_agent_only_stays_hidden_but_nudges():
+    http = _VisHttp({"scout-5678": "agent"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@scout-5678 pipeline done", "msg_root", http,
     )
     assert visible is False
-    assert note == ""
+    assert "sent hidden" in note
+    assert "'human'" in note and "'agent_only'" in note
 
 
 @pytest.mark.asyncio
-async def test_floor_mention_mixed_any_human_wins():
-    http = _FloorHttp({"alice-1234": "human", "scout-5678": "agent"})
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="@scout-5678 @alice-1234 status update",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_default_no_signal_nudges_explicit():
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "internal retry", "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden" in note
+    assert "'human'" in note and "'agent_only'" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_root_level_always_coerces():
+    """No root_id → can't fold → always sent visible regardless of
+    DM / @-mention signals."""
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "top-level chatter", "", http,
+    )
+    assert visible is True
+    assert "root-level messages can't fold" in note
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_mixed_mentions_any_human_wins():
+    http = _VisHttp({"alice-1234": "human", "scout-5678": "agent"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@scout-5678 @alice-1234 status", "msg_root", http,
     )
     assert visible is True
     assert "@-mentions a human" in note
 
 
 @pytest.mark.asyncio
-async def test_floor_no_mention_passes_through():
-    http = _FloorHttp()
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="internal note: retrying",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_default_profile_error_soft_fails_to_hidden():
+    """Transport error on profile fetch can't flip an intentional
+    hidden send — nudge fires, no coerce."""
+    http = _VisHttp({"alice-1234": "human"}, raise_error=True)
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@alice-1234 hi", "msg_root", http,
     )
     assert visible is False
-    assert note == ""
+    assert "sent hidden" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_email_not_mistaken_for_mention():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "see contact@alice-1234 for details",
+        "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden" in note
     assert http.calls == []
 
 
+# ── level="agent_only" ──────────────────────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_floor_profile_lookup_error_passes_through():
-    http = _FloorHttp({"alice-1234": "human"}, raise_error=True)
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="@alice-1234 hi",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_agent_only_dm_stays_hidden_but_warns():
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "agent_only", "@alice-1234", "hi", "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden per" in note
+    assert "DM" in note
+    assert "Double-check" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_only_mention_human_stays_hidden_but_warns():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "agent_only", "ch_abcd", "@alice-1234 fyi", "msg_root", http,
+    )
+    assert visible is False
+    assert "@-mentions a human" in note
+    assert "Double-check" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_only_mention_agent_no_note():
+    http = _VisHttp({"scout-5678": "agent"})
+    visible, note = await resolve_visibility(
+        "agent_only", "ch_abcd", "@scout-5678 done", "msg_root", http,
     )
     assert visible is False
     assert note == ""
 
 
 @pytest.mark.asyncio
-async def test_floor_already_visible_short_circuits():
-    http = _FloorHttp({"alice-1234": "human"})
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="@alice-1234 hi",
-        is_visible_to_human=True,
-        agent_only=False,
-        http_client=http,
+async def test_resolve_agent_only_root_level_still_coerces():
+    """agent_only doesn't override the root-level constraint — the UI
+    can't fold root-level so it goes out visible."""
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "agent_only", "ch_abcd", "top-level", "", http,
     )
     assert visible is True
-    assert note == ""
-    assert http.calls == []
+    assert "root-level messages can't fold" in note
+
+
+# ── validation ──────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_floor_email_not_mistaken_for_mention():
-    """``foo@alice-1234`` inside a URL / email doesn't match the
-    mention regex, so no coerce."""
-    http = _FloorHttp({"alice-1234": "human"})
-    visible, note = await _coerce_dm_and_human_mention_visibility(
-        channel_ref="ch_abcd",
-        text="see contact@alice-1234 for details",
-        is_visible_to_human=False,
-        agent_only=False,
-        http_client=http,
-    )
-    assert visible is False
-    assert note == ""
-    assert http.calls == []
+async def test_resolve_rejects_unknown_level():
+    http = _VisHttp()
+    with pytest.raises(RuntimeError, match="visibility_level"):
+        await resolve_visibility("visible", "ch_x", "hi", "msg_root", http)
+    with pytest.raises(RuntimeError):
+        await resolve_visibility("", "ch_x", "hi", "msg_root", http)
