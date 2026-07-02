@@ -109,6 +109,10 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+        # Foreground start has no other trigger for the fetch=True
+        # path, so capability reports fall back to the static list.
+        from ..agent.model_catalog import prefetch as _prefetch_model_catalog
+        _prefetch_model_catalog()
         # Retry any archived-dir pending revokes from a previous run.
         asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup())
         # Re-assert machine_id for already-linked operators' agents so agents

@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Machine now reports the live claude-code model list on foreground
+  `puffo-agent start`.** Previously the model catalog's Anthropic
+  `/v1/models` fetch was only triggered from `AgentDetail.__init__`
+  (the desktop-UI agent-detail widget), so a headless
+  `puffo-agent start` never warmed the in-process cache and the
+  control-WS `build_capabilities()` fell back to the hardcoded static
+  model list. `start --background` happened to work only because the
+  operator would eventually open the tray UI, filling the shared
+  cache the daemon thread reads. Fix: call
+  `model_catalog.prefetch()` from `Daemon.run()` at startup so both
+  paths report identically.
+
 ## [1.0.6] — 2026-07-01
 
 ### Added
