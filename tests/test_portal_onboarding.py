@@ -267,7 +267,6 @@ def test_friendly_device_name_falls_back_to_hostname(monkeypatch):
     monkeypatch.setattr(link.socket, "gethostname", lambda: "fallback-host")
     assert link.friendly_device_name() == "fallback-host"
 
-
 # ── F4: user-minted link codes (machine link --code) ────────────────
 
 def test_cmd_link_passes_code_through(monkeypatch):
@@ -286,41 +285,17 @@ def test_cmd_link_passes_code_through(monkeypatch):
     assert seen["code"] == "abcd-2345"
 
 
-def test_normalize_link_code():
-    from puffo_agent.portal.control.link import normalize_link_code
-
-    assert normalize_link_code(" abcd-2345 ") == "ABCD2345"
-    assert normalize_link_code("ABCD2345") == "ABCD2345"
-
-
-def test_run_link_code_branch_redeems_then_awaits(monkeypatch):
-    import asyncio
+def test_cmd_link_defaults_code_to_none(monkeypatch):
+    from puffo_agent.portal import cli
     from puffo_agent.portal.control import link
 
-    calls = []
+    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    seen = {}
 
-    async def _fake_redeem(server_url, hostname, code):
-        calls.append(("redeem", code))
-        return "https://x"
+    async def _fake_run_link(url, name, open_browser=True, code=None):
+        seen["code"] = code
+        return 0
 
-    async def _fake_await(base, code, hostname):
-        calls.append(("await", code))
-        return "approved", "op-0001"
-
-    monkeypatch.setattr(link, "redeem_link_code", _fake_redeem)
-    monkeypatch.setattr(link, "await_link_approval", _fake_await)
-    rc = asyncio.run(link.run_link("https://x", "Box", open_browser=False, code="abcd-2345"))
-    assert rc == 0
-    assert calls == [("redeem", "ABCD2345"), ("await", "ABCD2345")]
-
-
-def test_run_link_code_branch_reports_redeem_error(monkeypatch):
-    import asyncio
-    from puffo_agent.portal.control import link
-
-    async def _fake_redeem(server_url, hostname, code):
-        raise link.LinkError("unknown link code")
-
-    monkeypatch.setattr(link, "redeem_link_code", _fake_redeem)
-    rc = asyncio.run(link.run_link("https://x", "Box", open_browser=False, code="NOPE-1234"))
-    assert rc == 1
+    monkeypatch.setattr(link, "run_link", _fake_run_link)
+    assert cli.cmd_link(_link_ns()) == 0
+    assert seen["code"] is None
