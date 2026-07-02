@@ -47,6 +47,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   and send me a message" so the operator isn't left wondering "any
   message like what?". Bilingual (en + zh) preserved.
 
+- **`runtime.error` auth-recovery strings match the DM shape.** Five
+  sites in `credential_refresh.py` + `worker.py` used to render
+  engineer-log voice ("daemon CredentialRefresher saw N consecutive
+  X outcome(s)…", "suppressed from channel post — Check daemon
+  logs") through the `puffo-agent status` CLI + the web pane's
+  health card. All now use the same "Claude Code sign-in expired /
+  couldn't be refreshed. On the computer running puffo-agent, open
+  a terminal and run `claude auth login`, then send this agent a
+  message." shape as the DM. Consecutive-outcome counter moved to
+  a sibling `logger.warning` so the debug detail stays in the
+  daemon log. Rate-limit branch retains the "usually self-recovers,
+  check the daemon log" copy — never suggests `claude auth login`.
+
 - **`ensure_shared_primer` now syncs from code on every worker
   startup instead of seed-if-missing.** The old idempotent guard
   protected an operator-edit path nobody used, and silently pinned
