@@ -31,22 +31,21 @@ def test_oauth_copy_includes_english_and_chinese():
     # English strand: signals what expired + the specific CLI command.
     assert "Claude Code sign-in has expired" in text
     assert "claude auth login" in text
-    # PUF-341: WHERE the operator should run the command.
+    # WHERE the operator should run the command.
     assert "On the computer where puffo-agent is running" in text
-    # PUF-341: numbered ladder (open terminal → run → complete → send-back).
+    # Numbered ladder (open terminal → run → complete → send-back).
     assert "1. Open a terminal" in text
     assert "2. Run: `claude auth login`" in text
-    assert "send me any message" in text
-    # PUF-341: provider disambiguation — Sam explicitly asked
-    # "should I go to CodeX?" when he saw the old copy.
-    assert "not Codex" in text
+    # Step 4 anchors "send a message" on "once you're signed in" so the
+    # operator doesn't wonder "any message like what?"
+    assert "Once you're signed in" in text
+    assert "send me a message" in text
     assert "agent resume" not in text   # no manual resume step anymore
     # Chinese strand
     assert "Claude Code 登录已过期" in text
     assert "在运行 puffo-agent 的电脑上" in text
     assert "1. 打开终端" in text
-    assert "发一条消息" in text
-    assert "不是 Codex" in text
+    assert "登录完成后回到这里发一条消息" in text
     # Bold display name format survives on both strands
     assert text.count("**Planner**") == 2
 
@@ -582,10 +581,8 @@ def test_codex_harness_dispatches_codex_copy():
     assert "Codex sign-in has expired" in captured["text"]
     assert "codex login" in captured["text"]
     assert "Codex 登录已过期" in captured["text"]
-    # PUF-341 note: the disambiguation clause DOES mention Claude Code
-    # ("not Claude Code — even if it's installed…"), but the imperative
-    # instruction step must never tell the operator to run the Claude CLI.
     assert "claude auth login" not in captured["text"]
+    assert "Claude Code sign-in" not in captured["text"]
 
 
 def test_claude_harness_keeps_claude_copy():
@@ -599,10 +596,8 @@ def test_claude_harness_keeps_claude_copy():
 
     assert "Claude Code sign-in has expired" in captured["text"]
     assert "claude auth login" in captured["text"]
-    # PUF-341 note: the disambiguation clause DOES mention Codex
-    # ("not Codex — even if it's installed…"), but the imperative
-    # instruction step must never tell the operator to run `codex login`.
     assert "codex login" not in captured["text"]
+    assert "Codex sign-in" not in captured["text"]
 
 
 def test_missing_runtime_falls_back_to_claude_copy():

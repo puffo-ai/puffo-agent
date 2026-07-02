@@ -37,6 +37,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Auth-expired operator DM reads as instruction, not debug.** Both
+  `format_oauth_expired` (Claude Code) and `format_codex_oauth_expired`
+  now open with a plain-English "my sign-in has expired" header, pin
+  the surface with "On the computer where puffo-agent is running:",
+  and walk the operator through a 4-step ladder (open terminal → run
+  the CLI command → follow browser prompt → come back and message me).
+  Step 4 explicitly anchors on "Once you're signed in, come back here
+  and send me a message" so the operator isn't left wondering "any
+  message like what?". Bilingual (en + zh) preserved.
+
 - **`ensure_shared_primer` now syncs from code on every worker
   startup instead of seed-if-missing.** The old idempotent guard
   protected an operator-edit path nobody used, and silently pinned
