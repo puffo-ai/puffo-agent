@@ -710,6 +710,48 @@ async def test_archive_on_flag_defers_revoke_when_report_unsettled(
     assert payload["slug"] == info["slug"]
 
 
+async def test_delete_on_flag_defers_revoke_when_report_unsettled(
+    mock_server, monkeypatch,
+):
+    """Same defer contract on the delete path: unsettled report keeps
+    the dir as an archive with the deferred marker instead of
+    revoking + rmtree'ing."""
+    from puffo_agent.portal import daemon as daemon_mod
+    from puffo_agent.portal import import_agents as imp
+    from puffo_agent.portal.state import archived_dir
+
+    server, _ = mock_server
+    url = str(server.make_url("/")).rstrip("/")
+    info = _seed_source_agent(
+        os.environ["PUFFO_AGENT_HOME"], "alpha", "alpha-bot", url,
+    )
+
+    async def _unsettled(_cfg, _status):
+        return False
+
+    async def _must_not_revoke(*_a, **_k):
+        raise AssertionError("revoke must be deferred while the report is unsettled")
+
+    monkeypatch.setattr(daemon_mod, "_report_lifecycle", _unsettled)
+    monkeypatch.setattr(imp, "revoke_archived_device", _must_not_revoke)
+
+    d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+
+    async def _noop_stop(_agent_id):
+        return None
+
+    d._stop_worker = _noop_stop
+    await d._delete_on_flag("alpha")
+
+    dests = [p for p in archived_dir().iterdir() if p.name.startswith("alpha-del-")]
+    assert len(dests) == 1, "dir must be kept as archive, not rmtree'd"
+    marker = imp.archived_pending_revoke_path(dests[0])
+    assert marker.exists()
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["report_status"] == "archived"
+    assert payload["slug"] == info["slug"]
+
+
 async def test_sweep_archived_pending_revokes_handles_empty_archived_dir():
     from puffo_agent.portal import import_agents as imp
 
