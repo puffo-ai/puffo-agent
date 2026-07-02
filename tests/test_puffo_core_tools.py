@@ -484,6 +484,115 @@ async def test_list_channel_members_fails_loud_on_cache_miss():
     ), "must not issue a members call when cache misses"
 
 
+# ── FB-353 / PUF-348: bare user slug passed where a channel id belongs
+# gets a distinct, actionable error (not the membership-sounding
+# cache-miss error), across every channel-taking tool.
+
+
+def _assert_dm_hint(exc: Exception, slug: str) -> None:
+    msg = str(exc)
+    assert "not a channel id" in msg, f"expected slug-hint error, got: {msg}"
+    assert f"@{slug}" in msg
+    assert "get_dm_history" in msg
+
+
+@pytest.mark.asyncio
+async def test_send_message_bare_slug_gets_dm_hint():
+    cfg, http, _ = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp, "send_message",
+            {"channel": "alice-1234", "text": "hi", "visibility_level": "human"},
+        )
+    _assert_dm_hint(excinfo.value, "alice-1234")
+    assert not http.calls, "must bail before any HTTP"
+
+
+@pytest.mark.asyncio
+async def test_list_channel_members_bare_slug_gets_dm_hint():
+    cfg, _, _ = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "list_channel_members", {"channel": "alice-1234"})
+    _assert_dm_hint(excinfo.value, "alice-1234")
+
+
+@pytest.mark.asyncio
+async def test_leave_channel_bare_slug_gets_dm_hint():
+    cfg, _, _ = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "leave_channel", {"channel_id": "alice-1234"})
+    _assert_dm_hint(excinfo.value, "alice-1234")
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_bare_slug_gets_dm_hint():
+    cfg, _, _ = _setup()
+    d = tempfile.mkdtemp()
+    cfg.workspace = d
+    with open(os.path.join(d, "note.txt"), "w", encoding="utf-8") as f:
+        f.write("hello")
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp, "send_message_with_attachments",
+            {"paths": ["note.txt"], "channel": "alice-1234"},
+        )
+    _assert_dm_hint(excinfo.value, "alice-1234")
+
+
+@pytest.mark.asyncio
+async def test_get_channel_history_bare_slug_gets_dm_hint():
+    """The local-store read path would otherwise return an empty
+    window for a slug ref — dark instead of diagnostic."""
+    cfg, _, ms = _setup()
+    await ms.open()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "get_channel_history", {"channel": "alice-1234"})
+    _assert_dm_hint(excinfo.value, "alice-1234")
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_history_non_ch_ref_known_to_cache_still_works():
+    """The slug-hint guard only fires on refs the cache does NOT
+    know — an exotic non-``ch_`` id with a cached space mapping keeps
+    working."""
+    cfg, _, ms = _setup()
+    await ms.open()
+    await ms.mark_channel_space("weird-legacy-id", "sp_test")
+    await ms.store({
+        "envelope_id": "env_legacy", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "weird-legacy-id",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "still reachable", "sent_at": _now_ms(),
+    })
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp, "get_channel_history", {"channel": "weird-legacy-id"},
+    )
+    assert "still reachable" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_ch_prefixed_cache_miss_keeps_membership_error():
+    """A genuine ``ch_`` id the cache misses keeps the original
+    membership-flavoured error — the slug hint would mislead there."""
+    cfg, _, _ = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp, "send_message",
+            {"channel": "ch_nowhere", "text": "x", "visibility_level": "human"},
+        )
+    assert "no record of channel" in str(excinfo.value)
+    assert "not a channel id" not in str(excinfo.value)
+
+
 @pytest.mark.asyncio
 async def test_send_message_dm():
     cfg, http, ms = _setup()
