@@ -6,6 +6,63 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.7a1] — 2026-07-02
+
+Pre-release alpha for cross-platform validation of the daemon-owned
+credential refresh gate. Not for production. Semver note: `1.0.7a1`
+orders BEFORE `1.0.7` in pip's default resolver — install with
+`pip install --pre puffo-agent==1.0.7a1` to opt in.
+
+### Fixed
+
+- **Pre-delivery credential-refresh gate is now cross-platform.**
+  Before handing a message batch to a `cli-local` / `cli-docker`
+  claude agent, the worker blocks on the daemon's
+  `CredentialRefresher.ensure_fresh()` through the same single-writer
+  mutex the daemon uses internally. The gate was previously gated
+  behind `is_macos()` on the theory that Linux/Windows would win the
+  refresh race naturally through the shared symlinked host
+  credentials file — but Anthropic's rotating single-use refresh_token
+  semantics don't care about the OS: whenever N agents' claude
+  subprocesses read the same on-disk RT and POST refresh in parallel,
+  one wins, N-1 get `invalid_grant`. The macOS storm just made the
+  window wider (Keychain lookups + ACL prompts). Dropping the
+  `is_macos()` guard extends the same safety net to Linux and
+  Windows.
+- **Rotating-refresh-token silent-fail visibility.** If Anthropic
+  rotates the refresh_token but Claude Code's write of the new one
+  silently drops (both disk and Keychain retain the pre-rotation
+  token, revoked server-side), `claude --print` starts returning
+  401 `authentication_failed`. `CredentialRefresher._refresh_now`
+  now inspects the probe's stdout/stderr for that marker and, when
+  matched, flips `auth_failed` + DMs the operator with re-login
+  instructions instead of silently retrying every 120s.
+- **macOS: `KeychainBackend` falls through to the disk credentials
+  file when the Keychain entry is missing.** Claude Code 2.x under a
+  launchd session-context can silently fail Keychain writes while
+  still writing `~/.claude/.credentials.json` successfully. The
+  Keychain backend's `expires_in_seconds`, `refresh`, `bootstrap`,
+  `sync_to_agent`, and `poll_external_rotation` all now use the
+  disk file as a fallback.
+
+### Changed
+
+- **`ensure_fresh()` fans canonical credentials out to every
+  registered agent before returning True.** Closes the split-brain
+  window where the daemon's view is fresh but an agent's per-agent
+  credentials file is stale. `KeychainBackend.sync_to_agent` is now
+  idempotent — skips the atomic write when the target already matches
+  — so the fan-out from concurrent `ensure_fresh` callers stays cheap.
+
+### Added
+
+- **Verbose per-source credential-read logs.** `KeychainBackend`
+  now logs which source served each read (`source=cache` /
+  `source=keychain` / `source=disk`) at DEBUG level, plus WARN when
+  it falls through disk after a Keychain miss. Makes the
+  disk-vs-Keychain split-brain visible from the daemon log without
+  needing to attach a debugger.
+
 ## [1.0.6] — 2026-07-01
 
 ### Added

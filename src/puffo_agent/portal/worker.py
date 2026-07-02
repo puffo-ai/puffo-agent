@@ -22,7 +22,6 @@ from typing import Awaitable, Callable, Optional
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
-from ..macos.keychain import is_macos as _is_macos
 from .runtime_matrix import (
     RUNTIME_CLI_DOCKER,
     RUNTIME_CLI_LOCAL,
@@ -833,9 +832,9 @@ class Worker:
         # 401 surfacing in a reply short-circuits the daemon's 2-min
         # poll instead of waiting for the next tick.
         self._notify_refresh_needed = notify_refresh_needed
-        # macOS pre-delivery gate: blocking refresh through the
-        # daemon's mutex. Returns True iff post-refresh the token has
-        # >0s remaining. ``None`` for runtimes that don't go through
+        # Pre-delivery gate: blocking refresh through the daemon's
+        # mutex. Returns True iff post-refresh the token has >0s
+        # remaining. ``None`` for runtimes that don't go through
         # claude OAuth (api-puffo, ws-local).
         self._ensure_fresh_token = ensure_fresh_token
         # In-memory dedup for the auth_failed ENTER operator DM;
@@ -1227,14 +1226,15 @@ class Worker:
             # New batch while auth_failed: wake the refresher to check
             # for a re-login now (the flip below would mask auth_failed).
             self._maybe_wake_refresher_if_auth_failed(agent_id)
-            # macOS pre-delivery gate: before handing the batch to the
+            # Pre-delivery gate: before handing the batch to the
             # adapter, make sure the daemon-owned credential is fresh.
-            # Skips on non-macOS (Linux/Windows use a shared file —
-            # daemon's proactive refresh wins the race naturally) and
-            # on non-claude runtimes (ws-local, api-puffo).
+            # The rotating single-use refresh_token race isn't macOS-
+            # specific — N agents reading the same on-disk RT and
+            # POSTing to Anthropic in parallel loses N-1 with
+            # invalid_grant regardless of OS. Skipped only for non-
+            # claude runtimes (ws-local, api-puffo).
             if (
                 self._ensure_fresh_token is not None
-                and _is_macos()
                 and self.agent_cfg.runtime.kind in (
                     RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
                 )
