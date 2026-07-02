@@ -109,6 +109,13 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+        # Warm the claude-code model catalog off-thread so control-WS
+        # ``build_capabilities`` has real data to report. Without this
+        # ``puffo-agent start`` (no --ui / --background) never triggers
+        # a fetch=True path, so the server sees only the static fallback
+        # model list until an operator opens the desktop UI.
+        from ..agent.model_catalog import prefetch as _prefetch_model_catalog
+        _prefetch_model_catalog()
         # Retry any archived-dir pending revokes from a previous run.
         asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup())
         # Re-assert machine_id for already-linked operators' agents so agents
