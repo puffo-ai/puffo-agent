@@ -46,6 +46,13 @@ _REFRESHED_BLOB = json.dumps({
 })
 
 
+def _view(blob: str) -> str:
+    """The per-agent *view* of a canonical blob: refresh token
+    stripped. sync_to_agent writes this, never the raw blob."""
+    from puffo_agent.portal.state import sanitize_claude_credentials_blob
+    return sanitize_claude_credentials_blob(blob)
+
+
 def _force_macos(monkeypatch):
     monkeypatch.setattr(cm, "is_macos", lambda: True)
 
@@ -428,7 +435,8 @@ def test_keychain_backend_sync_to_agent_writes_per_agent_file(tmp_path, monkeypa
     agent_creds = agent_home / ".claude" / ".credentials.json"
     assert agent_creds.exists()
     assert not agent_creds.is_symlink()
-    assert agent_creds.read_text() == _BLOB
+    assert agent_creds.read_text() == _view(_BLOB)
+    assert "refreshToken" not in agent_creds.read_text()
 
 
 def test_keychain_backend_sync_skips_when_cache_empty(tmp_path, monkeypatch):
@@ -622,7 +630,7 @@ def test_refresher_with_keychain_backend_fans_sync_to_registered_agents(
 ):
     """After a _tick on macOS, the refresher's fan-out calls
     KeychainBackend.sync_to_agent for every registered agent — same
-    contract as the FileBackend's link_host_credentials path, just
+    contract as the FileBackend's sync_host_credentials_view path, just
     plumbed through the backend abstraction."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
     backend = _make_keychain_backend(tmp_path)
@@ -649,8 +657,8 @@ def test_refresher_with_keychain_backend_fans_sync_to_registered_agents(
 
     asyncio.run(refresher._tick())
 
-    assert (agent_a / ".claude" / ".credentials.json").read_text() == far_future_blob
-    assert (agent_b / ".claude" / ".credentials.json").read_text() == far_future_blob
+    assert (agent_a / ".claude" / ".credentials.json").read_text() == _view(far_future_blob)
+    assert (agent_b / ".claude" / ".credentials.json").read_text() == _view(far_future_blob)
 
 
 def test_refresher_with_keychain_backend_refreshes_when_close_to_expiry(
@@ -854,7 +862,7 @@ def test_sync_to_agent_uses_disk_when_cache_empty(monkeypatch, tmp_path):
     agent_home = tmp_path / "agent-a"
     agent_home.mkdir()
     backend.sync_to_agent(agent_home)
-    assert (agent_home / ".claude" / ".credentials.json").read_text() == _BLOB
+    assert (agent_home / ".claude" / ".credentials.json").read_text() == _view(_BLOB)
 
 
 def test_sync_to_agent_is_idempotent_when_target_matches(
@@ -873,7 +881,7 @@ def test_sync_to_agent_is_idempotent_when_target_matches(
     # First sync — file gets written.
     backend.sync_to_agent(agent_home)
     target = agent_home / ".claude" / ".credentials.json"
-    assert target.read_text() == _BLOB
+    assert target.read_text() == _view(_BLOB)
 
     import os as _os
     replace_calls = 0

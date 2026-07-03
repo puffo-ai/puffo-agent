@@ -98,8 +98,8 @@ def shared_fs_dir() -> Path:
 # Note: ``.claude.json`` is a sibling of the ``.claude/`` dir; Claude
 # CLI reads it from ``$HOME/.claude.json`` so we mirror that layout.
 # ``.credentials.json`` is intentionally excluded — set up separately
-# via ``link_host_credentials`` so every agent tracks live OAuth state
-# (matches cli-docker's bind-mount model).
+# via ``sync_host_credentials_view`` so every agent tracks live OAuth
+# state (matches cli-docker's bind-mount model).
 _CLAUDE_HOME_SEED_PATHS = (
     ".claude/settings.json",
     ".claude.json",
@@ -111,7 +111,7 @@ def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     ``$HOME``. Idempotent — never overwrites an existing file.
 
     ``.credentials.json`` is set up separately via
-    ``link_host_credentials``. Returns True if any file was copied.
+    ``sync_host_credentials_view``. Returns True if any file was copied.
     """
     import shutil
     agent_home.mkdir(parents=True, exist_ok=True)
@@ -136,8 +136,8 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
 
     Claude Code stores OAuth in Keychain instead of the file on macOS;
     this bridges to the shared-file path used by every other agent.
-    Called on every ``link_host_credentials`` invocation so refreshed
-    tokens propagate. Returns True if the file was written.
+    Called on every ``sync_host_credentials_view`` invocation so
+    refreshed tokens propagate. Returns True if the file was written.
     """
     import platform
     if platform.system() != "Darwin":
@@ -175,137 +175,153 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
         return False
 
 
-def link_host_credentials(host_home: Path, agent_home: Path) -> str:
-    """Share the operator's ``.credentials.json`` with the agent so
-    OAuth refresh-token rotation propagates automatically.
+def sanitize_claude_credentials_blob(blob: str) -> str | None:
+    """Strip ``claudeAiOauth.refreshToken`` from a host credentials
+    blob, producing the per-agent *view*. ``None`` when the blob isn't
+    parseable JSON (never hand agents something we can't vet).
 
-    Anthropic OAuth uses rotating refresh tokens; per-agent copies go
-    stale when the operator re-runs ``claude login``. Sharing one
-    file means any refresh (host, any agent) updates the single file
-    that everyone reads.
+    Claude Code runs fine without the key: it uses the access token
+    as-is and, on 401, fails cleanly instead of attempting a refresh.
+    """
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    oauth = data.get("claudeAiOauth")
+    if isinstance(oauth, dict):
+        oauth.pop("refreshToken", None)
+    return json.dumps(data)
 
-    Prefers symlink (free read-through); falls back to copy on
-    Windows-without-Developer-Mode. Hardlinks are intentionally
-    skipped — claude's atomic tmp+rename breaks the shared inode.
-    Per PUF-217, refresh-time writes run with ``HOME=host_home``
-    so claude renames at the host path, not at the agent symlink
-    — the symlink itself is never the rename target.
+
+def sanitize_codex_auth_blob(blob: str) -> str | None:
+    """Blank ``tokens.refresh_token`` in a host codex auth blob,
+    producing the per-agent *view*. ``None`` when unparseable.
+
+    Unlike claude, codex hard-fails deserialisation when the field is
+    *missing* (serde non-optional), so the view keeps the key with an
+    empty value: parse succeeds, ``codex login status`` reports
+    logged-in, and a refresh attempt is rejected server-side without
+    consuming the real (single-use) refresh token.
+    """
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        tokens["refresh_token"] = ""
+    return json.dumps(data)
+
+
+def _write_credential_view(target: Path, blob: str) -> None:
+    """Atomic tmp+rename write of ``blob`` at ``target``, mode 0600.
+
+    ``os.replace`` swaps the *path entry*, so when ``target`` is a
+    legacy symlink the link itself is replaced — the host file it
+    pointed at is never touched.
+    """
+    import stat
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
+    tmp.write_text(blob, encoding="utf-8")
+    try:
+        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    os.replace(tmp, target)
+
+
+def sync_host_credentials_view(host_home: Path, agent_home: Path) -> str:
+    """Write a refresh-token-free *view* of the operator's
+    ``.credentials.json`` into the agent's virtual ``$HOME``.
+
+    Agents only need the access token. Sharing the full file (the
+    pre-1.0.7a2 symlink model) handed every agent the single-use
+    rotating refresh token, so N concurrent claude processes could
+    race a refresh: the loser presents an already-consumed token and
+    Anthropic revokes the whole token family — every process 401s
+    until the operator re-runs ``claude /login``. With sanitized
+    views the daemon's ``CredentialRefresher`` (single writer, under
+    its asyncio.Lock) is the only holder of the refresh token, so the
+    race is structurally impossible.
+
+    Rotation propagates via the refresher's per-tick fan-out
+    (``_sync_views`` → here). The content comparison doubles as
+    self-healing: if an agent-side claude mangles its view (e.g. a
+    failed in-CLI refresh zeroing ``expiresAt``), the next tick
+    rewrites it from the host blob. Legacy symlinks are migrated to
+    view files in place.
 
     On macOS, ``_sync_credentials_from_keychain`` materialises the
-    file from the system Keychain first.
+    host file from the system Keychain first.
 
-    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
-    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-file"``.
+    Idempotent. Returns ``"view"``, ``"view (fresh)"``,
+    ``"view (migrated-from-symlink)"``, ``"unparseable-host-file"``,
+    ``"write-failed"``, or ``"no-host-file"``.
     """
-    import shutil
     host_creds = host_home / ".claude" / ".credentials.json"
     agent_creds = agent_home / ".claude" / ".credentials.json"
     # macOS Keychain → file bridge before we read host_creds.
     _sync_credentials_from_keychain(host_home)
-    if not host_creds.exists():
+    try:
+        host_blob = host_creds.read_text(encoding="utf-8")
+    except OSError:
         return "no-host-file"
-    agent_creds.parent.mkdir(parents=True, exist_ok=True)
+    view_blob = sanitize_claude_credentials_blob(host_blob)
+    if view_blob is None:
+        return "unparseable-host-file"
 
-    # Fast path: existing symlink already points at host_creds.
-    if agent_creds.is_symlink():
+    migrated = agent_creds.is_symlink()
+    if not migrated:
         try:
-            current = os.readlink(agent_creds)
-            if Path(current) == host_creds or current == str(host_creds):
-                return "symlink (already)"
+            if agent_creds.read_text(encoding="utf-8") == view_blob:
+                return "view (fresh)"
         except OSError:
             pass
-
-    # Fast path: copy-mode file already matches host.
-    if (
-        agent_creds.exists()
-        and not agent_creds.is_symlink()
-        and _file_is_up_to_date(agent_creds, host_creds)
-    ):
-        return "copy (fresh)"
-
-    # Tear down whatever's there before a fresh create. Unlink can
-    # fail on Windows races; the next call retries naturally.
     try:
-        if agent_creds.is_symlink() or agent_creds.exists():
-            agent_creds.unlink()
+        _write_credential_view(agent_creds, view_blob)
     except OSError:
-        pass
-
-    try:
-        os.symlink(host_creds, agent_creds)
-        return "symlink"
-    except (OSError, NotImplementedError):
-        pass
-
-    try:
-        shutil.copy2(host_creds, agent_creds)
-        return "copy"
-    except OSError:
-        return "no-host-file"
+        return "write-failed"
+    return "view (migrated-from-symlink)" if migrated else "view"
 
 
-def _file_is_up_to_date(dst: Path, src: Path) -> bool:
-    """True when ``dst`` and ``src`` have matching mtime + size."""
-    try:
-        ds, ss = dst.stat(), src.stat()
-    except OSError:
-        return False
-    return ds.st_mtime == ss.st_mtime and ds.st_size == ss.st_size
+def sync_host_codex_auth_view(host_home: Path, agent_codex_home: Path) -> str:
+    """Write a refresh-token-blanked *view* of the operator's
+    ``~/.codex/auth.json`` into the agent's ``$CODEX_HOME``.
 
+    Same rationale and lifecycle as ``sync_host_credentials_view`` —
+    OpenAI's refresh tokens rotate the same way (d2d2's
+    ``token_invalidated`` revocation came from exactly this race), and
+    ``CodexFileBackend``'s fan-out keeps the views fresh and
+    self-healed. See ``sanitize_codex_auth_blob`` for why the key is
+    blanked rather than removed.
 
-def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
-    """Share the operator's ``~/.codex/auth.json`` with the agent's
-    per-agent ``$CODEX_HOME`` so codex finds OAuth credentials there.
-
-    Mirrors ``link_host_credentials``'s symlink-preferred, copy-fallback
-    layout (Windows without Developer Mode rejects ``os.symlink``).
-    The same OAuth refresh-rotation story applies: a symlink lets every
-    agent see token rotations the moment codex (any process — main CLI
-    or another agent) writes back; a copy gets re-synced on the next
-    link call.
-
-    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
-    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-file"``.
+    Idempotent. Returns ``"view"``, ``"view (fresh)"``,
+    ``"view (migrated-from-symlink)"``, ``"unparseable-host-file"``,
+    ``"write-failed"``, or ``"no-host-file"``.
     """
-    import shutil
     host_auth = host_home / ".codex" / "auth.json"
     agent_auth = agent_codex_home / "auth.json"
-    if not host_auth.exists():
+    try:
+        host_blob = host_auth.read_text(encoding="utf-8")
+    except OSError:
         return "no-host-file"
-    agent_auth.parent.mkdir(parents=True, exist_ok=True)
+    view_blob = sanitize_codex_auth_blob(host_blob)
+    if view_blob is None:
+        return "unparseable-host-file"
 
-    if agent_auth.is_symlink():
+    migrated = agent_auth.is_symlink()
+    if not migrated:
         try:
-            current = os.readlink(agent_auth)
-            if Path(current) == host_auth or current == str(host_auth):
-                return "symlink (already)"
+            if agent_auth.read_text(encoding="utf-8") == view_blob:
+                return "view (fresh)"
         except OSError:
             pass
-
-    if (
-        agent_auth.exists()
-        and not agent_auth.is_symlink()
-        and _file_is_up_to_date(agent_auth, host_auth)
-    ):
-        return "copy (fresh)"
-
     try:
-        if agent_auth.is_symlink() or agent_auth.exists():
-            agent_auth.unlink()
+        _write_credential_view(agent_auth, view_blob)
     except OSError:
-        pass
-
-    try:
-        os.symlink(host_auth, agent_auth)
-        return "symlink"
-    except (OSError, NotImplementedError):
-        pass
-
-    try:
-        shutil.copy2(host_auth, agent_auth)
-        return "copy"
-    except OSError:
-        return "no-host-file"
+        return "write-failed"
+    return "view (migrated-from-symlink)" if migrated else "view"
 
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:

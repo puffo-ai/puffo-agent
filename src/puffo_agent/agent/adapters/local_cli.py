@@ -32,10 +32,10 @@ from ...mcp.config import (
 from ...portal.state import (
     agent_codex_user_dir,
     home_dir,
-    link_host_codex_auth,
-    link_host_credentials,
     read_host_codex_mcp_servers,
     seed_claude_home,
+    sync_host_codex_auth_view,
+    sync_host_credentials_view,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
     sync_host_plugins,
@@ -354,7 +354,7 @@ class LocalCLIAdapter(Adapter):
 
         # Always write config.toml — pins ``cli_auth_credentials_store``
         # to "file" so codex uses ``$CODEX_HOME/auth.json`` (not macOS
-        # Keychain) and our symlink/refresh model works. MCP section
+        # Keychain) and our credential-view/refresh model works. MCP section
         # only when puffo_core is configured. PUF-266: host's own MCP
         # entries from ``~/.codex/config.toml`` are merged in so the
         # agent inherits the operator's codex MCP catalog (the puffo
@@ -394,7 +394,7 @@ class LocalCLIAdapter(Adapter):
             **os.environ,
             "CODEX_HOME": str(codex_home),
         }
-        auth_mode = link_host_codex_auth(Path.home(), codex_home)
+        auth_mode = sync_host_codex_auth_view(Path.home(), codex_home)
         if auth_mode == "no-host-file":
             raise RuntimeError(
                 f"agent {self.agent_id!r}: codex needs auth — run "
@@ -986,8 +986,8 @@ class LocalCLIAdapter(Adapter):
             )
         # Seed the per-agent virtual $HOME on first use (settings,
         # .claude.json). Credentials are handled separately via
-        # link_host_credentials so every agent tracks the operator's
-        # live OAuth state.
+        # sync_host_credentials_view so every agent tracks the
+        # operator's live OAuth state.
         host_home = Path.home()
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
         seeded = seed_claude_home(host_home, self.agent_home_dir)
@@ -996,14 +996,14 @@ class LocalCLIAdapter(Adapter):
                 "agent %s: seeded per-agent virtual $HOME at %s from %s",
                 self.agent_id, self.agent_home_dir, host_home,
             )
-        # Symlink the agent's .credentials.json to the host's so
-        # every refresh is visible across agents. Falls back to copy
-        # on systems where symlinks aren't permitted; the daemon's
-        # CredentialRefresher post-tick view-sync (PUF-221) keeps the
-        # copy fresh.
-        mode = link_host_credentials(host_home, self.agent_home_dir)
+        # Write the agent's .credentials.json as a refresh-token-free
+        # view of the host's — the daemon is the only refresh-token
+        # holder, so agents can't race the single-use rotating token
+        # into a family revocation. The daemon's CredentialRefresher
+        # post-tick view-sync (PUF-221) keeps the view fresh.
+        mode = sync_host_credentials_view(host_home, self.agent_home_dir)
         logger.info(
-            "agent %s: shared host credentials (%s)",
+            "agent %s: wrote host credential view (%s)",
             self.agent_id, mode,
         )
         # One-way sync of host skills + MCP registrations. Runs

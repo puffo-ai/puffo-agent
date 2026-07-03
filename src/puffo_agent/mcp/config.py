@@ -101,7 +101,7 @@ def write_codex_mcp_config(
 
     Always emits ``cli_auth_credentials_store = "file"`` so codex
     reads/writes ``$CODEX_HOME/auth.json`` instead of macOS Keychain
-    (the daemon's ``CodexFileBackend`` + ``link_host_codex_auth``
+    (the daemon's ``CodexFileBackend`` + ``sync_host_codex_auth_view``
     only work in file-mode auth).
 
     Emits ``[mcp_servers.<name>]`` for the puffo_core stdio server

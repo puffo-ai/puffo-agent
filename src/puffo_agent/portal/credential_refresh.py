@@ -19,10 +19,11 @@ all platform specifics to a pluggable ``CredentialBackend``:
   - ``FileBackend`` (Linux / Windows): host file
     ``~/.claude/.credentials.json`` is the canonical store; refresh
     spawns ``claude --print`` with ``HOME=host_home`` so the atomic
-    tmp+rename lands at the host file; per-agent sync is a symlink (or
-    copy fallback) via ``link_host_credentials``. External rotation
-    (operator running ``claude /login``) propagates atomically through
-    the symlink — no poll needed.
+    tmp+rename lands at the host file; per-agent sync writes a
+    refresh-token-free view copy via ``sync_host_credentials_view``
+    (only the daemon holds the rotating refresh token). External
+    rotation (operator running ``claude /login``) is spotted by the
+    per-tick host-file fingerprint check and fanned out to the views.
   - ``KeychainBackend`` (macOS): Keychain is the canonical store
     (Claude Code 2.x). The daemon maintains a cache at
     ``~/.puffo-agent/run/claude-credentials.json``; refresh runs a
@@ -62,7 +63,11 @@ from typing import Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
-from .state import link_host_codex_auth, link_host_credentials
+from .state import (
+    sanitize_claude_credentials_blob,
+    sync_host_codex_auth_view,
+    sync_host_credentials_view,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -301,11 +306,14 @@ class FileBackend:
     """Host-file-canonical backend used on Linux and Windows. The host
     ``~/.claude/.credentials.json`` is the single source of truth;
     every agent's ``<agent_home>/.claude/.credentials.json`` is a
-    symlink (or copy fallback) onto it via ``link_host_credentials``.
+    sanitized view copy (host blob minus the rotating refresh token)
+    written by ``sync_host_credentials_view``. Only the daemon can
+    rotate, so concurrent agent processes can't race the (single-use)
+    refresh token into a family revocation.
 
-    External rotation (operator running ``claude /login``) propagates
-    atomically through the symlink, so no external-poll is needed
-    beyond the refresher's 2-minute ``expires_in`` poll.
+    External rotation (operator running ``claude /login``) is spotted
+    by the refresher's per-tick ``fingerprint`` check on the host file
+    and fanned out to the views within one 2-minute poll.
     """
     host_home: Path
 
@@ -382,7 +390,7 @@ class FileBackend:
         return RefreshOutcome.REFRESHED
 
     def sync_to_agent(self, agent_home: Path) -> None:
-        link_host_credentials(self.host_home, agent_home)
+        sync_host_credentials_view(self.host_home, agent_home)
 
     def fingerprint(self) -> tuple[int, int] | None:
         """(mtime_ns, size) of the host credential. Lets the refresher
@@ -418,8 +426,9 @@ class CodexFileBackend:
     long-running ``codex app-server`` would, rotates the OAuth bundle
     if stale, and writes back atomically to auth.json.
 
-    Per-agent sync is a symlink (or copy fallback on Windows
-    non-developer-mode) via ``link_host_codex_auth``.
+    Per-agent sync writes a refresh-token-blanked view copy via
+    ``sync_host_codex_auth_view`` — same single-rotator rationale as
+    ``FileBackend``.
     """
     host_home: Path
 
@@ -516,7 +525,7 @@ class CodexFileBackend:
         # agents to avoid cluttering them with a stray auth.json.
         if not agent_codex_home.exists():
             return
-        link_host_codex_auth(self.host_home, agent_codex_home)
+        sync_host_codex_auth_view(self.host_home, agent_codex_home)
 
     def fingerprint(self) -> tuple[int, int] | None:
         """(mtime_ns, size) of the host codex auth — external-rotation
@@ -740,11 +749,12 @@ class KeychainBackend:
         return RefreshOutcome.REFRESHED
 
     def sync_to_agent(self, agent_home: Path) -> None:
-        """Atomic-write the canonical blob to the agent's per-agent
-        ``.credentials.json``. Cache → disk file fallthrough so this
-        works even when the Keychain entry is missing. Idempotent —
-        skips the write when the target already matches, so fan-out
-        from concurrent ``ensure_fresh`` callers stays cheap."""
+        """Atomic-write the sanitized (refresh-token-free) view of the
+        canonical blob to the agent's per-agent ``.credentials.json``.
+        Cache → disk file fallthrough so this works even when the
+        Keychain entry is missing. Idempotent — skips the write when
+        the target already matches, so fan-out from concurrent
+        ``ensure_fresh`` callers stays cheap."""
         cache_blob = self.cache.read()
         blob = cache_blob or _read_disk_credentials_blob(Path.home())
         if not blob:
@@ -755,17 +765,27 @@ class KeychainBackend:
                 "target=%s",
                 agent_home,
             )
+        view_blob = sanitize_claude_credentials_blob(blob)
+        if view_blob is None:
+            logger.warning(
+                "keychain backend: canonical blob unparseable; not "
+                "syncing to %s",
+                agent_home,
+            )
+            return
         agent_claude = agent_home / ".claude"
         target = agent_claude / ".credentials.json"
         try:
-            if target.read_text(encoding="utf-8") == blob:
+            if not target.is_symlink() and (
+                target.read_text(encoding="utf-8") == view_blob
+            ):
                 return
         except OSError:
             pass
         try:
             agent_claude.mkdir(parents=True, exist_ok=True)
             tmp = agent_claude / f".{target.name}.tmp.{os.getpid()}"
-            tmp.write_text(blob, encoding="utf-8")
+            tmp.write_text(view_blob, encoding="utf-8")
             try:
                 import stat as _stat
                 tmp.chmod(_stat.S_IRUSR | _stat.S_IWUSR)
