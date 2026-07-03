@@ -224,6 +224,90 @@ def test_no_host_file(tmp_path):
     assert not _agent_view(agent).exists()
 
 
+def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_host(host)
+
+    real_chmod = Path.chmod
+
+    def _fail_chmod(self, *args, **kwargs):
+        if ".credentials.json.tmp" in self.name:
+            raise OSError("simulated chmod failure")
+        return real_chmod(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", _fail_chmod)
+
+    assert sync_host_credentials_view(host, agent) == "view"
+    view = _agent_view(agent)
+    assert "refreshToken" not in json.loads(
+        view.read_text(encoding="utf-8")
+    )["claudeAiOauth"]
+
+
+def test_agent_read_error_falls_through_to_rewrite(tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_host(host)
+
+    # Pre-place a file so the "not migrated" path enters read-compare.
+    view = _agent_view(agent)
+    view.parent.mkdir(parents=True, exist_ok=True)
+    view.write_text("stale-and-unreadable", encoding="utf-8")
+
+    real_read = Path.read_text
+
+    def _fail_agent_read(self, *args, **kwargs):
+        if self == view:
+            raise OSError("simulated read failure")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _fail_agent_read)
+
+    # Read-compare raised → falls through to write; final content is the view.
+    assert sync_host_credentials_view(host, agent) == "view"
+    monkeypatch.setattr(Path, "read_text", real_read)
+    assert "refreshToken" not in json.loads(
+        view.read_text(encoding="utf-8")
+    )["claudeAiOauth"]
+
+
+def test_concurrent_syncs_produce_valid_view(tmp_path):
+    """The race this whole design fixes: N concurrent writers hitting
+    the same agent view must all leave a complete, refresh-token-free
+    file behind. Also pins that the tmp+rename doesn't leak a partial
+    write on a losing thread."""
+    import threading
+
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_host(host)
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(6)
+
+    def _run():
+        try:
+            barrier.wait()
+            for _ in range(20):
+                sync_host_credentials_view(host, agent)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent sync raised: {errors!r}"
+    view = _agent_view(agent)
+    assert view.exists() and not view.is_symlink()
+    data = json.loads(view.read_text(encoding="utf-8"))
+    assert data["claudeAiOauth"]["accessToken"] == "at-123"
+    assert "refreshToken" not in data["claudeAiOauth"]
+
+
 def test_write_failure_returns_write_failed(tmp_path, monkeypatch):
     host = tmp_path / "host"
     agent = tmp_path / "agent"

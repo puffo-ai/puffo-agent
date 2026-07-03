@@ -157,6 +157,82 @@ def test_no_host_file(tmp_path):
     assert not (agent_codex / "auth.json").exists()
 
 
+def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    agent_codex = tmp_path / "agent" / ".codex"
+    _write_host(host)
+
+    real_chmod = Path.chmod
+
+    def _fail_chmod(self, *args, **kwargs):
+        if "auth.json.tmp" in self.name:
+            raise OSError("simulated chmod failure")
+        return real_chmod(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "chmod", _fail_chmod)
+
+    assert sync_host_codex_auth_view(host, agent_codex) == "view"
+    data = json.loads((agent_codex / "auth.json").read_text(encoding="utf-8"))
+    assert data["tokens"]["refresh_token"] == ""
+
+
+def test_agent_read_error_falls_through_to_rewrite(tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    agent_codex = tmp_path / "agent" / ".codex"
+    _write_host(host)
+
+    view = agent_codex / "auth.json"
+    view.parent.mkdir(parents=True, exist_ok=True)
+    view.write_text("stale-and-unreadable", encoding="utf-8")
+
+    real_read = Path.read_text
+
+    def _fail_agent_read(self, *args, **kwargs):
+        if self == view:
+            raise OSError("simulated read failure")
+        return real_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _fail_agent_read)
+
+    assert sync_host_codex_auth_view(host, agent_codex) == "view"
+    monkeypatch.setattr(Path, "read_text", real_read)
+    assert json.loads(view.read_text(encoding="utf-8"))["tokens"]["refresh_token"] == ""
+
+
+def test_concurrent_syncs_produce_valid_view(tmp_path):
+    """Race pin: N concurrent codex-view writers must leave a complete,
+    refresh-token-blanked file behind, no partial-write leaks."""
+    import threading
+
+    host = tmp_path / "host"
+    agent_codex = tmp_path / "agent" / ".codex"
+    _write_host(host)
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(6)
+
+    def _run():
+        try:
+            barrier.wait()
+            for _ in range(20):
+                sync_host_codex_auth_view(host, agent_codex)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_run) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent sync raised: {errors!r}"
+    view = agent_codex / "auth.json"
+    assert view.exists() and not view.is_symlink()
+    data = json.loads(view.read_text(encoding="utf-8"))
+    assert data["tokens"]["access_token"] == "at-123"
+    assert data["tokens"]["refresh_token"] == ""
+
+
 def test_write_failure_returns_write_failed(tmp_path, monkeypatch):
     host = tmp_path / "host"
     agent_codex = tmp_path / "agent" / ".codex"
