@@ -22,6 +22,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.portal.state import (
@@ -39,6 +41,20 @@ HOST_CREDS = {
         "subscriptionType": "max",
     }
 }
+
+
+def _symlinks_available(tmp_path: Path) -> bool:
+    probe = tmp_path / "_probe_link"
+    target = tmp_path / "_probe_target"
+    target.write_text("x", encoding="utf-8")
+    try:
+        os.symlink(target, probe)
+    except (OSError, NotImplementedError):
+        target.unlink(missing_ok=True)
+        return False
+    probe.unlink()
+    target.unlink()
+    return True
 
 
 def _write_host(host: Path, creds: dict | None = None) -> Path:
@@ -156,6 +172,8 @@ def test_view_heals_agent_side_garbage(tmp_path):
 
 
 def test_migrates_legacy_symlink_without_touching_host(tmp_path):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     host_creds = _write_host(host)
@@ -177,6 +195,8 @@ def test_migrates_legacy_symlink_without_touching_host(tmp_path):
 
 
 def test_migrates_broken_symlink(tmp_path):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_host(host)
@@ -201,6 +221,21 @@ def test_no_host_file(tmp_path):
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     assert sync_host_credentials_view(host, agent) == "no-host-file"
+    assert not _agent_view(agent).exists()
+
+
+def test_write_failure_returns_write_failed(tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_host(host)
+
+    def _boom(target, blob):
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.state._write_credential_view", _boom,
+    )
+    assert sync_host_credentials_view(host, agent) == "write-failed"
     assert not _agent_view(agent).exists()
 
 

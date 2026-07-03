@@ -14,6 +14,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.portal.state import (
@@ -33,6 +35,20 @@ HOST_AUTH = {
     },
     "last_refresh": "2026-07-02T00:00:00Z",
 }
+
+
+def _symlinks_available(tmp_path: Path) -> bool:
+    probe = tmp_path / "_probe_link"
+    target = tmp_path / "_probe_target"
+    target.write_text("x", encoding="utf-8")
+    try:
+        os.symlink(target, probe)
+    except (OSError, NotImplementedError):
+        target.unlink(missing_ok=True)
+        return False
+    probe.unlink()
+    target.unlink()
+    return True
 
 
 def _write_host(host: Path, auth: dict | None = None) -> Path:
@@ -112,6 +128,8 @@ def test_view_tracks_host_rotation(tmp_path):
 
 
 def test_migrates_legacy_symlink_without_touching_host(tmp_path):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
     host = tmp_path / "host"
     agent_codex = tmp_path / "agent" / ".codex"
     host_auth = _write_host(host)
@@ -136,6 +154,21 @@ def test_no_host_file(tmp_path):
     host = tmp_path / "host"
     agent_codex = tmp_path / "agent" / ".codex"
     assert sync_host_codex_auth_view(host, agent_codex) == "no-host-file"
+    assert not (agent_codex / "auth.json").exists()
+
+
+def test_write_failure_returns_write_failed(tmp_path, monkeypatch):
+    host = tmp_path / "host"
+    agent_codex = tmp_path / "agent" / ".codex"
+    _write_host(host)
+
+    def _boom(target, blob):
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.state._write_credential_view", _boom,
+    )
+    assert sync_host_codex_auth_view(host, agent_codex) == "write-failed"
     assert not (agent_codex / "auth.json").exists()
 
 

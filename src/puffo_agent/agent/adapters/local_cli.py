@@ -985,9 +985,7 @@ class LocalCLIAdapter(Adapter):
                 "or set ``PUFFO_CLAUDE_BIN=/abs/path/to/claude``."
             )
         # Seed the per-agent virtual $HOME on first use (settings,
-        # .claude.json). Credentials are handled separately via
-        # sync_host_credentials_view so every agent tracks the
-        # operator's live OAuth state.
+        # .claude.json). Credentials handled separately below.
         host_home = Path.home()
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
         seeded = seed_claude_home(host_home, self.agent_home_dir)
@@ -996,11 +994,8 @@ class LocalCLIAdapter(Adapter):
                 "agent %s: seeded per-agent virtual $HOME at %s from %s",
                 self.agent_id, self.agent_home_dir, host_home,
             )
-        # Write the agent's .credentials.json as a refresh-token-free
-        # view of the host's — the daemon is the only refresh-token
-        # holder, so agents can't race the single-use rotating token
-        # into a family revocation. The daemon's CredentialRefresher
-        # post-tick view-sync (PUF-221) keeps the view fresh.
+        # Refresh-token-free view; the daemon's refresher is the sole
+        # rotator. Post-tick view-sync keeps this file fresh.
         mode = sync_host_credentials_view(host_home, self.agent_home_dir)
         logger.info(
             "agent %s: wrote host credential view (%s)",

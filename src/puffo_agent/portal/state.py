@@ -232,32 +232,17 @@ def _write_credential_view(target: Path, blob: str) -> None:
 
 
 def sync_host_credentials_view(host_home: Path, agent_home: Path) -> str:
-    """Write a refresh-token-free *view* of the operator's
-    ``.credentials.json`` into the agent's virtual ``$HOME``.
+    """Write a refresh-token-free view of the operator's
+    ``.credentials.json`` into the agent's virtual ``$HOME`` so only
+    the daemon holds the rotating refresh token — concurrent agent
+    processes can't race a refresh into a token-family revocation.
 
-    Agents only need the access token. Sharing the full file (the
-    pre-1.0.7a2 symlink model) handed every agent the single-use
-    rotating refresh token, so N concurrent claude processes could
-    race a refresh: the loser presents an already-consumed token and
-    Anthropic revokes the whole token family — every process 401s
-    until the operator re-runs ``claude /login``. With sanitized
-    views the daemon's ``CredentialRefresher`` (single writer, under
-    its asyncio.Lock) is the only holder of the refresh token, so the
-    race is structurally impossible.
-
-    Rotation propagates via the refresher's per-tick fan-out
-    (``_sync_views`` → here). The content comparison doubles as
-    self-healing: if an agent-side claude mangles its view (e.g. a
-    failed in-CLI refresh zeroing ``expiresAt``), the next tick
-    rewrites it from the host blob. Legacy symlinks are migrated to
-    view files in place.
-
-    On macOS, ``_sync_credentials_from_keychain`` materialises the
-    host file from the system Keychain first.
-
-    Idempotent. Returns ``"view"``, ``"view (fresh)"``,
-    ``"view (migrated-from-symlink)"``, ``"unparseable-host-file"``,
-    ``"write-failed"``, or ``"no-host-file"``.
+    Idempotent (content-compare: also self-heals agent-side drift).
+    Legacy symlinks are replaced by view files in place; the host
+    file is never touched. On macOS, ``_sync_credentials_from_keychain``
+    materialises the host file first. Returns ``"view"``,
+    ``"view (fresh)"``, ``"view (migrated-from-symlink)"``,
+    ``"unparseable-host-file"``, ``"write-failed"``, or ``"no-host-file"``.
     """
     host_creds = host_home / ".claude" / ".credentials.json"
     agent_creds = agent_home / ".claude" / ".credentials.json"
@@ -286,19 +271,11 @@ def sync_host_credentials_view(host_home: Path, agent_home: Path) -> str:
 
 
 def sync_host_codex_auth_view(host_home: Path, agent_codex_home: Path) -> str:
-    """Write a refresh-token-blanked *view* of the operator's
-    ``~/.codex/auth.json`` into the agent's ``$CODEX_HOME``.
-
-    Same rationale and lifecycle as ``sync_host_credentials_view`` —
-    OpenAI's refresh tokens rotate the same way (d2d2's
-    ``token_invalidated`` revocation came from exactly this race), and
-    ``CodexFileBackend``'s fan-out keeps the views fresh and
-    self-healed. See ``sanitize_codex_auth_blob`` for why the key is
-    blanked rather than removed.
-
-    Idempotent. Returns ``"view"``, ``"view (fresh)"``,
-    ``"view (migrated-from-symlink)"``, ``"unparseable-host-file"``,
-    ``"write-failed"``, or ``"no-host-file"``.
+    """Codex counterpart of ``sync_host_credentials_view`` — writes a
+    view with ``tokens.refresh_token`` blanked (see
+    ``sanitize_codex_auth_blob`` for why blanked not removed).
+    Idempotent + self-healing; legacy symlinks migrated in place.
+    Same return taxonomy as ``sync_host_credentials_view``.
     """
     host_auth = host_home / ".codex" / "auth.json"
     agent_auth = agent_codex_home / "auth.json"
