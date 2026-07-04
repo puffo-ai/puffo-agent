@@ -652,6 +652,13 @@ into your own agent.
   into your `.claude.json`; just call `refresh()` and try it.
 - The credential is already on host — skip Step 1 and go straight to
   `sync_host_mcp`.
+- **Codex Apps connectors (`mcp__codex_apps__*` — Drive, Gmail, …)
+  are NOT puffo-managed MCP** — codex provisions them internally, so
+  they never appear in `list_mcp_servers` and this workflow can't
+  touch them. If writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`,
+  the operator must reconnect the connector in interactive codex
+  (approving write scopes), then you run `refresh(host_sync=True)`
+  and allow one worker turn for the token transition.
 
 ## Workflow
 
