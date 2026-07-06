@@ -98,7 +98,7 @@ def shared_fs_dir() -> Path:
 # Note: ``.claude.json`` is a sibling of the ``.claude/`` dir; Claude
 # CLI reads it from ``$HOME/.claude.json`` so we mirror that layout.
 # ``.credentials.json`` is intentionally excluded — set up separately
-# via ``sync_host_credentials_view`` so every agent tracks live OAuth
+# via ``sync_host_claude_code_auth_view`` so every agent tracks live OAuth
 # state (matches cli-docker's bind-mount model).
 _CLAUDE_HOME_SEED_PATHS = (
     ".claude/settings.json",
@@ -111,7 +111,7 @@ def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     ``$HOME``. Idempotent — never overwrites an existing file.
 
     ``.credentials.json`` is set up separately via
-    ``sync_host_credentials_view``. Returns True if any file was copied.
+    ``sync_host_claude_code_auth_view``. Returns True if any file was copied.
     """
     import shutil
     agent_home.mkdir(parents=True, exist_ok=True)
@@ -136,7 +136,7 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
 
     Claude Code stores OAuth in Keychain instead of the file on macOS;
     this bridges to the shared-file path used by every other agent.
-    Called on every ``sync_host_credentials_view`` invocation so
+    Called on every ``sync_host_claude_code_auth_view`` invocation so
     refreshed tokens propagate. Returns True if the file was written.
     """
     import platform
@@ -175,14 +175,11 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
         return False
 
 
-def sanitize_claude_credentials_blob(blob: str) -> str | None:
-    """Strip ``claudeAiOauth.refreshToken`` from a host credentials
-    blob, producing the per-agent *view*. ``None`` when the blob isn't
-    parseable JSON (never hand agents something we can't vet).
-
-    Claude Code runs fine without the key: it uses the access token
-    as-is and, on 401, fails cleanly instead of attempting a refresh.
-    """
+def sanitize_claude_code_auth_blob(blob: str) -> str | None:
+    """Strip ``claudeAiOauth.refreshToken`` from the host blob for the
+    agent view. ``None`` on unparseable JSON — never ship a blob we
+    can't vet. Claude Code tolerates the missing field: uses the
+    access token, 401s cleanly rather than attempting a refresh."""
     try:
         data = json.loads(blob)
     except ValueError:
@@ -194,15 +191,11 @@ def sanitize_claude_credentials_blob(blob: str) -> str | None:
 
 
 def sanitize_codex_auth_blob(blob: str) -> str | None:
-    """Blank ``tokens.refresh_token`` in a host codex auth blob,
-    producing the per-agent *view*. ``None`` when unparseable.
-
-    Unlike claude, codex hard-fails deserialisation when the field is
-    *missing* (serde non-optional), so the view keeps the key with an
-    empty value: parse succeeds, ``codex login status`` reports
-    logged-in, and a refresh attempt is rejected server-side without
-    consuming the real (single-use) refresh token.
-    """
+    """Blank (not remove) ``tokens.refresh_token`` for the agent view.
+    ``None`` on unparseable JSON. Codex serde is non-optional on this
+    field — dropping it crashes; empty string parses, ``codex login
+    status`` reports logged-in, and a refresh attempt fails server-side
+    without consuming the real (single-use) token."""
     try:
         data = json.loads(blob)
     except ValueError:
@@ -214,12 +207,9 @@ def sanitize_codex_auth_blob(blob: str) -> str | None:
 
 
 def _write_credential_view(target: Path, blob: str) -> None:
-    """Atomic tmp+rename write of ``blob`` at ``target``, mode 0600.
-
-    ``os.replace`` swaps the *path entry*, so when ``target`` is a
-    legacy symlink the link itself is replaced — the host file it
-    pointed at is never touched.
-    """
+    """Atomic tmp+rename write at ``target``, mode 0600. ``os.replace``
+    swaps the path entry, so a legacy symlink at ``target`` is replaced,
+    not followed — the host file it pointed at stays untouched."""
     import stat
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
@@ -231,28 +221,23 @@ def _write_credential_view(target: Path, blob: str) -> None:
     os.replace(tmp, target)
 
 
-def sync_host_credentials_view(host_home: Path, agent_home: Path) -> str:
-    """Write a refresh-token-free view of the operator's
-    ``.credentials.json`` into the agent's virtual ``$HOME`` so only
-    the daemon holds the rotating refresh token — concurrent agent
-    processes can't race a refresh into a token-family revocation.
-
-    Idempotent (content-compare: also self-heals agent-side drift).
-    Legacy symlinks are replaced by view files in place; the host
-    file is never touched. On macOS, ``_sync_credentials_from_keychain``
-    materialises the host file first. Returns ``"view"``,
+def sync_host_claude_code_auth_view(host_home: Path, agent_home: Path) -> str:
+    """Write a refresh-token-free view of the host's
+    ``.credentials.json`` into the agent's virtual ``$HOME`` — only
+    the daemon holds the rotating RT, so agents can't race a refresh
+    into a token-family revocation. Idempotent + self-healing;
+    legacy symlinks migrated in place. Returns ``"view"``,
     ``"view (fresh)"``, ``"view (migrated-from-symlink)"``,
     ``"unparseable-host-file"``, ``"write-failed"``, or ``"no-host-file"``.
     """
     host_creds = host_home / ".claude" / ".credentials.json"
     agent_creds = agent_home / ".claude" / ".credentials.json"
-    # macOS Keychain → file bridge before we read host_creds.
     _sync_credentials_from_keychain(host_home)
     try:
         host_blob = host_creds.read_text(encoding="utf-8")
     except OSError:
         return "no-host-file"
-    view_blob = sanitize_claude_credentials_blob(host_blob)
+    view_blob = sanitize_claude_code_auth_blob(host_blob)
     if view_blob is None:
         return "unparseable-host-file"
 
@@ -271,12 +256,9 @@ def sync_host_credentials_view(host_home: Path, agent_home: Path) -> str:
 
 
 def sync_host_codex_auth_view(host_home: Path, agent_codex_home: Path) -> str:
-    """Codex counterpart of ``sync_host_credentials_view`` — writes a
-    view with ``tokens.refresh_token`` blanked (see
-    ``sanitize_codex_auth_blob`` for why blanked not removed).
-    Idempotent + self-healing; legacy symlinks migrated in place.
-    Same return taxonomy as ``sync_host_credentials_view``.
-    """
+    """Codex counterpart of ``sync_host_claude_code_auth_view``; RT
+    blanked, not removed (see ``sanitize_codex_auth_blob``). Same
+    return taxonomy."""
     host_auth = host_home / ".codex" / "auth.json"
     agent_auth = agent_codex_home / "auth.json"
     try:

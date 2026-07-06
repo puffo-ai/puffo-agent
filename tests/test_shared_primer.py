@@ -215,3 +215,64 @@ def test_cli_reset_primer_unknown_agent_returns_error(monkeypatch):
     # Shared primer still re-seeds; the unknown agent yields a non-zero rc.
     assert args.func(args) == 2
     assert (home / "docker" / "shared" / "CLAUDE.md").exists()
+
+
+# ── primer + skill body correctness invariants ─────────────────────
+
+
+def test_docs_use_msg_envelope_id_format():
+    """Envelope ids are ``msg_<uuid>`` (crypto/message.py stamps them;
+    the server's prefix validator rejects anything else). No agent-facing
+    doc may teach the phantom ``env_`` format."""
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    assert "env_" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "msg_<uuid>" in DEFAULT_SHARED_CLAUDE_MD
+    for skill_id, (description, body) in DEFAULT_SKILLS.items():
+        assert "env_" not in description, f"stale env_ id in {skill_id} description"
+        assert "env_" not in body, f"stale env_ id in {skill_id} body"
+
+
+def test_primer_dm_reply_rule_lives_in_how_to_reply():
+    """The DM ``@<slug>`` rule sits inside 'How to reply' (where
+    agents actually read on reply), not only 100+ lines below."""
+    start = DEFAULT_SHARED_CLAUDE_MD.index("## How to reply")
+    end = DEFAULT_SHARED_CLAUDE_MD.index("## Spaces, channels, DMs")
+    how_to_reply = DEFAULT_SHARED_CLAUDE_MD[start:end]
+    assert "@<sender_slug>" in how_to_reply
+    metadata_block = DEFAULT_SHARED_CLAUDE_MD[:start]
+    assert 'channel="@<sender_slug>"' in metadata_block
+
+
+def test_primer_metadata_example_matches_builder():
+    """The documented metadata block must track what
+    ``agent/core.py`` actually emits: display-name ``sender`` +
+    separate ``sender_slug``, absolute ``.puffo/inbox`` attachment
+    paths, and the ``followup_messages_since`` field."""
+    assert "- sender_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
+    assert "followup_messages_since" in DEFAULT_SHARED_CLAUDE_MD
+    assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
+    # The old, wrong relative form must be gone.
+    assert "- attachments/<envelope_id>" not in DEFAULT_SHARED_CLAUDE_MD
+    # The attachments skill mirrors the same absolute-path convention.
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    description, body = DEFAULT_SKILLS["attachments"]
+    assert "<workspace>/.puffo/inbox/" in description
+    assert "<workspace>/.puffo/inbox/<envelope_id>/<filename>" in body
+
+
+def test_skills_do_not_reference_removed_send_params():
+    """``is_visible_to_human``/``agent_only`` send-side params were
+    replaced by ``visibility_level`` in 1.0.6. The incoming metadata
+    FIELD ``is_visible_to_human`` is still real, so only skill docs
+    are held to this — not the primer's metadata example."""
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    for skill_id, (description, body) in DEFAULT_SKILLS.items():
+        assert "is_visible_to_human" not in description, (
+            f"stale send-param in {skill_id} description"
+        )
+        assert "is_visible_to_human" not in body, (
+            f"stale send-param in {skill_id} body"
+        )

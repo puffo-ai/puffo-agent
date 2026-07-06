@@ -139,7 +139,7 @@ async def test_ensure_fresh_fans_out_to_agents_in_fresh_path(tmp_path):
         r.register_agent(agent)
 
     assert await r.ensure_fresh() is True
-    # FileBackend.sync_to_agent → sync_host_credentials_view → view copy
+    # FileBackend.sync_to_agent → sync_host_claude_code_auth_view → view copy
     # into <agent>/.claude/.credentials.json.
     for agent in (agent_a, agent_b):
         assert (agent / ".claude" / ".credentials.json").exists()

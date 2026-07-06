@@ -35,7 +35,7 @@ from ...portal.state import (
     read_host_codex_mcp_servers,
     seed_claude_home,
     sync_host_codex_auth_view,
-    sync_host_credentials_view,
+    sync_host_claude_code_auth_view,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
     sync_host_plugins,
@@ -352,13 +352,11 @@ class LocalCLIAdapter(Adapter):
         if not agents_md.exists():
             agents_md.write_text("", encoding="utf-8")
 
-        # Always write config.toml — pins ``cli_auth_credentials_store``
-        # to "file" so codex uses ``$CODEX_HOME/auth.json`` (not macOS
-        # Keychain) and our credential-view/refresh model works. MCP section
-        # only when puffo_core is configured. PUF-266: host's own MCP
-        # entries from ``~/.codex/config.toml`` are merged in so the
-        # agent inherits the operator's codex MCP catalog (the puffo
-        # entry below shadows any same-named host entry).
+        # Pin ``cli_auth_credentials_store=file`` so codex reads
+        # ``$CODEX_HOME/auth.json`` (not macOS Keychain) — required for
+        # our view/refresh model. Host's own ``~/.codex/config.toml``
+        # MCP entries are merged in so the agent inherits the
+        # operator's catalog (puffo entry below shadows same-name).
         host_mcps = read_host_codex_mcp_servers(Path.home())
         # Host wins on collision so the operator's local override
         # beats the catalog default — same precedence as claude's
@@ -996,7 +994,7 @@ class LocalCLIAdapter(Adapter):
             )
         # Refresh-token-free view; the daemon's refresher is the sole
         # rotator. Post-tick view-sync keeps this file fresh.
-        mode = sync_host_credentials_view(host_home, self.agent_home_dir)
+        mode = sync_host_claude_code_auth_view(host_home, self.agent_home_dir)
         logger.info(
             "agent %s: wrote host credential view (%s)",
             self.agent_id, mode,

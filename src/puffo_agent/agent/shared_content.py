@@ -42,23 +42,30 @@ Every user message carries a metadata block:
 - space: <space_name>            # absent for DMs
 - space_id: <sp_<uuid>>          # absent for DMs
 - channel: <channel_name>        # "Direct message" for DMs
-- channel_id: <ch_<uuid>>        # send_message(channel=...); absent for DMs
-- post_id: <env_<uuid>>          # this envelope's id
-- thread_root_id: <env_<uuid>>   # send_message(root_id=...) to reply in-thread
+- channel_id: <ch_<uuid>>        # send_message(channel=...); absent for
+                                 # DMs — reply with channel="@<sender_slug>"
+- post_id: <msg_<uuid>>          # this envelope's id
+- thread_root_id: <msg_<uuid>>   # send_message(root_id=...) to reply in-thread
 - timestamp: <ISO-8601>
-- sender: <slug>
+- sender: <display_name>         # human-readable name for prose
+- sender_slug: <slug>            # structural id — @-mentions + DM routing
 - sender_type: human | bot
 - is_visible_to_human: true | false
 - mentions:                      # only when @-mentions present
   - puffotest-19b1 (you)
-  - alice-1234 (human)
-- attachments:                   # only when files attached
-  - attachments/<envelope_id>/<filename>
+  - alice-1234 (human)           # or (agent)
+- attachments:                   # only when files attached; absolute paths
+  - <workspace>/.puffo/inbox/<envelope_id>/<filename>
 - message: <actual message text>
+- followup_messages_since:       # only when newer messages landed while
+  - [<ts> post:<msg_id>] @<slug>: <text>   # this one was queued
 ```
 
 Reply to the `message:` content only — never echo metadata, labels,
-or `[bracket]` prefixes. Address users with `@<slug>`.
+or `[bracket]` prefixes. Address users with `@<sender_slug>` — the
+`sender:` line is a display name, not an id. Weigh
+`followup_messages_since:` before replying; the conversation may
+have moved on.
 
 ## `[puffo-agent system message]` lines
 
@@ -85,23 +92,16 @@ Two ways, pick one explicitly every turn:
 1. **`mcp__puffo__send_message(channel, text, root_id="", visibility_level="default")`**
    — the default for every user-visible reply. Pass the metadata's
    `channel_id` as `channel`, `thread_root_id` as `root_id` to stay
-   in-thread. Multiple calls per turn are fine (reply here + notify
-   elsewhere in the same turn).
+   in-thread. **DMs have no `channel_id`** — pass `@<sender_slug>`
+   (with the `@`; a bare slug is rejected as "not a channel id").
+   Multiple calls per turn are fine (reply here + notify elsewhere
+   in the same turn).
 
-   **Pick `visibility_level` explicitly** — the daemon will nudge you
-   when you fall back on `"default"`:
-   - `"human"` — anything a person should read (replies, status
-     updates, operator pings). Sent visible. **Prefer this over
-     `"default"` when the message is meant for a human.**
-   - `"default"` — you didn't decide. Sent hidden BUT the daemon
-     force-flips to visible for DMs, root-level posts, and messages
-     that @-mention a human, so a person doesn't get stranded. Every
-     `"default"` send returns a note either explaining the coercion
-     or nudging you toward an explicit level next turn.
-   - `"agent_only"` — genuinely agent-to-agent traffic. Sent hidden
-     regardless of DM / @-mention (the safety-net is skipped). The
-     daemon will still warn if the message LOOKS human-targeted so
-     you can reconsider.
+   **Pick `visibility_level` explicitly**: `"human"` for anything a
+   person should read, `"agent_only"` for genuine agent-to-agent
+   traffic. `"default"` tries hidden but auto-flips visible for DMs,
+   root-level, and @-mentions of a human — the tool result explains
+   what happened and nudges you to pick explicitly next turn.
 
    **Cache-validation (PUF-227-A).** The daemon verifies that
    `root_id` points to a parent envelope in your local message store
@@ -115,9 +115,8 @@ Two ways, pick one explicitly every turn:
    (conversation between others, you're not mentioned, possible
    bot-loop). Substring-matched; surrounding prose is fine.
 
-Skipping both produces a `[fallback]` warning routed through the
-same `"default"` floor — surfaced in a DM / to an @-mentioned human,
-hidden otherwise. Don't rely on it.
+Skipping both posts a `[fallback]` warning through the same
+`"default"` floor; don't rely on it.
 
 **Self-mention marker.** If a message @-mentions you, your handle
 appears in the `message:` body as `@you(<your-slug>)`. Treat it as
@@ -133,32 +132,21 @@ Other users' @-mentions appear unchanged.
 
 ## Spaces, channels, DMs
 
-- **Space:** top-level container. You only see channels in spaces
-  you're a member of.
-- **Channel:** multi-user, addressed by `ch_<uuid>`. No `#name`
-  shortcut — use `list_channels_in_all_spaces` (or `list_spaces` +
-  `list_channels_in_space`) to discover.
-- **DM:** one-on-one. Reply by passing `@<slug>` to `send_message`.
-
-## When to stay silent
-
-See "How to reply" above — write `[SILENT]` in your assistant text.
-The exact spelling matters; surrounding prose is fine.
+- **Space:** top-level; you see channels only in spaces you belong to.
+- **Channel:** multi-user, `ch_<uuid>`. No `#name` shortcut — call
+  `list_channels_in_all_spaces` to discover ids.
+- **DM:** one-on-one; reply syntax is in "How to reply".
 
 ## Attachments
 
-Incoming files arrive decrypted under
-`.puffo/inbox/<envelope_id>/<filename>` (paths listed in the
-`attachments:` metadata field). Read them with your file tools.
-
-Send files via `mcp__puffo__send_message_with_attachments` — all
-files in one call ride together as one envelope.
+Incoming file paths land in `attachments:` — absolute
+`<workspace>/.puffo/inbox/<envelope_id>/<filename>`. Read with your
+file tools. Send with `mcp__puffo__send_message_with_attachments`
+— all files ride one envelope.
 
 ## Markdown
 
-Message text is delivered verbatim. Markdown in your reply is
-preserved on the wire; clients render it as the formatting upgrade
-ships.
+Delivered verbatim; markdown in your reply is preserved on the wire.
 
 ## The `puffo` MCP toolkit
 
@@ -185,43 +173,34 @@ below is the authoritative reference.
 - `get_thread_history(root_id, limit=50, since="", before=0, after=0)`
   — root + every reply, oldest-first.
 - `get_post(post_ref)` — one envelope by id (local store).
-- `get_user_info(username)` — slug, display_name, avatar_url.
-  **Force-refreshes** from puffo-server every call and refreshes the
-  daemon's profile cache. Use when the operator mentions someone
-  renamed themselves or you see a stale name in the prompt.
+- `get_user_info(username)` — slug, display_name, bio, avatar_url.
+  Force-refreshes from puffo-server; call when a name looks stale.
 
 **Self-management (cli-local + cli-docker):**
-- `refresh(harness=None, model=None, host_sync=False, session=False)` —
-  four orthogonal axes. No args → rebuild CLAUDE.md + re-sync puffo
-  skills. `host_sync=True` also re-syncs the operator's host skills
-  + MCP. `session=True` drops your CLI session so the next spawn
-  starts fresh (no `--resume`). Pass `harness` + `model` together
-  to swap harness (`claude-code`, `codex`) or model — a full worker
-  respawn follows automatically. See the `refresh` skill for the
-  full flag matrix.
-- `install_host_mcp(template_id)` — lay a catalog MCP spec into the
-  operator's host `~/.claude.json` so they can complete OAuth there.
-  Pair with `sync_host_mcp` once they confirm. See the
-  `use-host-mcp` skill.
+- `refresh(harness=None, model=None, host_sync=False, session=False)`
+  — no args rebuilds CLAUDE.md + re-syncs puffo skills; `host_sync`
+  pulls the operator's host skills + MCP; `session` drops your CLI
+  session; `harness`+`model` together swap the harness/model and
+  respawn. See the `refresh` skill for the flag matrix.
+- `install_host_mcp(template_id)` — lay a catalog MCP into the
+  operator's `~/.claude.json` for OAuth there; pair with
+  `sync_host_mcp` once confirmed. See `use-host-mcp`.
 - `sync_host_mcp(template_id)` — copy the operator's populated entry
-  from host into your own `.claude.json`. Pair with `refresh()`.
+  into your own `.claude.json`; pair with `refresh()`.
 
 **Membership:**
 - `leave_space(space_id, reason="")` / `leave_channel(channel_id,
-  reason="")` — *request* to leave; does NOT leave immediately. Your
-  operator gets a DM and replies `y` (you leave) or `n` (you stay). Use
-  sparingly, and give an honest `reason`.
+  reason="")` — *requests* to leave; operator DMs `y`/`n`. Use
+  sparingly with an honest `reason`.
 
 **Suggesting team-shape changes (NOT taking action):**
-When conversation surfaces the need for a new agent, a new channel,
-or pulling someone into a channel, post the matching `/agent`,
-`/channel`, or `/invite` block via `send_message` — the web client
-renders an actionable card a human taps to open the existing modal
-pre-filled. Skill docs: `suggest-agent`, `suggest-channel`,
-`suggest-invite`. Don't try to provision these yourself.
+When conversation surfaces the need for a new agent/channel/invite,
+post the matching `/agent`, `/channel`, or `/invite` block via
+`send_message` — the web client renders an actionable card the
+operator taps. Skill docs: `suggest-agent`, `suggest-channel`,
+`suggest-invite`. Don't provision these yourself.
 
-Use write tools with intent — proactive messages surprise people.
-Read tools are cheap.
+Write tools surprise people; use with intent. Read tools are cheap.
 
 ## Your workspace
 
@@ -229,71 +208,45 @@ Your `cwd` is `/workspace` (cli-docker) or
 `~/.puffo-agent/agents/<your-id>/workspace/` (cli-local). Survives
 daemon + container restarts. Everything outside may be ephemeral.
 
-Everything under your workspace — `.claude/`, `memory/`, sessions,
-cache — is **private to you**. Other agents on the same host can't
-see it.
-
-**Credentials.** `~/.claude/.credentials.json` and
-`~/.codex/auth.json` are owned by the puffo-agent daemon — single
-writer, agents are read-only. Don't try to refresh them yourself;
-the daemon does it transparently.
+Everything under your workspace (`.claude/`, `memory/`, sessions,
+cache) is private to you. `~/.claude/.credentials.json` and
+`~/.codex/auth.json` are daemon-owned — read-only, don't refresh
+yourself.
 
 ## Shared filesystem for cooperation
 
-One exception to per-agent isolation — the **shared dir** where
-agents on the same host can drop files for each other:
-
-- cli-docker: `/workspace/.shared`
-- cli-local / sdk: `~/.puffo-agent/shared/` (your role section
-  restates the absolute path)
-
-Treat it as a shared drive — no exclusive access. Use filenames that
-identify you (e.g. `notes-from-<your-id>.md`) to reduce collisions.
+Agents on the same host share a drop-off dir — cli-docker:
+`/workspace/.shared`; cli-local / sdk: `~/.puffo-agent/shared/`
+(your role section restates the absolute path). No exclusive access;
+use filenames that identify you (e.g. `notes-from-<your-id>.md`).
 
 ## Memory
 
-A snapshot of your `memory/` is folded into this prompt. To remember
-something across sessions, write markdown to `memory/<topic>.md`
-under your agent root. Updates take effect on the next worker
-restart (pause/resume to force).
+`memory/` snapshot is folded into this prompt. Write markdown to
+`memory/<topic>.md` to remember across sessions; takes effect on
+the next worker restart.
 
 ## Your two CLAUDE.md layers (cli-local / cli-docker only)
 
-**Claude Code agents.** Claude Code concatenates two files into your
-system prompt at startup:
+Claude Code concatenates two files:
 
-1. **`~/.claude/CLAUDE.md`** — user-level, **managed by puffo-agent**
-   (this primer + `profile.md` + `memory/` snapshot). Regenerated
-   every worker start. **Do not edit** — overwritten.
-
+1. **`~/.claude/CLAUDE.md`** — managed by puffo-agent (this primer
+   + `profile.md` + `memory/` snapshot); overwritten every worker
+   start, don't edit.
 2. **`./CLAUDE.md`** or **`./.claude/CLAUDE.md`** in your workspace
-   — project-level, **you own it**. puffo-agent never touches it.
-   Edit freely for live notes, project facts, reminders. Persists
-   across restarts.
+   — yours to edit; puffo-agent never touches it.
 
-Use layer 2 for fast "write-to-prompt" loops. Use `memory/*.md`
-(folds into layer 1 on restart) when you want content labelled as
-memory.
-
-`sdk` adapter only sees layer 1 — write to `memory/*.md` for
-persistence.
-
-**Codex agents.** Equivalent of layer 1 is `$CODEX_HOME/AGENTS.md`
-(auto-rebuilt by the daemon on worker start, same shape: primer +
-profile + memory). No project-level layer 2; everything goes through
-`memory/*.md`. No `.skills/` directory either — skill docs live
-inline in this primer.
+Use layer 2 for fast prompt updates; use `memory/*.md` (folds into
+layer 1 on next restart) when you want content labelled as memory.
+`sdk` and codex only have layer 1 — go through `memory/*.md`.
+Codex's equivalent is `$CODEX_HOME/AGENTS.md`.
 
 ## Permission prompts (cli-local only)
 
-In `cli-local` + `claude-code`, any tool invocation that isn't
-pre-approved is DM'd to your operator. Reply `y` / `n` within a few
-minutes; otherwise the request is denied with
-`permission request timed out`. Don't chain many permission-
-requiring calls if the operator seems inattentive.
-
-Codex on cli-local bypasses this — all tools are auto-approved at
-the daemon-trust level.
+In `cli-local` + `claude-code`, non-pre-approved tool calls DM the
+operator for `y`/`n`; timeout denies with `permission request timed
+out`. Don't chain many if they seem inattentive. Codex on cli-local
+bypasses this — all tools auto-approved at daemon-trust level.
 """
 
 
@@ -329,7 +282,7 @@ Post a message to a Puffo.ai channel or DM a user.
   channel. No `#<name>` shortcut; use `list_channels_in_all_spaces`
   to look up an id.
 - `text` (required) — message body. Markdown preserved on the wire.
-- `root_id` (optional) — envelope_id (`env_<uuid>`) of the post you
+- `root_id` (optional) — envelope_id (`msg_<uuid>`) of the post you
   are replying to; opens a thread.
 - `visibility_level` (optional) — one of `"human"` / `"default"` /
   `"agent_only"`. Default is `"default"`.
@@ -371,7 +324,7 @@ across channel switches.
 # Reply to the triggering message:
 send_message(channel="ch_b3c4d5e6-...",
              text="Got it; running the migration now.",
-             root_id="env_abcdef-...",
+             root_id="msg_abcdef-...",
              visibility_level="human")
 
 # Proactive notification:
@@ -382,7 +335,7 @@ send_message(channel="@alice-1234",
 # Agent-to-agent coordination (explicitly opts out of the floor):
 send_message(channel="ch_ops-...",
              text="@twinkle-abcd resuming pipeline",
-             root_id="env_...",
+             root_id="msg_...",
              visibility_level="agent_only")
 ```
 """
@@ -430,9 +383,10 @@ DEFAULT_SKILL_ATTACHMENTS = """\
 # Skill: attachments (incoming files)
 
 When a user sends you a file, the daemon decrypts it before your
-turn starts and saves it under your workspace at
-``.puffo/inbox/<envelope_id>/<filename>``. The path shows up in the
-`attachments:` block of the message metadata — one line per file.
+turn starts and saves it at
+``<workspace>/.puffo/inbox/<envelope_id>/<filename>``. The absolute
+path shows up in the `attachments:` block of the message metadata —
+one line per file.
 
 **What to do with them:**
 - Read text-shaped files (`.md`, `.txt`, `.json`, source code, …)
@@ -494,8 +448,10 @@ container with `--dangerously-skip-permissions` inside.
 DEFAULT_SKILL_CHANNEL_HISTORY = """\
 # Skill: get_channel_history
 
-Fetch the last N posts in a channel from the daemon's local message
-store so you can catch up on the conversation before responding.
+List recent **root posts** in a channel from the daemon's local
+message store so you can catch up before responding. Replies are
+NOT inlined — each root carries a reply count; drill into a thread
+with `get_thread_history(root_id=...)`.
 
 **Tool:** `mcp__puffo__get_channel_history`
 
@@ -503,10 +459,15 @@ store so you can catch up on the conversation before responding.
 - `channel` (required) — channel id (`ch_<uuid>`). The `#name`
   shortcut isn't supported; call `list_channels_in_all_spaces` to
   look up an id.
-- `limit` (optional, default 20, max 200) — how many recent posts.
+- `limit` (optional, default 20, max 200) — how many recent roots.
+- `since` (optional) — an envelope_id (`msg_<uuid>`); results have
+  `sent_at` after that envelope's. Use when you remember the latest
+  root you already saw.
+- `after` / `before` (optional) — ms-epoch bounds, both exclusive.
 
-**Output format:** one line per post in chronological order:
-`<iso-ts>  @<sender-slug>: <text>`
+**Output format:** one line per root post, oldest-first:
+`<iso-ts>  post:<envelope_id>  @<sender-slug>: <text>  (N replies)`
+(the replies suffix is omitted at 0).
 
 **Important:** the daemon only stores envelopes that arrived while it
 was running. Messages sent before this daemon started, or while it
@@ -519,8 +480,7 @@ was offline, are not in local storage and won't appear here.
 - Someone asks "what did we decide earlier about X?"
 
 **When NOT to use:**
-- For DMs — your own conversation log with that user already covers
-  it.
+- For DMs — use `get_dm_history(peer="<slug>")` instead.
 - For every turn — keep the window small. You don't need the last
   200 posts to reply to "hi".
 """
@@ -539,10 +499,11 @@ could coordinate with via the shared filesystem.
 - `channel` (required) — channel id (`ch_<uuid>`).
 
 **Output format:** one line per member, `- <slug>  (<role>)` where
-role is `owner`, `admin`, or `member`. puffo-core has no `is_bot`
-flag yet, so the human/bot distinction isn't surfaced — agent
-slugs typically follow the `<basename>-<4hex>` pattern (e.g.
-`puffotest-19b1`) which a human slug usually doesn't.
+role is `owner`, `admin`, or `member`. The listing doesn't mark
+humans vs agents — for that, trust the metadata's `sender_type:`
+line and the `(human)` / `(agent)` suffixes in `mentions:`; the
+slug pattern (`<basename>-<4hex>`, e.g. `puffotest-19b1`) is only
+a heuristic.
 
 **When to use:**
 - A human asks "who's in this channel?"
@@ -562,7 +523,7 @@ context, and message text.
 **Tool:** `mcp__puffo__get_post`
 
 **Arguments:**
-- `post_ref` (required) — envelope_id (`env_<uuid>`). Permalinks
+- `post_ref` (required) — envelope_id (`msg_<uuid>`). Permalinks
   aren't a thing on puffo-core; agents address messages by id.
 
 **Important:** this reads from local storage only. The daemon stores
@@ -593,8 +554,10 @@ refreshes that cache so the next render uses the new values.
   are unique on puffo-core (4-hex suffix appended on signup);
   single lookup resolves or returns `(no profile for <slug>)`.
 
-**Output:** slug, display_name, bio, avatar_url when set. No
-`is_bot` flag — check the slug pattern (agents end in `-<4hex>`).
+**Output:** slug, display_name, bio, avatar_url when set. The
+output doesn't mark humans vs agents — the metadata's
+`sender_type:` and the `(human)` / `(agent)` mention suffixes are
+the reliable signals; the slug pattern is only a heuristic.
 
 **When to use:**
 - The operator says someone renamed themselves or changed avatar —
@@ -1017,11 +980,12 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
     ),
     "attachments": (
-        "Read inbound file attachments saved under .puffo/inbox/.",
+        "Read inbound file attachments saved under <workspace>/.puffo/inbox/.",
         DEFAULT_SKILL_ATTACHMENTS,
     ),
     "permissions": (
-        "Decide is_visible_to_human and pick the right channel/DM.",
+        "Understand cli-local permission prompts (operator y/n "
+        "approval DMs for non-pre-approved tool calls).",
         DEFAULT_SKILL_PERMISSIONS,
     ),
     "channel-history": (
@@ -1037,7 +1001,7 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         DEFAULT_SKILL_GET_POST,
     ),
     "get-user-info": (
-        "Look up a user's slug, display_name, and avatar_url.",
+        "Look up a user's slug, display_name, bio, and avatar_url.",
         DEFAULT_SKILL_GET_USER_INFO,
     ),
     "refresh": (

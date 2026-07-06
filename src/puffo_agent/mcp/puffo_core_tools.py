@@ -61,6 +61,17 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
     """
     space_id = await cfg.data_client.lookup_channel_space(channel_id)
     if not space_id:
+        # Non-``ch_`` miss is almost always a bare user slug — hint at
+        # the DM path instead of the membership-flavoured error below.
+        if not channel_id.startswith("ch_"):
+            raise RuntimeError(
+                f"'{channel_id}' is not a channel id (channel ids "
+                f"start with 'ch_'). If it's a user slug, prepend "
+                f"'@' to DM them: send_message(channel='@{channel_id}', "
+                f"...); to read a DM conversation use "
+                f"get_dm_history(peer='{channel_id}'). To find a "
+                f"channel id, call list_channels_in_all_spaces."
+            )
         raise RuntimeError(
             f"agent has no record of channel {channel_id} — it may not "
             f"be a channel the agent belongs to, or the id may be "
@@ -550,6 +561,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "'#<name>' channel addressing isn't supported; pass the "
                 "channel id directly."
             )
+        # Local-store read would return empty on a slug — route non-
+        # ``ch_`` refs through the resolver purely for its hint error.
+        if not channel_ref.startswith("ch_"):
+            await _resolve_channel_space(cfg, channel_ref)
         channel_id = channel_ref
 
         try:

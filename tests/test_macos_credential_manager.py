@@ -49,8 +49,8 @@ _REFRESHED_BLOB = json.dumps({
 def _view(blob: str) -> str:
     """The per-agent *view* of a canonical blob: refresh token
     stripped. sync_to_agent writes this, never the raw blob."""
-    from puffo_agent.portal.state import sanitize_claude_credentials_blob
-    return sanitize_claude_credentials_blob(blob)
+    from puffo_agent.portal.state import sanitize_claude_code_auth_blob
+    return sanitize_claude_code_auth_blob(blob)
 
 
 def _force_macos(monkeypatch):
@@ -630,7 +630,7 @@ def test_refresher_with_keychain_backend_fans_sync_to_registered_agents(
 ):
     """After a _tick on macOS, the refresher's fan-out calls
     KeychainBackend.sync_to_agent for every registered agent — same
-    contract as the FileBackend's sync_host_credentials_view path, just
+    contract as the FileBackend's sync_host_claude_code_auth_view path, just
     plumbed through the backend abstraction."""
     monkeypatch.setattr(cm, "is_macos", lambda: True)
     backend = _make_keychain_backend(tmp_path)

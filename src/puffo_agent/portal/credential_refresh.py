@@ -1,50 +1,22 @@
-"""Daemon-owned Claude OAuth credential refresh.
+"""Daemon-owned Claude / Codex OAuth credential refresh.
 
-Replaces the per-agent ``refresh_ping`` from
-``agent/adapters/base.py``. Every refresh of the on-disk Claude
-credentials file goes through ONE process — the puffo-agent daemon —
-so Anthropic's single-use refresh-token rotation can't be raced by N
-agent workers all reading the same disk RT and burning each other's
-in-memory copies.
+All refresh writes go through ONE process (the daemon), so
+Anthropic + OpenAI's single-use rotating refresh tokens can't be
+raced by N agent workers burning each other's in-memory copies.
 
-Backend abstraction
--------------------
+``CredentialRefresher`` owns an ``asyncio.Lock`` (single-writer),
+the agent-home registry, the ``notify_refresh_needed`` wake event,
+the poll loop, and per-tick fan-out to registered agents. Platform
+specifics live in ``CredentialBackend`` implementations:
 
-The platform-agnostic ``CredentialRefresher`` owns the cross-cutting
-concerns: an ``asyncio.Lock`` (single-writer), an agent home registry,
-the ``_refresh_request`` event (notify_refresh_needed wake), the poll
-loop, and the per-tick fan-out to every registered agent. It delegates
-all platform specifics to a pluggable ``CredentialBackend``:
-
-  - ``FileBackend`` (Linux / Windows): host file
-    ``~/.claude/.credentials.json`` is the canonical store; refresh
-    spawns ``claude --print`` with ``HOME=host_home`` so the atomic
-    tmp+rename lands at the host file; per-agent sync writes a
-    refresh-token-free view copy via ``sync_host_credentials_view``
-    (only the daemon holds the rotating refresh token). External
-    rotation (operator running ``claude /login``) is spotted by the
-    per-tick host-file fingerprint check and fanned out to the views.
-  - ``KeychainBackend`` (macOS): Keychain is the canonical store
-    (Claude Code 2.x). The daemon maintains a cache at
-    ``~/.puffo-agent/run/claude-credentials.json``; refresh runs a
-    sandboxed ``claude --print`` so claude rotates the token against
-    Anthropic and writes it back; writeback to Keychain is best-effort
-    so the operator's main CLI / VS Code extension see the new token;
-    per-agent sync is a copy (Keychain ACL is keyed on UID + signing
-    identity, not HOME, so the per-agent HOME trick is moot). An extra
-    5-minute Keychain poll picks up rotations done by OTHER processes
-    (operator's main CLI, an agent's own claude self-refreshing on a
-    401) and fans them to running agents.
-
-Public API (unchanged from the file-backend-only version):
-
-  - ``register_agent`` / ``unregister_agent`` — agent-home set
-  - ``notify_refresh_needed`` — in-process 401 trigger
-  - ``run_loop`` — the daemon's long-lived coroutine
-  - ``expires_in_seconds`` — diagnostics surface
-
-The refactor is invisible to the daemon's ``daemon.py`` wiring
-beyond the choice of backend at construction time.
+- ``FileBackend`` (Linux / Windows): host file is the canonical store;
+  agents get sanitized views (no RT) via ``sync_host_claude_code_auth_view``.
+- ``KeychainBackend`` (macOS): system Keychain is canonical (Claude
+  Code 2.x); daemon caches at ``~/.puffo-agent/run/claude-credentials.json``.
+  Per-agent sync is a copy (Keychain ACL is keyed on UID + signing
+  identity, not HOME). An extra 5-min Keychain poll picks up
+  rotations done by other processes (operator's main CLI, an agent's
+  own claude self-refreshing on 401) and fans them out.
 """
 
 from __future__ import annotations
@@ -64,9 +36,9 @@ from typing import Callable, Optional, Protocol
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
 from .state import (
-    sanitize_claude_credentials_blob,
+    sanitize_claude_code_auth_blob,
     sync_host_codex_auth_view,
-    sync_host_credentials_view,
+    sync_host_claude_code_auth_view,
 )
 
 
@@ -161,18 +133,12 @@ def _maybe_disable_probe_model(out_tail: str, err_tail: str) -> None:
 def _classify_failed_refresh(
     out_tail: str, err_tail: str, *, rc: int, elapsed: float, log_prefix: str,
 ) -> RefreshOutcome:
-    # Shared rc!=0 classification used by FileBackend + KeychainBackend.
-    # Model-not-found check first: it's a permanent (per-daemon-life)
-    # state change, so it should latch even when the response also
-    # happens to look rate-limit-shaped.
+    # Model-not-found latches per-daemon-life, so it wins even when
+    # the response also looks rate-limit-shaped.
     _maybe_disable_probe_model(out_tail, err_tail)
-    # Auth-failed BEFORE rate-limit: Anthropic sometimes hands back a
-    # 401 with rate-limit-adjacent phrasing on rotated-and-revoked
-    # refresh_tokens (the "rotating-refresh-token silent-fail" mode —
-    # both disk and Keychain retain the pre-rotation token). The
-    # refresher can't recover from that; only the operator's re-login
-    # can. Flag as AUTH_FAILED so the worker's DM path fires now
-    # instead of on the 2-tick refresh_broken streak.
+    # Auth-failed before rate-limit: Anthropic sometimes wraps a 401
+    # on a revoked RT in rate-limit-adjacent wording; only operator
+    # re-login recovers, so DM now rather than after the 2-tick streak.
     if looks_like_auth_error(out_tail) or looks_like_auth_error(err_tail):
         logger.error(
             "%s auth failed rc=%d in %.1fs — refresh_token likely "
@@ -194,11 +160,9 @@ def _classify_failed_refresh(
     )
     return RefreshOutcome.FAILED
 
-# Codex's OAuth access_token is a JWT — the only authoritative expiry
-# is the ``exp`` claim inside the token. Codex's own ``last_refresh``
-# field uses an ~8-day staleness heuristic that's too coarse for our
-# refresh-before-expiry strategy (claude rotates hourly; codex's
-# access_token similarly expires in tens of minutes).
+# Codex's access_token is a JWT — the ``exp`` claim is the only
+# authoritative expiry; the file's ``last_refresh`` field's ~8-day
+# staleness heuristic is too coarse for refresh-before-expiry.
 def _jwt_exp_unix(token: str) -> int | None:
     """Decode a JWT's ``exp`` claim without signature verification.
 
@@ -303,18 +267,11 @@ class CredentialBackend(Protocol):
 
 @dataclass
 class FileBackend:
-    """Host-file-canonical backend used on Linux and Windows. The host
-    ``~/.claude/.credentials.json`` is the single source of truth;
-    every agent's ``<agent_home>/.claude/.credentials.json`` is a
-    sanitized view copy (host blob minus the rotating refresh token)
-    written by ``sync_host_credentials_view``. Only the daemon can
-    rotate, so concurrent agent processes can't race the (single-use)
-    refresh token into a family revocation.
-
-    External rotation (operator running ``claude /login``) is spotted
-    by the refresher's per-tick ``fingerprint`` check on the host file
-    and fanned out to the views within one 2-minute poll.
-    """
+    """Linux / Windows backend. Host ``~/.claude/.credentials.json``
+    is the single source of truth; agents get sanitized views (no RT)
+    via ``sync_host_claude_code_auth_view``. External rotation
+    (operator ``claude /login``) is picked up by the refresher's
+    per-tick host-file fingerprint check and fanned out to views."""
     host_home: Path
 
     @property
@@ -390,7 +347,7 @@ class FileBackend:
         return RefreshOutcome.REFRESHED
 
     def sync_to_agent(self, agent_home: Path) -> None:
-        sync_host_credentials_view(self.host_home, agent_home)
+        sync_host_claude_code_auth_view(self.host_home, agent_home)
 
     def fingerprint(self) -> tuple[int, int] | None:
         """(mtime_ns, size) of the host credential. Lets the refresher
@@ -765,7 +722,7 @@ class KeychainBackend:
                 "target=%s",
                 agent_home,
             )
-        view_blob = sanitize_claude_credentials_blob(blob)
+        view_blob = sanitize_claude_code_auth_blob(blob)
         if view_blob is None:
             logger.warning(
                 "keychain backend: canonical blob unparseable; not "

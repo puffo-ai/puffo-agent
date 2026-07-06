@@ -1,4 +1,4 @@
-"""Tests for ``sync_host_credentials_view`` — the per-agent credential
+"""Tests for ``sync_host_claude_code_auth_view`` — the per-agent credential
 *view* plumbing for cli-local agents.
 
 Model under test (replaces the pre-1.0.7a2 symlink sharing):
@@ -27,8 +27,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.portal.state import (
-    sanitize_claude_credentials_blob,
-    sync_host_credentials_view,
+    sanitize_claude_code_auth_blob,
+    sync_host_claude_code_auth_view,
 )
 
 
@@ -72,7 +72,7 @@ def _agent_view(agent: Path) -> Path:
 
 
 def test_sanitize_strips_refresh_token_only():
-    view = json.loads(sanitize_claude_credentials_blob(json.dumps(HOST_CREDS)))
+    view = json.loads(sanitize_claude_code_auth_blob(json.dumps(HOST_CREDS)))
     oauth = view["claudeAiOauth"]
     assert "refreshToken" not in oauth
     assert oauth["accessToken"] == "at-123"
@@ -81,12 +81,12 @@ def test_sanitize_strips_refresh_token_only():
 
 
 def test_sanitize_rejects_non_json():
-    assert sanitize_claude_credentials_blob("not json {") is None
+    assert sanitize_claude_code_auth_blob("not json {") is None
 
 
 def test_sanitize_tolerates_missing_oauth_section():
     blob = json.dumps({"somethingElse": True})
-    assert json.loads(sanitize_claude_credentials_blob(blob)) == {
+    assert json.loads(sanitize_claude_code_auth_blob(blob)) == {
         "somethingElse": True
     }
 
@@ -99,7 +99,7 @@ def test_view_written_without_refresh_token(tmp_path):
     agent = tmp_path / "agent"
     _write_host(host)
 
-    mode = sync_host_credentials_view(host, agent)
+    mode = sync_host_claude_code_auth_view(host, agent)
 
     assert mode == "view"
     view = _agent_view(agent)
@@ -116,7 +116,7 @@ def test_view_file_is_owner_only(tmp_path):
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_host(host)
-    sync_host_credentials_view(host, agent)
+    sync_host_claude_code_auth_view(host, agent)
     mode = _agent_view(agent).stat().st_mode & 0o777
     assert mode == 0o600
 
@@ -126,9 +126,9 @@ def test_view_idempotent(tmp_path):
     agent = tmp_path / "agent"
     _write_host(host)
 
-    assert sync_host_credentials_view(host, agent) == "view"
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
     before = _agent_view(agent).stat().st_mtime_ns
-    assert sync_host_credentials_view(host, agent) == "view (fresh)"
+    assert sync_host_claude_code_auth_view(host, agent) == "view (fresh)"
     # No rewrite -> no mtime churn.
     assert _agent_view(agent).stat().st_mtime_ns == before
 
@@ -137,14 +137,14 @@ def test_view_tracks_host_rotation(tmp_path):
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_host(host)
-    sync_host_credentials_view(host, agent)
+    sync_host_claude_code_auth_view(host, agent)
 
     rotated = json.loads(json.dumps(HOST_CREDS))
     rotated["claudeAiOauth"]["accessToken"] = "at-789"
     rotated["claudeAiOauth"]["refreshToken"] = "rt-new-000"
     _write_host(host, rotated)
 
-    assert sync_host_credentials_view(host, agent) == "view"
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
     data = json.loads(_agent_view(agent).read_text(encoding="utf-8"))
     assert data["claudeAiOauth"]["accessToken"] == "at-789"
     assert "refreshToken" not in data["claudeAiOauth"]
@@ -159,11 +159,11 @@ def test_view_heals_agent_side_garbage(tmp_path):
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_host(host)
-    sync_host_credentials_view(host, agent)
+    sync_host_claude_code_auth_view(host, agent)
 
     _agent_view(agent).write_text("{}", encoding="utf-8")
 
-    assert sync_host_credentials_view(host, agent) == "view"
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
     data = json.loads(_agent_view(agent).read_text(encoding="utf-8"))
     assert data["claudeAiOauth"]["accessToken"] == "at-123"
 
@@ -183,7 +183,7 @@ def test_migrates_legacy_symlink_without_touching_host(tmp_path):
     view.parent.mkdir(parents=True, exist_ok=True)
     os.symlink(host_creds, view)
 
-    mode = sync_host_credentials_view(host, agent)
+    mode = sync_host_claude_code_auth_view(host, agent)
 
     assert mode == "view (migrated-from-symlink)"
     assert not view.is_symlink()
@@ -205,7 +205,7 @@ def test_migrates_broken_symlink(tmp_path):
     view.parent.mkdir(parents=True, exist_ok=True)
     os.symlink(tmp_path / "ghost", view)
 
-    assert sync_host_credentials_view(host, agent) == (
+    assert sync_host_claude_code_auth_view(host, agent) == (
         "view (migrated-from-symlink)"
     )
     assert not view.is_symlink()
@@ -220,7 +220,7 @@ def test_migrates_broken_symlink(tmp_path):
 def test_no_host_file(tmp_path):
     host = tmp_path / "host"
     agent = tmp_path / "agent"
-    assert sync_host_credentials_view(host, agent) == "no-host-file"
+    assert sync_host_claude_code_auth_view(host, agent) == "no-host-file"
     assert not _agent_view(agent).exists()
 
 
@@ -238,7 +238,7 @@ def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "chmod", _fail_chmod)
 
-    assert sync_host_credentials_view(host, agent) == "view"
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
     view = _agent_view(agent)
     assert "refreshToken" not in json.loads(
         view.read_text(encoding="utf-8")
@@ -265,7 +265,7 @@ def test_agent_read_error_falls_through_to_rewrite(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "read_text", _fail_agent_read)
 
     # Read-compare raised → falls through to write; final content is the view.
-    assert sync_host_credentials_view(host, agent) == "view"
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
     monkeypatch.setattr(Path, "read_text", real_read)
     assert "refreshToken" not in json.loads(
         view.read_text(encoding="utf-8")
@@ -290,7 +290,7 @@ def test_concurrent_syncs_produce_valid_view(tmp_path):
         try:
             barrier.wait()
             for _ in range(20):
-                sync_host_credentials_view(host, agent)
+                sync_host_claude_code_auth_view(host, agent)
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -319,7 +319,7 @@ def test_write_failure_returns_write_failed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "puffo_agent.portal.state._write_credential_view", _boom,
     )
-    assert sync_host_credentials_view(host, agent) == "write-failed"
+    assert sync_host_claude_code_auth_view(host, agent) == "write-failed"
     assert not _agent_view(agent).exists()
 
 
@@ -327,13 +327,13 @@ def test_unparseable_host_file_leaves_agent_view_alone(tmp_path):
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_host(host)
-    sync_host_credentials_view(host, agent)
+    sync_host_claude_code_auth_view(host, agent)
     good_view = _agent_view(agent).read_text(encoding="utf-8")
 
     (host / ".claude" / ".credentials.json").write_text(
         "corrupted {", encoding="utf-8",
     )
 
-    assert sync_host_credentials_view(host, agent) == "unparseable-host-file"
+    assert sync_host_claude_code_auth_view(host, agent) == "unparseable-host-file"
     # Existing (still-valid) view untouched.
     assert _agent_view(agent).read_text(encoding="utf-8") == good_view

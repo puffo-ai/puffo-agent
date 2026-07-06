@@ -120,7 +120,7 @@ def test_tick_no_refresh_when_fresh_and_no_agent_trigger(tmp_path, monkeypatch):
     def fake_link(host_home, agent_home):
         sync_calls.append((host_home, agent_home))
 
-    monkeypatch.setattr(credential_refresh, "sync_host_credentials_view", fake_link)
+    monkeypatch.setattr(credential_refresh, "sync_host_claude_code_auth_view", fake_link)
 
     asyncio.run(r._tick())
     assert spawned == []
@@ -203,7 +203,7 @@ def test_tick_fans_view_sync_to_registered_agents(tmp_path, monkeypatch):
         synced.append(Path(agent_home))
         return "view"
 
-    monkeypatch.setattr(credential_refresh, "sync_host_credentials_view", fake_link)
+    monkeypatch.setattr(credential_refresh, "sync_host_claude_code_auth_view", fake_link)
     asyncio.run(r._tick())
     assert set(synced) == {a, b}
 
