@@ -115,3 +115,38 @@ def test_finalize_from_command_writes_profile(tmp_path, monkeypatch):
 def test_finalize_from_command_unknown_request():
     with pytest.raises(ValueError, match="no pending create"):
         asyncio.run(agent_create.finalize_from_command("acr_missing", {}))
+
+
+def test_cmd_agent_create_seeds_profile_briefing(tmp_path, monkeypatch):
+    """`puffo-agent agent create` seeds briefing/profile.md with the
+    managed identity block, so a freshly created agent's first prompt
+    rebuild already has managed identity framing."""
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    from puffo_agent.agent.memory import (
+        PROFILE_MANAGED_BEGIN,
+        PROFILE_MANAGED_END,
+    )
+    from puffo_agent.portal.cli import build_parser
+
+    # cli-local resolves the API key without prompting, so the create
+    # flow runs headless.
+    args = build_parser().parse_args([
+        "agent", "create",
+        "--id", "helper-0001",
+        "--display-name", "Helper",
+        "--role", "coder: writes code",
+        "--runtime", "cli-local",
+    ])
+    assert args.func(args) == 0
+
+    profile_briefing = (
+        tmp_path / "agents" / "helper-0001" / "memory" / "briefing"
+        / "profile.md"
+    )
+    assert profile_briefing.is_file()
+    text = profile_briefing.read_text(encoding="utf-8")
+    assert PROFILE_MANAGED_BEGIN in text
+    assert PROFILE_MANAGED_END in text
+    # Identity fields from the create args land inside the managed block.
+    assert "Helper" in text
+    assert "coder: writes code" in text

@@ -36,13 +36,12 @@ from .memory import (
     PROFILE_BRIEFING_NAME,
     RECOLLECTION_DIR,
     TOTAL_LIMIT,
-    BriefingCompileError,
-    MemoryStoreError,
     _byte_size,
     _compose_briefing,
     _read_briefing_entries,
     request_prompt_refresh,
 )
+from .memory_errors import BriefingCompileError, MemoryStoreError
 
 # Per-file byte limits (top of the design ranges, like M1's briefing
 # budget). ``imports/`` is never written through the store; its entry
@@ -112,7 +111,10 @@ class MemoryStore:
 
     def read_memory_file(self, path: str) -> dict:
         """Bounded read: ``body`` is capped at the area's file limit
-        (``truncated`` flags a cut); ``size`` is the real file size."""
+        (``truncated`` flags a cut); ``size`` is the real file size.
+        ``lossy`` is True when the file wasn't valid UTF-8 and
+        replacement characters were substituted (the read never
+        raises on stored bytes)."""
         scope, logical = self._validate_logical_path(path)
         physical = self._physical_path(logical)
         if not physical.is_file():
@@ -132,13 +134,23 @@ class MemoryStore:
             # A byte cap can split a multi-byte sequence; drop the
             # trailing partial character rather than emitting garbage.
             body = data[:limit].decode("utf-8", errors="ignore")
+            lossy = False
         else:
-            body = data.decode("utf-8")
+            # Never raise on stored bytes: a non-UTF-8 file is surfaced
+            # with U+FFFD replacements and flagged ``lossy`` instead of
+            # crashing the read with UnicodeDecodeError.
+            try:
+                body = data.decode("utf-8")
+                lossy = False
+            except UnicodeDecodeError:
+                body = data.decode("utf-8", errors="replace")
+                lossy = True
         return {
             "path": str(logical),
             "scope": scope,
             "size": size,
             "truncated": truncated,
+            "lossy": lossy,
             "body": body,
         }
 
@@ -188,7 +200,19 @@ class MemoryStore:
         text = original
         for patch in patches:
             old_text = patch["old_text"]
-            matches = text.count(old_text) if old_text else 2
+            if not old_text:
+                # An empty old_text has no unambiguous match point;
+                # tell direct store callers the truth rather than
+                # faking a "multiple matches" count.
+                raise MemoryStoreError(
+                    "memory_invalid_arguments",
+                    path=str(logical),
+                    suggestion=(
+                        "old_text must be non-empty text that appears "
+                        "exactly once in the file."
+                    ),
+                )
+            matches = text.count(old_text)
             if matches == 0:
                 raise MemoryStoreError(
                     "memory_patch_no_match",
@@ -284,14 +308,15 @@ class MemoryStore:
             ),
         }
 
-    # ── package-internal ─────────────────────────────────────────────
+    # ── daemon-owned writer (not one of the public seven) ────────────
 
-    def _put_memory_file(self, path: str, body: str) -> dict:
+    def put_memory_file(self, path: str, body: str) -> dict:
         """Overwrite-allowed create, for the daemon-owned M1 writers
-        (``MemoryManager.save`` / ``sync_profile_briefing``) — same
-        validation, sizing, atomicity, and briefing dirty hook. Not
-        part of the public seven: agent-facing callers must use
-        create/patch/append so overwrites stay deliberate."""
+        (``MemoryManager.save`` / ``sync_profile_briefing`` /
+        ``migrate_flat_memory``) — same validation, sizing, atomicity,
+        and briefing dirty hook. Not part of the public seven:
+        agent-facing callers must use create/patch/append so overwrites
+        stay deliberate."""
         scope, logical = self._validate_write_path(path)
         physical = self._physical_path(logical)
         size = self._validate_size(scope, logical, body)

@@ -24,7 +24,14 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .memory_errors import BriefingCompileError, MemoryStoreError
+
 logger = logging.getLogger(__name__)
+
+# Re-exported so ``from .memory import MemoryStoreError`` /
+# ``BriefingCompileError`` keeps working now that the classes live in
+# the leaf ``memory_errors`` module.
+__all__ = ["BriefingCompileError", "MemoryStoreError"]
 
 BRIEFING_DIR = "briefing"
 NOTES_DIR = "notes"
@@ -53,65 +60,6 @@ _MANAGED_BLOCK_RE = re.compile(
     re.escape(PROFILE_MANAGED_BEGIN) + r".*?" + re.escape(PROFILE_MANAGED_END),
     re.DOTALL,
 )
-
-
-class MemoryStoreError(Exception):
-    """Structured memory-store error: the M1 ``{path, size, limit,
-    suggestion}`` shape extended with ``code`` (M3-aligned names such
-    as ``memory_invalid_path`` / ``memory_scope_readonly``).
-    ``size``/``limit`` only apply to size violations; errors without
-    them omit the keys from ``to_dict()``."""
-
-    def __init__(
-        self,
-        code: str,
-        *,
-        path: str,
-        suggestion: str,
-        size: int | None = None,
-        limit: int | None = None,
-    ):
-        self.code = code
-        self.path = path
-        self.size = size
-        self.limit = limit
-        self.suggestion = suggestion
-        if size is not None and limit is not None:
-            message = (
-                f"{code}: {path} is {size} bytes (limit {limit}). {suggestion}"
-            )
-        else:
-            message = f"{code}: {path}. {suggestion}"
-        super().__init__(message)
-
-    def to_dict(self) -> dict:
-        out: dict = {"code": self.code, "path": self.path}
-        if self.size is not None:
-            out["size"] = self.size
-        if self.limit is not None:
-            out["limit"] = self.limit
-        out["suggestion"] = self.suggestion
-        return out
-
-
-class BriefingCompileError(MemoryStoreError):
-    """A briefing violates the compile budget. Fail closed — callers
-    get no truncated/partial output. ``code`` is one of
-    ``memory_file_too_large`` / ``memory_briefing_too_large``
-    (M3-aligned names)."""
-
-    def __init__(
-        self,
-        code: str,
-        *,
-        path: str,
-        size: int,
-        limit: int,
-        suggestion: str,
-    ):
-        super().__init__(
-            code, path=path, size=size, limit=limit, suggestion=suggestion,
-        )
 
 
 def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> bool:
@@ -159,9 +107,26 @@ def _byte_size(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+def _resolves_within_root(path: Path, memory_root: Path) -> bool:
+    """True iff ``path`` resolves to a location inside ``memory_root``.
+
+    The host-side compile / migration paths read the filesystem
+    directly (not through the M2 store), so a symlink under the memory
+    tree could otherwise pull in content from outside it. Resolving
+    both sides collapses symlinks in either the leaf or an ancestor
+    dir; a resolution failure is treated as "not contained"."""
+    try:
+        return path.resolve().is_relative_to(memory_root.resolve())
+    except OSError:
+        return False
+
+
 def _is_briefing_topic(path: Path) -> bool:
     return (
         path.is_file()
+        # ``is_file()`` follows symlinks; a symlinked briefing/<t>.md
+        # would inject its target's bytes, so exclude symlinks outright.
+        and not path.is_symlink()
         and path.suffix == ".md"
         and not path.name.startswith(".")
     )
@@ -174,7 +139,8 @@ def _read_briefing_entries(
     profile first, remaining topics by sorted filename. Empty bodies
     are dropped. Raises ``BriefingCompileError`` on a per-file limit
     violation unless ``enforce_per_file`` is off."""
-    briefing = Path(memory_root) / BRIEFING_DIR
+    memory_root = Path(memory_root)
+    briefing = memory_root / BRIEFING_DIR
     profile_body = ""
     entries: list[tuple[str, str]] = []
     if not briefing.is_dir():
@@ -185,6 +151,15 @@ def _read_briefing_entries(
         paths.remove(profile_path)
         paths.insert(0, profile_path)
     for path in paths:
+        # ``_is_briefing_topic`` already dropped leaf symlinks; this
+        # catches a topic that resolves outside the root through a
+        # symlinked ancestor dir (e.g. a symlinked briefing/).
+        if not _resolves_within_root(path, memory_root):
+            logger.warning(
+                "memory briefing: skipping %s — resolves outside the "
+                "memory root", path,
+            )
+            continue
         body = path.read_text(encoding="utf-8")
         if enforce_per_file and _byte_size(body) > PER_FILE_LIMIT:
             raise BriefingCompileError(
@@ -260,16 +235,30 @@ def migrate_flat_memory(memory_root: Path) -> list[str]:
     if not memory_root.is_dir():
         return []
     ensure_memory_tree(memory_root)
-    flat = [
-        p for p in sorted(memory_root.glob("*.md"))
-        if p.is_file() and p.name != "README.md" and not p.name.startswith(".")
-    ]
+    flat = []
+    for p in sorted(memory_root.glob("*.md")):
+        if not p.is_file() or p.name == "README.md" or p.name.startswith("."):
+            continue
+        # A symlinked flat file (or one resolving outside the root)
+        # must never be read or moved into the tree — that would fold
+        # arbitrary host content into the agent's memory.
+        if p.is_symlink() or not _resolves_within_root(p, memory_root):
+            logger.warning(
+                "memory migrate: skipping %s — symlink or resolves "
+                "outside the memory root", p,
+            )
+            continue
+        flat.append(p)
     if not flat:
         return []
 
     briefing_dir = memory_root / BRIEFING_DIR
     notes_dir = memory_root / NOTES_DIR
     pointer_path = briefing_dir / f"{MIGRATED_NOTES_TOPIC}.md"
+
+    from .memory_store import MemoryStore
+
+    store = MemoryStore(memory_root)
 
     # Live simulation state: recomposing from these on every candidate
     # keeps the fit check exact (section headers + join separators
@@ -310,6 +299,7 @@ def migrate_flat_memory(memory_root: Path) -> list[str]:
                 dest = notes_dir / f"{path.stem}-migrated-{n}.md"
                 n += 1
         path.rename(dest)
+        moved.append(f"{NOTES_DIR}/{dest.name}")
         pointer_line = (
             f"- {NOTES_DIR}/{dest.name} — migrated from flat memory\n"
         )
@@ -318,9 +308,25 @@ def migrate_flat_memory(memory_root: Path) -> list[str]:
             existing = pointer_path.read_text(encoding="utf-8")
         elif not entry_map.get(MIGRATED_NOTES_TOPIC):
             existing = "# Migrated notes\n\n"
-        pointer_path.write_text(existing + pointer_line, encoding="utf-8")
-        entry_map[MIGRATED_NOTES_TOPIC] = (existing + pointer_line).strip()
-        moved.append(f"{NOTES_DIR}/{dest.name}")
+        new_body = existing + pointer_line
+        try:
+            # Route the pointer through the store: same atomic write and
+            # per-file/total budget validation as any briefing topic, so
+            # a migration can never leave a briefing that fails the next
+            # compile.
+            store.put_memory_file(
+                f"{BRIEFING_DIR}/{MIGRATED_NOTES_TOPIC}.md", new_body,
+            )
+        except BriefingCompileError as exc:
+            # The note itself already migrated to notes/; only its
+            # pointer line is dropped so the briefing stays compilable.
+            logger.warning(
+                "memory migrate: pointer to %s skipped (%s) — the note "
+                "migrated but the briefing budget is full",
+                dest.name, exc.code,
+            )
+            continue
+        entry_map[MIGRATED_NOTES_TOPIC] = new_body.strip()
     return moved
 
 
@@ -391,7 +397,7 @@ def sync_profile_briefing(
         new_text = block
     from .memory_store import MemoryStore
 
-    MemoryStore(memory_root)._put_memory_file(
+    MemoryStore(memory_root).put_memory_file(
         f"{BRIEFING_DIR}/{PROFILE_BRIEFING_NAME}", new_text,
     )
     return path
@@ -424,7 +430,7 @@ class MemoryManager:
         # oversized save never leaves partial state behind. The
         # refresh flag stays owned by save() — the store gets no
         # workspace_dir — so its reason keeps the M1 shape.
-        MemoryStore(self.memory_dir)._put_memory_file(
+        MemoryStore(self.memory_dir).put_memory_file(
             f"{BRIEFING_DIR}/{safe_topic}.md", body,
         )
         self._request_refresh(topic)

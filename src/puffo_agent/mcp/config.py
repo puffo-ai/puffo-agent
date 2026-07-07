@@ -49,6 +49,20 @@ PUFFO_CORE_TOOL_NAMES = (
     "leave_space",
     "leave_channel",
     "refresh",
+    # M3 memory tools (registered by mcp.memory_tools). Kept in the
+    # core allowlist so the sdk adapter's gate auto-allows them like
+    # every other mcp__puffo__ tool — otherwise they register but are
+    # denied at call time on sdk-local.
+    "create_note",
+    "patch_note",
+    "append_note",
+    "create_briefing_topic",
+    "patch_briefing_topic",
+    "append_recollection",
+    "read_memory_file",
+    "read_memory_files",
+    "search_memory",
+    "search_imports",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(
     f"mcp__{MCP_SERVER_NAME}__{t}" for t in PUFFO_CORE_TOOL_NAMES

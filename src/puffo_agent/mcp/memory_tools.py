@@ -1,10 +1,13 @@
 """Semantic memory MCP tools (M3) over the M2 ``MemoryStore``.
 
-Ten agent-facing tools: six semantic writes (``create_note``,
-``patch_note``, ``append_note``, ``create_briefing_topic``,
-``patch_briefing_topic``, ``append_recollection``) and four
-read/search tools (``read_memory_file``, ``read_memory_files``,
-``search_memory``, ``search_imports``). The agent works with memory
+Ten tools: six semantic writes (``create_note``, ``patch_note``,
+``append_note``, ``create_briefing_topic``, ``patch_briefing_topic``,
+``append_recollection``) and four read/search tools
+(``read_memory_file``, ``read_memory_files``, ``search_memory``,
+``search_imports``). Nine are agent-facing; ``append_recollection``
+registers only under the maintenance scope (recollection/ is
+daemon-owned), so the agent-facing server exposes the other nine. The
+agent works with memory
 concepts — notes, briefing topics, recollections — never physical
 paths; semantic names are normalized onto logical paths
 (``notes/<name>.md``, ``briefing/<name>.md``, dated
@@ -61,10 +64,10 @@ from ..agent.memory import (
     IMPORTS_DIR,
     NOTES_DIR,
     RECOLLECTION_DIR,
-    MemoryStoreError,
     ensure_memory_tree,
     request_prompt_refresh,
 )
+from ..agent.memory_errors import MemoryStoreError
 from ..agent.memory_store import IMPORTS_READ_LIMIT, MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -247,6 +250,15 @@ def _validate_patches(operation: str, patches: object) -> list[dict]:
                 f"{operation}: each patch needs string old_text and new_text.",
                 "Pass patches as [{old_text, new_text}, ...].",
             )
+        if patch["old_text"] == "":
+            # An empty old_text has no single, unambiguous match point;
+            # reject it here rather than letting it reach the store.
+            raise _args_error(
+                operation,
+                f"{operation}: old_text must be a non-empty string.",
+                "old_text must be text that appears exactly once in the "
+                "file; it cannot be empty.",
+            )
         out.append(
             {"old_text": patch["old_text"], "new_text": patch["new_text"]}
         )
@@ -285,13 +297,17 @@ def _run_write(cfg: MemoryToolsConfig, tool: str, op, reason: str) -> dict:
     warnings: list[dict] = []
 
     commit_id = None
+    root = Path(cfg.memory_root)
     if changed:
-        if memory_git.git_available():
+        # Only attempt an audit commit when git is available AND our own
+        # ``.git`` audit repo exists — never stage into an enclosing
+        # repo the memory root happens to sit inside.
+        if memory_git.git_available() and (root / ".git").is_dir():
             message = memory_git.format_commit_message(
                 tool, [logical], reason,
             )
             commit_id = memory_git.commit_memory_change(
-                Path(cfg.memory_root), [logical], message,
+                root, [logical], message,
             )
             if commit_id is None:
                 warnings.append({
@@ -420,7 +436,11 @@ def _validate_search_args(operation: str, query: object, limit: object) -> int:
 
 
 def register_memory_tools(mcp: FastMCP, cfg: MemoryToolsConfig) -> None:
-    """Register the ten M3 semantic memory tools on ``mcp``."""
+    """Register the M3 semantic memory tools on ``mcp``.
+
+    Nine tools always register; ``append_recollection`` registers only
+    when ``cfg.maintenance`` is set, since recollection/ writes need the
+    maintenance scope the agent-facing server never grants."""
 
     # -- write tools ---------------------------------------------------
 
@@ -519,7 +539,6 @@ def register_memory_tools(mcp: FastMCP, cfg: MemoryToolsConfig) -> None:
             lambda s: s.patch_memory_file(path, checked), reason,
         )
 
-    @mcp.tool()
     async def append_recollection(
         text: str,
         date: str = "",
@@ -558,6 +577,15 @@ def register_memory_tools(mcp: FastMCP, cfg: MemoryToolsConfig) -> None:
             return store.create_memory_file(path, f"# {day}\n" + entry)
 
         return _run_write(cfg, "append_recollection", op, reason)
+
+    # recollection/ is daemon-owned maintenance memory; the agent-facing
+    # server (maintenance=False) has no write scope there, so an agent
+    # calling append_recollection would only ever get a
+    # memory_scope_readonly error. Register the tool solely under the
+    # explicit maintenance scope, where it actually works — a future
+    # maintenance server flips ``maintenance`` on.
+    if cfg.maintenance:
+        mcp.tool()(append_recollection)
 
     # -- read tools ----------------------------------------------------
 

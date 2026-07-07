@@ -10,6 +10,7 @@ docs/user-lead-designs/memory-implementation.md, named after it.
 """
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -39,6 +40,12 @@ M3_TOOLS = {
     "search_memory",
     "search_imports",
 }
+
+# append_recollection is daemon-owned maintenance memory: it registers
+# only under the explicit maintenance scope, so the agent-facing server
+# exposes the other nine.
+M3_MAINTENANCE_TOOLS = {"append_recollection"}
+M3_AGENT_TOOLS = M3_TOOLS - M3_MAINTENANCE_TOOLS
 
 
 @pytest.fixture
@@ -187,6 +194,23 @@ async def test_invalid_patches_are_rejected(root):
         assert err["code"] == "memory_invalid_arguments"
 
 
+@pytest.mark.asyncio
+async def test_patch_with_empty_old_text_is_rejected(root):
+    """An empty old_text is rejected at the tools layer with a
+    memory_invalid_arguments error before it ever reaches the store."""
+    mcp = _build(root)
+    await _call(mcp, "create_note", {"name": "n", "body": "content\n"})
+    err = await _call_err(mcp, "patch_note", {
+        "name": "n", "patches": [{"old_text": "", "new_text": "x"}],
+    })
+    assert err["code"] == "memory_invalid_arguments"
+    assert err["operation"] == "patch_note"
+    assert err["suggestion"]
+    # The note is untouched.
+    res = await _call(mcp, "read_memory_file", {"path": "notes/n.md"})
+    assert res["body"] == "content\n"
+
+
 # ── scenario 3: note tools cannot write outside notes/ ───────────────
 
 
@@ -245,18 +269,30 @@ async def test_briefing_topic_tools_cannot_write_outside_briefing(root):
 
 
 @pytest.mark.asyncio
-async def test_conversation_scope_cannot_write_recollection(root):
-    mcp = _build(root)
-    err = await _call_err(mcp, "append_recollection", {
-        "date": "2026-07-06", "text": "entry",
-    })
-    assert err["code"] == "memory_scope_readonly"
-    assert err["suggestion"]
+async def test_append_recollection_registered_only_under_maintenance(root):
+    # Agent-facing server (maintenance=False): the tool is not even
+    # registered — recollection/ is daemon-owned, so agent-side calls
+    # could only ever be scope-denied. The other nine tools are present.
+    agent_mcp = _build(root)
+    agent_tools = {t.name for t in await agent_mcp.list_tools()}
+    assert "append_recollection" not in agent_tools
+    assert M3_AGENT_TOOLS <= agent_tools
+
+    # Defense in depth: the store itself denies a conversation-scope
+    # recollection write with a structured scope error, touching nothing.
+    with pytest.raises(MemoryStoreError) as ei:
+        MemoryStore(root).create_memory_file(
+            "recollection/2026/07/2026-07-06.md", "entry\n",
+        )
+    assert ei.value.code == "memory_scope_readonly"
+    assert ei.value.suggestion
     assert not (root / "recollection" / "2026").exists()
 
-    # The same write under the explicit maintenance scope succeeds —
-    # the deny above is scope, not breakage.
+    # Maintenance server (maintenance=True): the tool IS registered and
+    # actually writes — the deny above is scope, not breakage.
     maint = _build(root, maintenance=True)
+    maint_tools = {t.name for t in await maint.list_tools()}
+    assert "append_recollection" in maint_tools
     res = await _call(maint, "append_recollection", {
         "date": "2026-07-06",
         "text": "learned a thing",
@@ -351,6 +387,97 @@ async def test_git_unavailable_degrades_gracefully(root, monkeypatch):
     assert res["warnings"] == []
     assert (root / "notes" / "n.md").is_file()
     assert not (root / ".git").exists()
+
+
+# ── git audit hygiene: containment + env scrubbing ───────────────────
+
+
+def _git_env_scrubbed(root: Path, *args: str) -> str:
+    """git for test assertions, with the location-override env vars
+    stripped so a poisoned ambient GIT_DIR can't skew the check."""
+    env = {
+        k: v for k, v in os.environ.items()
+        if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+    }
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        capture_output=True, text=True, check=True, env=env,
+    ).stdout.strip()
+
+
+def test_commit_refuses_when_memory_root_has_no_local_git(tmp_path):
+    """A memory root nested inside an enclosing repo but WITHOUT its own
+    .git must not have its writes staged/committed into the outer repo."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    for cmd in (
+        ["init", "-q"],
+        ["config", "user.email", "t@t"],
+        ["config", "user.name", "t"],
+        ["config", "commit.gpgsign", "false"],
+    ):
+        subprocess.run(["git", "-C", str(outer), *cmd], check=True)
+    (outer / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(outer), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(outer), "commit", "-q", "-m", "seed"], check=True)
+    head_before = _git_env_scrubbed(outer, "rev-parse", "HEAD")
+
+    memory = outer / "memory"
+    ensure_memory_tree(memory)
+    (memory / "notes" / "n.md").write_text("note\n", encoding="utf-8")
+    assert not (memory / ".git").exists()
+
+    result = memory_git.commit_memory_change(
+        memory, ["notes/n.md"], "memory: create notes/n.md\n",
+    )
+
+    # Refused: no commit id, outer HEAD unchanged, nothing staged there.
+    assert result is None
+    assert _git_env_scrubbed(outer, "rev-parse", "HEAD") == head_before
+    assert _git_env_scrubbed(outer, "diff", "--cached", "--name-only") == ""
+
+
+def test_poisoned_git_env_cannot_redirect_audit_commit(tmp_path, monkeypatch):
+    """GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE pointed at a bait repo
+    must not redirect the audit commit: it lands in <root>/.git and the
+    bait repo is untouched."""
+    bait = tmp_path / "bait"
+    bait.mkdir()
+    for cmd in (
+        ["init", "-q"],
+        ["config", "user.email", "b@b"],
+        ["config", "user.name", "b"],
+    ):
+        subprocess.run(["git", "-C", str(bait), *cmd], check=True)
+
+    memory = tmp_path / "memory"
+    ensure_memory_tree(memory)
+    (memory / "notes" / "n.md").write_text("note\n", encoding="utf-8")
+
+    monkeypatch.setenv("GIT_DIR", str(bait / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(bait))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(bait / ".git" / "index"))
+
+    assert memory_git.ensure_memory_git(memory) is True
+    commit_id = memory_git.commit_memory_change(
+        memory, ["notes/n.md"], "memory: create notes/n.md\n",
+    )
+
+    # The audit repo materialised at the memory root and holds the commit.
+    assert commit_id
+    assert (memory / ".git").is_dir()
+    log = _git_env_scrubbed(memory, "log", "-1", "--name-only", "--format=%H")
+    assert "notes/n.md" in log
+    # The bait repo received nothing.
+    bait_head = subprocess.run(
+        ["git", "-C", str(bait), "rev-list", "-n", "1", "--all"],
+        capture_output=True, text=True,
+        env={
+            k: v for k, v in os.environ.items()
+            if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+        },
+    ).stdout.strip()
+    assert bait_head == ""
 
 
 # ── scenario 8: write result envelope ────────────────────────────────
@@ -501,7 +628,7 @@ async def test_read_memory_files_reads_bounded_files_and_never_writes(root):
 
 
 @pytest.mark.asyncio
-async def test_all_ten_m3_tools_are_registered_on_built_server(root, tmp_path):
+async def test_agent_facing_m3_tools_are_registered_on_built_server(root, tmp_path):
     from puffo_agent.mcp.puffo_core_server import build_server
 
     server = build_server(
@@ -516,7 +643,11 @@ async def test_all_ten_m3_tools_are_registered_on_built_server(root, tmp_path):
         memory_dir=str(root),
     )
     names = {t.name for t in await server.list_tools()}
-    assert M3_TOOLS <= names
+    # build_server constructs the memory tools with maintenance=False,
+    # so the nine agent-facing tools register and the daemon-owned
+    # append_recollection does not.
+    assert M3_AGENT_TOOLS <= names
+    assert "append_recollection" not in names
     # Building the server has no side effects: the memory tree and its
     # git repo are ensured lazily on first tool call, not at build time.
     assert not root.exists()

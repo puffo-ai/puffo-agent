@@ -222,21 +222,24 @@ use filenames that identify you (e.g. `notes-from-<your-id>.md`).
 
 ## Memory
 
-Your memory is a small tree under `memory/`:
+A durable memory tree under `memory/`, managed through tools — never
+hand-edit these files:
 
-- `memory/briefing/<topic>.md` — durable facts you always want in
-  context. Compiled into this prompt, bounded: 16KB per file, 64KB
-  total. An over-budget briefing FAILS the prompt rebuild (no silent
-  truncation), so keep topics tight.
-- `memory/briefing/profile.md` — your identity framing; managed by
-  puffo-agent from your profile. Don't edit the managed block.
-- `memory/notes/` — unbounded detail; lives on disk for you to read
-  or grep, never injected into your prompt.
+- **Briefing topics** are always compiled into this prompt. Create and
+  edit them with `mcp__puffo__create_briefing_topic` /
+  `mcp__puffo__patch_briefing_topic`. Bounded: 16KB per topic, 64KB
+  compiled total; an over-budget write FAILS the rebuild (fail closed,
+  no silent truncation), so keep topics tight. A briefing write marks
+  the prompt for rebuild automatically — no `refresh()` step; it lands
+  at your next turn.
+- **Notes** are durable detail that never enters your prompt. Manage
+  them with `mcp__puffo__create_note` / `patch_note` / `append_note`;
+  recall with `mcp__puffo__search_memory` /
+  `mcp__puffo__read_memory_file`.
+- `memory/briefing/profile.md` — your identity framing, managed by
+  puffo-agent from your profile. Don't touch the managed block.
 - `memory/recollection/`, `memory/imports/` — reserved for the
   platform.
-
-Write markdown, then call `refresh()`; briefing changes land in your
-prompt on the next turn.
 
 ## Your two CLAUDE.md layers (cli-local / cli-docker only)
 
@@ -248,10 +251,10 @@ Claude Code concatenates two files:
 2. **`./CLAUDE.md`** or **`./.claude/CLAUDE.md`** in your workspace
    — yours to edit; puffo-agent never touches it.
 
-Use layer 2 for fast prompt updates; use `memory/briefing/*.md` +
-`refresh()` when you want content labelled as memory. `sdk` and
-codex only have layer 1 — go through `memory/briefing/*.md`.
-Codex's equivalent is `$CODEX_HOME/AGENTS.md`.
+Use layer 2 for fast, free-form prompt notes you keep yourself. For
+durable content labelled as memory, use the briefing tools above —
+they work on every runtime, `sdk` and codex included (those only have
+layer 1). Codex's layer-1 equivalent is `$CODEX_HOME/AGENTS.md`.
 
 ## Permission prompts (cli-local only)
 
@@ -613,7 +616,8 @@ axes; combine them freely.
 | `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
 
 **When to use:**
-- Edited `CLAUDE.md`, `profile.md`, `memory/briefing/*.md` → `refresh()`.
+- Edited `CLAUDE.md` or `profile.md` → `refresh()`. (Briefing topics
+  written via the memory tools rebuild automatically — no `refresh()`.)
 - Installed a new skill / MCP → `refresh()`.
 - Operator added a new skill to their `~/.claude/skills/` → tell them
   to call it "host-sync" and use `refresh(host_sync=True[, session=True])`.

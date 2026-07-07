@@ -257,6 +257,20 @@ def test_patch_with_multiple_matches_is_rejected(store, root):
     assert (root / "notes" / "n.md").read_text(encoding="utf-8") == "dup thing dup"
 
 
+def test_patch_with_empty_old_text_is_rejected(store, root):
+    """An empty old_text has no unambiguous match point; the store
+    rejects it with a truthful memory_invalid_arguments error rather
+    than the old ``count if old_text else 2`` fake-multiple-match hack."""
+    store.create_memory_file("notes/n.md", "content")
+    with pytest.raises(MemoryStoreError) as ei:
+        store.patch_memory_file("notes/n.md", [
+            {"old_text": "", "new_text": "x"},
+        ])
+    assert ei.value.code == "memory_invalid_arguments"
+    assert ei.value.suggestion
+    assert (root / "notes" / "n.md").read_text(encoding="utf-8") == "content"
+
+
 def test_patch_list_is_all_or_nothing(store, root):
     store.create_memory_file("notes/n.md", "alpha beta")
     with pytest.raises(MemoryStoreError) as ei:
@@ -346,6 +360,26 @@ def test_read_memory_files_returns_bounded_reads_without_modifying_memory(store,
 
     # Pure read: the tree is byte-identical afterwards.
     assert _tree_snapshot(root) == before
+
+
+def test_read_non_utf8_file_is_lossy_not_crashing(store, root):
+    """A stored file that isn't valid UTF-8 is surfaced with U+FFFD
+    replacements and flagged ``lossy`` instead of raising
+    UnicodeDecodeError."""
+    (root / "notes" / "x.md").write_bytes(b"\xff\xfe garbage")
+
+    res = store.read_memory_file("notes/x.md")  # must not raise
+
+    assert res["lossy"] is True
+    assert res["truncated"] is False
+    assert "�" in res["body"]
+    assert "garbage" in res["body"]
+
+    # A clean UTF-8 file is not flagged lossy.
+    store.create_memory_file("notes/ok.md", "clean text")
+    ok = store.read_memory_file("notes/ok.md")
+    assert ok["lossy"] is False
+    assert ok["body"] == "clean text"
 
 
 def test_read_memory_files_batch_over_limit_is_rejected(store):

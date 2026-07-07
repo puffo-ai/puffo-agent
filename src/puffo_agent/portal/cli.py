@@ -525,7 +525,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     )
     cfg.save()
 
-    from ..agent.memory import ensure_memory_tree
+    from ..agent.memory import ensure_memory_tree, sync_profile_briefing
     ensure_memory_tree(target / "memory")
 
     profile_path = target / "profile.md"
@@ -533,6 +533,20 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         shutil.copy2(args.profile, profile_path)
     else:
         profile_path.write_text(DEFAULT_PROFILE, encoding="utf-8")
+
+    # Seed briefing/profile.md now so the agent's very first prompt
+    # rebuild has managed identity framing (the worker's memory sync
+    # re-syncs it, but a freshly created agent shouldn't ship without
+    # it). Mirrors shared_content.rebuild_agent_claude_md's profile sync.
+    from .profile_sync import extract_soul_body
+    sync_profile_briefing(
+        target / "memory",
+        agent_id=agent_id,
+        display_name=cfg.display_name,
+        role=role,
+        role_short=role_short,
+        soul=extract_soul_body(profile_path.read_text(encoding="utf-8")),
+    )
 
     print(f"created agent {agent_id!r} at {target}")
     print(
@@ -1499,7 +1513,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
     """Re-sync the shared primer + rebuild the listed agents' CLAUDE.md.
     ensure_shared_primer runs on every worker startup, so this is only
     needed to force a rebuild without waiting for a message."""
-    from ..agent.memory import BriefingCompileError
+    from ..agent.memory_errors import BriefingCompileError
     from ..agent.shared_content import (
         ensure_shared_primer,
         rebuild_agent_claude_md,

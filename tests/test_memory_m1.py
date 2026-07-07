@@ -232,6 +232,114 @@ def test_migrate_flat_memory_over_total_budget_goes_to_notes(tmp_path):
     compile_briefing(root)  # still within budget after migration
 
 
+# ── symlink injection (host-side compile & migration) ────────────────
+
+
+def test_compile_excludes_symlinked_briefing_topic_outside_root(tmp_path):
+    """A symlinked briefing topic pointing at a file OUTSIDE the memory
+    root must never fold that file's bytes into the compiled prompt."""
+    root = tmp_path / "memory"
+    ensure_memory_tree(root)
+    (root / "briefing" / "real.md").write_text("real fact", encoding="utf-8")
+    secret = tmp_path / "outside-secret.md"
+    secret.write_text("SECRET-OUTSIDE-CONTENT", encoding="utf-8")
+    (root / "briefing" / "evil.md").symlink_to(secret)
+
+    out = compile_briefing(root)  # succeeds, does not raise
+
+    assert "real fact" in out
+    assert "SECRET-OUTSIDE-CONTENT" not in out
+    # The symlink is left on disk untouched, just never compiled.
+    assert (root / "briefing" / "evil.md").is_symlink()
+    assert secret.read_text(encoding="utf-8") == "SECRET-OUTSIDE-CONTENT"
+
+
+def test_compile_excludes_symlinked_briefing_topic_inside_root(tmp_path):
+    """Even a symlink whose target sits inside the root is excluded —
+    briefing topics are never followed through symlinks."""
+    root = tmp_path / "memory"
+    ensure_memory_tree(root)
+    (root / "notes" / "target.md").write_text(
+        "NOTE-TARGET-BYTES", encoding="utf-8",
+    )
+    (root / "briefing" / "link.md").symlink_to(root / "notes" / "target.md")
+
+    out = compile_briefing(root)
+
+    assert "NOTE-TARGET-BYTES" not in out
+
+
+def test_compile_excludes_topic_reached_through_symlinked_briefing_dir(tmp_path):
+    """A real topic file that resolves outside the root through a
+    symlinked briefing/ dir is dropped by the resolve() containment
+    check — exercising the guard beyond leaf symlinks."""
+    root = tmp_path / "memory"
+    ensure_memory_tree(root)
+    external = tmp_path / "external-briefing"
+    external.mkdir()
+    (external / "leak.md").write_text("EXTERNAL-LEAK-BYTES", encoding="utf-8")
+    briefing = root / "briefing"
+    briefing.rmdir()  # ensure_memory_tree left it empty
+    briefing.symlink_to(external)
+
+    out = compile_briefing(root)  # succeeds, does not raise
+
+    assert "EXTERNAL-LEAK-BYTES" not in out
+
+
+def test_migrate_flat_memory_skips_symlinked_flat_file(tmp_path):
+    """A symlinked flat *.md is never read or migrated — its target's
+    bytes must not enter the tree."""
+    root = tmp_path / "memory"
+    root.mkdir()
+    secret = tmp_path / "host-secret.md"
+    secret.write_text("HOST-SECRET-BYTES", encoding="utf-8")
+    (root / "evil.md").symlink_to(secret)
+    (root / "real.md").write_text("real flat fact", encoding="utf-8")
+
+    moved = migrate_flat_memory(root)  # does not raise
+
+    # The real flat file migrated; the symlink was skipped entirely.
+    assert "briefing/real.md" in moved
+    assert not any("evil" in m for m in moved)
+    # The symlink is left in place; its target was never read or moved.
+    assert (root / "evil.md").is_symlink()
+    assert secret.read_text(encoding="utf-8") == "HOST-SECRET-BYTES"
+    # No regular file in the tree carries the secret bytes.
+    for p in root.rglob("*.md"):
+        if p.is_symlink():
+            continue
+        assert "HOST-SECRET-BYTES" not in p.read_text(encoding="utf-8")
+
+
+def test_migrate_pointer_skipped_when_briefing_budget_full(tmp_path):
+    """When the briefing is so full that even the migrated-notes pointer
+    line would bust the total, the pointer is skipped (fail closed) — the
+    note still migrates and the result still compiles within budget."""
+    root = tmp_path / "memory"
+    ensure_memory_tree(root)
+    # Four ~16KB topics compile to ~10 bytes under the 64KB total,
+    # leaving no room for either the flat note or a pointer topic.
+    for i in range(4):
+        (root / "briefing" / f"seed-{i}.md").write_text(
+            "s" * 16368, encoding="utf-8",
+        )
+    assert len(compile_briefing(root).encode("utf-8")) <= TOTAL_LIMIT
+    # A small flat note can't fit briefing (total is full) → notes/.
+    (root / "overflow.md").write_text("overflow note body\n", encoding="utf-8")
+
+    moved = migrate_flat_memory(root)  # does not raise
+
+    assert moved == ["notes/overflow.md"]
+    assert (root / "notes" / "overflow.md").is_file()
+    # The pointer write was rejected by the store's budget check before
+    # any file was written, so no migrated-notes topic exists…
+    assert not (root / "briefing" / "migrated-notes.md").exists()
+    # …and the migrated tree still compiles within the total budget.
+    compiled = compile_briefing(root)  # must not raise
+    assert len(compiled.encode("utf-8")) <= TOTAL_LIMIT
+
+
 def test_migrate_flat_memory_name_collision_falls_back(tmp_path):
     root = tmp_path / "memory"
     root.mkdir()

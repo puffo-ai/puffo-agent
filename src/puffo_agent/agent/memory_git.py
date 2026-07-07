@@ -16,6 +16,7 @@ or a failed commit is logged and reported to the caller (``False`` /
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,24 +27,54 @@ logger = logging.getLogger(__name__)
 # guards against a wedged git process.
 _GIT_TIMEOUT = 30
 
+# Env vars that relocate git's repo/work-tree/index. A poisoned value
+# in the daemon's environment could otherwise redirect an audit commit
+# into an attacker-chosen repo, so they are scrubbed from every run.
+_GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+
 
 def git_available() -> bool:
     """True when a ``git`` binary is on PATH."""
     return shutil.which("git") is not None
 
 
+def _scrubbed_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for var in _GIT_LOCATION_ENV:
+        env.pop(var, None)
+    return env
+
+
 def _run_git(
-    memory_root: Path, args: list[str],
+    memory_root: Path, args: list[str], *, pin_repo: bool = True,
 ) -> subprocess.CompletedProcess | None:
-    """Run one git command inside the memory root. ``None`` on any
-    launch/timeout failure; callers also check ``returncode``."""
+    """Run one git command against the audit repo at ``memory_root``.
+
+    The environment is scrubbed of git location overrides
+    (``GIT_DIR``/``GIT_WORK_TREE``/``GIT_INDEX_FILE``), and — when
+    ``pin_repo`` — ``--git-dir``/``--work-tree`` are passed explicitly
+    so the command can only ever touch ``<root>/.git``: never an
+    enclosing repo, never a repo an env var points at.
+    ``pin_repo=False`` is used only for ``git init``, which must run
+    before ``.git`` exists. ``None`` on any launch/timeout failure;
+    callers also check ``returncode``."""
+    root = Path(memory_root)
+    cmd = ["git"]
+    if pin_repo:
+        cmd += [
+            f"--git-dir={root / '.git'}",
+            f"--work-tree={root}",
+            "-c", f"safe.directory={root}",
+        ]
+    cmd += args
     try:
         return subprocess.run(
-            ["git", *args],
-            cwd=str(memory_root),
+            cmd,
+            cwd=str(root),
             capture_output=True,
             text=True,
             timeout=_GIT_TIMEOUT,
+            env=_scrubbed_env(),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("memory git %s failed to run: %s", args[:1], exc)
@@ -66,14 +97,16 @@ def ensure_memory_git(memory_root: str | Path) -> bool:
             "audit-committed", memory_root,
         )
         return False
+    # ``init`` runs before ``.git`` exists, so it can't pin --git-dir;
+    # the config steps that follow do (the repo is present by then).
     steps = [
-        ["init", "--quiet"],
-        ["config", "user.name", "puffo-agent"],
-        ["config", "user.email", "memory@puffo.local"],
-        ["config", "commit.gpgsign", "false"],
+        (["init", "--quiet"], False),
+        (["config", "user.name", "puffo-agent"], True),
+        (["config", "user.email", "memory@puffo.local"], True),
+        (["config", "commit.gpgsign", "false"], True),
     ]
-    for step in steps:
-        proc = _run_git(memory_root, step)
+    for step, pin_repo in steps:
+        proc = _run_git(memory_root, step, pin_repo=pin_repo)
         if proc is None or proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip() if proc else "launch failed"
             logger.warning(
@@ -105,6 +138,15 @@ def commit_memory_change(
     that warrants a warning)."""
     memory_root = Path(memory_root)
     if not paths:
+        return None
+    # Only ever commit into our OWN audit repo. If the memory root sits
+    # inside an enclosing git repo but has no ``.git`` of its own, an
+    # unguarded add/commit would land in that outer repo — refuse.
+    if not (memory_root / ".git").is_dir():
+        logger.warning(
+            "memory git commit skipped at %s: no local .git audit repo",
+            memory_root,
+        )
         return None
     add = _run_git(memory_root, ["add", "--", *paths])
     if add is None or add.returncode != 0:
