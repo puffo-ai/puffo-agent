@@ -43,6 +43,7 @@ from .state import (
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
+    agent_yml_path,
     cli_session_json_path,
     docker_shared_dir,
     shared_fs_dir,
@@ -1151,6 +1152,17 @@ class Worker:
         refresh_agent_flag_path = pa_dir / "refresh_agent.flag"
         refresh_host_sync_flag_path = pa_dir / "refresh_host_sync.flag"
         refresh_session_flag_path = pa_dir / "refresh_session.flag"
+        # Config-file mtime watcher (additive to the flag path above):
+        # baseline seeded at agent start from the bundle we just
+        # materialized, so the first between-turns check does not
+        # spuriously reload an untouched profile.md / agent.yml. Between
+        # turns, `_process_config_mtime_reload` re-stats these and
+        # rebuilds the prompt when either moves forward.
+        agent_yml_path_str = str(agent_yml_path(agent_id))
+        config_mtimes = {
+            "profile": _stat_mtime_or_none(profile_path),
+            "agent_yml": _stat_mtime_or_none(agent_yml_path_str),
+        }
         # Per-turn context for the cli-local permission hook. The hook
         # is a separate subprocess and reads this file to learn which
         # channel + root to reply to.
@@ -1195,6 +1207,22 @@ class Worker:
             first_post_id = batch[0].get("envelope_id", "")
             channel_id = channel_meta.get("channel_id", "")
 
+            # Config-file mtime watch runs first so a disk rewrite of
+            # profile.md / agent.yml is picked up before the flag path;
+            # both funnel into `adapter.reload`. Additive — the flag
+            # sentinels below are unchanged and still run after this.
+            await _process_config_mtime_reload(
+                agent_id=agent_id,
+                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
+                agent_yml_path=agent_yml_path_str,
+                puffo=puffo,
+                adapter=self._adapter,
+                mtime_state=config_mtimes,
+            )
             await _process_refresh_flags(
                 agent_id=agent_id,
                 harness_name=(self.agent_cfg.runtime.harness or "").strip(),
@@ -1572,6 +1600,162 @@ class Worker:
                     pass
             self.runtime.status = "stopped"
             self.runtime.save(agent_id)
+
+
+def _stat_mtime_or_none(path: str | Path) -> float | None:
+    """``os.stat(path).st_mtime`` or ``None`` when the file is
+    missing / unreadable / mid-write. Never raises — callers use the
+    ``None`` sentinel to mean "couldn't observe; retry next turn"."""
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+async def _reload_from_disk(
+    *,
+    harness_name: str,
+    agent_id: str,
+    shared_path: Path,
+    profile_path: str,
+    memory_path: str,
+    workspace_path: str,
+    puffo,
+    adapter,
+) -> bool:
+    """Rebuild the managed system prompt from disk and hand it to the
+    adapter — the same primitives ``_process_refresh_flags`` uses for
+    the ``refresh_agent`` flag, factored out so the mtime watcher can
+    reuse them.
+
+    Assembles the new prompt into a **local** first; only once
+    ``_rebuild_managed_system_prompt`` succeeds does it mutate
+    ``puffo.system_prompt`` and call ``adapter.reload``. So a partial /
+    mid-write ``profile.md`` (transiently missing → ``FileNotFoundError``,
+    or a truncated read) raises out of here **before** any state is
+    touched, and the caller's try/except keeps the prior config intact.
+
+    Uses ``adapter.reload(prompt)`` with the default ``with_session=False``
+    — profile/soul edits do not require a fresh session (matching the
+    ``agent_seen`` branch of ``_process_refresh_flags``). Returns ``True``
+    on success; propagates any exception so the caller can decline to
+    advance the mtime baseline.
+    """
+    new_prompt = _rebuild_managed_system_prompt(
+        harness_name=harness_name,
+        agent_id=agent_id,
+        shared_path=shared_path,
+        profile_path=profile_path,
+        memory_path=memory_path,
+        workspace_path=workspace_path,
+    )
+    puffo.system_prompt = new_prompt
+    await adapter.reload(new_prompt)
+    return True
+
+
+async def _process_config_mtime_reload(
+    *,
+    agent_id: str,
+    harness_name: str,
+    shared_path: Path,
+    profile_path: str,
+    memory_path: str,
+    workspace_path: str,
+    agent_yml_path: str,
+    puffo,
+    adapter,
+    mtime_state: dict,
+) -> None:
+    """Between-turns watcher: reload the agent's config when
+    ``profile.md`` or ``agent.yml`` is rewritten on disk (e.g. by AIM's
+    ``sandbox.files.write`` config-sync). An mtime poll on the existing
+    turn-start check — no filesystem watcher, no new thread, no deps.
+
+    ``mtime_state`` is a mutable ``{"profile": float|None, "agent_yml":
+    float|None}`` baseline seeded at agent start (so the first turn does
+    not spuriously reload). A file counts as "changed" only when its
+    current mtime is observable and strictly newer than the baseline;
+    backwards movement (truncate-then-rewrite landing an earlier mtime)
+    is ignored, only re-anchoring the baseline. If either file changed,
+    a **single** ``_reload_from_disk`` runs (both changes funnel into one
+    reload). On failure the triggering baselines are left unadvanced so
+    the same still-newer mtime re-fires next turn, and the prior config
+    is retained.
+
+    **Reload-vs-restart map:** only the safe prompt/soul subset is
+    hot-applied. ``agent.yml`` *runtime* fields (kind / harness /
+    provider / model) are baked into the adapter at construction and are
+    **not** hot-swapped here — they take effect on the next worker
+    restart (existing ``refresh`` tool + ``restart.flag``). An
+    ``agent.yml`` edit therefore re-applies the profile/system-prompt and
+    logs the restart requirement; it never rebuilds the adapter.
+    """
+    triggered: dict[str, float] = {}
+    for key, path in (
+        ("profile", profile_path),
+        ("agent_yml", agent_yml_path),
+    ):
+        current = _stat_mtime_or_none(path)
+        baseline = mtime_state.get(key)
+        if current is None:
+            # Missing / mid-write — leave the baseline; retry next turn.
+            logger.debug(
+                "agent %s: config watch could not stat %s (%s); "
+                "keeping prior baseline",
+                agent_id, key, path,
+            )
+            continue
+        if baseline is None or current > baseline:
+            triggered[key] = current
+        elif current < baseline:
+            # Backwards mtime (truncate-then-rewrite). Don't reload;
+            # just re-anchor so it can't loop on the same stale value.
+            mtime_state[key] = current
+
+    if not triggered:
+        return
+
+    if "agent_yml" in triggered:
+        logger.info(
+            "agent %s: agent.yml changed — runtime fields "
+            "(kind/harness/provider/model) take effect on the next worker "
+            "restart; hot reload re-applies profile/system-prompt only",
+            agent_id,
+        )
+
+    try:
+        await _reload_from_disk(
+            harness_name=harness_name,
+            agent_id=agent_id,
+            shared_path=shared_path,
+            profile_path=profile_path,
+            memory_path=memory_path,
+            workspace_path=workspace_path,
+            puffo=puffo,
+            adapter=adapter,
+        )
+    except Exception as exc:
+        # Partial/mid-write read or adapter failure: keep the prior
+        # config (Step 2 guarantees no partial mutation) and leave the
+        # triggering baselines unadvanced so we re-fire next turn.
+        logger.warning(
+            "agent %s: config mtime reload (%s) failed, keeping prior "
+            "config: %s",
+            agent_id, ",".join(triggered), exc,
+        )
+        return
+
+    # Success — advance the baseline of every file that triggered to the
+    # exact mtime observed in the trigger loop (not a re-stat, so a write
+    # that lands mid-reload stays strictly-newer and re-fires next turn
+    # rather than being silently absorbed).
+    for key, observed in triggered.items():
+        mtime_state[key] = observed
+    logger.info(
+        "agent %s: reloaded config from disk (%s)",
+        agent_id, ",".join(triggered),
+    )
 
 
 async def _process_refresh_flags(
