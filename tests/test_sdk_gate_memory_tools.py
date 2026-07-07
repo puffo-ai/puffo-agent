@@ -1,9 +1,10 @@
 """The sdk-local adapter runs every tool call through ``_gate``, which
 allows a call only if some configured pattern matches. Puffo MCP tools
 are auto-allowed by seeding the gate's patterns with
-``PUFFO_CORE_TOOL_FQNS``. This pins that the ten M3 memory tools are in
-that set — otherwise they register on the server but get denied at call
-time on sdk-local (the M3 finding this guards against).
+``PUFFO_CORE_TOOL_FQNS``. This pins that the ten M3 memory tools and the
+five M4 read-only tools are in that set — otherwise they register on the
+server but get denied at call time on sdk-local (the finding this
+guards against).
 
 ``claude_agent_sdk`` is an optional dep the dev extra does NOT install;
 ``SDKAdapter.__init__`` defers that import, so the module (and
@@ -31,9 +32,21 @@ M3_TOOL_NAMES = (
     "search_imports",
 )
 
+M4_TOOL_NAMES = (
+    "get_memory_status",
+    "get_memory_file_status",
+    "list_memory_files",
+    "get_memory_history_status",
+    "get_memory_history",
+)
+
 
 def test_m3_memory_tools_are_in_core_allowlist():
     assert set(M3_TOOL_NAMES) <= set(PUFFO_CORE_TOOL_NAMES)
+
+
+def test_m4_memory_tools_are_in_core_allowlist():
+    assert set(M4_TOOL_NAMES) <= set(PUFFO_CORE_TOOL_NAMES)
 
 
 def test_m3_memory_tool_fqns_pass_the_sdk_gate():
@@ -41,6 +54,16 @@ def test_m3_memory_tool_fqns_pass_the_sdk_gate():
     # (see SDKAdapter.__init__ / _gate). Reproduce the exact allow
     # check the gate performs for each M3 tool's FQN.
     for name in M3_TOOL_NAMES:
+        fqn = f"mcp__{MCP_SERVER_NAME}__{name}"
+        allowed = any(
+            _pattern_matches(fqn, {}, pat) for pat in PUFFO_CORE_TOOL_FQNS
+        )
+        assert allowed, f"{fqn} would be denied by the sdk gate"
+
+
+def test_m4_memory_tool_fqns_pass_the_sdk_gate():
+    # Same gate check for the five M4 read-only tools.
+    for name in M4_TOOL_NAMES:
         fqn = f"mcp__{MCP_SERVER_NAME}__{name}"
         allowed = any(
             _pattern_matches(fqn, {}, pat) for pat in PUFFO_CORE_TOOL_FQNS

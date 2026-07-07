@@ -63,6 +63,15 @@ PUFFO_CORE_TOOL_NAMES = (
     "read_memory_files",
     "search_memory",
     "search_imports",
+    # M4 memory status / recall / history tools (read-only; registered
+    # by mcp.memory_tools). Same reason as the M3 block — the sdk gate
+    # auto-allows every mcp__puffo__ tool in this list, so leaving them
+    # out would register them but deny them at call time on sdk-local.
+    "get_memory_status",
+    "get_memory_file_status",
+    "list_memory_files",
+    "get_memory_history_status",
+    "get_memory_history",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(
     f"mcp__{MCP_SERVER_NAME}__{t}" for t in PUFFO_CORE_TOOL_NAMES

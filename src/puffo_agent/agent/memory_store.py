@@ -39,6 +39,7 @@ from .memory import (
     _byte_size,
     _compose_briefing,
     _read_briefing_entries,
+    compile_briefing,
     request_prompt_refresh,
 )
 from .memory_errors import BriefingCompileError, MemoryStoreError
@@ -51,6 +52,11 @@ RECOLLECTION_FILE_LIMIT = 128 * 1024
 IMPORTS_READ_LIMIT = RECOLLECTION_FILE_LIMIT
 
 READ_BATCH_LIMIT = 16
+
+# list_memory_files bounds (M4 recall): default page size and the hard
+# cap the requested limit is clamped to.
+LIST_DEFAULT_LIMIT = 100
+LIST_MAX_LIMIT = 500
 
 _FILE_LIMITS = {
     BRIEFING_DIR: PER_FILE_LIMIT,
@@ -307,6 +313,111 @@ class MemoryStore:
                 exists and scope == BRIEFING_DIR and logical.suffix == ".md"
             ),
         }
+
+    # ── M4 status + recall (pure filesystem reads, no git) ───────────
+
+    def _iter_scope_files(self, scope: str) -> list[tuple[str, Path]]:
+        """``(logical posix path, physical path)`` pairs under one
+        scope, sorted for deterministic order; hidden segments and
+        symlinks are skipped (same rules as ``memory_tools._scope_files``).
+        Uses ``rglob('*')`` filtered to real files — ``briefing/`` is
+        flat, ``recollection/`` is nested, ``imports/`` may hold
+        non-``.md`` files."""
+        base = self.memory_root / scope
+        if not base.is_dir():
+            return []
+        out: list[tuple[str, Path]] = []
+        for p in sorted(base.rglob("*")):
+            rel = p.relative_to(self.memory_root).as_posix()
+            if any(seg.startswith(".") for seg in rel.split("/")):
+                continue
+            if p.is_symlink() or not p.is_file():
+                continue
+            out.append((rel, p))
+        return out
+
+    def get_memory_status(self) -> dict:
+        """Root health + compiled-briefing size + per-scope
+        ``{files, total_size_bytes}`` — a pure filesystem read (no git,
+        no bodies). The compiled size is computed defensively: an
+        over-budget briefing reports the offending size with
+        ``over_budget=True`` rather than raising, because a status read
+        must never fail closed the way a write does."""
+        try:
+            compiled_size = _byte_size(compile_briefing(self.memory_root))
+            over_budget = False
+        except BriefingCompileError as exc:
+            compiled_size = exc.size or 0
+            over_budget = True
+        scopes: dict = {}
+        for scope in _SCOPES:
+            files = self._iter_scope_files(scope)
+            scopes[scope] = {
+                "files": len(files),
+                "total_size_bytes": sum(p.stat().st_size for _, p in files),
+            }
+        return {
+            "memory_root": str(self.memory_root),
+            "root_exists": self.memory_root.is_dir(),
+            "briefing": {
+                "compiled_size_bytes": compiled_size,
+                "limit_bytes": TOTAL_LIMIT,
+                "over_budget": over_budget,
+            },
+            "scopes": scopes,
+        }
+
+    def list_memory_files(
+        self, scope: str | None = None, limit: int = LIST_DEFAULT_LIMIT,
+    ) -> dict:
+        """Logical paths + lightweight metadata for the requested scope
+        (or all scopes in fixed order), **never** a body. Each entry is
+        ``{path, scope, size, writable, briefing_included}``; the list
+        is capped at ``min(limit, LIST_MAX_LIMIT)`` and ``truncated``
+        flags that more files exist beyond the cap."""
+        if scope is not None and scope not in _SCOPES:
+            raise MemoryStoreError(
+                "memory_path_out_of_scope",
+                path=str(scope),
+                suggestion=(
+                    "scope must be one of briefing, notes, recollection, "
+                    "imports — or omitted to list every scope."
+                ),
+            )
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise MemoryStoreError(
+                "memory_invalid_arguments",
+                path="",
+                suggestion=(
+                    f"limit must be a positive integer (default "
+                    f"{LIST_DEFAULT_LIMIT}, max {LIST_MAX_LIMIT})."
+                ),
+            )
+        cap = min(limit, LIST_MAX_LIMIT)
+        files: list[dict] = []
+        truncated = False
+        for sc in _SCOPES:
+            if scope is not None and sc != scope:
+                continue
+            for rel, physical in self._iter_scope_files(sc):
+                if len(files) >= cap:
+                    truncated = True
+                    break
+                logical = PurePosixPath(rel)
+                files.append({
+                    "path": rel,
+                    "scope": sc,
+                    "size": physical.stat().st_size,
+                    "writable": (
+                        self._scope_writable(sc) and logical.suffix == ".md"
+                    ),
+                    "briefing_included": (
+                        sc == BRIEFING_DIR and logical.suffix == ".md"
+                    ),
+                })
+            if truncated:
+                break
+        return {"files": files, "truncated": truncated}
 
     # ── daemon-owned writer (not one of the public seven) ────────────
 

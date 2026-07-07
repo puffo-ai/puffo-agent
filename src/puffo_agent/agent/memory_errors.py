@@ -67,3 +67,29 @@ class BriefingCompileError(MemoryStoreError):
         super().__init__(
             code, path=path, size=size, limit=limit, suggestion=suggestion,
         )
+
+
+class MemoryHistoryError(Exception):
+    """Structured memory-history error: the M4 read-only audit query
+    analogue of ``MemoryStoreError``. Carries ``code`` (one of the M4
+    history codes such as ``memory_history_unavailable`` /
+    ``memory_history_not_initialized`` / ``memory_invalid_history_query``
+    / ``memory_history_query_too_large`` / ``memory_history_read_failed``),
+    plus a human ``message`` and a ``suggestion``. Unlike
+    ``MemoryStoreError`` it carries no ``path``/``size``/``limit`` — a
+    history query is over the audit log, not a single file — so the
+    tools layer maps it to the ``{code, message, suggestion}`` envelope
+    with a ``memory_git`` cause layer."""
+
+    def __init__(self, code: str, *, message: str, suggestion: str):
+        self.code = code
+        self.message = message
+        self.suggestion = suggestion
+        super().__init__(f"{code}: {message} {suggestion}".rstrip())
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "suggestion": self.suggestion,
+        }

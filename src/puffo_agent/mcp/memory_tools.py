@@ -67,8 +67,12 @@ from ..agent.memory import (
     ensure_memory_tree,
     request_prompt_refresh,
 )
-from ..agent.memory_errors import MemoryStoreError
-from ..agent.memory_store import IMPORTS_READ_LIMIT, MemoryStore
+from ..agent.memory_errors import MemoryHistoryError, MemoryStoreError
+from ..agent.memory_store import (
+    IMPORTS_READ_LIMIT,
+    LIST_DEFAULT_LIMIT,
+    MemoryStore,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +174,50 @@ def _store_error(operation: str, exc: MemoryStoreError) -> ToolError:
             {"layer": "memory_store", "code": exc.code, "message": str(exc)},
         ],
     )
+
+
+def _history_error(operation: str, exc: MemoryHistoryError) -> ToolError:
+    """Map an M4 history-query error to the same structured envelope as
+    ``_store_error``, tagged with a ``memory_git`` cause layer. History
+    errors carry no path, so ``path`` is empty."""
+    return _tool_error(
+        code=exc.code,
+        message=f"{operation} failed: {exc.message}",
+        operation=operation,
+        path="",
+        suggestion=exc.suggestion,
+        causes=[
+            {"layer": "memory_git", "code": exc.code, "message": str(exc)},
+        ],
+    )
+
+
+def _validate_history_path(
+    cfg: MemoryToolsConfig, operation: str, path: str,
+) -> str:
+    """Validate a history path through the store's logical-path grammar
+    (grammar/scope only — a history query can legitimately reference a
+    since-deleted file, so there is no existence check). Store errors
+    (``memory_invalid_path`` / ``memory_path_out_of_scope``) re-raise as
+    tool errors."""
+    try:
+        _, logical = MemoryStore(cfg.memory_root)._validate_logical_path(path)
+    except MemoryStoreError as exc:
+        raise _store_error(operation, exc) from exc
+    return str(logical)
+
+
+def _briefing_refresh_pending(cfg: MemoryToolsConfig) -> bool:
+    """Whether a briefing change is awaiting a provider rebuild. In the
+    fat-agent model there is one provider-reload signal — the
+    ``refresh_agent.flag`` under ``<workspace>/.puffo-agent/`` — so both
+    ``briefing.dirty`` and ``briefing.provider_reload_required`` derive
+    from its presence. No workspace ⇒ nothing pending."""
+    if not cfg.workspace:
+        return False
+    from ..portal.state import refresh_agent_flag_path
+
+    return refresh_agent_flag_path(Path(cfg.workspace)).is_file()
 
 
 # ── semantic name / date handling ────────────────────────────────────
@@ -711,3 +759,161 @@ def register_memory_tools(mcp: FastMCP, cfg: MemoryToolsConfig) -> None:
             "ok": True, "query": query,
             "results": results, "truncated": truncated,
         }
+
+    # -- M4 status / recall / history (all read-only, agent-facing) ----
+    #
+    # Unlike the M3 read tools, these NEVER call _ensure: a status or
+    # history read must report an uninitialised tree/repo honestly
+    # rather than creating it. None of them expose any write, rollback,
+    # or raw git flag/ref surface.
+
+    @mcp.tool()
+    async def get_memory_status() -> dict:
+        """Read-only health of this agent's memory (no file bodies).
+
+        Reports root existence, whether the local git audit repo is
+        available, the compiled-briefing size with its budget and
+        dirty/reload flags, and per-scope ``{files, total_size_bytes}``.
+        Never creates the memory tree or the audit repo.
+        """
+        root = Path(cfg.memory_root)
+        status = _store(cfg).get_memory_status()
+        status["ok"] = True
+        status["git_enabled"] = (
+            memory_git.git_available() and (root / ".git").is_dir()
+        )
+        pending = _briefing_refresh_pending(cfg)
+        status["briefing"]["dirty"] = pending
+        status["briefing"]["provider_reload_required"] = pending
+        return status
+
+    @mcp.tool()
+    async def get_memory_file_status(path: str) -> dict:
+        """Existence / scope / size / limit / briefing-inclusion for one
+        logical memory path — deliberately NO body.
+
+        Extended (best-effort) with git last-change metadata
+        (``git_tracked`` / ``last_changed_commit_id`` /
+        ``last_changed_at``); when git is unavailable or the audit repo
+        is not initialised those fields are null and file status still
+        works. Read-only; never creates the tree or repo.
+        """
+        try:
+            status = _store(cfg).get_memory_file_status(path)
+        except MemoryStoreError as exc:
+            raise _store_error("get_memory_file_status", exc) from exc
+        git_tracked = None
+        last_commit = None
+        last_at = None
+        try:
+            hist = memory_git.history_status(
+                Path(cfg.memory_root), status["path"],
+            )
+            git_tracked = hist["path_tracked"]
+            last_commit = hist["last_changed_commit_id"]
+            last_at = hist["last_changed_at"]
+        except MemoryHistoryError as exc:
+            # No git / no audit repo just leaves the git fields null;
+            # any other failure is a real error worth surfacing.
+            if exc.code not in (
+                "memory_history_unavailable",
+                "memory_history_not_initialized",
+            ):
+                raise _history_error("get_memory_file_status", exc) from exc
+        status["git_tracked"] = git_tracked
+        status["last_changed_commit_id"] = last_commit
+        status["last_changed_at"] = last_at
+        status["ok"] = True
+        # M4 status is body-less by contract (recall bodies go through
+        # read_memory_file / read_memory_files).
+        assert "body" not in status
+        return status
+
+    @mcp.tool()
+    async def list_memory_files(
+        scope: str = "", limit: int = LIST_DEFAULT_LIMIT,
+    ) -> dict:
+        """List logical memory paths + lightweight metadata — never a
+        body.
+
+        Each entry carries ``path`` / ``scope`` / ``size`` /
+        ``writable`` / ``briefing_included``. ``scope`` (optional)
+        restricts to one area (briefing, notes, recollection, imports);
+        ``limit`` bounds the count and ``truncated`` flags that more
+        files exist. Read-only.
+        """
+        try:
+            result = _store(cfg).list_memory_files(scope or None, limit)
+        except MemoryStoreError as exc:
+            raise _store_error("list_memory_files", exc) from exc
+        return {"ok": True, **result}
+
+    @mcp.tool()
+    async def get_memory_history_status(path: str = "") -> dict:
+        """Read-only health of the memory audit history.
+
+        Reports git availability, whether the audit repo is
+        initialised, the HEAD commit id, and the clean/dirty state of
+        the work tree. When ``path`` (a logical memory path) is given it
+        also reports whether that path is tracked and when it last
+        changed. NOT a git passthrough — no raw git flags or refs are
+        accepted, and this never creates the repo.
+        """
+        logical = (
+            _validate_history_path(cfg, "get_memory_history_status", path)
+            if path else None
+        )
+        try:
+            result = memory_git.history_status(Path(cfg.memory_root), logical)
+        except MemoryHistoryError as exc:
+            raise _history_error("get_memory_history_status", exc) from exc
+        return {"ok": True, **result}
+
+    @mcp.tool()
+    async def get_memory_history(
+        path: str = "",
+        scopes: list[str] | None = None,
+        since: str = "",
+        until: str = "",
+        actor: str = "",
+        operation: str = "",
+        query: str = "",
+        limit: int = memory_git.HISTORY_DEFAULT_LIMIT,
+        include_diff: bool = False,
+    ) -> dict:
+        """Bounded read-only audit query over the local memory git
+        history. NOT a ``git log`` passthrough.
+
+        Only the whitelisted filters are honoured — ``path`` / ``scopes``
+        (which areas), ``since`` / ``until`` (dates), ``actor`` (commit
+        author), ``operation`` (matches the recorded write tool),
+        ``query`` (case-insensitive substring over commit
+        subject/reason/changed-paths — never the diff text), ``limit``,
+        and ``include_diff``. No raw git flags, refs, revision ranges,
+        or rollback are ever accepted: a filter value that looks like a
+        flag (``--all``) or a ref range (``HEAD~5..HEAD``) is treated as
+        a literal value. Each entry carries ``commit_id`` / ``time`` /
+        ``actor`` / ``operation`` / ``reason`` / ``message`` /
+        ``changed_paths`` / ``summary``; ``include_diff`` adds a
+        byte-capped ``diff`` excerpt with a ``diff_truncated`` flag.
+        """
+        logical = (
+            _validate_history_path(cfg, "get_memory_history", path)
+            if path else None
+        )
+        try:
+            result = memory_git.query_history(
+                Path(cfg.memory_root),
+                path=logical,
+                scopes=scopes,
+                since=since,
+                until=until,
+                actor=actor,
+                operation=operation,
+                query=query,
+                limit=limit,
+                include_diff=include_diff,
+            )
+        except MemoryHistoryError as exc:
+            raise _history_error("get_memory_history", exc) from exc
+        return {"ok": True, **result}
