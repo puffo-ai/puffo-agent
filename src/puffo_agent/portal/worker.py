@@ -359,7 +359,18 @@ def _build_puffo_core_client(
     from ..crypto.keystore import KeyStore
 
     pc = agent_cfg.puffo_core
-    _ensure_agent_identity_imported(agent_id, pc.slug)
+    bridge = None
+    if pc.transport == "bridge":
+        # T23 keyless transport: no identity file exists to import;
+        # the bridge authenticates with the sandbox token instead.
+        # Keystore/http below are still constructed (both lazy — they
+        # never touch disk/network in __init__); phase 2 replaces
+        # their call sites.
+        from ..agent.bridge_client import CloudBridgeClient
+
+        bridge = CloudBridgeClient(pc.server_url, pc.sandbox_token, pc.slug)
+    else:
+        _ensure_agent_identity_imported(agent_id, pc.slug)
     ks_dir = str(agent_dir(agent_id) / "keys")
     ks = KeyStore(ks_dir)
     http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
@@ -393,6 +404,7 @@ def _build_puffo_core_client(
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
+        bridge_client=bridge,
     )
 
 

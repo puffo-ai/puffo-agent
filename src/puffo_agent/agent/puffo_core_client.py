@@ -12,7 +12,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Optional
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
@@ -24,7 +24,10 @@ from ..crypto.message import (
     encrypt_message,
 )
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
-from ..crypto.ws_client import PuffoCoreWsClient
+from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF, PuffoCoreWsClient
+
+if TYPE_CHECKING:
+    from .bridge_client import CloudBridgeClient
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .core import AgentAPIError
@@ -456,6 +459,8 @@ class PuffoCoreMessageClient:
         segment_chars: int = 2000,
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
+        *,
+        bridge_client: "CloudBridgeClient | None" = None,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -484,6 +489,10 @@ class PuffoCoreMessageClient:
         self.store = message_store
         self._key_cache = DeviceKeyCache(http_client)
         self._ws: Optional[PuffoCoreWsClient] = None
+        # T23: injected keyless bridge transport (experimental). When
+        # non-None, listen() runs the bridge lifecycle loop instead of
+        # the signed WS client — no identity file is ever loaded.
+        self._bridge = bridge_client
         # Most recent DM sender. ``send_fallback_message(channel_id="")`` means
         # "reply to whoever just DMed me". Single-slot is fine since
         # the worker handles one envelope at a time; concurrent DM
@@ -587,6 +596,14 @@ class PuffoCoreMessageClient:
         turn exit (fresh dispatch AND kick-retry recovery).
         Invoked as ``on_turn_success(root_id, batch, channel_meta)``.
         """
+        if self._bridge is not None:
+            # T23 phase 1: keyless bridge transport. No identity file
+            # to load, and the consumer / invite-poll / warm tasks are
+            # skipped — they drive signed HTTP endpoints that can't
+            # work keyless until phase 2 rewires envelope flow.
+            await self._listen_bridge()
+            return
+
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
             decode_secret(identity.kem_secret_key)
@@ -938,6 +955,39 @@ class PuffoCoreMessageClient:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+    async def _listen_bridge(self) -> None:
+        """Bridge-transport lifecycle loop: connect → drain frames →
+        reconnect, with the same backoff schedule as the native
+        ``PuffoCoreWsClient.run()`` (start at INITIAL_BACKOFF, double
+        on failure, cap at MAX_BACKOFF, reset on successful connect).
+        """
+        bridge = self._bridge
+        assert bridge is not None  # guarded by listen()
+        backoff = INITIAL_BACKOFF
+        while True:
+            try:
+                try:
+                    await bridge.connect()
+                    backoff = INITIAL_BACKOFF
+                    async for frame in bridge.frames():
+                        # Phase 2 maps these into the message store +
+                        # thread queue; phase 1 logs and drops.
+                        self._log.info(
+                            "bridge frame dropped (phase 1): type=%s",
+                            frame.get("type", ""),
+                        )
+                finally:
+                    await bridge.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log.warning(
+                    "bridge WS disconnected (%s: %s), reconnecting in %ds",
+                    type(exc).__name__, exc, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
 
     async def _admit_thread_message(
         self,

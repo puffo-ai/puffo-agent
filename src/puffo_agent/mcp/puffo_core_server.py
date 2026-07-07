@@ -221,6 +221,18 @@ def _register_local_tools(
         return "\n".join(lines)
 
 
+class _BridgeNoKeysStore(KeyStore):
+    """Bridge transport (T23): the agent holds no local keys. Tools
+    that still hit a signed path get a clear error instead of a
+    FileNotFoundError, until phase 2 rewires them keyless."""
+
+    def load_identity(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+    def load_session(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+
 def build_server(
     slug: str,
     device_id: str,
@@ -232,8 +244,12 @@ def build_server(
     data_service_url: str,
     runtime_kind: str = "",
     harness: str = "",
+    transport: str = "",
 ) -> FastMCP:
-    ks = KeyStore(keystore_dir)
+    ks = (
+        _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
+        else KeyStore(keystore_dir)
+    )
     http = PuffoCoreHttpClient(server_url, ks, slug)
     data = DataClient(data_service_url, agent_id)
 
@@ -295,6 +311,7 @@ def _cfg_from_env() -> dict[str, str]:
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
+        "transport": os.environ.get("PUFFO_CORE_TRANSPORT", ""),
     }
 
 
