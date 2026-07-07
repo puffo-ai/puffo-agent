@@ -212,10 +212,16 @@ class CloudBridgeClient:
         recipient_slug: Optional[str] = None,
         space_id: Optional[str] = None,
         channel_id: Optional[str] = None,
+        reply_to_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
         timeout: float = 30.0,
     ) -> dict:
         # Pass EITHER recipient_slug (DM) OR space_id+channel_id
         # (channel); spec rejects mixed-shape frames as BAD_FRAME.
+        # ``reply_to_id`` / ``thread_root_id`` are route-agnostic thread
+        # linkage — the same snake_case field names a human/web message
+        # carries; added only when truthy so a top-level post stays
+        # shape-identical to the pre-threading frame.
         ws = await self._require_ws()
         client_ref = f"r_{uuid.uuid4().hex[:12]}"
         frame: dict[str, Any] = {
@@ -229,6 +235,10 @@ class CloudBridgeClient:
             frame["space_id"] = space_id
         if channel_id:
             frame["channel_id"] = channel_id
+        if reply_to_id:
+            frame["reply_to_id"] = reply_to_id
+        if thread_root_id:
+            frame["thread_root_id"] = thread_root_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._send_acks[client_ref] = fut
         await ws.send_json(frame)

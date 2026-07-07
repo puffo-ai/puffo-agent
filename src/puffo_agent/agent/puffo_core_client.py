@@ -810,6 +810,16 @@ class PuffoCoreMessageClient:
             try:
                 payload = self._payload_from_bridge_frame(frame)
                 if payload is not None:
+                    # Enrichment over the keyless path: the only sender
+                    # name achievable today is one the frame itself
+                    # carries. When present, pre-seed the profile cache so
+                    # the downstream ``_fetch_display_name`` is a cache hit
+                    # and fires NO HTTP (the signed /identities/profiles
+                    # route can't authenticate keyless — see the phase-2.5
+                    # gaps doc). Absent → the helper degrades to @slug as
+                    # before. Native frames never carry this, so their
+                    # path is untouched.
+                    self._preseed_frame_display_name(frame, payload)
                     await self._handle_plaintext_payload(payload)
             except Exception:
                 self._log.exception(
@@ -828,6 +838,45 @@ class PuffoCoreMessageClient:
             )
         else:
             self._log.debug("bridge frame ignored: type=%s", kind)
+
+    def _preseed_frame_display_name(
+        self, frame: dict, payload: MessagePayload,
+    ) -> None:
+        """If a bridge ``message`` frame carries the sender's display
+        name, prime the profile cache so the render path uses it with no
+        HTTP lookup.
+
+        This is the one enrichment the keyless wire permits today: the
+        Message frame has ``sender_slug`` but the signed profile route
+        (`/identities/profiles`) can't authenticate over the sandbox
+        token, so a name that isn't on the frame degrades to ``@slug``.
+        Reads defensively — ``sender_display_name`` first, then
+        ``display_name`` — and only seeds a non-empty name for a known
+        slug, so an absent/blank field leaves the cache untouched (never
+        pinning a false miss). ``avatar_url`` rides along when present.
+        Fail-soft: any error is swallowed so a malformed frame can't
+        break inbound delivery.
+        """
+        try:
+            slug = payload.sender_slug
+            if not slug:
+                return
+            name = (
+                frame.get("sender_display_name")
+                or frame.get("display_name")
+                or ""
+            )
+            name = name.strip() if isinstance(name, str) else ""
+            if not name:
+                return
+            avatar_url = frame.get("avatar_url") or ""
+            avatar_url = avatar_url.strip() if isinstance(avatar_url, str) else ""
+            self.set_profile(slug, name, avatar_url)
+        except Exception:
+            self._log.debug(
+                "bridge display-name pre-seed skipped (envelope_id=%s)",
+                frame.get("envelope_id"), exc_info=True,
+            )
 
     async def _handle_plaintext_payload(self, payload: MessagePayload) -> None:
         """Persist + surface a decoded message payload to the agent.
@@ -3819,8 +3868,11 @@ class PuffoCoreMessageClient:
             # crypto and fans out recipients. Empty channel_id ⇒ DM back
             # to the last DM sender; else a channel post (space resolved
             # from the same caches native uses). No encrypt_message /
-            # signed POST. Threaded ``root_id`` isn't wired on bridge yet
-            # (phase 3) — this replies top-level.
+            # signed POST. Threaded ``root_id`` rides the same snake_case
+            # ``thread_root_id`` / ``reply_to_id`` field names native
+            # stamps onto ``EncryptInput`` — passed unresolved (native's
+            # fallback path does too), so a reply threads under the id the
+            # daemon already validated on the inbound envelope.
             if channel_id:
                 target_space_id = self._channel_space.get(channel_id)
                 if not target_space_id:
@@ -3839,6 +3891,8 @@ class PuffoCoreMessageClient:
                     plaintext=text,
                     space_id=target_space_id,
                     channel_id=channel_id,
+                    thread_root_id=root_id or None,
+                    reply_to_id=root_id or None,
                 )
                 self._log.info(
                     "send_fallback_message[bridge] sent: kind=channel "
@@ -3854,7 +3908,10 @@ class PuffoCoreMessageClient:
                 )
                 return
             ack = await self._bridge.send_send(
-                plaintext=text, recipient_slug=recipient,
+                plaintext=text,
+                recipient_slug=recipient,
+                thread_root_id=root_id or None,
+                reply_to_id=root_id or None,
             )
             self._log.info(
                 "send_fallback_message[bridge] sent: kind=dm recipient=%s "

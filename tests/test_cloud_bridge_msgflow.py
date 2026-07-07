@@ -80,13 +80,16 @@ class FakeBridge:
 
     async def send_send(
         self, *, plaintext, recipient_slug=None, space_id=None,
-        channel_id=None, timeout: float = 30.0,
+        channel_id=None, reply_to_id=None, thread_root_id=None,
+        timeout: float = 30.0,
     ) -> dict:
         self.sent.append({
             "plaintext": plaintext,
             "recipient_slug": recipient_slug,
             "space_id": space_id,
             "channel_id": channel_id,
+            "reply_to_id": reply_to_id,
+            "thread_root_id": thread_root_id,
         })
         return dict(self._ack)
 
@@ -425,19 +428,278 @@ async def test_b_send_message_channel_uses_bridge_no_encrypt(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_b_send_message_threaded_note_on_bridge(tmp_path):
-    """root_id isn't wired on bridge yet — send top-level with a note."""
+async def test_b_send_message_channel_threads_on_bridge(tmp_path):
+    """root_id now threads on bridge (replaces the old top-level-note
+    test). ``send_send`` carries ``thread_root_id`` = the resolved TRUE
+    root of ``root_id`` and ``reply_to_id`` = the raw id the agent
+    passed. Seed a root + a reply so resolution makes a real hop
+    (resolved root != passed id), proving the resolver ran."""
     ms = MessageStore(str(tmp_path / "b_thread.db"))
+    await ms.mark_channel_space("ch_xyz", "sp_1")
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_xyz",
+        "space_id": "sp_1", "content": "root",
+        "sent_at": 1_700_000_000_000,
+        "thread_root_id": None, "reply_to_id": None,
+    })
+    await ms.store({
+        "envelope_id": "msg_reply", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_xyz",
+        "space_id": "sp_1", "content": "a reply",
+        "sent_at": 1_700_000_000_001,
+        "thread_root_id": "msg_root", "reply_to_id": "msg_root",
+    })
     bridge = FakeBridge()
     cfg = _tools_cfg(tmp_path, bridge=bridge, data_client=ms)
     tools = build_dispatch(cfg)
 
     result = await tools["send_message"](
-        channel="@alice-0001", text="reply", root_id="msg_parent",
+        channel="ch_xyz", text="reply", root_id="msg_reply",
     )
     assert len(bridge.sent) == 1
-    assert "top-level" in result.lower() or "phase 3" in result.lower() \
-        or "not wired" in result.lower()
+    sent = bridge.sent[0]
+    # Resolved to the true root, not the intermediate reply id.
+    assert sent["thread_root_id"] == "msg_root"
+    # Raw parent id the agent passed rides reply_to_id.
+    assert sent["reply_to_id"] == "msg_reply"
+    assert sent["space_id"] == "sp_1"
+    assert sent["channel_id"] == "ch_xyz"
+    # No stale "top-level" / "not wired" note — threading is live now.
+    assert "top-level" not in result.lower()
+    assert "not wired" not in result.lower()
+    assert "msg_bridgeack" in result
+
+
+@pytest.mark.asyncio
+async def test_b_send_message_dm_threads_on_bridge(tmp_path):
+    """DM route of ``send_message`` also threads. With the DM root seeded
+    locally, resolution + same-channel validation keep it, so both
+    ``thread_root_id`` and ``reply_to_id`` carry it — proving the DM
+    branch is wired, not silently dropping the ids."""
+    ms = MessageStore(str(tmp_path / "b_dm_thread.db"))
+    # Seed a real DM root so thread_root_id survives validation.
+    await ms.store({
+        "envelope_id": "dm_root", "envelope_kind": "dm",
+        "sender_slug": "alice-0001", "channel_id": None,
+        "space_id": None, "recipient_slug": "bot-0001",
+        "content": "root dm", "sent_at": 1_700_000_000_002,
+        "thread_root_id": None, "reply_to_id": None,
+    })
+    bridge = FakeBridge()
+    cfg = _tools_cfg(tmp_path, bridge=bridge, data_client=ms)
+    tools = build_dispatch(cfg)
+
+    result = await tools["send_message"](
+        channel="@alice-0001", text="reply", root_id="dm_root",
+    )
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["recipient_slug"] == "alice-0001"
+    assert sent["thread_root_id"] == "dm_root"
+    assert sent["reply_to_id"] == "dm_root"
+    assert "msg_bridgeack" in result
+
+
+@pytest.mark.asyncio
+async def test_send_fallback_message_threads_on_bridge(tmp_path):
+    """``send_fallback_message`` passes ``root_id`` through as BOTH
+    ``thread_root_id`` and ``reply_to_id`` on the bridge, for the channel
+    route and the DM route (native's fallback path threads unresolved
+    too)."""
+    bridge = FakeBridge()
+    client = _bridge_client(tmp_path, bridge, db="fallback_thread.db")
+    await client.store.mark_channel_space("ch_a", "sp_1")
+
+    # channel route
+    await client.send_fallback_message("ch_a", "chan reply", root_id="msg_root")
+    # DM route: stash a DM sender so empty channel_id routes to them.
+    client._last_dm_sender = "carol-0001"
+    await client.send_fallback_message("", "dm reply", root_id="msg_root2")
+
+    assert len(bridge.sent) == 2
+    chan = bridge.sent[0]
+    assert chan["channel_id"] == "ch_a" and chan["space_id"] == "sp_1"
+    assert chan["thread_root_id"] == "msg_root"
+    assert chan["reply_to_id"] == "msg_root"
+    dm = bridge.sent[1]
+    assert dm["recipient_slug"] == "carol-0001"
+    assert dm["thread_root_id"] == "msg_root2"
+    assert dm["reply_to_id"] == "msg_root2"
+
+
+@pytest.mark.asyncio
+async def test_inbound_thread_ids_surface_on_stored_row(tmp_path):
+    """IN: an inbound ``message`` frame carrying
+    ``thread_root_id``/``reply_to_id`` yields a stored row with those ids
+    populated. The parent root arrives on the same connection (same
+    channel) so the strict admit-time ``_validate_incoming_parent_id``
+    check keeps them instead of wiping to None."""
+    scripted = [
+        {
+            "type": "message", "envelope_id": "env_root_in",
+            "sender_slug": "alice-0001", "envelope_kind": "channel",
+            "space_id": "sp_1", "channel_id": "ch_a",
+            "sent_at": 1_700_000_000_100, "plaintext": "root",
+        },
+        {
+            "type": "message", "envelope_id": "env_reply_in",
+            "sender_slug": "alice-0001", "envelope_kind": "channel",
+            "space_id": "sp_1", "channel_id": "ch_a",
+            "sent_at": 1_700_000_000_200, "plaintext": "threaded inbound",
+            "thread_root_id": "env_root_in", "reply_to_id": "env_root_in",
+        },
+    ]
+    bridge = FakeBridge(scripted=scripted)
+    client = _bridge_client(tmp_path, bridge, db="in_thread.db")
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        if any(m.get("envelope_id") == "env_reply_in" for m in batch):
+            done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    row = await client.store.get_message_by_envelope("env_reply_in")
+    assert row is not None
+    assert row.thread_root_id == "env_root_in"
+    assert row.reply_to_id == "env_root_in"
+
+
+@pytest.mark.asyncio
+async def test_enrichment_prefers_frame_display_name_no_http(tmp_path):
+    """c-1: when the inbound frame carries a sender display name, the
+    rendered ``sender_display_name`` uses it and NO
+    ``/identities/profiles`` GET is made (the pre-seed makes
+    ``_fetch_display_name`` a cache hit)."""
+    calls: list[str] = []
+
+    async def _recording_get(path, *a, **k):
+        calls.append(path)
+        return {}
+
+    bridge = FakeBridge(scripted=[{
+        "type": "message", "envelope_id": "env_named",
+        "sender_slug": "alice-0001", "envelope_kind": "channel",
+        "space_id": "sp_1", "channel_id": "ch_a",
+        "sent_at": 1_700_000_000_300, "plaintext": "hi",
+        "sender_display_name": "Alice Cooper",
+    }])
+    client = _bridge_client(tmp_path, bridge, db="enrich_named.db")
+    client.http.get = _recording_get  # type: ignore[method-assign]
+
+    surfaced: list = []
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        surfaced.append(batch)
+        done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    named = [m for m in surfaced[0] if m["envelope_id"] == "env_named"][0]
+    assert named["sender_display_name"] == "Alice Cooper"
+    # No /identities/profiles GET at all — resolution came off the frame.
+    assert not any("identities/profiles" in p for p in calls), calls
+    # The pre-seed actually populated the profile cache.
+    assert client._profile_cache.get("alice-0001", (None,))[0] == "Alice Cooper"
+
+
+@pytest.mark.asyncio
+async def test_enrichment_degrades_without_frame_name(tmp_path):
+    """c-2: without a frame-carried name the helpers degrade to an empty
+    display name (render falls back to @slug) and never raise."""
+    bridge = FakeBridge(scripted=[{
+        "type": "message", "envelope_id": "env_unnamed",
+        "sender_slug": "bob-0001", "envelope_kind": "channel",
+        "space_id": "sp_1", "channel_id": "ch_a",
+        "sent_at": 1_700_000_000_400, "plaintext": "hi",
+        # no sender_display_name on the frame
+    }])
+    client = _bridge_client(tmp_path, bridge, db="enrich_unnamed.db")
+
+    surfaced: list = []
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        surfaced.append(batch)
+        done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    named = [m for m in surfaced[0] if m["envelope_id"] == "env_unnamed"][0]
+    assert named["sender_display_name"] == ""  # degraded
+    assert named["sender_slug"] == "bob-0001"
+
+
+def test_preseed_frame_display_name_unit(tmp_path):
+    """Focused: the pre-seed helper seeds a non-empty frame name for a
+    known slug, and leaves the cache untouched when the name is
+    absent/blank or the slug is missing (never pins a false miss)."""
+    client = _bridge_client(tmp_path, FakeBridge(), db="preseed.db")
+
+    from puffo_agent.crypto.message import MessagePayload as _MP
+
+    def _payload(slug):
+        return _MP(
+            payload_type="message", version=1, envelope_id="e",
+            envelope_kind="channel", sender_slug=slug, sender_subkey_id="",
+            sent_at=1, message_nonce="", content_type="text/plain",
+            content="x", is_visible_to_human=True, space_id="sp_1",
+            channel_id="ch_a", recipient_slug=None,
+        )
+
+    # present → seeds
+    client._preseed_frame_display_name(
+        {"sender_display_name": "Alice Cooper", "avatar_url": "http://a/x.png"},
+        _payload("alice-0001"),
+    )
+    assert client._profile_cache["alice-0001"][0] == "Alice Cooper"
+    assert client._profile_cache["alice-0001"][1] == "http://a/x.png"
+
+    # blank name → cache untouched
+    client._preseed_frame_display_name(
+        {"sender_display_name": "   "}, _payload("bob-0001"),
+    )
+    assert "bob-0001" not in client._profile_cache
+
+    # absent name → cache untouched
+    client._preseed_frame_display_name({}, _payload("dave-0001"))
+    assert "dave-0001" not in client._profile_cache
+
+    # missing slug → no crash, nothing seeded
+    client._preseed_frame_display_name(
+        {"sender_display_name": "Nobody"}, _payload(""),
+    )
+    assert "" not in client._profile_cache
+
+    # fallback key `display_name` also works
+    client._preseed_frame_display_name(
+        {"display_name": "Eve X"}, _payload("eve-0001"),
+    )
+    assert client._profile_cache["eve-0001"][0] == "Eve X"
+
+
+def test_phase25_gap_doc_names_all_routes():
+    """c-2 (doc): the phase-2.5 server-gaps doc exists and names the
+    inbound Message frame (thread ids + display name) plus the three
+    token-read REST routes the keyless enrichment path needs."""
+    from pathlib import Path
+
+    doc = (
+        Path(__file__).resolve().parents[1]
+        / "roadmap" / "cloud-agent" / "PHASE25-SERVER-ROUTE-GAPS.md"
+    )
+    assert doc.is_file(), f"missing gap doc: {doc}"
+    text = doc.read_text(encoding="utf-8")
+    # Inbound Message frame + the fields the agent already reads/pre-seeds.
+    assert "Message" in text
+    assert "thread_root_id" in text and "reply_to_id" in text
+    assert "sender_display_name" in text
+    # The three token-auth REST read routes.
+    assert "identities/profiles" in text
+    assert "/spaces/{space_id}/channels" in text
+    assert "/spaces/{space_id}/members" in text
 
 
 # --------------------------------------------------------------------------

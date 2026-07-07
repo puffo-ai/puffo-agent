@@ -455,34 +455,52 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # T23 bridge transport: send plaintext; the server holds all
             # crypto and fans out recipients. DM ('@slug') vs channel
             # ('ch_') routing only — no device-key fetch, no encrypt, no
-            # signed POST. Threaded replies aren't wired on bridge yet
-            # (phase 3), so a non-empty root_id sends top-level with a note.
-            root_note = ""
-            if root_id:
-                root_note = (
-                    " (note: threaded replies aren't wired on bridge "
-                    "transport yet — sent as a top-level post)"
-                )
+            # signed POST. Threaded replies carry the same snake_case
+            # ``thread_root_id`` / ``reply_to_id`` field names a human/web
+            # message uses: ``thread_root_id`` is the resolved+validated
+            # true root (same resolvers the native branch runs, driven off
+            # the local store — no network), ``reply_to_id`` is the raw
+            # parent id the agent passed. Resolution is fail-soft — a miss
+            # falls through with a note and the send still completes.
             if channel_ref.startswith("@"):
                 bridge_recipient = channel_ref[1:]
                 if not bridge_recipient:
                     raise RuntimeError("DM recipient slug is required after '@'")
+                resolved_root, root_note = await _resolve_root_id(
+                    root_id, cfg.data_client,
+                )
+                resolved_root, validate_note = await _validate_root_same_channel(
+                    resolved_root, None, None, cfg.data_client,
+                )
                 ack = await cfg.bridge_client.send_send(
-                    plaintext=text, recipient_slug=bridge_recipient,
+                    plaintext=text,
+                    recipient_slug=bridge_recipient,
+                    thread_root_id=resolved_root or None,
+                    reply_to_id=root_id or None,
                 )
             else:
                 bridge_channel_id = channel_ref
                 bridge_space_id = await _resolve_channel_space(
                     cfg, bridge_channel_id,
                 )
+                resolved_root, root_note = await _resolve_root_id(
+                    root_id, cfg.data_client,
+                )
+                resolved_root, validate_note = await _validate_root_same_channel(
+                    resolved_root, bridge_channel_id, bridge_space_id,
+                    cfg.data_client,
+                )
                 ack = await cfg.bridge_client.send_send(
                     plaintext=text,
                     space_id=bridge_space_id,
                     channel_id=bridge_channel_id,
+                    thread_root_id=resolved_root or None,
+                    reply_to_id=root_id or None,
                 )
             return (
                 f"posted {(ack or {}).get('envelope_id', '?')} to {channel}"
                 f"{root_note}"
+                f"{validate_note}"
             )
 
         if channel_ref.startswith("@"):
