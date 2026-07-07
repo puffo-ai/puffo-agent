@@ -525,7 +525,8 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     )
     cfg.save()
 
-    (target / "memory").mkdir(exist_ok=True)
+    from ..agent.memory import ensure_memory_tree
+    ensure_memory_tree(target / "memory")
 
     profile_path = target / "profile.md"
     if args.profile and Path(args.profile).exists():
@@ -1498,6 +1499,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
     """Re-sync the shared primer + rebuild the listed agents' CLAUDE.md.
     ensure_shared_primer runs on every worker startup, so this is only
     needed to force a rebuild without waiting for a message."""
+    from ..agent.memory import BriefingCompileError
     from ..agent.shared_content import (
         ensure_shared_primer,
         rebuild_agent_claude_md,
@@ -1522,14 +1524,23 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
             print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
             rc = 2
             continue
-        rebuild_agent_claude_md(
-            shared_dir=shared_dir,
-            profile_path=cfg.resolve_profile_path(),
-            memory_dir=cfg.resolve_memory_dir(),
-            workspace_dir=cfg.resolve_workspace_dir(),
-            claude_user_dir=agent_claude_user_dir(agent_id),
-            gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
-        )
+        try:
+            rebuild_agent_claude_md(
+                shared_dir=shared_dir,
+                profile_path=cfg.resolve_profile_path(),
+                memory_dir=cfg.resolve_memory_dir(),
+                workspace_dir=cfg.resolve_workspace_dir(),
+                claude_user_dir=agent_claude_user_dir(agent_id),
+                gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+                agent_id=agent_id,
+                display_name=cfg.display_name,
+                role=cfg.role,
+                role_short=cfg.role_short,
+            )
+        except BriefingCompileError as exc:
+            print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
         rebuilt.append(agent_id)
         print(f"rebuilt CLAUDE.md for {agent_id!r}")
 
