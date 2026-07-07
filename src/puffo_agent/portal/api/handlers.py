@@ -1891,6 +1891,52 @@ async def agents_import(request: web.Request) -> web.Response:
     return web.json_response(body)
 
 
+async def archive_check(request: web.Request) -> web.Response:
+    # Walks ~/.puffo-agent/archived/*/, probes each device server-side,
+    # and re-issues the self-revoke for any that aren't yet revoked.
+    # Only returns rows for archived agents owned by the paired operator.
+    from .. import import_agents as imp
+
+    paired_root = request["paired_root_pubkey"]
+    results = await imp.sweep_archive_check()
+    filtered = [r for r in results if r.owner_root_pubkey == paired_root]
+    body = {
+        "results": [
+            {
+                "dir_name": r.dir_name,
+                "slug": r.slug,
+                "device_id": r.device_id,
+                "outcome": r.outcome.value,
+                "detail": r.detail,
+            }
+            for r in filtered
+        ],
+        "summary": {
+            "total": len(filtered),
+            "consistent": sum(
+                1 for r in filtered if r.outcome is imp.ArchiveCheckOutcome.CONSISTENT
+            ),
+            "reconciled": sum(
+                1 for r in filtered if r.outcome is imp.ArchiveCheckOutcome.RECONCILED
+            ),
+            "problems": sum(
+                1 for r in filtered
+                if r.outcome in (
+                    imp.ArchiveCheckOutcome.UNREACHABLE,
+                    imp.ArchiveCheckOutcome.NO_KEYS,
+                    imp.ArchiveCheckOutcome.DEVICE_NOT_FOUND,
+                )
+            ),
+        },
+    }
+    logger.info(
+        "bridge: archive-check total=%d consistent=%d reconciled=%d problems=%d",
+        body["summary"]["total"], body["summary"]["consistent"],
+        body["summary"]["reconciled"], body["summary"]["problems"],
+    )
+    return web.json_response(body)
+
+
 async def agent_revoke_pending(request: web.Request) -> web.Response:
     from .. import import_agents as imp
 

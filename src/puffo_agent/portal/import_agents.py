@@ -768,3 +768,174 @@ async def sweep_archived_pending_revokes() -> int:
         if outcome is _RetryOutcome.SUCCEEDED:
             retried += 1
     return retried
+
+
+class ArchiveCheckOutcome(enum.Enum):
+    CONSISTENT = "consistent"                # server already has the revocation
+    RECONCILED = "reconciled"                # device was active; we just revoked it
+    NO_KEYS = "no_keys"                      # keystore missing / unparseable
+    DEVICE_NOT_FOUND = "device_not_found"    # server never had this device_id
+    UNREACHABLE = "unreachable"              # network / server / other failure
+
+
+@dataclass
+class ArchiveCheckResult:
+    dir_name: str                # basename of the archived dir
+    slug: str
+    device_id: str
+    outcome: ArchiveCheckOutcome
+    detail: str = ""
+    owner_root_pubkey: str = ""  # from identity_cert.declared_operator_public_key
+
+
+def _read_archived_puffo_core(archived_agent_dir: Path) -> tuple[str, str, str] | None:
+    # (server_url, slug, device_id) from archived agent.yml, or None if
+    # the file is missing / unreadable / lacks the puffo_core block.
+    import yaml
+    path = archived_agent_dir / "agent.yml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    pc = raw.get("puffo_core") or {}
+    slug = pc.get("slug") or ""
+    server_url = pc.get("server_url") or ""
+    device_id = pc.get("device_id") or ""
+    if not (slug and server_url and device_id):
+        return None
+    return server_url, slug, device_id
+
+
+async def check_archived_device(archived_agent_dir: Path) -> ArchiveCheckResult:
+    dir_name = archived_agent_dir.name
+    parsed = _read_archived_puffo_core(archived_agent_dir)
+    if parsed is None:
+        return ArchiveCheckResult(
+            dir_name=dir_name, slug="", device_id="",
+            outcome=ArchiveCheckOutcome.NO_KEYS,
+            detail="agent.yml missing or lacks puffo_core.{server_url,slug,device_id}",
+        )
+    server_url, slug, device_id = parsed
+    try:
+        identity = KeyStore(archived_agent_dir / "keys").load_identity(slug)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        return ArchiveCheckResult(
+            dir_name=dir_name, slug=slug, device_id=device_id,
+            outcome=ArchiveCheckOutcome.NO_KEYS, detail=f"{type(exc).__name__}: {exc}",
+        )
+    owner_pk = ""
+    if identity.identity_cert_json:
+        try:
+            cert = json.loads(identity.identity_cert_json)
+            op = cert.get("declared_operator_public_key") if isinstance(cert, dict) else None
+            if isinstance(op, str):
+                owner_pk = op
+        except (TypeError, ValueError):
+            pass
+    try:
+        root_signing = Ed25519KeyPair.from_secret_bytes(decode_secret(identity.root_secret_key))
+        device_signing = Ed25519KeyPair.from_secret_bytes(
+            decode_secret(identity.device_signing_secret_key)
+        )
+    except Exception as exc:  # noqa: BLE001
+        return ArchiveCheckResult(
+            dir_name=dir_name, slug=slug, device_id=device_id,
+            outcome=ArchiveCheckOutcome.NO_KEYS, detail=f"key decode failed: {exc}",
+            owner_root_pubkey=owner_pk,
+        )
+
+    try:
+        async with _remote_http_session(server_url) as session:
+            # Probe: try to register a fresh session subkey. Server's
+            # subkey handler rejects revoked devices with 403 DEVICE_REVOKED.
+            subkey = Ed25519KeyPair.generate()
+            cert = create_subkey_cert(device_signing, device_id, subkey.public_key_bytes())
+            body_bytes = json.dumps(
+                {"subkey_cert": cert}, separators=(",", ":")
+            ).encode("utf-8")
+            headers = sign_request(
+                signing_key=device_signing,
+                slug=slug,
+                signer_id=device_id,
+                method="POST",
+                path="/devices/subkeys",
+                body=body_bytes,
+            ).to_dict()
+            async with session.post(
+                f"{server_url.rstrip('/')}/devices/subkeys",
+                data=body_bytes,
+                headers=headers,
+            ) as resp:
+                status = resp.status
+                text = await resp.text()
+            if status == 403 and "DEVICE_REVOKED" in text:
+                return ArchiveCheckResult(
+                    dir_name=dir_name, slug=slug, device_id=device_id,
+                    outcome=ArchiveCheckOutcome.CONSISTENT,
+                    owner_root_pubkey=owner_pk,
+                )
+            if status == 400 and "DEVICE_NOT_FOUND" in text:
+                return ArchiveCheckResult(
+                    dir_name=dir_name, slug=slug, device_id=device_id,
+                    outcome=ArchiveCheckOutcome.DEVICE_NOT_FOUND,
+                    owner_root_pubkey=owner_pk,
+                )
+            if status >= 400:
+                return ArchiveCheckResult(
+                    dir_name=dir_name, slug=slug, device_id=device_id,
+                    outcome=ArchiveCheckOutcome.UNREACHABLE,
+                    detail=f"subkey probe returned {status}: {text[:200]}",
+                    owner_root_pubkey=owner_pk,
+                )
+            # Device is active — post revocation with the fresh subkey.
+            revocation = create_device_revocation(root_signing, device_id)
+            await _signed_post(
+                session,
+                server_url=server_url,
+                path=f"/devices/{device_id}/revoke",
+                signer_key=subkey,
+                signer_id=cert["subkey_id"],
+                slug=slug,
+                body_dict=revocation,
+            )
+    except ImportError as exc:
+        return ArchiveCheckResult(
+            dir_name=dir_name, slug=slug, device_id=device_id,
+            outcome=ArchiveCheckOutcome.UNREACHABLE, detail=str(exc),
+            owner_root_pubkey=owner_pk,
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+        return ArchiveCheckResult(
+            dir_name=dir_name, slug=slug, device_id=device_id,
+            outcome=ArchiveCheckOutcome.UNREACHABLE,
+            detail=f"{type(exc).__name__}: {exc}",
+            owner_root_pubkey=owner_pk,
+        )
+
+    # Revoke succeeded — clear any stale pending_revoke marker.
+    marker = archived_pending_revoke_path(archived_agent_dir)
+    if marker.exists():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    return ArchiveCheckResult(
+        dir_name=dir_name, slug=slug, device_id=device_id,
+        outcome=ArchiveCheckOutcome.RECONCILED,
+        owner_root_pubkey=owner_pk,
+    )
+
+
+async def sweep_archive_check() -> list[ArchiveCheckResult]:
+    # Walks ~/.puffo-agent/archived/*/ and probes every archived agent.
+    from .state import archived_dir
+
+    root = archived_dir()
+    if not root.exists():
+        return []
+    results: list[ArchiveCheckResult] = []
+    for entry in sorted(root.iterdir(), key=lambda p: p.name):
+        if not entry.is_dir():
+            continue
+        results.append(await check_archived_device(entry))
+    return results

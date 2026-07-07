@@ -1164,6 +1164,47 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     return asyncio.run(_archive_async())
 
 
+_ARCHIVE_CHECK_MARK = {
+    "consistent": "ok",
+    "reconciled": "revoked",
+    "device_not_found": "device-not-found",
+    "no_keys": "no-keys",
+    "unreachable": "unreachable",
+}
+
+
+def format_archive_check_results(results) -> tuple[str, int]:
+    # Returns (printable text, rc). rc=1 if any result needs
+    # operator attention (unreachable / no-keys / device-not-found).
+    if not results:
+        return "no archived agents to check", 0
+    lines = []
+    for r in results:
+        line = f"[{_ARCHIVE_CHECK_MARK[r.outcome.value]}] {r.dir_name}"
+        if r.detail:
+            line += f"  ({r.detail})"
+        lines.append(line)
+    reconciled = sum(1 for r in results if r.outcome.value == "reconciled")
+    problems = sum(
+        1 for r in results
+        if r.outcome.value in ("unreachable", "no_keys", "device_not_found")
+    )
+    lines.append(
+        f"summary: {len(results)} checked, {reconciled} revoked, "
+        f"{problems} needing attention"
+    )
+    return "\n".join(lines), (0 if problems == 0 else 1)
+
+
+def cmd_agent_archive_check(args: argparse.Namespace) -> int:
+    from .import_agents import sweep_archive_check
+
+    results = asyncio.run(sweep_archive_check())
+    text, rc = format_archive_check_results(results)
+    print(text)
+    return rc
+
+
 def cmd_agent_edit(args: argparse.Namespace) -> int:
     agent_id = args.id
     if not agent_yml_path(agent_id).exists():
@@ -1888,6 +1929,15 @@ def build_parser() -> argparse.ArgumentParser:
     archive = agent_sub.add_parser("archive", help="Stop and archive an agent to ~/.puffo-agent/archived/")
     archive.add_argument("id")
     archive.set_defaults(func=cmd_agent_archive)
+
+    archive_check = agent_sub.add_parser(
+        "archive-check",
+        help=(
+            "Verify every archived agent is also revoked server-side; "
+            "re-issue the self-revoke for any that aren't."
+        ),
+    )
+    archive_check.set_defaults(func=cmd_agent_archive_check)
 
     edit = agent_sub.add_parser("edit", help="Open the agent's profile.md in $EDITOR")
     edit.add_argument("id")

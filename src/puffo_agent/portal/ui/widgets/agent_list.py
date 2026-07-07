@@ -155,6 +155,7 @@ class AgentList(QWidget):
     agent_selected = Signal(object)
     # Background import worker → main thread; bool = success, str = summary.
     _import_done = Signal(bool, str)
+    _archive_check_done = Signal(bool, str)
 
     def __init__(
         self,
@@ -168,6 +169,7 @@ class AgentList(QWidget):
         self._running_only = True
         self._build()
         self._import_done.connect(self._on_import_finished)
+        self._archive_check_done.connect(self._on_archive_check_finished)
         if avatar_cache is not None:
             avatar_cache.avatar_ready.connect(self._on_avatar_ready)
 
@@ -183,6 +185,13 @@ class AgentList(QWidget):
         self._import_btn = QPushButton("Import agent")
         self._import_btn.clicked.connect(self._on_import_clicked)
         t_layout.addWidget(self._import_btn)
+        self._archive_check_btn = QPushButton("Archive check")
+        self._archive_check_btn.setToolTip(
+            "Verify every locally-archived agent is also revoked "
+            "server-side; re-issue the revoke for any that aren't."
+        )
+        self._archive_check_btn.clicked.connect(self._on_archive_check_clicked)
+        t_layout.addWidget(self._archive_check_btn)
         t_layout.addStretch(1)
         layout.addWidget(toolbar)
 
@@ -313,6 +322,62 @@ class AgentList(QWidget):
         if success:
             QMessageBox.information(self, title, summary)
             self.refresh()
+        else:
+            QMessageBox.warning(self, title, summary)
+
+    def _on_archive_check_clicked(self) -> None:
+        self._archive_check_btn.setEnabled(False)
+        self._archive_check_btn.setText("Checking…")
+
+        def worker() -> None:
+            try:
+                from ...import_agents import (
+                    ArchiveCheckOutcome,
+                    sweep_archive_check,
+                )
+                results = asyncio.run(sweep_archive_check())
+                if not results:
+                    self._archive_check_done.emit(True, "no archived agents to check")
+                    return
+                mark = {
+                    ArchiveCheckOutcome.CONSISTENT: "ok",
+                    ArchiveCheckOutcome.RECONCILED: "revoked",
+                    ArchiveCheckOutcome.DEVICE_NOT_FOUND: "device-not-found",
+                    ArchiveCheckOutcome.NO_KEYS: "no-keys",
+                    ArchiveCheckOutcome.UNREACHABLE: "unreachable",
+                }
+                lines = [
+                    f"[{mark[r.outcome]}] {r.dir_name}"
+                    + (f"  ({r.detail})" if r.detail else "")
+                    for r in results
+                ]
+                reconciled = sum(
+                    1 for r in results if r.outcome is ArchiveCheckOutcome.RECONCILED
+                )
+                problems = sum(
+                    1 for r in results
+                    if r.outcome in (
+                        ArchiveCheckOutcome.UNREACHABLE,
+                        ArchiveCheckOutcome.NO_KEYS,
+                        ArchiveCheckOutcome.DEVICE_NOT_FOUND,
+                    )
+                )
+                lines.append(
+                    f"\n{len(results)} checked, {reconciled} revoked, "
+                    f"{problems} needing attention"
+                )
+                self._archive_check_done.emit(problems == 0, "\n".join(lines))
+            except Exception as exc:
+                self._archive_check_done.emit(False, f"{type(exc).__name__}: {exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_archive_check_finished(self, ok: bool, summary: str) -> None:
+        self._archive_check_btn.setEnabled(True)
+        self._archive_check_btn.setText("Archive check")
+        title = "Archive check" + ("" if ok else " — attention required")
+        if ok:
+            QMessageBox.information(self, title, summary)
         else:
             QMessageBox.warning(self, title, summary)
 

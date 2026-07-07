@@ -61,6 +61,7 @@ def build_app(cfg: BridgeConfig, ws_local_hub=None) -> web.Application:
     app.router.add_get("/v1/agents/{id}/claude-md", h.get_claude_md)
     app.router.add_post("/v1/agents/export", h.agents_export)
     app.router.add_post("/v1/agents/import", h.agents_import)
+    app.router.add_post("/v1/agents/archive-check", h.archive_check)
     app.router.add_post("/v1/agents/{id}/revoke-pending", h.agent_revoke_pending)
     return app
 
