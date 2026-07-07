@@ -243,11 +243,14 @@ def puffo_core_mcp_env(
     rpc_url: str = "http://127.0.0.1:63385",
     runtime_kind: str = "",
     harness: str = "",
+    memory_dir: str = "",
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess. The MCP never
     touches ``messages.db`` or ``~/.claude.json`` directly — the
     daemon owns both. cli-docker rewrites the loopback URLs to
-    ``host.docker.internal``."""
+    ``host.docker.internal``. ``memory_dir`` (optional) pins the
+    memory root for the M3 memory tools; when empty the server falls
+    back to the workspace-sibling ``memory/`` dir."""
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -266,6 +269,8 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
+    if memory_dir:
+        env["PUFFO_MEMORY_DIR"] = memory_dir
     # codex only forwards [mcp_servers.puffo.env] to the subprocess,
     # so CODEX_HOME must be pinned explicitly or list_mcp_servers
     # would read the operator's host config instead of the agent's.
@@ -285,6 +290,7 @@ def puffo_core_stdio_sdk_config(
     keystore_dir: str,
     workspace: str,
     agent_id: str,
+    memory_dir: str = "",
 ) -> dict:
     """Return the ``mcp_servers`` config dict for the SDK adapter."""
     return {
@@ -301,6 +307,7 @@ def puffo_core_stdio_sdk_config(
                 workspace=workspace,
                 agent_id=agent_id,
                 runtime_kind="sdk-local",
+                memory_dir=memory_dir,
             ),
         }
     }

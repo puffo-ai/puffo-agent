@@ -292,6 +292,7 @@ class DockerCLIAdapter(Adapter):
         # No PUFFO_CORE_DB_PATH — MCP routes data reads through the
         # daemon's data service at PUFFO_DATA_SERVICE_URL.
         env["PUFFO_WORKSPACE"] = "/workspace"
+        env["PUFFO_MEMORY_DIR"] = "/home/agent/.puffo-agent-state/memory"
         env["PUFFO_RUNTIME_KIND"] = "cli-docker"
         env["PUFFO_HARNESS"] = "hermes"
         env["PYTHONPATH"] = "/opt/puffoagent-pkg"
@@ -731,6 +732,7 @@ class DockerCLIAdapter(Adapter):
             # No PUFFO_CORE_DB_PATH — SQLite reads route via the
             # daemon's data service.
             env["PUFFO_WORKSPACE"] = "/workspace"
+            env["PUFFO_MEMORY_DIR"] = "/home/agent/.puffo-agent-state/memory"
             env["PUFFO_RUNTIME_KIND"] = "cli-docker"
             env["PUFFO_HARNESS"] = self.harness.name()
             env["PYTHONPATH"] = "/opt/puffoagent-pkg"
@@ -1166,6 +1168,7 @@ def _puffo_gemini_mcp_entry(
     env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
     # No PUFFO_CORE_DB_PATH — see mcp/data_client.py.
     env["PUFFO_WORKSPACE"] = "/workspace"
+    env["PUFFO_MEMORY_DIR"] = "/home/agent/.puffo-agent-state/memory"
     env["PUFFO_RUNTIME_KIND"] = "cli-docker"
     env["PUFFO_HARNESS"] = "gemini-cli"
     env["PYTHONPATH"] = "/opt/puffoagent-pkg"

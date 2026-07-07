@@ -138,6 +138,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
+                memory_dir=str(agent_cfg.resolve_memory_dir()),
             )
         return adapter
 
@@ -220,6 +221,10 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-docker",
                 harness=agent_cfg.runtime.harness,
+                # MCP runs in-container; the agent dir is bind-mounted
+                # at /home/agent/.puffo-agent-state (docker_cli also
+                # pins this at its env-override sites).
+                memory_dir="/home/agent/.puffo-agent-state/memory",
             )
         return adapter
 
@@ -268,6 +273,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
+                memory_dir=str(agent_cfg.resolve_memory_dir()),
             )
         return adapter
 

@@ -114,13 +114,14 @@ class BriefingCompileError(MemoryStoreError):
         )
 
 
-def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> None:
+def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> bool:
     """Drop ``refresh_agent.flag`` so the worker rebuilds the prompt
     artifacts on the next batch. Best-effort; same payload shape as
     ``profile_sync.write_refresh_agent_flag``. No-op without a
-    workspace dir."""
+    workspace dir. Returns True iff the flag was written (the M3
+    tools layer maps this to the ``provider_reload`` post-effect)."""
     if not workspace_dir:
-        return
+        return False
     from ..portal.state import refresh_agent_flag_path
 
     flag_path = refresh_agent_flag_path(Path(workspace_dir))
@@ -138,6 +139,8 @@ def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> None:
         logger.warning(
             "refresh_agent.flag write failed (%s): %s", reason, exc,
         )
+        return False
+    return True
 
 
 def ensure_memory_tree(memory_root: Path) -> None:
