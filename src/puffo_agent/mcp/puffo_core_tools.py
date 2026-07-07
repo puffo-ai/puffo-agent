@@ -109,8 +109,10 @@ class PuffoCoreToolsConfig:
     # T23 keyless bridge transport (``CloudBridgeClient``). Populated only
     # at the in-process ws-local site (from ``client._bridge``); the
     # subprocess/RPC MCP path leaves it None → native encrypt+signed POST.
-    # When set, ``send_message`` sends plaintext via the bridge and
-    # ``send_message_with_attachments`` refuses (phase 3).
+    # When set, both ``send_message`` and ``send_message_with_attachments``
+    # send plaintext via the bridge: attachment bytes are uploaded keyless
+    # (``bridge_client.upload_blob``) and referenced by ``blob_id`` in the
+    # frame's top-level ``attachments`` — no encrypt, no signed POST.
     bridge_client: Any = None
 
 
@@ -1038,13 +1040,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "send_message_with_attachments: agent has no configured "
                 "workspace dir"
             )
-        if cfg.bridge_client is not None:
-            # T23 phase 3: attachments over the keyless bridge aren't
-            # wired yet. Fail loud rather than silently encrypt (native
-            # path) or crash — a bridge agent has no signed-crypto seam.
-            raise RuntimeError(
-                "attachments are not supported on bridge transport yet"
-            )
         if not paths or not isinstance(paths, list):
             raise RuntimeError(
                 "send_message_with_attachments: paths is required "
@@ -1085,6 +1080,99 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     f"send_message_with_attachments: {rel!r} is not a file"
                 )
             targets.append(target)
+
+        if cfg.bridge_client is not None:
+            # T23 bridge transport: the server holds the at-rest blob
+            # store, so we upload each file's PLAINTEXT bytes keyless
+            # (``upload_blob`` → ``x-sandbox-token``, raw body) and pass
+            # the returned ``blob_id``s as top-level ``AttachmentRef``s
+            # into the same plaintext ``send`` frame ``send_message``
+            # uses. No ``encrypt_attachment``, no device-key fetch, no
+            # signed ``/messages`` POST — a bridge agent has no
+            # signed-crypto seam. DM vs channel routing + fail-soft
+            # thread resolution mirror ``send_message``'s bridge branch.
+            channel_ref = channel.strip()
+            if channel_ref.startswith("#"):
+                raise RuntimeError(
+                    "'#<name>' channel addressing isn't supported; pass "
+                    "the channel id directly."
+                )
+            refs: list[dict] = []
+            total_bytes = 0
+            for target in targets:
+                plaintext = target.read_bytes()
+                # Keep the native 8 MiB pre-check so an oversized file
+                # fails before we burn an upload round-trip.
+                if len(plaintext) > 8 * 1024 * 1024:
+                    raise RuntimeError(
+                        f"send_message_with_attachments: {target.name!r} is "
+                        f"{len(plaintext)} bytes (server caps at 8 MiB)"
+                    )
+                mime_type, _ = mimetypes.guess_type(target.name)
+                mime_type = mime_type or "application/octet-stream"
+                up = await cfg.bridge_client.upload_blob(plaintext)
+                blob_id = up.get("blob_id") if isinstance(up, dict) else None
+                if not blob_id:
+                    raise RuntimeError(
+                        f"send_message_with_attachments: bridge returned no "
+                        f"blob_id for {target.name!r} ({up!r})"
+                    )
+                refs.append({
+                    "blob_id": blob_id,
+                    "filename": target.name,
+                    "mime_type": mime_type,
+                    "size_bytes": len(plaintext),
+                })
+                total_bytes += len(plaintext)
+
+            if channel_ref.startswith("@"):
+                bridge_recipient = channel_ref[1:]
+                if not bridge_recipient:
+                    raise RuntimeError(
+                        "DM recipient slug is required after '@'"
+                    )
+                resolved_root, root_note = await _resolve_root_id(
+                    root_id, cfg.data_client,
+                )
+                resolved_root, validate_note = await _validate_root_same_channel(
+                    resolved_root, None, None, cfg.data_client,
+                )
+                ack = await cfg.bridge_client.send_send(
+                    plaintext=caption,
+                    recipient_slug=bridge_recipient,
+                    attachments=refs,
+                    thread_root_id=resolved_root or None,
+                    reply_to_id=root_id or None,
+                )
+            else:
+                bridge_channel_id = channel_ref
+                bridge_space_id = await _resolve_channel_space(
+                    cfg, bridge_channel_id,
+                )
+                resolved_root, root_note = await _resolve_root_id(
+                    root_id, cfg.data_client,
+                )
+                resolved_root, validate_note = await _validate_root_same_channel(
+                    resolved_root, bridge_channel_id, bridge_space_id,
+                    cfg.data_client,
+                )
+                ack = await cfg.bridge_client.send_send(
+                    plaintext=caption,
+                    space_id=bridge_space_id,
+                    channel_id=bridge_channel_id,
+                    attachments=refs,
+                    thread_root_id=resolved_root or None,
+                    reply_to_id=root_id or None,
+                )
+            names = ", ".join(t.name for t in targets)
+            thread_note = f" in thread {resolved_root}" if resolved_root else ""
+            return (
+                f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} "
+                f"bytes total) to {channel}{thread_note} "
+                f"(envelope_id {(ack or {}).get('envelope_id', '?')})"
+                f"{root_note}"
+                f"{validate_note}"
+            )
 
         # Encrypt + upload each file. ``blob_id`` is patched in
         # after /blobs/upload returns — AAD doesn't depend on it.

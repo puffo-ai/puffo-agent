@@ -60,6 +60,10 @@ class CloudBridgeClient:
     ) -> None:
         ws_base = cloud_url.replace("http", "ws", 1)
         self._url = f"{ws_base.rstrip('/')}/v2/cloud-agents/subscribe"
+        # Keep the original http(s):// base for the keyless blob REST
+        # routes (``upload_blob`` / ``download_blob``) — same
+        # ``x-sandbox-token`` auth as the WS, no signed-crypto seam.
+        self._http_base = cloud_url.rstrip("/")
         self._token = sandbox_token
         self._slug = agent_slug
         self._session: aiohttp.ClientSession | None = None
@@ -205,6 +209,78 @@ class CloudBridgeClient:
             raise BridgeClosed("WS is not connected")
         return self._ws
 
+    async def upload_blob(self, data: bytes) -> dict:
+        """Keyless blob upload: POST the raw plaintext bytes to the
+        sandbox blob route, authenticated by ``x-sandbox-token`` (no
+        signed crypto — the server holds the at-rest store). Returns the
+        server ack JSON ``{ blob_id, size_bytes, uploaded_at }``.
+
+        Raises ``BridgeError`` on any non-2xx / transport / bad-body
+        failure so the caller (an outbound attachment send) surfaces a
+        clear tool error rather than silently dropping the file. Opens a
+        short-lived session per call so blob HTTP is independent of the
+        WS lifecycle.
+        """
+        url = f"{self._http_base}/v2/cloud-agents/blobs/upload"
+        headers = {
+            "x-sandbox-token": self._token,
+            "content-type": "application/octet-stream",
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as session:
+                async with session.post(
+                    url, data=data, headers=headers,
+                ) as resp:
+                    body = await resp.read()
+                    if resp.status // 100 != 2:
+                        raise BridgeError(
+                            "BLOB_UPLOAD",
+                            f"upload failed (status={resp.status}): "
+                            f"{body[:200]!r}",
+                        )
+                    try:
+                        return json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        raise BridgeError(
+                            "BLOB_UPLOAD",
+                            f"upload returned non-JSON body: {exc}",
+                        ) from exc
+        except aiohttp.ClientError as exc:
+            raise BridgeError(
+                "BLOB_UPLOAD", f"upload transport error: {exc}",
+            ) from exc
+
+    async def download_blob(self, blob_id: str) -> bytes | None:
+        """Keyless blob download by id: GET the raw bytes from the
+        sandbox blob route, authenticated by ``x-sandbox-token`` (no
+        decrypt). Fail-soft — returns ``None`` on any non-200 (404
+        BLOB_NOT_FOUND, 413 FILE_TOO_LARGE, 401 UNAUTHORIZED) or
+        transport error, logging at WARNING; a missing / oversized /
+        unfetchable blob must never crash the inbound turn or the listen
+        loop.
+        """
+        url = f"{self._http_base}/v2/cloud-agents/blobs/{blob_id}"
+        headers = {"x-sandbox-token": self._token}
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "cloud bridge: blob download failed "
+                            "(%s, status=%s)", blob_id, resp.status,
+                        )
+                        return None
+                    return await resp.read()
+        except Exception as exc:  # noqa: BLE001 — fail-soft download
+            logger.warning(
+                "cloud bridge: blob download error (%s): %s", blob_id, exc,
+            )
+            return None
+
     async def send_send(
         self,
         *,
@@ -214,6 +290,7 @@ class CloudBridgeClient:
         channel_id: Optional[str] = None,
         reply_to_id: Optional[str] = None,
         thread_root_id: Optional[str] = None,
+        attachments: Optional[list[dict]] = None,
         timeout: float = 30.0,
     ) -> dict:
         # Pass EITHER recipient_slug (DM) OR space_id+channel_id
@@ -222,6 +299,11 @@ class CloudBridgeClient:
         # linkage — the same snake_case field names a human/web message
         # carries; added only when truthy so a top-level post stays
         # shape-identical to the pre-threading frame.
+        # ``attachments`` is the canonical top-level list of
+        # ``AttachmentRef`` dicts ({ blob_id, filename?, mime_type?,
+        # size_bytes? }); blobs were already uploaded keyless via
+        # ``upload_blob``. Added only when non-empty so a plain send
+        # stays byte-shape-identical to the pre-attachment frame.
         ws = await self._require_ws()
         client_ref = f"r_{uuid.uuid4().hex[:12]}"
         frame: dict[str, Any] = {
@@ -239,6 +321,8 @@ class CloudBridgeClient:
             frame["reply_to_id"] = reply_to_id
         if thread_root_id:
             frame["thread_root_id"] = thread_root_id
+        if attachments:
+            frame["attachments"] = attachments
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._send_acks[client_ref] = fut
         await ws.send_json(frame)

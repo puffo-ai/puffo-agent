@@ -985,6 +985,30 @@ class PuffoCoreMessageClient:
         else:
             raw_text = str(payload.content) if payload.content else ""
 
+        # Keyless-bridge attachments: the server holds the blob store, so
+        # an inbound bridge ``message`` frame carries top-level
+        # ``attachments`` = [{ blob_id, filename, mime_type, size_bytes }]
+        # (surfaced onto ``payload.attachments`` by
+        # ``_payload_from_bridge_frame``). Download each by ``blob_id``
+        # via the keyless GET — no decrypt — and save into the same
+        # inbox the native content-type block fills, so the agent's
+        # ``attachments`` message field is populated identically. Native
+        # payloads never set ``payload.attachments`` (it's excluded from
+        # ``to_payload_dict`` and only the bridge mapper sets it) and
+        # ``self._bridge`` is None on native, so this branch is
+        # bridge-only. Per-ref failures log + skip inside the helper.
+        if (
+            self._bridge is not None
+            and isinstance(payload.attachments, list)
+            and payload.attachments
+        ):
+            attachment_paths.extend(
+                await self._save_inbound_bridge_attachments(
+                    envelope_id=payload.envelope_id,
+                    refs=payload.attachments,
+                )
+            )
+
         # Stash the sender so `send_fallback_message("")` can route replies.
         # Always overwrite — first-write would pin replies to a
         # stale peer when a different person DMs us.
@@ -1183,6 +1207,11 @@ class PuffoCoreMessageClient:
             recipient_slug=recipient_slug,
             thread_root_id=frame.get("thread_root_id"),
             reply_to_id=frame.get("reply_to_id"),
+            # Keyless-bridge attachments ride the frame top level as
+            # ``[{ blob_id, filename, mime_type, size_bytes }]``; the
+            # shared inbound tail downloads each blob by id (no decrypt).
+            # Native frames never carry this key, so it stays None there.
+            attachments=frame.get("attachments"),
         )
 
     async def _admit_thread_message(
@@ -3762,6 +3791,81 @@ class PuffoCoreMessageClient:
                 except OSError as exc:
                     self._log.warning(
                         "could not rename compressed image %s: %s", target, exc,
+                    )
+                    paths.append(str(target))
+            else:
+                paths.append(str(target))
+        return paths
+
+    async def _save_inbound_bridge_attachments(
+        self, *, envelope_id: str, refs: list,
+    ) -> list[str]:
+        """Keyless-bridge sibling of ``_save_inbound_attachments``:
+        download each blob by ``blob_id`` (no decrypt — the server holds
+        the blob store) and save it to ``<workspace>/.puffo/inbox/
+        <envelope_id>/<filename>``, returning absolute paths. Per-ref
+        failures (bad shape, missing/oversized/unfetchable blob, save
+        error) are logged and skipped so one bad ref never crashes the
+        turn or the listen loop.
+
+        Mirrors the native saver's filename sanitisation + oversized-
+        image downscale so a bridge-delivered image is treated
+        identically to a native one.
+        """
+        if not self.workspace or not refs or self._bridge is None:
+            return []
+        from pathlib import Path
+        inbox = Path(self.workspace) / ".puffo" / "inbox" / envelope_id
+        inbox.mkdir(parents=True, exist_ok=True)
+        paths: list[str] = []
+        for raw in refs:
+            if not isinstance(raw, dict):
+                continue
+            blob_id = raw.get("blob_id")
+            if not blob_id:
+                self._log.warning(
+                    "bridge attachment ref missing blob_id: %r", raw,
+                )
+                continue
+            try:
+                data = await self._bridge.download_blob(blob_id)
+            except Exception as exc:  # noqa: BLE001 — one bad ref never fatal
+                self._log.warning(
+                    "bridge attachment download raised (%s): %s",
+                    blob_id, exc,
+                )
+                continue
+            if data is None:
+                # Missing / oversized / unfetchable — download_blob
+                # already logged; skip without failing the turn.
+                continue
+            # Sanitise filename to block ``../`` / absolute-path
+            # write-outside-inbox via a malicious sender.
+            safe_name = Path(str(raw.get("filename") or "")).name or blob_id
+            target = inbox / safe_name
+            try:
+                target.write_bytes(data)
+            except OSError as exc:
+                self._log.warning(
+                    "bridge attachment save failed (%s): %s", target, exc,
+                )
+                continue
+            # Shrink oversized images off-loop, same as the native saver.
+            origin = target.with_name(f"{target.stem}.origin{target.suffix}")
+            resized = await asyncio.to_thread(
+                _downscale_oversized_image, target, origin, self._image_edge_px,
+            )
+            if resized:
+                compressed = target.with_name(
+                    f"{target.stem}.compressed{target.suffix}"
+                )
+                try:
+                    target.rename(compressed)
+                    paths.append(str(compressed))
+                except OSError as exc:
+                    self._log.warning(
+                        "could not rename compressed image %s: %s",
+                        target, exc,
                     )
                     paths.append(str(target))
             else:

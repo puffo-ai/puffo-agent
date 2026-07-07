@@ -13,7 +13,11 @@ suite pins the phase-2 seam swap:
       loop keeps running for live frames);
   (d) native (``bridge_client=None``) still encrypts on send and
       decrypts on receive — the extraction is behaviour-preserving;
-  (e) attachments over the bridge fail loud (phase 3).
+  (e) attachments over the bridge upload PLAINTEXT bytes keyless
+      (``upload_blob``) + ref them by ``blob_id`` in the ``send`` frame
+      on the way out, and download by ``blob_id`` (``download_blob``,
+      no decrypt) into the inbox on the way in — with native attachment
+      send still encrypting + using signed HTTP.
 
 Every fake is offline: no real WS, HTTP, E2B, or LLM.
 """
@@ -54,11 +58,20 @@ class FakeBridge:
     ``frames()`` replays a scripted list then suspends (mimicking a live
     WS awaiting its next frame) so ``_listen_bridge`` stays connected
     instead of reconnect-storming — the test cancels the task when done.
-    ``send_send`` records its kwargs and returns a canned ack;
-    ``send_fetch_pending`` / ``connect`` / ``close`` count calls.
+    ``send_send`` records its kwargs (including ``attachments``) and
+    returns a canned ack; ``send_fetch_pending`` / ``connect`` / ``close``
+    count calls. ``upload_blob`` mints a fresh ``blob_id`` per call and
+    records the raw bytes; ``download_blob`` serves from a ``blob_id`` →
+    bytes map (``None`` for an unknown id, mimicking a missing/oversized
+    blob) and records every id requested.
     """
 
-    def __init__(self, scripted: list[dict] | None = None, ack: dict | None = None):
+    def __init__(
+        self,
+        scripted: list[dict] | None = None,
+        ack: dict | None = None,
+        blobs: dict[str, bytes] | None = None,
+    ):
         self._scripted = list(scripted or [])
         self._ack = ack or {
             "type": "ack",
@@ -69,6 +82,11 @@ class FakeBridge:
         self.connect_count = 0
         self.fetch_pending_count = 0
         self.close_count = 0
+        # Keyless blob surface.
+        self.uploaded: list[bytes] = []
+        self.downloaded: list[str] = []
+        self._blobs: dict[str, bytes] = dict(blobs or {})
+        self._upload_seq = 0
         # Never set → frames() suspends after the script drains.
         self._blocked = asyncio.Event()
 
@@ -78,10 +96,21 @@ class FakeBridge:
     async def send_fetch_pending(self, *, limit=None) -> None:
         self.fetch_pending_count += 1
 
+    async def upload_blob(self, data: bytes) -> dict:
+        self._upload_seq += 1
+        blob_id = f"blob_{self._upload_seq:04d}"
+        self.uploaded.append(data)
+        self._blobs[blob_id] = data
+        return {"blob_id": blob_id, "size_bytes": len(data), "uploaded_at": 0}
+
+    async def download_blob(self, blob_id: str):
+        self.downloaded.append(blob_id)
+        return self._blobs.get(blob_id)
+
     async def send_send(
         self, *, plaintext, recipient_slug=None, space_id=None,
         channel_id=None, reply_to_id=None, thread_root_id=None,
-        timeout: float = 30.0,
+        attachments=None, timeout: float = 30.0,
     ) -> dict:
         self.sent.append({
             "plaintext": plaintext,
@@ -90,6 +119,7 @@ class FakeBridge:
             "channel_id": channel_id,
             "reply_to_id": reply_to_id,
             "thread_root_id": thread_root_id,
+            "attachments": attachments,
         })
         return dict(self._ack)
 
@@ -145,6 +175,12 @@ class FakeHttp:
         self.calls.append(("POST", path, body))
         return self.responses.get(path, {"ok": True})
 
+    async def post_bytes(self, path, body=None):
+        # Native attachment path uploads ciphertext here; return a
+        # canned blob_id unless a test registers its own response.
+        self.calls.append(("POST_BYTES", path, body))
+        return self.responses.get(path, {"blob_id": "blob_native_1"})
+
 
 # --------------------------------------------------------------------------
 # Builders
@@ -152,10 +188,12 @@ class FakeHttp:
 
 
 def _bridge_client(
-    tmp_path, bridge, *, slug="bot-0001", db="messages.db",
+    tmp_path, bridge, *, slug="bot-0001", db="messages.db", workspace=None,
 ) -> PuffoCoreMessageClient:
     """A bridge-transport message client with a stubbed (offline) http
-    so inbound enrichment helpers degrade to ids-for-names."""
+    so inbound enrichment helpers degrade to ids-for-names. Pass
+    ``workspace`` when the test exercises inbound attachment saving
+    (the saver no-ops on an empty workspace)."""
     ks = KeyStore(str(tmp_path / f"keys-{db}"))
     http = PuffoCoreHttpClient("http://127.0.0.1:1", ks, slug)
     store = MessageStore(str(tmp_path / db))
@@ -166,6 +204,7 @@ def _bridge_client(
         keystore=ks,
         http_client=http,
         message_store=store,
+        workspace=workspace or "",
         bridge_client=bridge,
     )
 
@@ -919,29 +958,352 @@ async def test_d_native_inbound_still_decrypts_before_storing(tmp_path, monkeypa
 
 
 # --------------------------------------------------------------------------
-# (e) attachment guard
+# (e) attachments over the bridge: keyless blob upload/download, native
+#     unchanged
 # --------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_e_attachments_refused_on_bridge_no_encrypt(tmp_path, monkeypatch):
+async def test_e_attachments_uploaded_keyless_and_reffed_on_bridge(
+    tmp_path, monkeypatch,
+):
+    """OUT: a bridge DM attachment send uploads each file's PLAINTEXT
+    bytes via ``upload_blob`` and rides the returned ``blob_id``(s) into
+    the ``send`` frame's top-level ``attachments`` (with filename /
+    mime_type / size_bytes) — no ``encrypt_*`` and no signed HTTP."""
     enc_calls: list[int] = []
     monkeypatch.setattr(
         pct_mod, "encrypt_message_with_content_key",
         lambda *a, **k: enc_calls.append(1),
     )
+    monkeypatch.setattr(
+        pct_mod, "encrypt_message", lambda *a, **k: enc_calls.append(1),
+    )
+    monkeypatch.setattr(
+        pct_mod, "encrypt_attachment", lambda *a, **k: enc_calls.append(1),
+    )
 
-    ms = MessageStore(str(tmp_path / "e.db"))
+    ms = MessageStore(str(tmp_path / "e_out.db"))
+    bridge = FakeBridge()
+    http = FakeHttp()
+    cfg = _tools_cfg(tmp_path, bridge=bridge, data_client=ms, http=http)
+    tools = build_dispatch(cfg)
+
+    body = b"hello attachment bytes"
+    (tmp_path / "note.txt").write_bytes(body)
+    result = await tools["send_message_with_attachments"](
+        paths=["note.txt"], channel="@alice-0001", caption="see file",
+    )
+
+    # Uploaded exactly once, with the raw plaintext bytes.
+    assert bridge.uploaded == [body]
+    # One send frame carrying the ref by blob_id.
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["plaintext"] == "see file"
+    assert sent["recipient_slug"] == "alice-0001"
+    assert sent["space_id"] is None and sent["channel_id"] is None
+    refs = sent["attachments"]
+    assert isinstance(refs, list) and len(refs) == 1
+    ref = refs[0]
+    assert ref["blob_id"] == "blob_0001"
+    assert ref["filename"] == "note.txt"
+    assert ref["mime_type"] == "text/plain"
+    assert ref["size_bytes"] == len(body)
+    # No signed-crypto: no encrypt, no /blobs/upload or /messages POST.
+    assert enc_calls == []
+    assert not any(
+        p in ("/blobs/upload", "/messages") for _, p, _ in http.calls
+    ), http.calls
+    assert "msg_bridgeack" in result
+
+
+@pytest.mark.asyncio
+async def test_e_attachments_channel_route_on_bridge(tmp_path):
+    """OUT (channel route): a channel attachment send resolves the
+    space from the local cache and threads the ``send`` frame with the
+    space/channel ids, carrying the blob ref."""
+    ms = MessageStore(str(tmp_path / "e_out_ch.db"))
+    await ms.mark_channel_space("ch_xyz", "sp_1")
     bridge = FakeBridge()
     cfg = _tools_cfg(tmp_path, bridge=bridge, data_client=ms)
     tools = build_dispatch(cfg)
 
-    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
-    with pytest.raises(RuntimeError) as excinfo:
-        await tools["send_message_with_attachments"](
-            paths=["note.txt"], channel="@alice-0001", caption="see file",
-        )
-    msg = str(excinfo.value).lower()
-    assert "bridge" in msg and "not supported" in msg
-    assert enc_calls == []
-    assert bridge.sent == []
+    (tmp_path / "doc.txt").write_bytes(b"team doc")
+    await tools["send_message_with_attachments"](
+        paths=["doc.txt"], channel="ch_xyz", caption="team file",
+    )
+    assert len(bridge.uploaded) == 1
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["space_id"] == "sp_1"
+    assert sent["channel_id"] == "ch_xyz"
+    assert sent["recipient_slug"] is None
+    assert sent["attachments"][0]["blob_id"] == "blob_0001"
+
+
+@pytest.mark.asyncio
+async def test_send_send_puts_attachments_top_level():
+    """Frame-shape unit on the real ``CloudBridgeClient.send_send``:
+    ``attachments`` lands at the frame top level when non-empty and is
+    omitted entirely when ``None`` (a plain send stays shape-identical to
+    the pre-attachment frame)."""
+    from puffo_agent.agent.bridge_client import CloudBridgeClient
+
+    client = CloudBridgeClient("http://127.0.0.1:1", "tok", "bot-0001")
+
+    class _CapturingWs:
+        def __init__(self, owner):
+            self.owner = owner
+            self.sent_frames: list[dict] = []
+
+        async def send_json(self, frame):
+            self.sent_frames.append(frame)
+            # send_send set the ack future before calling send_json;
+            # resolve it so the awaited call returns immediately.
+            cref = frame.get("client_ref")
+            fut = self.owner._send_acks.get(cref)
+            if fut is not None and not fut.done():
+                fut.set_result({"type": "ack", "envelope_id": "msg_cap"})
+
+    ws = _CapturingWs(client)
+
+    async def _require_ws():
+        return ws
+
+    client._require_ws = _require_ws  # type: ignore[method-assign]
+
+    refs = [{"blob_id": "b1", "filename": "a.txt", "mime_type": "text/plain"}]
+    await client.send_send(
+        plaintext="cap", recipient_slug="alice-0001", attachments=refs,
+    )
+    frame_with = ws.sent_frames[-1]
+    assert frame_with["attachments"] == refs
+    assert frame_with["plaintext"] == "cap"
+    assert frame_with["recipient_slug"] == "alice-0001"
+
+    # No attachments → key absent entirely.
+    await client.send_send(plaintext="hi", recipient_slug="alice-0001")
+    frame_without = ws.sent_frames[-1]
+    assert "attachments" not in frame_without
+
+
+@pytest.mark.asyncio
+async def test_inbound_attachments_surface_and_download_by_blob_id(tmp_path):
+    """IN: an inbound ``message`` frame with top-level ``attachments``
+    drives ``download_blob(blob_id)`` and writes the bytes into
+    ``.puffo/inbox/<envelope_id>/<filename>``; the surfaced message
+    event's ``attachments`` lists that path."""
+    BLOB = "blob_in1"
+    DATA = b"inbound report bytes"
+    frame = {
+        "type": "message", "envelope_id": "env_att_in",
+        "sender_slug": "alice-0001", "envelope_kind": "channel",
+        "space_id": "sp_1", "channel_id": "ch_a",
+        "sent_at": 1_700_000_001_000, "plaintext": "see attached",
+        "attachments": [{
+            "blob_id": BLOB, "filename": "report.txt",
+            "mime_type": "text/plain", "size_bytes": len(DATA),
+        }],
+    }
+    bridge = FakeBridge(scripted=[frame], blobs={BLOB: DATA})
+    client = _bridge_client(
+        tmp_path, bridge, db="att_in.db", workspace=str(tmp_path),
+    )
+    surfaced: list = []
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        surfaced.append(batch)
+        done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    # Fetched by blob_id, no decrypt.
+    assert bridge.downloaded == [BLOB]
+    saved = tmp_path / ".puffo" / "inbox" / "env_att_in" / "report.txt"
+    assert saved.is_file()
+    assert saved.read_bytes() == DATA
+    msg = [m for m in surfaced[0] if m["envelope_id"] == "env_att_in"][0]
+    assert str(saved) in msg["attachments"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_pending_backfill_carries_attachments(tmp_path):
+    """IN (backfill): a message frame drained via the cold-start
+    ``fetch_pending`` path (same ``frames()``/handle_inbound tail)
+    surfaces + downloads attachments identically to a live frame."""
+    BLOB = "blob_bf1"
+    DATA = b"backfilled file"
+    scripted = [
+        {
+            "type": "message", "envelope_id": "env_att_bf",
+            "sender_slug": "alice-0001", "envelope_kind": "channel",
+            "space_id": "sp_1", "channel_id": "ch_a",
+            "sent_at": 1_700_000_001_500, "plaintext": "backfilled attach",
+            "attachments": [{
+                "blob_id": BLOB, "filename": "bf.txt",
+                "mime_type": "text/plain", "size_bytes": len(DATA),
+            }],
+        },
+        {"type": "pending_delivered", "count": 1},
+    ]
+    bridge = FakeBridge(scripted=scripted, blobs={BLOB: DATA})
+    client = _bridge_client(
+        tmp_path, bridge, db="att_bf.db", workspace=str(tmp_path),
+    )
+    surfaced: list = []
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        surfaced.append(batch)
+        done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    # The backfill drive fired exactly one fetch_pending.
+    assert bridge.fetch_pending_count == 1
+    assert bridge.downloaded == [BLOB]
+    saved = tmp_path / ".puffo" / "inbox" / "env_att_bf" / "bf.txt"
+    assert saved.is_file() and saved.read_bytes() == DATA
+    msg = [m for m in surfaced[0] if m["envelope_id"] == "env_att_bf"][0]
+    assert str(saved) in msg["attachments"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_missing_blob_skipped_loop_survives(tmp_path):
+    """Fail-soft: a ref whose blob ``download_blob`` returns ``None`` for
+    (missing / oversized) is skipped — no exception, the message still
+    delivers with empty ``attachments``, and the listen loop keeps
+    running so a following frame is still processed."""
+    scripted = [
+        {
+            "type": "message", "envelope_id": "env_missing_blob",
+            "sender_slug": "alice-0001", "envelope_kind": "channel",
+            "space_id": "sp_1", "channel_id": "ch_a",
+            "sent_at": 1_700_000_002_000, "plaintext": "attached but gone",
+            "attachments": [{"blob_id": "blob_missing", "filename": "x.bin"}],
+        },
+        {
+            "type": "message", "envelope_id": "env_after_missing",
+            "sender_slug": "alice-0001", "envelope_kind": "channel",
+            "space_id": "sp_1", "channel_id": "ch_a",
+            "sent_at": 1_700_000_002_100, "plaintext": "still flowing",
+        },
+    ]
+    # Empty blob map → download_blob returns None for blob_missing.
+    bridge = FakeBridge(scripted=scripted, blobs={})
+    client = _bridge_client(
+        tmp_path, bridge, db="missing_blob.db", workspace=str(tmp_path),
+    )
+    surfaced: dict[str, dict] = {}
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        for m in batch:
+            surfaced[m["envelope_id"]] = m
+        if "env_after_missing" in surfaced:
+            done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    # Download was attempted then skipped.
+    assert bridge.downloaded == ["blob_missing"]
+    # Both messages delivered — the loop survived the missing blob.
+    assert await client.store.get_message_by_envelope("env_missing_blob") is not None
+    assert await client.store.get_message_by_envelope("env_after_missing") is not None
+    assert "env_missing_blob" in surfaced and "env_after_missing" in surfaced
+    # The message with the missing blob carries no attachment path.
+    assert surfaced["env_missing_blob"]["attachments"] == []
+    # No blob dir/file was written for the skipped ref.
+    assert not (tmp_path / ".puffo" / "inbox" / "env_missing_blob" / "x.bin").exists()
+
+
+@pytest.mark.asyncio
+async def test_e_native_attachments_still_encrypt_and_signed_http(
+    tmp_path, monkeypatch,
+):
+    """Native (``bridge_client=None``) attachment send still encrypts the
+    file (``encrypt_attachment``) + the envelope
+    (``encrypt_message_with_content_key``) and uploads the ciphertext via
+    signed ``http_client.post_bytes('/blobs/upload', ...)``, then POSTs
+    ``/messages`` — the bridge blob surface is never touched."""
+    enc_att_calls: list[int] = []
+    enc_msg_calls: list[int] = []
+
+    class _FakeMeta:
+        def __init__(self):
+            self.blob_id = ""
+
+        def to_dict(self):
+            return {"blob_id": self.blob_id, "filename": "note.txt"}
+
+    def _enc_att_spy(*, plaintext, filename, mime_type, blob_id):
+        enc_att_calls.append(1)
+        return (b"CIPHERTEXT", _FakeMeta())
+
+    def _enc_msg_spy(inp, signing_key, *, now_ms=None):
+        enc_msg_calls.append(1)
+        return ({"envelope_id": "msg_native_att", "type": "message_envelope"}, b"ck")
+
+    monkeypatch.setattr(pct_mod, "encrypt_attachment", _enc_att_spy)
+    monkeypatch.setattr(pct_mod, "encrypt_message_with_content_key", _enc_msg_spy)
+
+    ks = _native_keystore(tmp_path)
+    http = FakeHttp()
+    http.responses["/blobs/upload"] = {"blob_id": "blob_native_att"}
+    http.responses["/certs/sync?slugs=bot-0001,alice-0001"] = {
+        "entries": [{
+            "seq": 1,
+            "kind": "device_cert",
+            "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_a",
+                "kem_public_key": base64url_encode(
+                    KemKeyPair.generate().public_key_bytes()
+                ),
+            },
+        }],
+        "has_more": False,
+    }
+    ms = MessageStore(str(tmp_path / "e_native.db"))
+    cfg = PuffoCoreToolsConfig(
+        slug="bot-0001",
+        device_id="dev_test",
+        keystore=ks,
+        http_client=http,
+        data_client=ms,
+        space_id="sp_home",
+        workspace=str(tmp_path),
+        bridge_client=None,  # native
+    )
+    tools = build_dispatch(cfg)
+
+    (tmp_path / "note.txt").write_bytes(b"native file bytes")
+    result = await tools["send_message_with_attachments"](
+        paths=["note.txt"], channel="@alice-0001", caption="native attach",
+    )
+
+    assert enc_att_calls, "native attachment send must encrypt the file"
+    assert enc_msg_calls, "native attachment send must encrypt the envelope"
+    assert any(
+        m == "POST_BYTES" and p == "/blobs/upload" for m, p, _ in http.calls
+    ), f"native must upload ciphertext via signed post_bytes; calls={http.calls}"
+    assert any(
+        m == "POST" and p == "/messages" for m, p, _ in http.calls
+    ), f"native must POST the envelope; calls={http.calls}"
+    assert "uploaded 1 file" in result
+
+
+def test_message_payload_to_dict_omits_attachments():
+    """Guard: the additive ``attachments`` field is NOT serialized by
+    ``to_payload_dict()`` — native seal canonical bytes stay unchanged."""
+    p = MessagePayload(
+        payload_type="message_payload", version=1, envelope_id="msg_x",
+        envelope_kind="dm", sender_slug="bot-0001", sender_subkey_id="sk",
+        sent_at=1, message_nonce="n", content_type="text/plain",
+        content="hi", is_visible_to_human=True,
+        attachments=[{"blob_id": "b1"}],
+    )
+    d = p.to_payload_dict()
+    assert "attachments" not in d
