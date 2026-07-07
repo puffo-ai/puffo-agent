@@ -1438,3 +1438,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             reason=reason,
         )
 
+    # Bridge-only sandbox-lifecycle tools (schedule_wake / cancel_wake /
+    # get_scheduled_wake / get_runtime_status / keep_alive). Gated on
+    # ``bridge_client`` — set ONLY at the in-process ws-local site — so a
+    # native/subprocess agent never registers them (and never exposes the
+    # keyless ``x-sandbox-token`` lifecycle surface). Imported lazily so
+    # the native path doesn't pay for a module it will never use.
+    if cfg.bridge_client is not None:
+        from .lifecycle_tools import register_lifecycle_tools
+        register_lifecycle_tools(mcp, cfg)
+

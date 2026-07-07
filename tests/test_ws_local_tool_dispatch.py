@@ -39,6 +39,12 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         # membership
         "leave_space",
         "leave_channel",
+        # bridge-only sandbox lifecycle
+        "schedule_wake",
+        "cancel_wake",
+        "get_scheduled_wake",
+        "get_runtime_status",
+        "keep_alive",
     })
 
 

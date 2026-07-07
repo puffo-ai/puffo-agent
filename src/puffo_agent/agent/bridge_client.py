@@ -281,6 +281,157 @@ class CloudBridgeClient:
             )
             return None
 
+    async def _token_request(
+        self, method: str, path: str, *, json_body: Any = None,
+    ) -> tuple[int, Any]:
+        """Keyless REST call on the sandbox HTTP surface: send ``method``
+        to ``{http_base}{path}`` authenticated by ``x-sandbox-token``
+        (the same seam ``upload_blob`` / ``download_blob`` use — no
+        signed crypto). ``json_body`` is sent as a JSON request body when
+        given. Returns ``(status, parsed_json_or_None)``; an empty or
+        non-JSON body (e.g. a 204) parses to ``None``. Wraps transport
+        failures in ``BridgeError`` so lifecycle callers surface a clean
+        error instead of a raw aiohttp exception.
+
+        Opens a short-lived session per call so lifecycle HTTP stays
+        independent of the WS lifecycle (mirrors the blob routes).
+        """
+        url = f"{self._http_base}{path}"
+        headers = {"x-sandbox-token": self._token}
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as session:
+                async with session.request(
+                    method, url, headers=headers, json=json_body,
+                ) as resp:
+                    body = await resp.read()
+                    if not body:
+                        return resp.status, None
+                    try:
+                        return resp.status, json.loads(body)
+                    except json.JSONDecodeError:
+                        return resp.status, None
+        except aiohttp.ClientError as exc:
+            raise BridgeError(
+                "LIFECYCLE", f"{method} {path} transport error: {exc}",
+            ) from exc
+
+    async def schedule_wake(
+        self,
+        *,
+        after_seconds: int | None = None,
+        wake_at: str | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Schedule a server-side wake for this sandbox: POST
+        ``/v2/cloud-agents/schedule-wake`` keyless. Pass exactly one of
+        ``after_seconds`` (relative) or ``wake_at`` (absolute ISO ts) —
+        the caller enforces that; ``reason`` rides along when non-empty.
+        Returns the server's confirmed ``{wake_at, reason}``. Non-2xx /
+        transport → ``BridgeError``."""
+        body: dict[str, Any] = {}
+        if after_seconds is not None:
+            body["after_seconds"] = after_seconds
+        if wake_at is not None:
+            body["wake_at"] = wake_at
+        if reason:
+            body["reason"] = reason
+        status, parsed = await self._token_request(
+            "POST", "/v2/cloud-agents/schedule-wake", json_body=body,
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "SCHEDULE_WAKE",
+                f"schedule-wake failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def get_scheduled_wake(self) -> dict:
+        """Read the current scheduled wake: GET
+        ``/v2/cloud-agents/scheduled-wake`` keyless. Returns the server
+        body — ``{wake_at, reason}`` when one is set, or ``{wake_at:
+        None}`` when none is scheduled. Non-2xx / transport →
+        ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "GET", "/v2/cloud-agents/scheduled-wake",
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "SCHEDULED_WAKE",
+                f"scheduled-wake read failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {"wake_at": None}
+
+    async def cancel_wake(self) -> dict:
+        """Cancel the scheduled wake: DELETE
+        ``/v2/cloud-agents/scheduled-wake`` keyless. Returns the parsed
+        body, or ``{}`` on an empty 204. Non-2xx / transport →
+        ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "DELETE", "/v2/cloud-agents/scheduled-wake",
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "CANCEL_WAKE",
+                f"cancel-wake failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def runtime_status(self) -> dict:
+        """Read this sandbox's runtime status: GET
+        ``/v2/cloud-agents/runtime-status`` keyless. Returns the server
+        body (``{state, timeout_at, seconds_until_sleep?, sandbox_id}``);
+        ``seconds_until_sleep`` may be ``None`` when the server can't
+        compute it — surfaced verbatim, never fabricated. Non-2xx /
+        transport → ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "GET", "/v2/cloud-agents/runtime-status",
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "RUNTIME_STATUS",
+                f"runtime-status read failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def keepalive(self, seconds: int) -> dict:
+        """Push back this sandbox's auto-sleep deadline: POST
+        ``/v2/cloud-agents/keepalive`` ``{seconds}`` keyless.
+
+        Normalizes the "deadline-refresh not landed upstream" signal to
+        a first-class result so the caller branches without catching:
+          - 2xx → ``{"available": True, **body}`` (body carries
+            ``timeout_at`` / ``seconds_until_sleep``).
+          - 501 / 503, or a 2xx body with ``available`` false →
+            ``{"available": False, "detail": <msg>}``.
+        Any other non-2xx / transport failure → ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "POST", "/v2/cloud-agents/keepalive",
+            json_body={"seconds": seconds},
+        )
+        parsed = parsed if isinstance(parsed, dict) else {}
+        if status in (501, 503):
+            detail = (
+                parsed.get("error")
+                or parsed.get("detail")
+                or f"keepalive unavailable (status={status})"
+            )
+            return {"available": False, "detail": detail}
+        if status // 100 == 2:
+            if parsed.get("available") is False:
+                detail = (
+                    parsed.get("error")
+                    or parsed.get("detail")
+                    or "keepalive reported unavailable"
+                )
+                return {"available": False, "detail": detail}
+            return {"available": True, **parsed}
+        raise BridgeError(
+            "KEEPALIVE",
+            f"keepalive failed (status={status}): {parsed!r}",
+        )
+
     async def send_send(
         self,
         *,
