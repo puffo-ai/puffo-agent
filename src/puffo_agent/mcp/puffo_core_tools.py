@@ -106,6 +106,12 @@ class PuffoCoreToolsConfig:
     # Set only on the in-process (ws-local) path, where tools run inside
     # the daemon and drive the message client directly instead of via RPC.
     message_client: Any = None
+    # T23 keyless bridge transport (``CloudBridgeClient``). Populated only
+    # at the in-process ws-local site (from ``client._bridge``); the
+    # subprocess/RPC MCP path leaves it None → native encrypt+signed POST.
+    # When set, ``send_message`` sends plaintext via the bridge and
+    # ``send_message_with_attachments`` refuses (phase 3).
+    bridge_client: Any = None
 
 
 async def _fetch_device_keys(
@@ -443,6 +449,40 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "'#<name>' channel addressing isn't supported; "
                 "use the channel id (e.g. 'ch_<uuid>') or call "
                 "list_channels_in_all_spaces to look one up."
+            )
+
+        if cfg.bridge_client is not None:
+            # T23 bridge transport: send plaintext; the server holds all
+            # crypto and fans out recipients. DM ('@slug') vs channel
+            # ('ch_') routing only — no device-key fetch, no encrypt, no
+            # signed POST. Threaded replies aren't wired on bridge yet
+            # (phase 3), so a non-empty root_id sends top-level with a note.
+            root_note = ""
+            if root_id:
+                root_note = (
+                    " (note: threaded replies aren't wired on bridge "
+                    "transport yet — sent as a top-level post)"
+                )
+            if channel_ref.startswith("@"):
+                bridge_recipient = channel_ref[1:]
+                if not bridge_recipient:
+                    raise RuntimeError("DM recipient slug is required after '@'")
+                ack = await cfg.bridge_client.send_send(
+                    plaintext=text, recipient_slug=bridge_recipient,
+                )
+            else:
+                bridge_channel_id = channel_ref
+                bridge_space_id = await _resolve_channel_space(
+                    cfg, bridge_channel_id,
+                )
+                ack = await cfg.bridge_client.send_send(
+                    plaintext=text,
+                    space_id=bridge_space_id,
+                    channel_id=bridge_channel_id,
+                )
+            return (
+                f"posted {(ack or {}).get('envelope_id', '?')} to {channel}"
+                f"{root_note}"
             )
 
         if channel_ref.startswith("@"):
@@ -979,6 +1019,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             raise RuntimeError(
                 "send_message_with_attachments: agent has no configured "
                 "workspace dir"
+            )
+        if cfg.bridge_client is not None:
+            # T23 phase 3: attachments over the keyless bridge aren't
+            # wired yet. Fail loud rather than silently encrypt (native
+            # path) or crash — a bridge agent has no signed-crypto seam.
+            raise RuntimeError(
+                "attachments are not supported on bridge transport yet"
             )
         if not paths or not isinstance(paths, list):
             raise RuntimeError(

@@ -39,7 +39,12 @@ class _SpyKeyStore(KeyStore):
 
 
 class _StubBridge:
-    """Bridge stub: records the lifecycle calls listen() makes."""
+    """Bridge stub: records the lifecycle calls listen() makes.
+
+    Phase 2 drives ``send_fetch_pending`` once per successful connect
+    (cold-start backfill) before iterating frames, so the recorded
+    order is connect → fetch_pending → frames.
+    """
 
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -48,6 +53,9 @@ class _StubBridge:
     async def connect(self) -> None:
         self.calls.append("connect")
         self.connected.set()
+
+    async def send_fetch_pending(self, *, limit=None) -> None:
+        self.calls.append("fetch_pending")
 
     async def frames(self):
         self.calls.append("frames")
@@ -107,7 +115,7 @@ async def test_injected_bridge_skips_ws_client_and_identity_load(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert stub.calls[:2] == ["connect", "frames"]
+    assert stub.calls[:3] == ["connect", "fetch_pending", "frames"]
     assert "close" in stub.calls
     assert _RecordingWs.instances == []
     assert spy_ks.load_identity_calls == []
