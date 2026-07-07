@@ -55,7 +55,46 @@ _MANAGED_BLOCK_RE = re.compile(
 )
 
 
-class BriefingCompileError(Exception):
+class MemoryStoreError(Exception):
+    """Structured memory-store error: the M1 ``{path, size, limit,
+    suggestion}`` shape extended with ``code`` (M3-aligned names such
+    as ``memory_invalid_path`` / ``memory_scope_readonly``).
+    ``size``/``limit`` only apply to size violations; errors without
+    them omit the keys from ``to_dict()``."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        path: str,
+        suggestion: str,
+        size: int | None = None,
+        limit: int | None = None,
+    ):
+        self.code = code
+        self.path = path
+        self.size = size
+        self.limit = limit
+        self.suggestion = suggestion
+        if size is not None and limit is not None:
+            message = (
+                f"{code}: {path} is {size} bytes (limit {limit}). {suggestion}"
+            )
+        else:
+            message = f"{code}: {path}. {suggestion}"
+        super().__init__(message)
+
+    def to_dict(self) -> dict:
+        out: dict = {"code": self.code, "path": self.path}
+        if self.size is not None:
+            out["size"] = self.size
+        if self.limit is not None:
+            out["limit"] = self.limit
+        out["suggestion"] = self.suggestion
+        return out
+
+
+class BriefingCompileError(MemoryStoreError):
     """A briefing violates the compile budget. Fail closed — callers
     get no truncated/partial output. ``code`` is one of
     ``memory_file_too_large`` / ``memory_briefing_too_large``
@@ -70,23 +109,35 @@ class BriefingCompileError(Exception):
         limit: int,
         suggestion: str,
     ):
-        self.code = code
-        self.path = path
-        self.size = size
-        self.limit = limit
-        self.suggestion = suggestion
         super().__init__(
-            f"{code}: {path} is {size} bytes (limit {limit}). {suggestion}"
+            code, path=path, size=size, limit=limit, suggestion=suggestion,
         )
 
-    def to_dict(self) -> dict:
-        return {
-            "code": self.code,
-            "path": self.path,
-            "size": self.size,
-            "limit": self.limit,
-            "suggestion": self.suggestion,
-        }
+
+def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> None:
+    """Drop ``refresh_agent.flag`` so the worker rebuilds the prompt
+    artifacts on the next batch. Best-effort; same payload shape as
+    ``profile_sync.write_refresh_agent_flag``. No-op without a
+    workspace dir."""
+    if not workspace_dir:
+        return
+    from ..portal.state import refresh_agent_flag_path
+
+    flag_path = refresh_agent_flag_path(Path(workspace_dir))
+    try:
+        flag_path.parent.mkdir(parents=True, exist_ok=True)
+        flag_path.write_text(
+            json.dumps({
+                "version": 1,
+                "requested_at": int(time.time()),
+                "reason": reason,
+            }) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning(
+            "refresh_agent.flag write failed (%s): %s", reason, exc,
+        )
 
 
 def ensure_memory_tree(memory_root: Path) -> None:
@@ -333,9 +384,13 @@ def sync_profile_briefing(
             # Pre-existing user file without markers: identity framing
             # leads, user content follows untouched.
             new_text = block + "\n" + text
-        path.write_text(new_text, encoding="utf-8")
     else:
-        path.write_text(block, encoding="utf-8")
+        new_text = block
+    from .memory_store import MemoryStore
+
+    MemoryStore(memory_root)._put_memory_file(
+        f"{BRIEFING_DIR}/{PROFILE_BRIEFING_NAME}", new_text,
+    )
     return path
 
 
@@ -354,72 +409,22 @@ class MemoryManager:
         return compile_briefing(Path(self.memory_dir))
 
     def save(self, topic: str, content: str):
+        from .memory_store import MemoryStore
+
         safe_topic = topic.replace(" ", "_").replace("/", "-")
-        path = Path(self.memory_dir) / BRIEFING_DIR / f"{safe_topic}.md"
         # Aware-UTC with ``Z`` suffix (``datetime.utcnow`` is
         # deprecated in 3.12+).
         updated = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         body = f"---\ntopic: {topic}\nupdated: {updated}\n---\n\n{content}\n"
-        size = _byte_size(body)
-        if size > PER_FILE_LIMIT:
-            raise BriefingCompileError(
-                "memory_file_too_large",
-                path=str(path),
-                size=size,
-                limit=PER_FILE_LIMIT,
-                suggestion=(
-                    "Save a shorter briefing topic; put the detail in "
-                    f"memory/{NOTES_DIR}/ instead."
-                ),
-            )
-        # Pre-validate the would-be compiled total so an oversized
-        # save never leaves partial state behind.
-        profile_body, entries = _read_briefing_entries(
-            Path(self.memory_dir), enforce_per_file=False,
+        # The store validates sizes (per-file + would-be compiled
+        # total, raising BriefingCompileError) before any write, so an
+        # oversized save never leaves partial state behind. The
+        # refresh flag stays owned by save() — the store gets no
+        # workspace_dir — so its reason keeps the M1 shape.
+        MemoryStore(self.memory_dir)._put_memory_file(
+            f"{BRIEFING_DIR}/{safe_topic}.md", body,
         )
-        entry_map = dict(entries)
-        if safe_topic == "profile":
-            profile_body = body.strip()
-        else:
-            entry_map[safe_topic] = body.strip()
-        total = _byte_size(
-            _compose_briefing(profile_body, sorted(entry_map.items()))
-        )
-        if total > TOTAL_LIMIT:
-            raise BriefingCompileError(
-                "memory_briefing_too_large",
-                path=str(path),
-                size=total,
-                limit=TOTAL_LIMIT,
-                suggestion=(
-                    "This save would push the compiled briefing over "
-                    f"budget; move topics to memory/{NOTES_DIR}/ first."
-                ),
-            )
-        path.write_text(body, encoding="utf-8")
         self._request_refresh(topic)
 
     def _request_refresh(self, topic: str) -> None:
-        """Drop ``refresh_agent.flag`` so the worker rebuilds the
-        prompt artifacts on the next batch. Best-effort; same payload
-        shape as ``profile_sync.write_refresh_agent_flag``."""
-        if not self.workspace_dir:
-            return
-        from ..portal.state import refresh_agent_flag_path
-
-        flag_path = refresh_agent_flag_path(Path(self.workspace_dir))
-        try:
-            flag_path.parent.mkdir(parents=True, exist_ok=True)
-            flag_path.write_text(
-                json.dumps({
-                    "version": 1,
-                    "requested_at": int(time.time()),
-                    "reason": f"memory.save:{topic}",
-                }) + "\n",
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.warning(
-                "refresh_agent.flag write failed after memory save (%s): %s",
-                topic, exc,
-            )
+        request_prompt_refresh(self.workspace_dir, f"memory.save:{topic}")
