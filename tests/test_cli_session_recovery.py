@@ -65,12 +65,9 @@ class _FakeProc:
     """Stand-in for ``asyncio.subprocess.Process``. Construct inside
     an async helper since StreamReader requires a running loop.
 
-    ``stdout_lines`` model the TURN response: they're fed on the first
-    ``stdin.write`` (the frame), mirroring that Claude Code only emits
-    after receiving the turn — so the PUF-360 pre-frame drain sees an
-    empty buffer, as in production. ``pre_turn_lines`` model stdout
-    already buffered BEFORE the turn (internal cron / background
-    chatter) and are fed at construction so the drain can consume them.
+    ``pre_turn_lines`` are fed at construction (buffered before the
+    turn frame); ``stdout_lines`` are fed on the first ``stdin.write``,
+    mirroring that Claude Code only emits after receiving the turn.
     """
     def __init__(
         self,
@@ -686,7 +683,7 @@ def test_run_turn_auth_error_takes_precedence_over_too_large_rewrite(
     assert out.metadata.get("request_too_large") is None
 
 
-# ── PUF-360: pre-turn stdout drain (cron / background chatter leak) ──────────
+# ── pre-turn stdout drain ────────────────────────────────────────────────────
 
 
 def _assistant_line(text: str) -> bytes:
@@ -722,12 +719,10 @@ def test_one_turn_drains_pre_turn_cron_stdout(tmp_path):
 
     out = asyncio.run(drive())
 
-    # The reply is the turn's text only — the cron line is gone.
     assert out.reply == "here is your answer"
     assert "News check complete" not in out.reply
     assert out.metadata["assistant_text_parts"] == ["here is your answer"]
 
-    # The drained cron text is audited for observability.
     events = _read_audit_events(tmp_path / "audit.log")
     pre = [e for e in events if e.get("event") == "turn.pre_drain"]
     assert len(pre) == 1
@@ -767,3 +762,39 @@ def test_no_pre_turn_stdout_is_a_clean_noop(tmp_path):
     assert out.reply == "all good"
     events = _read_audit_events(tmp_path / "audit.log")
     assert not [e for e in events if e.get("event") == "turn.pre_drain"]
+
+
+def test_drain_stops_on_eof_when_subprocess_died_pre_turn(tmp_path):
+    """Stdout EOF during the drain (subprocess exited pre-turn) exits
+    the drain cleanly; the main loop then reports eof_mid_turn."""
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        reader.feed_data(_assistant_line("last words"))
+        reader.feed_eof()
+        proc = _FakeProc(stdout_lines=[])
+        proc.stdout = reader
+        session._proc = proc
+        return await session._one_turn("hi")
+
+    out = asyncio.run(drive())
+    assert out.metadata.get("stream_error") == "eof_mid_turn"
+    assert out.reply == ""
+
+
+def test_drain_swallows_readline_error_and_hands_off_to_main_loop(tmp_path):
+    """Oversized event / dead pipe surfacing as LimitOverrunError during
+    the drain: the drain exits best-effort; the main read loop's own
+    handler then records the stream_error."""
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        session._proc = _FakeProc(
+            stdout_raises=asyncio.LimitOverrunError("event too big", 0),
+        )
+        return await session._one_turn("hi")
+
+    out = asyncio.run(drive())
+    assert out.metadata.get("stream_error") == "readline_limit"
+    assert out.reply == ""

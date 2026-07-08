@@ -167,13 +167,11 @@ INIT_TIMEOUT_SECONDS = 10.0
 # every event size seen in practice.
 STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
 
-# PUF-360: pre-turn stdout drain. Claude Code's internal cron / background
-# activity emits ``assistant`` events during quiet periods; those sit in the
-# stdout stream and, without draining, get read as the NEXT turn's reply
-# (the read loop has no turn-correlation — it collects text until ``result``).
-# Per-readline timeout only bounds the "buffer empty" check (already-buffered
-# lines return instantly); the wall-time budget caps a chatty pre-turn
-# producer so it can't stall the turn.
+# Read loop has no turn-correlation — collects until ``result`` — so any
+# pre-turn ``assistant`` chatter (Claude Code's internal cron ticks) leaks
+# into the next turn's reply. Drained before the frame write. Per-readline
+# timeout bounds the empty-buffer check; wall-time cap keeps a chatty
+# producer from stalling the turn.
 STALE_STDOUT_DRAIN_TIMEOUT = 0.1
 STALE_STDOUT_DRAIN_BUDGET = 1.0
 
@@ -660,14 +658,8 @@ class ClaudeSession:
     # ── One turn ──────────────────────────────────────────────────────────────
 
     async def _drain_stale_stdout(self) -> int:
-        """PUF-360: consume stdout events emitted before this turn's frame.
-
-        Called pre-frame-write, so anything buffered is pre-turn output
-        (Claude Code internal cron / background ``assistant`` chatter) that
-        the read loop would otherwise fold into this turn's reply. Drains
-        until the buffer is empty (per-readline timeout) or a wall-time
-        budget elapses; audit-logs any drained assistant text for
-        observability. Returns the number of events drained."""
+        """Consume stdout events buffered before this turn's frame is
+        written, so pre-turn chatter isn't folded into the reply."""
         assert self._proc is not None and self._proc.stdout is not None
         drained = 0
         deadline = time.monotonic() + STALE_STDOUT_DRAIN_BUDGET
@@ -678,15 +670,13 @@ class ClaudeSession:
                     timeout=STALE_STDOUT_DRAIN_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                break  # nothing more was already waiting — buffer drained
+                break
             except (asyncio.LimitOverrunError, ValueError,
                     ConnectionResetError, BrokenPipeError):
-                # Best-effort: any read problem here (oversized event,
-                # dead pipe) stops the drain and hands off to the main
-                # read loop, which has the full graceful-recovery path.
+                # Best-effort — main read loop handles recovery.
                 break
             if not line:
-                break  # EOF — subprocess died pre-turn; frame write surfaces it
+                break
             drained += 1
             event = _parse_event(line)
             if event is None or self.audit is None:
@@ -737,10 +727,6 @@ class ClaudeSession:
             "parent_tool_use_id": None,
             "session_id": self._session_id or "puffoagent-turn",
         }
-        # PUF-360: drain any stdout the subprocess emitted BEFORE this
-        # frame (internal cron / background chatter) so the read loop
-        # below only collects THIS turn's events. Pre-frame, so no
-        # turn-generated event can be in the buffer yet.
         await self._drain_stale_stdout()
         self._proc.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
         try:
