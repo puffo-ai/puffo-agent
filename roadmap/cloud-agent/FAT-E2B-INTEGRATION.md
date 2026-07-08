@@ -8,6 +8,12 @@ through Shan's LiteLLM virtual-key endpoint instead of the vendor
 default). Neither changes native/desktop behavior when the new config is
 absent.
 
+> **Keyless outbound dispatch (T23 phase 1):** how a keyless cloud agent
+> does all outbound tool work over unsigned `/v2/cloud-agents/*` HTTP
+> (egress-injected `x-sandbox-token`) instead of the bridge WS — and which
+> GAP rows flip to PASS — is written up in
+> [`KEYLESS-DISPATCH-PHASE1.md`](./KEYLESS-DISPATCH-PHASE1.md).
+
 ---
 
 ## 1. Slim packaging — base install is Qt-free

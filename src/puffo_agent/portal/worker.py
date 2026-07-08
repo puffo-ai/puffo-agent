@@ -386,7 +386,12 @@ def _build_puffo_core_client(
         _ensure_agent_identity_imported(agent_id, pc.slug)
     ks_dir = str(agent_dir(agent_id) / "keys")
     ks = KeyStore(ks_dir)
-    http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
+    # Bridge agents dispatch outbound tool work keyless over the unsigned
+    # ``/v2/cloud-agents/*`` routes; ``route.py`` reuses ``client.http``, so
+    # the in-process ws-local cfg's ``keyless`` accessor reads True here.
+    http = PuffoCoreHttpClient(
+        pc.server_url, ks, pc.slug, keyless=(pc.transport == "bridge"),
+    )
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (

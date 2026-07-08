@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 
 import aiohttp
 from aiohttp import web
@@ -418,5 +419,111 @@ class TestHttpClientUnsigned(AioHTTPTestCase):
         try:
             result = await client.get_unsigned("/invites/ABC/check")
             assert result["available"] is True
+        finally:
+            await client.close()
+
+
+class TestHttpClientKeylessEgress(AioHTTPTestCase):
+    """T23 keyless transport: ``post_bytes_unsigned`` + the test-only
+    egress ``x-sandbox-token`` shim on the three unsigned methods. An
+    echo handler captures the headers + body the server received."""
+
+    def setUp(self):
+        self.ks, _ = _make_keystore_with_identity()
+        self.subkey = Ed25519KeyPair.generate()
+        _make_keystore_with_session(self.ks, self.subkey)
+        self.captured_headers = {}
+        self.captured_body = b""
+        super().setUp()
+
+    async def get_application(self):
+        app = web.Application()
+        app.router.add_route("POST", "/v2/cloud-agents/blobs/upload", self._echo)
+        app.router.add_route("POST", "/v2/cloud-agents/messages", self._echo)
+        app.router.add_route("GET", "/v2/cloud-agents/spaces", self._echo)
+        # Signed routes — used to prove the shim never touches them.
+        app.router.add_route("GET", "/health", self._echo)
+        app.router.add_route("POST", "/messages", self._echo)
+        return app
+
+    async def _echo(self, request: web.Request):
+        self.captured_headers = {k.lower(): v for k, v in request.headers.items()}
+        self.captured_body = await request.read()
+        return web.json_response({"ok": True, "blob_id": "b1"})
+
+    @unittest_run_loop
+    async def test_post_bytes_unsigned_sends_raw_bytes_no_signature(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PUFFO_LOCAL_SANDBOX_TOKEN", None)
+                result = await client.post_bytes_unsigned(
+                    "/v2/cloud-agents/blobs/upload", b"\x00\x01raw-bytes",
+                )
+            assert result["blob_id"] == "b1"
+            # Raw body posted verbatim; octet-stream content type; unsigned.
+            assert self.captured_body == b"\x00\x01raw-bytes"
+            assert self.captured_headers.get("content-type", "").startswith(
+                "application/octet-stream"
+            )
+            assert "x-puffo-signature" not in self.captured_headers
+            assert "x-sandbox-token" not in self.captured_headers
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_egress_shim_adds_token_when_env_set(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {"PUFFO_LOCAL_SANDBOX_TOKEN": "tok-abc"}):
+                await client.get_unsigned("/v2/cloud-agents/spaces")
+                assert self.captured_headers.get("x-sandbox-token") == "tok-abc"
+                await client.post_unsigned(
+                    "/v2/cloud-agents/messages", {"plaintext": "hi"},
+                )
+                assert self.captured_headers.get("x-sandbox-token") == "tok-abc"
+                await client.post_bytes_unsigned(
+                    "/v2/cloud-agents/blobs/upload", b"blobbytes",
+                )
+                assert self.captured_headers.get("x-sandbox-token") == "tok-abc"
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_egress_shim_absent_when_env_unset(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("PUFFO_LOCAL_SANDBOX_TOKEN", None)
+                await client.get_unsigned("/v2/cloud-agents/spaces")
+                assert "x-sandbox-token" not in self.captured_headers
+                await client.post_unsigned(
+                    "/v2/cloud-agents/messages", {"plaintext": "hi"},
+                )
+                assert "x-sandbox-token" not in self.captured_headers
+                await client.post_bytes_unsigned(
+                    "/v2/cloud-agents/blobs/upload", b"x",
+                )
+                assert "x-sandbox-token" not in self.captured_headers
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_signed_methods_never_carry_sandbox_token(self):
+        # Even with the env var set, the signed get/post must stay
+        # untouched — the shim lives only on the unsigned methods.
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            with patch.dict(os.environ, {"PUFFO_LOCAL_SANDBOX_TOKEN": "tok-abc"}):
+                await client.get("/health")
+                assert "x-sandbox-token" not in self.captured_headers
+                assert "x-puffo-signature" in self.captured_headers
+                await client.post("/messages", {"x": 1})
+                assert "x-sandbox-token" not in self.captured_headers
+                assert "x-puffo-signature" in self.captured_headers
         finally:
             await client.close()

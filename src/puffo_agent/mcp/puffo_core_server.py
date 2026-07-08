@@ -250,7 +250,14 @@ def build_server(
         _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
         else KeyStore(keystore_dir)
     )
-    http = PuffoCoreHttpClient(server_url, ks, slug)
+    # Keyless (T23 bridge) tools do all outbound work over the unsigned
+    # ``/v2/cloud-agents/*`` routes (egress-injected ``x-sandbox-token``),
+    # so the subprocess is self-sufficient with no local keystore. The
+    # ``_BridgeNoKeysStore`` guard above stays as a defensive dead-end for
+    # any residual signed call.
+    http = PuffoCoreHttpClient(
+        server_url, ks, slug, keyless=(transport == "bridge"),
+    )
     data = DataClient(data_service_url, agent_id)
 
     # None when PUFFO_RPC_URL is unset; tools surface a clear error

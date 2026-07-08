@@ -88,6 +88,70 @@ def _ts_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
 
 
+# ── transport seam ─────────────────────────────────────────────────
+#
+# One helper per wire read/write. Each branches on ``cfg.keyless``: the
+# keyless (T23 bridge) transport hits the unsigned, token-authed
+# ``/v2/cloud-agents/*`` routes (the E2B egress proxy injects
+# ``x-sandbox-token``); the native transport keeps the signed keystore
+# path byte-for-byte. Kept as module-level ``_read_*``/``_send_*``
+# functions to match the existing ``_resolve_channel_space`` /
+# ``_fetch_device_keys`` idiom.
+
+
+async def _read_spaces(cfg: Any) -> Any:
+    if cfg.keyless:
+        return await cfg.http_client.get_unsigned("/v2/cloud-agents/spaces")
+    return await cfg.http_client.get("/spaces")
+
+
+async def _read_space_channels(cfg: Any, space_id: str) -> Any:
+    if cfg.keyless:
+        return await cfg.http_client.get_unsigned(
+            f"/v2/cloud-agents/spaces/{space_id}/channels"
+        )
+    return await cfg.http_client.get(f"/spaces/{space_id}/channels")
+
+
+async def _read_channel_members(
+    cfg: Any, space_id: str, channel_id: str,
+) -> Any:
+    """Keyless degrades to the space roster: the server exposes no
+    keyless *channel*-members route, only ``/spaces/{id}/members``, so
+    the keyless branch reads that (``channel_id`` is unused). Native
+    keeps its channel-scoped route."""
+    if cfg.keyless:
+        return await cfg.http_client.get_unsigned(
+            f"/v2/cloud-agents/spaces/{space_id}/members"
+        )
+    return await cfg.http_client.get(
+        f"/spaces/{space_id}/channels/{channel_id}/members"
+    )
+
+
+async def _read_profiles(cfg: Any, slugs_csv: str) -> Any:
+    quoted = urllib.parse.quote(slugs_csv, safe=",")
+    if cfg.keyless:
+        return await cfg.http_client.get_unsigned(
+            f"/v2/cloud-agents/identities/profiles?slugs={quoted}"
+        )
+    return await cfg.http_client.get(
+        f"/identities/profiles?slugs={quoted}"
+    )
+
+
+async def _send_keyless(cfg: Any, body: dict) -> dict:
+    return await cfg.http_client.post_unsigned(
+        "/v2/cloud-agents/messages", body,
+    ) or {}
+
+
+async def _upload_blob_keyless(cfg: Any, data: bytes) -> dict:
+    return await cfg.http_client.post_bytes_unsigned(
+        "/v2/cloud-agents/blobs/upload", data,
+    ) or {}
+
+
 @dataclass
 class PuffoCoreToolsConfig:
     slug: str
@@ -114,6 +178,15 @@ class PuffoCoreToolsConfig:
     # (``bridge_client.upload_blob``) and referenced by ``blob_id`` in the
     # frame's top-level ``attachments`` — no encrypt, no signed POST.
     bridge_client: Any = None
+
+    @property
+    def keyless(self) -> bool:
+        """True on the T23 bridge transport: outbound reads/sends go over
+        the unsigned ``/v2/cloud-agents/*`` routes (egress-injected
+        ``x-sandbox-token``) instead of the signed keystore path. Reads
+        ``http_client.keyless``; test fakes without the attribute default
+        to native, so existing native tests keep passing untouched."""
+        return getattr(self.http_client, "keyless", False)
 
 
 async def _fetch_device_keys(
@@ -379,6 +452,36 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def whoami() -> str:
         """Return your own identity: display name, slug, device_id, and
         subkey info."""
+        if cfg.keyless:
+            # T23 keyless bridge transport: the sandbox holds no local
+            # keystore, so build identity from the config instead of
+            # ``load_identity``/``load_session``. display_name resolves
+            # over the unsigned profiles route; the signing subkey is
+            # managed server-side.
+            lines = []
+            try:
+                data = await _read_profiles(cfg, cfg.slug)
+                profiles = (
+                    data.get("profiles", []) if isinstance(data, dict) else []
+                )
+                display_name = (
+                    (profiles[0].get("display_name") or "").strip()
+                    if profiles else ""
+                )
+                if display_name:
+                    lines.append(f"display_name: {display_name}")
+            except Exception as exc:
+                logger.warning(
+                    "whoami: failed to fetch own display_name: %s", exc,
+                )
+            lines += [
+                f"slug:      {cfg.slug}",
+                f"device_id: {cfg.device_id}",
+                f"server:    {cfg.http_client.server_url}",
+                "subkey:    (managed server-side; keyless transport)",
+            ]
+            return "\n".join(lines)
+
         identity = cfg.keystore.load_identity(cfg.slug)
         lines = []
         # display_name lives on the server (the local keystore only has
@@ -453,11 +556,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "list_channels_in_all_spaces to look one up."
             )
 
-        if cfg.bridge_client is not None:
-            # T23 bridge transport: send plaintext; the server holds all
-            # crypto and fans out recipients. DM ('@slug') vs channel
-            # ('ch_') routing only — no device-key fetch, no encrypt, no
-            # signed POST. Threaded replies carry the same snake_case
+        if cfg.keyless:
+            # T23 keyless bridge transport: POST plaintext to the unsigned
+            # ``/v2/cloud-agents/messages`` route (the E2B egress proxy
+            # injects ``x-sandbox-token``); the server holds all crypto and
+            # fans out recipients. DM ('@slug') vs channel ('ch_') routing
+            # only — no device-key fetch, no encrypt, no signed POST, no
+            # bridge WS. Threaded replies carry the same snake_case
             # ``thread_root_id`` / ``reply_to_id`` field names a human/web
             # message uses: ``thread_root_id`` is the resolved+validated
             # true root (same resolvers the native branch runs, driven off
@@ -465,8 +570,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # parent id the agent passed. Resolution is fail-soft — a miss
             # falls through with a note and the send still completes.
             if channel_ref.startswith("@"):
-                bridge_recipient = channel_ref[1:]
-                if not bridge_recipient:
+                keyless_recipient = channel_ref[1:]
+                if not keyless_recipient:
                     raise RuntimeError("DM recipient slug is required after '@'")
                 resolved_root, root_note = await _resolve_root_id(
                     root_id, cfg.data_client,
@@ -474,36 +579,35 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 resolved_root, validate_note = await _validate_root_same_channel(
                     resolved_root, None, None, cfg.data_client,
                 )
-                ack = await cfg.bridge_client.send_send(
-                    plaintext=text,
-                    recipient_slug=bridge_recipient,
-                    thread_root_id=resolved_root or None,
-                    # F4: drop the raw parent ref when root validation wiped
-                    # the thread — no dangling reply_to for a root the send
-                    # no longer threads under.
-                    reply_to_id=(root_id or None) if resolved_root else None,
-                )
+                body: dict[str, Any] = {
+                    "plaintext": text,
+                    "recipient_slug": keyless_recipient,
+                }
             else:
-                bridge_channel_id = channel_ref
-                bridge_space_id = await _resolve_channel_space(
-                    cfg, bridge_channel_id,
+                keyless_channel_id = channel_ref
+                keyless_space_id = await _resolve_channel_space(
+                    cfg, keyless_channel_id,
                 )
                 resolved_root, root_note = await _resolve_root_id(
                     root_id, cfg.data_client,
                 )
                 resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, bridge_channel_id, bridge_space_id,
+                    resolved_root, keyless_channel_id, keyless_space_id,
                     cfg.data_client,
                 )
-                ack = await cfg.bridge_client.send_send(
-                    plaintext=text,
-                    space_id=bridge_space_id,
-                    channel_id=bridge_channel_id,
-                    thread_root_id=resolved_root or None,
-                    # F4: drop the raw parent ref when root validation wiped
-                    # the thread (see the DM branch above).
-                    reply_to_id=(root_id or None) if resolved_root else None,
-                )
+                body = {
+                    "plaintext": text,
+                    "space_id": keyless_space_id,
+                    "channel_id": keyless_channel_id,
+                }
+            # Only truthy thread keys ride the body. F4: drop the raw parent
+            # ref when root validation wiped the thread — no dangling
+            # reply_to for a root the send no longer threads under.
+            if resolved_root:
+                body["thread_root_id"] = resolved_root
+                if root_id:
+                    body["reply_to_id"] = root_id
+            ack = await _send_keyless(cfg, body)
             return (
                 f"posted {(ack or {}).get('envelope_id', '?')} to {channel}"
                 f"{root_note}"
@@ -744,7 +848,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         agent actually has, so the result reflects authoritative
         permissions — channels can be enumerated for any space
         listed here via ``list_channels_in_space``."""
-        data = await cfg.http_client.get("/spaces")
+        data = await _read_spaces(cfg)
         spaces_entries = (data or {}).get("spaces", []) or []
         if not spaces_entries:
             return "(not a member of any space)"
@@ -774,7 +878,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         sid = (space_id or "").strip()
         if not sid:
             raise RuntimeError("space_id is required")
-        data = await cfg.http_client.get(f"/spaces/{sid}/channels")
+        data = await _read_space_channels(cfg, sid)
         channels = (
             data.get("channels", []) if isinstance(data, dict) else []
         ) or []
@@ -804,7 +908,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         for the case where the LLM wants the full membership picture
         in one tool call. Walks one ``GET /spaces`` plus one
         ``GET /spaces/<sp>/channels`` per space."""
-        spaces_data = await cfg.http_client.get("/spaces")
+        spaces_data = await _read_spaces(cfg)
         spaces_entries = (spaces_data or {}).get("spaces", []) or []
         if not spaces_entries:
             return "(not a member of any space)"
@@ -814,9 +918,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_name = sp.get("name", "") or space_id
             if not space_id:
                 continue
-            ch_data = await cfg.http_client.get(
-                f"/spaces/{space_id}/channels"
-            )
+            ch_data = await _read_space_channels(cfg, space_id)
             channels = (
                 ch_data.get("channels", []) if isinstance(ch_data, dict) else []
             )
@@ -849,9 +951,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         # for any channel not in the agent's home space.
         space_id = await _resolve_channel_space(cfg, channel_id)
 
-        data = await cfg.http_client.get(
-            f"/spaces/{space_id}/channels/{channel_id}/members"
-        )
+        # Keyless degrades to the space roster (no keyless channel-members
+        # route exists); native reads the channel-scoped members. See
+        # ``_read_channel_members``.
+        data = await _read_channel_members(cfg, space_id, channel_id)
         rows = []
         for m in data.get("members", []):
             slug = m.get("slug", "?")
@@ -875,9 +978,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         # ``/identities/profiles?slugs=`` accepts a comma-separated
         # list; we read back the first entry. Empty list means the
         # slug isn't registered.
-        data = await cfg.http_client.get(
-            f"/identities/profiles?slugs={urllib.parse.quote(slug, safe='')}"
-        )
+        data = await _read_profiles(cfg, slug)
         profiles = data.get("profiles", []) if isinstance(data, dict) else []
         if not profiles:
             return f"(no profile for {slug})"
@@ -1086,21 +1187,22 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 )
             targets.append(target)
 
-        if cfg.bridge_client is not None:
-            # T23 bridge transport: the server holds the at-rest blob
-            # store, so we upload each file's PLAINTEXT bytes keyless
-            # (``upload_blob`` → ``x-sandbox-token``, raw body) and pass
-            # the returned ``blob_id``s as top-level ``AttachmentRef``s
-            # into the same plaintext ``send`` frame ``send_message``
-            # uses. No ``encrypt_attachment``, no device-key fetch, no
-            # signed ``/messages`` POST — a bridge agent has no
-            # signed-crypto seam. DM vs channel routing + fail-soft
-            # thread resolution mirror ``send_message``'s bridge branch.
+        if cfg.keyless:
+            # T23 keyless bridge transport: the server holds the at-rest
+            # blob store, so we upload each file's PLAINTEXT bytes unsigned
+            # (``post_bytes_unsigned`` → egress-injected ``x-sandbox-token``,
+            # raw body) and pass the returned ``blob_id``s as top-level
+            # ``AttachmentRef``s into the same plaintext ``/v2/cloud-agents/
+            # messages`` POST ``send_message`` uses. No ``encrypt_attachment``,
+            # no device-key fetch, no signed ``/messages`` POST — a keyless
+            # agent has no signed-crypto seam. DM vs channel routing +
+            # fail-soft thread resolution mirror ``send_message``'s keyless
+            # branch.
             #
             # F5: run EVERY precondition — destination resolve/validate,
             # root resolve/validate, and all per-file size checks — BEFORE
-            # the first ``upload_blob``, so a rejected route or an oversized
-            # Nth file raises with no orphaned blobs left on the server.
+            # the first upload, so a rejected route or an oversized Nth file
+            # raises with no orphaned blobs left on the server.
             channel_ref = channel.strip()
             if channel_ref.startswith("#"):
                 raise RuntimeError(
@@ -1112,19 +1214,19 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # a stale ``ch_`` (``_resolve_channel_space`` raises) fails here,
             # before any upload.
             is_dm = channel_ref.startswith("@")
-            bridge_recipient = ""
-            bridge_channel_id = ""
-            bridge_space_id = None
+            keyless_recipient = ""
+            keyless_channel_id = ""
+            keyless_space_id = None
             if is_dm:
-                bridge_recipient = channel_ref[1:]
-                if not bridge_recipient:
+                keyless_recipient = channel_ref[1:]
+                if not keyless_recipient:
                     raise RuntimeError(
                         "DM recipient slug is required after '@'"
                     )
             else:
-                bridge_channel_id = channel_ref
-                bridge_space_id = await _resolve_channel_space(
-                    cfg, bridge_channel_id,
+                keyless_channel_id = channel_ref
+                keyless_space_id = await _resolve_channel_space(
+                    cfg, keyless_channel_id,
                 )
 
             # (2) Resolve + validate the thread root before uploads.
@@ -1133,8 +1235,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             )
             resolved_root, validate_note = await _validate_root_same_channel(
                 resolved_root,
-                None if is_dm else bridge_channel_id,
-                None if is_dm else bridge_space_id,
+                None if is_dm else keyless_channel_id,
+                None if is_dm else keyless_space_id,
                 cfg.data_client,
             )
 
@@ -1158,12 +1260,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # (4) Only now upload each blob → build refs.
             refs: list[dict] = []
             for target, plaintext, mime_type in prepared:
-                up = await cfg.bridge_client.upload_blob(plaintext)
+                up = await _upload_blob_keyless(cfg, plaintext)
                 blob_id = up.get("blob_id") if isinstance(up, dict) else None
                 if not blob_id:
                     raise RuntimeError(
-                        f"send_message_with_attachments: bridge returned no "
-                        f"blob_id for {target.name!r} ({up!r})"
+                        f"send_message_with_attachments: keyless upload "
+                        f"returned no blob_id for {target.name!r} ({up!r})"
                     )
                 refs.append({
                     "blob_id": blob_id,
@@ -1175,22 +1277,23 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # (5) One send using the pre-resolved route + the F4 reply_to
             # gate (drop the raw parent when root validation wiped it).
             if is_dm:
-                ack = await cfg.bridge_client.send_send(
-                    plaintext=caption,
-                    recipient_slug=bridge_recipient,
-                    attachments=refs,
-                    thread_root_id=resolved_root or None,
-                    reply_to_id=(root_id or None) if resolved_root else None,
-                )
+                body: dict[str, Any] = {
+                    "plaintext": caption,
+                    "recipient_slug": keyless_recipient,
+                    "attachments": refs,
+                }
             else:
-                ack = await cfg.bridge_client.send_send(
-                    plaintext=caption,
-                    space_id=bridge_space_id,
-                    channel_id=bridge_channel_id,
-                    attachments=refs,
-                    thread_root_id=resolved_root or None,
-                    reply_to_id=(root_id or None) if resolved_root else None,
-                )
+                body = {
+                    "plaintext": caption,
+                    "space_id": keyless_space_id,
+                    "channel_id": keyless_channel_id,
+                    "attachments": refs,
+                }
+            if resolved_root:
+                body["thread_root_id"] = resolved_root
+                if root_id:
+                    body["reply_to_id"] = root_id
+            ack = await _send_keyless(cfg, body)
             names = ", ".join(t.name for t in targets)
             thread_note = f" in thread {resolved_root}" if resolved_root else ""
             return (

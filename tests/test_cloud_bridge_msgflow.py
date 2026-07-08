@@ -152,6 +152,13 @@ class FakeHttp:
     def __init__(self):
         self.calls: list[tuple[str, str, object]] = []
         self.responses: dict[str, dict] = {}
+        # T23 keyless surface. Off by default (native/inbound tests keep
+        # the signed path); ``_tools_cfg`` flips it on for the send-tool
+        # tests so they exercise the unsigned ``/v2/cloud-agents/*`` seam.
+        self.keyless = False
+        self.server_url = "http://sandbox.local"
+        self.uploaded: list[bytes] = []
+        self._blob_seq = 0
 
     def _match(self, path: str) -> dict:
         if path in self.responses:
@@ -189,6 +196,29 @@ class FakeHttp:
         # canned blob_id unless a test registers its own response.
         self.calls.append(("POST_BYTES", path, body))
         return self.responses.get(path, {"blob_id": "blob_native_1"})
+
+    # ── keyless (T23) unsigned methods ──────────────────────────────
+
+    async def get_unsigned(self, path):
+        self.calls.append(("GET_UNSIGNED", path, None))
+        return self._match(path)
+
+    async def post_unsigned(self, path, body=None):
+        self.calls.append(("POST_UNSIGNED", path, body))
+        if path in self.responses:
+            return self.responses[path]
+        return {"envelope_id": "msg_bridgeack"}
+
+    async def post_bytes_unsigned(self, path, body):
+        self._blob_seq += 1
+        self.uploaded.append(body)
+        self.calls.append(
+            ("POST_BYTES_UNSIGNED", path, len(body) if body else 0)
+        )
+        return {
+            "blob_id": f"blob_{self._blob_seq:04d}",
+            "size_bytes": len(body) if body else 0,
+        }
 
 
 # --------------------------------------------------------------------------
@@ -247,16 +277,26 @@ def _native_keystore(tmp_path, slug="bot-0001") -> KeyStore:
 
 def _tools_cfg(tmp_path, *, bridge, data_client, http=None, slug="bot-0001"):
     ks = KeyStore(str(tmp_path / "cfg-keys"))
+    http = http or FakeHttp()
+    # T23: outbound send tools run keyless over ``/v2/cloud-agents/*``.
+    # The ``bridge`` stays on the cfg (inbound + lifecycle) but must NOT
+    # be touched by send — the tests assert ``bridge.sent == []``.
+    http.keyless = True
     return PuffoCoreToolsConfig(
         slug=slug,
         device_id="dev_test",
         keystore=ks,
-        http_client=http or FakeHttp(),
+        http_client=http,
         data_client=data_client,
         space_id="sp_home",
         workspace=str(tmp_path),
         bridge_client=bridge,
     )
+
+
+def _http_sends(http):
+    """Bodies of every keyless ``POST /v2/cloud-agents/messages``."""
+    return [b for m, p, b in http.calls if m == "POST_UNSIGNED"]
 
 
 async def _drive_listen_until(client, *, on_message, done: asyncio.Event, timeout=5.0):
@@ -437,11 +477,17 @@ async def test_b_send_message_dm_uses_bridge_no_encrypt(tmp_path, monkeypatch):
 
     result = await tools["send_message"](channel="@alice-0001", text="hi alice")
 
-    assert len(bridge.sent) == 1
-    sent = bridge.sent[0]
-    assert sent["plaintext"] == "hi alice"
-    assert sent["recipient_slug"] == "alice-0001"
-    assert sent["space_id"] is None and sent["channel_id"] is None
+    # Keyless: one unsigned POST /v2/cloud-agents/messages, no bridge send.
+    sends = _http_sends(cfg.http_client)
+    assert [p for m, p, _ in cfg.http_client.calls if m == "POST_UNSIGNED"] == [
+        "/v2/cloud-agents/messages",
+    ]
+    assert len(sends) == 1
+    body = sends[0]
+    assert body["plaintext"] == "hi alice"
+    assert body["recipient_slug"] == "alice-0001"
+    assert "space_id" not in body and "channel_id" not in body
+    assert bridge.sent == []
     assert "msg_bridgeack" in result
     assert enc_calls == []
 
@@ -465,12 +511,14 @@ async def test_b_send_message_channel_uses_bridge_no_encrypt(tmp_path, monkeypat
 
     result = await tools["send_message"](channel="ch_xyz", text="team update")
 
-    assert len(bridge.sent) == 1
-    sent = bridge.sent[0]
-    assert sent["plaintext"] == "team update"
-    assert sent["space_id"] == "sp_1"
-    assert sent["channel_id"] == "ch_xyz"
-    assert sent["recipient_slug"] is None
+    sends = _http_sends(cfg.http_client)
+    assert len(sends) == 1
+    body = sends[0]
+    assert body["plaintext"] == "team update"
+    assert body["space_id"] == "sp_1"
+    assert body["channel_id"] == "ch_xyz"
+    assert "recipient_slug" not in body
+    assert bridge.sent == []
     assert "msg_bridgeack" in result
     assert enc_calls == []
 
@@ -505,14 +553,16 @@ async def test_b_send_message_channel_threads_on_bridge(tmp_path):
     result = await tools["send_message"](
         channel="ch_xyz", text="reply", root_id="msg_reply",
     )
-    assert len(bridge.sent) == 1
-    sent = bridge.sent[0]
+    sends = _http_sends(cfg.http_client)
+    assert len(sends) == 1
+    body = sends[0]
     # Resolved to the true root, not the intermediate reply id.
-    assert sent["thread_root_id"] == "msg_root"
+    assert body["thread_root_id"] == "msg_root"
     # Raw parent id the agent passed rides reply_to_id.
-    assert sent["reply_to_id"] == "msg_reply"
-    assert sent["space_id"] == "sp_1"
-    assert sent["channel_id"] == "ch_xyz"
+    assert body["reply_to_id"] == "msg_reply"
+    assert body["space_id"] == "sp_1"
+    assert body["channel_id"] == "ch_xyz"
+    assert bridge.sent == []
     # No stale "top-level" / "not wired" note — threading is live now.
     assert "top-level" not in result.lower()
     assert "not wired" not in result.lower()
@@ -541,11 +591,13 @@ async def test_b_send_message_dm_threads_on_bridge(tmp_path):
     result = await tools["send_message"](
         channel="@alice-0001", text="reply", root_id="dm_root",
     )
-    assert len(bridge.sent) == 1
-    sent = bridge.sent[0]
-    assert sent["recipient_slug"] == "alice-0001"
-    assert sent["thread_root_id"] == "dm_root"
-    assert sent["reply_to_id"] == "dm_root"
+    sends = _http_sends(cfg.http_client)
+    assert len(sends) == 1
+    body = sends[0]
+    assert body["recipient_slug"] == "alice-0001"
+    assert body["thread_root_id"] == "dm_root"
+    assert body["reply_to_id"] == "dm_root"
+    assert bridge.sent == []
     assert "msg_bridgeack" in result
 
 
@@ -1004,14 +1056,19 @@ async def test_e_attachments_uploaded_keyless_and_reffed_on_bridge(
         paths=["note.txt"], channel="@alice-0001", caption="see file",
     )
 
-    # Uploaded exactly once, with the raw plaintext bytes.
-    assert bridge.uploaded == [body]
-    # One send frame carrying the ref by blob_id.
-    assert len(bridge.sent) == 1
-    sent = bridge.sent[0]
+    # Uploaded exactly once, keyless, with the raw plaintext bytes.
+    assert http.uploaded == [body]
+    assert [p for m, p, _ in http.calls if m == "POST_BYTES_UNSIGNED"] == [
+        "/v2/cloud-agents/blobs/upload",
+    ]
+    # One keyless send carrying the ref by blob_id; bridge untouched.
+    assert bridge.uploaded == [] and bridge.sent == []
+    sends = _http_sends(http)
+    assert len(sends) == 1
+    sent = sends[0]
     assert sent["plaintext"] == "see file"
     assert sent["recipient_slug"] == "alice-0001"
-    assert sent["space_id"] is None and sent["channel_id"] is None
+    assert "space_id" not in sent and "channel_id" not in sent
     refs = sent["attachments"]
     assert isinstance(refs, list) and len(refs) == 1
     ref = refs[0]
@@ -1019,7 +1076,7 @@ async def test_e_attachments_uploaded_keyless_and_reffed_on_bridge(
     assert ref["filename"] == "note.txt"
     assert ref["mime_type"] == "text/plain"
     assert ref["size_bytes"] == len(body)
-    # No signed-crypto: no encrypt, no /blobs/upload or /messages POST.
+    # No signed-crypto: no encrypt, no signed /blobs/upload or /messages POST.
     assert enc_calls == []
     assert not any(
         p in ("/blobs/upload", "/messages") for _, p, _ in http.calls
@@ -1042,12 +1099,14 @@ async def test_e_attachments_channel_route_on_bridge(tmp_path):
     await tools["send_message_with_attachments"](
         paths=["doc.txt"], channel="ch_xyz", caption="team file",
     )
-    assert len(bridge.uploaded) == 1
-    assert len(bridge.sent) == 1
-    sent = bridge.sent[0]
+    assert len(cfg.http_client.uploaded) == 1
+    assert bridge.uploaded == [] and bridge.sent == []
+    sends = _http_sends(cfg.http_client)
+    assert len(sends) == 1
+    sent = sends[0]
     assert sent["space_id"] == "sp_1"
     assert sent["channel_id"] == "ch_xyz"
-    assert sent["recipient_slug"] is None
+    assert "recipient_slug" not in sent
     assert sent["attachments"][0]["blob_id"] == "blob_0001"
 
 
