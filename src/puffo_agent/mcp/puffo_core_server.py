@@ -222,6 +222,18 @@ def _register_local_tools(
         return "\n".join(lines)
 
 
+class _BridgeNoKeysStore(KeyStore):
+    """Bridge transport (T23): the agent holds no local keys. Tools
+    that still hit a signed path get a clear error instead of a
+    FileNotFoundError, until phase 2 rewires them keyless."""
+
+    def load_identity(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+    def load_session(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+
 def build_server(
     slug: str,
     device_id: str,
@@ -234,9 +246,20 @@ def build_server(
     runtime_kind: str = "",
     harness: str = "",
     memory_dir: str = "",
+    transport: str = "",
 ) -> FastMCP:
-    ks = KeyStore(keystore_dir)
-    http = PuffoCoreHttpClient(server_url, ks, slug)
+    ks = (
+        _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
+        else KeyStore(keystore_dir)
+    )
+    # Keyless (T23 bridge) tools do all outbound work over the unsigned
+    # ``/v2/cloud-agents/*`` routes (egress-injected ``x-sandbox-token``),
+    # so the subprocess is self-sufficient with no local keystore. The
+    # ``_BridgeNoKeysStore`` guard above stays as a defensive dead-end for
+    # any residual signed call.
+    http = PuffoCoreHttpClient(
+        server_url, ks, slug, keyless=(transport == "bridge"),
+    )
     data = DataClient(data_service_url, agent_id)
 
     # None when PUFFO_RPC_URL is unset; tools surface a clear error
@@ -309,6 +332,7 @@ def _cfg_from_env() -> dict[str, str]:
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
         "memory_dir": os.environ.get("PUFFO_MEMORY_DIR", ""),
+        "transport": os.environ.get("PUFFO_CORE_TRANSPORT", ""),
     }
 
 

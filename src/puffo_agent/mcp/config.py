@@ -267,6 +267,7 @@ def puffo_core_mcp_env(
     runtime_kind: str = "",
     harness: str = "",
     memory_dir: str = "",
+    transport: str = "",
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess. The MCP never
     touches ``messages.db`` or ``~/.claude.json`` directly — the
@@ -294,6 +295,19 @@ def puffo_core_mcp_env(
         env["PUFFO_HARNESS"] = harness
     if memory_dir:
         env["PUFFO_MEMORY_DIR"] = memory_dir
+    # T23 bridge transport — no caller passes this yet; adapter env
+    # wiring lands with phase 2.
+    if transport:
+        env["PUFFO_CORE_TRANSPORT"] = transport
+    # Test-only egress shim: forward PUFFO_LOCAL_SANDBOX_TOKEN into the
+    # subprocess so its keyless http client can simulate the E2B egress
+    # token injection against a local server. Guarded on presence in the
+    # daemon environment — production leaves it unset, so nothing is
+    # written to any config file.
+    import os as _os
+    local_sandbox_token = _os.environ.get("PUFFO_LOCAL_SANDBOX_TOKEN")
+    if local_sandbox_token:
+        env["PUFFO_LOCAL_SANDBOX_TOKEN"] = local_sandbox_token
     # codex only forwards [mcp_servers.puffo.env] to the subprocess,
     # so CODEX_HOME must be pinned explicitly or list_mcp_servers
     # would read the operator's host config instead of the agent's.

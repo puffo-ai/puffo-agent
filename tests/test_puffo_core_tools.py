@@ -121,6 +121,91 @@ def _setup():
     return cfg, http, ms
 
 
+class KeylessFakeHttpClient:
+    """Recording stub for the T23 keyless transport. ``keyless=True``
+    flips ``PuffoCoreToolsConfig.keyless`` so the tools take the unsigned
+    ``/v2/cloud-agents/*`` seam. Records every unsigned call and mints a
+    fresh blob_id per upload. The signed ``get``/``post``/``post_bytes``
+    methods are deliberately ABSENT so any accidental signed call fails
+    loud (proving keyless tools never hit the signed path)."""
+
+    def __init__(self, server_url: str = "http://sandbox.local"):
+        self.keyless = True
+        self.server_url = server_url
+        self.calls: list[tuple[str, str, object]] = []
+        self.responses: dict[str, dict] = {}
+        self.uploaded: list[bytes] = []
+        self._blob_seq = 0
+
+    def _match(self, path: str) -> dict:
+        if path in self.responses:
+            return self.responses[path]
+        base = path.split("?", 1)[0]
+        return self.responses.get(base, {})
+
+    async def get_unsigned(self, path):
+        self.calls.append(("GET_UNSIGNED", path, None))
+        return self._match(path)
+
+    async def post_unsigned(self, path, body=None):
+        self.calls.append(("POST_UNSIGNED", path, body))
+        if path in self.responses:
+            return self.responses[path]
+        return {"envelope_id": "msg_keyless"}
+
+    async def post_bytes_unsigned(self, path, body):
+        self._blob_seq += 1
+        self.uploaded.append(body)
+        self.calls.append(
+            ("POST_BYTES_UNSIGNED", path, len(body) if body else 0)
+        )
+        return {
+            "blob_id": f"blob_{self._blob_seq:04d}",
+            "size_bytes": len(body) if body else 0,
+        }
+
+
+class _SpyKeyStore:
+    """Records any keystore load so a keyless tool that accidentally
+    reaches the keystore is caught. Both loads raise, mirroring the
+    ``_BridgeNoKeysStore`` dead-end."""
+
+    def __init__(self):
+        self.loads: list[tuple[str, str]] = []
+
+    def load_identity(self, slug):
+        self.loads.append(("identity", slug))
+        raise AssertionError("keyless tool must not load identity")
+
+    def load_session(self, slug):
+        self.loads.append(("session", slug))
+        raise AssertionError("keyless tool must not load session")
+
+
+def _setup_keyless():
+    """Keyless tools config: recording keyless http client + a real
+    MessageStore, and NO keystore identity/session written to disk —
+    proving the keyless tools never touch the keystore."""
+    d = tempfile.mkdtemp()
+    ks = KeyStore(os.path.join(d, "keys"))
+    ms = MessageStore(os.path.join(d, "messages.db"))
+    http = KeylessFakeHttpClient()
+    cfg = PuffoCoreToolsConfig(
+        slug="agent-0001",
+        device_id="dev_test",
+        keystore=ks,
+        http_client=http,
+        data_client=ms,
+        space_id="sp_test",
+    )
+    return cfg, http, ms
+
+
+def _keyless_sends(http):
+    """The bodies of every keyless ``POST /v2/cloud-agents/messages``."""
+    return [b for m, p, b in http.calls if m == "POST_UNSIGNED"]
+
+
 def _build_tools(cfg):
     from mcp.server.fastmcp import FastMCP
     mcp = FastMCP("test")
@@ -1765,3 +1850,480 @@ async def test_resolve_rejects_unknown_level():
         await resolve_visibility("visible", "ch_x", "hi", "msg_root", http)
     with pytest.raises(RuntimeError):
         await resolve_visibility("", "ch_x", "hi", "msg_root", http)
+
+
+# ── F4 / F5: keyless-transport send preconditions ───────────────────
+#
+# Under the T23 keyless transport the two send tools POST plaintext to
+# ``/v2/cloud-agents/messages`` (blobs to ``/v2/cloud-agents/blobs/
+# upload``) instead of driving the bridge WS. F4/F5 semantics are
+# preserved on that HTTP seam:
+#
+# F4: reply_to_id must be dropped when _validate_root_same_channel wipes
+#     the resolved root (no dangling parent ref).
+# F5: send_message_with_attachments must run EVERY precondition
+#     (destination resolve, root validate, all per-file size checks)
+#     before the first blob upload, so a rejected route or an oversized
+#     later file raises with no orphaned blobs.
+
+
+class _RecordingBridge:
+    """A bridge stub used only to PROVE the keyless send path bypasses
+    the WS: if it's ever touched (``sent``/``uploaded`` non-empty) the
+    keyless branch wrongly fell back to the bridge."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.uploaded: list[bytes] = []
+        self._seq = 0
+
+    async def upload_blob(self, data: bytes) -> dict:
+        self._seq += 1
+        self.uploaded.append(data)
+        return {"blob_id": f"blob_{self._seq:04d}", "size_bytes": len(data)}
+
+    async def send_send(self, *, plaintext, recipient_slug=None,
+                        space_id=None, channel_id=None, reply_to_id=None,
+                        thread_root_id=None, attachments=None,
+                        timeout: float = 30.0) -> dict:
+        self.sent.append({
+            "plaintext": plaintext, "recipient_slug": recipient_slug,
+            "space_id": space_id, "channel_id": channel_id,
+            "reply_to_id": reply_to_id, "thread_root_id": thread_root_id,
+            "attachments": attachments,
+        })
+        return {"type": "ack", "envelope_id": "msg_rec"}
+
+
+def _keyless_ws_setup(bridge=None):
+    """A keyless tools config with a workspace dir so the send tools'
+    attachments path runs. An optional ``bridge`` is attached only to
+    prove the keyless branch never touches it. Returns
+    ``(cfg, http, ms, workspace_dir)``."""
+    cfg, http, ms = _setup_keyless()
+    ws = tempfile.mkdtemp()
+    cfg.workspace = ws
+    if bridge is not None:
+        cfg.bridge_client = bridge
+    return cfg, http, ms, ws
+
+
+def _write_ws_file(ws: str, name: str, data: bytes = b"x") -> str:
+    from pathlib import Path
+    (Path(ws) / name).write_bytes(data)
+    return name
+
+
+@pytest.mark.asyncio
+async def test_f4_keyless_reply_to_dropped_when_root_wiped():
+    """An unknown root_id gets wiped by _validate_root_same_channel; the
+    keyless send body must carry NEITHER thread_root_id NOR reply_to_id
+    (F4: no dangling parent ref)."""
+    cfg, http, ms, _ = _keyless_ws_setup()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "reply", "root_id": "msg_never_seen",
+    })
+
+    sends = _keyless_sends(http)
+    assert len(sends) == 1
+    body = sends[0]
+    assert "thread_root_id" not in body
+    assert "reply_to_id" not in body  # F4: dropped alongside the wiped root
+    assert "posted" in result
+
+
+@pytest.mark.asyncio
+async def test_f4_keyless_reply_to_kept_when_root_valid():
+    """A valid same-channel root is preserved: both thread_root_id and
+    reply_to_id ride the keyless send body."""
+    cfg, http, ms, _ = _keyless_ws_setup()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root post", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "reply", "root_id": "msg_root",
+    })
+
+    body = _keyless_sends(http)[0]
+    assert body["thread_root_id"] == "msg_root"
+    assert body["reply_to_id"] == "msg_root"
+    assert "posted" in result
+
+
+@pytest.mark.asyncio
+async def test_f4_keyless_attachments_reply_to_dropped_when_root_wiped():
+    """The same F4 gate applies to the keyless attachments send path."""
+    cfg, http, ms, ws = _keyless_ws_setup()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+
+    await _call(mcp, "send_message_with_attachments", {
+        "paths": ["a.txt"], "channel": "ch_abc", "caption": "cap",
+        "root_id": "msg_never_seen",
+    })
+
+    body = _keyless_sends(http)[0]
+    assert "thread_root_id" not in body
+    assert "reply_to_id" not in body
+
+
+@pytest.mark.asyncio
+async def test_f5_keyless_attachments_bare_at_dm_raises_before_upload():
+    """A bare ``@`` destination is rejected before any blob is uploaded."""
+    cfg, http, ms, ws = _keyless_ws_setup()
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "send_message_with_attachments", {
+            "paths": ["a.txt"], "channel": "@", "caption": "x",
+        })
+    assert "DM recipient" in str(exc.value)
+    assert http.uploaded == []  # F5: no orphaned blobs
+
+
+@pytest.mark.asyncio
+async def test_f5_keyless_attachments_stale_channel_raises_before_upload():
+    """A stale/unknown ``ch_`` id (not in the cache) raises via
+    _resolve_channel_space before any upload."""
+    cfg, http, ms, ws = _keyless_ws_setup()
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "send_message_with_attachments", {
+            "paths": ["a.txt"], "channel": "ch_stale", "caption": "x",
+        })
+    assert "no record of channel" in str(exc.value)
+    assert http.uploaded == []
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_f5_keyless_attachments_oversized_later_file_orphans_nothing():
+    """An oversized SECOND file makes the whole send raise before ANY
+    upload — the earlier valid file must not be orphaned on the server."""
+    cfg, http, ms, ws = _keyless_ws_setup()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "small.txt", b"small")
+    _write_ws_file(ws, "big.bin", b"x" * (8 * 1024 * 1024 + 1))
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "send_message_with_attachments", {
+            "paths": ["small.txt", "big.bin"], "channel": "ch_abc",
+            "caption": "x",
+        })
+    assert "8 MiB" in str(exc.value)
+    assert http.uploaded == []  # F5: the earlier small file wasn't uploaded
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_f5_keyless_attachments_happy_path_uploads_all_and_sends_once():
+    """The valid multi-file keyless path uploads every file via
+    ``post_bytes_unsigned`` then issues exactly one
+    ``post_unsigned`` carrying all blob refs."""
+    cfg, http, ms, ws = _keyless_ws_setup()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "a.txt", b"aaa")
+    _write_ws_file(ws, "b.txt", b"bbbb")
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "send_message_with_attachments", {
+        "paths": ["a.txt", "b.txt"], "channel": "ch_abc", "caption": "hi",
+    })
+
+    # Two unsigned blob uploads, in order, then one unsigned message send.
+    upload_paths = [p for m, p, _ in http.calls if m == "POST_BYTES_UNSIGNED"]
+    assert upload_paths == [
+        "/v2/cloud-agents/blobs/upload", "/v2/cloud-agents/blobs/upload",
+    ]
+    assert http.uploaded == [b"aaa", b"bbbb"]
+    sends = _keyless_sends(http)
+    assert len(sends) == 1
+    body = sends[0]
+    assert body["space_id"] == "sp_test"
+    assert body["channel_id"] == "ch_abc"
+    assert body["plaintext"] == "hi"
+    assert [r["filename"] for r in body["attachments"]] == ["a.txt", "b.txt"]
+    assert [r["blob_id"] for r in body["attachments"]] == ["blob_0001", "blob_0002"]
+    assert "uploaded 2 file" in result
+
+
+# ── keyless reads → /v2/cloud-agents/* (unsigned) ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_keyless_list_spaces_hits_cloud_agents_route():
+    cfg, http, ms = _setup_keyless()
+    http.responses["/v2/cloud-agents/spaces"] = {
+        "spaces": [{"space_id": "sp_team", "name": "Team"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_spaces")
+    assert "sp_team" in result and "Team" in result
+    assert ("GET_UNSIGNED", "/v2/cloud-agents/spaces", None) in http.calls
+
+
+@pytest.mark.asyncio
+async def test_keyless_list_channels_in_space_hits_cloud_agents_route():
+    cfg, http, ms = _setup_keyless()
+    http.responses["/v2/cloud-agents/spaces/sp_target/channels"] = {
+        "channels": [{"channel_id": "ch_g", "name": "general"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_target"})
+    assert "ch_g" in result and "general" in result
+    assert (
+        "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_target/channels", None,
+    ) in http.calls
+
+
+@pytest.mark.asyncio
+async def test_keyless_list_channels_in_all_spaces_hits_cloud_agents_routes():
+    cfg, http, ms = _setup_keyless()
+    http.responses["/v2/cloud-agents/spaces"] = {
+        "spaces": [{"space_id": "sp_a", "name": "A"}],
+    }
+    http.responses["/v2/cloud-agents/spaces/sp_a/channels"] = {
+        "channels": [{"channel_id": "ch_x", "name": "general"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channels_in_all_spaces")
+    assert "sp_a" in result and "ch_x" in result
+    assert ("GET_UNSIGNED", "/v2/cloud-agents/spaces", None) in http.calls
+    assert (
+        "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_a/channels", None,
+    ) in http.calls
+
+
+@pytest.mark.asyncio
+async def test_keyless_list_channel_members_degrades_to_space_roster():
+    """No keyless channel-members route exists; the keyless tool reads
+    the space roster ``/v2/cloud-agents/spaces/<sp>/members`` after
+    resolving channel→space from the cache."""
+    cfg, http, ms = _setup_keyless()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    http.responses["/v2/cloud-agents/spaces/sp_test/members"] = {
+        "members": [
+            {"slug": "alice-0001", "role": "owner"},
+            {"slug": "agent-0001", "role": "member"},
+        ],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "list_channel_members", {"channel": "ch_abc"})
+    assert "alice-0001" in result and "(owner)" in result
+    assert "agent-0001" in result and "(member)" in result
+    assert (
+        "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_test/members", None,
+    ) in http.calls
+    # NEVER the native channel-scoped route.
+    assert not any("channels/ch_abc/members" in p for _, p, _ in http.calls)
+
+
+@pytest.mark.asyncio
+async def test_keyless_get_user_info_hits_cloud_agents_route():
+    cfg, http, ms = _setup_keyless()
+    http.responses["/v2/cloud-agents/identities/profiles?slugs=alice-0001"] = {
+        "profiles": [{
+            "slug": "alice-0001", "display_name": "Alice", "bio": "A user",
+        }],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "get_user_info", {"username": "@alice-0001"})
+    assert "alice-0001" in result and "Alice" in result and "A user" in result
+    assert (
+        "GET_UNSIGNED",
+        "/v2/cloud-agents/identities/profiles?slugs=alice-0001",
+        None,
+    ) in http.calls
+
+
+# ── keyless whoami: no keystore ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_keyless_whoami_needs_no_keystore():
+    """Keyless whoami builds identity from cfg + resolves display_name
+    over the unsigned profiles route, never loading the keystore."""
+    cfg, http, ms = _setup_keyless()
+    spy = _SpyKeyStore()
+    cfg.keystore = spy
+    http.responses["/v2/cloud-agents/identities/profiles?slugs=agent-0001"] = {
+        "profiles": [{"slug": "agent-0001", "display_name": "Cloud Bot"}],
+    }
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "whoami")
+    assert "Cloud Bot" in result
+    assert "agent-0001" in result
+    assert "dev_test" in result
+    assert "sandbox.local" in result          # from http_client.server_url
+    assert "managed server-side" in result    # keyless subkey line
+    assert spy.loads == []                     # keystore never touched
+
+
+# ── keyless send_message: unsigned POST, no bridge ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_message_dm_posts_unsigned():
+    cfg, http, ms = _setup_keyless()
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "@alice-0001", "text": "hi there",
+    })
+    assert "posted" in result
+    sends = [(p, b) for m, p, b in http.calls if m == "POST_UNSIGNED"]
+    assert len(sends) == 1
+    path, body = sends[0]
+    assert path == "/v2/cloud-agents/messages"
+    assert body == {"plaintext": "hi there", "recipient_slug": "alice-0001"}
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_message_channel_posts_unsigned():
+    cfg, http, ms = _setup_keyless()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "hello channel",
+    })
+    assert "posted" in result
+    sends = [(p, b) for m, p, b in http.calls if m == "POST_UNSIGNED"]
+    assert len(sends) == 1
+    path, body = sends[0]
+    assert path == "/v2/cloud-agents/messages"
+    assert body == {
+        "plaintext": "hello channel",
+        "space_id": "sp_test",
+        "channel_id": "ch_abc",
+    }
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_message_channel_threaded_carries_ids():
+    cfg, http, ms = _setup_keyless()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(), "thread_root_id": None,
+    })
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "reply", "root_id": "msg_root",
+    })
+    assert "posted" in result
+    body = _keyless_sends(http)[0]
+    assert body["space_id"] == "sp_test"
+    assert body["channel_id"] == "ch_abc"
+    assert body["thread_root_id"] == "msg_root"
+    assert body["reply_to_id"] == "msg_root"
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_message_returns_ack_envelope_id():
+    cfg, http, ms = _setup_keyless()
+    http.responses["/v2/cloud-agents/messages"] = {"envelope_id": "msg_ack99"}
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "@alice-0001", "text": "hi",
+    })
+    assert "msg_ack99" in result
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_message_bypasses_bridge():
+    """A bridge is present but the keyless branch must POST over HTTP and
+    make ZERO bridge send_send calls."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, _ = _keyless_ws_setup(bridge)
+    mcp = _build_tools(cfg)
+    await _call(mcp, "send_message", {"channel": "@bob-0001", "text": "yo"})
+    assert bridge.sent == []
+    assert bridge.uploaded == []
+    assert _keyless_sends(http) == [
+        {"plaintext": "yo", "recipient_slug": "bob-0001"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_keyless_attachments_bypasses_bridge():
+    """Keyless attachments upload via post_bytes_unsigned and never touch
+    the bridge's upload_blob/send_send."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, ws = _keyless_ws_setup(bridge)
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+    await _call(mcp, "send_message_with_attachments", {
+        "paths": ["a.txt"], "channel": "ch_abc", "caption": "cap",
+    })
+    assert bridge.sent == []
+    assert bridge.uploaded == []
+    assert http.uploaded == [b"aaa"]
+    assert len(_keyless_sends(http)) == 1
+
+
+# ── build_server(transport="bridge") is keyless-self-sufficient ─────
+
+
+def test_build_server_bridge_transport_is_keyless(tmp_path, monkeypatch):
+    """The subprocess server built with ``transport="bridge"`` gives its
+    ``PuffoCoreHttpClient`` ``keyless=True`` and keeps ``bridge_client``
+    None (outbound is HTTP, not WS)."""
+    import puffo_agent.mcp.puffo_core_server as pcs
+
+    captured = {}
+    real = pcs.PuffoCoreHttpClient
+
+    def spy(server_url, ks, slug, keyless=False):
+        client = real(server_url, ks, slug, keyless=keyless)
+        captured["client"] = client
+        return client
+
+    monkeypatch.setattr(pcs, "PuffoCoreHttpClient", spy)
+    server = pcs.build_server(
+        slug="bot-0001", device_id="dev_test", server_url="http://127.0.0.1:1",
+        space_id="", keystore_dir="", workspace=str(tmp_path),
+        agent_id="bot-0001", data_service_url="http://127.0.0.1:1",
+        transport="bridge",
+    )
+    from mcp.server.fastmcp import FastMCP
+    assert isinstance(server, FastMCP)
+    assert captured["client"].keyless is True
+
+
+def test_build_server_native_transport_is_not_keyless(tmp_path, monkeypatch):
+    """A non-bridge build keeps the signed path — ``keyless`` is False."""
+    import puffo_agent.mcp.puffo_core_server as pcs
+
+    captured = {}
+    real = pcs.PuffoCoreHttpClient
+
+    def spy(server_url, ks, slug, keyless=False):
+        client = real(server_url, ks, slug, keyless=keyless)
+        captured["client"] = client
+        return client
+
+    monkeypatch.setattr(pcs, "PuffoCoreHttpClient", spy)
+    pcs.build_server(
+        slug="bot-0001", device_id="dev_test", server_url="http://127.0.0.1:1",
+        space_id="", keystore_dir=str(tmp_path / "keys"),
+        workspace=str(tmp_path), agent_id="bot-0001",
+        data_service_url="http://127.0.0.1:1",
+    )
+    assert captured["client"].keyless is False
