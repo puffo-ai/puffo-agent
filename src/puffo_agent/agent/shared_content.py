@@ -50,6 +50,9 @@ Every user message carries a metadata block:
 - sender: <display_name>         # human-readable name for prose
 - sender_slug: <slug>            # structural id — @-mentions + DM routing
 - sender_type: human | bot
+- sender_owner_slug: <slug>      # only when sender is an agent — the
+                                 # operator who owns it
+- is_from_operator: true         # only when the sender is YOUR operator
 - is_visible_to_human: true | false
 - mentions:                      # only when @-mentions present
   - puffotest-19b1 (you)

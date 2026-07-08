@@ -116,6 +116,8 @@ class PuffoAgent:
         create_at: int = 0,
         space_id: str = "",
         space_name: str = "",
+        sender_owner_slug: str = "",
+        is_from_operator: bool = False,
     ) -> str | None:
         self._append_user(
             channel_name, sender, sender_email, text,
@@ -128,6 +130,8 @@ class PuffoAgent:
             create_at=create_at,
             space_id=space_id,
             space_name=space_name,
+            sender_owner_slug=sender_owner_slug,
+            is_from_operator=is_from_operator,
         )
         return await self._run_turn_and_route(
             channel_name=channel_name,
@@ -177,6 +181,8 @@ class PuffoAgent:
                 space_name=channel_meta.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
                 is_visible_to_human=msg.get("is_visible_to_human", True),
+                sender_owner_slug=msg.get("sender_owner_slug", ""),
+                is_from_operator=msg.get("is_from_operator", False),
             )
             for msg in batch
         ]
@@ -237,6 +243,8 @@ class PuffoAgent:
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
+                sender_owner_slug=msg.get("sender_owner_slug", ""),
+                is_from_operator=msg.get("is_from_operator", False),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
 
@@ -400,6 +408,8 @@ class PuffoAgent:
         space_name: str = "",
         sender_display_name: str = "",
         is_visible_to_human: bool = True,
+        sender_owner_slug: str = "",
+        is_from_operator: bool = False,
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -417,6 +427,8 @@ class PuffoAgent:
             space_name=space_name,
             sender_display_name=sender_display_name,
             is_visible_to_human=is_visible_to_human,
+            sender_owner_slug=sender_owner_slug,
+            is_from_operator=is_from_operator,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -439,6 +451,8 @@ class PuffoAgent:
         space_name: str = "",
         sender_display_name: str = "",
         is_visible_to_human: bool = True,
+        sender_owner_slug: str = "",
+        is_from_operator: bool = False,
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
@@ -473,6 +487,14 @@ class PuffoAgent:
         lines.append(f"- sender: {display}")
         lines.append(f"- sender_slug: {sender}")
         lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
+        # PUF-361: sender-identity enrichment. ``sender_owner_slug`` is
+        # present only when the sender is an agent (the operator behind
+        # it, from the attestation chain); ``is_from_operator`` marks a
+        # message from THIS agent's own operator.
+        if sender_owner_slug:
+            lines.append(f"- sender_owner_slug: {sender_owner_slug}")
+        if is_from_operator:
+            lines.append("- is_from_operator: true")
         lines.append(
             f"- is_visible_to_human: {'true' if is_visible_to_human else 'false'}"
         )

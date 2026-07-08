@@ -254,6 +254,9 @@ def test_primer_metadata_example_matches_builder():
     # full peer blocks in one turn instead.
     assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
     assert "SEVERAL of these blocks" in DEFAULT_SHARED_CLAUDE_MD
+    # Sender-identity enrichment fields documented.
+    assert "- sender_owner_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
+    assert "- is_from_operator: true" in DEFAULT_SHARED_CLAUDE_MD
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
     # The old, wrong relative form must be gone.
     assert "- attachments/<envelope_id>" not in DEFAULT_SHARED_CLAUDE_MD
