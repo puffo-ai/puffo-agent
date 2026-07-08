@@ -6,6 +6,112 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pre-turn stdout drain — no more cron chatter leaking into replies.**
+  Claude Code emits `assistant` events during its internal cron ticks
+  while a turn isn't in flight; those events sat in the subprocess
+  stdout stream until the next turn started and got folded into that
+  turn's reply — visible to the operator as messages like *"News
+  check complete. 3 new items…"* prepended to whatever the agent was
+  actually asked. `ClaudeSession._one_turn` now drains buffered
+  stdout events immediately before writing the turn frame; drained
+  events are audit-logged as `turn.pre_drain` so future cron-behavior
+  patterns are observable without a repro. Per-readline 0.1s timeout
+  (bounds the empty-buffer check) plus a 1.0s wall-time cap keep a
+  chatty pre-turn producer from stalling the turn.
+
+## [1.0.7] — 2026-07-06
+
+### Fixed
+
+- **Refresh-token-free credential views.** Agents no longer hold
+  the rotating single-use refresh token — the daemon writes a
+  sanitized view of `~/.claude/.credentials.json` and
+  `~/.codex/auth.json` into each agent's virtual `$HOME` (view
+  has the access token, refresh token stripped for Claude / blanked
+  to `""` for Codex). Before this, N concurrent claude/codex
+  processes could all try to refresh the same rotating refresh
+  token — the loser presented an already-consumed token and the
+  provider (Anthropic + OpenAI) revoked the entire token family,
+  requiring an operator re-login. With views, only the daemon's
+  `CredentialRefresher` (single-writer, under its `asyncio.Lock`)
+  holds the refresh token, so the race is structurally impossible.
+  Legacy per-agent symlinks are migrated in place on first sync;
+  the host file is never touched. Content-compare on sync doubles
+  as self-healing if an agent-side CLI mangles its view.
+- **Pre-delivery credential-refresh gate is now cross-platform.**
+  Before handing a message batch to a `cli-local` / `cli-docker`
+  claude agent, the worker blocks on the daemon's
+  `CredentialRefresher.ensure_fresh()` through the same single-writer
+  mutex the daemon uses internally. The gate was previously behind
+  `is_macos()`; Anthropic's rotating single-use refresh-token
+  semantics don't care about the OS, so dropping the guard extends
+  the same safety net to Linux and Windows.
+- **Rotating-refresh-token silent-fail visibility.** When Anthropic
+  rotates the refresh token but Claude Code's write of the new one
+  silently drops (both disk and Keychain retain the pre-rotation
+  token, revoked server-side), `claude --print` returns 401
+  `authentication_failed`. `CredentialRefresher._refresh_now` now
+  inspects the probe's stdout/stderr for that marker and, when
+  matched, flips `auth_failed` + DMs the operator with re-login
+  instructions instead of silently retrying every 120s.
+- **macOS: `KeychainBackend` falls through to the disk credentials
+  file when the Keychain entry is missing.** Claude Code 2.x under
+  a launchd session-context can silently fail Keychain writes while
+  still writing `~/.claude/.credentials.json` successfully. The
+  Keychain backend's `expires_in_seconds`, `refresh`, `bootstrap`,
+  `sync_to_agent`, and `poll_external_rotation` now use the disk
+  file as a fallback.
+- **Machine reports the live claude-code model list on foreground
+  `puffo-agent start`.** Previously the model catalog's Anthropic
+  `/v1/models` fetch was only triggered from
+  `AgentDetail.__init__`, so a headless start never warmed the
+  cache and `build_capabilities()` fell back to the static list.
+  `start --background` accidentally worked only because the
+  operator would eventually open the tray UI. Fix: call
+  `model_catalog.prefetch()` from `Daemon.run()` at startup.
+- **Distinct error when an agent passes a bare user slug where a
+  channel id belongs.** `send_message`,
+  `send_message_with_attachments`, `list_channel_members`,
+  `leave_channel`, and `get_channel_history` now return
+  `"'<slug>' is not a channel id — prepend '@' to DM them:
+  send_message(channel='@<slug>', ...); to read a DM use
+  get_dm_history(peer='<slug>'). To find a channel id, call
+  list_channels_in_all_spaces."` instead of the generic membership
+  cache-miss error. A genuine `ch_`-prefixed cache miss keeps the
+  original wording. Injected once in `_resolve_channel_space` so
+  all channel-taking tools share it.
+
+### Changed
+
+- **`ensure_fresh()` fans canonical credentials out to every
+  registered agent before returning True.** Closes the split-brain
+  window where the daemon's view is fresh but an agent's per-agent
+  view is stale.
+- **Agent primer + skill bodies audited for correctness.** Envelope
+  ids documented as `msg_<uuid>` (six references corrected).
+  Attachment paths documented as absolute
+  `<workspace>/.puffo/inbox/<envelope_id>/<filename>`. Metadata
+  example now shows separate `sender` (display name) +
+  `sender_slug` (structural id), the `(agent)` mention suffix,
+  and `followup_messages_since:`. The DM reply rule
+  (`channel="@<sender_slug>"`) moved into "How to reply" next to
+  the `channel_id` guidance. `list_channel_members` and
+  `get_user_info` skill bodies no longer claim `puffo-core has no
+  is_bot flag` — trust metadata `sender_type:` and
+  `(human)` / `(agent)` mention suffixes.
+- **Shared primer tightened.** `DEFAULT_SHARED_CLAUDE_MD` compressed
+  from 267 to 220 lines (~440 tokens saved per turn). No
+  load-bearing information dropped.
+
+### Added
+
+- **Verbose per-source credential-read logs.** `KeychainBackend`
+  logs which source served each read (`source=cache` /
+  `source=keychain` / `source=disk`) at DEBUG level, plus WARN when
+  it falls through disk after a Keychain miss.
+
 ## [1.0.6] — 2026-07-01
 
 ### Added

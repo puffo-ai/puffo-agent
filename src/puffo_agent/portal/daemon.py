@@ -109,6 +109,10 @@ class Daemon:
 
         # One-shot version check at startup; non-blocking, best-effort.
         asyncio.ensure_future(_log_outdated_version_warning())
+        # Foreground start has no other trigger for the fetch=True
+        # path, so capability reports fall back to the static list.
+        from ..agent.model_catalog import prefetch as _prefetch_model_catalog
+        _prefetch_model_catalog()
         # Retry any archived-dir pending revokes from a previous run.
         asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup())
         # Re-assert machine_id for already-linked operators' agents so agents
@@ -283,6 +287,7 @@ class Daemon:
                         self.daemon_cfg,
                         agent_cfg,
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                        ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
                         ws_local_hub=self.ws_local_hub,
                     )
                     self.workers[agent_id] = worker
@@ -300,6 +305,7 @@ class Daemon:
                         self.daemon_cfg,
                         agent_cfg,
                         notify_refresh_needed=self._notify_refresh_for(agent_cfg),
+                        ensure_fresh_token=self._ensure_fresh_for(agent_cfg),
                         ws_local_hub=self.ws_local_hub,
                     )
                     self.workers[agent_id] = worker
@@ -371,6 +377,9 @@ class Daemon:
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         return self._refresher_for(agent_cfg).notify_refresh_needed
+
+    def _ensure_fresh_for(self, agent_cfg: AgentConfig):
+        return self._refresher_for(agent_cfg).ensure_fresh
 
     def _set_worker_profile_cache(
         self, agent_id: str, slug: str, display_name: str, avatar_url: str,

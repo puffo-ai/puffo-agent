@@ -766,7 +766,7 @@ def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
     Writes the ``refresh-token`` flag file; the daemon picks it up
     on its next reconcile tick, wakes the credential refresher, runs
     one ``claude --print "ok"`` against the host credentials, and
-    fans ``link_host_credentials`` to every registered agent home.
+    fans ``sync_host_claude_code_auth_view`` to every registered agent home.
     Single writer (daemon) = no multi-process race on Anthropic's
     single-use refresh tokens.
     """

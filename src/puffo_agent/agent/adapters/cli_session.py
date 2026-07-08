@@ -167,6 +167,14 @@ INIT_TIMEOUT_SECONDS = 10.0
 # every event size seen in practice.
 STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
 
+# Read loop has no turn-correlation — collects until ``result`` — so any
+# pre-turn ``assistant`` chatter (Claude Code's internal cron ticks) leaks
+# into the next turn's reply. Drained before the frame write. Per-readline
+# timeout bounds the empty-buffer check; wall-time cap keeps a chatty
+# producer from stalling the turn.
+STALE_STDOUT_DRAIN_TIMEOUT = 0.1
+STALE_STDOUT_DRAIN_BUDGET = 1.0
+
 
 class _ResumeFailed(Exception):
     """The subprocess exited before emitting init — usually because
@@ -649,6 +657,44 @@ class ClaudeSession:
 
     # ── One turn ──────────────────────────────────────────────────────────────
 
+    async def _drain_stale_stdout(self) -> int:
+        """Consume stdout events buffered before this turn's frame is
+        written, so pre-turn chatter isn't folded into the reply."""
+        assert self._proc is not None and self._proc.stdout is not None
+        drained = 0
+        deadline = time.monotonic() + STALE_STDOUT_DRAIN_BUDGET
+        while time.monotonic() < deadline:
+            try:
+                line = await asyncio.wait_for(
+                    self._proc.stdout.readline(),
+                    timeout=STALE_STDOUT_DRAIN_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                break
+            except (asyncio.LimitOverrunError, ValueError,
+                    ConnectionResetError, BrokenPipeError):
+                # Best-effort — main read loop handles recovery.
+                break
+            if not line:
+                break
+            drained += 1
+            event = _parse_event(line)
+            if event is None or self.audit is None:
+                continue
+            t = event.get("type")
+            text = ""
+            if t == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "") or ""
+            self.audit.write("turn.pre_drain", event_type=t, text=text)
+        if drained:
+            logger.info(
+                "agent %s: drained %d stale pre-turn stdout event(s)",
+                self.agent_id, drained,
+            )
+        return drained
+
     async def _one_turn(self, user_message: str) -> TurnResult:
         assert self._proc is not None and self._proc.stdin is not None
         ums_bytes = len(user_message.encode("utf-8"))
@@ -681,6 +727,7 @@ class ClaudeSession:
             "parent_tool_use_id": None,
             "session_id": self._session_id or "puffoagent-turn",
         }
+        await self._drain_stale_stdout()
         self._proc.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
         try:
             await self._proc.stdin.drain()
