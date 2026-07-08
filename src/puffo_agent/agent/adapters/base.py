@@ -31,6 +31,22 @@ def is_silent(text: str) -> bool:
     return SILENT_MARKER in text
 
 
+def anthropic_base_url_env(base_url: str) -> dict[str, str]:
+    """Map an Anthropic-compatible LLM base URL to the subprocess/SDK
+    env override that routes model calls through it.
+
+    Returns ``{"ANTHROPIC_BASE_URL": base_url}`` when ``base_url`` is a
+    non-empty string, else ``{}`` — so an absent/empty base URL leaves
+    the spawn env untouched (vendor endpoint, today's behavior). Shared
+    by the SDK adapter (``run_turn`` env) and the cli-local adapter
+    (``_llm_env``) so the mapping stays DRY and unit-testable without
+    importing the optional ``claude-agent-sdk``.
+    """
+    if base_url:
+        return {"ANTHROPIC_BASE_URL": base_url}
+    return {}
+
+
 # Refresh when fewer than this many seconds remain on the access
 @dataclass
 class TurnContext:

@@ -112,6 +112,9 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             agent_id=agent_cfg.id,
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             max_turns=agent_cfg.runtime.max_turns,
+            # Empty = vendor endpoint (unchanged); set = route the SDK's
+            # model calls through the proxy via ANTHROPIC_BASE_URL.
+            base_url=agent_cfg.runtime.llm_base_url,
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
@@ -239,6 +242,13 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            # Empty base URL → no env override (claude keeps its OAuth /
+            # ~/.claude credential path). Set → ANTHROPIC_BASE_URL routes
+            # the CLI's model calls through the proxy; the VK rides on
+            # runtime.api_key (injected as ANTHROPIC_API_KEY only when
+            # the base URL is also set — see LocalCLIAdapter._llm_env).
+            llm_base_url=agent_cfg.runtime.llm_base_url,
+            llm_api_key=agent_cfg.runtime.api_key,
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
@@ -268,6 +278,9 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
     """Anthropic/OpenAI message-completion provider for the
     chat-local adapter. Per-agent fields override daemon defaults."""
     provider_name = runtime.provider or daemon_cfg.default_provider
+    # Empty base URL → None → vendor endpoint (today's behavior, byte-for-
+    # byte unchanged). Set → route completions through the proxy (VK).
+    base_url = runtime.llm_base_url or None
 
     if provider_name == "anthropic":
         from ..agent.providers.anthropic_provider import AnthropicProvider
@@ -277,7 +290,7 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
             raise RuntimeError(
                 "anthropic api_key is not set in daemon.yml or agent.yml"
             )
-        return AnthropicProvider(api_key=api_key, model=model)
+        return AnthropicProvider(api_key=api_key, model=model, base_url=base_url)
 
     if provider_name == "openai":
         from ..agent.providers.openai_provider import OpenAIProvider
@@ -287,7 +300,7 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
             raise RuntimeError(
                 "openai api_key is not set in daemon.yml or agent.yml"
             )
-        return OpenAIProvider(api_key=api_key, model=model)
+        return OpenAIProvider(api_key=api_key, model=model, base_url=base_url)
 
     raise RuntimeError(f"unknown provider {provider_name!r}")
 

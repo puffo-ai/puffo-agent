@@ -256,17 +256,41 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 
+# Shown when a GUI entry point (``start --ui`` / ``start --tray``) is
+# invoked but the desktop UI's ``[gui]`` extra (PySide6) isn't installed.
+# The base ``pip install puffo-agent`` is deliberately Qt-free so headless
+# / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.
+_GUI_EXTRA_HINT = (
+    "the desktop UI requires the [gui] extra (PySide6), which is not "
+    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n\n"
+    "(the headless daemon — `puffo-agent start` with no UI flag — runs "
+    "without it.)"
+)
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     with_local_bridge = getattr(args, "with_local_bridge", False)
+    # The PySide6 import inside run_tray/launch is deferred to call time,
+    # so the ImportError surfaces from the call, not the ``from .ui...``
+    # line — wrap both so a missing [gui] extra yields the actionable hint
+    # instead of a raw ModuleNotFoundError traceback.
     if getattr(args, "tray_runner", False):
-        from .ui.tray import run_tray
-        return run_tray(with_local_bridge=with_local_bridge)
+        try:
+            from .ui.tray import run_tray
+            return run_tray(with_local_bridge=with_local_bridge)
+        except ImportError:
+            print(_GUI_EXTRA_HINT, file=sys.stderr)
+            return 1
     if getattr(args, "background", False):
         from .background import spawn_background
         return spawn_background(with_local_bridge=with_local_bridge)
     if getattr(args, "ui", False):
-        from .ui.launcher import launch
-        return launch(with_local_bridge=with_local_bridge)
+        try:
+            from .ui.launcher import launch
+            return launch(with_local_bridge=with_local_bridge)
+        except ImportError:
+            print(_GUI_EXTRA_HINT, file=sys.stderr)
+            return 1
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

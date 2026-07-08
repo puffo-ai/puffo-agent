@@ -987,6 +987,14 @@ class RuntimeConfig:
     provider: str = ""            # empty = default for kind
     model: str = ""
     api_key: str = ""
+    # OpenAI/Anthropic-compatible base URL for the LLM plane. Set this
+    # to route model calls through a proxy — e.g. Shan's LiteLLM virtual
+    # key endpoint for cloud agents — instead of the vendor default.
+    # Consumed by chat-local (Anthropic + OpenAI providers), sdk-local
+    # and cli-local/claude-code (as ANTHROPIC_BASE_URL). Empty = vendor
+    # endpoint (today's behavior, byte-for-byte unchanged). The matching
+    # secret rides on ``api_key`` (the VK), so no new field is needed.
+    llm_base_url: str = ""
     # Tool allowlist patterns (sdk | cli-local | cli-docker). Each
     # entry is a bare tool name ("Read") or tool-name-plus-arg glob
     # ("Bash(git *)", "Read(**/*.py)"). Empty = no tools allowed.
@@ -1122,6 +1130,7 @@ class AgentConfig:
                 provider=provider,
                 model=rt.get("model", ""),
                 api_key=rt.get("api_key", ""),
+                llm_base_url=rt.get("llm_base_url", ""),
                 allowed_tools=list(rt.get("allowed_tools") or []),
                 docker_image=rt.get("docker_image", ""),
                 docker_memory_limit=rt.get("docker_memory_limit", ""),
