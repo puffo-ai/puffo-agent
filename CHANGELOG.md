@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pre-turn stdout drain — no more cron chatter leaking into replies.**
+  Claude Code emits `assistant` events during its internal cron ticks
+  while a turn isn't in flight; those events sat in the subprocess
+  stdout stream until the next turn started and got folded into that
+  turn's reply — visible to the operator as messages like *"News
+  check complete. 3 new items…"* prepended to whatever the agent was
+  actually asked. `ClaudeSession._one_turn` now drains buffered
+  stdout events immediately before writing the turn frame; drained
+  events are audit-logged as `turn.pre_drain` so future cron-behavior
+  patterns are observable without a repro. Per-readline 0.1s timeout
+  (bounds the empty-buffer check) plus a 1.0s wall-time cap keep a
+  chatty pre-turn producer from stalling the turn.
+
 ## [1.0.7] — 2026-07-06
 
 ### Fixed
