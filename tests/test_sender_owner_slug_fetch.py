@@ -1,6 +1,7 @@
-"""PUF-361: the daemon reads ``owner_slug`` off the same /identities/profiles
-response it already fetches for display names, caches it under the profile TTL,
-and serves it via ``_fetch_owner_slug`` (agents only; empty for humans)."""
+"""Daemon reads ``owner_slug`` off the same ``/identities/profiles``
+response it already fetches for display names, caches it under the
+profile TTL, and serves it via ``_fetch_owner_slug`` (agents only;
+empty for humans)."""
 
 from __future__ import annotations
 

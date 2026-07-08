@@ -505,11 +505,10 @@ class PuffoCoreMessageClient:
         # under the same TTL — transient lookup failures self-heal at
         # the next tick instead of pinning a permanent "" miss.
         self._profile_cache: dict[str, tuple[str, str, float]] = {}
-        # PUF-361: slug → (owner_slug, fetched_at_monotonic). Filled from
-        # the same /identities/profiles response as the profile cache;
-        # ``owner_slug`` is non-empty only for agents (their operator, per
-        # the attestation chain). Same TTL so re-ownership propagates
-        # without a daemon restart.
+        # slug → (owner_slug, fetched_at_monotonic). Populated by the
+        # same ``/identities/profiles`` call as ``_profile_cache``; empty
+        # for humans, the operator for agents. Same TTL so re-ownership
+        # propagates without a daemon restart.
         self._owner_slug_cache: dict[str, tuple[str, float]] = {}
         # Invitation event_ids the worker has already processed.
         # Lifetime-scoped — the operator-DM branch isn't idempotent
@@ -855,9 +854,7 @@ class PuffoCoreMessageClient:
             sender_display_name = await self._fetch_display_name(
                 payload.sender_slug,
             )
-            # PUF-361: sender-identity enrichment. owner_slug is a
-            # cache hit off the display-name fetch above; the operator
-            # marker is a local equality.
+            # Cache-hit off ``_fetch_display_name`` above — no extra HTTP.
             sender_owner_slug = await self._fetch_owner_slug(
                 payload.sender_slug,
             )
@@ -2104,11 +2101,9 @@ class PuffoCoreMessageClient:
         return name
 
     async def _fetch_owner_slug(self, slug: str) -> str:
-        """PUF-361: the sender's operator slug (agents only; ``""`` for
-        humans / revoked attestation), from the same /identities/profiles
-        response the display-name fetch uses. The inbound path resolves
-        the sender's display_name just before this, so the TTL'd cache is
-        warm — no extra round-trip."""
+        """Sender's operator slug (agents only; ``""`` for humans /
+        revoked attestation). Inbound path resolves the display_name
+        just before this so the TTL'd cache is warm — no extra HTTP."""
         if not slug:
             return ""
         now = time.monotonic()
@@ -2159,7 +2154,7 @@ class PuffoCoreMessageClient:
                 if entry.get("slug") == slug:
                     name = (entry.get("display_name") or "").strip()
                     avatar_url = (entry.get("avatar_url") or "").strip()
-                    # PUF-361: present only for agents (the operator).
+                    # Non-empty only for agents (their operator).
                     owner_slug = (entry.get("owner_slug") or "").strip()
                     break
         except Exception as exc:

@@ -487,10 +487,10 @@ class PuffoAgent:
         lines.append(f"- sender: {display}")
         lines.append(f"- sender_slug: {sender}")
         lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
-        # PUF-361: sender-identity enrichment. ``sender_owner_slug`` is
-        # present only when the sender is an agent (the operator behind
-        # it, from the attestation chain); ``is_from_operator`` marks a
-        # message from THIS agent's own operator.
+        # ``sender_owner_slug`` fires only for agent senders (their
+        # operator); ``is_from_operator`` only when the sender IS the
+        # agent's own operator. Emit conditionally so older agents
+        # don't see keys their primer doesn't document.
         if sender_owner_slug:
             lines.append(f"- sender_owner_slug: {sender_owner_slug}")
         if is_from_operator:

@@ -6,6 +6,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Sender-identity metadata on inbound messages.** Two new fields land
+  in the structured user-block agents see: `sender_owner_slug` names
+  the operator behind an agent sender (present only for agents, sourced
+  from the attestation chain via `/identities/profiles`), and
+  `is_from_operator: true` marks a message from THIS agent's own
+  operator. Both emit conditionally so older agents don't see keys
+  their primer doesn't document. Zero extra HTTP round-trips: the
+  daemon reads `owner_slug` off the same `/identities/profiles` fetch
+  that resolves the sender's display name, caches it under the profile
+  TTL so re-ownership propagates without a daemon restart. Primer
+  documents both.
+
+### Changed
+
+- **Dead `followup_messages_since` removed from the primer + code.**
+  No code path has emitted the field since thread batching replaced
+  single-message dispatch, but the primer still documented it —
+  agents went looking for it and misreported batched messages as
+  message loss. The primer now documents the real shape (one turn
+  may carry several metadata blocks) and points agents at
+  `get_thread_history` / `get_channel_history` when mid-turn
+  freshness matters.
+
 ### Fixed
 
 - **Multi-message batches reached CLI agents with only the last
@@ -18,17 +43,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   subprocess, in DMs and channels alike. The whole batch now lands as
   one user entry (per-message metadata blocks, blank-line separated),
   fixing all CLI-family runtimes at the shell layer.
-
-### Changed
-
-- **Dead `followup_messages_since` removed from the primer + code.**
-  No code path has emitted the field since thread batching replaced
-  single-message dispatch, but the primer still documented it —
-  agents went looking for it and misreported batched messages as
-  message loss. The primer now documents the real shape (one turn
-  may carry several metadata blocks) and points agents at
-  `get_thread_history` / `get_channel_history` when mid-turn
-  freshness matters.
 
 ## [1.0.8] — 2026-07-08
 

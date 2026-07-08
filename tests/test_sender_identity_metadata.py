@@ -1,6 +1,6 @@
-"""PUF-361: inbound-metadata sender-identity enrichment — ``sender_owner_slug``
-when the sender is an agent, ``is_from_operator`` when the sender is this
-agent's own operator. ``_format_user_block`` uses only its args, so an unbound
+"""Inbound-metadata sender-identity enrichment: ``sender_owner_slug``
+fires for agent senders, ``is_from_operator`` for the agent's own
+operator. ``_format_user_block`` uses only its args, so an unbound
 call renders the block in isolation.
 """
 
