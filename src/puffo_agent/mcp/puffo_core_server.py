@@ -32,6 +32,7 @@ from .host_tools import (
     _uninstall_skill,
     _write_refresh_model_flag,
 )
+from .memory_tools import MemoryToolsConfig, register_memory_tools
 from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
 
 logger = logging.getLogger(__name__)
@@ -232,6 +233,7 @@ def build_server(
     data_service_url: str,
     runtime_kind: str = "",
     harness: str = "",
+    memory_dir: str = "",
 ) -> FastMCP:
     ks = KeyStore(keystore_dir)
     http = PuffoCoreHttpClient(server_url, ks, slug)
@@ -263,6 +265,17 @@ def build_server(
     )
     register_core_tools(mcp, core_cfg)
     _register_local_tools(mcp, workspace, runtime_kind, harness)
+
+    # Memory root: PUFFO_MEMORY_DIR when set; otherwise the default
+    # AgentConfig layout where memory/ and workspace/ are siblings
+    # under the agent dir. ``maintenance`` stays False here — the
+    # agent-facing server never gets recollection/ write scope.
+    if not memory_dir:
+        memory_dir = str(Path(workspace).parent / "memory")
+    mem_cfg = MemoryToolsConfig(
+        memory_root=memory_dir, workspace=workspace, maintenance=False,
+    )
+    register_memory_tools(mcp, mem_cfg)
     return mcp
 
 
@@ -295,6 +308,7 @@ def _cfg_from_env() -> dict[str, str]:
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
+        "memory_dir": os.environ.get("PUFFO_MEMORY_DIR", ""),
     }
 
 

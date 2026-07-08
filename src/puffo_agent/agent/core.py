@@ -94,7 +94,7 @@ class PuffoAgent:
         self.agent_id = agent_id
         self.logger = agent_logger(__name__, agent_id)
 
-        self.memory = MemoryManager(memory_dir)
+        self.memory = MemoryManager(memory_dir, workspace_dir=workspace_dir)
         self.memory_dir = memory_dir
 
         # Conversation log shared across all channels.

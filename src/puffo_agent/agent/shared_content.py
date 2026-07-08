@@ -3,8 +3,8 @@
 The shared platform primer (``~/.puffo-agent/docker/shared/CLAUDE.md``)
 is folded into each agent's generated CLAUDE.md at worker startup.
 ``ensure_shared_primer`` syncs the baked-in primer to disk on every worker
-startup; ``assemble_claude_md``
-combines primer + profile + memory snapshot into the per-agent prompt.
+startup; ``assemble_claude_md`` combines primer + profile + the compiled
+memory briefing (bounded; see ``agent.memory``) into the per-agent prompt.
 """
 
 from __future__ import annotations
@@ -222,24 +222,39 @@ use filenames that identify you (e.g. `notes-from-<your-id>.md`).
 
 ## Memory
 
-`memory/` snapshot is folded into this prompt. Write markdown to
-`memory/<topic>.md` to remember across sessions; takes effect on
-the next worker restart.
+A durable memory tree under `memory/`, managed through tools — never
+hand-edit these files:
+
+- **Briefing topics** are always compiled into this prompt. Create and
+  edit them with `mcp__puffo__create_briefing_topic` /
+  `mcp__puffo__patch_briefing_topic`. Bounded: 16KB per topic, 64KB
+  compiled total; an over-budget write FAILS the rebuild (fail closed,
+  no silent truncation), so keep topics tight. A briefing write marks
+  the prompt for rebuild automatically — no `refresh()` step; it lands
+  at your next turn.
+- **Notes** are durable detail that never enters your prompt. Manage
+  them with `mcp__puffo__create_note` / `patch_note` / `append_note`;
+  recall with `mcp__puffo__search_memory` /
+  `mcp__puffo__read_memory_file`.
+- `memory/briefing/profile.md` — your identity framing, managed by
+  puffo-agent from your profile. Don't touch the managed block.
+- `memory/recollection/`, `memory/imports/` — reserved for the
+  platform.
 
 ## Your two CLAUDE.md layers (cli-local / cli-docker only)
 
 Claude Code concatenates two files:
 
 1. **`~/.claude/CLAUDE.md`** — managed by puffo-agent (this primer
-   + `profile.md` + `memory/` snapshot); overwritten every worker
-   start, don't edit.
+   + `profile.md` + compiled `memory/briefing/`); overwritten on
+   every rebuild, don't edit.
 2. **`./CLAUDE.md`** or **`./.claude/CLAUDE.md`** in your workspace
    — yours to edit; puffo-agent never touches it.
 
-Use layer 2 for fast prompt updates; use `memory/*.md` (folds into
-layer 1 on next restart) when you want content labelled as memory.
-`sdk` and codex only have layer 1 — go through `memory/*.md`.
-Codex's equivalent is `$CODEX_HOME/AGENTS.md`.
+Use layer 2 for fast, free-form prompt notes you keep yourself. For
+durable content labelled as memory, use the briefing tools above —
+they work on every runtime, `sdk` and codex included (those only have
+layer 1). Codex's layer-1 equivalent is `$CODEX_HOME/AGENTS.md`.
 
 ## Permission prompts (cli-local only)
 
@@ -601,7 +616,8 @@ axes; combine them freely.
 | `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
 
 **When to use:**
-- Edited `CLAUDE.md`, `profile.md`, `memory/*.md` → `refresh()`.
+- Edited `CLAUDE.md` or `profile.md` → `refresh()`. (Briefing topics
+  written via the memory tools rebuild automatically — no `refresh()`.)
 - Installed a new skill / MCP → `refresh()`.
 - Operator added a new skill to their `~/.claude/skills/` → tell them
   to call it "host-sync" and use `refresh(host_sync=True[, session=True])`.
@@ -1196,43 +1212,61 @@ def read_shared_primer(shared_dir: Path) -> str:
         return ""
 
 
-def read_memory_snapshot(memory_dir: Path) -> str:
-    """Concatenate every ``*.md`` in ``memory_dir`` (sorted, so output
-    is deterministic). Returns ``""`` when the directory is missing
-    or empty.
+def compile_agent_memory_briefing(
+    *,
+    memory_dir: Path,
+    profile_text: str,
+    agent_id: str = "",
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
+) -> str:
+    """Bring the memory tree up to date and return the compiled
+    bounded briefing: ensure the tree, migrate legacy flat
+    ``memory/*.md``, re-sync ``briefing/profile.md`` from the native
+    profile surfaces (agent.yml identity fields + the ``# Soul`` body
+    of agent-root profile.md), then compile ``briefing/``.
+
+    Raises ``memory.BriefingCompileError`` (fail closed — no
+    truncation) when the briefing violates its budget.
     """
-    if not memory_dir.is_dir():
-        return ""
-    parts: list[str] = []
-    for path in sorted(memory_dir.glob("*.md")):
-        if path.name == "README.md":
-            continue
-        try:
-            body = path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if not body:
-            continue
-        parts.append(f"### {path.stem}\n\n{body}")
-    return "\n\n".join(parts)
+    from ..portal.profile_sync import extract_soul_body
+    from .memory import (
+        compile_briefing,
+        ensure_memory_tree,
+        migrate_flat_memory,
+        sync_profile_briefing,
+    )
+
+    ensure_memory_tree(memory_dir)
+    migrate_flat_memory(memory_dir)
+    sync_profile_briefing(
+        memory_dir,
+        agent_id=agent_id,
+        display_name=display_name,
+        role=role,
+        role_short=role_short,
+        soul=extract_soul_body(profile_text),
+    )
+    return compile_briefing(memory_dir)
 
 
 def assemble_claude_md(
     *,
     shared_primer: str,
     profile: str,
-    memory_snapshot: str,
+    memory_briefing: str,
 ) -> str:
     """Produce the per-agent CLAUDE.md. Order: primer (platform
-    conventions) → role → memory.
+    conventions) → role → memory (the compiled bounded briefing).
     """
     parts: list[str] = []
     if shared_primer.strip():
         parts.append(shared_primer.strip())
     if profile.strip():
         parts.append("---\n\n# Your role\n\n" + profile.strip())
-    if memory_snapshot.strip():
-        parts.append("---\n\n# Your memory\n\n" + memory_snapshot.strip())
+    if memory_briefing.strip():
+        parts.append("---\n\n# Your memory\n\n" + memory_briefing.strip())
     return "\n\n".join(parts) + "\n"
 
 
@@ -1279,14 +1313,19 @@ def rebuild_agent_codex_md(
     memory_dir: Path,
     workspace_dir: Path,
     codex_user_dir: Path,
+    agent_id: str = "",
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
 ) -> str:
     """Assemble + write one codex agent's AGENTS.md.
 
     Same content shape as ``rebuild_agent_claude_md`` (shared primer +
-    agent profile + memory snapshot), targeting codex's instruction-
-    file path. Skill bodies mirror into ``workspace/.agents/skills/``
-    where codex's project-scope discovery walks; the SKILL.md +
-    frontmatter shape is identical to Claude Code's.
+    agent profile + compiled memory briefing), targeting codex's
+    instruction-file path. Skill bodies mirror into
+    ``workspace/.agents/skills/`` where codex's project-scope discovery
+    walks; the SKILL.md + frontmatter shape is identical to Claude
+    Code's.
     """
     ensure_shared_primer(shared_dir)
     sync_shared_skills_codex(shared_dir, workspace_dir)
@@ -1298,7 +1337,14 @@ def rebuild_agent_codex_md(
     agents_md = assemble_claude_md(
         shared_primer=primer,
         profile=profile_text,
-        memory_snapshot=read_memory_snapshot(memory_dir),
+        memory_briefing=compile_agent_memory_briefing(
+            memory_dir=memory_dir,
+            profile_text=profile_text,
+            agent_id=agent_id,
+            display_name=display_name,
+            role=role,
+            role_short=role_short,
+        ),
     )
     write_agents_md(codex_user_dir, agents_md)
     return agents_md
@@ -1312,13 +1358,20 @@ def rebuild_agent_claude_md(
     workspace_dir: Path,
     claude_user_dir: Path,
     gemini_user_dir: Path,
+    agent_id: str = "",
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
 ) -> str:
     """Assemble + write one agent's managed CLAUDE.md / GEMINI.md.
 
     Seeds the shared primer if missing, mirrors shared skills into the
-    workspace, reads the agent's ``profile.md`` + memory snapshot, then
-    writes the combined prompt to the agent's USER-level ``.claude/`` /
-    ``.gemini/`` dirs. Returns the assembled CLAUDE.md string.
+    workspace, reads the agent's ``profile.md``, brings the memory tree
+    up to date (ensure/migrate/profile-sync) and compiles the bounded
+    briefing, then writes the combined prompt to the agent's USER-level
+    ``.claude/`` / ``.gemini/`` dirs. Returns the assembled CLAUDE.md
+    string. Raises ``memory.BriefingCompileError`` when the briefing
+    is over budget (fail closed — the previous artifact is kept).
 
     Shared by the worker's startup path and the ``agent reset-primer``
     CLI command so the assembly sequence lives in exactly one place.
@@ -1333,7 +1386,14 @@ def rebuild_agent_claude_md(
     claude_md = assemble_claude_md(
         shared_primer=primer,
         profile=profile_text,
-        memory_snapshot=read_memory_snapshot(memory_dir),
+        memory_briefing=compile_agent_memory_briefing(
+            memory_dir=memory_dir,
+            profile_text=profile_text,
+            agent_id=agent_id,
+            display_name=display_name,
+            role=role,
+            role_short=role_short,
+        ),
     )
     write_claude_md(claude_user_dir, claude_md)
     write_gemini_md(gemini_user_dir, claude_md)
