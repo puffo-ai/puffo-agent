@@ -494,6 +494,11 @@ class PuffoCoreMessageClient:
         # non-None, listen() runs the bridge lifecycle loop instead of
         # the signed WS client — no identity file is ever loaded.
         self._bridge = bridge_client
+        # In-flight ack tasks scheduled off the bridge dispatch loop
+        # (F1). Held so the tasks aren't GC'd mid-flight; each removes
+        # itself via a done-callback. Native transport never populates
+        # this — the ack lives only in the bridge dispatcher.
+        self._ack_tasks: set[asyncio.Task] = set()
         # Most recent DM sender. ``send_fallback_message(channel_id="")`` means
         # "reply to whoever just DMed me". Single-slot is fine since
         # the worker handles one envelope at a time; concurrent DM
@@ -821,6 +826,17 @@ class PuffoCoreMessageClient:
                     # path is untouched.
                     self._preseed_frame_display_name(frame, payload)
                     await self._handle_plaintext_payload(payload)
+                    # F1: ack the delivered envelope now that it handled
+                    # cleanly. A handling exception above skips this (still
+                    # inside the try), so the server redelivers. Scheduled
+                    # async — awaiting send_ack inline would deadlock the
+                    # frames() loop, which must keep receiving to deliver the
+                    # server's ack_result that resolves send_ack's future.
+                    task = asyncio.create_task(
+                        self._ack_bridge_envelope([payload.envelope_id])
+                    )
+                    self._ack_tasks.add(task)
+                    task.add_done_callback(self._ack_tasks.discard)
             except Exception:
                 self._log.exception(
                     "bridge message frame handling failed (envelope_id=%s)",
@@ -838,6 +854,25 @@ class PuffoCoreMessageClient:
             )
         else:
             self._log.debug("bridge frame ignored: type=%s", kind)
+
+    async def _ack_bridge_envelope(self, envelope_ids: list[str]) -> None:
+        """Fail-soft ack of handled bridge envelopes (F1).
+
+        A failed ack must never crash the listen loop — the server
+        redelivers unacked envelopes, so a lost ack is at worst a
+        redelivery, not a dropped message. Native transport never calls
+        this (no ``_bridge``).
+        """
+        bridge = self._bridge
+        if bridge is None or not envelope_ids:
+            return
+        try:
+            await bridge.send_ack(envelope_ids)
+        except Exception:  # noqa: BLE001 — a failed ack must not crash the loop
+            self._log.warning(
+                "bridge ack failed (envelope_ids=%s)",
+                envelope_ids, exc_info=True,
+            )
 
     def _preseed_frame_display_name(
         self, frame: dict, payload: MessagePayload,
@@ -3840,8 +3875,15 @@ class PuffoCoreMessageClient:
                 # already logged; skip without failing the turn.
                 continue
             # Sanitise filename to block ``../`` / absolute-path
-            # write-outside-inbox via a malicious sender.
-            safe_name = Path(str(raw.get("filename") or "")).name or blob_id
+            # write-outside-inbox via a malicious sender. The blob_id
+            # fallback is basename-reduced too — a blob_id carrying path
+            # separators must not escape the inbox — and a final literal
+            # guarantees a non-empty name.
+            safe_name = (
+                Path(str(raw.get("filename") or "")).name
+                or Path(str(blob_id)).name
+                or "attachment"
+            )
             target = inbox / safe_name
             try:
                 target.write_bytes(data)

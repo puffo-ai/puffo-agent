@@ -330,3 +330,60 @@ async def test_schedule_wake_rejects_neither():
     result = await dispatch["schedule_wake"]()
     assert "one of after_seconds" in result
     assert bridge.calls == []
+
+
+# --------------------------------------------------------------------------
+# F7: after_seconds is coerced to int before the > 0 compare, so a raw
+# ws-local string value schedules cleanly instead of raising TypeError.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_f7_schedule_wake_coerces_string_after_seconds():
+    """A raw ws-local ``{"after_seconds": "600"}`` schedules without a
+    TypeError and forwards the coerced INT to the bridge."""
+    bridge = _FakeBridge()
+    dispatch = build_dispatch(_cfg(bridge))
+    result = await dispatch["schedule_wake"](after_seconds="600")
+    # Confirmed-wake string, no crash.
+    assert "wake scheduled for" in result
+    # Exactly one schedule_wake call, forwarding the coerced int 600.
+    sched = [args for name, args in bridge.calls if name == "schedule_wake"]
+    assert len(sched) == 1
+    assert sched[0]["after_seconds"] == 600
+    assert isinstance(sched[0]["after_seconds"], int)
+    assert sched[0]["wake_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_f7_schedule_wake_int_after_seconds_still_works():
+    """Regression: the ordinary int path is unchanged by the coercion."""
+    bridge = _FakeBridge()
+    dispatch = build_dispatch(_cfg(bridge))
+    result = await dispatch["schedule_wake"](after_seconds=600)
+    assert "wake scheduled for" in result
+    sched = [args for name, args in bridge.calls if name == "schedule_wake"]
+    assert sched and sched[0]["after_seconds"] == 600
+
+
+@pytest.mark.asyncio
+async def test_f7_schedule_wake_non_numeric_after_seconds_clean_error():
+    """A non-numeric ``after_seconds`` returns a clean coercion-error
+    string (fail-soft) and never reaches the bridge."""
+    bridge = _FakeBridge()
+    dispatch = build_dispatch(_cfg(bridge))
+    result = await dispatch["schedule_wake"](after_seconds="abc")
+    assert isinstance(result, str)
+    assert "must be an integer number of seconds" in result
+    assert bridge.calls == []
+
+
+@pytest.mark.asyncio
+async def test_f7_schedule_wake_string_zero_is_treated_as_unset():
+    """``"0"`` (and 0) coerce to the unset branch → the "pass one of"
+    guidance, not a spurious schedule."""
+    bridge = _FakeBridge()
+    dispatch = build_dispatch(_cfg(bridge))
+    result = await dispatch["schedule_wake"](after_seconds="0")
+    assert "one of after_seconds" in result
+    assert bridge.calls == []

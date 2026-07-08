@@ -54,7 +54,21 @@ def register_lifecycle_tools(mcp: FastMCP, cfg: Any) -> None:
         """
         if cfg.bridge_client is None:
             return "schedule_wake is only available to cloud (bridge) agents."
-        has_after = bool(after_seconds) and after_seconds > 0
+        # F7: a raw ws-local dispatch can hand us after_seconds as a string
+        # (e.g. {"after_seconds": "600"}). Coerce to int before the > 0
+        # compare — mirrors keep_alive — so a stringy value schedules
+        # cleanly instead of raising TypeError deeper in the compare.
+        if after_seconds in (None, "", 0, "0"):
+            after_val = 0
+        else:
+            try:
+                after_val = int(after_seconds)
+            except (TypeError, ValueError):
+                return (
+                    "schedule_wake: after_seconds must be an integer "
+                    "number of seconds."
+                )
+        has_after = after_val > 0
         has_at = bool(wake_at and wake_at.strip())
         if has_after and has_at:
             return (
@@ -68,7 +82,7 @@ def register_lifecycle_tools(mcp: FastMCP, cfg: Any) -> None:
             )
         try:
             result = await cfg.bridge_client.schedule_wake(
-                after_seconds=int(after_seconds) if has_after else None,
+                after_seconds=after_val if has_after else None,
                 wake_at=wake_at.strip() if has_at else None,
                 reason=reason,
             )

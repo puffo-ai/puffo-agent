@@ -81,37 +81,46 @@ class CloudBridgeClient:
             timeout=aiohttp.ClientTimeout(total=None),
         )
         headers = {"x-sandbox-token": self._token}
+        # F2: guard the whole handshake so EVERY failure path closes the
+        # half-open session/ws — the handshake error, a connector/OS error
+        # or TimeoutError from ws_connect/receive, and each bad-frame
+        # BridgeError. self.close() null-checks _ws/_session, so a pre-
+        # ws_connect failure (session only) still closes cleanly and
+        # leaves self._session is None.
         try:
-            self._ws = await self._session.ws_connect(
-                self._url, headers=headers, heartbeat=None,
-            )
-        except aiohttp.WSServerHandshakeError as exc:
-            await self._session.close()
-            self._session = None
-            raise BridgeError(
-                "HANDSHAKE",
-                f"WS upgrade failed (status={exc.status}): {exc.message}",
-            ) from exc
-        # Wait for the first frame — must be 'connected'.
-        first = await self._ws.receive(timeout=10.0)
-        if first.type != aiohttp.WSMsgType.TEXT:
+            try:
+                self._ws = await self._session.ws_connect(
+                    self._url, headers=headers, heartbeat=None,
+                )
+            except aiohttp.WSServerHandshakeError as exc:
+                raise BridgeError(
+                    "HANDSHAKE",
+                    f"WS upgrade failed (status={exc.status}): {exc.message}",
+                ) from exc
+            # Wait for the first frame — must be 'connected'.
+            first = await self._ws.receive(timeout=10.0)
+            if first.type != aiohttp.WSMsgType.TEXT:
+                raise BridgeError(
+                    "HANDSHAKE",
+                    f"expected text 'connected', got {first.type!r}",
+                )
+            try:
+                frame = json.loads(first.data)
+            except json.JSONDecodeError as exc:
+                raise BridgeError(
+                    "HANDSHAKE", f"bad first frame: {exc}",
+                ) from exc
+            if frame.get("type") != "connected":
+                raise BridgeError(
+                    "HANDSHAKE",
+                    f"expected 'connected', got {frame.get('type')!r}",
+                )
+        except BaseException:
             await self.close()
-            raise BridgeError(
-                "HANDSHAKE",
-                f"expected text 'connected', got {first.type!r}",
-            )
-        try:
-            frame = json.loads(first.data)
-        except json.JSONDecodeError as exc:
-            await self.close()
-            raise BridgeError("HANDSHAKE", f"bad first frame: {exc}") from exc
-        if frame.get("type") != "connected":
-            await self.close()
-            raise BridgeError(
-                "HANDSHAKE",
-                f"expected 'connected', got {frame.get('type')!r}",
-            )
+            raise
         logger.info("cloud bridge: WS connected (slug=%s)", self._slug)
+        # Start the heartbeat only after a clean handshake so no failure
+        # path leaves a live heartbeat task behind.
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def frames(self) -> AsyncIterator[dict]:
@@ -490,6 +499,25 @@ class CloudBridgeClient:
             frame["limit"] = limit
         await ws.send_json(frame)
 
+    def _discard_waiter(
+        self, queue: "asyncio.Queue", fut: "asyncio.Future",
+    ) -> None:
+        """Remove ``fut`` from a FIFO waiter queue in place (F3).
+
+        Sync (no awaits) so it can't interleave with ``frames()`` popping
+        the same queue. Drains the queue, keeps every waiter that isn't
+        ``fut``, and re-enqueues them in order — so a timed-out waiter is
+        pulled out and the next real ``ack_result`` / ``spaces`` frame
+        isn't mis-delivered to a dead future.
+        """
+        remaining = []
+        while not queue.empty():
+            item = queue.get_nowait()
+            if item is not fut:
+                remaining.append(item)
+        for item in remaining:
+            queue.put_nowait(item)
+
     async def send_ack(
         self, envelope_ids: list[str], *, timeout: float = 30.0,
     ) -> dict:
@@ -497,14 +525,22 @@ class CloudBridgeClient:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         await self._ack_result_waiters.put(fut)
         await ws.send_json({"type": "ack", "envelope_ids": envelope_ids})
-        return await asyncio.wait_for(fut, timeout=timeout)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._discard_waiter(self._ack_result_waiters, fut)
+            raise
 
     async def send_list_spaces(self, *, timeout: float = 30.0) -> dict:
         ws = await self._require_ws()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         await self._spaces_waiters.put(fut)
         await ws.send_json({"type": "list_spaces"})
-        return await asyncio.wait_for(fut, timeout=timeout)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._discard_waiter(self._spaces_waiters, fut)
+            raise
 
     async def close(self) -> None:
         if self._heartbeat_task is not None:

@@ -1765,3 +1765,212 @@ async def test_resolve_rejects_unknown_level():
         await resolve_visibility("visible", "ch_x", "hi", "msg_root", http)
     with pytest.raises(RuntimeError):
         await resolve_visibility("", "ch_x", "hi", "msg_root", http)
+
+
+# ── F4 / F5: bridge-transport send preconditions ────────────────────
+#
+# F4: reply_to_id must be dropped when _validate_root_same_channel wipes
+#     the resolved root (no dangling parent ref).
+# F5: send_message_with_attachments must run EVERY precondition
+#     (destination resolve, root validate, all per-file size checks)
+#     before the first upload_blob, so a rejected route or an oversized
+#     later file raises with no orphaned blobs.
+
+
+class _RecordingBridge:
+    """Records ``send_send`` kwargs + blob uploads for the bridge-branch
+    tests. ``upload_blob`` mints a fresh blob_id per call and appends the
+    raw bytes to ``uploaded`` (empty ⇒ nothing was uploaded)."""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.uploaded: list[bytes] = []
+        self._seq = 0
+
+    async def upload_blob(self, data: bytes) -> dict:
+        self._seq += 1
+        self.uploaded.append(data)
+        return {"blob_id": f"blob_{self._seq:04d}", "size_bytes": len(data)}
+
+    async def send_send(self, *, plaintext, recipient_slug=None,
+                        space_id=None, channel_id=None, reply_to_id=None,
+                        thread_root_id=None, attachments=None,
+                        timeout: float = 30.0) -> dict:
+        self.sent.append({
+            "plaintext": plaintext, "recipient_slug": recipient_slug,
+            "space_id": space_id, "channel_id": channel_id,
+            "reply_to_id": reply_to_id, "thread_root_id": thread_root_id,
+            "attachments": attachments,
+        })
+        return {"type": "ack", "envelope_id": "msg_rec"}
+
+
+def _bridge_setup(bridge):
+    """A bridge-transport tools config reusing the native ``_setup``
+    keystore/http/store, plus ``bridge_client`` + a fresh ``workspace``
+    dir so the bridge branch of the send tools runs. Returns
+    ``(cfg, http, ms, workspace_dir)``."""
+    cfg, http, ms = _setup()
+    ws = tempfile.mkdtemp()
+    bcfg = PuffoCoreToolsConfig(
+        slug=cfg.slug,
+        device_id=cfg.device_id,
+        keystore=cfg.keystore,
+        http_client=http,
+        data_client=ms,
+        space_id=cfg.space_id,
+        workspace=ws,
+        bridge_client=bridge,
+    )
+    return bcfg, http, ms, ws
+
+
+def _write_ws_file(ws: str, name: str, data: bytes = b"x") -> str:
+    from pathlib import Path
+    (Path(ws) / name).write_bytes(data)
+    return name
+
+
+@pytest.mark.asyncio
+async def test_f4_bridge_reply_to_dropped_when_root_wiped():
+    """An unknown root_id gets wiped by _validate_root_same_channel; the
+    outbound send must carry NEITHER thread_root_id NOR reply_to_id (F4:
+    no dangling parent ref)."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, _ = _bridge_setup(bridge)
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "reply", "root_id": "msg_never_seen",
+    })
+
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["thread_root_id"] is None
+    assert sent["reply_to_id"] is None  # F4: dropped alongside the wiped root
+    assert "posted" in result
+
+
+@pytest.mark.asyncio
+async def test_f4_bridge_reply_to_kept_when_root_valid():
+    """A valid same-channel root is preserved: both thread_root_id and
+    reply_to_id ride the send."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, _ = _bridge_setup(bridge)
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root post", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "reply", "root_id": "msg_root",
+    })
+
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["thread_root_id"] == "msg_root"
+    assert sent["reply_to_id"] == "msg_root"
+    assert "posted" in result
+
+
+@pytest.mark.asyncio
+async def test_f4_bridge_attachments_reply_to_dropped_when_root_wiped():
+    """The same F4 gate applies to the attachments send path."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, ws = _bridge_setup(bridge)
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+
+    await _call(mcp, "send_message_with_attachments", {
+        "paths": ["a.txt"], "channel": "ch_abc", "caption": "cap",
+        "root_id": "msg_never_seen",
+    })
+
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["thread_root_id"] is None
+    assert sent["reply_to_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_f5_attachments_bare_at_dm_raises_before_upload():
+    """A bare ``@`` destination is rejected before any blob is uploaded."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, ws = _bridge_setup(bridge)
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "send_message_with_attachments", {
+            "paths": ["a.txt"], "channel": "@", "caption": "x",
+        })
+    assert "DM recipient" in str(exc.value)
+    assert bridge.uploaded == []  # F5: no orphaned blobs
+
+
+@pytest.mark.asyncio
+async def test_f5_attachments_stale_channel_raises_before_upload():
+    """A stale/unknown ``ch_`` id (not in the cache) raises via
+    _resolve_channel_space before any upload."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, ws = _bridge_setup(bridge)
+    _write_ws_file(ws, "a.txt", b"aaa")
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "send_message_with_attachments", {
+            "paths": ["a.txt"], "channel": "ch_stale", "caption": "x",
+        })
+    assert "no record of channel" in str(exc.value)
+    assert bridge.uploaded == []
+
+
+@pytest.mark.asyncio
+async def test_f5_attachments_oversized_later_file_orphans_nothing():
+    """An oversized SECOND file makes the whole send raise before ANY
+    upload — the earlier valid file must not be orphaned on the server."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, ws = _bridge_setup(bridge)
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "small.txt", b"small")
+    _write_ws_file(ws, "big.bin", b"x" * (8 * 1024 * 1024 + 1))
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "send_message_with_attachments", {
+            "paths": ["small.txt", "big.bin"], "channel": "ch_abc",
+            "caption": "x",
+        })
+    assert "8 MiB" in str(exc.value)
+    assert bridge.uploaded == []  # F5: the earlier small file wasn't uploaded
+
+
+@pytest.mark.asyncio
+async def test_f5_attachments_happy_path_uploads_all_and_sends_once():
+    """The valid multi-file path uploads every file and issues exactly
+    one send carrying all refs."""
+    bridge = _RecordingBridge()
+    cfg, http, ms, ws = _bridge_setup(bridge)
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    _write_ws_file(ws, "a.txt", b"aaa")
+    _write_ws_file(ws, "b.txt", b"bbbb")
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "send_message_with_attachments", {
+        "paths": ["a.txt", "b.txt"], "channel": "ch_abc", "caption": "hi",
+    })
+
+    assert bridge.uploaded == [b"aaa", b"bbbb"]
+    assert len(bridge.sent) == 1
+    sent = bridge.sent[0]
+    assert sent["space_id"] == "sp_test"
+    assert sent["channel_id"] == "ch_abc"
+    assert [r["filename"] for r in sent["attachments"]] == ["a.txt", "b.txt"]
+    assert "uploaded 2 file" in result

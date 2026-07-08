@@ -478,7 +478,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     plaintext=text,
                     recipient_slug=bridge_recipient,
                     thread_root_id=resolved_root or None,
-                    reply_to_id=root_id or None,
+                    # F4: drop the raw parent ref when root validation wiped
+                    # the thread — no dangling reply_to for a root the send
+                    # no longer threads under.
+                    reply_to_id=(root_id or None) if resolved_root else None,
                 )
             else:
                 bridge_channel_id = channel_ref
@@ -497,7 +500,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     space_id=bridge_space_id,
                     channel_id=bridge_channel_id,
                     thread_root_id=resolved_root or None,
-                    reply_to_id=root_id or None,
+                    # F4: drop the raw parent ref when root validation wiped
+                    # the thread (see the DM branch above).
+                    reply_to_id=(root_id or None) if resolved_root else None,
                 )
             return (
                 f"posted {(ack or {}).get('envelope_id', '?')} to {channel}"
@@ -1091,18 +1096,55 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # signed ``/messages`` POST — a bridge agent has no
             # signed-crypto seam. DM vs channel routing + fail-soft
             # thread resolution mirror ``send_message``'s bridge branch.
+            #
+            # F5: run EVERY precondition — destination resolve/validate,
+            # root resolve/validate, and all per-file size checks — BEFORE
+            # the first ``upload_blob``, so a rejected route or an oversized
+            # Nth file raises with no orphaned blobs left on the server.
             channel_ref = channel.strip()
             if channel_ref.startswith("#"):
                 raise RuntimeError(
                     "'#<name>' channel addressing isn't supported; pass "
                     "the channel id directly."
                 )
-            refs: list[dict] = []
+
+            # (1) Resolve + validate the destination first. A bare ``@`` or
+            # a stale ``ch_`` (``_resolve_channel_space`` raises) fails here,
+            # before any upload.
+            is_dm = channel_ref.startswith("@")
+            bridge_recipient = ""
+            bridge_channel_id = ""
+            bridge_space_id = None
+            if is_dm:
+                bridge_recipient = channel_ref[1:]
+                if not bridge_recipient:
+                    raise RuntimeError(
+                        "DM recipient slug is required after '@'"
+                    )
+            else:
+                bridge_channel_id = channel_ref
+                bridge_space_id = await _resolve_channel_space(
+                    cfg, bridge_channel_id,
+                )
+
+            # (2) Resolve + validate the thread root before uploads.
+            resolved_root, root_note = await _resolve_root_id(
+                root_id, cfg.data_client,
+            )
+            resolved_root, validate_note = await _validate_root_same_channel(
+                resolved_root,
+                None if is_dm else bridge_channel_id,
+                None if is_dm else bridge_space_id,
+                cfg.data_client,
+            )
+
+            # (3) Read every file + run the 8 MiB check for ALL files
+            # before uploading any — a later oversized file must not orphan
+            # earlier blobs.
+            prepared: list[tuple[Any, bytes, str]] = []
             total_bytes = 0
             for target in targets:
                 plaintext = target.read_bytes()
-                # Keep the native 8 MiB pre-check so an oversized file
-                # fails before we burn an upload round-trip.
                 if len(plaintext) > 8 * 1024 * 1024:
                     raise RuntimeError(
                         f"send_message_with_attachments: {target.name!r} is "
@@ -1110,6 +1152,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     )
                 mime_type, _ = mimetypes.guess_type(target.name)
                 mime_type = mime_type or "application/octet-stream"
+                prepared.append((target, plaintext, mime_type))
+                total_bytes += len(plaintext)
+
+            # (4) Only now upload each blob → build refs.
+            refs: list[dict] = []
+            for target, plaintext, mime_type in prepared:
                 up = await cfg.bridge_client.upload_blob(plaintext)
                 blob_id = up.get("blob_id") if isinstance(up, dict) else None
                 if not blob_id:
@@ -1123,46 +1171,25 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     "mime_type": mime_type,
                     "size_bytes": len(plaintext),
                 })
-                total_bytes += len(plaintext)
 
-            if channel_ref.startswith("@"):
-                bridge_recipient = channel_ref[1:]
-                if not bridge_recipient:
-                    raise RuntimeError(
-                        "DM recipient slug is required after '@'"
-                    )
-                resolved_root, root_note = await _resolve_root_id(
-                    root_id, cfg.data_client,
-                )
-                resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, None, None, cfg.data_client,
-                )
+            # (5) One send using the pre-resolved route + the F4 reply_to
+            # gate (drop the raw parent when root validation wiped it).
+            if is_dm:
                 ack = await cfg.bridge_client.send_send(
                     plaintext=caption,
                     recipient_slug=bridge_recipient,
                     attachments=refs,
                     thread_root_id=resolved_root or None,
-                    reply_to_id=root_id or None,
+                    reply_to_id=(root_id or None) if resolved_root else None,
                 )
             else:
-                bridge_channel_id = channel_ref
-                bridge_space_id = await _resolve_channel_space(
-                    cfg, bridge_channel_id,
-                )
-                resolved_root, root_note = await _resolve_root_id(
-                    root_id, cfg.data_client,
-                )
-                resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, bridge_channel_id, bridge_space_id,
-                    cfg.data_client,
-                )
                 ack = await cfg.bridge_client.send_send(
                     plaintext=caption,
                     space_id=bridge_space_id,
                     channel_id=bridge_channel_id,
                     attachments=refs,
                     thread_root_id=resolved_root or None,
-                    reply_to_id=root_id or None,
+                    reply_to_id=(root_id or None) if resolved_root else None,
                 )
             names = ", ".join(t.name for t in targets)
             thread_note = f" in thread {resolved_root}" if resolved_root else ""

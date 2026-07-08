@@ -79,6 +79,9 @@ class FakeBridge:
             "client_ref": "r_test",
         }
         self.sent: list[dict] = []
+        # F1: every send_ack call records its envelope_ids, so a test can
+        # assert exactly one ack per handled bridge message.
+        self.acked: list[list[str]] = []
         self.connect_count = 0
         self.fetch_pending_count = 0
         self.close_count = 0
@@ -106,6 +109,12 @@ class FakeBridge:
     async def download_blob(self, blob_id: str):
         self.downloaded.append(blob_id)
         return self._blobs.get(blob_id)
+
+    async def send_ack(
+        self, envelope_ids, *, timeout: float = 30.0,
+    ) -> dict:
+        self.acked.append(list(envelope_ids))
+        return {"type": "ack_result", "acked": list(envelope_ids)}
 
     async def send_send(
         self, *, plaintext, recipient_slug=None, space_id=None,
@@ -1293,6 +1302,203 @@ async def test_e_native_attachments_still_encrypt_and_signed_http(
         m == "POST" and p == "/messages" for m, p, _ in http.calls
     ), f"native must POST the envelope; calls={http.calls}"
     assert "uploaded 1 file" in result
+
+
+# --------------------------------------------------------------------------
+# (F1) handled bridge messages are acked exactly once; the shared tail
+#      (native's whole inbound path) never acks.
+# --------------------------------------------------------------------------
+
+
+async def _open_dispatch_client(tmp_path, bridge, *, db):
+    """A bridge client with the minimal per-listen() state so
+    ``_dispatch_bridge_frame`` / ``_handle_plaintext_payload`` can run
+    without spinning up the full listen loop (mirrors the reference-path
+    setup in test (a))."""
+    client = _bridge_client(tmp_path, bridge, db=db)
+    client._queue = asyncio.PriorityQueue()
+    client._queue_seq = 0
+    client._thread_state = {}
+    await client.store.open()
+    return client
+
+
+def _bridge_message_frame(env_id: str) -> dict:
+    return {
+        "type": "message", "envelope_id": env_id,
+        "sender_slug": "alice-0001", "envelope_kind": "channel",
+        "space_id": "sp_1", "channel_id": "ch_a",
+        "sent_at": 1_700_000_004_000, "plaintext": "ack me",
+    }
+
+
+@pytest.mark.asyncio
+async def test_f1_handled_bridge_message_acked_exactly_once(tmp_path):
+    """A handled inbound ``message`` frame schedules exactly one
+    ``send_ack([envelope_id])`` off the dispatcher — the ack is async
+    (never awaited inline, which would deadlock ``frames()``)."""
+    ENV_ID = "env_ack_once"
+    bridge = FakeBridge()
+    client = await _open_dispatch_client(tmp_path, bridge, db="ack_once.db")
+
+    await client._dispatch_bridge_frame(_bridge_message_frame(ENV_ID))
+    # The ack is scheduled, not awaited inline: exactly one task is
+    # in-flight right after dispatch returns.
+    assert len(client._ack_tasks) == 1
+    # Let the scheduled ack task run to completion.
+    await asyncio.gather(*client._ack_tasks)
+
+    assert bridge.acked == [[ENV_ID]]
+    # The done-callback cleaned the task set up afterwards.
+    assert client._ack_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_f1_ack_over_full_listen_loop(tmp_path):
+    """End-to-end over ``_listen_bridge``: a live frame surfaces AND gets
+    acked exactly once (proves the ack fires on the real loop, not just a
+    direct dispatch call)."""
+    ENV_ID = "env_ack_live"
+    bridge = FakeBridge(scripted=[_bridge_message_frame(ENV_ID)])
+    client = _bridge_client(tmp_path, bridge, db="ack_live.db")
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+    # Drain any ack task still in flight after the loop was cancelled.
+    if client._ack_tasks:
+        await asyncio.gather(*client._ack_tasks, return_exceptions=True)
+
+    assert bridge.acked == [[ENV_ID]]
+
+
+@pytest.mark.asyncio
+async def test_f1_failing_message_handling_skips_ack(tmp_path):
+    """A frame whose handling raises is NOT acked — the ack sits inside
+    the handling ``try`` after a clean ``_handle_plaintext_payload``, so a
+    raise skips it and the server redelivers."""
+    ENV_ID = "env_ack_fail"
+    bridge = FakeBridge()
+    client = await _open_dispatch_client(tmp_path, bridge, db="ack_fail.db")
+
+    async def _boom(payload):
+        raise RuntimeError("handling blew up")
+
+    client._handle_plaintext_payload = _boom  # type: ignore[method-assign]
+
+    # _dispatch_bridge_frame swallows the handling exception (logs it).
+    await client._dispatch_bridge_frame(_bridge_message_frame(ENV_ID))
+    await asyncio.sleep(0)
+
+    assert client._ack_tasks == set()
+    assert bridge.acked == []
+
+
+@pytest.mark.asyncio
+async def test_f1_shared_tail_does_not_ack_native_untouched(tmp_path):
+    """The ack lives ONLY in ``_dispatch_bridge_frame``. The shared
+    ``_handle_plaintext_payload`` tail — the entirety of native's inbound
+    path — issues no ack. Proven with a bridge PRESENT: even then,
+    driving the tail directly acks nothing."""
+    bridge = FakeBridge()
+    client = await _open_dispatch_client(tmp_path, bridge, db="tail_noack.db")
+
+    payload = MessagePayload(
+        payload_type="puffo.message", version=1,
+        envelope_id="env_tail", envelope_kind="channel",
+        sender_slug="alice-0001", sender_subkey_id="", sent_at=1,
+        message_nonce="", content_type="text/plain", content="hi",
+        is_visible_to_human=True, space_id="sp_1", channel_id="ch_a",
+    )
+    await client._handle_plaintext_payload(payload)
+    await asyncio.sleep(0)
+
+    assert client._ack_tasks == set()
+    assert bridge.acked == []
+
+
+@pytest.mark.asyncio
+async def test_f1_native_config_client_never_acks(tmp_path):
+    """A genuinely native client (``bridge_client=None``) has no bridge to
+    ack against and never schedules an ack task when its inbound tail
+    runs."""
+    ks = _native_keystore(tmp_path)
+    http = PuffoCoreHttpClient("http://127.0.0.1:1", ks, "bot-0001")
+    store = MessageStore(str(tmp_path / "native_noack.db"))
+    client = PuffoCoreMessageClient(
+        slug="bot-0001", device_id="dev_test", space_id="sp_home",
+        keystore=ks, http_client=http, message_store=store,
+    )  # no bridge → native
+    assert client._bridge is None
+    client._queue = asyncio.PriorityQueue()
+    client._queue_seq = 0
+    client._thread_state = {}
+    await client.store.open()
+
+    async def _empty_get(path, *a, **k):
+        return {}
+
+    client.http.get = _empty_get  # type: ignore[method-assign]
+
+    payload = MessagePayload(
+        payload_type="puffo.message", version=1,
+        envelope_id="env_native_tail", envelope_kind="channel",
+        sender_slug="alice-0001", sender_subkey_id="", sent_at=1,
+        message_nonce="", content_type="text/plain", content="hi",
+        is_visible_to_human=True, space_id="sp_1", channel_id="ch_a",
+    )
+    await client._handle_plaintext_payload(payload)
+    await asyncio.sleep(0)
+
+    assert client._ack_tasks == set()
+
+
+# --------------------------------------------------------------------------
+# (F6) the inbound bridge blob_id filename fallback is basename-sanitised
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_f6_blob_id_fallback_sanitised_stays_in_inbox(tmp_path):
+    """A ref with NO filename and a ``blob_id`` carrying path separators
+    (``../escape``) is written by its basename INSIDE the inbox dir, never
+    a level above it."""
+    DATA = b"escape-attempt-bytes"
+    frame = {
+        "type": "message", "envelope_id": "env_f6",
+        "sender_slug": "alice-0001", "envelope_kind": "channel",
+        "space_id": "sp_1", "channel_id": "ch_a",
+        "sent_at": 1_700_000_005_000, "plaintext": "see attached",
+        # No filename → fallback to the (malicious) blob_id.
+        "attachments": [{"blob_id": "../escape"}],
+    }
+    bridge = FakeBridge(scripted=[frame], blobs={"../escape": DATA})
+    client = _bridge_client(
+        tmp_path, bridge, db="f6.db", workspace=str(tmp_path),
+    )
+    surfaced: list = []
+    done = asyncio.Event()
+
+    async def on_message(root_id, batch, channel_meta):
+        surfaced.append(batch)
+        done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+
+    inbox = (tmp_path / ".puffo" / "inbox" / "env_f6").resolve()
+    saved = inbox / "escape"
+    assert saved.is_file(), "sanitised file must land inside the inbox dir"
+    assert saved.read_bytes() == DATA
+    # The written path resolves inside the inbox — no ../ escape.
+    assert str(saved.resolve()).startswith(str(inbox))
+    # The pre-fix bug would have written one level up (a sibling of the
+    # envelope dir); assert that escaped location does NOT exist.
+    assert not (tmp_path / ".puffo" / "inbox" / "escape").exists()
+    # Surfaced attachment path points at the sanitised in-inbox file.
+    msg = [m for m in surfaced[0] if m["envelope_id"] == "env_f6"][0]
+    assert str(saved) in msg["attachments"]
 
 
 def test_message_payload_to_dict_omits_attachments():
