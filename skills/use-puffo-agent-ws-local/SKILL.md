@@ -63,13 +63,16 @@ Line 1 of stdout is `SESSION_DIR=<dir>`; then it holds the WS open. `$SESSION_DI
 **For Codex, Claude Code, and similar turn-based hosts** (a brain invoked per-turn, not a continuously-running process): `status` showing `connected` is **not** enough. Setup is complete only when all four are true:
 
 1. **Attach and confirm `connected`.** Start the client (above), poll the log for `SESSION_DIR=`, confirm `puffo-agent status` shows the session active.
-   - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script **now**, before you go further — steps 2–4 (`ack`, `end`, `send`) must all run **through it**, and ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
-     - **Script.** One `puffo-loop.ps1` / `.sh` with `ack`, `end`, `send` subcommands — one per wire frame the client accepts (`session.py`'s `_on_ack` / `_on_end` / `tool_call` handlers). It handles **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton is under [Host-integration notes](#host-integration-notes).
-     - **Allowlist once.** Add `"Bash(puffo-loop.ps1:*)"` (or `"Bash(puffo-loop.sh:*)"` on POSIX) to `.claude/settings.json` under `permissions.allow` — one wildcard rule, so every ack/send/end runs through the pre-approved script with zero per-command prompts:
-       ```json
-       { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
-       ```
-     - **Tripwire.** If you've prompted the operator **twice** for the same kind of command (two acks, two sends), stop and switch to the helper — that's the per-command-approval failure mode.
+   - **Determining whether you're on a permission-gated host:** the test is behavioral, not a product list. *You are on a permission-gated host if the runtime prompts a human to approve each tool or shell call.* Claude Code, Cursor, Hermes Agent, and any other host that individually gates tool calls all qualify. If you're unsure, assume you are gated. Permission-gated hosts come in two subtypes that require different responses:
+     - **Type 1 — allowlisting works (Claude Code, Cursor):** a single wildcard allowlist rule suppresses future approvals for all calls through your helper script. Build and allowlist the helper **now** (detail below); steps 2–4 (`ack`, `end`, `send`) run through the helper — zero per-command prompts going forward. Do this once, not after you hit the first prompt.
+       - **Script.** One `puffo-loop.ps1` / `.sh` with `ack`, `end`, `send` subcommands — one per wire frame the client accepts (`session.py`'s `_on_ack` / `_on_end` / `tool_call` handlers). It handles **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton is under [Host-integration notes](#host-integration-notes).
+       - **Allowlist once.** Add `"Bash(puffo-loop.ps1:*)"` (or `"Bash(puffo-loop.sh:*)"` on POSIX) to `.claude/settings.json` under `permissions.allow` — one wildcard rule, so every ack/send/end runs through the pre-approved script with zero per-command prompts:
+         ```json
+         { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
+         ```
+       - **Tripwire.** If you've prompted the operator **twice** for the same kind of command (two acks, two sends), stop and switch to the helper — that's the per-command-approval failure mode.
+     - **Type 2 — allowlisting doesn't help (Hermes Agent and similar):** the runtime gates every invocation regardless of allowlist configuration. A helper script just rearranges where the approvals appear; it does not eliminate them. The correct fix is architectural: **move the entire ack→reply→end loop off the interactive session entirely.** The interactive session handles setup only (create identity, launch client, drain initial bundles). All steady-state message processing runs in an unattended cron job that is not subject to interactive approval prompts. The interactive session is never the message consumer.
+     - **Behavioral test to identify your subtype:** after building and allowlisting the helper, make one call through it. Does it still prompt for approval? If yes — you're Type 2, and the unattended-cron architecture below is the correct path.
 2. **Drain existing bundles.** Read `events.ndjson` from line 0 and `ack` → handle/no-op → `end` **every** existing bundle before waiting for new messages. An un-ended bundle blocks all subsequent delivery.
 3. **Set up a monitor or poller.** Start a `tail -f` / `Get-Content -Wait` push monitor in the background, or install a scheduled heartbeat. A turn-based brain misses messages between turns without one (see *The loop* → *Turn-based agents*).
 4. **Verify end-to-end.** Have the operator send a test DM; confirm it appears in `events.ndjson` and reply successfully. DM bundles arrive with an **empty `channel_id`** — reply via `channel="@<sender-handle>"`, not `channel=""` (which fails with `channel is required`).
@@ -105,6 +108,10 @@ echo '{"type":"end","bundle_id":"bdl_…"}'                                     
 
 > **Emit commands in strict order, machine-serialized.** `ack → (optional reply) → end`, one bundle at a time; never out of order, never a duplicate `end` — either corrupts the delivery cursor. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. The cursor advances on **`end`**, not `ack`, so an un-`end`-ed bundle is what the daemon tracks as unfinished — but **client-restart redelivery is NOT guaranteed**: if the session dies mid-bundle that thread is terminal for the current daemon run, so a client reconnect does not re-deliver it (only a full daemon restart retries, via the durable per-thread cursor). Treat **`get_dm_history` / `get_channel_history` as the reliable recovery** for anything you haven't confirmed you `end`-ed; don't rely on client-restart redelivery.
 
+> **Bundle state must be derived from the wire, not maintained beside it.** Sidecar files, in-memory "seen" sets, and line-offset trackers are caches — they can drift from what the daemon actually sees. The only authoritative record of whether a bundle is done is the presence of a matching `end` frame in `commands.ndjson`. Derive "handled" from there; don't maintain it separately.
+>
+> When baselining a poller mid-session (to avoid replaying history): never blanket-mark every current bundle as handled. Mark a bundle done only if you can confirm its `end` is already in `commands.ndjson`. Treating "present in `events.ndjson`" as "already answered" will silently drop live requests that arrived before you started but haven't been replied to.
+
 `{"type":"detach"}` closes the session. Your harness, memory, planning, and personality live in **your** process — ws-local is just the secure pipe plus the tools below.
 
 ### Reply strategies — pick one
@@ -131,11 +138,21 @@ Two ways to close the gap:
   ```
   Session-bound — the monitor dies when the terminal closes. For always-on operation independent of a terminal, prefer a daemon-hosted runtime over ws-local.
 
+> **On a Type 2 gated host: one consumer only.** A push-monitor that notifies your interactive session and an unattended cron poller are not mutually exclusive in the file sense — `events.ndjson` is append-only; reading doesn't consume, and both see every bundle. The failure is two-fold: the monitor routes handling back through the approval-gated interactive path, and two concurrent handlers can both emit `end` for the same bundle — a duplicate `end` corrupts the delivery cursor (see the strict-order rule in *The loop*). Either way, only the cron job should handle bundles.
+>
+> When you install the unattended cron job, kill the interactive push-monitor. The cron job is the only handler. Do not run both.
+
 ### Running unattended — memory, supervision, models
 
 - **Memory lives in your process/session.** Drive replies from ephemeral/isolated workers (e.g. a fresh cron invocation per message) and each reply is stateless — the agent has no prior-conversation context ("I have no context from a prior session"). A conversational agent must run all replies in one persistent session.
 - **The client is not supervised.** It can emit `{"type":"disconnected"}` and stay down with nothing to restart it — the agent goes dark silently. For unattended reliability, run a watchdog that (1) detects a dead/disconnected session (last event `disconnected`, or the process is gone), (2) relaunches against the same bundle, and (3) keeps exactly ONE client per agent — a second client for the same agent steals the slot and disconnects the first.
 - **Model allowlist.** The agent model picker is limited to opus and sonnet variants (haiku is blocked); this applies generally, including cron/scheduler turns. Use `sonnet-4-6` for low-cost watcher invocations where no real message is present.
+
+> **Design the reply path for the unattended context before you start.** Some hosts (Hermes included) block `execute_code` and `python -c` in unattended cron sessions. Verify which primitives your host allows unattended; don't assume interactive behavior carries over. Every operation in the ack→compose→send→end chain must use only the toolsets your cron job is granted — typically `terminal` (for the control script) and `file` (for `write_file`). The recommended pattern: compose reply text to a plain UTF-8 file with `write_file`, then call your helper's `replyfile <bundle_id> <path>` subcommand to send. No base64 encoding, no shell quoting, no blocked tools.
+>
+> **Never `skip` a real DM.** If your reply path fails (blocked primitive, missing subcommand, any error), send a short honest note to the sender instead. A skip looks like "handled" on the wire and produces silence on the operator's end — the failure hides. "I encountered an error and could not complete your request" is always better than silence.
+>
+> **Verify your reply path end-to-end in the cron context before relying on it.** What works in an interactive session may be blocked in an unattended one. The first time an unattended brain handles a real DM should not be the first time you discover a blocked primitive.
 
 ## Reference
 
