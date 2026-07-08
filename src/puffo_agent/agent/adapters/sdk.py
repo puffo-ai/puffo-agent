@@ -19,7 +19,13 @@ from typing import Any
 from ...mcp.config import (
     PUFFO_CORE_TOOL_FQNS,
 )
-from .base import Adapter, TurnContext, TurnResult, format_history_as_prompt
+from .base import (
+    Adapter,
+    TurnContext,
+    TurnResult,
+    anthropic_base_url_env,
+    format_history_as_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +41,7 @@ class SDKAdapter(Adapter):
         workspace_dir: str = "",
         owner_username: str = "",
         max_turns: int = 10,
+        base_url: str = "",
     ):
         try:
             from claude_agent_sdk import (
@@ -61,6 +68,10 @@ class SDKAdapter(Adapter):
 
         self.api_key = api_key
         self.model = model
+        # Anthropic-compatible base URL (e.g. LiteLLM VK). Empty =
+        # vendor endpoint. Injected as ANTHROPIC_BASE_URL into the SDK
+        # subprocess env in run_turn.
+        self.base_url = base_url
         self.patterns = list(allowed_tools or [])
         # Puffo MCP tools auto-allow — users shouldn't need to thread
         # ``mcp__puffo__send_message`` through their allowed_tools.
@@ -77,6 +88,11 @@ class SDKAdapter(Adapter):
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         mcp_servers = self.mcp_servers_override or {}
 
+        # Vendor endpoint unless base_url is set; ANTHROPIC_BASE_URL then
+        # routes the SDK's model calls through the proxy (LiteLLM VK).
+        env = {"ANTHROPIC_API_KEY": self.api_key} if self.api_key else {}
+        env.update(anthropic_base_url_env(self.base_url))
+
         options = self._Options(
             system_prompt=ctx.system_prompt,
             cwd=ctx.workspace_dir or None,
@@ -88,7 +104,7 @@ class SDKAdapter(Adapter):
             can_use_tool=self._gate,
             permission_mode=self.permission_mode,
             model=self.model or None,
-            env={"ANTHROPIC_API_KEY": self.api_key} if self.api_key else {},
+            env=env,
             mcp_servers=mcp_servers,
             setting_sources=["project"],  # pick up .claude/CLAUDE.md under cwd
             max_turns=self.max_turns,

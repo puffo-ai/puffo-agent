@@ -9,6 +9,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
+# PySide6 now ships only in the ``[gui]`` extra (the base install is
+# Qt-free for headless/cloud daemons). Skip the Qt view tests when the
+# extra isn't installed rather than erroring out collection.
+pytest.importorskip("PySide6")
+
 from PySide6.QtWidgets import QApplication
 
 from puffo_agent.portal.ui.widgets.log_view import LogView
