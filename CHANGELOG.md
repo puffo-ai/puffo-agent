@@ -6,6 +6,30 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multi-message batches reached CLI agents with only the last
+  message.** The thread-batched queue correctly coalesced same-root
+  messages that arrived while an agent was mid-turn, but the shell
+  appended each batch message as its own user log entry — and CLI
+  adapters transmit only the latest entry per turn (the resume-based
+  session already holds prior history), so every batched message
+  except the last was silently dropped before reaching the
+  subprocess, in DMs and channels alike. The whole batch now lands as
+  one user entry (per-message metadata blocks, blank-line separated),
+  fixing all CLI-family runtimes at the shell layer.
+
+### Changed
+
+- **Dead `followup_messages_since` removed from the primer + code.**
+  No code path has emitted the field since thread batching replaced
+  single-message dispatch, but the primer still documented it —
+  agents went looking for it and misreported batched messages as
+  message loss. The primer now documents the real shape (one turn
+  may carry several metadata blocks) and points agents at
+  `get_thread_history` / `get_channel_history` when mid-turn
+  freshness matters.
+
 ## [1.0.8] — 2026-07-08
 
 ### Added

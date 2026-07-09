@@ -57,15 +57,19 @@ Every user message carries a metadata block:
 - attachments:                   # only when files attached; absolute paths
   - <workspace>/.puffo/inbox/<envelope_id>/<filename>
 - message: <actual message text>
-- followup_messages_since:       # only when newer messages landed while
-  - [<ts> post:<msg_id>] @<slug>: <text>   # this one was queued
 ```
+
+One turn may carry SEVERAL of these blocks (blank-line separated) —
+messages that queued on the same thread while you were busy. Read
+them all before replying; the conversation may have moved on.
+Messages that land while you're mid-turn arrive in your NEXT turn —
+if freshness matters (you took a while, or you're about to commit to
+something), pull the latest with `mcp__puffo__get_thread_history` /
+`mcp__puffo__get_channel_history` before posting.
 
 Reply to the `message:` content only — never echo metadata, labels,
 or `[bracket]` prefixes. Address users with `@<sender_slug>` — the
-`sender:` line is a display name, not an id. Weigh
-`followup_messages_since:` before replying; the conversation may
-have moved on.
+`sender:` line is a display name, not an id.
 
 ## `[puffo-agent system message]` lines
 
