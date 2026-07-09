@@ -248,9 +248,12 @@ def test_primer_metadata_example_matches_builder():
     """The documented metadata block must track what
     ``agent/core.py`` actually emits: display-name ``sender`` +
     separate ``sender_slug``, absolute ``.puffo/inbox`` attachment
-    paths, and the ``followup_messages_since`` field."""
+    paths, and multi-block batch turns."""
     assert "- sender_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
-    assert "followup_messages_since" in DEFAULT_SHARED_CLAUDE_MD
+    # Dead field — no code path emits it; batched messages arrive as
+    # full peer blocks in one turn instead.
+    assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "SEVERAL of these blocks" in DEFAULT_SHARED_CLAUDE_MD
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
     # The old, wrong relative form must be gone.
     assert "- attachments/<envelope_id>" not in DEFAULT_SHARED_CLAUDE_MD

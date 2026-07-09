@@ -47,9 +47,6 @@ def _user_message_preview(messages: list[dict]) -> str:
         content = m.get("content")
         if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
             body = content.split("- message: ", 1)[1]
-            cut = body.find("\n- followup_messages_since:")
-            if cut != -1:
-                body = body[:cut]
             return " ".join(body.split())[:STATUS_PREVIEW_CHARS]
     return ""
 
@@ -117,7 +114,6 @@ class PuffoAgent:
         post_id: str = "",
         root_id: str = "",
         create_at: int = 0,
-        followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
     ) -> str | None:
@@ -130,7 +126,6 @@ class PuffoAgent:
             mentions=mentions,
             post_id=post_id,
             create_at=create_at,
-            followups=followups,
             space_id=space_id,
             space_name=space_name,
         )
@@ -178,7 +173,6 @@ class PuffoAgent:
                 mentions=msg.get("mentions") or [],
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
-                followups=None,
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
@@ -402,7 +396,6 @@ class PuffoAgent:
         mentions: list[dict] | None = None,
         post_id: str = "",
         create_at: int = 0,
-        followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
         sender_display_name: str = "",
@@ -420,7 +413,6 @@ class PuffoAgent:
             mentions=mentions,
             post_id=post_id,
             create_at=create_at,
-            followups=followups,
             space_id=space_id,
             space_name=space_name,
             sender_display_name=sender_display_name,
@@ -443,7 +435,6 @@ class PuffoAgent:
         mentions: list[dict] | None = None,
         post_id: str = "",
         create_at: int = 0,
-        followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
         sender_display_name: str = "",
@@ -510,19 +501,6 @@ class PuffoAgent:
                         f"image)"
                     )
         lines.append("- message: " + text)
-        if followups:
-            # Messages that arrived in the same thread/channel AFTER
-            # this one was queued. The agent should weigh them before
-            # replying — the conversation may have moved on.
-            lines.append("- followup_messages_since:")
-            for f in followups:
-                ts = f.get("timestamp", "") or _ms_to_iso(f.get("create_at", 0))
-                fid = f.get("id", "")
-                fsender = f.get("sender_username", "") or f.get("sender_id", "")
-                ftext = f.get("text", "") or ""
-                lines.append(
-                    f"  - [{ts} post:{fid}] @{fsender}: {ftext}"
-                )
         return "\n".join(lines)
 
     def _append_assistant(self, channel_name: str, reply: str):
