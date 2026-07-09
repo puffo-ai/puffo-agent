@@ -74,7 +74,7 @@ def _msg(envelope_id: str, sender: str = "alice-0001", sent_at: int | None = Non
         "root_id": "",
         "is_dm": False,
         "attachments": [],
-        "sender_is_bot": False,
+        "sender_is_agent": False,
         "mentions": [],
         "envelope_id": envelope_id,
         "sent_at": sent_at if sent_at is not None else _now_ms(),
@@ -95,10 +95,26 @@ def _channel_meta() -> dict:
 
 
 def test_compute_priority_bands():
-    assert _compute_priority(direct=True, sender_is_bot=False) == PRIORITY_MENTIONED_HUMAN
-    assert _compute_priority(direct=True, sender_is_bot=True) == PRIORITY_MENTIONED_BOT
-    assert _compute_priority(direct=False, sender_is_bot=False) == PRIORITY_HUMAN
-    assert _compute_priority(direct=False, sender_is_bot=True) == PRIORITY_BOT
+    assert _compute_priority(direct=True, sender_is_agent=False) == PRIORITY_MENTIONED_HUMAN
+    assert _compute_priority(direct=True, sender_is_agent=True) == PRIORITY_MENTIONED_BOT
+    assert _compute_priority(direct=False, sender_is_agent=False) == PRIORITY_HUMAN
+    assert _compute_priority(direct=False, sender_is_agent=True) == PRIORITY_BOT
+
+
+def test_handle_envelope_admits_with_owner_slug_priority():
+    """handle_envelope is a closure inside listen(); pin its admit-time
+    priority derivation at the source level so a revert to the old
+    hardcoded sender_is_agent=False can't slip past the unit tests."""
+    import inspect
+
+    from puffo_agent.agent import puffo_core_client as pcc
+
+    src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
+    assert "sender_is_agent = bool(sender_owner_slug)" in src
+    assert "priority = _compute_priority(direct, sender_is_agent)" in src
+    # No hardcoded flag under either the old or the new spelling.
+    assert "sender_is_agent = False" not in src
+    assert "sender_is_bot" not in src
 
 
 # ─── MessageStore: thread-batch helpers ───────────────────────────

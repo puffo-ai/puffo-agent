@@ -214,15 +214,15 @@ def _parse_operator_pubkey(identity_cert_json: Optional[str]) -> Optional[bytes]
     return op_pk
 
 
-def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
-    """Map (direct, sender_is_bot) to one of the PRIORITY_* bands.
+def _compute_priority(direct: bool, sender_is_agent: bool) -> int:
+    """Map (direct, sender_is_agent) to one of the PRIORITY_* bands.
     PRIORITY_SYSTEM is reserved for a future service-message envelope.
     """
-    if direct and not sender_is_bot:
+    if direct and not sender_is_agent:
         return PRIORITY_MENTIONED_HUMAN
-    if direct and sender_is_bot:
+    if direct and sender_is_agent:
         return PRIORITY_MENTIONED_BOT
-    if not sender_is_bot:
+    if not sender_is_agent:
         return PRIORITY_HUMAN
     return PRIORITY_BOT
 
@@ -815,10 +815,6 @@ class PuffoCoreMessageClient:
             else:
                 channel_name = channel_id
 
-            direct = is_dm or is_mention
-            sender_is_bot = False  # puffo-core has no is_bot flag yet
-            priority = _compute_priority(direct, sender_is_bot)
-
             # Thread-batched queue: every message coalesces under
             # its ``root_id`` (the envelope's ``thread_root_id``, or
             # the message itself when it's a top-level post). The
@@ -863,6 +859,12 @@ class PuffoCoreMessageClient:
                 and payload.sender_slug == self.operator_slug
             )
 
+            # ``owner_slug`` is agent-only — the is-agent signal the
+            # priority bands were designed around.
+            direct = is_dm or is_mention
+            sender_is_agent = bool(sender_owner_slug)
+            priority = _compute_priority(direct, sender_is_agent)
+
             # Long-message redaction. Operators paste big chunks of
             # code or transcripts that, combined with the agent's
             # system prompt + thread history, can blow past the LLM
@@ -895,7 +897,7 @@ class PuffoCoreMessageClient:
                 "root_id": payload_thread_root_id or "",
                 "is_dm": is_dm,
                 "attachments": attachment_paths,
-                "sender_is_bot": sender_is_bot,
+                "sender_is_agent": sender_is_agent,
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
@@ -2643,7 +2645,7 @@ class PuffoCoreMessageClient:
             "root_id": "",
             "is_dm": False,
             "attachments": [],
-            "sender_is_bot": False,
+            "sender_is_agent": False,
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
@@ -2983,7 +2985,7 @@ class PuffoCoreMessageClient:
             "root_id": "",
             "is_dm": False,
             "attachments": [],
-            "sender_is_bot": False,
+            "sender_is_agent": False,
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,

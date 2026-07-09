@@ -108,7 +108,7 @@ class PuffoAgent:
         text: str,
         direct: bool = False,
         attachments: list[str] | None = None,
-        sender_is_bot: bool = False,
+        sender_is_agent: bool = False,
         mentions: list[dict] | None = None,
         on_progress=None,
         post_id: str = "",
@@ -124,7 +124,7 @@ class PuffoAgent:
             channel_id=channel_id,
             root_id=root_id,
             attachments=attachments,
-            sender_is_bot=sender_is_bot,
+            sender_is_agent=sender_is_agent,
             mentions=mentions,
             post_id=post_id,
             create_at=create_at,
@@ -150,7 +150,7 @@ class PuffoAgent:
 
         Each entry in ``batch`` is the same decoded-message dict the
         listen handler used to enqueue (envelope_id, sender_slug,
-        text, attachments, mentions, sent_at, sender_is_bot,
+        text, attachments, mentions, sent_at, sender_is_agent,
         is_dm…). The thread/channel context is constant across the
         batch and rides on ``channel_meta`` (channel_id,
         channel_name, space_id, space_name).
@@ -173,7 +173,7 @@ class PuffoAgent:
                 channel_id=channel_meta.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
-                sender_is_bot=msg.get("sender_is_bot", False),
+                sender_is_agent=msg.get("sender_is_agent", False),
                 mentions=msg.get("mentions") or [],
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
@@ -236,7 +236,7 @@ class PuffoAgent:
                 channel_id=channel_meta.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
-                sender_is_bot=msg.get("sender_is_bot", False),
+                sender_is_agent=msg.get("sender_is_agent", False),
                 mentions=msg.get("mentions") or [],
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
@@ -400,7 +400,7 @@ class PuffoAgent:
         attachments: list[str] | None,
         channel_id: str = "",
         root_id: str = "",
-        sender_is_bot: bool = False,
+        sender_is_agent: bool = False,
         mentions: list[dict] | None = None,
         post_id: str = "",
         create_at: int = 0,
@@ -419,7 +419,7 @@ class PuffoAgent:
             attachments=attachments,
             channel_id=channel_id,
             root_id=root_id,
-            sender_is_bot=sender_is_bot,
+            sender_is_agent=sender_is_agent,
             mentions=mentions,
             post_id=post_id,
             create_at=create_at,
@@ -443,7 +443,7 @@ class PuffoAgent:
         attachments: list[str] | None,
         channel_id: str = "",
         root_id: str = "",
-        sender_is_bot: bool = False,
+        sender_is_agent: bool = False,
         mentions: list[dict] | None = None,
         post_id: str = "",
         create_at: int = 0,
@@ -488,8 +488,8 @@ class PuffoAgent:
         lines.append(f"- sender_slug: {sender}")
         # ``owner_slug`` exists only for agents, so it doubles as the
         # agent signal here. Display-only — priority banding still
-        # runs on the upstream ``sender_is_bot`` flag.
-        sender_type = "agent" if (sender_is_bot or sender_owner_slug) else "human"
+        # runs on the upstream ``sender_is_agent`` flag.
+        sender_type = "agent" if (sender_is_agent or sender_owner_slug) else "human"
         lines.append(f"- sender_type: {sender_type}")
         # ``sender_owner_slug`` fires only for agent senders (their
         # operator); ``is_from_operator`` only when the sender IS the

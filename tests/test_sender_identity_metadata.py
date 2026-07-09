@@ -30,7 +30,7 @@ def test_agent_sender_gets_owner_slug():
     assert "- sender_owner_slug: nova-op-9999" in block
     assert "- is_from_operator:" not in block
     # owner_slug is agent-only, so it flips the displayed type even
-    # while the upstream sender_is_bot flag is still hardcoded False.
+    # while the upstream sender_is_agent flag is still hardcoded False.
     assert "- sender_type: agent" in block
 
 

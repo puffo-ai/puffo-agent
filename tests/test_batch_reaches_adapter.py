@@ -41,7 +41,7 @@ def _msg(envelope_id: str, sender: str, text: str, sent_at: int) -> dict:
         "sender_email": "",
         "text": text,
         "attachments": [],
-        "sender_is_bot": False,
+        "sender_is_agent": False,
         "mentions": [],
         "sent_at": sent_at,
         "is_dm": False,
