@@ -905,6 +905,80 @@ class Worker:
         # Signalled when warm() finishes (success, failure, or skipped).
         # Daemon awaits this to serialise heavy startup across workers.
         self._warm_done = asyncio.Event()
+        # Proactive (between-turns) profile reload state. The refresh
+        # watcher (see ``_run``) and the turn-start ``_process_refresh_flags``
+        # call share this lock so a flag is consumed exactly once —
+        # whichever path wins takes it; the loser hits the early-return
+        # when the flags are already gone. ``_turn_active`` gates the
+        # watcher so it never applies mid-generation (deferred to the
+        # turn-start path). ``_refresh_now`` is a signal-driven wake so
+        # SIGHUP can beat the 250 ms idle poll.
+        self._reload_lock = asyncio.Lock()
+        self._turn_active = False
+        self._refresh_now = asyncio.Event()
+
+    def notify_refresh(self) -> None:
+        """Wake the proactive refresh watcher now (sub-poll latency).
+        Called from the daemon's SIGHUP handler, which runs on the loop
+        thread. No-op safe: setting an already-set Event is idempotent,
+        and if the worker has no watcher yet (pre-``_run``) the flag is
+        simply observed on the first watcher tick."""
+        self._refresh_now.set()
+
+    async def _proactive_refresh_tick(self, flag_paths, apply) -> bool:
+        """One proactive-watcher iteration's decision + apply. Skips when
+        a turn owns flag consumption (``_turn_active``) or no flag in
+        ``flag_paths`` is pending; otherwise takes ``_reload_lock`` (the
+        same lock the turn-start path holds → consume-once), re-checks
+        ``_turn_active``, and awaits ``apply`` (the bound
+        ``_process_refresh_flags`` call). Returns whether ``apply`` ran.
+        Exceptions from ``apply`` are swallowed so the watcher never
+        kills the worker — the turn-start path is the backstop."""
+        if self._turn_active:
+            # A turn owns flag consumption; never apply mid-turn.
+            return False
+        if not any(p.exists() for p in flag_paths):
+            # Cheap exists() check before taking the lock.
+            return False
+        async with self._reload_lock:
+            if self._turn_active:
+                # A turn started between the check and the lock; defer to
+                # the turn-start path.
+                return False
+            try:
+                await apply()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: proactive refresh failed: %s",
+                    self.agent_cfg.id, exc,
+                )
+            return True
+
+    async def _refresh_watcher_loop(
+        self, flag_paths, apply, *, interval: float = 0.25,
+    ) -> None:
+        """Proactive between-turns profile reload loop. Polls
+        ``flag_paths`` every ``interval`` s (waking immediately when
+        ``notify_refresh()`` fires) so a ``profile.md`` / host-sync /
+        session edit takes effect while the agent is IDLE — instead of
+        only lazily at the next turn. Each pending flag is funneled into
+        ``apply``, the bound turn-start ``_process_refresh_flags`` /
+        ``adapter.reload`` primitive (adapter-only reload: the bridge WS
+        on ``self._client`` and the worker are untouched). No-op unless a
+        flag is present, so native/desktop runtimes see no behavioral
+        change beyond applying an already-written flag sooner. Runs as a
+        sibling task of ``heartbeat``; ends when ``_stop`` is set."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._refresh_now.wait(), timeout=interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._refresh_now.clear()
+            if self._stop.is_set():
+                break
+            await self._proactive_refresh_tick(flag_paths, apply)
 
     def start(self) -> asyncio.Task:
         if self._task is not None and not self._task.done():
@@ -1231,6 +1305,13 @@ class Worker:
             """
             if not batch:
                 return
+            # Own this turn: block the proactive refresh watcher from
+            # applying mid-turn. Held True through the entire turn —
+            # including the ``puffo.handle_message_batch`` LLM call — and
+            # cleared in the finally below. The turn-start
+            # ``_process_refresh_flags`` call (under ``_reload_lock``)
+            # owns flag consumption while this is True.
+            self._turn_active = True
             # Diagnostic: log every dispatched batch so we can trace
             # cross-batch duplicates (same envelope_id surfacing in
             # consecutive turns). If the SAME envelope_id appears
@@ -1250,22 +1331,26 @@ class Worker:
             first_post_id = batch[0].get("envelope_id", "")
             channel_id = channel_meta.get("channel_id", "")
 
-            await _process_refresh_flags(
-                agent_id=agent_id,
-                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
-                shared_path=shared_path,
-                profile_path=profile_path,
-                memory_path=memory_path,
-                workspace_path=workspace_path,
-                display_name=self.agent_cfg.display_name,
-                role=self.agent_cfg.role,
-                role_short=self.agent_cfg.role_short,
-                puffo=puffo,
-                adapter=self._adapter,
-                refresh_agent_flag=refresh_agent_flag_path,
-                refresh_host_sync_flag=refresh_host_sync_flag_path,
-                refresh_session_flag=refresh_session_flag_path,
-            )
+            # Serialized against the proactive watcher so a flag is
+            # consumed exactly once (whichever path takes the lock first
+            # applies; the other sees the early-return-when-no-flags).
+            async with self._reload_lock:
+                await _process_refresh_flags(
+                    agent_id=agent_id,
+                    harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                    shared_path=shared_path,
+                    profile_path=profile_path,
+                    memory_path=memory_path,
+                    workspace_path=workspace_path,
+                    display_name=self.agent_cfg.display_name,
+                    role=self.agent_cfg.role,
+                    role_short=self.agent_cfg.role_short,
+                    puffo=puffo,
+                    adapter=self._adapter,
+                    refresh_agent_flag=refresh_agent_flag_path,
+                    refresh_host_sync_flag=refresh_host_sync_flag_path,
+                    refresh_session_flag=refresh_session_flag_path,
+                )
             try:
                 current_turn_path.parent.mkdir(parents=True, exist_ok=True)
                 current_turn_path.write_text(
@@ -1426,6 +1511,9 @@ class Worker:
                     current_turn_path.unlink()
                 except OSError:
                     pass
+                # Turn is over (incl. the LLM call): release the guard so
+                # the proactive watcher may apply between-turns edits.
+                self._turn_active = False
             # One batch = one "message" for the runtime counter; the
             # display still reads as "N messages processed."
             self.runtime.msg_count += 1
@@ -1553,6 +1641,33 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
 
+        # Proactive between-turns reload: bind the turn-start
+        # ``_process_refresh_flags`` primitive over this run's locals so
+        # the watcher applies the SAME reload the turn-start path does.
+        refresh_flag_paths = (
+            refresh_agent_flag_path,
+            refresh_host_sync_flag_path,
+            refresh_session_flag_path,
+        )
+
+        async def apply_refresh() -> None:
+            await _process_refresh_flags(
+                agent_id=agent_id,
+                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
+                display_name=self.agent_cfg.display_name,
+                role=self.agent_cfg.role,
+                role_short=self.agent_cfg.role_short,
+                puffo=puffo,
+                adapter=self._adapter,
+                refresh_agent_flag=refresh_agent_flag_path,
+                refresh_host_sync_flag=refresh_host_sync_flag_path,
+                refresh_session_flag=refresh_session_flag_path,
+            )
+
         # PUF-221: per-agent credential_refresh coroutine retired —
         # CredentialRefresher in portal/credential_refresh.py owns the
         # refresh loop daemon-wide. Single writer = no multi-process
@@ -1589,6 +1704,9 @@ class Worker:
 
         hb_task = asyncio.ensure_future(heartbeat())
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
+        watch_task = asyncio.ensure_future(
+            self._refresh_watcher_loop(refresh_flag_paths, apply_refresh)
+        )
         try:
             while not self._stop.is_set():
                 try:
@@ -1623,7 +1741,8 @@ class Worker:
             reporter.stop()
             hb_task.cancel()
             status_task.cancel()
-            for task in (hb_task, status_task):
+            watch_task.cancel()
+            for task in (hb_task, status_task, watch_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):

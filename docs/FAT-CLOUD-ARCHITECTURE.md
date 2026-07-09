@@ -295,6 +295,19 @@ is cited.
   `// TODO(phase-2): notify runtime via AgentServerMsg::ConfigUpdate` **WS push is
   superseded by config-sync F** — there is no live `ConfigUpdate` frame; the mtime-watch
   replaces it.
+  - **Proactive (idle) reload — [BUILT].** Independently of the DESIGNED mtime-watch,
+    profile hot-reload no longer waits for the next turn: a between-turns **refresh
+    watcher** (`refresh_watcher` in `portal/worker.py`, idle poll ≤250 ms) plus an
+    optional guarded **SIGHUP** hook (`_install_posix_sighup_handler` +
+    `Daemon.notify_refresh_all`) both funnel into the **existing** turn-start
+    `_process_refresh_flags` → `adapter.reload` primitive. So a `refresh_agent.flag`
+    drop applies while the agent is IDLE (flag-to-swap **< 500 ms**), not only lazily
+    at the next message. The reload is **adapter-only** — the bridge WS (`Worker._client`)
+    and the worker are preserved, no restart / CLI re-spawn. A shared `_reload_lock` +
+    `_turn_active` guard keeps consume-once and never applies mid-generation. Target is
+    the cloud agent (`runtime.kind: cli-local` + `puffo_core.transport: bridge`); this is
+    distinct from — and does not implement — the `_process_config_mtime_reload`
+    mtime-watch, which stays DESIGNED.
 - **Metadata reads over token-HTTP.** Four membership-scoped read routes
   (`GET /spaces`, `GET /spaces/{id}/channels`, `.../members`, `GET /identities/profiles`)
   need to accept the `x-sandbox-token` as an alternative to subkey-signing so a
