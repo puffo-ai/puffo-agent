@@ -354,7 +354,11 @@ def _build_puffo_core_client(
     the dataclass defaults.
     """
     from ..agent.message_store import MessageStore
-    from ..agent.puffo_core_client import PuffoCoreMessageClient, max_image_edge_px
+    from ..agent.puffo_core_client import (
+        DEFAULT_MAX_INPUT_BYTES,
+        PuffoCoreMessageClient,
+        max_image_edge_px,
+    )
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
@@ -374,10 +378,17 @@ def _build_puffo_core_client(
 
     # The inbound-image downscale cap follows the harness's effective model
     # (Opus 4.7+ resolves 2576px, else 1568px).
-    if (agent_cfg.runtime.harness or "claude-code") == "codex":
+    is_codex = (agent_cfg.runtime.harness or "claude-code") == "codex"
+    if is_codex:
         model = agent_cfg.runtime.model or (daemon_cfg.openai.model if daemon_cfg else "")
     else:
         model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
+
+    # PUF-363: per-turn input-block byte budget for greedy-fill batching.
+    # Claude Code hard-rejects a single user block over ~180KB pre-send, so
+    # split batches to stay under it. Codex has no such input cap — give it a
+    # far larger ceiling that only trips as a runaway safety net.
+    max_input_bytes = 4_000_000 if is_codex else DEFAULT_MAX_INPUT_BYTES
 
     return PuffoCoreMessageClient(
         slug=pc.slug,
@@ -393,6 +404,7 @@ def _build_puffo_core_client(
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
+        max_input_bytes=max_input_bytes,
     )
 
 

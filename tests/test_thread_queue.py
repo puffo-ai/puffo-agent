@@ -25,8 +25,11 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import logging
+
 from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.agent.puffo_core_client import (
+    DEFAULT_MAX_INPUT_BYTES,
     PRIORITY_BOT,
     PRIORITY_HUMAN,
     PRIORITY_MENTIONED_BOT,
@@ -59,6 +62,10 @@ def _make_client_for_queue(store: MessageStore) -> PuffoCoreMessageClient:
     client._queue = asyncio.PriorityQueue()
     client._queue_seq = 0
     client._thread_state = {}
+    # PUF-363: greedy-fill needs a byte budget + a logger. Default budget
+    # is large so pre-existing small-batch tests never trigger a split.
+    client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES
+    client._log = logging.getLogger("puffo-core-client-test")
     return client
 
 
@@ -910,4 +917,174 @@ async def test_pre_existing_cursor_blocks_redelivered_messages():
     assert await store.get_last_processed_sent_at("env_root") == 500
     # A fresh root has no entry → returns 0 → admits everything.
     assert await store.get_last_processed_sent_at("env_fresh") == 0
+    await store.close()
+
+
+# ─── PUF-363: greedy-fill input batching ─────────────────────────
+
+
+def _sized_msg(envelope_id: str, text_bytes: int, sent_at: int) -> dict:
+    m = _msg(envelope_id, sent_at=sent_at)
+    m["text"] = "x" * text_bytes
+    return m
+
+
+async def _run_consumer_n_batches(
+    client: PuffoCoreMessageClient,
+    n: int,
+    on_first=None,
+) -> list[tuple[str, list[dict], dict]]:
+    """Drive ``_consume_queue`` until it dispatches ``n`` batches. If
+    ``on_first`` is given it's awaited during the FIRST dispatch (to
+    simulate a mid-dispatch arrival)."""
+    received: list[tuple[str, list[dict], dict]] = []
+    done = asyncio.Event()
+
+    async def callback(root_id, batch, channel_meta):
+        received.append((root_id, batch, channel_meta))
+        if len(received) == 1 and on_first is not None:
+            await on_first()
+        if len(received) >= n:
+            done.set()
+
+    task = asyncio.create_task(client._consume_queue(callback))
+    try:
+        await asyncio.wait_for(done.wait(), timeout=5.0)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert len(received) == n
+    return received
+
+
+def test_default_max_input_bytes_matches_adapter_cap():
+    """Drift guard: the greedy-fill budget default must track the Claude
+    Code adapter's own pre-send cap, or the split stops protecting it."""
+    from puffo_agent.agent.adapters.cli_session import MAX_USER_MESSAGE_BYTES
+
+    assert DEFAULT_MAX_INPUT_BYTES == MAX_USER_MESSAGE_BYTES
+
+
+def test_greedy_fit_prefix_selects_largest_fitting_prefix():
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    client._max_input_bytes = 12_000
+    # Each block ≈ 2048 overhead + 3000 text = 5048 bytes; 2 fit under
+    # 12000 (10098), the 3rd would push to 15148.
+    msgs = [_sized_msg(f"e{i}", 3000, 100 + i) for i in range(5)]
+    assert client._greedy_fit_prefix(msgs) == 2
+
+
+def test_greedy_fit_prefix_empty_and_all_fit():
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES
+    assert client._greedy_fit_prefix([]) == 0
+    small = [_sized_msg(f"e{i}", 10, 100 + i) for i in range(4)]
+    assert client._greedy_fit_prefix(small) == 4
+
+
+def test_greedy_fit_prefix_single_over_budget_message_goes_alone():
+    """A lone message bigger than the whole budget can't be split at a
+    boundary — it must still dispatch (K=1) so the thread never stalls;
+    the adapter's own pre-send cap is the backstop."""
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    client._max_input_bytes = 4_000
+    huge = [_sized_msg("e_huge", 50_000, 100)]
+    assert client._greedy_fit_prefix(huge) == 1
+
+
+def test_message_block_bytes_over_counts_real_content():
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    m = _sized_msg("e0", 100, 100)
+    m["attachments"] = ["/a/b.png"]
+    m["mentions"] = ["bob-0002"]
+    # text(100) + attachment(8+16) + mention(8+8) + overhead(2048) all counted.
+    assert client._message_block_bytes(m) >= 100 + 2048
+
+
+@pytest.mark.asyncio
+async def test_consume_greedy_fill_defers_overflow(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.puffo_core_client.random.uniform", lambda a, b: 0.0
+    )
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+    client._max_input_bytes = 12_000  # ~2 messages/turn at 5048 bytes each
+
+    for i in range(5):
+        await client._admit_thread_message(
+            root_id="env_root",
+            priority=PRIORITY_HUMAN,
+            msg_dict=_sized_msg(f"e{i}", 3000, 100 + i),
+            channel_meta=_channel_meta(),
+        )
+
+    batches = await _run_consumer_n_batches(client, 3)
+    ids = [[m["envelope_id"] for m in b] for (_r, b, _m) in batches]
+    # FIFO preserved, split at message boundaries, nothing dropped.
+    assert ids == [["e0", "e1"], ["e2", "e3"], ["e4"]]
+    # Cursor only ever covers the last DISPATCHED message.
+    assert await store.get_last_processed_sent_at("env_root") == 104
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_greedy_fill_mid_dispatch_arrival_keeps_fifo(monkeypatch):
+    """A message that arrives WHILE the first (fitting) batch is being
+    dispatched must land AFTER the deferred tail, not ahead of it."""
+    monkeypatch.setattr(
+        "puffo_agent.agent.puffo_core_client.random.uniform", lambda a, b: 0.0
+    )
+    store = await _make_store()
+    client = _make_client_for_queue(store)
+    client._max_input_bytes = 12_000
+
+    for i in range(3):  # batch1 = [e0, e1]; deferred = [e2]
+        await client._admit_thread_message(
+            root_id="env_root",
+            priority=PRIORITY_HUMAN,
+            msg_dict=_sized_msg(f"e{i}", 3000, 100 + i),
+            channel_meta=_channel_meta(),
+        )
+
+    async def late_arrival():
+        await client._admit_thread_message(
+            root_id="env_root",
+            priority=PRIORITY_HUMAN,
+            msg_dict=_sized_msg("e_late", 3000, 200),
+            channel_meta=_channel_meta(),
+        )
+
+    batches = await _run_consumer_n_batches(client, 2, on_first=late_arrival)
+    ids = [[m["envelope_id"] for m in b] for (_r, b, _m) in batches]
+    # Deferred e2 stays ahead of the mid-dispatch arrival e_late.
+    assert ids == [["e0", "e1"], ["e2", "e_late"]]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_greedy_fill_noop_when_batch_fits(monkeypatch):
+    """Budget comfortably above the batch → single dispatch, no defer,
+    slot closes exactly like the pre-PUF-363 path."""
+    monkeypatch.setattr(
+        "puffo_agent.agent.puffo_core_client.random.uniform", lambda a, b: 0.0
+    )
+    store = await _make_store()
+    client = _make_client_for_queue(store)  # default large budget
+
+    for i in range(3):
+        await client._admit_thread_message(
+            root_id="env_root",
+            priority=PRIORITY_HUMAN,
+            msg_dict=_sized_msg(f"e{i}", 500, 100 + i),
+            channel_meta=_channel_meta(),
+        )
+
+    root_id, batch, _ = await _run_consumer_one_batch(client)
+    assert [m["envelope_id"] for m in batch] == ["e0", "e1", "e2"]
+    assert client._thread_state["env_root"].in_queue is False
+    assert client._thread_state["env_root"].messages == []
+    assert await store.get_last_processed_sent_at("env_root") == 102
     await store.close()
