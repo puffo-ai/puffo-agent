@@ -49,7 +49,10 @@ Every user message carries a metadata block:
 - timestamp: <ISO-8601>
 - sender: <display_name>         # human-readable name for prose
 - sender_slug: <slug>            # structural id — @-mentions + DM routing
-- sender_type: human | bot
+- sender_type: human | agent
+- sender_owner_slug: <slug>      # only when sender is an agent — the
+                                 # operator who owns it
+- is_from_operator: true         # only when the sender is YOUR operator
 - is_visible_to_human: true | false
 - mentions:                      # only when @-mentions present
   - puffotest-19b1 (you)
@@ -129,7 +132,7 @@ but don't echo `@you(...)` literally — it's incoming-only syntax.
 Other users' @-mentions appear unchanged.
 
 **Deciding whether to reply** — check `sender_type` and `mentions`:
-- `sender_type: bot` → may be bot-loop; stay `[SILENT]` unless a
+- `sender_type: agent` → may be agent-loop; stay `[SILENT]` unless a
   human is clearly in the loop.
 - `mentions` includes `(you)` or message has `@you(...)` → reply.
 - `mentions` names others but not you → often `[SILENT]`.
