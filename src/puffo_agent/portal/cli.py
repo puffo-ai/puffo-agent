@@ -256,17 +256,41 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 
+# Shown when a GUI entry point (``start --ui`` / ``start --tray``) is
+# invoked but the desktop UI's ``[gui]`` extra (PySide6) isn't installed.
+# The base ``pip install puffo-agent`` is deliberately Qt-free so headless
+# / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.
+_GUI_EXTRA_HINT = (
+    "the desktop UI requires the [gui] extra (PySide6), which is not "
+    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n\n"
+    "(the headless daemon — `puffo-agent start` with no UI flag — runs "
+    "without it.)"
+)
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     with_local_bridge = getattr(args, "with_local_bridge", False)
+    # The PySide6 import inside run_tray/launch is deferred to call time,
+    # so the ImportError surfaces from the call, not the ``from .ui...``
+    # line — wrap both so a missing [gui] extra yields the actionable hint
+    # instead of a raw ModuleNotFoundError traceback.
     if getattr(args, "tray_runner", False):
-        from .ui.tray import run_tray
-        return run_tray(with_local_bridge=with_local_bridge)
+        try:
+            from .ui.tray import run_tray
+            return run_tray(with_local_bridge=with_local_bridge)
+        except ImportError:
+            print(_GUI_EXTRA_HINT, file=sys.stderr)
+            return 1
     if getattr(args, "background", False):
         from .background import spawn_background
         return spawn_background(with_local_bridge=with_local_bridge)
     if getattr(args, "ui", False):
-        from .ui.launcher import launch
-        return launch(with_local_bridge=with_local_bridge)
+        try:
+            from .ui.launcher import launch
+            return launch(with_local_bridge=with_local_bridge)
+        except ImportError:
+            print(_GUI_EXTRA_HINT, file=sys.stderr)
+            return 1
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -525,13 +549,28 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     )
     cfg.save()
 
-    (target / "memory").mkdir(exist_ok=True)
+    from ..agent.memory import ensure_memory_tree, sync_profile_briefing
+    ensure_memory_tree(target / "memory")
 
     profile_path = target / "profile.md"
     if args.profile and Path(args.profile).exists():
         shutil.copy2(args.profile, profile_path)
     else:
         profile_path.write_text(DEFAULT_PROFILE, encoding="utf-8")
+
+    # Seed briefing/profile.md now so the agent's very first prompt
+    # rebuild has managed identity framing (the worker's memory sync
+    # re-syncs it, but a freshly created agent shouldn't ship without
+    # it). Mirrors shared_content.rebuild_agent_claude_md's profile sync.
+    from .profile_sync import extract_soul_body
+    sync_profile_briefing(
+        target / "memory",
+        agent_id=agent_id,
+        display_name=cfg.display_name,
+        role=role,
+        role_short=role_short,
+        soul=extract_soul_body(profile_path.read_text(encoding="utf-8")),
+    )
 
     print(f"created agent {agent_id!r} at {target}")
     print(
@@ -1498,6 +1537,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
     """Re-sync the shared primer + rebuild the listed agents' CLAUDE.md.
     ensure_shared_primer runs on every worker startup, so this is only
     needed to force a rebuild without waiting for a message."""
+    from ..agent.memory_errors import BriefingCompileError
     from ..agent.shared_content import (
         ensure_shared_primer,
         rebuild_agent_claude_md,
@@ -1522,14 +1562,23 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
             print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
             rc = 2
             continue
-        rebuild_agent_claude_md(
-            shared_dir=shared_dir,
-            profile_path=cfg.resolve_profile_path(),
-            memory_dir=cfg.resolve_memory_dir(),
-            workspace_dir=cfg.resolve_workspace_dir(),
-            claude_user_dir=agent_claude_user_dir(agent_id),
-            gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
-        )
+        try:
+            rebuild_agent_claude_md(
+                shared_dir=shared_dir,
+                profile_path=cfg.resolve_profile_path(),
+                memory_dir=cfg.resolve_memory_dir(),
+                workspace_dir=cfg.resolve_workspace_dir(),
+                claude_user_dir=agent_claude_user_dir(agent_id),
+                gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+                agent_id=agent_id,
+                display_name=cfg.display_name,
+                role=cfg.role,
+                role_short=cfg.role_short,
+            )
+        except BriefingCompileError as exc:
+            print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
         rebuilt.append(agent_id)
         print(f"rebuilt CLAUDE.md for {agent_id!r}")
 

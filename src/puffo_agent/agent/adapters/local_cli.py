@@ -42,7 +42,7 @@ from ...portal.state import (
     sync_host_skills,
 )
 from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
-from .base import Adapter, TurnContext, TurnResult
+from .base import Adapter, TurnContext, TurnResult, anthropic_base_url_env
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
 from .desired_install import run_spawn_install
@@ -170,9 +170,18 @@ class LocalCLIAdapter(Adapter):
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
+        llm_base_url: str = "",
+        llm_api_key: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
+        # Anthropic-compatible base URL (e.g. LiteLLM VK) + its key.
+        # When ``llm_base_url`` is set, the claude-code spawn env gets
+        # ANTHROPIC_BASE_URL (and ANTHROPIC_API_KEY=VK when llm_api_key
+        # is non-empty). Empty base URL injects nothing, preserving the
+        # ``claude login`` / OAuth credential path. See ``_llm_env``.
+        self.llm_base_url = llm_base_url
+        self.llm_api_key = llm_api_key
         self.workspace_dir = workspace_dir
         self.claude_dir = claude_dir
         self.session_file = Path(session_file)
@@ -776,6 +785,7 @@ class LocalCLIAdapter(Adapter):
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
             **self._macos_credential_env(),
+            **self._llm_env(),
         }
         self._session = ClaudeSession(
             agent_id=self.agent_id,
@@ -814,6 +824,22 @@ class LocalCLIAdapter(Adapter):
         return {
             "CLAUDE_CONFIG_DIR": str(Path(self.agent_home_dir) / ".claude"),
         }
+
+    def _llm_env(self) -> dict[str, str]:
+        """LLM-plane env overrides for the claude-code spawn.
+
+        Empty ``llm_base_url`` → ``{}`` (spawn env unchanged; claude
+        authenticates via ``~/.claude/.credentials.json`` / OAuth as
+        today). When set, inject ``ANTHROPIC_BASE_URL`` so the CLI's
+        model calls hit the proxy (LiteLLM VK), plus
+        ``ANTHROPIC_API_KEY=<VK>`` when ``llm_api_key`` is non-empty so
+        the CLI authenticates against the VK rather than the operator's
+        OAuth token.
+        """
+        env = anthropic_base_url_env(self.llm_base_url)
+        if env and self.llm_api_key:
+            env["ANTHROPIC_API_KEY"] = self.llm_api_key
+        return env
 
     def _permission_hook_env(self) -> dict[str, str]:
         """Env vars the PreToolUse hook script reads. Claude inherits

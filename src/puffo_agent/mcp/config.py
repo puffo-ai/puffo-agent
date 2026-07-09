@@ -49,6 +49,29 @@ PUFFO_CORE_TOOL_NAMES = (
     "leave_space",
     "leave_channel",
     "refresh",
+    # M3 memory tools (registered by mcp.memory_tools). Kept in the
+    # core allowlist so the sdk adapter's gate auto-allows them like
+    # every other mcp__puffo__ tool — otherwise they register but are
+    # denied at call time on sdk-local.
+    "create_note",
+    "patch_note",
+    "append_note",
+    "create_briefing_topic",
+    "patch_briefing_topic",
+    "append_recollection",
+    "read_memory_file",
+    "read_memory_files",
+    "search_memory",
+    "search_imports",
+    # M4 memory status / recall / history tools (read-only; registered
+    # by mcp.memory_tools). Same reason as the M3 block — the sdk gate
+    # auto-allows every mcp__puffo__ tool in this list, so leaving them
+    # out would register them but deny them at call time on sdk-local.
+    "get_memory_status",
+    "get_memory_file_status",
+    "list_memory_files",
+    "get_memory_history_status",
+    "get_memory_history",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(
     f"mcp__{MCP_SERVER_NAME}__{t}" for t in PUFFO_CORE_TOOL_NAMES
@@ -243,11 +266,15 @@ def puffo_core_mcp_env(
     rpc_url: str = "http://127.0.0.1:63385",
     runtime_kind: str = "",
     harness: str = "",
+    memory_dir: str = "",
+    transport: str = "",
 ) -> dict[str, str]:
     """Env dict for the puffo-core MCP subprocess. The MCP never
     touches ``messages.db`` or ``~/.claude.json`` directly — the
     daemon owns both. cli-docker rewrites the loopback URLs to
-    ``host.docker.internal``."""
+    ``host.docker.internal``. ``memory_dir`` (optional) pins the
+    memory root for the M3 memory tools; when empty the server falls
+    back to the workspace-sibling ``memory/`` dir."""
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -266,6 +293,21 @@ def puffo_core_mcp_env(
         env["PUFFO_RUNTIME_KIND"] = runtime_kind
     if harness:
         env["PUFFO_HARNESS"] = harness
+    if memory_dir:
+        env["PUFFO_MEMORY_DIR"] = memory_dir
+    # T23 bridge transport — no caller passes this yet; adapter env
+    # wiring lands with phase 2.
+    if transport:
+        env["PUFFO_CORE_TRANSPORT"] = transport
+    # Test-only egress shim: forward PUFFO_LOCAL_SANDBOX_TOKEN into the
+    # subprocess so its keyless http client can simulate the E2B egress
+    # token injection against a local server. Guarded on presence in the
+    # daemon environment — production leaves it unset, so nothing is
+    # written to any config file.
+    import os as _os
+    local_sandbox_token = _os.environ.get("PUFFO_LOCAL_SANDBOX_TOKEN")
+    if local_sandbox_token:
+        env["PUFFO_LOCAL_SANDBOX_TOKEN"] = local_sandbox_token
     # codex only forwards [mcp_servers.puffo.env] to the subprocess,
     # so CODEX_HOME must be pinned explicitly or list_mcp_servers
     # would read the operator's host config instead of the agent's.
@@ -285,6 +327,7 @@ def puffo_core_stdio_sdk_config(
     keystore_dir: str,
     workspace: str,
     agent_id: str,
+    memory_dir: str = "",
 ) -> dict:
     """Return the ``mcp_servers`` config dict for the SDK adapter."""
     return {
@@ -301,6 +344,7 @@ def puffo_core_stdio_sdk_config(
                 workspace=workspace,
                 agent_id=agent_id,
                 runtime_kind="sdk-local",
+                memory_dir=memory_dir,
             ),
         }
     }

@@ -2,8 +2,15 @@ import anthropic
 
 
 class AnthropicProvider:
-    def __init__(self, api_key: str, model: str):
-        self.client = anthropic.Anthropic(api_key=api_key)
+    def __init__(self, api_key: str, model: str, base_url: str | None = None):
+        # ``base_url`` routes completions through a proxy (e.g. a LiteLLM
+        # virtual-key endpoint) instead of api.anthropic.com. Passed to
+        # the client only when set so the default stays the vendor
+        # endpoint — byte-for-byte unchanged when no base_url is given.
+        if base_url:
+            self.client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
+        else:
+            self.client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
     def complete(self, system_prompt: str, messages: list[dict]) -> tuple[str, int, int]:

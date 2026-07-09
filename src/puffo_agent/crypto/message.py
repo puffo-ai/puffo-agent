@@ -72,6 +72,14 @@ class MessagePayload:
     recipient_slug: Optional[str] = None
     thread_root_id: Optional[str] = None
     reply_to_id: Optional[str] = None
+    # Keyless-bridge only: top-level ``AttachmentRef`` list carried on
+    # inbound plaintext ``message`` frames. NOT part of the native
+    # signed/AEAD payload — deliberately excluded from
+    # ``to_payload_dict()`` so every native seal/open produces the
+    # identical canonical bytes the Rust server expects. Native inbound
+    # keys off ``content_type`` and never reads this field, so it stays
+    # ``None`` on that path.
+    attachments: Optional[list] = None
 
     def to_payload_dict(self) -> dict:
         """JSON shape matching the server's ``MessagePayload``.
@@ -80,6 +88,10 @@ class MessagePayload:
         omitted): the server's verified-payload validator calls
         ``expect_null`` on the inactive route fields per envelope
         kind, so omitting them returns InvalidInput.
+
+        ``attachments`` is intentionally NOT emitted here — it's a
+        bridge-transport-only surface field, and adding it would
+        diverge the canonical signing bytes from the server's.
         """
         return {
             "type": self.payload_type,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 import aiohttp
@@ -24,10 +25,22 @@ class HttpError(Exception):
 
 
 class PuffoCoreHttpClient:
-    def __init__(self, server_url: str, keystore: KeyStore, slug: str):
+    def __init__(
+        self,
+        server_url: str,
+        keystore: KeyStore,
+        slug: str,
+        keyless: bool = False,
+    ):
         self.server_url = server_url.rstrip("/")
         self.keystore = keystore
         self.slug = slug
+        # T23 keyless bridge transport: outbound tool work goes over the
+        # unsigned ``/v2/cloud-agents/*`` routes and the E2B egress proxy
+        # injects ``x-sandbox-token`` on the way out. Tools branch on this
+        # to pick the keyless vs native (signed) path; native agents leave
+        # it False and are byte-for-byte unchanged.
+        self.keyless = keyless
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -181,13 +194,52 @@ class PuffoCoreHttpClient:
         _, data = await self._request("DELETE", path)
         return data
 
+    def _egress_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
+        """Merge the test-only egress ``x-sandbox-token`` shim into the
+        request headers.
+
+        In production the E2B egress proxy injects the sandbox token on
+        outbound HTTPS, so ``PUFFO_LOCAL_SANDBOX_TOKEN`` is unset and this
+        returns ``base`` untouched — no header is written into any config
+        file or request. Set the env var locally to simulate that
+        injection against a plaintext test server. Called ONLY from the
+        unsigned keyless methods below; native signed requests never hit
+        this path.
+        """
+        headers = dict(base or {})
+        token = os.environ.get("PUFFO_LOCAL_SANDBOX_TOKEN")
+        if token:
+            headers["x-sandbox-token"] = token
+        return headers
+
     async def post_unsigned(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""
         http = await self._get_session()
         async with http.post(
             f"{self.server_url}{path}",
             data=raw,
-            headers={"content-type": "application/json"},
+            headers=self._egress_headers({"content-type": "application/json"}),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text
+
+    async def post_bytes_unsigned(self, path: str, body: bytes) -> Any:
+        """POST raw bytes unsigned (keyless blob upload). Mirrors
+        ``post_unsigned`` but carries an ``application/octet-stream`` body
+        and no signature — the egress proxy supplies auth via
+        ``x-sandbox-token``."""
+        http = await self._get_session()
+        async with http.post(
+            f"{self.server_url}{path}",
+            data=body,
+            headers=self._egress_headers(
+                {"content-type": "application/octet-stream"}
+            ),
         ) as resp:
             text = await resp.text()
             if resp.status >= 400:
@@ -199,7 +251,10 @@ class PuffoCoreHttpClient:
 
     async def get_unsigned(self, path: str) -> Any:
         http = await self._get_session()
-        async with http.get(f"{self.server_url}{path}") as resp:
+        async with http.get(
+            f"{self.server_url}{path}",
+            headers=self._egress_headers(),
+        ) as resp:
             text = await resp.text()
             if resp.status >= 400:
                 raise HttpError(resp.status, text)

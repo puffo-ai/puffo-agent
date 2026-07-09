@@ -57,12 +57,17 @@ def _rebuild_managed_system_prompt(
     profile_path: str,
     memory_path: str,
     workspace_path: str,
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
 ) -> str:
     """Dispatch wrapper: write the right system-prompt file(s) for the
     agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; every
     other harness goes through the legacy claude-code path (which also
     writes GEMINI.md for the gemini-cli harness sharing the same body).
-    Returns the assembled prompt body either way.
+    Returns the assembled prompt body either way. The identity fields
+    feed the managed ``memory/briefing/profile.md`` re-sync inside the
+    rebuild.
     """
     if harness_name == "codex":
         return rebuild_agent_codex_md(
@@ -71,6 +76,10 @@ def _rebuild_managed_system_prompt(
             memory_dir=Path(memory_path),
             workspace_dir=Path(workspace_path),
             codex_user_dir=agent_codex_user_dir(agent_id),
+            agent_id=agent_id,
+            display_name=display_name,
+            role=role,
+            role_short=role_short,
         )
     return rebuild_agent_claude_md(
         shared_dir=shared_path,
@@ -79,6 +88,10 @@ def _rebuild_managed_system_prompt(
         workspace_dir=Path(workspace_path),
         claude_user_dir=agent_claude_user_dir(agent_id),
         gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+        agent_id=agent_id,
+        display_name=display_name,
+        role=role,
+        role_short=role_short,
     )
 
 logger = logging.getLogger(__name__)
@@ -112,6 +125,9 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             agent_id=agent_cfg.id,
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             max_turns=agent_cfg.runtime.max_turns,
+            # Empty = vendor endpoint (unchanged); set = route the SDK's
+            # model calls through the proxy via ANTHROPIC_BASE_URL.
+            base_url=agent_cfg.runtime.llm_base_url,
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
@@ -125,6 +141,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
+                memory_dir=str(agent_cfg.resolve_memory_dir()),
             )
         return adapter
 
@@ -207,6 +224,10 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-docker",
                 harness=agent_cfg.runtime.harness,
+                # MCP runs in-container; the agent dir is bind-mounted
+                # at /home/agent/.puffo-agent-state (docker_cli also
+                # pins this at its env-override sites).
+                memory_dir="/home/agent/.puffo-agent-state/memory",
             )
         return adapter
 
@@ -239,6 +260,13 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            # Empty base URL → no env override (claude keeps its OAuth /
+            # ~/.claude credential path). Set → ANTHROPIC_BASE_URL routes
+            # the CLI's model calls through the proxy; the VK rides on
+            # runtime.api_key (injected as ANTHROPIC_API_KEY only when
+            # the base URL is also set — see LocalCLIAdapter._llm_env).
+            llm_base_url=agent_cfg.runtime.llm_base_url,
+            llm_api_key=agent_cfg.runtime.api_key,
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
@@ -255,6 +283,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
+                memory_dir=str(agent_cfg.resolve_memory_dir()),
             )
         return adapter
 
@@ -268,6 +297,9 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
     """Anthropic/OpenAI message-completion provider for the
     chat-local adapter. Per-agent fields override daemon defaults."""
     provider_name = runtime.provider or daemon_cfg.default_provider
+    # Empty base URL → None → vendor endpoint (today's behavior, byte-for-
+    # byte unchanged). Set → route completions through the proxy (VK).
+    base_url = runtime.llm_base_url or None
 
     if provider_name == "anthropic":
         from ..agent.providers.anthropic_provider import AnthropicProvider
@@ -277,7 +309,7 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
             raise RuntimeError(
                 "anthropic api_key is not set in daemon.yml or agent.yml"
             )
-        return AnthropicProvider(api_key=api_key, model=model)
+        return AnthropicProvider(api_key=api_key, model=model, base_url=base_url)
 
     if provider_name == "openai":
         from ..agent.providers.openai_provider import OpenAIProvider
@@ -287,7 +319,7 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
             raise RuntimeError(
                 "openai api_key is not set in daemon.yml or agent.yml"
             )
-        return OpenAIProvider(api_key=api_key, model=model)
+        return OpenAIProvider(api_key=api_key, model=model, base_url=base_url)
 
     raise RuntimeError(f"unknown provider {provider_name!r}")
 
@@ -359,10 +391,26 @@ def _build_puffo_core_client(
     from ..crypto.keystore import KeyStore
 
     pc = agent_cfg.puffo_core
-    _ensure_agent_identity_imported(agent_id, pc.slug)
+    bridge = None
+    if pc.transport == "bridge":
+        # T23 keyless transport: no identity file exists to import;
+        # the bridge authenticates with the sandbox token instead.
+        # Keystore/http below are still constructed (both lazy — they
+        # never touch disk/network in __init__); phase 2 replaces
+        # their call sites.
+        from ..agent.bridge_client import CloudBridgeClient
+
+        bridge = CloudBridgeClient(pc.server_url, pc.sandbox_token, pc.slug)
+    else:
+        _ensure_agent_identity_imported(agent_id, pc.slug)
     ks_dir = str(agent_dir(agent_id) / "keys")
     ks = KeyStore(ks_dir)
-    http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
+    # Bridge agents dispatch outbound tool work keyless over the unsigned
+    # ``/v2/cloud-agents/*`` routes; ``route.py`` reuses ``client.http``, so
+    # the in-process ws-local cfg's ``keyless`` accessor reads True here.
+    http = PuffoCoreHttpClient(
+        pc.server_url, ks, pc.slug, keyless=(pc.transport == "bridge"),
+    )
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (
@@ -393,6 +441,7 @@ def _build_puffo_core_client(
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
+        bridge_client=bridge,
     )
 
 
@@ -1042,16 +1091,19 @@ class Worker:
             memory_path = str(self.agent_cfg.resolve_memory_dir())
             workspace_path = str(self.agent_cfg.resolve_workspace_dir())
             claude_path = str(self.agent_cfg.resolve_claude_dir())
-            Path(memory_path).mkdir(parents=True, exist_ok=True)
             Path(workspace_path).mkdir(parents=True, exist_ok=True)
             _seed_claude_dir(Path(claude_path))
 
             # Assemble managed CLAUDE.md from shared primer + profile
-            # + memory snapshot. Written to user-level (.claude/
-            # CLAUDE.md) so Claude Code auto-discovers it. The
-            # project-level CLAUDE.md is left for the agent to edit.
-            # chat-local / sdk-local don't auto-discover, so the same
-            # string is passed as PuffoAgent's system_prompt.
+            # + compiled memory briefing. The rebuild ensures the
+            # memory tree + migrates legacy flat memory/*.md first.
+            # Written to user-level (.claude/CLAUDE.md) so Claude Code
+            # auto-discovers it. The project-level CLAUDE.md is left
+            # for the agent to edit. chat-local / sdk-local don't
+            # auto-discover, so the same string is passed as
+            # PuffoAgent's system_prompt. An over-budget briefing
+            # raises BriefingCompileError → caught below, worker init
+            # fails with runtime.status="error" (fail closed).
             shared_path = docker_shared_dir()
             claude_md = _rebuild_managed_system_prompt(
                 harness_name=(self.agent_cfg.runtime.harness or "").strip(),
@@ -1060,6 +1112,9 @@ class Worker:
                 profile_path=profile_path,
                 memory_path=memory_path,
                 workspace_path=workspace_path,
+                display_name=self.agent_cfg.display_name,
+                role=self.agent_cfg.role,
+                role_short=self.agent_cfg.role_short,
             )
 
             # One-time migration: remove an older project-level
@@ -1202,6 +1257,9 @@ class Worker:
                 profile_path=profile_path,
                 memory_path=memory_path,
                 workspace_path=workspace_path,
+                display_name=self.agent_cfg.display_name,
+                role=self.agent_cfg.role,
+                role_short=self.agent_cfg.role_short,
                 puffo=puffo,
                 adapter=self._adapter,
                 refresh_agent_flag=refresh_agent_flag_path,
@@ -1587,6 +1645,9 @@ async def _process_refresh_flags(
     refresh_agent_flag: Path,
     refresh_host_sync_flag: Path,
     refresh_session_flag: Path,
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
@@ -1627,6 +1688,9 @@ async def _process_refresh_flags(
                 profile_path=profile_path,
                 memory_path=memory_path,
                 workspace_path=workspace_path,
+                display_name=display_name,
+                role=role,
+                role_short=role_short,
             )
             puffo.system_prompt = new_prompt
             logger.info(

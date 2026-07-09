@@ -87,7 +87,8 @@ def test_rebuild_agent_claude_md_assembles_primer_profile_memory():
     profile.write_text("# Soul\nI am a test agent.", encoding="utf-8")
     memory = root / "memory"
     memory.mkdir()
-    (memory / "notes.md").write_text("a remembered fact", encoding="utf-8")
+    # Legacy flat memory file — migrated into briefing/ on rebuild.
+    (memory / "facts.md").write_text("a remembered fact", encoding="utf-8")
     workspace = root / "workspace"
     workspace.mkdir()
     claude_user = root / ".claude"
@@ -100,15 +101,37 @@ def test_rebuild_agent_claude_md_assembles_primer_profile_memory():
         workspace_dir=workspace,
         claude_user_dir=claude_user,
         gemini_user_dir=gemini_user,
+        agent_id="tester-0001",
+        display_name="Tester",
     )
-    # Shared primer is seeded on demand, then primer + profile + memory
-    # all land in the assembled prompt.
+    # Shared primer is seeded on demand, then primer + profile + the
+    # compiled memory briefing all land in the assembled prompt.
     assert "Puffo.ai platform primer" in out
     assert "I am a test agent." in out
     assert "a remembered fact" in out
+    # The flat file was migrated into the briefing tree, and the
+    # managed profile briefing was synced from the identity fields.
+    assert (memory / "briefing" / "facts.md").is_file()
+    assert not (memory / "facts.md").exists()
+    assert (memory / "briefing" / "profile.md").is_file()
+    # notes/ content never lands in the artifact.
+    (memory / "notes" / "scratch.md").write_text(
+        "note-only detail", encoding="utf-8",
+    )
+    out2 = rebuild_agent_claude_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        claude_user_dir=claude_user,
+        gemini_user_dir=gemini_user,
+        agent_id="tester-0001",
+        display_name="Tester",
+    )
+    assert "note-only detail" not in out2
     # Written to both user-level dirs.
-    assert (claude_user / "CLAUDE.md").read_text(encoding="utf-8") == out
-    assert (gemini_user / "GEMINI.md").read_text(encoding="utf-8") == out
+    assert (claude_user / "CLAUDE.md").read_text(encoding="utf-8") == out2
+    assert (gemini_user / "GEMINI.md").read_text(encoding="utf-8") == out2
 
 
 # ── codex variants strip mcp__puffo__ prefix ───────────────────────

@@ -32,6 +32,7 @@ from .host_tools import (
     _uninstall_skill,
     _write_refresh_model_flag,
 )
+from .memory_tools import MemoryToolsConfig, register_memory_tools
 from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,18 @@ def _register_local_tools(
         return "\n".join(lines)
 
 
+class _BridgeNoKeysStore(KeyStore):
+    """Bridge transport (T23): the agent holds no local keys. Tools
+    that still hit a signed path get a clear error instead of a
+    FileNotFoundError, until phase 2 rewires them keyless."""
+
+    def load_identity(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+    def load_session(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+
 def build_server(
     slug: str,
     device_id: str,
@@ -232,9 +245,21 @@ def build_server(
     data_service_url: str,
     runtime_kind: str = "",
     harness: str = "",
+    memory_dir: str = "",
+    transport: str = "",
 ) -> FastMCP:
-    ks = KeyStore(keystore_dir)
-    http = PuffoCoreHttpClient(server_url, ks, slug)
+    ks = (
+        _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
+        else KeyStore(keystore_dir)
+    )
+    # Keyless (T23 bridge) tools do all outbound work over the unsigned
+    # ``/v2/cloud-agents/*`` routes (egress-injected ``x-sandbox-token``),
+    # so the subprocess is self-sufficient with no local keystore. The
+    # ``_BridgeNoKeysStore`` guard above stays as a defensive dead-end for
+    # any residual signed call.
+    http = PuffoCoreHttpClient(
+        server_url, ks, slug, keyless=(transport == "bridge"),
+    )
     data = DataClient(data_service_url, agent_id)
 
     # None when PUFFO_RPC_URL is unset; tools surface a clear error
@@ -263,6 +288,17 @@ def build_server(
     )
     register_core_tools(mcp, core_cfg)
     _register_local_tools(mcp, workspace, runtime_kind, harness)
+
+    # Memory root: PUFFO_MEMORY_DIR when set; otherwise the default
+    # AgentConfig layout where memory/ and workspace/ are siblings
+    # under the agent dir. ``maintenance`` stays False here — the
+    # agent-facing server never gets recollection/ write scope.
+    if not memory_dir:
+        memory_dir = str(Path(workspace).parent / "memory")
+    mem_cfg = MemoryToolsConfig(
+        memory_root=memory_dir, workspace=workspace, maintenance=False,
+    )
+    register_memory_tools(mcp, mem_cfg)
     return mcp
 
 
@@ -295,6 +331,8 @@ def _cfg_from_env() -> dict[str, str]:
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
+        "memory_dir": os.environ.get("PUFFO_MEMORY_DIR", ""),
+        "transport": os.environ.get("PUFFO_CORE_TRANSPORT", ""),
     }
 
 

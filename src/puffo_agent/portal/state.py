@@ -941,6 +941,13 @@ class TriggerRules:
 DEFAULT_PUFFO_SERVER_URL = "https://chat.puffo.ai/relay"
 
 
+## Transports for the puffo-core backend (T23). ``native`` is today's
+## signed-crypto path; ``bridge`` is the experimental keyless WS bridge
+## (server holds all crypto, auth via sandbox_token). agent.yml only —
+## no UI knob while bridge is experimental.
+VALID_TRANSPORTS = ("native", "bridge")
+
+
 @dataclass
 class PuffoCoreConfig:
     """puffo-core signed API config — the agent's only chat backend."""
@@ -955,6 +962,13 @@ class PuffoCoreConfig:
     # Hidden knob (no UI, agent.yml only): when true, space invites from
     # non-operators are auto-accepted, then the operator is DM'd a report.
     auto_accept_space_invitations: bool = False
+    # One of VALID_TRANSPORTS. ``bridge`` (experimental) talks plaintext
+    # WS to ``server_url``'s /v2/cloud-agents/subscribe endpoint using
+    # ``sandbox_token`` instead of local key files. Absent from saved
+    # agent.yml unless set to bridge.
+    transport: str = "native"
+    # Bridge only — the keyless auth credential minted at provision time.
+    sandbox_token: str = ""
 
     def is_configured(self) -> bool:
         return bool(self.server_url and self.slug and self.device_id and self.space_id)
@@ -973,6 +987,14 @@ class RuntimeConfig:
     provider: str = ""            # empty = default for kind
     model: str = ""
     api_key: str = ""
+    # OpenAI/Anthropic-compatible base URL for the LLM plane. Set this
+    # to route model calls through a proxy — e.g. Shan's LiteLLM virtual
+    # key endpoint for cloud agents — instead of the vendor default.
+    # Consumed by chat-local (Anthropic + OpenAI providers), sdk-local
+    # and cli-local/claude-code (as ANTHROPIC_BASE_URL). Empty = vendor
+    # endpoint (today's behavior, byte-for-byte unchanged). The matching
+    # secret rides on ``api_key`` (the VK), so no new field is needed.
+    llm_base_url: str = ""
     # Tool allowlist patterns (sdk | cli-local | cli-docker). Each
     # entry is a bare tool name ("Read") or tool-name-plus-arg glob
     # ("Bash(git *)", "Read(**/*.py)"). Empty = no tools allowed.
@@ -1068,6 +1090,22 @@ class AgentConfig:
                 f"agent {agent_id!r}: invalid runtime config — {result.error}"
             )
 
+        # Transport validation (T23). Absent key ⇒ native ⇒ identical
+        # to pre-transport configs; bridge requires its credential pair.
+        transport = pc.get("transport", "native")
+        sandbox_token = pc.get("sandbox_token", "")
+        server_url = pc.get("server_url") or DEFAULT_PUFFO_SERVER_URL
+        if transport not in VALID_TRANSPORTS:
+            raise RuntimeError(
+                f"agent {agent_id!r}: invalid puffo_core.transport "
+                f"{transport!r} — valid transports: {list(VALID_TRANSPORTS)}"
+            )
+        if transport == "bridge" and not (sandbox_token and server_url):
+            raise RuntimeError(
+                f"agent {agent_id!r}: puffo_core.transport 'bridge' "
+                "requires both server_url and sandbox_token"
+            )
+
         return cls(
             id=raw.get("id", agent_id),
             state=raw.get("state", "running"),
@@ -1076,7 +1114,7 @@ class AgentConfig:
             role=raw.get("role", ""),
             role_short=raw.get("role_short", ""),
             puffo_core=PuffoCoreConfig(
-                server_url=pc.get("server_url") or DEFAULT_PUFFO_SERVER_URL,
+                server_url=server_url,
                 slug=pc.get("slug", ""),
                 device_id=pc.get("device_id", ""),
                 space_id=pc.get("space_id", ""),
@@ -1084,12 +1122,15 @@ class AgentConfig:
                 auto_accept_space_invitations=bool(
                     pc.get("auto_accept_space_invitations", False)
                 ),
+                transport=transport,
+                sandbox_token=sandbox_token,
             ),
             runtime=RuntimeConfig(
                 kind=kind,
                 provider=provider,
                 model=rt.get("model", ""),
                 api_key=rt.get("api_key", ""),
+                llm_base_url=rt.get("llm_base_url", ""),
                 allowed_tools=list(rt.get("allowed_tools") or []),
                 docker_image=rt.get("docker_image", ""),
                 docker_memory_limit=rt.get("docker_memory_limit", ""),
@@ -1114,6 +1155,12 @@ class AgentConfig:
     def save(self) -> None:
         path = agent_yml_path(self.id)
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Native agents (the default) keep a byte-identical agent.yml:
+        # the transport keys are only written for bridge agents.
+        pc_dict = asdict(self.puffo_core)
+        if self.puffo_core.transport == "native":
+            pc_dict.pop("transport", None)
+            pc_dict.pop("sandbox_token", None)
         data = {
             "id": self.id,
             "state": self.state,
@@ -1122,7 +1169,7 @@ class AgentConfig:
             "role": self.role,
             "role_short": self.role_short,
             "created_at": self.created_at,
-            "puffo_core": asdict(self.puffo_core),
+            "puffo_core": pc_dict,
             "runtime": asdict(self.runtime),
             "profile": self.profile,
             "memory_dir": self.memory_dir,
