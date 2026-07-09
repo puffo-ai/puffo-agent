@@ -120,6 +120,34 @@ async def mint_link_code(server_url: str, hostname: str) -> tuple[str, str]:
     return code, base
 
 
+def normalize_link_code(code: str) -> str:
+    """Codes are shown as ``ABCD-1234``; strip dashes/whitespace, uppercase."""
+    return code.strip().replace("-", "").upper()
+
+
+async def redeem_link_code(server_url: str, hostname: str, code: str) -> str:
+    """Register this machine (idempotent) and claim a USER-minted link code.
+    Returns the base URL; the operator's client then issues the control cert,
+    which ``await_link_approval`` picks up."""
+    machine = load_or_create_machine()
+    base = server_url.rstrip("/")
+    path = f"/v2/machines/links/{code}/redeem"
+    async with aiohttp.ClientSession() as session:
+        cert = machine_auth.machine_cert(machine, hostname)
+        async with session.post(f"{base}/v2/machines", json={"machine_cert": cert}) as resp:
+            if resp.status != 200:
+                raise LinkError(f"registration rejected ({resp.status}): {await resp.text()}")
+        headers = machine_auth.signed_headers(machine, "POST", path)
+        async with session.post(f"{base}{path}", headers=headers) as resp:
+            if resp.status == 404:
+                raise LinkError("unknown link code — check for typos")
+            if resp.status == 410:
+                raise LinkError("link code expired — generate a new one in the web app")
+            if resp.status != 200:
+                raise LinkError(f"could not redeem code ({resp.status}): {await resp.text()}")
+    return base
+
+
 async def await_link_approval(
     base: str, code: str, hostname: str, timeout: float = LINK_TIMEOUT_SECONDS
 ) -> tuple[str, str | None]:
@@ -250,28 +278,40 @@ async def migrate_owned_agents(operator_root_pubkey: str) -> int:
     return reported
 
 
-async def run_link(server_url: str, hostname: str, open_browser: bool = True) -> int:
-    """Register this machine, mint a link code, and wait for an operator to
-    approve it (CLI entry point). Auto-opens the link page in a browser unless
-    ``open_browser`` is False."""
-    try:
-        code, base = await mint_link_code(server_url, hostname)
-    except LinkError as exc:
-        print(f"link: {exc}")
-        return 1
-
-    web = _web_url_from_server(server_url)
-    link_url = f"{web}/link-machine?code={code}"
-    print(f"\n  Link code:  {code}\n")
-    print(f"  Open:  {link_url}")
-    print("  (the link opens the puffo web app with the code pre-filled —")
-    print(f"   or go to My Agents → Link machine and enter it to approve '{hostname}'.)\n")
-    if open_browser:
+async def run_link(
+    server_url: str, hostname: str, open_browser: bool = True, code: str | None = None
+) -> int:
+    """Link this machine to an operator (CLI entry point). Without ``code``:
+    mint a code and wait for the operator to approve it in the web app.
+    With ``code`` (user-minted in the web app): claim it and wait for the
+    operator's client to issue the control cert."""
+    if code:
+        code = normalize_link_code(code)
         try:
-            webbrowser.open(link_url)
-        except Exception as exc:  # noqa: BLE001 — best-effort; the URL is printed above
-            logger.debug("link: could not auto-open browser: %s", exc)
-    print("  Waiting for approval (Ctrl-C to cancel)...")
+            base = await redeem_link_code(server_url, hostname, code)
+        except LinkError as exc:
+            print(f"link: {exc}")
+            return 1
+        print(f"\n  Code accepted — finishing the link for '{hostname}'...")
+    else:
+        try:
+            code, base = await mint_link_code(server_url, hostname)
+        except LinkError as exc:
+            print(f"link: {exc}")
+            return 1
+
+        web = _web_url_from_server(server_url)
+        link_url = f"{web}/link-machine?code={code}"
+        print(f"\n  Link code:  {code}\n")
+        print(f"  Open:  {link_url}")
+        print("  (the link opens the puffo web app with the code pre-filled —")
+        print(f"   or go to My Agents → Link machine and enter it to approve '{hostname}'.)\n")
+        if open_browser:
+            try:
+                webbrowser.open(link_url)
+            except Exception as exc:  # noqa: BLE001 — best-effort; the URL is printed above
+                logger.debug("link: could not auto-open browser: %s", exc)
+        print("  Waiting for approval (Ctrl-C to cancel)...")
 
     try:
         status, operator_slug = await await_link_approval(base, code, hostname)

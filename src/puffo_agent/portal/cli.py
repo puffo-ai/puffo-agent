@@ -1222,7 +1222,9 @@ def cmd_link(args: argparse.Namespace) -> int:
     name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(run_link(server_url, name, open_browser=not args.not_open))
+        return asyncio.run(
+            run_link(server_url, name, open_browser=not args.not_open, code=args.code)
+        )
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
@@ -2017,6 +2019,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--not-open",
         action="store_true",
         help="Don't auto-open the link page in your browser.",
+    )
+    machine_link.add_argument(
+        "--code",
+        default=None,
+        help="Link code generated in the puffo web app (e.g. ABCD-1234); "
+        "this machine claims it instead of minting its own.",
     )
     machine_link.set_defaults(func=cmd_link)
 

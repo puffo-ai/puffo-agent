@@ -6,6 +6,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.8] — 2026-07-08
+
+### Added
+
+- **`puffo-agent machine link --code ABCD-1234`.** Claim a link code
+  the operator generated in the puffo web app (My Agents → Link
+  machine → *Generate code*) instead of minting one on this machine
+  and asking a browser to approve it. The machine registers itself
+  (idempotent) and POSTs `/v2/machines/links/<code>/redeem`; the
+  operator's client then issues the control cert, which the existing
+  approval poll picks up. Codes are case-insensitive and dashes are
+  optional — `abcd-2345`, `ABCD2345`, and `AB-CD-23-45` all normalize
+  to the same code. Without `--code` the mint-and-open-browser flow
+  is unchanged; the daemon still auto-starts. Requires puffo-server's
+  `/redeem` endpoint (paired server PR).
+
 ### Fixed
 
 - **Pre-turn stdout drain — no more cron chatter leaking into replies.**
