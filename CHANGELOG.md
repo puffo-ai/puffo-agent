@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.8a1] — 2026-07-08
+
 ### Added
 
 - **`puffo-agent machine link --code ABCD-1234`.** Claim a link code
