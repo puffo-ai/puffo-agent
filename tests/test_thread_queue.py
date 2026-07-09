@@ -101,6 +101,30 @@ def test_compute_priority_bands():
     assert _compute_priority(direct=False, sender_is_bot=True) == PRIORITY_BOT
 
 
+def test_priority_for_derives_agent_band_from_owner_slug():
+    """owner_slug presence (agent-only field) drops the sender into
+    the bot bands; humans (empty owner_slug) keep the human bands."""
+    from puffo_agent.agent.puffo_core_client import _priority_for
+
+    assert _priority_for(direct=True, sender_owner_slug="") == PRIORITY_MENTIONED_HUMAN
+    assert _priority_for(direct=True, sender_owner_slug="op-9999") == PRIORITY_MENTIONED_BOT
+    assert _priority_for(direct=False, sender_owner_slug="") == PRIORITY_HUMAN
+    assert _priority_for(direct=False, sender_owner_slug="op-9999") == PRIORITY_BOT
+
+
+def test_handle_envelope_admits_with_owner_slug_priority():
+    """handle_envelope is a closure inside listen(); pin its admit-time
+    priority derivation at the source level so a revert to the old
+    hardcoded sender_is_bot=False can't slip past the unit tests."""
+    import inspect
+
+    from puffo_agent.agent import puffo_core_client as pcc
+
+    src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
+    assert "priority = _priority_for(direct, sender_owner_slug)" in src
+    assert 'sender_is_bot = False  # puffo-core has no is_bot flag yet' not in src
+
+
 # ─── MessageStore: thread-batch helpers ───────────────────────────
 
 

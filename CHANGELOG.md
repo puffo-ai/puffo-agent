@@ -24,9 +24,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `human` — the upstream is-bot flag is unset pending a server-side
   signal, but `owner_slug`'s presence is already a reliable agent
   marker); the display value is renamed `bot` → `agent` to match the
-  `(agent)` mention suffix. Priority banding is unchanged.
+  `(agent)` mention suffix.
 
 ### Changed
+
+- **Priority bands now receive the real is-agent signal.** The
+  message-queue priority computation had `sender_is_bot` hardcoded
+  `False` (puffo-core exposes no is-bot flag), so every sender landed
+  in the human bands and the agent bands were dead code. `owner_slug`
+  (agent-only, already fetched per sender) now drives the banding:
+  human traffic outranks agent traffic, mentions outrank both floors.
+  Behavior change in agent-dense fleets — an agent's DM/mention ranks
+  below a human's, and agent channel chatter yields to human channel
+  messages when both are queued.
 
 - **Dead `followup_messages_since` removed from the primer + code.**
   No code path has emitted the field since thread batching replaced

@@ -227,6 +227,13 @@ def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
     return PRIORITY_BOT
 
 
+def _priority_for(direct: bool, sender_owner_slug: str) -> int:
+    """``owner_slug`` is agent-only, so its presence is the is-agent
+    signal the bands were designed around: human traffic outranks
+    agent traffic, mentions outrank both floors."""
+    return _compute_priority(direct, sender_is_bot=bool(sender_owner_slug))
+
+
 # Hard cap on the preview length embedded in the redaction
 # placeholder. Big enough to convey the message's flavour to the
 # agent (so it knows whether to bother fetching segments) but
@@ -815,10 +822,6 @@ class PuffoCoreMessageClient:
             else:
                 channel_name = channel_id
 
-            direct = is_dm or is_mention
-            sender_is_bot = False  # puffo-core has no is_bot flag yet
-            priority = _compute_priority(direct, sender_is_bot)
-
             # Thread-batched queue: every message coalesces under
             # its ``root_id`` (the envelope's ``thread_root_id``, or
             # the message itself when it's a top-level post). The
@@ -862,6 +865,10 @@ class PuffoCoreMessageClient:
                 self.operator_slug
                 and payload.sender_slug == self.operator_slug
             )
+
+            direct = is_dm or is_mention
+            sender_is_bot = bool(sender_owner_slug)
+            priority = _priority_for(direct, sender_owner_slug)
 
             # Long-message redaction. Operators paste big chunks of
             # code or transcripts that, combined with the agent's
