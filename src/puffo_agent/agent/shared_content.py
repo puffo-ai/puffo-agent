@@ -658,7 +658,8 @@ into your own agent.
   touch them. If writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`,
   the operator must reconnect the connector in interactive codex
   (approving write scopes), then you run `refresh(host_sync=True)`
-  and allow one worker turn for the token transition.
+  (cli-docker: add `session=True`) and allow one worker turn for the
+  token transition.
 
 ## Workflow
 
