@@ -8,15 +8,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Runbook for Codex Apps connector scope failures.** Operator-facing
-  docs (the `use-host-mcp` skill body + `SETUP_FOR_AI.md` troubleshooting
-  table) now explain that Codex Apps connectors (`mcp__codex_apps__*` —
-  Drive, Gmail, …) are codex-internal, not puffo-managed MCP, so
+- **Runbook for Codex Apps connector scope failures.** The `use-host-mcp`
+  skill body now explains that Codex Apps connectors (`mcp__codex_apps__*`
+  — Drive, Gmail, …) are codex-internal, not puffo-managed MCP, so
   `list_mcp_servers` can't see them and `sync_host_mcp` can't fix them.
   When writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, the fix is to
   reconnect the connector in interactive codex (approving write scopes),
   then `refresh(host_sync=True)` on the agent (`session=True` too on
   cli-docker) and allow one worker turn. Docs only — no code path change.
+
+### Removed
+
+- **`SETUP_FOR_AI.md`.** The standalone AI-assistant onboarding guide was
+  last meaningfully updated at 0.9.4, had drifted from the current setup
+  flow, was referenced by nothing, and was never packaged. The living
+  onboarding pointer is the hosted `https://chat.puffo.ai/setup.md` plus
+  the in-agent skills.
 
 ## [1.1.0] — 2026-07-08
 
