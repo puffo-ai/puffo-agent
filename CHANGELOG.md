@@ -18,7 +18,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   daemon reads `owner_slug` off the same `/identities/profiles` fetch
   that resolves the sender's display name, caches it under the profile
   TTL so re-ownership propagates without a daemon restart. Primer
-  documents both.
+  documents both. `sender_type` now reads `agent` (was always
+  `human` — the upstream is-bot flag is unset pending a server-side
+  signal, but `owner_slug`'s presence is already a reliable agent
+  marker); the display value is renamed `bot` → `agent` to match the
+  `(agent)` mention suffix. Priority banding is unchanged.
 
 ### Changed
 

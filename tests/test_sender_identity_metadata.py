@@ -29,6 +29,9 @@ def test_agent_sender_gets_owner_slug():
     block = _block(sender="nova-agent-1234", sender_owner_slug="nova-op-9999")
     assert "- sender_owner_slug: nova-op-9999" in block
     assert "- is_from_operator:" not in block
+    # owner_slug is agent-only, so it flips the displayed type even
+    # while the upstream sender_is_bot flag is still hardcoded False.
+    assert "- sender_type: agent" in block
 
 
 def test_message_from_own_operator_is_flagged():
@@ -36,12 +39,14 @@ def test_message_from_own_operator_is_flagged():
     assert "- is_from_operator: true" in block
     # A human operator has no owner_slug of their own.
     assert "- sender_owner_slug:" not in block
+    assert "- sender_type: human" in block
 
 
 def test_human_non_operator_gets_neither_field():
     block = _block(sender="random-human-0001")
     assert "- sender_owner_slug:" not in block
     assert "- is_from_operator:" not in block
+    assert "- sender_type: human" in block
 
 
 def test_agent_owned_by_current_operator_gets_both():

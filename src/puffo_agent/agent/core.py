@@ -486,7 +486,11 @@ class PuffoAgent:
         display = sender_display_name or sender
         lines.append(f"- sender: {display}")
         lines.append(f"- sender_slug: {sender}")
-        lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
+        # ``owner_slug`` exists only for agents, so it doubles as the
+        # agent signal here. Display-only — priority banding still
+        # runs on the upstream ``sender_is_bot`` flag.
+        sender_type = "agent" if (sender_is_bot or sender_owner_slug) else "human"
+        lines.append(f"- sender_type: {sender_type}")
         # ``sender_owner_slug`` fires only for agent senders (their
         # operator); ``is_from_operator`` only when the sender IS the
         # agent's own operator. Emit conditionally so older agents
