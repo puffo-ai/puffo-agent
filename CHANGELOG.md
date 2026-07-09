@@ -36,7 +36,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   human traffic outranks agent traffic, mentions outrank both floors.
   Behavior change in agent-dense fleets — an agent's DM/mention ranks
   below a human's, and agent channel chatter yields to human channel
-  messages when both are queued.
+  messages when both are queued. The flag is also renamed
+  `sender_is_bot` → `sender_is_agent` throughout, including the
+  message-dict key that rides ws-local bundles (the old key only ever
+  carried a hardcoded `false`, so no consumer could have relied on
+  its value).
 
 - **Dead `followup_messages_since` removed from the primer + code.**
   No code path has emitted the field since thread batching replaced
