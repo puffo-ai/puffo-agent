@@ -1088,3 +1088,18 @@ async def test_greedy_fill_noop_when_batch_fits(monkeypatch):
     assert client._thread_state["env_root"].messages == []
     assert await store.get_last_processed_sent_at("env_root") == 102
     await store.close()
+
+
+def test_greedy_fit_prefix_harness_budget_drives_split():
+    """Per-harness budget: the SAME batch that a Claude Code client
+    (180KB) splits fits in a single dispatch under a Codex-scale budget
+    (the worker's 4MB safety-net ceiling). Proves ``max_input_bytes`` —
+    not the message set — decides the split boundary."""
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    msgs = [_sized_msg(f"e{i}", 60_000, 100 + i) for i in range(5)]  # ~62KB each
+
+    client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES  # 180KB (Claude Code)
+    assert client._greedy_fit_prefix(msgs) == 2  # 2 blocks fit, 3rd overflows
+
+    client._max_input_bytes = 4_000_000  # Codex safety-net ceiling
+    assert client._greedy_fit_prefix(msgs) == 5  # whole batch fits, no split
