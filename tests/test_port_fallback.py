@@ -179,7 +179,10 @@ async def test_data_service_mutates_cfg_port_on_fallback(caplog):
         with caplog.at_level(logging.INFO, logger="puffo_agent.portal.data_service"):
             runner = await ds.start_data_service(cfg)
         assert runner is not None
-        assert cfg.port == requested + 1
+        # Usually requested+1, but a busy CI host can occupy that too —
+        # the contract is "mutated to the actually-bound port in the
+        # fallback window", not a specific offset.
+        assert requested < cfg.port <= requested + 99
         assert any(
             "fell back to" in rec.message
             for rec in caplog.records
@@ -239,7 +242,10 @@ async def test_rpc_service_mutates_cfg_port_on_fallback(caplog):
         with caplog.at_level(logging.INFO, logger="puffo_agent.portal.rpc_service"):
             runner = await rs.start_rpc_service(cfg)
         assert runner is not None
-        assert cfg.port == requested + 1
+        # Usually requested+1, but a busy CI host can occupy that too —
+        # the contract is "mutated to the actually-bound port in the
+        # fallback window", not a specific offset.
+        assert requested < cfg.port <= requested + 99
         assert any(
             "fell back to" in rec.message
             for rec in caplog.records
