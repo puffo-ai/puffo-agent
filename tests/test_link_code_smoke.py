@@ -39,17 +39,23 @@ def _home():
 
 
 def _make_app(state: dict) -> web.Application:
-    """Minimal server: registers the machine, records the claimed
-    machine_id on redeem, and flips the poll to 'approved' after one
-    request (so the poll loop exercises pending→approved)."""
+    """Minimal server: registers the machine, mints a code (mint path),
+    records the claimed machine_id (redeem path), and flips the poll
+    to 'approved' after one request so the loop exercises
+    pending→approved."""
 
     async def register(request):
         body = await request.json()
         state["registered"] = body["machine_cert"]["machine_id"]
         return web.json_response({"machine_id": state["registered"]})
 
+    async def mint(request):
+        assert request.headers.get("x-puffo-machine-id")
+        assert request.headers.get("x-puffo-signature")
+        state["minted_by"] = request.headers["x-puffo-machine-id"]
+        return web.json_response({"code": "SRVR1234"})
+
     async def redeem(request):
-        # Machine-auth headers are present + signed by the real client.
         assert request.headers.get("x-puffo-machine-id")
         assert request.headers.get("x-puffo-signature")
         state["claimed_by"] = request.headers["x-puffo-machine-id"]
@@ -69,6 +75,7 @@ def _make_app(state: dict) -> web.Application:
 
     app = web.Application()
     app.router.add_post("/v2/machines", register)
+    app.router.add_post("/v2/machines/links", mint)
     app.router.add_post("/v2/machines/links/{code}/redeem", redeem)
     app.router.add_get("/v2/machines/links/{code}", poll)
     return app
@@ -103,6 +110,44 @@ async def test_smoke_run_link_code_end_to_end(monkeypatch):
     assert state["polls"] >= 2
 
     # The pairing landed on disk with the approved operator.
+    from puffo_agent.portal.control.store import load_pairings
+
+    pairings = load_pairings()
+    assert "op-0001" in pairings
+
+
+@pytest.mark.asyncio
+async def test_smoke_run_link_mint_path_end_to_end(monkeypatch):
+    """Symmetric smoke for the original mint path (no ``--code``): drives
+    ``run_link`` end-to-end against a fake server that mints the code
+    and then approves on the second poll. Guards the refactored mint
+    branch inside ``if code: ... else: ...``."""
+    state: dict = {}
+    server = TestServer(_make_app(state))
+    await server.start_server()
+    try:
+        base = str(server.make_url("")).rstrip("/")
+
+        monkeypatch.setattr(link_mod.asyncio, "sleep", lambda _s: _REAL_SLEEP(0))
+        monkeypatch.setattr(link_mod, "verify_control_cert", lambda *a: "op_root_pk")
+        monkeypatch.setattr(link_mod.webbrowser, "open", lambda _url: None)
+
+        async def _noop_migrate(_root):
+            return 0
+
+        monkeypatch.setattr(link_mod, "migrate_owned_agents", _noop_migrate)
+
+        rc = await run_link(base, "SmokeBox", open_browser=False, code=None)
+        assert rc == 0
+    finally:
+        await server.close()
+
+    # Server actually minted the code for this machine, then approved on poll 2.
+    assert state["registered"].startswith("mac_")
+    assert state["minted_by"] == state["registered"]
+    assert "claimed_by" not in state  # mint path never touches /redeem
+    assert state["polls"] >= 2
+
     from puffo_agent.portal.control.store import load_pairings
 
     pairings = load_pairings()
