@@ -511,7 +511,7 @@ class PuffoAgent:
                 if m.get("is_self"):
                     suffix = " (you)"
                 else:
-                    kind = "agent" if m.get("is_bot") else "human"
+                    kind = "agent" if m.get("is_agent") else "human"
                     suffix = f" ({kind})"
                 lines.append(f"  - {m['username']}{suffix}")
         if attachments:

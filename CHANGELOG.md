@@ -40,7 +40,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `sender_is_bot` → `sender_is_agent` throughout, including the
   message-dict key that rides ws-local bundles (the old key only ever
   carried a hardcoded `false`, so no consumer could have relied on
-  its value).
+  its value). Mention entries follow suit: `is_bot` → `is_agent`
+  (same bundle surface; the rendered `(agent)` / `(human)` suffixes
+  are unchanged).
 
 - **Dead `followup_messages_since` removed from the primer + code.**
   No code path has emitted the field since thread batching replaced
