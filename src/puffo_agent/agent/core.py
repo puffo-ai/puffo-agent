@@ -156,20 +156,21 @@ class PuffoAgent:
         batch and rides on ``channel_meta`` (channel_id,
         channel_name, space_id, space_name).
 
-        The agent sees every message in order as separate ``user``
-        turns in the shell log so the LLM can reason about who said
-        what and decide on its own how many replies to issue. The
-        ``followups`` field on the old single-message path is gone —
-        every message is a real user turn now.
+        The whole batch is appended as ONE ``user`` log entry (blocks
+        joined with a blank line, same shape as the api-error-retry
+        fallback). CLI adapters transmit only ``ctx.messages[-1]`` per
+        turn — the resume-based session already holds the earlier
+        history — so per-message entries would silently drop all but
+        the last message of the batch.
         """
         if not batch:
             return None
-        for msg in batch:
-            self._append_user(
-                channel_meta.get("channel_name", ""),
-                msg.get("sender_slug", ""),
-                msg.get("sender_email", ""),
-                msg.get("text", ""),
+        blocks = [
+            self._format_user_block(
+                channel_name=channel_meta.get("channel_name", ""),
+                sender=msg.get("sender_slug", ""),
+                sender_email=msg.get("sender_email", ""),
+                text=msg.get("text", ""),
                 channel_id=channel_meta.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
@@ -183,6 +184,10 @@ class PuffoAgent:
                 sender_display_name=msg.get("sender_display_name", ""),
                 is_visible_to_human=msg.get("is_visible_to_human", True),
             )
+            for msg in batch
+        ]
+        self.log.append({"role": "user", "content": "\n\n".join(blocks)})
+        self._truncate_log()
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
         # agent itself decides who to reply to.
