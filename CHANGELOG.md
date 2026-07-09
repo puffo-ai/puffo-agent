@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Runbook for Codex Apps connector scope failures.** Operator-facing
+  docs (the `use-host-mcp` skill body + `SETUP_FOR_AI.md` troubleshooting
+  table) now explain that Codex Apps connectors (`mcp__codex_apps__*` —
+  Drive, Gmail, …) are codex-internal, not puffo-managed MCP, so
+  `list_mcp_servers` can't see them and `sync_host_mcp` can't fix them.
+  When writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, the fix is to
+  reconnect the connector in interactive codex (approving write scopes),
+  then `refresh(host_sync=True)` on the agent (`session=True` too on
+  cli-docker) and allow one worker turn. Docs only — no code path change.
+
 ## [1.1.0] — 2026-07-08
 
 ### Added
