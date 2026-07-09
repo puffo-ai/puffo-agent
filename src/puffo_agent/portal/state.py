@@ -429,7 +429,18 @@ def sync_host_gemini_skills(host_home: Path, project_dir: Path) -> int:
 
 # Path prefixes that won't resolve inside the runtime container.
 # ``/home/agent/`` is handled separately because it IS valid inside.
-_HOST_LOCAL_COMMAND_PREFIXES = ("/Users/", "/tmp/", "/var/folders/")
+# The macOS entries (/opt/homebrew, /opt/local, /Volumes, /private) cover
+# Homebrew (Apple-silicon + Intel), MacPorts, external/mounted volumes, and
+# the /private symlink target of /tmp + /var — all host-only (PUF-34).
+_HOST_LOCAL_COMMAND_PREFIXES = (
+    "/Users/",
+    "/tmp/",
+    "/var/folders/",
+    "/opt/homebrew/",
+    "/opt/local/",
+    "/Volumes/",
+    "/private/",
+)
 
 
 def _looks_host_local_command(command: str) -> bool:
@@ -444,6 +455,22 @@ def _looks_host_local_command(command: str) -> bool:
     if command.startswith("/home/") and not command.startswith("/home/agent/"):
         return True
     return any(command.startswith(p) for p in _HOST_LOCAL_COMMAND_PREFIXES)
+
+
+def _host_local_token(cfg: dict) -> str | None:
+    """PUF-34: first token in an MCP server cfg that points at a host-only
+    path, or ``None`` when everything resolves inside the container. Scans
+    ``args`` as well as ``command`` — a bare ``npx`` / ``uvx`` command often
+    hides the host path in an argument (e.g. ``uvx /Volumes/tools/mcp``)."""
+    if not isinstance(cfg, dict):
+        return None
+    cmd = cfg.get("command") or ""
+    if isinstance(cmd, str) and _looks_host_local_command(cmd):
+        return cmd
+    for arg in cfg.get("args") or []:
+        if isinstance(arg, str) and _looks_host_local_command(arg):
+            return arg
+    return None
 
 
 def sync_host_mcp_servers(
@@ -480,12 +507,17 @@ def sync_host_mcp_servers(
 
     agent_servers = dict(agent_data.get("mcpServers") or {})
     unreachable: list[tuple[str, str]] = []
+    merged = 0
     for name, cfg in host_servers.items():
+        token = _host_local_token(cfg)
+        if token is not None:
+            # PUF-34: a host-only path won't resolve in the container — skip
+            # it rather than inject a dead server config that fails silently.
+            # The caller logs an actionable warning off ``unreachable``.
+            unreachable.append((name, token))
+            continue
         agent_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
+        merged += 1
     agent_data["mcpServers"] = agent_servers
 
     try:
@@ -495,7 +527,7 @@ def sync_host_mcp_servers(
         os.replace(tmp, agent_path)
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return merged, unreachable
 
 
 def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
@@ -660,12 +692,15 @@ def sync_host_gemini_mcp_servers(
 
     merged_servers = dict(agent_data.get("mcpServers") or {})
     unreachable: list[tuple[str, str]] = []
+    merged = 0
     for name, cfg in host_servers.items():
+        token = _host_local_token(cfg)
+        if token is not None:
+            # PUF-34: skip a host-only server rather than inject dead config.
+            unreachable.append((name, token))
+            continue
         merged_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
+        merged += 1
 
     if extra_servers:
         for name, cfg in extra_servers.items():
@@ -680,7 +715,7 @@ def sync_host_gemini_mcp_servers(
         os.replace(tmp, agent_path)
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return merged, unreachable
 
 
 def daemon_yml_path() -> Path:

@@ -856,10 +856,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in unreachable:
                 logger.warning(
-                    "agent %s: host MCP %r command %r looks host-local and "
-                    "won't resolve inside the container. Install the "
-                    "binary in the image or bind-mount it explicitly, "
-                    "otherwise this MCP will fail on first use.",
+                    "agent %s: host MCP %r has host-local path %r that won't "
+                    "resolve inside the container — SKIPPED (not injected). "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
             # Plugins: the actual plugin tree is bind-mounted read-
@@ -913,10 +913,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in gemini_unreachable:
                 logger.warning(
-                    "agent %s: host gemini MCP %r command %r looks "
-                    "host-local and won't resolve inside the container. "
-                    "Install the binary in the image or bind-mount it, "
-                    "otherwise the MCP will fail on first use.",
+                    "agent %s: host gemini MCP %r has host-local path %r "
+                    "that won't resolve inside the container — SKIPPED. "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
 
