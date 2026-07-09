@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-08
+
 ### Added
 
 - **Sender-identity metadata on inbound messages.** Two new fields land
