@@ -69,3 +69,16 @@ def test_fields_sit_between_sender_type_and_visibility():
     ow = next(i for i, ln in enumerate(lines) if ln.startswith("- sender_owner_slug:"))
     vis = next(i for i, ln in enumerate(lines) if ln.startswith("- is_visible_to_human:"))
     assert st < ow < vis
+
+
+def test_mention_suffixes_render_from_is_agent():
+    """Mention entries carry ``is_agent`` (renamed from ``is_bot``);
+    the block renders (you) / (agent) / (human) suffixes from it."""
+    block = _block(mentions=[
+        {"username": "me-0001", "is_agent": True, "is_self": True},
+        {"username": "nova-bot-1234", "is_agent": True, "is_self": False},
+        {"username": "alice-1234", "is_agent": False, "is_self": False},
+    ])
+    assert "  - me-0001 (you)" in block
+    assert "  - nova-bot-1234 (agent)" in block
+    assert "  - alice-1234 (human)" in block

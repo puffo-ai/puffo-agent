@@ -786,12 +786,12 @@ class PuffoCoreMessageClient:
             mentions: list[dict] = []
             for slug in parsed:
                 if slug == self_slug_lower:
-                    mentions.append({"username": self.slug, "is_bot": True, "is_self": True})
+                    mentions.append({"username": self.slug, "is_agent": True, "is_self": True})
                     continue
                 if space_members and slug not in space_members:
                     continue
-                is_bot = space_members.get(slug) == "agent"
-                mentions.append({"username": slug, "is_bot": is_bot, "is_self": False})
+                is_agent = space_members.get(slug) == "agent"
+                mentions.append({"username": slug, "is_agent": is_agent, "is_self": False})
 
             # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
             # (the documented "addressed to you" signal).
