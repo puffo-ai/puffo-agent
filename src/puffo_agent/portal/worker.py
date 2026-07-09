@@ -1600,7 +1600,9 @@ async def _process_refresh_flags(
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
-    Order: host sync → CLAUDE.md rebuild → session drop."""
+    Order: host sync → CLAUDE.md rebuild → session drop. A CLAUDE.md
+    rebuild forces the session drop too (PUF-36) so the new prompt
+    actually applies instead of being shadowed by a ``--resume`` replay."""
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()
@@ -1648,9 +1650,14 @@ async def _process_refresh_flags(
             )
 
     try:
+        # PUF-36: a rebuilt system prompt (agent_seen) can't take effect while
+        # the adapter resumes an existing CLI session — Claude Code bakes the
+        # system prompt at session creation and ``--resume`` replays the old
+        # one, so profile edits appear silently ignored. Force a fresh session
+        # whenever the prompt was rebuilt, not only on an explicit --session.
         await adapter.reload(
             new_prompt if new_prompt is not None else puffo.system_prompt,
-            with_session=session_seen,
+            with_session=session_seen or agent_seen,
         )
     except Exception as exc:
         logger.warning(
