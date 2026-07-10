@@ -201,6 +201,14 @@ class Daemon:
     def request_stop(self) -> None:
         self._stop.set()
 
+    def notify_refresh_all(self) -> None:
+        """Wake every worker's proactive refresh watcher. Each watcher
+        then consumes whatever refresh flags exist on disk — no flags are
+        written here, so consume-once is preserved. Fired by the SIGHUP
+        handler for sub-poll reload latency."""
+        for worker in self.workers.values():
+            worker.notify_refresh()
+
     def _load_agent_cfg_cached(self, agent_id: str) -> "AgentConfig":
         """Reuses a cached parse when (mtime_ns, size) is unchanged.
         Same exceptions as ``AgentConfig.load`` on parse failure."""
@@ -942,6 +950,30 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
+def _install_posix_sighup_handler(loop, handle_sighup) -> bool:
+    """Install a SIGHUP handler that wakes every worker's proactive
+    refresh watcher (which then consumes whatever refresh flags exist).
+    Returns whether it did. Safe no-op — returns ``False`` without
+    raising — off the main thread (where ``add_signal_handler`` →
+    ``set_wakeup_fd`` raises), on platforms with no ``SIGHUP`` (Windows),
+    and where the loop doesn't support ``add_signal_handler``. Adds no
+    new trigger surface: SIGHUP only wakes watchers, it writes no flags,
+    so consume-once is preserved.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    sig = getattr(signal, "SIGHUP", None)
+    if sig is None:
+        # No SIGHUP on this platform (Windows).
+        return False
+    try:
+        loop.add_signal_handler(sig, handle_sighup)
+        return True
+    except NotImplementedError:
+        # Loop doesn't support add_signal_handler (e.g. Windows proactor).
+        return False
+
+
 async def run_daemon(with_local_bridge: bool = False) -> int:
     # Single-daemon enforcement. ``start`` against an already-running
     # daemon exits 0 (the user wanted a running daemon; one exists) —
@@ -976,6 +1008,16 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
         daemon.request_stop()
 
     posix_handlers_installed = _install_posix_stop_handlers(loop, handle_signal)
+
+    # SIGHUP → proactive profile reload: wake every worker's refresh
+    # watcher so a between-turns profile.md / host-sync / session edit
+    # applies immediately (sub-poll latency) instead of on the next
+    # idle tick. Safe no-op where SIGHUP is unavailable.
+    def handle_sighup() -> None:
+        logger.info("received SIGHUP; waking worker refresh watchers")
+        daemon.notify_refresh_all()
+
+    _install_posix_sighup_handler(loop, handle_sighup)
 
     # Windows fallback: synchronous C-runtime Ctrl+C handler dispatched
     # back onto the loop via call_soon_threadsafe. Without this the
