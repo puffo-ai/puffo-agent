@@ -6,7 +6,28 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Over-limit message bursts no longer drop the whole batch (PUF-363).**
+  When a thread's queued messages would, concatenated into the single
+  per-turn input block, exceed the harness input-byte budget (Claude
+  Code's 180KB pre-send cap), the consumer now dispatches the largest
+  FIFO prefix that fits and defers the remainder to following turns —
+  split only at message boundaries, nothing dropped, nothing reordered.
+  Previously the adapter rejected the whole over-limit batch with a
+  "reduce or split" reply and every message in it went unprocessed.
+  Codex gets a 4MB safety-net ceiling (it has no adapter input cap).
+
 ### Changed
+
+- **Long-message redaction thresholds raised to 16000/8000 chars**
+  (inline cap / `get_post_segment` page size, from 4000/2000). Per-turn
+  totals are now bounded by greedy-fill batching, so the inline cap only
+  guards session-lifetime context growth — typical code/log pastes
+  inline whole instead of collapsing to a preview placeholder. Both
+  limits now live in one shared `puffo_agent.limits` module, and the
+  redaction placeholder cites `segment_size` explicitly so paging stays
+  aligned on hosts that override the daemon page size.
 
 - **Runbook for Codex Apps connector scope failures.** The `use-host-mcp`
   skill body now explains that Codex Apps connectors (`mcp__codex_apps__*`
