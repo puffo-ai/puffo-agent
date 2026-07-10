@@ -384,8 +384,7 @@ def _build_puffo_core_client(
     else:
         model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
 
-    # Claude Code hard-rejects a single user block over ~180KB pre-send;
-    # Codex has no input cap, so its ceiling is only a runaway safety net.
+    # Codex has no adapter input cap; its ceiling is a runaway safety net.
     max_input_bytes = 4_000_000 if is_codex else DEFAULT_MAX_INPUT_BYTES
 
     return PuffoCoreMessageClient(

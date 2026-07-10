@@ -62,7 +62,6 @@ def _make_client_for_queue(store: MessageStore) -> PuffoCoreMessageClient:
     client._queue = asyncio.PriorityQueue()
     client._queue_seq = 0
     client._thread_state = {}
-    # Budget large by default so small-batch tests never trigger a split.
     client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES
     client._log = logging.getLogger("puffo-core-client-test")
     return client

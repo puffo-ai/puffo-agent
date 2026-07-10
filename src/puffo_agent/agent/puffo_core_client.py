@@ -65,17 +65,11 @@ PRIORITY_SYSTEM = 5
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
-# Per-turn input-block byte budget for greedy-fill batching. Mirrors the
-# Claude Code pre-send cap in ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``
-# — a test asserts the two stay in sync. Codex has no such cap; the worker
-# passes it a far larger ceiling.
+# Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
 DEFAULT_MAX_INPUT_BYTES = 180 * 1000
 
-# Conservative per-message overhead for the ``_format_user_block`` metadata
-# header (channel/space/sender/slugs/timestamp/… lines). The greedy-fill
-# byte estimate adds this to the raw text so it OVER-counts the real block
-# — over-counting only defers a message one turn early, it never overflows
-# the cap.
+# Deliberately over-counts the ``_format_user_block`` metadata header so a
+# near-boundary split lands one turn early, never over the cap.
 _BLOCK_METADATA_OVERHEAD_BYTES = 2048
 
 
@@ -1258,11 +1252,8 @@ class PuffoCoreMessageClient:
             )
 
     def _message_block_bytes(self, msg: dict) -> int:
-        """Conservative UTF-8 byte estimate of one message's formatted
-        ``_format_user_block``. Over-counts (fixed metadata overhead plus
-        per-item slack for attachments/mentions) so the greedy-fill never
-        under-estimates and lets an over-cap block through to the adapter.
-        """
+        """Conservative byte estimate of one formatted block — over-counts
+        so greedy-fill never lets an over-cap block through."""
         n = len((msg.get("text") or "").encode("utf-8"))
         for att in (msg.get("attachments") or []):
             n += len(str(att).encode("utf-8")) + 16
@@ -1271,12 +1262,9 @@ class PuffoCoreMessageClient:
         return n + _BLOCK_METADATA_OVERHEAD_BYTES
 
     def _greedy_fit_prefix(self, messages: list[dict]) -> int:
-        """Largest prefix length K such that the concatenated
-        blocks of ``messages[:K]`` fit ``_max_input_bytes``. Always >= 1
-        so a single over-budget message still dispatches alone (the
-        adapter's own pre-send cap is the backstop) rather than stalling
-        the thread forever.
-        """
+        """Largest K where ``messages[:K]`` fits ``_max_input_bytes``.
+        Always >= 1 — a lone over-budget message dispatches alone (the
+        adapter cap is the backstop) instead of stalling the thread."""
         budget = self._max_input_bytes
         total = 0
         for i, msg in enumerate(messages):
@@ -1330,14 +1318,9 @@ class PuffoCoreMessageClient:
             all_msgs = entry.messages
             channel_meta = entry.channel_meta
 
-            # Safety net: paranoid in-batch dedup before the greedy-fill
-            # split, so byte accounting + the split boundary act on the
-            # real, deduplicated set. ``_admit_thread_message``'s in-queue
-            # dedup plus ``dispatching_ids`` should already guarantee
-            # ``all_msgs`` is duplicate-free, but if some upstream race we
-            # haven't characterised slips a duplicate past both, we must
-            # NOT hand the same envelope to the agent twice. The warning
-            # log lets us spot the offending path if it ever fires.
+            # Paranoid in-batch dedup (before the split, so byte accounting
+            # sees the real set). Admit-time dedup should make this a no-op;
+            # the warning exposes any upstream race that slips one through.
             seen_ids: set[str] = set()
             deduped: list[dict] = []
             dropped: list[str] = []
@@ -1356,8 +1339,8 @@ class PuffoCoreMessageClient:
                     len(dropped), root_id, dropped,
                 )
 
-            # Greedy-fill: dispatch only the FIFO prefix whose concatenated
-            # block fits the input-byte budget; the remainder stays queued.
+            # Greedy-fill: dispatch the FIFO prefix that fits the byte
+            # budget; the remainder stays queued.
             split = self._greedy_fit_prefix(deduped)
             batch = deduped[:split]
             deferred = deduped[split:]
@@ -1365,11 +1348,9 @@ class PuffoCoreMessageClient:
                 m.get("envelope_id") for m in batch if m.get("envelope_id")
             }
             if deferred:
-                # Keep the slot OPEN so a mid-dispatch arrival appends after
-                # the deferred tail (FIFO) instead of taking the reopen
-                # branch, which would overwrite ``messages``. The durable
-                # cursor only advances over ``batch``, so the deferred stay
-                # re-readable across a restart.
+                # Slot stays OPEN so a mid-dispatch arrival appends after the
+                # deferred tail instead of overwriting via the reopen branch;
+                # the cursor covers only ``batch``, so deferred survive restart.
                 entry.messages = deferred
                 entry.in_queue = True
                 self._queue_seq += 1
