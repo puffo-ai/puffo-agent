@@ -41,13 +41,20 @@ CREATE INDEX IF NOT EXISTS idx_messages_thread_root
 -- Per-thread cursor used by the thread-batched priority queue. After
 -- ``on_message_batch`` finishes successfully, the consumer advances
 -- this to the ``sent_at`` of the last message in the dispatched
--- batch. The listen handler then drops any inbound message whose
--- ``sent_at`` is <= the stored cursor, so server-side pending-message
--- redeliveries after a daemon restart don't re-trigger the agent on
--- already-processed threads.
+-- batch, plus the envelope_ids of the batch messages that share that
+-- exact ``sent_at`` (JSON array). The listen handler then drops any
+-- inbound message whose ``sent_at`` is strictly below the cursor, or
+-- equal to it with an envelope_id already recorded at the watermark —
+-- so server-side pending-message redeliveries after a daemon restart
+-- don't re-trigger the agent, while a genuinely-NEW message that
+-- merely shares the watermark ``sent_at`` (same-millisecond burst
+-- from a programmatic sender; the wire timestamp is epoch-ms) is
+-- still admitted. Reject-on-equal alone caused the "reply once then
+-- silent" bug (T27).
 CREATE TABLE IF NOT EXISTS thread_processing_state (
     root_id TEXT PRIMARY KEY,
-    last_processed_sent_at INTEGER NOT NULL
+    last_processed_sent_at INTEGER NOT NULL,
+    last_processed_envelope_ids TEXT NOT NULL DEFAULT '[]'
 );
 
 -- One row per channel the agent has been auto-prompted to introduce
@@ -140,6 +147,25 @@ class MessageStore:
             "PRAGMA mmap_size=268435456;"
         )
         await self._db.executescript(_SCHEMA)
+        await self._migrate(self._db)
+
+    @staticmethod
+    async def _migrate(db: aiosqlite.Connection) -> None:
+        """Bring a pre-existing DB up to the current schema.
+        ``CREATE TABLE IF NOT EXISTS`` never alters an existing table,
+        so columns added after first ship need an explicit ALTER here.
+        Idempotent and backward-compatible (new columns carry a
+        DEFAULT, so old rows keep working)."""
+        async with db.execute(
+            "PRAGMA table_info(thread_processing_state)"
+        ) as cursor:
+            cols = {row[1] for row in await cursor.fetchall()}
+        if "last_processed_envelope_ids" not in cols:
+            await db.execute(
+                "ALTER TABLE thread_processing_state "
+                "ADD COLUMN last_processed_envelope_ids TEXT NOT NULL DEFAULT '[]'"
+            )
+            await db.commit()
 
     async def close(self) -> None:
         if self._db:
@@ -540,39 +566,94 @@ class MessageStore:
     async def get_last_processed_sent_at(self, root_id: str) -> int:
         """``sent_at`` of the last message in the most recently
         dispatched batch for this thread, or ``0`` if the agent has
-        never processed it. Used at enqueue time to drop redelivered
-        messages whose work has already been done.
+        never processed it. Prefer ``get_thread_cursor`` at the
+        inbound gate — the bare watermark can't distinguish a
+        redelivered envelope from a NEW message that shares the
+        watermark ``sent_at``.
+        """
+        sent_at, _ids = await self.get_thread_cursor(root_id)
+        return sent_at
+
+    async def get_thread_cursor(self, root_id: str) -> tuple[int, set[str]]:
+        """The per-thread dedup cursor: ``(last_processed_sent_at,
+        envelope_ids processed AT that exact sent_at)``. ``(0, set())``
+        when the agent has never processed the thread. The id set only
+        ever holds the ties at the watermark millisecond (a handful at
+        most), never the whole history — anything strictly below the
+        watermark is covered by the timestamp comparison alone.
+        Rows written before the ``last_processed_envelope_ids`` column
+        existed yield an empty set (fail-open: a same-``sent_at``
+        redelivery right after upgrade may re-dispatch once, which is
+        the safe direction — never silently dropping new messages).
         """
         if not root_id:
-            return 0
+            return 0, set()
         db = await self._ensure_db()
         async with db.execute(
-            "SELECT last_processed_sent_at FROM thread_processing_state "
-            "WHERE root_id = ?",
+            "SELECT last_processed_sent_at, last_processed_envelope_ids "
+            "FROM thread_processing_state WHERE root_id = ?",
             (root_id,),
         ) as cursor:
             row = await cursor.fetchone()
-        return int(row[0]) if row else 0
+        if row is None:
+            return 0, set()
+        try:
+            ids_raw = json.loads(row[1]) if row[1] else []
+        except (ValueError, TypeError):
+            ids_raw = []
+        ids = {str(i) for i in ids_raw if i} if isinstance(ids_raw, list) else set()
+        return int(row[0]), ids
 
     async def mark_thread_processed(
-        self, root_id: str, sent_at: int,
+        self,
+        root_id: str,
+        sent_at: int,
+        envelope_ids: list[str] | None = None,
     ) -> None:
-        """Upsert the per-thread cursor. ``MAX(existing, new)`` so
-        out-of-order writes (extremely unlikely but cheap to guard)
-        never regress the cursor.
+        """Upsert the per-thread cursor. Never regresses: a lower
+        ``sent_at`` is a no-op; an equal ``sent_at`` unions
+        ``envelope_ids`` into the recorded watermark set (two batches
+        can legitimately end on the same millisecond); a higher
+        ``sent_at`` replaces both the watermark and the id set.
+        ``envelope_ids`` should be the ids of the just-dispatched
+        batch messages whose ``sent_at`` equals the new watermark.
+
+        Single atomic upsert — the equal-watermark union runs in SQL.
+        No read-then-write window, and the same execute+commit shape
+        the pre-ids cursor had, so a caller cancelled right after its
+        dispatch callback still gets the write through.
         """
         if not root_id:
             return
+        new_ids = [i for i in (envelope_ids or []) if i]
         db = await self._ensure_db()
         await db.execute(
-            """INSERT INTO thread_processing_state (root_id, last_processed_sent_at)
-               VALUES (?, ?)
+            """INSERT INTO thread_processing_state
+                 (root_id, last_processed_sent_at, last_processed_envelope_ids)
+               VALUES (?, ?, ?)
                ON CONFLICT(root_id) DO UPDATE SET
+                 last_processed_envelope_ids = CASE
+                   WHEN excluded.last_processed_sent_at
+                        > thread_processing_state.last_processed_sent_at
+                     THEN excluded.last_processed_envelope_ids
+                   WHEN excluded.last_processed_sent_at
+                        = thread_processing_state.last_processed_sent_at
+                     THEN (
+                       SELECT json_group_array(value) FROM (
+                         SELECT value FROM json_each(
+                           thread_processing_state.last_processed_envelope_ids)
+                         UNION
+                         SELECT value FROM json_each(
+                           excluded.last_processed_envelope_ids)
+                       )
+                     )
+                   ELSE thread_processing_state.last_processed_envelope_ids
+                 END,
                  last_processed_sent_at = MAX(
                    thread_processing_state.last_processed_sent_at,
                    excluded.last_processed_sent_at
                  )""",
-            (root_id, sent_at),
+            (root_id, sent_at, json.dumps(new_ids)),
         )
         await db.commit()
 
