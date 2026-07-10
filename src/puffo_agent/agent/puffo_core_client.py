@@ -4169,7 +4169,12 @@ class PuffoCoreMessageClient:
             space_id=send_space_id,
             channel_id=send_channel_id,
             recipient_slug=recipient_slug,
-            thread_root_id=root_id if root_id else None,
+            # DM fallback replies go top-level so they render inline in the
+            # linear DM conversation. Threading a DM reply under the incoming
+            # message buries it behind a "N replies" thread badge in the main
+            # view — the human never sees the answer inline and it reads as the
+            # agent going silent. Channels keep threading (root_id) as before.
+            thread_root_id=(None if envelope_kind == "dm" else (root_id or None)),
             content_type="text/plain",
             content=text,
             recipients=devices,
