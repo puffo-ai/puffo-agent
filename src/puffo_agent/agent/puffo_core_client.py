@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
+from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
@@ -460,8 +461,8 @@ class PuffoCoreMessageClient:
         operator_slug: str = "",
         auto_accept_space_invitations: bool = False,
         workspace: str = "",
-        max_inline_chars: int = 16000,
-        segment_chars: int = 8000,
+        max_inline_chars: int = MAX_INLINE_MESSAGE_CHARS,
+        segment_chars: int = MESSAGE_SEGMENT_CHARS,
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,

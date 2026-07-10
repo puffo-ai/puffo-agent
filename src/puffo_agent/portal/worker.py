@@ -370,10 +370,10 @@ def _build_puffo_core_client(
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (
-        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else 16000
+        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else MAX_INLINE_MESSAGE_CHARS
     )
     segment_chars = (
-        daemon_cfg.segment_chars if daemon_cfg is not None else 8000
+        daemon_cfg.segment_chars if daemon_cfg is not None else MESSAGE_SEGMENT_CHARS
     )
 
     # The inbound-image downscale cap follows the harness's effective model

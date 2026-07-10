@@ -32,6 +32,8 @@ from typing import Any
 import psutil
 import yaml
 
+from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+
 
 # Where daemon.yml, agents/, etc. live.
 def home_dir() -> Path:
@@ -845,8 +847,8 @@ class DaemonConfig:
     # view is redacted. Per-turn totals are bounded by greedy-fill
     # batching, so this only guards session-lifetime context growth;
     # 16000 inlines typical code/log pastes whole.
-    max_inline_message_chars: int = 16000
-    segment_chars: int = 8000
+    max_inline_message_chars: int = MAX_INLINE_MESSAGE_CHARS
+    segment_chars: int = MESSAGE_SEGMENT_CHARS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -871,8 +873,10 @@ class DaemonConfig:
             runtime_heartbeat_seconds=float(raw.get("runtime_heartbeat_seconds", 5.0)),
             docker_memory_limit=raw.get("docker_memory_limit", "1.5g"),
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
-            max_inline_message_chars=int(raw.get("max_inline_message_chars", 16000)),
-            segment_chars=int(raw.get("segment_chars", 8000)),
+            max_inline_message_chars=int(
+                raw.get("max_inline_message_chars", MAX_INLINE_MESSAGE_CHARS)
+            ),
+            segment_chars=int(raw.get("segment_chars", MESSAGE_SEGMENT_CHARS)),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
