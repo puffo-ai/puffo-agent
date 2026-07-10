@@ -494,10 +494,11 @@ class PuffoCoreMessageClient:
         # non-None, listen() runs the bridge lifecycle loop instead of
         # the signed WS client — no identity file is ever loaded.
         self._bridge = bridge_client
-        # In-flight ack tasks scheduled off the bridge dispatch loop
-        # (F1). Held so the tasks aren't GC'd mid-flight; each removes
+        # In-flight fire-and-forget tasks scheduled off the bridge
+        # dispatch loop (F1 acks + added_to_space spaces refreshes).
+        # Held so the tasks aren't GC'd mid-flight; each removes
         # itself via a done-callback. Native transport never populates
-        # this — the ack lives only in the bridge dispatcher.
+        # this — both producers live only in the bridge dispatcher.
         self._ack_tasks: set[asyncio.Task] = set()
         # Most recent DM sender. ``send_fallback_message(channel_id="")`` means
         # "reply to whoever just DMed me". Single-slot is fine since
@@ -847,6 +848,24 @@ class PuffoCoreMessageClient:
                 "bridge backfill complete: pending_delivered (count=%s)",
                 frame.get("count"),
             )
+        elif kind == "added_to_space":
+            # Server push (AgentServerMsg::AddedToSpace) the moment this
+            # agent is added to a Space — refresh the known-spaces view
+            # eagerly instead of waiting for the next lazy list_spaces.
+            # Scheduled async, same shape as the F1 ack: awaiting
+            # send_list_spaces inline would deadlock the frames() loop,
+            # which must keep receiving to deliver the 'spaces' reply
+            # that resolves the request future.
+            space_id = frame.get("space_id") or ""
+            self._log.info(
+                "bridge: added to space %s — refreshing spaces",
+                space_id or "<missing space_id>",
+            )
+            task = asyncio.create_task(
+                self._refresh_bridge_spaces(space_id)
+            )
+            self._ack_tasks.add(task)
+            task.add_done_callback(self._ack_tasks.discard)
         elif kind == "error":
             self._log.warning(
                 "bridge error frame: code=%s message=%s",
@@ -872,6 +891,45 @@ class PuffoCoreMessageClient:
             self._log.warning(
                 "bridge ack failed (envelope_ids=%s)",
                 envelope_ids, exc_info=True,
+            )
+
+    async def _refresh_bridge_spaces(self, trigger_space_id: str = "") -> None:
+        """Re-issue ``list_spaces`` over the bridge WS after an
+        ``added_to_space`` push so the new space enters the agent's
+        known set eagerly (name cache + disk cache) rather than lazily
+        on the next tool call. Idempotent: a duplicate ``added_to_space``
+        for an already-known space is a harmless re-list (``setdefault``
+        keeps the existing entries). Fail-soft: a failed refresh logs
+        and drops — the MCP ``list_spaces`` tool reads the authoritative
+        route live, so a lost refresh is at worst a stale name cache,
+        never a missed membership. Native transport never calls this
+        (no ``_bridge``).
+        """
+        bridge = self._bridge
+        if bridge is None:
+            return
+        try:
+            resp = await bridge.send_list_spaces()
+            entries = resp.get("spaces") or []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                # The wire spec names the id field ``id``; the signed
+                # HTTP route uses ``space_id`` — read both defensively.
+                sid = entry.get("space_id") or entry.get("id") or ""
+                name = (entry.get("name") or "").strip()
+                if sid and name:
+                    self._space_name_cache.setdefault(sid, name)
+                    disk_cache.persist_space(sid, name)
+            self._log.info(
+                "bridge spaces refresh: %d spaces listed "
+                "(trigger space_id=%s)",
+                len(entries), trigger_space_id or "<missing>",
+            )
+        except Exception:  # noqa: BLE001 — a failed refresh must not crash the loop
+            self._log.warning(
+                "bridge spaces refresh failed (trigger space_id=%s)",
+                trigger_space_id, exc_info=True,
             )
 
     def _preseed_frame_display_name(
