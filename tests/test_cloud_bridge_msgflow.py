@@ -571,10 +571,15 @@ async def test_b_send_message_channel_threads_on_bridge(tmp_path):
 
 @pytest.mark.asyncio
 async def test_b_send_message_dm_threads_on_bridge(tmp_path):
-    """DM route of ``send_message`` also threads. With the DM root seeded
-    locally, resolution + same-channel validation keep it, so both
-    ``thread_root_id`` and ``reply_to_id`` carry it — proving the DM
-    branch is wired, not silently dropping the ids."""
+    """DM route of ``send_message`` sends TOP-LEVEL, not threaded.
+
+    Per the DM-fallback-top-level fix (PR #159, commit 7ace93b): DMs are
+    linear conversations, so a DM reply ('@slug') must render inline in the
+    main view rather than hiding behind an "N replies" thread badge.
+    Even with a resolvable DM root seeded, the DM branch deliberately drops
+    ``thread_root_id``/``reply_to_id`` — proving the branch is wired to the
+    new top-level contract, while the recipient still resolves correctly.
+    Channels keep threading (covered by the channel-route tests above)."""
     ms = MessageStore(str(tmp_path / "b_dm_thread.db"))
     # Seed a real DM root so thread_root_id survives validation.
     await ms.store({
@@ -595,8 +600,10 @@ async def test_b_send_message_dm_threads_on_bridge(tmp_path):
     assert len(sends) == 1
     body = sends[0]
     assert body["recipient_slug"] == "alice-0001"
-    assert body["thread_root_id"] == "dm_root"
-    assert body["reply_to_id"] == "dm_root"
+    # DM replies are top-level: threading keys are intentionally omitted so
+    # the reply renders inline, not behind an "N replies" badge (PR #159).
+    assert "thread_root_id" not in body
+    assert "reply_to_id" not in body
     assert bridge.sent == []
     assert "msg_bridgeack" in result
 
