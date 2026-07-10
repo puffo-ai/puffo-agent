@@ -603,7 +603,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # Only truthy thread keys ride the body. F4: drop the raw parent
             # ref when root validation wiped the thread — no dangling
             # reply_to for a root the send no longer threads under.
-            if resolved_root:
+            # DMs are linear: never thread a DM reply ('@slug'), or it hides
+            # behind an "N replies" badge in the main view instead of inline.
+            if resolved_root and not channel_ref.startswith("@"):
                 body["thread_root_id"] = resolved_root
                 if root_id:
                     body["reply_to_id"] = root_id
