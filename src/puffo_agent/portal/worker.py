@@ -384,10 +384,8 @@ def _build_puffo_core_client(
     else:
         model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
 
-    # PUF-363: per-turn input-block byte budget for greedy-fill batching.
-    # Claude Code hard-rejects a single user block over ~180KB pre-send, so
-    # split batches to stay under it. Codex has no such input cap — give it a
-    # far larger ceiling that only trips as a runaway safety net.
+    # Claude Code hard-rejects a single user block over ~180KB pre-send;
+    # Codex has no input cap, so its ceiling is only a runaway safety net.
     max_input_bytes = 4_000_000 if is_codex else DEFAULT_MAX_INPUT_BYTES
 
     return PuffoCoreMessageClient(

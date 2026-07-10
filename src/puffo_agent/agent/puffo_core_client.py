@@ -65,12 +65,9 @@ PRIORITY_SYSTEM = 5
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
-# PUF-363: FIFO greedy-fill input batching. When a thread's queued
-# messages would, once concatenated into one per-turn block, exceed the
-# harness input-byte budget, the consumer dispatches only the prefix that
-# fits and defers the rest to the next turn(s). Mirrors the Claude Code
-# pre-send cap in ``adapters/cli_session.MAX_USER_MESSAGE_BYTES`` — a test
-# asserts the two stay in sync. Codex has no such cap and the worker
+# Per-turn input-block byte budget for greedy-fill batching. Mirrors the
+# Claude Code pre-send cap in ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``
+# — a test asserts the two stay in sync. Codex has no such cap; the worker
 # passes it a far larger ceiling.
 DEFAULT_MAX_INPUT_BYTES = 180 * 1000
 
@@ -495,7 +492,6 @@ class PuffoCoreMessageClient:
         # 200k-context model with a verbose system prompt.
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
-        # PUF-363: per-turn input-block byte budget for greedy-fill batching.
         self._max_input_bytes = max(1, int(max_input_bytes))
         self._image_edge_px = int(image_edge_px) or _DEFAULT_IMAGE_EDGE_PX
         self.keystore = keystore
@@ -1275,7 +1271,7 @@ class PuffoCoreMessageClient:
         return n + _BLOCK_METADATA_OVERHEAD_BYTES
 
     def _greedy_fit_prefix(self, messages: list[dict]) -> int:
-        """PUF-363: largest prefix length K such that the concatenated
+        """Largest prefix length K such that the concatenated
         blocks of ``messages[:K]`` fit ``_max_input_bytes``. Always >= 1
         so a single over-budget message still dispatches alone (the
         adapter's own pre-send cap is the backstop) rather than stalling
@@ -1360,10 +1356,8 @@ class PuffoCoreMessageClient:
                     len(dropped), root_id, dropped,
                 )
 
-            # PUF-363: greedy-fill. Dispatch only the FIFO prefix whose
-            # concatenated block fits the harness input-byte budget; keep
-            # the remainder queued for a following turn. Nothing dropped,
-            # nothing reordered, split only at message boundaries.
+            # Greedy-fill: dispatch only the FIFO prefix whose concatenated
+            # block fits the input-byte budget; the remainder stays queued.
             split = self._greedy_fit_prefix(deduped)
             batch = deduped[:split]
             deferred = deduped[split:]
@@ -1371,14 +1365,11 @@ class PuffoCoreMessageClient:
                 m.get("envelope_id") for m in batch if m.get("envelope_id")
             }
             if deferred:
-                # Keep the slot OPEN with the remainder so a mid-dispatch
-                # arrival appends AFTER the deferred tail (FIFO) instead of
-                # taking ``_admit_thread_message``'s reopen branch, which
-                # would overwrite ``messages``. Re-enqueue a fresh tuple so
-                # the serial consumer drains the remainder next turn (the
-                # durable cursor only advances over ``batch``'s tail, so the
-                # deferred — higher ``sent_at`` — stays uncovered + safe
-                # across a restart).
+                # Keep the slot OPEN so a mid-dispatch arrival appends after
+                # the deferred tail (FIFO) instead of taking the reopen
+                # branch, which would overwrite ``messages``. The durable
+                # cursor only advances over ``batch``, so the deferred stay
+                # re-readable across a restart.
                 entry.messages = deferred
                 entry.in_queue = True
                 self._queue_seq += 1

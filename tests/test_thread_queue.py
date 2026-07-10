@@ -62,8 +62,7 @@ def _make_client_for_queue(store: MessageStore) -> PuffoCoreMessageClient:
     client._queue = asyncio.PriorityQueue()
     client._queue_seq = 0
     client._thread_state = {}
-    # PUF-363: greedy-fill needs a byte budget + a logger. Default budget
-    # is large so pre-existing small-batch tests never trigger a split.
+    # Budget large by default so small-batch tests never trigger a split.
     client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES
     client._log = logging.getLogger("puffo-core-client-test")
     return client
@@ -920,7 +919,7 @@ async def test_pre_existing_cursor_blocks_redelivered_messages():
     await store.close()
 
 
-# ─── PUF-363: greedy-fill input batching ─────────────────────────
+# ─── greedy-fill input batching ──────────────────────────────────
 
 
 def _sized_msg(envelope_id: str, text_bytes: int, sent_at: int) -> dict:

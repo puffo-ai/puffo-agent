@@ -32,8 +32,7 @@ def _make_client(max_retries: int = 1) -> PuffoCoreMessageClient:
     client.slug = "tester-1234"
     client._log = logging.getLogger("test-puf-255")
     client.MAX_API_ERROR_RETRIES = max_retries  # type: ignore[attr-defined]
-    # PUF-363: the ``_consume_queue`` success-branch test drives greedy-fill,
-    # which reads this budget. Large enough to never split these tiny batches.
+    # Greedy-fill reads this budget; large enough to never split here.
     client._queue_seq = 0
     client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES
 
