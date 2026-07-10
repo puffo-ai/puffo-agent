@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+import ssl
 import sys
 import tempfile
 import time
 
 import aiohttp
+import certifi
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 from aiohttp_socks import ProxyConnector
@@ -108,6 +110,23 @@ def test_remote_http_session_uses_socks_proxy_env(monkeypatch):
         try:
             assert getattr(session, "_trust_env", None) is False
             assert isinstance(session.connector, ProxyConnector)
+        finally:
+            await session.close()
+
+    asyncio.run(run())
+
+
+def test_remote_http_session_trusts_certifi_ca_bundle(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+
+    async def run():
+        session = create_remote_http_session("https://api.puffo.ai")
+        try:
+            ctx = session.connector._ssl
+            assert isinstance(ctx, ssl.SSLContext)
+            assert ctx.verify_mode == ssl.CERT_REQUIRED
+            reference = ssl.create_default_context(cafile=certifi.where())
+            assert ctx.get_ca_certs() == reference.get_ca_certs()
         finally:
             await session.close()
 

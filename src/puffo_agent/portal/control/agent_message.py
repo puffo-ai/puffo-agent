@@ -14,6 +14,7 @@ import aiohttp
 
 from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.encoding import base64url_decode, base64url_encode
+from ...crypto.http_session import create_remote_http_session
 from ...crypto.primitives import (
     aead_encrypt,
     ed25519_verify,
@@ -126,7 +127,7 @@ async def fetch_active_recipients(
     path = f"/v2/machines/{machine.machine_id}/operators/{operator_slug}/devices/active"
     headers = machine_auth.signed_headers(machine, "GET", path)
     try:
-        async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT) as session:
+        async with create_remote_http_session(base_url, timeout=HTTP_TIMEOUT) as session:
             async with session.get(f"{base_url.rstrip('/')}{path}", headers=headers) as resp:
                 if resp.status >= 400:
                     return []

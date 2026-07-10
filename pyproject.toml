@@ -37,6 +37,9 @@ dependencies = [
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
     "anthropic>=0.25",
+    # certifi's CA bundle backs relay TLS verification regardless of the
+    # host's ambient OpenSSL cert store (see crypto/http_session.py).
+    "certifi>=2024.2.2",
     "cryptography>=43.0",
     "mcp>=1.0",
     # Pillow: dimension-check + downscale inbound image attachments so

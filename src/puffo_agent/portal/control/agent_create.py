@@ -307,9 +307,12 @@ async def post_slug_binding(server_url: str, slug_binding: dict, pending_token: 
     token + self-signature are the gate; no auth header)."""
     import aiohttp
 
+    from ...crypto.http_session import create_remote_http_session
+
     url = f"{server_url.rstrip('/')}/certs/slug_binding"
     body = {"pending_token": pending_token, "slug_binding": slug_binding}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with create_remote_http_session(server_url, timeout=timeout) as session:
         async with session.post(url, json=body) as resp:
             if resp.status >= 400:
                 text = await resp.text()
