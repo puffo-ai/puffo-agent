@@ -842,12 +842,11 @@ class DaemonConfig:
     # the agent fetches the full content one chunk at a time via
     # the ``get_post_segment`` MCP tool. The original envelope is
     # stored unmodified in ``messages.db`` — only the prompt-budget
-    # view is redacted. Tuned for Claude's 200k window minus a
-    # generous system-prompt + history headroom; defaults pinned at
-    # 4000/2000 so a single 8-segment paste fits comfortably even
-    # with a verbose primer.
-    max_inline_message_chars: int = 4000
-    segment_chars: int = 2000
+    # view is redacted. Per-turn totals are bounded by greedy-fill
+    # batching, so this only guards session-lifetime context growth;
+    # 16000 inlines typical code/log pastes whole.
+    max_inline_message_chars: int = 16000
+    segment_chars: int = 8000
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -872,8 +871,8 @@ class DaemonConfig:
             runtime_heartbeat_seconds=float(raw.get("runtime_heartbeat_seconds", 5.0)),
             docker_memory_limit=raw.get("docker_memory_limit", "1.5g"),
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
-            max_inline_message_chars=int(raw.get("max_inline_message_chars", 4000)),
-            segment_chars=int(raw.get("segment_chars", 2000)),
+            max_inline_message_chars=int(raw.get("max_inline_message_chars", 16000)),
+            segment_chars=int(raw.get("segment_chars", 8000)),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}

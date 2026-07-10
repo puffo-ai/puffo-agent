@@ -299,7 +299,8 @@ def _maybe_redact_long_text(
         f"  preview: {raw_preview}\n"
         "Retrieve the full body one chunk at a time with "
         "mcp__puffo__get_post_segment("
-        f"envelope_id=\"{envelope_id}\", segment=N) where N runs "
+        f"envelope_id=\"{envelope_id}\", segment=N, "
+        f"segment_size={segment_chars}) where N runs "
         f"0..{seg_count - 1}. Fetch only the segments you actually "
         "need — the placeholder above already tells you what kind "
         "of content it is."
@@ -459,8 +460,8 @@ class PuffoCoreMessageClient:
         operator_slug: str = "",
         auto_accept_space_invitations: bool = False,
         workspace: str = "",
-        max_inline_chars: int = 4000,
-        segment_chars: int = 2000,
+        max_inline_chars: int = 16000,
+        segment_chars: int = 8000,
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,

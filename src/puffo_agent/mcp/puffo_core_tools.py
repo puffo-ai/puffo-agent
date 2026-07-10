@@ -879,7 +879,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def get_post_segment(
         envelope_id: str,
         segment: int,
-        segment_size: int = 2000,
+        segment_size: int = 8000,
     ) -> str:
         """Page a long message body back in chunks.
 
@@ -901,7 +901,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
           * unknown envelope_id → "message <id> not found in local storage"
           * empty content       → "message <id> has no text body"
 
-        ``segment_size`` defaults to 2000 to match the daemon's
+        ``segment_size`` defaults to 8000 to match the daemon's
         default redaction page size; pass the value the placeholder
         cited if the operator has overridden it on their host.
         """
