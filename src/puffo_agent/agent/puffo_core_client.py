@@ -239,6 +239,24 @@ def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
 _LONG_MESSAGE_PREVIEW_CHARS = 240
 
 
+def _batch_tail_cursor(batch: list[dict]) -> tuple[int, list[str]]:
+    """The cursor advance for a successfully dispatched batch:
+    ``batch[-1].sent_at`` (the high-water mark just covered) plus the
+    envelope_ids of every batch message sharing that exact ``sent_at``.
+    Recording the watermark ties lets the inbound gate tell a
+    redelivered already-processed envelope (same id — drop) from a
+    genuinely-new same-millisecond arrival (different id — admit);
+    see ``MessageStore.mark_thread_processed``.
+    """
+    tail_sent_at = batch[-1].get("sent_at", 0) if batch else 0
+    tail_ids = [
+        m.get("envelope_id", "")
+        for m in batch
+        if m.get("envelope_id") and m.get("sent_at", 0) == tail_sent_at
+    ]
+    return tail_sent_at, tail_ids
+
+
 def _maybe_redact_long_text(
     text: str,
     *,
@@ -1125,13 +1143,25 @@ class PuffoCoreMessageClient:
 
         # Cross-restart dedup: after a daemon restart the server
         # redelivers anything in /messages/pending. If we already
-        # dispatched a batch that covers ``payload.sent_at``,
-        # skip — the agent has seen this.
-        last_processed = await self.store.get_last_processed_sent_at(root_id)
-        if payload.sent_at <= last_processed:
+        # dispatched a batch that covers ``payload.sent_at``, skip —
+        # the agent has seen this. ``sent_at`` is epoch-MILLISECONDS
+        # but NOT unique: a programmatic burst (agent→agent, server-
+        # stamped bridge sends) can put two distinct envelopes on the
+        # same root in the same ms. Rejecting on bare
+        # ``sent_at <= watermark`` dropped the genuinely-new second
+        # message and the agent went silent after one reply (T27), so
+        # equality alone is not enough — at the watermark we only
+        # reject an envelope_id we have actually processed.
+        last_processed, processed_ids = await self.store.get_thread_cursor(
+            root_id,
+        )
+        if payload.sent_at < last_processed or (
+            payload.sent_at == last_processed
+            and payload.envelope_id in processed_ids
+        ):
             self._log.info(
                 "handle_envelope: cursor-rejected duplicate envelope=%s "
-                "(sent_at=%d <= last_processed=%d, root=%s)",
+                "(sent_at=%d, last_processed=%d, root=%s)",
                 payload.envelope_id, payload.sent_at,
                 last_processed, root_id,
             )
@@ -1276,10 +1306,10 @@ class PuffoCoreMessageClient:
           and gets skipped on pop via the ``current_seq`` mismatch
           check in ``_consume_queue``.
 
-        Caller must have already filtered out messages whose
-        ``sent_at`` is at or below
-        ``store.get_last_processed_sent_at(root_id)``; this method
-        doesn't re-check the durable cursor.
+        Caller must have already run the durable-cursor gate
+        (``store.get_thread_cursor(root_id)``: drop when ``sent_at``
+        is below the watermark, or equal to it with an envelope_id
+        recorded at the watermark); this method doesn't re-check it.
         """
         entry = self._thread_state.get(root_id)
         incoming_id = msg_dict.get("envelope_id", "")
@@ -1432,10 +1462,10 @@ class PuffoCoreMessageClient:
                 # the retry. Advance cursor past the failed batch
                 # so we don't re-trigger on redelivery.
                 if batch:
-                    tail_sent_at = batch[-1].get("sent_at", 0)
+                    tail_sent_at, tail_ids = _batch_tail_cursor(batch)
                     try:
                         await self.store.mark_thread_processed(
-                            root_id, tail_sent_at,
+                            root_id, tail_sent_at, tail_ids,
                         )
                     except Exception:
                         self._log.exception(
@@ -1671,11 +1701,15 @@ class PuffoCoreMessageClient:
 
             # Success: persist the cursor so a restart-then-redeliver
             # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
-            # the high-water mark we just covered.
+            # the high-water mark we just covered; the watermark ties'
+            # envelope_ids ride along so a same-ms NEW arrival is
+            # still admitted later.
             if batch:
-                tail_sent_at = batch[-1].get("sent_at", 0)
+                tail_sent_at, tail_ids = _batch_tail_cursor(batch)
                 try:
-                    await self.store.mark_thread_processed(root_id, tail_sent_at)
+                    await self.store.mark_thread_processed(
+                        root_id, tail_sent_at, tail_ids,
+                    )
                 except Exception:
                     self._log.exception(
                         "mark_thread_processed(%s, %d) failed; agent "
