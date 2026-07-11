@@ -164,6 +164,7 @@ class LocalCLIAdapter(Adapter):
         owner_username: str = "",
         permission_mode: str = "default",
         sandbox: str = "danger-full-access",
+        task_timeout_seconds: float = 600.0,
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
@@ -184,6 +185,7 @@ class LocalCLIAdapter(Adapter):
         self.owner_username = owner_username
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
         self.sandbox = _sanitise_sandbox(sandbox, agent_id)
+        self.task_timeout_seconds = task_timeout_seconds
         self.desired_skills = list(desired_skills or [])
         self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
@@ -474,6 +476,7 @@ class LocalCLIAdapter(Adapter):
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             model=self.model,
+            task_timeout_seconds=self.task_timeout_seconds,
             audit=codex_audit,
         )
         return self._codex_session

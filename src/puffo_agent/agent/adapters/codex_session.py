@@ -228,6 +228,7 @@ class CodexSession:
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
         model: str = "",
+        task_timeout_seconds: float = TURN_TIMEOUT_SECONDS,
         audit: Optional[AuditLog] = None,
     ):
         self.agent_id = agent_id
@@ -243,6 +244,9 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
+        # Per-agent turn wall-clock budget (PUF-375). Defaults to the module
+        # constant; agents running long reasoning tasks raise it via agent.yml.
+        self.task_timeout_seconds = task_timeout_seconds
         self.audit = audit
 
         self._proc: asyncio.subprocess.Process | None = None
@@ -336,12 +340,12 @@ class CodexSession:
             else:
                 try:
                     await asyncio.wait_for(
-                        turn.completed, timeout=TURN_TIMEOUT_SECONDS,
+                        turn.completed, timeout=self.task_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "agent %s: codex turn timed out after %ds",
-                        self.agent_id, TURN_TIMEOUT_SECONDS,
+                        self.agent_id, self.task_timeout_seconds,
                     )
                     # Best-effort interrupt so the server stops streaming
                     # output we'll never read.
@@ -359,8 +363,15 @@ class CodexSession:
                     rotated_in_branch = self._propagate_turn_outcome(
                         outcome="timeout",
                     )
+                    # PUF-375 (b'): replace the bare empty reply with an
+                    # operator-facing line so a timeout doesn't surface as
+                    # silence. Routed as a normal reply by core.py.
+                    timeout_min = int(self.task_timeout_seconds // 60)
                     return TurnResult(
-                        reply="",
+                        reply=(
+                            f"⏱ Task exceeded the {timeout_min}-minute timeout; "
+                            "the codex session state was cleared for the next turn."
+                        ),
                         metadata={
                             "codex_turn_timeout": True,
                             "codex_thread_rotated": rotated_in_branch,
