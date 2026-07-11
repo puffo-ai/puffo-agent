@@ -761,10 +761,8 @@ def _update_profile_summary(cfg: AgentConfig, new_summary: str) -> None:
 
 
 def _update_profile_role(cfg: AgentConfig, new_role: str) -> None:
-    """Rewrite the first ``**Role:**`` line of profile.md so the prompt
-    the worker assembles carries the edited role, not just agent.yml and
-    the server identity. Custom profiles without that line are left
-    untouched."""
+    """Rewrite the first ``**Role:**`` line of profile.md so the assembled
+    prompt carries the edit; custom profiles without one are untouched."""
     if not new_role.strip():
         return
     try:

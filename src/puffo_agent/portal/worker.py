@@ -1600,11 +1600,9 @@ async def _process_refresh_flags(
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
-    Order: host sync → CLAUDE.md rebuild → session drop. A rebuild that
-    changed the primer/profile slice of the prompt drops the session too
-    (the CLI bakes the system prompt at session creation, so ``--resume``
-    would replay the old one); an unchanged or memory-only rebuild keeps
-    the conversation."""
+    Order: host sync → CLAUDE.md rebuild → session drop. A changed
+    primer/profile slice drops the session too (``--resume`` would replay
+    the stale baked prompt); memory-only or no-op rebuilds keep it."""
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()
@@ -1645,8 +1643,6 @@ async def _process_refresh_flags(
             )
             from ..agent.shared_content import MEMORY_SECTION_HEADER
 
-            # Memory-only changes don't force a fresh session: the old
-            # conversation already contains what the agent just wrote.
             def _session_core(prompt: str) -> str:
                 return prompt.split(MEMORY_SECTION_HEADER, 1)[0]
 

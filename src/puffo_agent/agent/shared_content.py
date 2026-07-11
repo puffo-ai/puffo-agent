@@ -1232,9 +1232,8 @@ def read_memory_snapshot(memory_dir: Path) -> str:
     return "\n\n".join(parts)
 
 
-# Session-relevant slice boundary: everything before this header (primer +
-# profile) forces a fresh CLI session when it changes; the memory snapshot
-# after it doesn't.
+# Splits the session-relevant slice (primer + profile) from the memory
+# snapshot for the worker's fresh-session check.
 MEMORY_SECTION_HEADER = "---\n\n# Your memory\n\n"
 
 

@@ -373,3 +373,31 @@ async def test_control_edit_paused_agent_drops_no_flag(monkeypatch):
     workspace = AgentConfig.load("paused-bot").resolve_workspace_dir()
     assert not (workspace / ".puffo-agent" / "reload.flag").exists()
     assert not (Path(home) / "agents" / "paused-bot" / ".puffo-agent" / "restart.flag").exists()
+
+
+@pytest.mark.asyncio
+async def test_control_edit_role_rewrites_profile_role_line(monkeypatch):
+    home = isolated_home()
+    write_test_agent(home, "role-bot")
+    cfg = AgentConfig.load("role-bot")
+    cfg.state = "running"
+    cfg.save()
+    profile = Path(home) / "agents" / "role-bot" / "profile.md"
+    profile.write_text(
+        "# Role Bot\n\n**Role:** helper: old\n\n# Soul\n\nText.\n", encoding="utf-8",
+    )
+    _patch_sync(monkeypatch)
+
+    from puffo_agent.portal.control import client as ctrl
+
+    result = await ctrl.execute_command(
+        op="edit",
+        agent_slug="role-bot",
+        params={"role": "coder: new description"},
+        server_url="https://example.test",
+        paired_root_pubkey="op-pk",
+    )
+    assert result == {"ok": True}
+    text = profile.read_text(encoding="utf-8")
+    assert "**Role:** coder: new description\n" in text
+    assert "helper: old" not in text

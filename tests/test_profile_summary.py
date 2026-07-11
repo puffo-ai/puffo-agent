@@ -328,3 +328,16 @@ def test_update_profile_role_only_first_line_rewritten(monkeypatch):
         ).read()
         assert text.startswith("**Role:** replaced\n")
         assert "**Role:** second" in text
+
+
+def test_update_profile_role_swallows_read_errors(monkeypatch):
+    from puffo_agent.portal.api.handlers import _update_profile_role
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(home, "**Role:** x\n")
+        monkeypatch.setattr(
+            type(cfg), "resolve_profile_path",
+            lambda self: (_ for _ in ()).throw(OSError("boom")),
+        )
+        _update_profile_role(cfg, "new role")  # must not raise

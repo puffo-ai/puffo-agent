@@ -836,3 +836,34 @@ def test_process_refresh_flags_profile_change_with_memory_drops_session(tmp_path
     assert len(adapter.reload_calls) == 1
     _, with_session = adapter.reload_calls[0]
     assert with_session is True
+
+
+def test_process_refresh_flags_reload_failure_still_clears_flags(tmp_path, monkeypatch):
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "rebuilt",
+    )
+
+    class _ExplodingAdapter:
+        async def reload(self, *_a, **_k):
+            raise RuntimeError("reload failed")
+
+    puffo = _FakePuffo(prompt="stale")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=_ExplodingAdapter(),
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert puffo.system_prompt == "rebuilt"
+    assert not agent_flag.exists()
