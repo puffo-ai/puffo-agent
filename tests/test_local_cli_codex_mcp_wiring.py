@@ -317,3 +317,51 @@ def test_codex_symlink_oserror_is_nonfatal(tmp_path, monkeypatch):
         tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
     )
     assert not (host_home / ".local" / "bin" / "codex").exists()
+
+
+def test_bundle_discovery_composes_with_stale_symlink_retarget(tmp_path, monkeypatch):
+    # FB-400 end-to-end: codex now resolves via a bundle path (as ChatGPT.app
+    # does after the app update) AND ~/.local/bin/codex is a corpse from the
+    # moved-out install. One worker start must BOTH discover the binary via the
+    # bundle path AND re-target the dead symlink to it.
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
+    from puffo_agent.agent import cli_bin
+    from puffo_agent.agent.adapters import local_cli as lc
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    bundle_codex = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / "codex"
+    bundle_codex.parent.mkdir(parents=True)
+    bundle_codex.write_text("#!/bin/sh\n", encoding="utf-8")
+    bundle_codex.chmod(0o755)
+    link = host_home / ".local" / "bin" / "codex"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "Codex.app" / "Contents" / "Resources" / "codex")  # corpse
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(lc, "is_macos", lambda: True)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    # Force resolution to the bundle path (env + PATH miss), cache-isolated so
+    # neither our resolution nor a prior test's leaks across the boundary.
+    monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda *a, **k: None)
+    monkeypatch.setattr(cli_bin, "_real_path", lambda: "")
+    monkeypatch.setattr(cli_bin, "_real_path_cache", None)
+    cli_bin._resolve_memcache.clear()
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [bundle_codex])
+
+    class _Stop:
+        def __init__(self, *a, **k):
+            raise RuntimeError("stop before spawn")
+
+    monkeypatch.setattr(lc, "CodexSession", _Stop)
+    adapter = _make_adapter(tmp_path)
+    try:
+        with pytest.raises(RuntimeError):
+            adapter._ensure_codex_session()
+        # Item 2: the corpse symlink now points at the bundle-discovered binary.
+        assert os.readlink(link) == str(bundle_codex)
+    finally:
+        cli_bin._resolve_memcache.clear()
