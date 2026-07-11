@@ -128,7 +128,24 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
     assert "fs_default_should_be_ignored" not in servers
 
 
-# ── PUF-372: codex subprocess PATH shim ────────────────────────────
+# ── codex spawn-path shims ─────────────────────────────────────────
+
+
+def _symlinks_available(tmp_path: Path) -> bool:
+    probe = tmp_path / "_probe_symlink"
+    target = tmp_path / "_probe_target"
+    target.write_text("x", encoding="utf-8")
+    try:
+        os.symlink(target, probe)
+        probe.unlink()
+        target.unlink()
+        return True
+    except (OSError, NotImplementedError):
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return False
 
 
 def _drive_codex_env(tmp_path, monkeypatch, *, path_value, codex_bin):
@@ -160,38 +177,51 @@ def _drive_codex_env(tmp_path, monkeypatch, *, path_value, codex_bin):
 
 
 def test_codex_subprocess_path_prepends_binary_dir(tmp_path, monkeypatch):
-    # Narrow PATH missing the codex bin dir → the resolved binary's own dir is
-    # prepended so codex's in-process execvp("codex") (view_image) resolves.
+    codex_bin = "/opt/homebrew/bin/codex"
     entries = _drive_codex_env(
         tmp_path, monkeypatch,
-        path_value="/usr/bin:/bin",
-        codex_bin="/opt/homebrew/bin/codex",
+        path_value=os.pathsep.join(["/usr/bin", "/bin"]),
+        codex_bin=codex_bin,
     )
-    assert entries[0] == "/opt/homebrew/bin", entries
-    assert "/usr/bin" in entries  # original PATH preserved
+    assert entries[0] == str(Path(codex_bin).parent), entries
+    assert "/usr/bin" in entries
 
 
 def test_codex_subprocess_path_idempotent_when_dir_present(tmp_path, monkeypatch):
-    # Bin dir already on PATH → not duplicated.
+    codex_bin = "/opt/homebrew/bin/codex"
+    bin_dir = str(Path(codex_bin).parent)
     entries = _drive_codex_env(
         tmp_path, monkeypatch,
-        path_value="/opt/homebrew/bin:/usr/bin",
-        codex_bin="/opt/homebrew/bin/codex",
+        path_value=os.pathsep.join([bin_dir, "/usr/bin"]),
+        codex_bin=codex_bin,
     )
-    assert entries.count("/opt/homebrew/bin") == 1, entries
+    assert entries.count(bin_dir) == 1, entries
 
 
-def _drive_codex_macos(tmp_path, monkeypatch, *, codex_bin, seed_existing=None):
-    """macOS variant: run `_ensure_codex_session` with is_macos()=True so the
-    hardcoded-path symlink logic runs. Returns the host_home."""
+def test_codex_subprocess_path_set_when_path_empty(tmp_path, monkeypatch):
+    codex_bin = "/opt/homebrew/bin/codex"
+    entries = _drive_codex_env(
+        tmp_path, monkeypatch, path_value="", codex_bin=codex_bin,
+    )
+    assert entries == [str(Path(codex_bin).parent)]
+
+
+def _drive_codex_macos(tmp_path, monkeypatch, *, codex_bin, seed=None):
+    """macOS variant: is_macos()=True so the hardcoded-path symlink logic
+    runs. ``seed`` pre-creates ~/.local/bin/codex: ("file", body) or
+    ("symlink", target). Returns host_home."""
     from puffo_agent.agent.adapters import local_cli as lc
 
     host_home = tmp_path / "host"
     host_home.mkdir()
-    if seed_existing is not None:
+    if seed is not None:
+        kind, value = seed
         link = host_home / ".local" / "bin" / "codex"
         link.parent.mkdir(parents=True)
-        link.write_text(seed_existing, encoding="utf-8")
+        if kind == "file":
+            link.write_text(value, encoding="utf-8")
+        else:
+            link.symlink_to(value)
     monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(lc, "is_macos", lambda: True)
@@ -210,8 +240,8 @@ def _drive_codex_macos(tmp_path, monkeypatch, *, codex_bin, seed_existing=None):
 
 
 def test_codex_symlinks_hardcoded_path_on_macos(tmp_path, monkeypatch):
-    # ~/.local/bin/codex absent → symlinked to the resolved binary so codex's
-    # fs-sandbox self-invoke (hardcoded path) resolves.
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
     host_home = _drive_codex_macos(
         tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
     )
@@ -221,11 +251,47 @@ def test_codex_symlinks_hardcoded_path_on_macos(tmp_path, monkeypatch):
 
 
 def test_codex_symlink_does_not_clobber_existing(tmp_path, monkeypatch):
-    # A real ~/.local/bin/codex is left untouched (create-if-absent only).
     host_home = _drive_codex_macos(
         tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
-        seed_existing="#!/bin/sh\n",
+        seed=("file", "#!/bin/sh"),
     )
     existing = host_home / ".local" / "bin" / "codex"
     assert not existing.is_symlink()
-    assert existing.read_text() == "#!/bin/sh\n"
+    assert existing.read_text() == "#!/bin/sh"
+
+
+def test_codex_symlink_repoints_dangling_link(tmp_path, monkeypatch):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
+    # A stale link from a moved install must be re-pointed, not skipped.
+    host_home = _drive_codex_macos(
+        tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
+        seed=("symlink", str(tmp_path / "gone" / "codex")),
+    )
+    link = host_home / ".local" / "bin" / "codex"
+    assert link.is_symlink()
+    assert os.readlink(link) == "/opt/homebrew/bin/codex"
+
+
+def test_codex_symlink_leaves_live_link_alone(tmp_path, monkeypatch):
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
+    other = tmp_path / "other-codex"
+    other.write_text("x", encoding="utf-8")
+    host_home = _drive_codex_macos(
+        tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
+        seed=("symlink", str(other)),
+    )
+    link = host_home / ".local" / "bin" / "codex"
+    assert os.readlink(link) == str(other)
+
+
+def test_codex_symlink_oserror_is_nonfatal(tmp_path, monkeypatch):
+    def _boom(self, *_a, **_k):
+        raise OSError("no privilege")
+
+    monkeypatch.setattr(Path, "symlink_to", _boom)
+    host_home = _drive_codex_macos(
+        tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
+    )
+    assert not (host_home / ".local" / "bin" / "codex").exists()
