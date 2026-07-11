@@ -62,3 +62,14 @@ def test_codex_session_stores_timeout():
         task_timeout_seconds=42.0,
     )
     assert s.task_timeout_seconds == 42.0
+
+
+def test_timeout_budget_label():
+    # PUF-375 (b') sub-60s polish: minutes when >=60s, else seconds — never
+    # a nonsensical "0-minute".
+    from puffo_agent.agent.adapters.codex_session import _timeout_budget_label
+    assert _timeout_budget_label(600.0) == "10-minute"
+    assert _timeout_budget_label(1800.0) == "30-minute"
+    assert _timeout_budget_label(90.0) == "1-minute"
+    assert _timeout_budget_label(45.0) == "45-second"
+    assert _timeout_budget_label(5.0) == "5-second"

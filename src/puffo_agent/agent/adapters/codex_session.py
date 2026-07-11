@@ -101,6 +101,14 @@ def _looks_like_codex_thread_limit(err_text: str) -> bool:
     return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
 
+def _timeout_budget_label(seconds: float) -> str:
+    """Human label for a turn-timeout budget: minutes when >=60s, else seconds
+    (so a sub-minute budget doesn't render as a nonsensical '0-minute')."""
+    if seconds >= 60:
+        return f"{int(seconds // 60)}-minute"
+    return f"{int(seconds)}-second"
+
+
 # Verbatim Codex auth-failure signals — anchored so we don't auto-flip on
 # legitimate model/quota errors. ``invalid thread id ... found 0`` is a
 # downstream symptom of an empty conversation_id, not auth — kept out.
@@ -366,11 +374,12 @@ class CodexSession:
                     # PUF-375 (b'): replace the bare empty reply with an
                     # operator-facing line so a timeout doesn't surface as
                     # silence. Routed as a normal reply by core.py.
-                    timeout_min = int(self.task_timeout_seconds // 60)
                     return TurnResult(
                         reply=(
-                            f"⏱ Task exceeded the {timeout_min}-minute timeout; "
-                            "the codex session state was cleared for the next turn."
+                            f"⏱ Task exceeded the "
+                            f"{_timeout_budget_label(self.task_timeout_seconds)} "
+                            "timeout; the codex session state was cleared for "
+                            "the next turn."
                         ),
                         metadata={
                             "codex_turn_timeout": True,
