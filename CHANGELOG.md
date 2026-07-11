@@ -8,6 +8,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Profile edits now take effect on refresh — a changed prompt forces a
+  fresh CLI session (PUF-36).** The CLI bakes the system prompt at
+  session creation, so `--resume` replayed the old one and profile edits
+  appeared silently ignored. The refresh path now compares the rebuilt
+  prompt's primer + profile slice against the current one and drops the
+  session only when that slice actually changed: memory-only rebuilds,
+  no-op refreshes (host-sync, skill installs), display_name/role-chip
+  edits, restarts, and model swaps all keep the conversation; an
+  explicit `refresh(session=True)` still always drops it.
+
+- **Role edits reach the agent's prompt.** Editing role from the web
+  updated `agent.yml` and the server identity but never the
+  `**Role:**` line in `profile.md`, so the in-prompt role stayed stale
+  on both edit paths (local bridge + control-WS). Both now rewrite the
+  first `**Role:**` line; custom profiles without one are untouched.
+
 - **Over-limit message bursts no longer drop the whole batch (PUF-363).**
   When a thread's queued messages would, concatenated into the single
   per-turn input block, exceed the harness input-byte budget (Claude
