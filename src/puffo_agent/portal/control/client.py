@@ -11,6 +11,7 @@ import logging
 
 import aiohttp
 
+from ...crypto.http_session import create_remote_http_session
 from ..state import (
     AgentConfig,
     agent_yml_path,
@@ -386,7 +387,7 @@ class MachineControlClient:
         if not pairings:
             return
         base = next(iter(pairings.values())).server_url.rstrip("/")
-        async with aiohttp.ClientSession() as session:
+        async with create_remote_http_session(base) as session:
             async with session.ws_connect(_ws_url(base), heartbeat=None) as ws:
                 await self._send(ws, machine_auth.ws_connect_frame(self.machine))
                 # Initial capability snapshot on connect.
@@ -548,7 +549,7 @@ class ControlManager:
                     body = json.dumps({"agents": len(discover_agents())}).encode()
                     headers = machine_auth.signed_headers(machine, "POST", "/v2/machines/me", body)
                     headers["content-type"] = "application/json"
-                    async with aiohttp.ClientSession() as session:
+                    async with create_remote_http_session(base) as session:
                         await session.post(f"{base}/v2/machines/me", data=body, headers=headers)
             except Exception as exc:  # noqa: BLE001 — best-effort liveness
                 log.debug("control: /me report failed: %s", exc)

@@ -18,6 +18,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   "reduce or split" reply and every message in it went unprocessed.
   Codex gets a 4MB safety-net ceiling (it has no adapter input cap).
 
+- **Relay TLS now trusts certifi's CA bundle, so linking works on hosts
+  without a populated OpenSSL cert store.** Linking against
+  `https://chat.puffo.ai` died with `SSL: CERTIFICATE_VERIFY_FAILED —
+  unable to get local issuer certificate` on interpreters whose ambient
+  cert store isn't set up (python.org's macOS Python before running
+  "Install Certificates.command", some uv-managed builds); local testing
+  never caught it because it ran against plain `http://localhost:3000`.
+  `create_remote_http_session` now builds a module-level SSL context
+  that trusts the system store PLUS certifi's bundle (so corporate-proxy
+  roots keep working) and applies it to both the SOCKS `ProxyConnector`
+  and the default `TCPConnector`, and
+  every relay-facing HTTPS/WSS call site (link code mint / redeem /
+  approval poll / unlink, the control-WS reverse channel + `/me` liveness,
+  active-recipient fetch, slug-binding finalize) now routes through that
+  factory instead of a bare `aiohttp.ClientSession()`. `certifi` is now a
+  declared dependency.
+
 ### Changed
 
 - **Long-message redaction thresholds raised to 16000/8000 chars**

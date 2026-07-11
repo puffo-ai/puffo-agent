@@ -37,6 +37,8 @@ dependencies = [
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
     "anthropic>=0.25",
+    # Relay TLS trust bundle for hosts with an empty OpenSSL cert store.
+    "certifi>=2024.2.2",
     "cryptography>=43.0",
     "mcp>=1.0",
     # Pillow: dimension-check + downscale inbound image attachments so

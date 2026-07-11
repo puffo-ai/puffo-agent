@@ -87,7 +87,9 @@ class _FakeSession:
 
 def _patch_session(monkeypatch, routes):
     session = _FakeSession(routes)
-    monkeypatch.setattr(link_mod.aiohttp, "ClientSession", lambda *a, **k: session)
+    monkeypatch.setattr(
+        link_mod, "create_remote_http_session", lambda *a, **k: session
+    )
     return session
 
 

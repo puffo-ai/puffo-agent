@@ -9,8 +9,7 @@ import socket
 import sys
 import webbrowser
 
-import aiohttp
-
+from ...crypto.http_session import create_remote_http_session
 from ..api.ownership import is_owner
 from ..state import AgentConfig, discover_agents
 from . import machine_auth
@@ -107,7 +106,7 @@ async def mint_link_code(server_url: str, hostname: str) -> tuple[str, str]:
     ``(code, base)``; the machine private key never leaves disk."""
     machine = load_or_create_machine()
     base = server_url.rstrip("/")
-    async with aiohttp.ClientSession() as session:
+    async with create_remote_http_session(base) as session:
         cert = machine_auth.machine_cert(machine, hostname)
         async with session.post(f"{base}/v2/machines", json={"machine_cert": cert}) as resp:
             if resp.status != 200:
@@ -132,7 +131,7 @@ async def redeem_link_code(server_url: str, hostname: str, code: str) -> str:
     machine = load_or_create_machine()
     base = server_url.rstrip("/")
     path = f"/v2/machines/links/{code}/redeem"
-    async with aiohttp.ClientSession() as session:
+    async with create_remote_http_session(base) as session:
         cert = machine_auth.machine_cert(machine, hostname)
         async with session.post(f"{base}/v2/machines", json={"machine_cert": cert}) as resp:
             if resp.status != 200:
@@ -156,7 +155,7 @@ async def await_link_approval(
     where status is ``approved`` / ``expired`` / ``timeout``."""
     machine = load_or_create_machine()
     waited = 0.0
-    async with aiohttp.ClientSession() as session:
+    async with create_remote_http_session(base) as session:
         while waited < timeout:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
             waited += POLL_INTERVAL_SECONDS
@@ -355,7 +354,7 @@ async def run_unlink(operator_slug: str, expected_server_url: str | None = None)
     headers = machine_auth.signed_headers(machine, "POST", "/v2/machines/links/unlink", body)
     headers["content-type"] = "application/json"
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_remote_http_session(base) as session:
             async with session.post(
                 f"{base}/v2/machines/links/unlink", data=body, headers=headers
             ) as resp:
