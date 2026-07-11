@@ -421,6 +421,21 @@ class LocalCLIAdapter(Adapter):
                 "@openai/codex`), Codex.app, or set "
                 "``PUFFO_CODEX_BIN=/abs/path/to/codex``."
             )
+        # PUF-372: codex's own tools re-invoke `codex` by NAME via execvp (the
+        # `view_image` tool is the observed case). The daemon spawns codex by
+        # absolute path, but on macOS the LaunchAgent PATH is narrow and misses
+        # the resolver's dirs (`/opt/homebrew/bin`, the Codex.app bundle), so
+        # that in-process `execvp("codex")` fails with "No such file or
+        # directory". Guarantee the resolved binary's own dir is on the
+        # subprocess PATH. Idempotent — no-op when it's already the first entry.
+        codex_bin_dir = str(Path(codex_bin).parent)
+        existing_path = env.get("PATH", "")
+        if codex_bin_dir and codex_bin_dir not in existing_path.split(os.pathsep):
+            env["PATH"] = (
+                codex_bin_dir + os.pathsep + existing_path
+                if existing_path
+                else codex_bin_dir
+            )
         argv = [codex_bin, "app-server"]
 
         codex_audit = AuditLog(

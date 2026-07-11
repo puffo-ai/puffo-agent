@@ -126,3 +126,56 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
     servers = doc.get("mcp_servers") or {}
     assert "fs_custom" in servers
     assert "fs_default_should_be_ignored" not in servers
+
+
+# ── PUF-372: codex subprocess PATH shim ────────────────────────────
+
+
+def _drive_codex_env(tmp_path, monkeypatch, *, path_value, codex_bin):
+    """Run `_ensure_codex_session` far enough to build the subprocess env,
+    capturing it at CodexSession construction (mocked to stop before spawn)."""
+    from puffo_agent.agent.adapters import local_cli as lc
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setenv("PATH", path_value)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    monkeypatch.setattr(lc, "resolve_codex_bin", lambda: codex_bin)
+
+    captured: dict = {}
+
+    class _StopCodexSession:
+        def __init__(self, *a, env=None, **k):
+            captured["env"] = env
+            raise RuntimeError("stop before spawn")
+
+    monkeypatch.setattr(lc, "CodexSession", _StopCodexSession)
+
+    adapter = _make_adapter(tmp_path)
+    with pytest.raises(RuntimeError):
+        adapter._ensure_codex_session()
+    return captured["env"]["PATH"].split(os.pathsep)
+
+
+def test_codex_subprocess_path_prepends_binary_dir(tmp_path, monkeypatch):
+    # Narrow PATH missing the codex bin dir → the resolved binary's own dir is
+    # prepended so codex's in-process execvp("codex") (view_image) resolves.
+    entries = _drive_codex_env(
+        tmp_path, monkeypatch,
+        path_value="/usr/bin:/bin",
+        codex_bin="/opt/homebrew/bin/codex",
+    )
+    assert entries[0] == "/opt/homebrew/bin", entries
+    assert "/usr/bin" in entries  # original PATH preserved
+
+
+def test_codex_subprocess_path_idempotent_when_dir_present(tmp_path, monkeypatch):
+    # Bin dir already on PATH → not duplicated.
+    entries = _drive_codex_env(
+        tmp_path, monkeypatch,
+        path_value="/opt/homebrew/bin:/usr/bin",
+        codex_bin="/opt/homebrew/bin/codex",
+    )
+    assert entries.count("/opt/homebrew/bin") == 1, entries
