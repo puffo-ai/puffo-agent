@@ -10,6 +10,18 @@ from .memory import MemoryManager
 
 MAX_LOG_ENTRIES = 60
 
+# Prepended to the newest inbound message(s) at turn-construction time so the
+# model doesn't re-answer earlier messages replayed from ``self.log`` (the
+# "re-answer" bug: a stateless turn replays the whole buffer, and with no
+# marker the model sometimes fires an extra send_message for an already-handled
+# question). Applied only to a per-turn COPY of the log — never persisted, so it
+# never accumulates across turns.
+_NEW_MESSAGE_BOUNDARY = (
+    "[conversation boundary — everything above this line is earlier conversation "
+    "you have ALREADY responded to; do NOT answer any of it again. Reply only to "
+    "the new message(s) below.]\n"
+)
+
 
 class AgentAPIError(Exception):
     """Raised when adapter output contains ``API Error``. Signals the
@@ -191,6 +203,7 @@ class PuffoAgent:
             channel_name=channel_meta.get("channel_name", ""),
             sender=last_msg.get("sender_slug", ""),
             on_progress=on_progress,
+            new_count=len(batch),
         )
 
     async def handle_api_error_retry(
@@ -284,11 +297,29 @@ class PuffoAgent:
         self._append_assistant(channel_meta.get("channel_name", ""), fallback)
         return fallback
 
+    def _messages_with_boundary(self, new_count: int) -> list[dict]:
+        """Per-turn copy of ``self.log`` with the newest ``new_count`` inbound
+        message(s) preceded by a boundary marker, so replayed history isn't
+        re-answered. Never mutates ``self.log`` (marker is not persisted).
+
+        No marker when the whole log IS the new batch (nothing prior to
+        disambiguate) — the first-ever turn stays clean.
+        """
+        messages = list(self.log)
+        if new_count < 1 or len(messages) <= new_count:
+            return messages
+        idx = len(messages) - new_count  # first of the new message(s)
+        marked = dict(messages[idx])
+        marked["content"] = _NEW_MESSAGE_BOUNDARY + marked["content"]
+        messages[idx] = marked
+        return messages
+
     async def _run_turn_and_route(
         self,
         channel_name: str,
         sender: str,
         on_progress=None,
+        new_count: int = 1,
     ) -> str | None:
         """Shared tail for ``handle_message`` and ``handle_message_batch``.
         Runs one adapter turn against the current ``self.log`` and
@@ -296,7 +327,7 @@ class PuffoAgent:
         """
         ctx = TurnContext(
             system_prompt=self.system_prompt,
-            messages=list(self.log),
+            messages=self._messages_with_boundary(new_count),
             workspace_dir=self.workspace_dir,
             claude_dir=self.claude_dir,
             memory_dir=self.memory_dir,
