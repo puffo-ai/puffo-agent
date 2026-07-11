@@ -21,6 +21,7 @@ from typing import Awaitable, Callable, Optional
 
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
+from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
 from ..agent.status_reporter import StatusReporter
 from .runtime_matrix import (
     RUNTIME_CLI_DOCKER,

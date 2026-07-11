@@ -34,6 +34,7 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from ..limits import MESSAGE_SEGMENT_CHARS
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
 
