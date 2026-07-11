@@ -98,6 +98,21 @@ def test_bundle_paths_per_platform(platform_value, want_first, monkeypatch):
         assert want_first in str(paths[0]).lower()
 
 
+def test_darwin_bundle_paths_include_chatgpt_app(monkeypatch):
+    # PUF-372 follow-up: ChatGPT.app bundles codex after the desktop-app
+    # update that moved the binary out of Codex.app — both must be covered.
+    monkeypatch.setattr(cli_bin.sys, "platform", "darwin")
+    paths = [p.as_posix() for p in cli_bin._codex_bundle_paths()]
+    assert "/Applications/ChatGPT.app/Contents/Resources/codex" in paths
+    assert any(
+        p.endswith("Applications/ChatGPT.app/Contents/Resources/codex")
+        and p != "/Applications/ChatGPT.app/Contents/Resources/codex"
+        for p in paths
+    ), "expected the ~/Applications ChatGPT.app path too"
+    # Codex.app paths retained (added, not replaced).
+    assert "/Applications/Codex.app/Contents/Resources/codex" in paths
+
+
 def test_hermes_env_override_wins(tmp_path, monkeypatch):
     """``$PUFFO_HERMES_BIN`` beats PATH + bundle paths."""
     fake = _make_exe(tmp_path, "fake_hermes")

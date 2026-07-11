@@ -286,6 +286,28 @@ def test_codex_symlink_leaves_live_link_alone(tmp_path, monkeypatch):
     assert os.readlink(link) == str(other)
 
 
+def test_codex_not_found_error_is_legible(tmp_path, monkeypatch):
+    # PUF-372 follow-up: the pre-spawn "not found" error must name ChatGPT.app
+    # and the restart-after-app-update remedy, not a bare red.
+    from puffo_agent.agent.adapters import local_cli as lc
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(lc, "is_macos", lambda: False)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    monkeypatch.setattr(lc, "resolve_codex_bin", lambda: None)
+
+    adapter = _make_adapter(tmp_path)
+    with pytest.raises(RuntimeError) as ei:
+        adapter._ensure_codex_session()
+    msg = str(ei.value)
+    assert "codex binary not found" in msg
+    assert "ChatGPT.app" in msg
+    assert "restart puffo-agent" in msg
+
+
 def test_codex_symlink_oserror_is_nonfatal(tmp_path, monkeypatch):
     def _boom(self, *_a, **_k):
         raise OSError("no privilege")
