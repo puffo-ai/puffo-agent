@@ -646,16 +646,14 @@ def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypa
         refresh_session_flag=tmp_path / "refresh_session.flag",
     ))
     assert puffo.system_prompt == "new prompt"
-    # PUF-36: a prompt rebuild now forces a fresh session (with_session=True)
-    # so the new prompt actually applies instead of being shadowed by --resume.
     assert adapter.reload_calls == [("new prompt", True)]
     assert not agent_flag.exists()
 
 
 def test_process_refresh_flags_prompt_rebuild_forces_fresh_session(tmp_path, monkeypatch):
-    """PUF-36: rebuilding the managed prompt (agent flag) drops the CLI
-    session even without an explicit session flag, so the next spawn doesn't
-    ``--resume`` a stale baked system prompt."""
+    """A rebuild that changed the prompt drops the CLI session even without
+    an explicit session flag — ``--resume`` would replay the stale baked
+    system prompt."""
     from puffo_agent.portal import worker as worker_mod
     monkeypatch.setattr(
         worker_mod, "_rebuild_managed_system_prompt", lambda **_: "rebuilt",
@@ -679,3 +677,94 @@ def test_process_refresh_flags_prompt_rebuild_forces_fresh_session(tmp_path, mon
         refresh_session_flag=tmp_path / "refresh_session.flag",  # NOT set
     ))
     assert adapter.reload_calls == [("rebuilt", True)]
+
+
+def test_process_refresh_flags_unchanged_rebuild_keeps_session(tmp_path, monkeypatch):
+    """A rebuild that produced the SAME prompt preserves the conversation —
+    only an actual prompt change forces the fresh session."""
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "same",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="same")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert adapter.reload_calls == [("same", False)]
+    assert not agent_flag.exists()
+
+
+def test_process_refresh_flags_session_flag_wins_over_unchanged_rebuild(tmp_path, monkeypatch):
+    """An explicit session flag drops the session even when the rebuilt
+    prompt is unchanged."""
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "same",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="same")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+    session_flag = tmp_path / "refresh_session.flag"
+    session_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=session_flag,
+    ))
+    assert adapter.reload_calls == [("same", True)]
+    assert not session_flag.exists()
+
+
+def test_process_refresh_flags_rebuild_failure_keeps_session(tmp_path, monkeypatch):
+    """If the rebuild raises, the old prompt reloads and the session is
+    preserved (nothing changed, so nothing to force)."""
+    from puffo_agent.portal import worker as worker_mod
+
+    def _boom(**_):
+        raise RuntimeError("rebuild failed")
+
+    monkeypatch.setattr(worker_mod, "_rebuild_managed_system_prompt", _boom)
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="old prompt")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert adapter.reload_calls == [("old prompt", False)]
+    assert not agent_flag.exists()
