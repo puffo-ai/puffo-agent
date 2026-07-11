@@ -421,6 +421,44 @@ class LocalCLIAdapter(Adapter):
                 "@openai/codex`), Codex.app, or set "
                 "``PUFFO_CODEX_BIN=/abs/path/to/codex``."
             )
+        # codex's fs-sandbox helper self-invokes via the hardcoded path
+        # ~/.local/bin/codex (PATH can't fix an absolute execvp) — point
+        # it at the resolved binary; never touch a real file or live link.
+        if is_macos():
+            hardcoded = Path.home() / ".local" / "bin" / "codex"
+            if not hardcoded.exists():
+                try:
+                    hardcoded.parent.mkdir(parents=True, exist_ok=True)
+                    if hardcoded.is_symlink():
+                        hardcoded.unlink()
+                    hardcoded.symlink_to(codex_bin)
+                    logger.info(
+                        "agent %s: symlinked %s -> %s for codex fs-sandbox "
+                        "self-invoke", self.agent_id, hardcoded, codex_bin,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "agent %s: could not create ~/.local/bin/codex "
+                        "symlink (%s); codex view_image may fail", self.agent_id, exc,
+                    )
+
+        # Name-based re-invokes: the binary's dir goes on the subprocess PATH.
+        codex_bin_dir = str(Path(codex_bin).parent)
+        existing_path = env.get("PATH", "")
+        existing_dirs = {
+            os.path.normcase(os.path.normpath(p))
+            for p in existing_path.split(os.pathsep)
+            if p
+        }
+        if (
+            codex_bin_dir
+            and os.path.normcase(os.path.normpath(codex_bin_dir)) not in existing_dirs
+        ):
+            env["PATH"] = (
+                codex_bin_dir + os.pathsep + existing_path
+                if existing_path
+                else codex_bin_dir
+            )
         argv = [codex_bin, "app-server"]
 
         codex_audit = AuditLog(

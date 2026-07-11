@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **codex `view_image` (and other self-invoking codex tools) work on
+  macOS hosts where codex isn't at `~/.local/bin/codex` (PUF-372).**
+  codex's fs-sandbox helper re-invokes the CLI via that hardcoded path,
+  which doesn't exist on Homebrew / Codex.app installs — the tool died
+  with `execvp() ... No such file or directory`. The daemon now points
+  `~/.local/bin/codex` at the resolved binary before spawning (a real
+  file or live symlink there is never touched; a dangling link from a
+  moved install is re-pointed) and additionally prepends the binary's
+  dir to the subprocess `PATH` for name-based re-invokes.
+
 - **cli-docker no longer injects host-local MCP configs that can't run in
   the container (PUF-34).** Host-sync now recognizes macOS host-only
   paths (`/opt/homebrew`, `/opt/local`, `/Volumes`, `/private`) and also
