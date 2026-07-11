@@ -421,13 +421,34 @@ class LocalCLIAdapter(Adapter):
                 "@openai/codex`), Codex.app, or set "
                 "``PUFFO_CODEX_BIN=/abs/path/to/codex``."
             )
-        # PUF-372: codex's own tools re-invoke `codex` by NAME via execvp (the
-        # `view_image` tool is the observed case). The daemon spawns codex by
-        # absolute path, but on macOS the LaunchAgent PATH is narrow and misses
-        # the resolver's dirs (`/opt/homebrew/bin`, the Codex.app bundle), so
-        # that in-process `execvp("codex")` fails with "No such file or
-        # directory". Guarantee the resolved binary's own dir is on the
-        # subprocess PATH. Idempotent — no-op when it's already the first entry.
+        # PUF-372 (primary fix — confirmed on two hosts, Ted + Denzel):
+        # codex's macOS fs-sandbox helper (`sandbox-exec`) self-invokes the CLI
+        # at a HARDCODED path `~/.local/bin/codex`, e.g.
+        #   sandbox-exec: execvp() of '/Users/x/.local/bin/codex' failed
+        # When codex is installed elsewhere (Homebrew, Codex.app) that path is
+        # absent → the self-invoke fails and tools like `view_image` break. A
+        # subprocess-PATH tweak can't fix an execvp of an absolute path, so we
+        # "ride the hardcode": symlink `~/.local/bin/codex` to the resolved
+        # binary. Create-if-absent only — never clobber a real file/link there.
+        if is_macos():
+            hardcoded = Path.home() / ".local" / "bin" / "codex"
+            if not hardcoded.exists() and not hardcoded.is_symlink():
+                try:
+                    hardcoded.parent.mkdir(parents=True, exist_ok=True)
+                    hardcoded.symlink_to(codex_bin)
+                    logger.info(
+                        "agent %s: symlinked %s -> %s for codex fs-sandbox "
+                        "self-invoke", self.agent_id, hardcoded, codex_bin,
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "agent %s: could not create ~/.local/bin/codex "
+                        "symlink (%s); codex view_image may fail", self.agent_id, exc,
+                    )
+
+        # Secondary belt-and-suspenders: also put the resolved binary's dir on
+        # the subprocess PATH, in case any codex code path re-invokes by bare
+        # name rather than the hardcoded absolute path. Idempotent.
         codex_bin_dir = str(Path(codex_bin).parent)
         existing_path = env.get("PATH", "")
         if codex_bin_dir and codex_bin_dir not in existing_path.split(os.pathsep):
