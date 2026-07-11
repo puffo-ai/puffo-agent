@@ -32,6 +32,7 @@ log = logging.getLogger("puffo_agent.control")
 
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
+USAGE_INTERVAL_SECONDS = 60.0
 RESCAN_SECONDS = 5.0
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
@@ -525,6 +526,7 @@ class ControlManager:
         machine = None
         ws_task: asyncio.Task | None = None
         me_task: asyncio.Task | None = None
+        usage_task: asyncio.Task | None = None
         try:
             while not self._stop.is_set():
                 pairings = load_pairings()
@@ -534,13 +536,15 @@ class ControlManager:
                     client = MachineControlClient(machine)
                     ws_task = asyncio.create_task(client.run(self._stop))
                     me_task = asyncio.create_task(self._me_loop(machine))
+                    usage_task = asyncio.create_task(self._usage_loop(machine))
                 if not pairings and ws_task is not None:
                     ws_task.cancel()
                     me_task.cancel()
-                    ws_task = me_task = None
+                    usage_task.cancel()
+                    ws_task = me_task = usage_task = None
                 await _sleep_or_stop(self._stop, RESCAN_SECONDS)
         finally:
-            for t in (ws_task, me_task):
+            for t in (ws_task, me_task, usage_task):
                 if t is not None:
                     t.cancel()
 
@@ -558,6 +562,38 @@ class ControlManager:
             except Exception as exc:  # noqa: BLE001 — best-effort liveness
                 log.debug("control: /me report failed: %s", exc)
             await _sleep_or_stop(self._stop, ME_INTERVAL_SECONDS)
+
+    async def _usage_loop(self, machine) -> None:
+        """PUF-364: flush accrued per-harness token deltas to the server on a
+        cadence. Commit-on-2xx: a failed/dropped POST is retried next tick
+        with the same deltas, so usage is neither lost nor double-counted."""
+        from .reporter import get_reporter
+
+        while not self._stop.is_set():
+            try:
+                snap = get_reporter().snapshot_usage()
+                pairings = load_pairings()
+                if snap and pairings:
+                    base = next(iter(pairings.values())).server_url.rstrip("/")
+                    path = f"/v2/machines/{machine.machine_id}/usage"
+                    entries = [
+                        {"harness": h, "input_tokens": i, "output_tokens": o}
+                        for h, (i, o) in snap.items()
+                    ]
+                    body = json.dumps({"entries": entries}).encode()
+                    headers = machine_auth.signed_headers(machine, "POST", path, body)
+                    headers["content-type"] = "application/json"
+                    async with create_remote_http_session(base) as session:
+                        resp = await session.post(
+                            f"{base}{path}", data=body, headers=headers
+                        )
+                        if resp.status < 300:
+                            get_reporter().commit_usage_sent(snap)
+                        else:
+                            log.debug("control: usage report HTTP %s", resp.status)
+            except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
+                log.debug("control: usage report failed: %s", exc)
+            await _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS)
 
     def stop(self) -> None:
         self._stop.set()

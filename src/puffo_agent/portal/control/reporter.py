@@ -27,6 +27,11 @@ class AgentStatusReporter:
         self._sender: Sender | None = None
         self._machine = None
         self._cache: dict[str, tuple[float, list[agent_message.Recipient]]] = {}
+        # PUF-364: per-harness token deltas accrued since the last successful
+        # report; drained by the control manager's usage loop. Values are
+        # [input_sum, output_sum]. Sync-only mutation (single event loop).
+        self._usage: dict[str, list[int]] = {}
+        self._harness_cache: dict[str, str] = {}
 
     def set_sender(self, sender: Sender | None) -> None:
         """Called by the control client: a sender while the WS is up, None on drop."""
@@ -79,6 +84,44 @@ class AgentStatusReporter:
             self._machine_identity(), recipients, payload
         )
         await self._sender(operator_slug, envelope)
+
+    def record_turn_usage(
+        self, agent_slug: str, input_tokens: int, output_tokens: int
+    ) -> None:
+        """Accrue a turn's token counts against the agent's harness. Drained
+        per (machine, harness) by the control manager's usage loop."""
+        if input_tokens <= 0 and output_tokens <= 0:
+            return
+        harness = self._harness(agent_slug)
+        if not harness:
+            return
+        slot = self._usage.setdefault(harness, [0, 0])
+        slot[0] += max(0, input_tokens)
+        slot[1] += max(0, output_tokens)
+
+    def snapshot_usage(self) -> dict[str, tuple[int, int]]:
+        """Non-zero accrued deltas per harness. The loop POSTs these then calls
+        ``commit_usage_sent`` to subtract exactly what was sent, so turns
+        accruing during the in-flight POST are preserved rather than lost."""
+        return {h: (v[0], v[1]) for h, v in self._usage.items() if v[0] or v[1]}
+
+    def commit_usage_sent(self, sent: dict[str, tuple[int, int]]) -> None:
+        for harness, (inp, out) in sent.items():
+            slot = self._usage.get(harness)
+            if slot is not None:
+                slot[0] -= inp
+                slot[1] -= out
+
+    def _harness(self, agent_slug: str) -> str | None:
+        hit = self._harness_cache.get(agent_slug)
+        if hit is not None:
+            return hit
+        try:
+            harness = AgentConfig.load(agent_slug).runtime.harness or "claude-code"
+        except Exception:  # noqa: BLE001
+            return None
+        self._harness_cache[agent_slug] = harness
+        return harness
 
     def _machine_identity(self):
         if self._machine is None:

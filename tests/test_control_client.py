@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import types
 
 import pytest
@@ -124,3 +125,95 @@ async def test_create_without_pending_token_rejected(home):
     )
     assert res["ok"] is False
     assert "pending_token" in res["error"]
+
+
+# ── PUF-364: usage-report flush loop ───────────────────────────────
+
+
+class _FakeResp:
+    def __init__(self, status):
+        self.status = status
+
+
+class _FakeSession:
+    def __init__(self, status, calls):
+        self._status, self._calls = status, calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, data=None, headers=None):
+        self._calls.append({"url": url, "data": data, "headers": headers})
+        return _FakeResp(self._status)
+
+
+class _FakeReporter:
+    def __init__(self, snap):
+        self._snap = dict(snap)
+        self.committed = []
+
+    def snapshot_usage(self):
+        return dict(self._snap)
+
+    def commit_usage_sent(self, sent):
+        self.committed.append(sent)
+
+
+def _wire_usage(monkeypatch, *, snap, status, calls):
+    from puffo_agent.portal.control import reporter as reporter_mod
+
+    fake = _FakeReporter(snap)
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: fake)
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(server_url="https://s/", operator_root_pubkey="R"),
+    })
+    monkeypatch.setattr(cc.machine_auth, "signed_headers", lambda *a, **k: {"x-sig": "1"})
+    monkeypatch.setattr(
+        cc, "create_remote_http_session", lambda base, **k: _FakeSession(status, calls)
+    )
+
+    async def _stop_after(stop, timeout):
+        stop.set()  # run exactly one loop iteration
+
+    monkeypatch.setattr(cc, "_sleep_or_stop", _stop_after)
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_usage_loop_posts_and_commits_on_2xx(monkeypatch):
+    calls = []
+    fake = _wire_usage(
+        monkeypatch, snap={"codex": (140, 40), "claude-code": (3, 1)},
+        status=200, calls=calls,
+    )
+    await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://s/v2/machines/mac_1/usage"
+    body = json.loads(calls[0]["data"])
+    entries = {e["harness"]: (e["input_tokens"], e["output_tokens"]) for e in body["entries"]}
+    assert entries == {"codex": (140, 40), "claude-code": (3, 1)}
+    assert fake.committed == [{"codex": (140, 40), "claude-code": (3, 1)}]
+
+
+@pytest.mark.asyncio
+async def test_usage_loop_does_not_commit_on_error(monkeypatch):
+    calls = []
+    fake = _wire_usage(monkeypatch, snap={"codex": (5, 2)}, status=500, calls=calls)
+    await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
+
+    assert len(calls) == 1        # POST attempted
+    assert fake.committed == []   # not cleared → same deltas retried next tick
+
+
+@pytest.mark.asyncio
+async def test_usage_loop_skips_post_when_empty(monkeypatch):
+    calls = []
+    fake = _wire_usage(monkeypatch, snap={}, status=200, calls=calls)
+    await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
+
+    assert calls == []            # nothing accrued → no request
+    assert fake.committed == []
