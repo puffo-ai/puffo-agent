@@ -768,3 +768,71 @@ def test_process_refresh_flags_rebuild_failure_keeps_session(tmp_path, monkeypat
     ))
     assert adapter.reload_calls == [("old prompt", False)]
     assert not agent_flag.exists()
+
+
+def test_process_refresh_flags_memory_only_change_keeps_session(tmp_path, monkeypatch):
+    """A rebuild whose primer/profile slice is identical — only the memory
+    snapshot differs — preserves the conversation."""
+    from puffo_agent.agent.shared_content import MEMORY_SECTION_HEADER
+    from puffo_agent.portal import worker as worker_mod
+
+    core = "primer\n\n---\n\n# Your role\n\nprofile"
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt",
+        lambda **_: core + "\n\n" + MEMORY_SECTION_HEADER + "NEW memory\n",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt=core + "\n\n" + MEMORY_SECTION_HEADER + "old memory\n")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert len(adapter.reload_calls) == 1
+    _, with_session = adapter.reload_calls[0]
+    assert with_session is False
+    assert puffo.system_prompt.endswith("NEW memory\n")
+
+
+def test_process_refresh_flags_profile_change_with_memory_drops_session(tmp_path, monkeypatch):
+    """A profile-slice change still drops the session even when a memory
+    section is present on both sides."""
+    from puffo_agent.agent.shared_content import MEMORY_SECTION_HEADER
+    from puffo_agent.portal import worker as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt",
+        lambda **_: "NEW profile" + "\n\n" + MEMORY_SECTION_HEADER + "mem\n",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="old profile" + "\n\n" + MEMORY_SECTION_HEADER + "mem\n")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert len(adapter.reload_calls) == 1
+    _, with_session = adapter.reload_calls[0]
+    assert with_session is True

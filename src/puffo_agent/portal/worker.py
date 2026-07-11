@@ -1601,9 +1601,10 @@ async def _process_refresh_flags(
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
     Order: host sync → CLAUDE.md rebuild → session drop. A rebuild that
-    CHANGED the prompt drops the session too (the CLI bakes the system
-    prompt at session creation, so ``--resume`` would replay the old
-    one); an unchanged rebuild keeps the conversation."""
+    changed the primer/profile slice of the prompt drops the session too
+    (the CLI bakes the system prompt at session creation, so ``--resume``
+    would replay the old one); an unchanged or memory-only rebuild keeps
+    the conversation."""
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()
@@ -1642,7 +1643,16 @@ async def _process_refresh_flags(
                 memory_path=memory_path,
                 workspace_path=workspace_path,
             )
-            prompt_changed = new_prompt != puffo.system_prompt
+            from ..agent.shared_content import MEMORY_SECTION_HEADER
+
+            # Memory-only changes don't force a fresh session: the old
+            # conversation already contains what the agent just wrote.
+            def _session_core(prompt: str) -> str:
+                return prompt.split(MEMORY_SECTION_HEADER, 1)[0]
+
+            prompt_changed = _session_core(new_prompt) != _session_core(
+                puffo.system_prompt
+            )
             puffo.system_prompt = new_prompt
             logger.info(
                 "agent %s: system prompt rebuilt from disk (changed=%s)",
