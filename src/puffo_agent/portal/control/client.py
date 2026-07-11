@@ -565,8 +565,10 @@ class ControlManager:
 
     async def _usage_loop(self, machine) -> None:
         """PUF-364: flush accrued per-harness token deltas to the server on a
-        cadence. Commit-on-2xx: a failed/dropped POST is retried next tick
-        with the same deltas, so usage is neither lost nor double-counted."""
+        cadence. Commit-on-observed-2xx: a failed/unreachable POST retries next
+        tick (at-least-once, no loss); the trade-off is a rare over-count if the
+        server commits but its 2xx response is lost, since the server side
+        accumulates unconditionally. Acceptable for approximate usage."""
         from .reporter import get_reporter
 
         while not self._stop.is_set():
