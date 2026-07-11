@@ -466,8 +466,7 @@ def _host_local_token(cfg: dict) -> str | None:
     if isinstance(cmd, str) and _looks_host_local_command(cmd):
         return cmd
     for arg in cfg.get("args") or []:
-        # /tmp exists in the container, so a /tmp arg (log/db output path)
-        # is fine even though a /tmp *binary* is host-staged.
+        # /tmp exists in the container: a /tmp arg is a valid output path.
         if (
             isinstance(arg, str)
             and not arg.startswith("/tmp/")
@@ -515,8 +514,6 @@ def sync_host_mcp_servers(
     for name, cfg in host_servers.items():
         token = _host_local_token(cfg)
         if token is not None:
-            # Skip rather than inject a dead server config; the caller
-            # logs an actionable warning off ``unreachable``.
             unreachable.append((name, token))
             continue
         agent_servers[name] = cfg

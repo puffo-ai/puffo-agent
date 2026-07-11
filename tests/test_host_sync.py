@@ -283,17 +283,13 @@ def test_sync_host_mcp_skips_host_local_and_flags_them(tmp_path):
 
     merged, unreachable = sync_host_mcp_servers(host, agent)
 
-    # Only the 3 container-resolvable servers are merged.
     assert merged == 3
     flagged_names = sorted(name for name, _ in unreachable)
     assert flagged_names == [
         "brew-local", "linux-home", "mac-local", "volume-arg", "windows",
     ]
-    # The dead host-local configs are NOT written into the agent file.
     written = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
     assert sorted(written["mcpServers"]) == ["bare-ok", "container-ok", "sys-ok"]
-    # The offending token (arg, not the bare command) is reported for the
-    # args-hidden case so the warning is actionable.
     assert dict(unreachable)["volume-arg"] == "/Volumes/tools/mcp"
 
 
@@ -633,11 +629,9 @@ def test_looks_host_local_command_opt_container_pkg_not_flagged():
 
 
 def test_host_local_token_scans_command_and_args():
-    # Host-local via the command.
     assert _host_local_token(
         {"command": "/opt/homebrew/bin/mcp", "args": []}
     ) == "/opt/homebrew/bin/mcp"
-    # Host-local hidden in an arg behind a bare launcher.
     assert _host_local_token(
         {"command": "uvx", "args": ["--from", "/Volumes/tools/mcp", "run"]}
     ) == "/Volumes/tools/mcp"
@@ -645,13 +639,10 @@ def test_host_local_token_scans_command_and_args():
     assert _host_local_token(
         {"command": "npx", "args": ["-y", "@scope/pkg"]}
     ) is None
-    # /tmp args are container-valid output paths, not host binaries.
     assert _host_local_token(
         {"command": "npx", "args": ["--log", "/tmp/mcp.log"]}
     ) is None
-    # ...but a /tmp *command* is still a host-staged binary.
     assert _host_local_token({"command": "/tmp/adhoc-server", "args": []}) == "/tmp/adhoc-server"
-    # Non-dict / missing fields tolerated.
     assert _host_local_token({}) is None
     assert _host_local_token("not-a-dict") is None
 
@@ -907,3 +898,61 @@ def test_sync_host_gemini_mcp_servers_flags_host_local_commands(tmp_path):
     n, unreachable = sync_host_gemini_mcp_servers(host, agent)
     assert n == 1  # host-local "local" skipped, only "image" merges
     assert [name for name, _ in unreachable] == ["local"]
+
+
+def test_sync_host_mcp_corrupt_host_file_is_noop(tmp_path):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    (host).mkdir(parents=True)
+    (host / ".claude.json").write_text("{not json", encoding="utf-8")
+
+    assert sync_host_mcp_servers(host, agent) == (0, [])
+    assert not (agent / ".claude.json").exists()
+
+
+def test_sync_host_mcp_corrupt_agent_file_still_merges(tmp_path):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "mcpServers": {"ok": {"command": "npx", "args": []}},
+    })
+    (agent).mkdir(parents=True)
+    (agent / ".claude.json").write_text("{not json", encoding="utf-8")
+
+    merged, unreachable = sync_host_mcp_servers(host, agent)
+
+    assert (merged, unreachable) == (1, [])
+    written = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
+    assert "ok" in written["mcpServers"]
+
+
+def test_sync_host_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
+    import puffo_agent.portal.state as state_mod
+
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "mcpServers": {"ok": {"command": "npx", "args": []}},
+    })
+    monkeypatch.setattr(
+        state_mod.os, "replace",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    assert sync_host_mcp_servers(host, agent) == (0, [])
+
+
+def test_sync_host_gemini_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
+    import puffo_agent.portal.state as state_mod
+
+    host = tmp_path / "host"
+    project = tmp_path / "proj"
+    _write_json(host / ".gemini" / "settings.json", {
+        "mcpServers": {"ok": {"command": "npx", "args": []}},
+    })
+    monkeypatch.setattr(
+        state_mod.os, "replace",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    assert sync_host_gemini_mcp_servers(host, project) == (0, [])
