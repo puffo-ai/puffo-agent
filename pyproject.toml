@@ -37,8 +37,7 @@ dependencies = [
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
     "anthropic>=0.25",
-    # certifi's CA bundle backs relay TLS verification regardless of the
-    # host's ambient OpenSSL cert store (see crypto/http_session.py).
+    # Relay TLS trust bundle for hosts with an empty OpenSSL cert store.
     "certifi>=2024.2.2",
     "cryptography>=43.0",
     "mcp>=1.0",

@@ -11,9 +11,8 @@ from aiohttp_socks import ProxyConnector
 
 _SOCKS_SCHEMES = {"socks4", "socks4a", "socks5", "socks5h"}
 
-# System store PLUS certifi: some interpreters ship an empty ambient store
-# (python.org macOS Python before "Install Certificates.command"), while
-# corporate-proxy hosts need their OS-installed roots — trust both.
+# System store first, certifi on top: some interpreters ship an empty
+# ambient store; corporate-proxy hosts need their OS-installed roots.
 _SSL_CONTEXT = ssl.create_default_context()
 _SSL_CONTEXT.load_verify_locations(cafile=certifi.where())
 
