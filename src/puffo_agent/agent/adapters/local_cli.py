@@ -421,11 +421,9 @@ class LocalCLIAdapter(Adapter):
                 "@openai/codex`), Codex.app, or set "
                 "``PUFFO_CODEX_BIN=/abs/path/to/codex``."
             )
-        # codex's macOS fs-sandbox helper self-invokes the CLI at the
-        # hardcoded path ~/.local/bin/codex; a PATH tweak can't fix an
-        # execvp of an absolute path, so point that path at the resolved
-        # binary. A real file (or a live symlink) there is never touched;
-        # a dangling symlink from a moved install is re-pointed.
+        # codex's fs-sandbox helper self-invokes via the hardcoded path
+        # ~/.local/bin/codex (PATH can't fix an absolute execvp) — point
+        # it at the resolved binary; never touch a real file or live link.
         if is_macos():
             hardcoded = Path.home() / ".local" / "bin" / "codex"
             if not hardcoded.exists():
@@ -444,8 +442,7 @@ class LocalCLIAdapter(Adapter):
                         "symlink (%s); codex view_image may fail", self.agent_id, exc,
                     )
 
-        # Belt-and-suspenders for name-based re-invokes: the resolved
-        # binary's dir goes on the subprocess PATH.
+        # Name-based re-invokes: the binary's dir goes on the subprocess PATH.
         codex_bin_dir = str(Path(codex_bin).parent)
         existing_path = env.get("PATH", "")
         existing_dirs = {
