@@ -21,6 +21,7 @@ from typing import Awaitable, Callable, Optional
 
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
+from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
 from ..agent.status_reporter import StatusReporter
 from .runtime_matrix import (
     RUNTIME_CLI_DOCKER,
@@ -354,7 +355,11 @@ def _build_puffo_core_client(
     the dataclass defaults.
     """
     from ..agent.message_store import MessageStore
-    from ..agent.puffo_core_client import PuffoCoreMessageClient, max_image_edge_px
+    from ..agent.puffo_core_client import (
+        DEFAULT_MAX_INPUT_BYTES,
+        PuffoCoreMessageClient,
+        max_image_edge_px,
+    )
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
@@ -366,18 +371,22 @@ def _build_puffo_core_client(
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (
-        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else 4000
+        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else MAX_INLINE_MESSAGE_CHARS
     )
     segment_chars = (
-        daemon_cfg.segment_chars if daemon_cfg is not None else 2000
+        daemon_cfg.segment_chars if daemon_cfg is not None else MESSAGE_SEGMENT_CHARS
     )
 
     # The inbound-image downscale cap follows the harness's effective model
     # (Opus 4.7+ resolves 2576px, else 1568px).
-    if (agent_cfg.runtime.harness or "claude-code") == "codex":
+    is_codex = (agent_cfg.runtime.harness or "claude-code") == "codex"
+    if is_codex:
         model = agent_cfg.runtime.model or (daemon_cfg.openai.model if daemon_cfg else "")
     else:
         model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
+
+    # Codex has no adapter input cap; its ceiling is a runaway safety net.
+    max_input_bytes = 4_000_000 if is_codex else DEFAULT_MAX_INPUT_BYTES
 
     return PuffoCoreMessageClient(
         slug=pc.slug,
@@ -393,6 +402,7 @@ def _build_puffo_core_client(
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
+        max_input_bytes=max_input_bytes,
     )
 
 

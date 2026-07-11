@@ -8,7 +8,10 @@ from typing import Any
 
 import pytest
 
-from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+from puffo_agent.agent.puffo_core_client import (
+    DEFAULT_MAX_INPUT_BYTES,
+    PuffoCoreMessageClient,
+)
 from puffo_agent.agent.core import AgentAPIError
 from puffo_agent.portal.worker import Worker
 
@@ -29,6 +32,8 @@ def _make_client(max_retries: int = 1) -> PuffoCoreMessageClient:
     client.slug = "tester-1234"
     client._log = logging.getLogger("test-puf-255")
     client.MAX_API_ERROR_RETRIES = max_retries  # type: ignore[attr-defined]
+    client._queue_seq = 0
+    client._max_input_bytes = DEFAULT_MAX_INPUT_BYTES
 
     class _StubStore:
         async def mark_thread_processed(self, *args, **kwargs):

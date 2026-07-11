@@ -414,3 +414,67 @@ def test_build_puffo_core_client_threads_agent_created_at(monkeypatch, tmp_path)
         "PuffoCoreMessageClient(agent_created_at=...) "
         f"— got {captured.get('agent_created_at')!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("harness", "expected_budget"),
+    [
+        ("claude-code", 180_000),
+        ("codex", 4_000_000),
+    ],
+)
+def test_build_puffo_core_client_selects_harness_input_budget(
+    monkeypatch, tmp_path, harness, expected_budget,
+):
+    """The per-harness greedy-fill budget must thread through the worker:
+    Claude Code gets the adapter-cap default, Codex the safety-net ceiling."""
+    from puffo_agent.portal import worker
+    from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig, RuntimeConfig
+
+    cfg = AgentConfig(
+        id="agent-test-1234",
+        puffo_core=PuffoCoreConfig(
+            server_url="https://example.test",
+            slug="agent-test-1234",
+            device_id="dev-1",
+            space_id="",
+            operator_slug="",
+        ),
+        runtime=RuntimeConfig(
+            kind="chat-local",
+            harness=harness,
+        ),
+    )
+
+    monkeypatch.setattr(
+        worker, "_ensure_agent_identity_imported", lambda *_a, **_k: None,
+    )
+    captured: dict[str, object] = {}
+
+    class DummyClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.puffo_core_client.PuffoCoreMessageClient",
+        DummyClient,
+    )
+    monkeypatch.setattr(
+        "puffo_agent.crypto.keystore.KeyStore",
+        lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.message_store.MessageStore",
+        lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr(
+        AgentConfig, "resolve_workspace_dir", lambda self: tmp_path,
+    )
+
+    worker._build_puffo_core_client(cfg, "agent-test-1234")
+
+    assert captured.get("max_input_bytes") == expected_budget

@@ -34,6 +34,7 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from ..limits import MESSAGE_SEGMENT_CHARS
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
 
@@ -879,7 +880,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def get_post_segment(
         envelope_id: str,
         segment: int,
-        segment_size: int = 2000,
+        segment_size: int = MESSAGE_SEGMENT_CHARS,
     ) -> str:
         """Page a long message body back in chunks.
 
@@ -901,9 +902,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
           * unknown envelope_id → "message <id> not found in local storage"
           * empty content       → "message <id> has no text body"
 
-        ``segment_size`` defaults to 2000 to match the daemon's
-        default redaction page size; pass the value the placeholder
-        cited if the operator has overridden it on their host.
+        ``segment_size`` defaults to the daemon's default redaction
+        page size; pass the value the placeholder cited if the operator
+        has overridden it on their host.
         """
         envelope_id = (envelope_id or "").strip()
         if not envelope_id:
