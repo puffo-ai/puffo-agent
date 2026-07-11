@@ -547,6 +547,70 @@ def test_turn_failed_raises(tmp_path):
     assert "model overloaded" in err
 
 
+RECONNECT_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+msg = r()
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/failed",
+   "params": {"error": {"message": "Reconnecting... 2/5"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_reconnect_turn_routes_to_retry_not_drop(tmp_path):
+    # PUF-375 (b) ε: a mid-reconnect turn failure must surface as a (non-auth)
+    # AgentAPIError — routed to the consumer's re-enqueue/retry path so the
+    # batch isn't dropped — NOT the raw RuntimeError the worker swallows +
+    # drops (work loss) while flipping unhandled_error (false red). And it must
+    # NOT count toward the wedged threshold.
+    from puffo_agent.agent.core import AgentAPIError
+
+    fake = _write_fake(tmp_path, RECONNECT_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            await cs.run_turn("hi", "sys")
+            return ("none", None)
+        except AgentAPIError as exc:
+            return ("apierror", exc)
+        except RuntimeError as exc:
+            return ("runtime", exc)
+        finally:
+            await cs.aclose()
+
+    kind, exc = asyncio.run(_run())
+    assert kind == "apierror", f"expected AgentAPIError retry route, got {kind}"
+    assert exc.is_auth is False
+    assert "Reconnecting" in str(exc)
+    # Transient — not a wedged strike.
+    assert cs._consecutive_thread_failures == 0
+
+
+def test_looks_like_codex_reconnect():
+    from puffo_agent.agent.adapters.codex_session import _looks_like_codex_reconnect
+    assert _looks_like_codex_reconnect("codex turn failed: Reconnecting... 2/5")
+    assert _looks_like_codex_reconnect("reconnecting to backend")
+    assert not _looks_like_codex_reconnect("model overloaded")
+    assert not _looks_like_codex_reconnect("agent thread limit reached")
+    assert not _looks_like_codex_reconnect("")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # reload() updates current_instructions without restarting the process
 # ─────────────────────────────────────────────────────────────────────────────

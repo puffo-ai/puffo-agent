@@ -101,6 +101,18 @@ def _looks_like_codex_thread_limit(err_text: str) -> bool:
     return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
 
+# PUF-375 (b): codex App Server reconnecting to its backend mid-turn surfaces
+# as ``codex turn failed: Reconnecting... N/M``. It's transient + self-heals,
+# so it must NOT drop the batch or count as a wedged strike.
+_CODEX_RECONNECT_PATTERN: re.Pattern[str] = re.compile(
+    r"\bReconnecting\b", re.IGNORECASE
+)
+
+
+def _looks_like_codex_reconnect(err_text: str) -> bool:
+    return bool(_CODEX_RECONNECT_PATTERN.search(err_text or ""))
+
+
 def _timeout_budget_label(seconds: float) -> str:
     """Human label for a turn-timeout budget: minutes when >=60s, else seconds
     (so a sub-minute budget doesn't render as a nonsensical '0-minute')."""
@@ -395,6 +407,21 @@ class CodexSession:
 
         if turn_failed_exc is not None:
             err_text = str(turn_failed_exc)
+            # PUF-375 (b) ε: a mid-reconnect failure is transient — codex is
+            # re-establishing its backend and will self-heal. Route it through
+            # the retry substrate (non-auth AgentAPIError → the consumer
+            # re-enqueues the batch + backs off) instead of the raw RuntimeError
+            # that the worker swallows + drops (work loss) while flipping
+            # unhandled_error (false red). Don't count it as a wedged strike.
+            if _looks_like_codex_reconnect(err_text):
+                from ..core import AgentAPIError
+                logger.info(
+                    "agent %s: codex mid-reconnect; deferring batch for retry "
+                    "(not a wedged strike): %s", self.agent_id, err_text,
+                )
+                raise AgentAPIError(
+                    f"codex reconnecting (transient): {err_text}", is_auth=False,
+                ) from turn_failed_exc
             self._propagate_turn_outcome(
                 outcome="turn_failed", err_text=err_text,
             )
