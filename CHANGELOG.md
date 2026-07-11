@@ -25,9 +25,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   cert store isn't set up (python.org's macOS Python before running
   "Install Certificates.command", some uv-managed builds); local testing
   never caught it because it ran against plain `http://localhost:3000`.
-  `create_remote_http_session` now builds a module-level
-  `ssl.create_default_context(cafile=certifi.where())` and applies it to
-  both the SOCKS `ProxyConnector` and the default `TCPConnector`, and
+  `create_remote_http_session` now builds a module-level SSL context
+  that trusts the system store PLUS certifi's bundle (so corporate-proxy
+  roots keep working) and applies it to both the SOCKS `ProxyConnector`
+  and the default `TCPConnector`, and
   every relay-facing HTTPS/WSS call site (link code mint / redeem /
   approval poll / unlink, the control-WS reverse channel + `/me` liveness,
   active-recipient fetch, slug-binding finalize) now routes through that

@@ -116,17 +116,40 @@ def test_remote_http_session_uses_socks_proxy_env(monkeypatch):
     asyncio.run(run())
 
 
+def _assert_certifi_and_system_trust(ctx):
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    loaded = ctx.get_ca_certs()
+    certifi_only = ssl.create_default_context(cafile=certifi.where())
+    missing = [c for c in certifi_only.get_ca_certs() if c not in loaded]
+    assert not missing, f"{len(missing)} certifi CAs not loaded"
+    system_only = ssl.create_default_context()
+    missing = [c for c in system_only.get_ca_certs() if c not in loaded]
+    assert not missing, f"{len(missing)} system CAs not loaded"
+
+
 def test_remote_http_session_trusts_certifi_ca_bundle(monkeypatch):
     _clear_proxy_env(monkeypatch)
 
     async def run():
         session = create_remote_http_session("https://api.puffo.ai")
         try:
-            ctx = session.connector._ssl
-            assert isinstance(ctx, ssl.SSLContext)
-            assert ctx.verify_mode == ssl.CERT_REQUIRED
-            reference = ssl.create_default_context(cafile=certifi.where())
-            assert ctx.get_ca_certs() == reference.get_ca_certs()
+            _assert_certifi_and_system_trust(session.connector._ssl)
+        finally:
+            await session.close()
+
+    asyncio.run(run())
+
+
+def test_remote_http_session_socks_connector_gets_same_trust(monkeypatch):
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:9")
+
+    async def run():
+        session = create_remote_http_session("https://api.puffo.ai")
+        try:
+            assert isinstance(session.connector, ProxyConnector)
+            _assert_certifi_and_system_trust(session.connector._ssl)
         finally:
             await session.close()
 

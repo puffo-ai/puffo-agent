@@ -11,11 +11,11 @@ from aiohttp_socks import ProxyConnector
 
 _SOCKS_SCHEMES = {"socks4", "socks4a", "socks5", "socks5h"}
 
-# Trust certifi's CA bundle rather than the host's ambient OpenSSL store,
-# which isn't populated on some interpreters (python.org macOS Python before
-# "Install Certificates.command", some uv-managed builds). Without this the
-# relay's TLS cert fails to verify and linking dies at the handshake.
-_SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+# System store PLUS certifi: some interpreters ship an empty ambient store
+# (python.org macOS Python before "Install Certificates.command"), while
+# corporate-proxy hosts need their OS-installed roots — trust both.
+_SSL_CONTEXT = ssl.create_default_context()
+_SSL_CONTEXT.load_verify_locations(cafile=certifi.where())
 
 
 def _env_proxy_for_url(url: str) -> str | None:
