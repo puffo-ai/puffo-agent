@@ -27,6 +27,7 @@ import pytest
 from puffo_agent.portal.state import (
     AGENT_INSTALLED_MARKER,
     HOST_SYNCED_MARKER,
+    _host_local_token,
     _looks_host_local_command,
     sync_host_enabled_plugins,
     sync_host_gemini_mcp_servers,
@@ -261,13 +262,18 @@ def test_sync_host_mcp_host_wins_on_collision(tmp_path):
     assert data["mcpServers"]["shared"]["args"] == ["host-version"]
 
 
-def test_sync_host_mcp_flags_unreachable_command_paths(tmp_path):
+def test_sync_host_mcp_skips_host_local_and_flags_them(tmp_path):
+    """Host-local servers (incl. macOS paths + host paths hidden in args)
+    are skipped rather than injected as dead config, and reported in
+    ``unreachable``; container-resolvable ones still merge."""
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_json(host / ".claude.json", {
         "mcpServers": {
             "bare-ok": {"command": "npx", "args": []},
             "mac-local": {"command": "/Users/alice/bin/mcp", "args": []},
+            "brew-local": {"command": "/opt/homebrew/bin/mcp", "args": []},
+            "volume-arg": {"command": "uvx", "args": ["/Volumes/tools/mcp"]},
             "linux-home": {"command": "/home/bob/mcp", "args": []},
             "windows": {"command": r"C:\Users\bob\mcp.exe", "args": []},
             "container-ok": {"command": "/home/agent/.local/bin/mcp", "args": []},
@@ -277,9 +283,38 @@ def test_sync_host_mcp_flags_unreachable_command_paths(tmp_path):
 
     merged, unreachable = sync_host_mcp_servers(host, agent)
 
-    assert merged == 6
+    assert merged == 3
     flagged_names = sorted(name for name, _ in unreachable)
-    assert flagged_names == ["linux-home", "mac-local", "windows"]
+    assert flagged_names == [
+        "brew-local", "linux-home", "mac-local", "volume-arg", "windows",
+    ]
+    written = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
+    assert sorted(written["mcpServers"]) == ["bare-ok", "container-ok", "sys-ok"]
+    assert dict(unreachable)["volume-arg"] == "/Volumes/tools/mcp"
+
+
+def test_sync_host_gemini_mcp_skips_host_local_but_keeps_extra(tmp_path):
+    """The gemini sibling skips host-local servers too, while still
+    injecting the always-on ``extra_servers``."""
+    host = tmp_path / "host"
+    project = tmp_path / "proj"
+    _write_json(host / ".gemini" / "settings.json", {
+        "mcpServers": {
+            "brew-local": {"command": "/opt/homebrew/bin/mcp", "args": []},
+            "ok": {"command": "npx", "args": []},
+        },
+    })
+
+    merged, unreachable = sync_host_gemini_mcp_servers(
+        host, project, extra_servers={"puffo": {"command": "python3"}},
+    )
+
+    assert merged == 1  # only "ok" merged; brew-local skipped
+    assert sorted(n for n, _ in unreachable) == ["brew-local"]
+    written = json.loads(
+        (project / ".gemini" / "settings.json").read_text(encoding="utf-8")
+    )
+    assert sorted(written["mcpServers"]) == ["ok", "puffo"]  # extra always present
 
 
 def test_sync_host_mcp_no_host_file_is_noop(tmp_path):
@@ -574,11 +609,42 @@ def test_looks_host_local_command_flags_host_paths():
         "/home/bob/.local/bin/mcp",
         "/tmp/adhoc-server",
         "/var/folders/xy/T/mcp-12345",
+        "/opt/homebrew/bin/mcp",
+        "/opt/local/bin/mcp",
+        "/Volumes/ext-ssd/tools/mcp",
+        "/private/tmp/mcp",
         r"C:\Users\bob\mcp.exe",
         r"D:\apps\mcp.exe",
         "node C:\\stuff\\x.js",  # any backslash anywhere
     ):
         assert _looks_host_local_command(cmd), f"expected flagged: {cmd!r}"
+
+
+def test_looks_host_local_command_opt_container_pkg_not_flagged():
+    """/opt/homebrew + /opt/local must not swallow the container's own
+    /opt/puffoagent-pkg install path."""
+    assert not _looks_host_local_command(
+        "/opt/puffoagent-pkg/puffoagent/mcp/puffo_core_server.py"
+    )
+
+
+def test_host_local_token_scans_command_and_args():
+    assert _host_local_token(
+        {"command": "/opt/homebrew/bin/mcp", "args": []}
+    ) == "/opt/homebrew/bin/mcp"
+    assert _host_local_token(
+        {"command": "uvx", "args": ["--from", "/Volumes/tools/mcp", "run"]}
+    ) == "/Volumes/tools/mcp"
+    # Fully container-resolvable → None.
+    assert _host_local_token(
+        {"command": "npx", "args": ["-y", "@scope/pkg"]}
+    ) is None
+    assert _host_local_token(
+        {"command": "npx", "args": ["--log", "/tmp/mcp.log"]}
+    ) is None
+    assert _host_local_token({"command": "/tmp/adhoc-server", "args": []}) == "/tmp/adhoc-server"
+    assert _host_local_token({}) is None
+    assert _host_local_token("not-a-dict") is None
 
 
 def test_looks_host_local_command_empty_is_not_flagged():
@@ -830,5 +896,63 @@ def test_sync_host_gemini_mcp_servers_flags_host_local_commands(tmp_path):
     agent = tmp_path / "agent"
 
     n, unreachable = sync_host_gemini_mcp_servers(host, agent)
-    assert n == 2
+    assert n == 1  # host-local "local" skipped, only "image" merges
     assert [name for name, _ in unreachable] == ["local"]
+
+
+def test_sync_host_mcp_corrupt_host_file_is_noop(tmp_path):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    (host).mkdir(parents=True)
+    (host / ".claude.json").write_text("{not json", encoding="utf-8")
+
+    assert sync_host_mcp_servers(host, agent) == (0, [])
+    assert not (agent / ".claude.json").exists()
+
+
+def test_sync_host_mcp_corrupt_agent_file_still_merges(tmp_path):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "mcpServers": {"ok": {"command": "npx", "args": []}},
+    })
+    (agent).mkdir(parents=True)
+    (agent / ".claude.json").write_text("{not json", encoding="utf-8")
+
+    merged, unreachable = sync_host_mcp_servers(host, agent)
+
+    assert (merged, unreachable) == (1, [])
+    written = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
+    assert "ok" in written["mcpServers"]
+
+
+def test_sync_host_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
+    import puffo_agent.portal.state as state_mod
+
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude.json", {
+        "mcpServers": {"ok": {"command": "npx", "args": []}},
+    })
+    monkeypatch.setattr(
+        state_mod.os, "replace",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    assert sync_host_mcp_servers(host, agent) == (0, [])
+
+
+def test_sync_host_gemini_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
+    import puffo_agent.portal.state as state_mod
+
+    host = tmp_path / "host"
+    project = tmp_path / "proj"
+    _write_json(host / ".gemini" / "settings.json", {
+        "mcpServers": {"ok": {"command": "npx", "args": []}},
+    })
+    monkeypatch.setattr(
+        state_mod.os, "replace",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    assert sync_host_gemini_mcp_servers(host, project) == (0, [])

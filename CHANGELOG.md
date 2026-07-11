@@ -8,6 +8,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **cli-docker no longer injects host-local MCP configs that can't run in
+  the container (PUF-34).** Host-sync now recognizes macOS host-only
+  paths (`/opt/homebrew`, `/opt/local`, `/Volumes`, `/private`) and also
+  catches host paths hidden in `args` behind a bare `npx`/`uvx` launcher.
+  Detected servers are skipped with an actionable warning ("install in
+  the image or bind-mount, then re-sync") instead of being injected as
+  dead config that failed on first use; `/tmp` args stay container-valid
+  (a `/tmp` output path is fine, a `/tmp` binary is still host-staged),
+  and the container's own `/opt/puffoagent-pkg` keeps resolving.
+
 - **Profile edits now take effect on refresh — a changed prompt forces a
   fresh CLI session (PUF-36).** The CLI bakes the system prompt at
   session creation, so `--resume` replayed the old one and profile edits
