@@ -1232,6 +1232,11 @@ def read_memory_snapshot(memory_dir: Path) -> str:
     return "\n\n".join(parts)
 
 
+# Splits the session-relevant slice (primer + profile) from the memory
+# snapshot for the worker's fresh-session check.
+MEMORY_SECTION_HEADER = "---\n\n# Your memory\n\n"
+
+
 def assemble_claude_md(
     *,
     shared_primer: str,
@@ -1247,7 +1252,7 @@ def assemble_claude_md(
     if profile.strip():
         parts.append("---\n\n# Your role\n\n" + profile.strip())
     if memory_snapshot.strip():
-        parts.append("---\n\n# Your memory\n\n" + memory_snapshot.strip())
+        parts.append(MEMORY_SECTION_HEADER + memory_snapshot.strip())
     return "\n\n".join(parts) + "\n"
 
 

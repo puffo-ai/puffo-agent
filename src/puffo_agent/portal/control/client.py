@@ -277,6 +277,10 @@ async def execute_command(
                 params["profile"], encoding="utf-8"
             )
             prompt_changed = True
+        if isinstance(params.get("role"), str):
+            from ..api.handlers import _update_profile_role
+
+            _update_profile_role(cfg, params["role"])
         if patch:
             try:
                 from ..api.handlers import _sync_agent_profile

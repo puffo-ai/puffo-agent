@@ -818,3 +818,40 @@ async def test_rename_respects_ascii_word_boundaries():
 # Unit-level coverage on the ``rewrite_profile_name`` helper lives in
 # ``tests/test_rewrite_profile_name.py`` — sync tests don't compose
 # with this file's ``pytestmark = pytest.mark.asyncio``.
+
+
+async def test_role_edit_rewrites_profile_md_role_line(monkeypatch):
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home,
+        "role-line-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    profile = Path(home) / "agents" / "role-line-bot" / "profile.md"
+    profile.write_text(
+        "# Role Bot\n\n**Role:** helper: old\n\n# Soul\n\nText.\n", encoding="utf-8",
+    )
+
+    async def _spy_sync(cfg, patch):
+        pass
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.api.handlers._sync_agent_profile", _spy_sync,
+    )
+
+    cfg = DaemonConfig().bridge
+    app = build_app(cfg)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"role": "coder: new description"}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/role-line-bot/profile", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/role-line-bot/profile", data=body, headers=h)
+        assert r.status == 200, await r.text()
+
+    text = profile.read_text(encoding="utf-8")
+    assert "**Role:** coder: new description\n" in text
+    assert "helper: old" not in text

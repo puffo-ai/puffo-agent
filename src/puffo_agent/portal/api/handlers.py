@@ -651,6 +651,8 @@ async def update_profile(request: web.Request) -> web.Response:
     if isinstance(new_role_short, str):
         cfg.role_short = new_role_short
     cfg.save()
+    if isinstance(new_role, str):
+        _update_profile_role(cfg, new_role)
     if stripped_summary is not None:
         _update_profile_summary(cfg, stripped_summary)
         profile_patch["soul"] = stripped_summary
@@ -756,6 +758,24 @@ def _update_profile_summary(cfg: AgentConfig, new_summary: str) -> None:
         path.write_text("".join(new_lines), encoding="utf-8")
     except Exception as exc:
         logger.warning("bridge: failed to update profile summary for agent=%s: %s", cfg, exc)
+
+
+def _update_profile_role(cfg: AgentConfig, new_role: str) -> None:
+    """Rewrite the first ``**Role:**`` line of profile.md so the assembled
+    prompt carries the edit; custom profiles without one are untouched."""
+    if not new_role.strip():
+        return
+    try:
+        path = cfg.resolve_profile_path()
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        for i, raw in enumerate(lines):
+            if raw.rstrip("\r\n").startswith("**Role:**"):
+                ending = raw[len(raw.rstrip("\r\n")):] or "\n"
+                lines[i] = f"**Role:** {new_role.strip()}{ending}"
+                path.write_text("".join(lines), encoding="utf-8")
+                return
+    except Exception as exc:
+        logger.warning("bridge: failed to update profile role for agent=%s: %s", cfg, exc)
 
 
 async def _upload_avatar_via_agent_keystore(

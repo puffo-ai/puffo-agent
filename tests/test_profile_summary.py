@@ -258,3 +258,86 @@ def test_update_appends_soul_when_absent(monkeypatch):
         _update_profile_summary(cfg, "Freshly added soul.")
         out = _profile_summary(cfg)
         assert out == "Freshly added soul."
+
+
+# ── _update_profile_role ─────────────────────────────────────────────────────
+
+
+def test_update_profile_role_rewrites_role_line(monkeypatch):
+    from puffo_agent.portal.api.handlers import _update_profile_role
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(
+            home,
+            "# Bot\n\n**Role:** helper: old description\n\n# Soul\n\nText.\n",
+        )
+        _update_profile_role(cfg, "coder: writes production code")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert "**Role:** coder: writes production code\n" in text
+        assert "old description" not in text
+        assert "# Soul\n\nText.\n" in text
+
+
+def test_update_profile_role_no_role_line_is_noop(monkeypatch):
+    from puffo_agent.portal.api.handlers import _update_profile_role
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        original = "# Custom layout\n\nNo role line here.\n"
+        cfg = _agent_with_profile(home, original)
+        _update_profile_role(cfg, "coder: new role")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert text == original
+
+
+def test_update_profile_role_empty_role_is_noop(monkeypatch):
+    from puffo_agent.portal.api.handlers import _update_profile_role
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        original = "# Bot\n\n**Role:** keeper: keep this\n"
+        cfg = _agent_with_profile(home, original)
+        _update_profile_role(cfg, "   ")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert text == original
+
+
+def test_update_profile_role_only_first_line_rewritten(monkeypatch):
+    from puffo_agent.portal.api.handlers import _update_profile_role
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(
+            home,
+            "**Role:** first\n\nBody quoting **Role:** second\n",
+        )
+        _update_profile_role(cfg, "replaced")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert text.startswith("**Role:** replaced\n")
+        assert "**Role:** second" in text
+
+
+def test_update_profile_role_swallows_read_errors(monkeypatch):
+    from puffo_agent.portal.api.handlers import _update_profile_role
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(home, "**Role:** x\n")
+        monkeypatch.setattr(
+            type(cfg), "resolve_profile_path",
+            lambda self: (_ for _ in ()).throw(OSError("boom")),
+        )
+        _update_profile_role(cfg, "new role")  # must not raise

@@ -1600,7 +1600,9 @@ async def _process_refresh_flags(
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
-    Order: host sync → CLAUDE.md rebuild → session drop."""
+    Order: host sync → CLAUDE.md rebuild → session drop. A changed
+    primer/profile slice drops the session too (``--resume`` would replay
+    the stale baked prompt); memory-only or no-op rebuilds keep it."""
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()
@@ -1628,6 +1630,7 @@ async def _process_refresh_flags(
             )
 
     new_prompt: str | None = None
+    prompt_changed = False
     if agent_seen:
         try:
             new_prompt = _rebuild_managed_system_prompt(
@@ -1638,9 +1641,18 @@ async def _process_refresh_flags(
                 memory_path=memory_path,
                 workspace_path=workspace_path,
             )
+            from ..agent.shared_content import MEMORY_SECTION_HEADER
+
+            def _session_core(prompt: str) -> str:
+                return prompt.split(MEMORY_SECTION_HEADER, 1)[0]
+
+            prompt_changed = _session_core(new_prompt) != _session_core(
+                puffo.system_prompt
+            )
             puffo.system_prompt = new_prompt
             logger.info(
-                "agent %s: system prompt rebuilt from disk", agent_id,
+                "agent %s: system prompt rebuilt from disk (changed=%s)",
+                agent_id, prompt_changed,
             )
         except Exception as exc:
             logger.warning(
@@ -1650,7 +1662,7 @@ async def _process_refresh_flags(
     try:
         await adapter.reload(
             new_prompt if new_prompt is not None else puffo.system_prompt,
-            with_session=session_seen,
+            with_session=session_seen or prompt_changed,
         )
     except Exception as exc:
         logger.warning(
