@@ -263,9 +263,9 @@ def test_sync_host_mcp_host_wins_on_collision(tmp_path):
 
 
 def test_sync_host_mcp_skips_host_local_and_flags_them(tmp_path):
-    """PUF-34: host-local servers (incl. macOS paths + host paths hidden in
-    args) are SKIPPED rather than injected as dead config, and reported in
-    ``unreachable``. Container-resolvable ones are still merged."""
+    """Host-local servers (incl. macOS paths + host paths hidden in args)
+    are skipped rather than injected as dead config, and reported in
+    ``unreachable``; container-resolvable ones still merge."""
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_json(host / ".claude.json", {
@@ -298,8 +298,8 @@ def test_sync_host_mcp_skips_host_local_and_flags_them(tmp_path):
 
 
 def test_sync_host_gemini_mcp_skips_host_local_but_keeps_extra(tmp_path):
-    """PUF-34 sweep: the gemini sibling skips host-local servers too, while
-    still injecting the always-on ``extra_servers`` (the puffo entry)."""
+    """The gemini sibling skips host-local servers too, while still
+    injecting the always-on ``extra_servers``."""
     host = tmp_path / "host"
     project = tmp_path / "proj"
     _write_json(host / ".gemini" / "settings.json", {
@@ -613,7 +613,6 @@ def test_looks_host_local_command_flags_host_paths():
         "/home/bob/.local/bin/mcp",
         "/tmp/adhoc-server",
         "/var/folders/xy/T/mcp-12345",
-        # PUF-34: macOS host-only prefixes.
         "/opt/homebrew/bin/mcp",
         "/opt/local/bin/mcp",
         "/Volumes/ext-ssd/tools/mcp",
@@ -626,8 +625,8 @@ def test_looks_host_local_command_flags_host_paths():
 
 
 def test_looks_host_local_command_opt_container_pkg_not_flagged():
-    """The new /opt/homebrew + /opt/local prefixes must NOT swallow the
-    container's own /opt/puffoagent-pkg install path."""
+    """/opt/homebrew + /opt/local must not swallow the container's own
+    /opt/puffoagent-pkg install path."""
     assert not _looks_host_local_command(
         "/opt/puffoagent-pkg/puffoagent/mcp/puffo_core_server.py"
     )
@@ -646,6 +645,12 @@ def test_host_local_token_scans_command_and_args():
     assert _host_local_token(
         {"command": "npx", "args": ["-y", "@scope/pkg"]}
     ) is None
+    # /tmp args are container-valid output paths, not host binaries.
+    assert _host_local_token(
+        {"command": "npx", "args": ["--log", "/tmp/mcp.log"]}
+    ) is None
+    # ...but a /tmp *command* is still a host-staged binary.
+    assert _host_local_token({"command": "/tmp/adhoc-server", "args": []}) == "/tmp/adhoc-server"
     # Non-dict / missing fields tolerated.
     assert _host_local_token({}) is None
     assert _host_local_token("not-a-dict") is None
@@ -900,6 +905,5 @@ def test_sync_host_gemini_mcp_servers_flags_host_local_commands(tmp_path):
     agent = tmp_path / "agent"
 
     n, unreachable = sync_host_gemini_mcp_servers(host, agent)
-    # PUF-34: host-local "local" is skipped, only "image" merges.
-    assert n == 1
+    assert n == 1  # host-local "local" skipped, only "image" merges
     assert [name for name, _ in unreachable] == ["local"]

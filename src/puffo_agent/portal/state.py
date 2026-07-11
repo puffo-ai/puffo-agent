@@ -428,10 +428,8 @@ def sync_host_gemini_skills(host_home: Path, project_dir: Path) -> int:
 
 
 # Path prefixes that won't resolve inside the runtime container.
-# ``/home/agent/`` is handled separately because it IS valid inside.
-# The macOS entries (/opt/homebrew, /opt/local, /Volumes, /private) cover
-# Homebrew (Apple-silicon + Intel), MacPorts, external/mounted volumes, and
-# the /private symlink target of /tmp + /var — all host-only (PUF-34).
+# ``/home/agent/`` is handled separately because it IS valid inside;
+# ``/opt/puffoagent-pkg`` stays resolvable (prefixes are more specific).
 _HOST_LOCAL_COMMAND_PREFIXES = (
     "/Users/",
     "/tmp/",
@@ -458,17 +456,23 @@ def _looks_host_local_command(command: str) -> bool:
 
 
 def _host_local_token(cfg: dict) -> str | None:
-    """PUF-34: first token in an MCP server cfg that points at a host-only
-    path, or ``None`` when everything resolves inside the container. Scans
-    ``args`` as well as ``command`` — a bare ``npx`` / ``uvx`` command often
-    hides the host path in an argument (e.g. ``uvx /Volumes/tools/mcp``)."""
+    """First token in an MCP server cfg that points at a host-only path,
+    or ``None`` when everything resolves inside the container. Scans
+    ``args`` too — a bare ``npx`` / ``uvx`` command often hides the host
+    path in an argument."""
     if not isinstance(cfg, dict):
         return None
     cmd = cfg.get("command") or ""
     if isinstance(cmd, str) and _looks_host_local_command(cmd):
         return cmd
     for arg in cfg.get("args") or []:
-        if isinstance(arg, str) and _looks_host_local_command(arg):
+        # /tmp exists in the container, so a /tmp arg (log/db output path)
+        # is fine even though a /tmp *binary* is host-staged.
+        if (
+            isinstance(arg, str)
+            and not arg.startswith("/tmp/")
+            and _looks_host_local_command(arg)
+        ):
             return arg
     return None
 
@@ -511,9 +515,8 @@ def sync_host_mcp_servers(
     for name, cfg in host_servers.items():
         token = _host_local_token(cfg)
         if token is not None:
-            # PUF-34: a host-only path won't resolve in the container — skip
-            # it rather than inject a dead server config that fails silently.
-            # The caller logs an actionable warning off ``unreachable``.
+            # Skip rather than inject a dead server config; the caller
+            # logs an actionable warning off ``unreachable``.
             unreachable.append((name, token))
             continue
         agent_servers[name] = cfg
@@ -696,7 +699,6 @@ def sync_host_gemini_mcp_servers(
     for name, cfg in host_servers.items():
         token = _host_local_token(cfg)
         if token is not None:
-            # PUF-34: skip a host-only server rather than inject dead config.
             unreachable.append((name, token))
             continue
         merged_servers[name] = cfg
