@@ -4,6 +4,21 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Sender relationship classification (Puffo Friends).** Every inbound
+  message sender is classified against the agent's and its owner's
+  relationships (fetched via the new `/v2/identities/{slug}/relationships`
+  API, cached 10 min): owner-blocked wins, then agent friendship
+  (`owner_and_my_friend`), then owner friendship (`owner_friend`).
+  Non-default tags land in the message metadata block as
+  `sender_relationship` so agents can weigh replies. DMs from blocked
+  senders are acknowledged and dropped client-side — never persisted,
+  never dispatched, invisible to the sender; group messages still flow
+  carrying the tag. New `list_friends` MCP tool on all tool surfaces.
+
 ## [1.1.1] — 2026-07-10
 
 ### Fixed

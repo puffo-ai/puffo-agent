@@ -82,3 +82,23 @@ def test_mention_suffixes_render_from_is_agent():
     assert "  - me-0001 (you)" in block
     assert "  - nova-bot-1234 (agent)" in block
     assert "  - alice-1234 (human)" in block
+
+
+# --- sender_relationship tag ---
+
+
+def test_relationship_tag_renders_when_signal():
+    block = _block(sender="friend-1234", sender_relationship="owner_and_my_friend")
+    assert "- sender_relationship: owner_and_my_friend" in block
+
+
+def test_relationship_default_is_omitted():
+    block = _block(sender="anyone-1234", sender_relationship="default")
+    assert "- sender_relationship:" not in block
+    block = _block(sender="anyone-1234")
+    assert "- sender_relationship:" not in block
+
+
+def test_relationship_blocked_renders_for_group_messages():
+    block = _block(sender="spammer-1234", sender_relationship="blocked")
+    assert "- sender_relationship: blocked" in block

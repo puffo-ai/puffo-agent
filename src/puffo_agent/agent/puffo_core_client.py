@@ -475,6 +475,10 @@ class PuffoCoreMessageClient:
         # Operator's slug — used to DM them on non-auto-acceptable
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
+        # (own, owner) relationship maps: slug -> status. TTL'd like the
+        # profile cache; empty maps on fetch failure so messages flow.
+        self._relationship_maps: tuple[dict, dict] | None = None
+        self._relationship_maps_at = 0.0
         self.auto_accept_space_invitations = bool(auto_accept_space_invitations)
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
@@ -686,6 +690,9 @@ class PuffoCoreMessageClient:
             validated_reply_to_id = await self._validate_incoming_parent_id(
                 payload.reply_to_id, payload.channel_id, payload.space_id,
             )
+            if await self._drop_blocked_dm(payload):
+                return
+
             await self.store.store({
                 "envelope_id": payload.envelope_id,
                 "envelope_kind": payload.envelope_kind,
@@ -869,6 +876,9 @@ class PuffoCoreMessageClient:
                 self.operator_slug
                 and payload.sender_slug == self.operator_slug
             )
+            sender_relationship = await self._sender_relationship(
+                payload.sender_slug,
+            )
 
             # ``owner_slug`` is agent-only — the is-agent signal the
             # priority bands were designed around.
@@ -903,6 +913,7 @@ class PuffoCoreMessageClient:
                 "sender_display_name": sender_display_name,
                 "sender_owner_slug": sender_owner_slug,
                 "is_from_operator": is_from_operator,
+                "sender_relationship": sender_relationship,
                 "sender_email": "",
                 "text": llm_text,
                 "root_id": payload_thread_root_id or "",
@@ -2146,6 +2157,66 @@ class PuffoCoreMessageClient:
             return None
         self._inviter_root_cache[slug] = root_pk
         return root_pk
+
+    async def _drop_blocked_dm(self, payload) -> bool:
+        """Blocked-DM ack-and-drop: nothing persisted, the sender learns
+        nothing. Group messages still flow (tagged) — the agent decides
+        whether to ignore them."""
+        if payload.channel_id:
+            return False
+        rel = await self._sender_relationship(payload.sender_slug)
+        if rel != "blocked":
+            return False
+        self._log.info(
+            "dropping DM from blocked sender %s (envelope=%s)",
+            payload.sender_slug, payload.envelope_id,
+        )
+        return True
+
+    async def _fetch_relationship_maps(self) -> tuple[dict, dict]:
+        """(own, owner) maps of slug -> status. The agent reads its own
+        relationships plus its owner's (read-only server grant)."""
+        now = time.monotonic()
+        if (
+            self._relationship_maps is not None
+            and now - self._relationship_maps_at < _PROFILE_CACHE_TTL_SECONDS
+        ):
+            return self._relationship_maps
+
+        async def _load(slug: str) -> dict:
+            if not slug:
+                return {}
+            data = await self.http.get(f"/v2/identities/{slug}/relationships")
+            return {
+                r.get("other_slug", ""): r.get("status", "")
+                for r in (data or {}).get("relationships", []) or []
+            }
+
+        try:
+            own = await _load(self.slug)
+            owner = await _load(self.operator_slug)
+            self._relationship_maps = (own, owner)
+        except Exception as exc:  # noqa: BLE001 — classification is best-effort
+            self._log.warning("relationship fetch failed: %s", exc)
+            if self._relationship_maps is None:
+                self._relationship_maps = ({}, {})
+        self._relationship_maps_at = now
+        return self._relationship_maps
+
+    async def _sender_relationship(self, sender_slug: str) -> str:
+        """blocked | owner_and_my_friend | owner_friend | default, by the
+        spec precedence: owner block wins, then agent friendship, then
+        owner friendship."""
+        if not sender_slug or sender_slug == self.operator_slug:
+            return "default"
+        own, owner = await self._fetch_relationship_maps()
+        if owner.get(sender_slug) == "blocked" or own.get(sender_slug) == "blocked":
+            return "blocked"
+        if own.get(sender_slug) == "friend":
+            return "owner_and_my_friend"
+        if owner.get(sender_slug) == "friend":
+            return "owner_friend"
+        return "default"
 
     async def _fetch_display_name(self, slug: str) -> str:
         """display_name via the unified profile cache. Empty string

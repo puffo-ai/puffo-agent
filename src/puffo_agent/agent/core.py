@@ -118,6 +118,7 @@ class PuffoAgent:
         space_name: str = "",
         sender_owner_slug: str = "",
         is_from_operator: bool = False,
+        sender_relationship: str = "",
     ) -> str | None:
         self._append_user(
             channel_name, sender, sender_email, text,
@@ -132,6 +133,7 @@ class PuffoAgent:
             space_name=space_name,
             sender_owner_slug=sender_owner_slug,
             is_from_operator=is_from_operator,
+            sender_relationship=sender_relationship,
         )
         return await self._run_turn_and_route(
             channel_name=channel_name,
@@ -183,6 +185,7 @@ class PuffoAgent:
                 is_visible_to_human=msg.get("is_visible_to_human", True),
                 sender_owner_slug=msg.get("sender_owner_slug", ""),
                 is_from_operator=msg.get("is_from_operator", False),
+                sender_relationship=msg.get("sender_relationship", ""),
             )
             for msg in batch
         ]
@@ -245,6 +248,7 @@ class PuffoAgent:
                 sender_display_name=msg.get("sender_display_name", ""),
                 sender_owner_slug=msg.get("sender_owner_slug", ""),
                 is_from_operator=msg.get("is_from_operator", False),
+                sender_relationship=msg.get("sender_relationship", ""),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
 
@@ -410,6 +414,7 @@ class PuffoAgent:
         is_visible_to_human: bool = True,
         sender_owner_slug: str = "",
         is_from_operator: bool = False,
+        sender_relationship: str = "",
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -429,6 +434,7 @@ class PuffoAgent:
             is_visible_to_human=is_visible_to_human,
             sender_owner_slug=sender_owner_slug,
             is_from_operator=is_from_operator,
+            sender_relationship=sender_relationship,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -453,6 +459,7 @@ class PuffoAgent:
         is_visible_to_human: bool = True,
         sender_owner_slug: str = "",
         is_from_operator: bool = False,
+        sender_relationship: str = "",
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
@@ -497,6 +504,9 @@ class PuffoAgent:
         # don't see keys their primer doesn't document.
         if sender_owner_slug:
             lines.append(f"- sender_owner_slug: {sender_owner_slug}")
+        # Relationship tag emits only when it carries signal.
+        if sender_relationship and sender_relationship != "default":
+            lines.append(f"- sender_relationship: {sender_relationship}")
         if is_from_operator:
             lines.append("- is_from_operator: true")
         lines.append(
