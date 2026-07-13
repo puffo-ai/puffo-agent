@@ -416,7 +416,7 @@ class LocalCLIAdapter(Adapter):
         if codex_bin is None:
             raise RuntimeError(
                 "codex binary not found. Tried $PUFFO_CODEX_BIN, $PATH, "
-                "and the Codex.app / ChatGPT.app / Windows / Linux bundle "
+                "and the ChatGPT.app / Codex.app / Windows / Linux bundle "
                 "paths. If you recently updated the ChatGPT or Codex "
                 "desktop app, restart puffo-agent so it re-resolves the "
                 "binary. Otherwise install the Codex CLI (`npm install -g "

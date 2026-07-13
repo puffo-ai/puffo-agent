@@ -80,7 +80,7 @@ def test_claude_resolver_uses_its_own_env(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("platform_value,want_first", [
-    ("darwin", "/Applications/Codex.app/Contents/Resources/codex"),
+    ("darwin", "/Applications/ChatGPT.app/Contents/Resources/codex"),
     ("win32", "codex.exe"),  # contains-check
 ])
 def test_bundle_paths_per_platform(platform_value, want_first, monkeypatch):
@@ -107,9 +107,10 @@ def test_darwin_bundle_paths_include_chatgpt_app(monkeypatch):
         and p != "/Applications/ChatGPT.app/Contents/Resources/codex"
         for p in paths
     ), "expected the ~/Applications ChatGPT.app path too"
-    # Codex.app retained AND preferred — _first_existing takes the first hit.
-    assert paths.index("/Applications/Codex.app/Contents/Resources/codex") < paths.index(
-        "/Applications/ChatGPT.app/Contents/Resources/codex"
+    # ChatGPT.app preferred over a leftover Codex.app copy — _first_existing
+    # takes the first hit.
+    assert paths.index("/Applications/ChatGPT.app/Contents/Resources/codex") < paths.index(
+        "/Applications/Codex.app/Contents/Resources/codex"
     )
 
 
