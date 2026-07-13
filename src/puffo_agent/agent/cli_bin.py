@@ -196,8 +196,7 @@ def _write_path_cache(name: str, path: str) -> None:
 
 def _codex_bundle_paths() -> list[Path]:
     if sys.platform == "darwin":
-        # ChatGPT.app bundles codex too (as of the desktop app update that
-        # migrated the binary out of Codex.app) — check both.
+        # Newer ChatGPT.app builds bundle codex (moved out of Codex.app).
         return _expand(
             "/Applications/Codex.app/Contents/Resources/codex",
             "~/Applications/Codex.app/Contents/Resources/codex",

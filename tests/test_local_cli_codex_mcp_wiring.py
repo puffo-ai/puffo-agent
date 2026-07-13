@@ -287,8 +287,6 @@ def test_codex_symlink_leaves_live_link_alone(tmp_path, monkeypatch):
 
 
 def test_codex_not_found_error_is_legible(tmp_path, monkeypatch):
-    # PUF-372 follow-up: the pre-spawn "not found" error must name ChatGPT.app
-    # and the restart-after-app-update remedy, not a bare red.
     from puffo_agent.agent.adapters import local_cli as lc
 
     host_home = tmp_path / "host"
@@ -320,10 +318,8 @@ def test_codex_symlink_oserror_is_nonfatal(tmp_path, monkeypatch):
 
 
 def test_bundle_discovery_composes_with_stale_symlink_retarget(tmp_path, monkeypatch):
-    # FB-400 end-to-end: codex now resolves via a bundle path (as ChatGPT.app
-    # does after the app update) AND ~/.local/bin/codex is a corpse from the
-    # moved-out install. One worker start must BOTH discover the binary via the
-    # bundle path AND re-target the dead symlink to it.
+    # One start must both discover codex via a bundle path AND re-target
+    # the dangling ~/.local/bin/codex left by the moved-out install.
     if not _symlinks_available(tmp_path):
         pytest.skip("symlinks unavailable on this host")
     from puffo_agent.agent import cli_bin
@@ -343,8 +339,7 @@ def test_bundle_discovery_composes_with_stale_symlink_retarget(tmp_path, monkeyp
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(lc, "is_macos", lambda: True)
     monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
-    # Force resolution to the bundle path (env + PATH miss), cache-isolated so
-    # neither our resolution nor a prior test's leaks across the boundary.
+    # Force bundle-path resolution; isolate both resolver cache layers.
     monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
     monkeypatch.setattr("shutil.which", lambda *a, **k: None)
     monkeypatch.setattr(cli_bin, "_real_path", lambda: "")
@@ -359,9 +354,8 @@ def test_bundle_discovery_composes_with_stale_symlink_retarget(tmp_path, monkeyp
     monkeypatch.setattr(lc, "CodexSession", _Stop)
     adapter = _make_adapter(tmp_path)
     try:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="stop before spawn"):
             adapter._ensure_codex_session()
-        # Item 2: the corpse symlink now points at the bundle-discovered binary.
         assert os.readlink(link) == str(bundle_codex)
     finally:
         cli_bin._resolve_memcache.clear()
