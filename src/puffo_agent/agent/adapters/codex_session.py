@@ -101,9 +101,8 @@ def _looks_like_codex_thread_limit(err_text: str) -> bool:
     return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
 
-# PUF-375 (b): codex App Server reconnecting to its backend mid-turn surfaces
-# as ``codex turn failed: Reconnecting... N/M``. It's transient + self-heals,
-# so it must NOT drop the batch or count as a wedged strike.
+# Mid-turn ``turn failed: Reconnecting... N/M`` is transient — the App
+# Server self-heals; don't drop the batch or count a wedged strike.
 _CODEX_RECONNECT_PATTERN: re.Pattern[str] = re.compile(
     r"\bReconnecting\b", re.IGNORECASE
 )
@@ -264,8 +263,7 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
-        # Per-agent turn wall-clock budget (PUF-375). Defaults to the module
-        # constant; agents running long reasoning tasks raise it via agent.yml.
+        # Per-agent turn wall-clock budget; raised via agent.yml for long tasks.
         self.task_timeout_seconds = task_timeout_seconds
         self.audit = audit
 
@@ -383,16 +381,16 @@ class CodexSession:
                     rotated_in_branch = self._propagate_turn_outcome(
                         outcome="timeout",
                     )
-                    # PUF-375 (b'): replace the bare empty reply with an
-                    # operator-facing line so a timeout doesn't surface as
-                    # silence. Routed as a normal reply by core.py.
+                    # Operator-facing reply so a timeout doesn't surface as
+                    # silence; only claim a reset when rotation actually fired.
+                    label = _timeout_budget_label(self.task_timeout_seconds)
+                    suffix = (
+                        "; the codex session was reset for the next turn."
+                        if rotated_in_branch
+                        else "."
+                    )
                     return TurnResult(
-                        reply=(
-                            f"⏱ Task exceeded the "
-                            f"{_timeout_budget_label(self.task_timeout_seconds)} "
-                            "timeout; the codex session state was cleared for "
-                            "the next turn."
-                        ),
+                        reply=f"⏱ Task exceeded the {label} timeout{suffix}",
                         metadata={
                             "codex_turn_timeout": True,
                             "codex_thread_rotated": rotated_in_branch,
@@ -407,12 +405,9 @@ class CodexSession:
 
         if turn_failed_exc is not None:
             err_text = str(turn_failed_exc)
-            # PUF-375 (b) ε: a mid-reconnect failure is transient — codex is
-            # re-establishing its backend and will self-heal. Route it through
-            # the retry substrate (non-auth AgentAPIError → the consumer
-            # re-enqueues the batch + backs off) instead of the raw RuntimeError
-            # that the worker swallows + drops (work loss) while flipping
-            # unhandled_error (false red). Don't count it as a wedged strike.
+            # Transient mid-reconnect: non-auth AgentAPIError routes the batch
+            # to the consumer's re-enqueue/backoff instead of the raw
+            # RuntimeError drop; not a wedged strike.
             if _looks_like_codex_reconnect(err_text):
                 from ..core import AgentAPIError
                 logger.info(

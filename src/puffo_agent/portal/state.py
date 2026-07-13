@@ -1026,8 +1026,8 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # codex (cli-local) per-turn wall-clock budget in seconds (PUF-375).
-    # Default 600s; raise for agents running long reasoning/complex tasks.
+    # codex (cli-local) per-turn wall-clock budget in seconds; raise for
+    # agents running long reasoning/complex tasks.
     task_timeout_seconds: float = 600.0
     # Agent engine (CLI kinds only):
     #   - ``claude-code``: ``claude`` CLI with our stream-json session

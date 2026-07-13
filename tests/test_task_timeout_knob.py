@@ -1,5 +1,5 @@
-"""PUF-375 (a): RuntimeConfig.task_timeout_seconds round-trips through
-agent.yml, defaults to 600s, and reaches the CodexSession."""
+"""RuntimeConfig.task_timeout_seconds round-trips through agent.yml,
+defaults to 600s, and reaches the CodexSession."""
 
 from __future__ import annotations
 
@@ -64,9 +64,45 @@ def test_codex_session_stores_timeout():
     assert s.task_timeout_seconds == 42.0
 
 
+def test_local_cli_adapter_plumbs_timeout_to_codex_session(tmp_path, monkeypatch):
+    from puffo_agent.agent.adapters import local_cli as lc
+    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
+    from puffo_agent.agent.harness import CodexHarness
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(lc, "is_macos", lambda: False)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    monkeypatch.setattr(lc, "resolve_codex_bin", lambda: str(tmp_path / "codex"))
+
+    captured: dict = {}
+
+    class _Capture:
+        def __init__(self, *a, **k):
+            captured.update(k)
+            raise RuntimeError("stop before spawn")
+
+    monkeypatch.setattr(lc, "CodexSession", _Capture)
+    adapter = LocalCLIAdapter(
+        agent_id="a",
+        model="",
+        workspace_dir=str(tmp_path / "ws"),
+        claude_dir=str(tmp_path / "cl"),
+        session_file=str(tmp_path / "s.json"),
+        mcp_config_file=str(tmp_path / "mcp.json"),
+        agent_home_dir=str(tmp_path / "agents" / "a"),
+        harness=CodexHarness(),
+        permission_mode="bypassPermissions",
+        task_timeout_seconds=123.0,
+    )
+    with pytest.raises(RuntimeError, match="stop before spawn"):
+        adapter._ensure_codex_session()
+    assert captured["task_timeout_seconds"] == 123.0
+
+
 def test_timeout_budget_label():
-    # PUF-375 (b') sub-60s polish: minutes when >=60s, else seconds — never
-    # a nonsensical "0-minute".
     from puffo_agent.agent.adapters.codex_session import _timeout_budget_label
     assert _timeout_budget_label(600.0) == "10-minute"
     assert _timeout_budget_label(1800.0) == "30-minute"

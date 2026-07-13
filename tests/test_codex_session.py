@@ -567,11 +567,8 @@ while True:
 
 
 def test_reconnect_turn_routes_to_retry_not_drop(tmp_path):
-    # PUF-375 (b) ε: a mid-reconnect turn failure must surface as a (non-auth)
-    # AgentAPIError — routed to the consumer's re-enqueue/retry path so the
-    # batch isn't dropped — NOT the raw RuntimeError the worker swallows +
-    # drops (work loss) while flipping unhandled_error (false red). And it must
-    # NOT count toward the wedged threshold.
+    # Non-auth AgentAPIError = the consumer's re-enqueue path; a raw
+    # RuntimeError would be swallowed + dropped by the worker.
     from puffo_agent.agent.core import AgentAPIError
 
     fake = _write_fake(tmp_path, RECONNECT_SCRIPT)
@@ -609,6 +606,53 @@ def test_looks_like_codex_reconnect():
     assert not _looks_like_codex_reconnect("model overloaded")
     assert not _looks_like_codex_reconnect("agent thread limit reached")
     assert not _looks_like_codex_reconnect("")
+
+
+TIMEOUT_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "t1"}}})
+
+# ACK every request (turn/start, turn/interrupt) but never complete a turn.
+while True:
+    msg = r()
+    if msg is None:
+        break
+    if msg.get("id") is not None:
+        w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+'''
+
+
+def test_timeout_reply_reset_claim_matches_rotation(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    fake = _write_fake(tmp_path, TIMEOUT_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        task_timeout_seconds=1.0,
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            r1 = await cs.run_turn("hi", "sys")
+            r2 = await cs.run_turn("still there?", "sys")
+            return r1, r2
+        finally:
+            await cs.aclose()
+
+    r1, r2 = asyncio.run(_run())
+    # First timeout: below the wedged threshold — no rotation, no reset claim.
+    assert "1-second timeout" in r1.reply
+    assert r1.metadata["codex_turn_timeout"] is True
+    assert r1.metadata["codex_thread_rotated"] is False
+    assert "reset" not in r1.reply
+    # Second consecutive timeout rotates; the reply may now claim the reset.
+    assert r2.metadata["codex_thread_rotated"] is True
+    assert "reset for the next turn" in r2.reply
 
 
 # ─────────────────────────────────────────────────────────────────────────────
