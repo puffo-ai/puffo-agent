@@ -427,6 +427,12 @@ _NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     # Subscription-plan quotas (the prod miss the reviewer surfaced).
     re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
+    # Model-usage-cap fallback: "You've reached your <Model> limit. Run
+    # /usage-credits ...". Kept model-agnostic (Fable 5 today, next model
+    # tomorrow) + apostrophe-robust (`.?` = straight/curly/none) so it's not
+    # the per-string whack-a-mole PUF-214 was. Sibling of the "hit your"
+    # pattern above; same start-anchored broadness. PUF-380 / FB-65 reopen.
+    re.compile(r"^\s*You.?ve reached your\b.*?\blimit\b", re.IGNORECASE),
     re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
     # CLI-emitted server 429 / 5xx.
     re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
