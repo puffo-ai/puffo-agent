@@ -608,6 +608,59 @@ def test_looks_like_codex_reconnect():
     assert not _looks_like_codex_reconnect("")
 
 
+RECONNECT_THEN_RECOVER_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+# Turn 1 fails mid-reconnect.
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+w({"jsonrpc": "2.0", "method": "turn/failed",
+   "params": {"error": {"message": "Reconnecting... 2/5"}}})
+
+# Turn 2 (the retry) succeeds on the same thread.
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+   "params": {"threadId": "c1", "turnId": "u2", "itemId": "m", "delta": "recovered"}})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_reconnect_then_retry_recovers_on_same_session(tmp_path):
+    # Mirrors the worker retry path: run_retry_turn re-enters run_turn on the
+    # same session after the AgentAPIError.
+    from puffo_agent.agent.core import AgentAPIError
+
+    fake = _write_fake(tmp_path, RECONNECT_THEN_RECOVER_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            with pytest.raises(AgentAPIError):
+                await cs.run_turn("hi", "sys")
+            return await cs.run_turn("hi again", "sys")
+        finally:
+            await cs.aclose()
+
+    result = asyncio.run(_run())
+    assert result.reply == "recovered"
+    assert cs._consecutive_thread_failures == 0
+
+
 TIMEOUT_SCRIPT = '''\
 absorb_initialize()
 

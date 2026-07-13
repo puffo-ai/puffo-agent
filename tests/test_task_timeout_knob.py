@@ -102,6 +102,29 @@ def test_local_cli_adapter_plumbs_timeout_to_codex_session(tmp_path, monkeypatch
     assert captured["task_timeout_seconds"] == 123.0
 
 
+def test_build_adapter_plumbs_timeout_to_local_cli(home):
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.state import AgentConfig, RuntimeConfig
+    from puffo_agent.portal.worker import build_adapter
+
+    cfg = AgentConfig(
+        id="codex-knob",
+        display_name="codex-knob",
+        runtime=RuntimeConfig(
+            kind="cli-local", harness="codex", task_timeout_seconds=777.0,
+        ),
+    )
+    daemon = SimpleNamespace(
+        openai=SimpleNamespace(model=""),
+        anthropic=SimpleNamespace(model=""),
+        data_service=SimpleNamespace(port=63388),
+        rpc_service=SimpleNamespace(port=63389),
+    )
+    adapter = build_adapter(daemon, cfg)
+    assert adapter.task_timeout_seconds == 777.0
+
+
 def test_timeout_budget_label():
     from puffo_agent.agent.adapters.codex_session import _timeout_budget_label
     assert _timeout_budget_label(600.0) == "10-minute"
