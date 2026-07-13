@@ -185,10 +185,8 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
         )
-        # When puffo_core is configured, give the adapter env to spawn
-        # ``python -m puffo_agent.mcp.puffo_core_server``. The adapter
-        # rewrites path-typed env values to container bind-mount paths
-        # at config-write time.
+        # Env for spawning the puffo_core MCP server; path-typed values are
+        # rewritten to container bind-mount paths at config-write time.
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
             pc = agent_cfg.puffo_core
@@ -234,6 +232,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             owner_username=operator,
             permission_mode=agent_cfg.runtime.permission_mode,
             sandbox=agent_cfg.runtime.sandbox,
+            task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
             harness=harness,
             desired_skills=agent_cfg.desired_skills,
             desired_mcps=agent_cfg.desired_mcps,
@@ -406,12 +405,9 @@ def _build_puffo_core_client(
     )
 
 
-# PUF-214: auth-class patterns — definitive evidence of OAuth /
-# API-key failure. Shared by the leak filter (suppress the leak)
-# and by health-flip detection (`runtime.health=auth_failed`).
-# Anchored / unambiguous-token patterns only, per the doc-citation
-# audit; high-FP markers like "401" / "unauthorized" / "api_error"
-# stay OUT — they collide with legitimate agent prose.
+# Auth-class patterns: definitive OAuth/API-key failure only. Shared by
+# the leak filter and the auth_failed health flip. High-FP markers
+# (401, unauthorized, api_error) stay out; they collide with agent prose.
 _AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*Not logged in[\s\S]*Please run /login", re.IGNORECASE),
     re.compile(r"^\s*OAuth token (?:revoked|has expired)\b", re.IGNORECASE),
@@ -451,10 +447,8 @@ _WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     *_NON_AUTH_LEAK_PATTERNS,
 )
 
-# Backoff range applied after a suppressed leak fires. Random in
-# [15, 60] drops the steady-state leak frequency ~30× without
-# grounding the agent — single-batch leaks self-clear during the
-# sleep; sustained limit conditions get sampled, not hammered.
+# Post-leak backoff: random 15-60s samples sustained limits instead of
+# hammering; single-batch leaks self-clear during the sleep.
 _SUPPRESSION_BACKOFF_MIN_SECONDS = 15.0
 _SUPPRESSION_BACKOFF_MAX_SECONDS = 60.0
 
@@ -837,15 +831,10 @@ class Worker:
         # Set for ws-local agents; the Worker idles and registers an
         # attach point instead of running a harness consumer.
         self._ws_local_hub = ws_local_hub
-        # PUF-221: daemon-owned CredentialRefresher hook. Fired from
-        # the auth-class leak branch in _handle_suppressed_reply so a
-        # 401 surfacing in a reply short-circuits the daemon's 2-min
-        # poll instead of waiting for the next tick.
+        # CredentialRefresher hook: a 401 in a reply short-circuits the 2-min poll.
         self._notify_refresh_needed = notify_refresh_needed
-        # Pre-delivery gate: blocking refresh through the daemon's
-        # mutex. Returns True iff post-refresh the token has >0s
-        # remaining. ``None`` for runtimes that don't go through
-        # claude OAuth (api-puffo, ws-local).
+        # Blocking pre-delivery refresh via the daemon mutex; True iff the token
+        # has time left. None for runtimes without claude OAuth (api-puffo, ws-local).
         self._ensure_fresh_token = ensure_fresh_token
         # In-memory dedup for the auth_failed ENTER operator DM;
         # re-armed on credential refresh-success (daemon
@@ -1056,12 +1045,9 @@ class Worker:
             Path(workspace_path).mkdir(parents=True, exist_ok=True)
             _seed_claude_dir(Path(claude_path))
 
-            # Assemble managed CLAUDE.md from shared primer + profile
-            # + memory snapshot. Written to user-level (.claude/
-            # CLAUDE.md) so Claude Code auto-discovers it. The
-            # project-level CLAUDE.md is left for the agent to edit.
-            # chat-local / sdk-local don't auto-discover, so the same
-            # string is passed as PuffoAgent's system_prompt.
+            # Managed CLAUDE.md (primer + profile + memory) written user-level for
+            # auto-discovery; project-level stays agent-editable. chat/sdk-local
+            # get the same string as system_prompt.
             shared_path = docker_shared_dir()
             claude_md = _rebuild_managed_system_prompt(
                 harness_name=(self.agent_cfg.runtime.harness or "").strip(),
@@ -1117,11 +1103,8 @@ class Worker:
             self._warm_done.set()
             return
 
-        # PUF-221: per-agent refresh_ping retired — daemon-level
-        # CredentialRefresher (portal/credential_refresh.py) owns
-        # OAuth refresh + writes back to ``~/.claude/.credentials.json``
-        # as a single writer. Agents just read the disk file via the
-        # per-agent symlink the daemon refresher maintains.
+        # Per-agent refresh_ping retired; daemon-level CredentialRefresher is
+        # the single writer of ~/.claude/.credentials.json.
 
         # Warm the adapter so persisted-session agents re-spawn their
         # subprocess now rather than on the first DM. Non-fatal.
@@ -1186,22 +1169,15 @@ class Worker:
             """
             if not batch:
                 return
-            # Diagnostic: log every dispatched batch so we can trace
-            # cross-batch duplicates (same envelope_id surfacing in
-            # consecutive turns). If the SAME envelope_id appears
-            # across two log lines for one agent within a few
-            # seconds, the cursor or dispatching_ids check missed it.
+            # Duplicate tracer: same envelope_id in two lines within seconds =
+            # cursor or dispatching_ids miss.
             batch_ids = [m.get("envelope_id", "") for m in batch]
             logger.info(
                 "agent %s: on_message_batch root=%s size=%d envelopes=%s",
                 agent_id, root_id, len(batch), batch_ids,
             )
-            # Status telemetry is now per-thread-batch. The first
-            # message in arrival order gets the /processing/start
-            # call (yellow dot lands there) — that's what the human
-            # who triggered the agent will see go yellow first. The
-            # rest of the batch flips straight from white to green
-            # via /processing/end:batch at the end of the turn.
+            # Per-batch telemetry: first message gets /processing/start (yellow
+            # dot); the rest flip white->green via /processing/end:batch.
             first_post_id = batch[0].get("envelope_id", "")
             channel_id = channel_meta.get("channel_id", "")
 
@@ -1236,13 +1212,9 @@ class Worker:
             # New batch while auth_failed: wake the refresher to check
             # for a re-login now (the flip below would mask auth_failed).
             self._maybe_wake_refresher_if_auth_failed(agent_id)
-            # Pre-delivery gate: before handing the batch to the
-            # adapter, make sure the daemon-owned credential is fresh.
-            # The rotating single-use refresh_token race isn't macOS-
-            # specific — N agents reading the same on-disk RT and
-            # POSTing to Anthropic in parallel loses N-1 with
-            # invalid_grant regardless of OS. Skipped only for non-
-            # claude runtimes (ws-local, api-puffo).
+            # Pre-delivery credential gate. The single-use refresh_token race is
+            # OS-agnostic: N agents refreshing in parallel lose N-1 with
+            # invalid_grant. Skipped for non-claude runtimes (ws-local, api-puffo).
             if (
                 self._ensure_fresh_token is not None
                 and self.agent_cfg.runtime.kind in (
@@ -1251,15 +1223,9 @@ class Worker:
             ):
                 ok = await self._ensure_fresh_token()
                 if not ok:
-                    # Mutex-guarded refresh failed → token is stuck.
-                    # ``_enter_auth_failed`` flips runtime.health,
-                    # wakes the refresher, and (via
-                    # ``_on_auth_failed_enter`` + the
-                    # ``_auth_failed_notification_sent`` dedup) DMs
-                    # the operator ONCE per expiration episode. Raise
-                    # to push the batch back into the consumer's
-                    # retry path so it redelivers once the operator
-                    # recovers.
+                    # Token stuck: _enter_auth_failed flips health + DMs the operator once
+                    # per episode; raise pushes the batch into the consumer retry path so
+                    # it redelivers on recovery.
                     logger.warning(
                         "agent %s: pre-delivery token refresh failed; "
                         "flagging auth_failed and deferring batch",
@@ -1329,10 +1295,8 @@ class Worker:
                         get_reporter().emit(agent_id, "error", {"error": turn_error})
                     )
                 if run_id is not None and first_post_id:
-                    # Build the batch payload: first row reuses the
-                    # /start run_id (server UPDATEs its row); the
-                    # rest get fresh run_ids and are UPSERTed by the
-                    # server with started_at = ended_at = now.
+                    # First row reuses the /start run_id (server UPDATE); the rest get
+                    # fresh run_ids (server UPSERT, started_at = ended_at = now).
                     runs: list[dict] = [{
                         "run_id": run_id,
                         "message_id": first_post_id,
@@ -1505,15 +1469,11 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
 
-        # PUF-221: per-agent credential_refresh coroutine retired —
-        # CredentialRefresher in portal/credential_refresh.py owns the
-        # refresh loop daemon-wide. Single writer = no multi-process
-        # rotation race on Anthropic's single-use refresh tokens.
+        # Per-agent credential_refresh coroutine retired; CredentialRefresher
+        # owns the loop daemon-wide (single writer, no rotation race).
 
-        # Server-side status reporter: own heartbeat task; begin_turn /
-        # end_turn fire inline from on_message via this closure. Falls
-        # back to a no-op when the client has no http client (tests).
-        # Lazy provider so each heartbeat reads live runtime.health.
+        # Status reporter: heartbeat task + inline begin/end_turn; no-op
+        # without an http client (tests). Lazy provider reads live runtime.health.
         reporter = (
             StatusReporter(
                 client.http,

@@ -6,7 +6,22 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-agent codex turn timeout: `runtime.task_timeout_seconds` in
+  `agent.yml` (PUF-375).** Default stays 600s; raise it for agents
+  running long reasoning or complex tasks. A timed-out turn now posts
+  an operator-facing "⏱ Task exceeded the N-minute timeout" reply
+  instead of silence (and says whether the codex session was reset).
+
 ### Fixed
+
+- **codex mid-reconnect turn failures no longer drop the batch or flip
+  a false red (PUF-375).** A `turn failed: Reconnecting... N/M` from
+  the codex App Server is transient — it now routes into the existing
+  retry substrate (re-enqueue + backoff) instead of being swallowed as
+  an unhandled error, and it no longer counts toward the wedged-thread
+  rotation threshold.
 
 - **codex is now discovered inside ChatGPT.app on macOS (PUF-372
   follow-up).** A ChatGPT desktop-app update moved the bundled codex
