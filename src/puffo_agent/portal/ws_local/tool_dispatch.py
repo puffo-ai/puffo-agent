@@ -31,6 +31,7 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "get_dm_history",
     "get_thread_history",
     "list_channel_members",
+    "list_friends",
     "list_spaces",
     "list_channels_in_space",
     "list_channels_in_all_spaces",

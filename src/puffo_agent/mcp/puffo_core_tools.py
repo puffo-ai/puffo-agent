@@ -673,6 +673,22 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
+    async def list_friends() -> str:
+        """List this agent's friends (mutual, owner-granted or
+        owner-approved relationships). Friends are your most trusted
+        senders — their messages arrive tagged owner_and_my_friend."""
+        data = await cfg.http_client.get(
+            f"/v2/identities/{cfg.slug}/relationships?status=friend"
+        )
+        entries = (data or {}).get("relationships", []) or []
+        if not entries:
+            return "(no friends yet)"
+        lines = [
+            f"- {r.get('other_slug', '')}" for r in entries if r.get("other_slug")
+        ]
+        return "\n".join(lines)
+
+    @mcp.tool()
     async def list_spaces() -> str:
         """List spaces this agent is a member of (id + name).
 

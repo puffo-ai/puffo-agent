@@ -33,6 +33,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "get_dm_history",
         "get_thread_history",
         "list_channel_members",
+        "list_friends",
         "list_spaces",
         "list_channels_in_space",
         "list_channels_in_all_spaces",
