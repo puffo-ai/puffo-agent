@@ -286,6 +286,26 @@ def test_codex_symlink_leaves_live_link_alone(tmp_path, monkeypatch):
     assert os.readlink(link) == str(other)
 
 
+def test_codex_not_found_error_is_legible(tmp_path, monkeypatch):
+    from puffo_agent.agent.adapters import local_cli as lc
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(lc, "is_macos", lambda: False)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    monkeypatch.setattr(lc, "resolve_codex_bin", lambda: None)
+
+    adapter = _make_adapter(tmp_path)
+    with pytest.raises(RuntimeError) as ei:
+        adapter._ensure_codex_session()
+    msg = str(ei.value)
+    assert "codex binary not found" in msg
+    assert "ChatGPT.app" in msg
+    assert "restart puffo-agent" in msg
+
+
 def test_codex_symlink_oserror_is_nonfatal(tmp_path, monkeypatch):
     def _boom(self, *_a, **_k):
         raise OSError("no privilege")
@@ -295,3 +315,47 @@ def test_codex_symlink_oserror_is_nonfatal(tmp_path, monkeypatch):
         tmp_path, monkeypatch, codex_bin="/opt/homebrew/bin/codex",
     )
     assert not (host_home / ".local" / "bin" / "codex").exists()
+
+
+def test_bundle_discovery_composes_with_stale_symlink_retarget(tmp_path, monkeypatch):
+    # One start must both discover codex via a bundle path AND re-target
+    # the dangling ~/.local/bin/codex left by the moved-out install.
+    if not _symlinks_available(tmp_path):
+        pytest.skip("symlinks unavailable on this host")
+    from puffo_agent.agent import cli_bin
+    from puffo_agent.agent.adapters import local_cli as lc
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    bundle_codex = tmp_path / "ChatGPT.app" / "Contents" / "Resources" / "codex"
+    bundle_codex.parent.mkdir(parents=True)
+    bundle_codex.write_text("#!/bin/sh\n", encoding="utf-8")
+    bundle_codex.chmod(0o755)
+    link = host_home / ".local" / "bin" / "codex"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "Codex.app" / "Contents" / "Resources" / "codex")  # corpse
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(lc, "is_macos", lambda: True)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    # Force bundle-path resolution; isolate both resolver cache layers.
+    monkeypatch.delenv("PUFFO_CODEX_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda *a, **k: None)
+    monkeypatch.setattr(cli_bin, "_real_path", lambda: "")
+    monkeypatch.setattr(cli_bin, "_real_path_cache", None)
+    cli_bin._resolve_memcache.clear()
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [bundle_codex])
+
+    class _Stop:
+        def __init__(self, *a, **k):
+            raise RuntimeError("stop before spawn")
+
+    monkeypatch.setattr(lc, "CodexSession", _Stop)
+    adapter = _make_adapter(tmp_path)
+    try:
+        with pytest.raises(RuntimeError, match="stop before spawn"):
+            adapter._ensure_codex_session()
+        assert os.readlink(link) == str(bundle_codex)
+    finally:
+        cli_bin._resolve_memcache.clear()

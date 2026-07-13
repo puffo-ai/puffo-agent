@@ -4,6 +4,19 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **codex is now discovered inside ChatGPT.app on macOS (PUF-372
+  follow-up).** A ChatGPT desktop-app update moved the bundled codex
+  binary out of Codex.app, leaving agents unable to spawn. The resolver
+  now checks `ChatGPT.app/Contents/Resources/codex` (system and
+  per-user `Applications`, preferred over a leftover Codex.app copy),
+  which also re-points the `~/.local/bin/codex` fs-sandbox shim at the
+  new location. The "codex binary not found" error now names the bundle
+  paths tried and the restart-after-app-update remedy.
+
 ## [1.1.1] — 2026-07-10
 
 ### Fixed
