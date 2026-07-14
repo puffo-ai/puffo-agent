@@ -27,6 +27,16 @@ class AgentStatusReporter:
         self._sender: Sender | None = None
         self._machine = None
         self._cache: dict[str, tuple[float, list[agent_message.Recipient]]] = {}
+        # Latest raw ``account/rateLimits/updated`` payload a codex session saw;
+        # the usage loop reads it for the machine's codex budget snapshot.
+        self._codex_rate_limits: dict | None = None
+
+    def record_codex_rate_limits(self, raw: dict | None) -> None:
+        if isinstance(raw, dict):
+            self._codex_rate_limits = raw
+
+    def latest_codex_rate_limits(self) -> dict | None:
+        return self._codex_rate_limits
 
     def set_sender(self, sender: Sender | None) -> None:
         """Called by the control client: a sender while the WS is up, None on drop."""

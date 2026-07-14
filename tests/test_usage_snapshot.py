@@ -131,3 +131,58 @@ async def test_collect_snapshot_missing_binary_is_none(monkeypatch):
     monkeypatch.setattr(us, "machine_harnesses", lambda: {"claude-code"})
     monkeypatch.setattr(us, "resolve_claude_bin", lambda: None)
     assert await us.collect_usage_snapshot(Path(".")) is None
+
+
+# ── codex rate-limits (app-server account/rateLimits/updated) ──────
+
+def test_parse_codex_rate_limits_session_and_weekly():
+    raw = {
+        "primary": {"usedPercent": 4, "windowDurationMins": 300, "resetsAt": 1783405466},
+        "secondary": {"usedPercent": 3, "windowDurationMins": 10080, "resetsAt": 1783969993},
+    }
+    assert us.parse_codex_rate_limits(raw) == {
+        "session": {"used_pct": 4, "resets_at": 1783405466},
+        "weekly": {"used_pct": 3, "resets_at": 1783969993},
+    }
+
+
+def test_parse_codex_rate_limits_weekly_only():
+    raw = {
+        "primary": {"usedPercent": 5, "windowDurationMins": 10080, "resetsAt": 1784489223},
+        "secondary": None,
+    }
+    assert us.parse_codex_rate_limits(raw) == {
+        "weekly": {"used_pct": 5, "resets_at": 1784489223}
+    }
+
+
+def test_parse_codex_rate_limits_empty_or_bad():
+    assert us.parse_codex_rate_limits(None) is None
+    assert us.parse_codex_rate_limits({}) is None
+    assert us.parse_codex_rate_limits({"primary": {"windowDurationMins": 300}}) is None
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_includes_codex_from_reporter(monkeypatch):
+    from puffo_agent.portal.control import reporter as reporter_mod
+
+    monkeypatch.setattr(us, "machine_harnesses", lambda: {"codex"})
+    rep = reporter_mod.AgentStatusReporter()
+    rep.record_codex_rate_limits(
+        {"primary": {"usedPercent": 7, "windowDurationMins": 300, "resetsAt": 111}}
+    )
+    monkeypatch.setattr(us, "get_reporter", lambda: rep, raising=False)
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: rep)
+    snap = await us.collect_usage_snapshot(Path("."))
+    assert snap == {"codex": {"session": {"used_pct": 7, "resets_at": 111}}}
+
+
+def test_reporter_records_and_returns_codex_rate_limits():
+    from puffo_agent.portal.control.reporter import AgentStatusReporter
+
+    rep = AgentStatusReporter()
+    assert rep.latest_codex_rate_limits() is None
+    rep.record_codex_rate_limits({"primary": {"usedPercent": 1}})
+    assert rep.latest_codex_rate_limits() == {"primary": {"usedPercent": 1}}
+    rep.record_codex_rate_limits(None)  # ignored, keeps last
+    assert rep.latest_codex_rate_limits() == {"primary": {"usedPercent": 1}}

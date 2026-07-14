@@ -992,3 +992,19 @@ def test_codex_legacy_session_file_treated_as_full_access(tmp_path):
         agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
     )
     assert reset._conversation_id == ""  # now differs → reset
+
+
+def test_account_ratelimits_frame_pushes_to_reporter(tmp_path, monkeypatch):
+    from puffo_agent.portal.control import reporter as reporter_mod
+
+    rep = reporter_mod.AgentStatusReporter()
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: rep)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=["x"],
+        cwd=str(tmp_path),
+    )
+    raw = {"primary": {"usedPercent": 8, "windowDurationMins": 300, "resetsAt": 9}}
+    asyncio.run(cs._handle_notification("account/rateLimits/updated", {"rateLimits": raw}))
+    assert rep.latest_codex_rate_limits() == raw

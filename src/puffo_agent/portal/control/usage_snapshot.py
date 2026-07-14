@@ -50,6 +50,24 @@ def parse_claude_usage(text: str) -> dict | None:
     return out or None
 
 
+def parse_codex_rate_limits(raw: dict | None) -> dict | None:
+    """Normalise a codex ``account/rateLimits/updated`` payload into the same
+    ``{session, weekly}`` shape as claude-code. primary/secondary carry the
+    window, so classify by ``windowDurationMins`` (~300 = 5h, ~10080 = weekly)
+    rather than their slot. ``resets_at`` stays a unix epoch."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    for slot in ("primary", "secondary"):
+        w = raw.get(slot)
+        if not isinstance(w, dict) or "usedPercent" not in w:
+            continue
+        entry = {"used_pct": w["usedPercent"], "resets_at": w.get("resetsAt")}
+        mins = w.get("windowDurationMins") or 0
+        out["session" if mins <= 1440 else "weekly"] = entry
+    return out or None
+
+
 def machine_harnesses() -> set[str]:
     """Harnesses in use by this machine's agents (drives which /usage to probe)."""
     harnesses = set()
@@ -96,8 +114,9 @@ async def collect_usage_snapshot(host_home: Path) -> dict | None:
         if claude_bin and (text := await _run_claude_usage(claude_bin, host_home)):
             if parsed := parse_claude_usage(text):
                 snapshot["claude-code"] = parsed
-    # TODO codex: the ChatGPT backend returns a ``rate_limits`` object
-    # (primary = 5h session, secondary = weekly; used_percent + reset_at epoch)
-    # — but ``codex exec`` doesn't surface it and ``/usage`` isn't a slash
-    # command there. Capture it from the app-server frames CodexSession reads.
+    if "codex" in harnesses:
+        from .reporter import get_reporter
+
+        if parsed := parse_codex_rate_limits(get_reporter().latest_codex_rate_limits()):
+            snapshot["codex"] = parsed
     return snapshot or None

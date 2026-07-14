@@ -1085,6 +1085,13 @@ class CodexSession:
         m = method.replace(".", "/").lower()
         turn = self._active_turn
 
+        # Account-level, arrives with or without an active turn.
+        if m.startswith("account/ratelimits/updated"):
+            from ...portal.control.reporter import get_reporter
+
+            get_reporter().record_codex_rate_limits((params or {}).get("rateLimits"))
+            return
+
         if m.startswith("thread/tokenusage/updated") and turn is not None:
             # codex reports per-turn tokens here (not turn/completed); ``last``
             # refreshes during the turn, final value stands at turn/completed.
