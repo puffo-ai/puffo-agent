@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 import aiohttp
 
@@ -27,11 +28,14 @@ from ..state import (
 from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
+from .usage_snapshot import collect_usage_snapshot
 
 log = logging.getLogger("puffo_agent.control")
 
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
+# Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
+USAGE_INTERVAL_SECONDS = 6 * 60 * 60.0
 RESCAN_SECONDS = 5.0
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
@@ -194,6 +198,24 @@ async def _create_agent_command(
     return {"ok": True, "agent_slug": result["agent_id"]}
 
 
+async def post_usage_snapshot(machine, base: str) -> bool:
+    """Collect the machine's usage-budget snapshot and POST it to the server.
+    Returns True iff there was a snapshot to send. Shared by the periodic loop
+    and the on-demand ``refresh_usage`` command."""
+    snapshot = await collect_usage_snapshot(Path.home())
+    if not snapshot:
+        return False
+    path = f"/v2/machines/{machine.machine_id}/usage"
+    body = json.dumps({"snapshot": snapshot}).encode()
+    headers = machine_auth.signed_headers(machine, "POST", path, body)
+    headers["content-type"] = "application/json"
+    async with create_remote_http_session(base) as session:
+        resp = await session.post(f"{base}{path}", data=body, headers=headers)
+        if resp.status >= 300:
+            log.debug("control: usage report HTTP %s", resp.status)
+    return True
+
+
 async def execute_command(
     op: str,
     agent_slug: str | None,
@@ -296,6 +318,15 @@ async def execute_command(
                 {"requested_at": int(__import__("time").time())},
             )
         return {"ok": True}
+    if op == "refresh_usage":
+        # Machine-level (no agent_slug) — re-probe /usage and POST now instead
+        # of waiting for the periodic tick.
+        if not server_url:
+            return {"ok": False, "error": "refresh_usage: no server_url"}
+        posted = await post_usage_snapshot(
+            load_or_create_machine(), server_url.rstrip("/")
+        )
+        return {"ok": True, "posted": posted}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
     if op == "agent_create_approved":
@@ -525,6 +556,7 @@ class ControlManager:
         machine = None
         ws_task: asyncio.Task | None = None
         me_task: asyncio.Task | None = None
+        usage_task: asyncio.Task | None = None
         try:
             while not self._stop.is_set():
                 pairings = load_pairings()
@@ -534,13 +566,15 @@ class ControlManager:
                     client = MachineControlClient(machine)
                     ws_task = asyncio.create_task(client.run(self._stop))
                     me_task = asyncio.create_task(self._me_loop(machine))
+                    usage_task = asyncio.create_task(self._usage_loop(machine))
                 if not pairings and ws_task is not None:
                     ws_task.cancel()
                     me_task.cancel()
-                    ws_task = me_task = None
+                    usage_task.cancel()
+                    ws_task = me_task = usage_task = None
                 await _sleep_or_stop(self._stop, RESCAN_SECONDS)
         finally:
-            for t in (ws_task, me_task):
+            for t in (ws_task, me_task, usage_task):
                 if t is not None:
                     t.cancel()
 
@@ -558,6 +592,19 @@ class ControlManager:
             except Exception as exc:  # noqa: BLE001 — best-effort liveness
                 log.debug("control: /me report failed: %s", exc)
             await _sleep_or_stop(self._stop, ME_INTERVAL_SECONDS)
+
+    async def _usage_loop(self, machine) -> None:
+        """Probe each runtime's /usage budget and POST the machine's snapshot.
+        Replace-latest server-side, so a dropped tick just resends next time."""
+        while not self._stop.is_set():
+            try:
+                pairings = load_pairings()
+                if pairings:
+                    base = next(iter(pairings.values())).server_url.rstrip("/")
+                    await post_usage_snapshot(machine, base)
+            except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
+                log.debug("control: usage report failed: %s", exc)
+            await _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS)
 
     def stop(self) -> None:
         self._stop.set()
