@@ -2282,6 +2282,12 @@ class PuffoCoreMessageClient:
         Serialized + 5s-debounced so a burst of misses doesn't stampede
         the server; no-op if a re-warm already ran in the last few
         seconds.
+
+        Trade-off: a *different* channel that goes stale within the 5s
+        window won't get its own re-warm and fails loud until the window
+        lapses — acceptable because a full warm re-syncs *all* the
+        agent's channels at once (one miss heals the rest), and the
+        on-(re)connect warm covers the steady state.
         """
         async with self._rewarm_lock:
             now = time.monotonic()
@@ -2294,7 +2300,10 @@ class PuffoCoreMessageClient:
         """Re-warm caches on every (re)connect so a membership event
         missed during the reconnect window self-heals rather than
         staying stale until a daemon restart (PUF-376 γ). Fire-and-
-        forget so it doesn't block catch-up / listen.
+        forget so it doesn't block catch-up / listen — unlike the
+        on-miss path (``rewarm_channel_caches`` behind
+        ``lookup_channel_space``), which awaits because it must re-check
+        the store before deciding to fail loud.
         """
         asyncio.ensure_future(self._warm_member_caches())
 
