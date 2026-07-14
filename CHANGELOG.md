@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.2] — 2026-07-14
 
 ### Added
 
@@ -25,6 +25,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   instead of silence (and says whether the codex session was reset).
 
 ### Fixed
+
+- **Stop the CLI's model-usage-cap fallback from leaking to operators
+  (PUF-380).** A `You've reached your <Model> limit. Run /usage-credits …`
+  line from the harness now matches the worker's non-auth leak filter.
+  The pattern is model-agnostic and apostrophe-robust, so future models and
+  curly-quote variants are covered without another one-off.
 
 - **codex mid-reconnect turn failures no longer drop the batch or flip
   a false red (PUF-375).** A `turn failed: Reconnecting... N/M` from
