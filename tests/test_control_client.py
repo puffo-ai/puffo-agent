@@ -196,3 +196,46 @@ async def test_usage_loop_tolerates_http_error(monkeypatch):
     # Best-effort: a 5xx must not raise; the loop finishes its iteration.
     await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
     assert len(calls) == 1
+
+
+# ── refresh_usage command (on-demand snapshot POST) ────────────────
+
+
+def _wire_refresh_usage(monkeypatch, *, snapshot, status, calls):
+    async def _collect(_home):
+        return snapshot
+
+    monkeypatch.setattr(cc, "collect_usage_snapshot", _collect)
+    monkeypatch.setattr(cc, "load_or_create_machine", lambda: types.SimpleNamespace(machine_id="mac_1"))
+    monkeypatch.setattr(cc.machine_auth, "signed_headers", lambda *a, **k: {"x-sig": "1"})
+    monkeypatch.setattr(
+        cc, "create_remote_http_session", lambda base, **k: _FakeSession(status, calls)
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_usage_posts_now(monkeypatch):
+    calls = []
+    snap = {"claude-code": {"session": {"used_pct": 2}}}
+    _wire_refresh_usage(monkeypatch, snapshot=snap, status=200, calls=calls)
+    res = await cc.execute_command("refresh_usage", None, {}, server_url="https://s/")
+    assert res == {"ok": True, "posted": True}
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://s/v2/machines/mac_1/usage"
+    assert json.loads(calls[0]["data"]) == {"snapshot": snap}
+
+
+@pytest.mark.asyncio
+async def test_refresh_usage_no_snapshot_posts_nothing(monkeypatch):
+    calls = []
+    _wire_refresh_usage(monkeypatch, snapshot=None, status=200, calls=calls)
+    res = await cc.execute_command("refresh_usage", None, {}, server_url="https://s/")
+    assert res == {"ok": True, "posted": False}
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_usage_without_server_url_errors():
+    res = await cc.execute_command("refresh_usage", None, {})
+    assert res["ok"] is False
+    assert "server_url" in res["error"]

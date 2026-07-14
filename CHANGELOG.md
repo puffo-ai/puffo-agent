@@ -4,6 +4,20 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Report each machine's CLI usage-budget to puffo-server (PUF-364).**
+  The daemon reads every runtime's plan budget — claude-code from
+  `claude -p /usage`, codex from the app-server's `account/rateLimits`
+  frames — normalizes both to `{session, weekly}` with `used_pct` and a
+  unix-epoch `resets_at`, and POSTs the whole per-machine snapshot on a
+  5-minute cadence (latest replaces on the server). A machine-level
+  `refresh_usage` control command re-probes and posts on demand instead
+  of waiting for the tick. Adds `tzdata` as a dependency so Windows can
+  resolve the named timezone in claude's reset times.
+
 ## [1.1.1] — 2026-07-10
 
 ### Fixed

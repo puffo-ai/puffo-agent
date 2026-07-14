@@ -196,6 +196,26 @@ async def _create_agent_command(
     return {"ok": True, "agent_slug": result["agent_id"]}
 
 
+async def post_usage_snapshot(machine, base: str) -> bool:
+    """Collect the machine's usage-budget snapshot and POST it to the server.
+    Returns True iff there was a snapshot to send. Shared by the periodic loop
+    and the on-demand ``refresh_usage`` command."""
+    from pathlib import Path
+
+    snapshot = await collect_usage_snapshot(Path.home())
+    if not snapshot:
+        return False
+    path = f"/v2/machines/{machine.machine_id}/usage"
+    body = json.dumps({"snapshot": snapshot}).encode()
+    headers = machine_auth.signed_headers(machine, "POST", path, body)
+    headers["content-type"] = "application/json"
+    async with create_remote_http_session(base) as session:
+        resp = await session.post(f"{base}{path}", data=body, headers=headers)
+        if resp.status >= 300:
+            log.debug("control: usage report HTTP %s", resp.status)
+    return True
+
+
 async def execute_command(
     op: str,
     agent_slug: str | None,
@@ -298,6 +318,15 @@ async def execute_command(
                 {"requested_at": int(__import__("time").time())},
             )
         return {"ok": True}
+    if op == "refresh_usage":
+        # Machine-level (no agent_slug) — re-probe /usage and POST now instead
+        # of waiting for the periodic tick.
+        if not server_url:
+            return {"ok": False, "error": "refresh_usage: no server_url"}
+        posted = await post_usage_snapshot(
+            load_or_create_machine(), server_url.rstrip("/")
+        )
+        return {"ok": True, "posted": posted}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
     if op == "agent_create_approved":
@@ -567,24 +596,12 @@ class ControlManager:
     async def _usage_loop(self, machine) -> None:
         """Probe each runtime's /usage budget and POST the machine's snapshot.
         Replace-latest server-side, so a dropped tick just resends next time."""
-        from pathlib import Path
-
         while not self._stop.is_set():
             try:
-                snapshot = await collect_usage_snapshot(Path.home())
                 pairings = load_pairings()
-                if snapshot and pairings:
+                if pairings:
                     base = next(iter(pairings.values())).server_url.rstrip("/")
-                    path = f"/v2/machines/{machine.machine_id}/usage"
-                    body = json.dumps({"snapshot": snapshot}).encode()
-                    headers = machine_auth.signed_headers(machine, "POST", path, body)
-                    headers["content-type"] = "application/json"
-                    async with create_remote_http_session(base) as session:
-                        resp = await session.post(
-                            f"{base}{path}", data=body, headers=headers
-                        )
-                        if resp.status >= 300:
-                            log.debug("control: usage report HTTP %s", resp.status)
+                    await post_usage_snapshot(machine, base)
             except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
                 log.debug("control: usage report failed: %s", exc)
             await _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS)
