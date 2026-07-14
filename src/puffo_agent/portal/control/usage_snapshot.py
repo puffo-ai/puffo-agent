@@ -96,5 +96,8 @@ async def collect_usage_snapshot(host_home: Path) -> dict | None:
         if claude_bin and (text := await _run_claude_usage(claude_bin, host_home)):
             if parsed := parse_claude_usage(text):
                 snapshot["claude-code"] = parsed
-    # TODO: codex has no programmatic /usage budget source yet.
+    # TODO codex: the ChatGPT backend returns a ``rate_limits`` object
+    # (primary = 5h session, secondary = weekly; used_percent + reset_at epoch)
+    # — but ``codex exec`` doesn't surface it and ``/usage`` isn't a slash
+    # command there. Capture it from the app-server frames CodexSession reads.
     return snapshot or None
