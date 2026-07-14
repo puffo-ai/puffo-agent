@@ -107,6 +107,33 @@ def test_lets_through_authentication_topic_prose():
     assert _suppress_worker_error_leak(reply) == reply
 
 
+# ── PUF-380 / FB-65 reopen: model-usage-cap fallback ────────────────
+
+
+def test_suppresses_model_usage_cap_fallback():
+    """The CLI's model-quota fallback the fleet cascade leaked (2026-07-13)."""
+    leak = (
+        "You've reached your Fable 5 limit. Run /usage-credits to continue "
+        "or switch models with /model."
+    )
+    assert _suppress_worker_error_leak(leak) is None
+    # Model-agnostic — the next model's variant is caught too, not whack-a-mole.
+    assert _suppress_worker_error_leak(
+        "You've reached your Opus 4.8 limit. Run /usage-credits to continue."
+    ) is None
+    # Curly-apostrophe variant (CLIs vary).
+    assert _suppress_worker_error_leak(
+        "You’ve reached your Fable 5 limit."
+    ) is None
+
+
+def test_lets_through_reached_your_prose_without_limit():
+    """Starts with 'You've reached your' but no '... limit' fallback shape —
+    the pattern requires the limit token, so this legit prose passes through."""
+    reply = "You've reached your goal for today — 5 tasks done. Nice work!"
+    assert _suppress_worker_error_leak(reply) == reply
+
+
 def test_lets_through_empty_reply():
     """``if reply:`` at the call site already short-circuits empty
     replies; the filter shouldn't change that semantics."""

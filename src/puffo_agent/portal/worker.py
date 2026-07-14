@@ -427,6 +427,8 @@ _NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     # Subscription-plan quotas (the prod miss the reviewer surfaced).
     re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
+    # Model-usage-cap fallback ("reached your <Model> limit …"); model-agnostic + apostrophe-robust (`.?`).
+    re.compile(r"^\s*You.?ve reached your\b.*?\blimit\b", re.IGNORECASE),
     re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
     # CLI-emitted server 429 / 5xx.
     re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
