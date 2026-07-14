@@ -50,6 +50,9 @@ dependencies = [
     "pyside6>=6.7",
     "python-socks>=2.4",
     "pyyaml>=6.0",
+    # IANA tz DB for zoneinfo (Windows has no system tz db) — parsing
+    # claude's /usage reset times to epoch needs the named zone.
+    "tzdata>=2024.1",
     "websockets>=12.0",
 ]
 
