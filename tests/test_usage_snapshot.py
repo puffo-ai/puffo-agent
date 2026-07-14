@@ -20,24 +20,51 @@ SAMPLE = (
 )
 
 
+def _wall(epoch: int):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.fromtimestamp(epoch, ZoneInfo("America/Los_Angeles"))
+
+
 def test_parse_full_snapshot():
     out = us.parse_claude_usage(SAMPLE)
-    assert out["session"] == {
-        "used_pct": 41,
-        "resets_at": "Jul 14, 12:40am (America/Los_Angeles)",
+    assert out["session"]["used_pct"] == 41
+    assert out["weekly"]["used_pct"] == 9
+    assert out["weekly_by_model"][0] == {
+        "model": "Fable",
+        "used_pct": 3,
+        "resets_at": out["weekly"]["resets_at"],
     }
-    assert out["weekly"] == {
-        "used_pct": 9,
-        "resets_at": "Jul 20, 5pm (America/Los_Angeles)",
-    }
-    assert out["weekly_by_model"] == [
-        {"model": "Fable", "used_pct": 3, "resets_at": "Jul 20, 5pm (America/Los_Angeles)"}
-    ]
+    # resets_at is an epoch that round-trips to the prose wall-clock.
+    s = _wall(out["session"]["resets_at"])
+    assert (s.month, s.day, s.hour, s.minute) == (7, 14, 0, 40)
+    w = _wall(out["weekly"]["resets_at"])
+    assert (w.month, w.day, w.hour) == (7, 20, 17)
 
 
-def test_parse_session_only():
+def test_parse_session_only_with_unparseable_resets_omits_the_field():
+    # "tomorrow" isn't the dated-tz format → resets_at is dropped, pct kept.
     out = us.parse_claude_usage("Current session: 5% used · resets tomorrow")
-    assert out == {"session": {"used_pct": 5, "resets_at": "tomorrow"}}
+    assert out == {"session": {"used_pct": 5}}
+
+
+def test_claude_resets_to_epoch_variants():
+    assert (_wall(us._claude_resets_to_epoch("Jul 20, 5pm (America/Los_Angeles)")).hour) == 17
+    midnight = _wall(us._claude_resets_to_epoch("Jul 14, 12:40am (America/Los_Angeles)"))
+    assert (midnight.hour, midnight.minute) == (0, 40)
+    noon = _wall(us._claude_resets_to_epoch("Jul 14, 12pm (America/Los_Angeles)"))
+    assert noon.hour == 12
+    # Every valid parse resolves to a near-future reset (year inferred).
+    import time
+
+    assert us._claude_resets_to_epoch("Jan 1, 9am (America/Los_Angeles)") >= time.time() - 86400
+
+
+def test_claude_resets_to_epoch_bad_input_is_none():
+    assert us._claude_resets_to_epoch("whenever") is None
+    assert us._claude_resets_to_epoch("Jul 20, 5pm (Not/AZone)") is None
+    assert us._claude_resets_to_epoch("") is None
 
 
 def test_parse_no_budget_line_is_none():
@@ -186,3 +213,8 @@ def test_reporter_records_and_returns_codex_rate_limits():
     assert rep.latest_codex_rate_limits() == {"primary": {"usedPercent": 1}}
     rep.record_codex_rate_limits(None)  # ignored, keeps last
     assert rep.latest_codex_rate_limits() == {"primary": {"usedPercent": 1}}
+
+
+def test_parse_codex_rate_limits_omits_missing_resets_at():
+    raw = {"primary": {"usedPercent": 6, "windowDurationMins": 300, "resetsAt": None}}
+    assert us.parse_codex_rate_limits(raw) == {"session": {"used_pct": 6}}

@@ -31,16 +31,63 @@ _WEEK_RE = re.compile(
 )
 
 
+_RESETS_RE = re.compile(
+    r"^(\w{3})\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)",
+    re.IGNORECASE,
+)
+_MONTHS = {m: i for i, m in enumerate(
+    "jan feb mar apr may jun jul aug sep oct nov dec".split(), 1)}
+
+
+def _claude_resets_to_epoch(prose: str) -> int | None:
+    """Claude's ``/usage`` reset time is a year-less, named-tz phrase like
+    ``Jul 20, 5pm (America/Los_Angeles)``. Parse to a unix epoch (matching
+    codex's ``resetsAt``); ``None`` on any format/tz miss so the caller omits
+    the field rather than shipping an unparseable string."""
+    m = _RESETS_RE.match(prose.strip())
+    if not m:
+        return None
+    try:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        month = _MONTHS[m.group(1).lower()]
+        day, hour = int(m.group(2)), int(m.group(3))
+        minute = int(m.group(4) or 0)
+        if m.group(5).lower() == "pm" and hour != 12:
+            hour += 12
+        elif m.group(5).lower() == "am" and hour == 12:
+            hour = 0
+        tz = ZoneInfo(m.group(6).strip())
+        now = datetime.now(tz)
+        dt = datetime(now.year, month, day, hour, minute, tzinfo=tz)
+        # Year-less: a reset that lands in the past means it's next year
+        # (weekly/session windows only ever reset in the near future).
+        if dt.timestamp() < now.timestamp() - 86400:
+            dt = dt.replace(year=now.year + 1)
+        return int(dt.timestamp())
+    except Exception:  # noqa: BLE001 — unknown tz / format drift → omit the field
+        return None
+
+
+def _budget_entry(used_pct: int, resets_prose: str) -> dict:
+    entry: dict = {"used_pct": used_pct}
+    epoch = _claude_resets_to_epoch(resets_prose)
+    if epoch is not None:
+        entry["resets_at"] = epoch
+    return entry
+
+
 def parse_claude_usage(text: str) -> dict | None:
     """Parse ``/usage`` prose into ``{session, weekly, weekly_by_model}``.
     ``None`` when the text carries no budget line (auth error, format drift)."""
     out: dict = {}
     if m := _SESSION_RE.search(text):
-        out["session"] = {"used_pct": int(m.group(1)), "resets_at": m.group(2).strip()}
+        out["session"] = _budget_entry(int(m.group(1)), m.group(2))
     models = []
     for m in _WEEK_RE.finditer(text):
-        label, pct, resets = m.group(1).strip(), int(m.group(2)), m.group(3).strip()
-        entry = {"used_pct": pct, "resets_at": resets}
+        label = m.group(1).strip()
+        entry = _budget_entry(int(m.group(2)), m.group(3))
         if label.lower() == "all models":
             out["weekly"] = entry
         else:
@@ -62,7 +109,9 @@ def parse_codex_rate_limits(raw: dict | None) -> dict | None:
         w = raw.get(slot)
         if not isinstance(w, dict) or "usedPercent" not in w:
             continue
-        entry = {"used_pct": w["usedPercent"], "resets_at": w.get("resetsAt")}
+        entry = {"used_pct": w["usedPercent"]}
+        if isinstance(w.get("resetsAt"), int):
+            entry["resets_at"] = w["resetsAt"]
         mins = w.get("windowDurationMins") or 0
         out["session" if mins <= 1440 else "weekly"] = entry
     return out or None
