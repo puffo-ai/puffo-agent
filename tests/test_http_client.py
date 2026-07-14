@@ -434,6 +434,7 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
         _make_keystore_with_session(self.ks, self.subkey)
         self.captured_headers = {}
         self.captured_body = b""
+        self.captured_path = ""
         super().setUp()
 
     async def get_application(self):
@@ -441,7 +442,12 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
         app.router.add_route("POST", "/v2/cloud-agents/blobs/upload", self._echo)
         app.router.add_route("POST", "/v2/cloud-agents/messages", self._echo)
         app.router.add_route("GET", "/v2/cloud-agents/spaces", self._echo)
-        # Signed routes — used to prove the shim never touches them.
+        app.router.add_route(
+            "GET", "/v2/cloud-agents/spaces/{sid}/members", self._echo
+        )
+        # Signed routes — used to prove the shim never touches them, and that
+        # a native (keyless=False) client keeps hitting the un-rewritten path.
+        app.router.add_route("GET", "/spaces", self._echo)
         app.router.add_route("GET", "/health", self._echo)
         app.router.add_route("POST", "/messages", self._echo)
         return app
@@ -449,6 +455,7 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
     async def _echo(self, request: web.Request):
         self.captured_headers = {k.lower(): v for k, v in request.headers.items()}
         self.captured_body = await request.read()
+        self.captured_path = request.path
         return web.json_response({"ok": True, "blob_id": "b1"})
 
     @unittest_run_loop
@@ -508,6 +515,42 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
                     "/v2/cloud-agents/blobs/upload", b"x",
                 )
                 assert "x-sandbox-token" not in self.captured_headers
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_keyless_get_routes_twinned_read_to_cloud_agents(self):
+        # A keyless agent's plain get() of a twinned read route is transparently
+        # rewritten to /v2/cloud-agents/* and sent UNSIGNED (egress token only).
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {"PUFFO_LOCAL_SANDBOX_TOKEN": "tok-abc"}):
+                result = await client.get("/spaces")
+                assert result["ok"] is True
+                assert self.captured_path == "/v2/cloud-agents/spaces"
+                assert "x-puffo-signature" not in self.captured_headers
+                assert self.captured_headers.get("x-sandbox-token") == "tok-abc"
+
+                # a deeper twinned route (incl. the #222 channel-members one)
+                await client.get("/spaces/sp_1/members")
+                assert (
+                    self.captured_path == "/v2/cloud-agents/spaces/sp_1/members"
+                )
+                assert "x-puffo-signature" not in self.captured_headers
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_native_get_is_not_rewritten(self):
+        # A native (signed) client must keep hitting the un-rewritten path and
+        # sign it — the shim is keyless-only.
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")  # keyless=False
+        try:
+            await client.get("/spaces")
+            assert self.captured_path == "/spaces"
+            assert "x-puffo-signature" in self.captured_headers
         finally:
             await client.close()
 

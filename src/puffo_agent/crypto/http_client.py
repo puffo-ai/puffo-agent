@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import aiohttp
@@ -15,6 +16,36 @@ from .keystore import KeyStore, Session, decode_secret
 from .primitives import Ed25519KeyPair
 
 logger = logging.getLogger(__name__)
+
+# Signed read routes that have a keyless ``/v2/cloud-agents/*`` twin
+# (server-side ``SandboxTokenAuth``, added incrementally through puffo-server
+# and completed by #222's channel-members route). A keyless bridge agent has
+# no subkey to sign with, so it rewrites these to the twin and sends them
+# unsigned — the E2B egress proxy injects ``x-sandbox-token`` (see
+# ``_egress_headers``). Routes NOT listed here (``/spaces/{id}/events``,
+# ``/spaces/events``) have no twin and stay on the signed path; a keyless
+# agent still can't reach them, exactly as before this migration.
+_CLOUD_AGENT_READ_ROUTES = (
+    re.compile(r"^/spaces$"),
+    re.compile(r"^/spaces/[^/]+/channels$"),
+    re.compile(r"^/spaces/[^/]+/members$"),
+    re.compile(r"^/spaces/[^/]+/channels/[^/]+/members$"),
+    re.compile(r"^/identities/profiles$"),
+)
+
+
+def cloud_agent_read_twin(path: str) -> str | None:
+    """Return the ``/v2/cloud-agents/*`` twin of a signed read ``path`` (query
+    preserved), or ``None`` when the path has no keyless twin.
+
+    Splitting on ``?`` keeps ``/identities/profiles?slugs=...`` matchable while
+    the query rides along untouched. Anchored patterns mean ``/spaces/events``
+    and ``/spaces/{id}/events`` deliberately DON'T match — they have no twin.
+    """
+    base, sep, query = path.partition("?")
+    if any(rx.match(base) for rx in _CLOUD_AGENT_READ_ROUTES):
+        return f"/v2/cloud-agents{base}{sep}{query}"
+    return None
 
 
 class HttpError(Exception):
@@ -145,6 +176,14 @@ class PuffoCoreHttpClient:
             return resp.status, data
 
     async def get(self, path: str) -> Any:
+        # Keyless bridge agents can't sign: transparently route the twinned
+        # read routes to ``/v2/cloud-agents/*`` (unsigned; egress injects the
+        # sandbox token). Native (signed) agents leave ``keyless`` False and
+        # this branch never fires — call sites are byte-for-byte unchanged.
+        if self.keyless:
+            twin = cloud_agent_read_twin(path)
+            if twin is not None:
+                return await self.get_unsigned(twin)
         _, data = await self._request("GET", path)
         return data
 
