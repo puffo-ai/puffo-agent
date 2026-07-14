@@ -198,6 +198,71 @@ async def test_usage_loop_tolerates_http_error(monkeypatch):
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_usage_loop_swallows_probe_exception(monkeypatch):
+    _wire_usage(monkeypatch, snapshot={}, status=200, calls=[])
+
+    async def _boom(_home):
+        raise RuntimeError("probe blew up")
+
+    monkeypatch.setattr(cc, "collect_usage_snapshot", _boom)
+    # Must not propagate — the loop logs and waits for the next tick.
+    await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
+
+
+def _wire_run(monkeypatch, mgr, *, pairing_seq, stop_after):
+    """Drive ControlManager.run() deterministically: each control task becomes a
+    cancellable sleep, and the pairing lookup follows ``pairing_seq``."""
+    import asyncio as aio
+
+    usage_spawns = []
+    monkeypatch.setattr(cc, "load_pairings", lambda: pairing_seq.pop(0) if pairing_seq else {})
+    monkeypatch.setattr(cc, "load_or_create_machine", lambda: types.SimpleNamespace(machine_id="mac_1"))
+
+    class _FakeClient:
+        def __init__(self, machine):
+            pass
+
+        def run(self, stop):
+            return aio.sleep(3600)
+
+    monkeypatch.setattr(cc, "MachineControlClient", _FakeClient)
+    monkeypatch.setattr(mgr, "_me_loop", lambda machine: aio.sleep(3600))
+
+    def _usage(machine):
+        usage_spawns.append(machine)
+        return aio.sleep(3600)
+
+    monkeypatch.setattr(mgr, "_usage_loop", _usage)
+
+    ticks = {"n": 0}
+
+    async def _sos(stop, timeout):
+        ticks["n"] += 1
+        if ticks["n"] >= stop_after:
+            stop.set()
+
+    monkeypatch.setattr(cc, "_sleep_or_stop", _sos)
+    return usage_spawns
+
+
+@pytest.mark.asyncio
+async def test_run_spawns_usage_task_and_cancels_on_exit(monkeypatch):
+    mgr = cc.ControlManager()
+    spawns = _wire_run(monkeypatch, mgr, pairing_seq=[{"op": object()}], stop_after=1)
+    await mgr.run()  # exits while still paired → finally cancels the live tasks
+    assert len(spawns) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_cancels_usage_task_when_unpaired(monkeypatch):
+    mgr = cc.ControlManager()
+    # iter1 paired → spawn; iter2 unpaired → the cancel-and-clear branch runs.
+    spawns = _wire_run(monkeypatch, mgr, pairing_seq=[{"op": object()}, {}], stop_after=2)
+    await mgr.run()
+    assert len(spawns) == 1
+
+
 # ── refresh_usage command (on-demand snapshot POST) ────────────────
 
 

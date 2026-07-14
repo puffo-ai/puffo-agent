@@ -9,14 +9,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Report each machine's CLI usage-budget to puffo-server (PUF-364).**
-  The daemon reads every runtime's plan budget — claude-code from
-  `claude -p /usage`, codex from the app-server's `account/rateLimits`
-  frames — normalizes both to `{session, weekly}` with `used_pct` and a
-  unix-epoch `resets_at`, and POSTs the whole per-machine snapshot on a
-  5-minute cadence (latest replaces on the server). A machine-level
-  `refresh_usage` control command re-probes and posts on demand instead
-  of waiting for the tick. Adds `tzdata` as a dependency so Windows can
-  resolve the named timezone in claude's reset times.
+  The daemon probes every installed runtime's plan budget — claude-code
+  via `claude -p /usage`, codex via a throwaway app-server driven through
+  one trivial turn (codex only emits its budget after a turn) — normalizes
+  both to `{session, weekly}` with `used_pct` and a unix-epoch `resets_at`,
+  and POSTs the whole per-machine snapshot (latest replaces on the server).
+  Runs every 6h, or immediately on the machine-level `refresh_usage`
+  control command the UI sends. Adds `tzdata` as a dependency so Windows
+  can resolve the named timezone in claude's reset times.
 
 - **Per-agent codex turn timeout: `runtime.task_timeout_seconds` in
   `agent.yml` (PUF-375).** Default stays 600s; raise it for agents

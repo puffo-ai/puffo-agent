@@ -1,9 +1,11 @@
 """Collect each runtime's current usage-budget snapshot for the machine.
 
-Claude Code exposes its plan budget (5h session + weekly limits) only via the
-interactive ``/usage`` slash command, which ``claude -p '/usage'
---output-format json`` runs non-interactively. We parse that prose into
-structured fields. Codex has no equivalent budget source today.
+Both harnesses are probed on demand — the daemon runs this on a slow cadence
+(and on the ``refresh_usage`` command). Claude Code exposes its plan budget only
+via the interactive ``/usage`` slash command, which ``claude -p '/usage'
+--output-format json`` runs non-interactively; we parse that prose. Codex only
+emits its budget (an ``account/rateLimits/updated`` frame) *after a turn*, so we
+spawn a throwaway app-server and run one trivial turn to read it.
 """
 
 from __future__ import annotations
@@ -16,12 +18,14 @@ import re
 from pathlib import Path
 
 from ..._proc import no_window_kwargs
-from ...agent.cli_bin import resolve_claude_bin
+from ...agent.cli_bin import resolve_claude_bin, resolve_codex_bin
 from ..state import AgentConfig, discover_agents
 
 logger = logging.getLogger(__name__)
 
 USAGE_PROBE_TIMEOUT_SECONDS = 60
+# Wider ceiling than claude's: codex pays a cold app-server spawn plus a turn.
+CODEX_PROBE_TIMEOUT_SECONDS = 90
 
 _SESSION_RE = re.compile(
     r"Current session:\s*(\d+)%\s*used\s*[·|]\s*resets\s+(.+)", re.IGNORECASE
@@ -153,6 +157,89 @@ async def _run_claude_usage(claude_bin: str, host_home: Path) -> str | None:
         return None
 
 
+def _extract_thread_id(result: object) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    for k in ("threadId", "thread_id", "conversationId", "id"):
+        if result.get(k):
+            return str(result[k])
+    thread = result.get("thread")
+    if isinstance(thread, dict):
+        return thread.get("id") or thread.get("threadId")
+    if isinstance(thread, str):
+        return thread
+    return None
+
+
+async def _drive_codex_probe(proc) -> dict | None:
+    """Run the JSON-RPC handshake + one trivial turn against a codex app-server
+    and return the ``rateLimits`` payload from the post-turn frame. Split from
+    the spawn so tests can drive it with a fake process."""
+
+    async def send(obj: dict) -> None:
+        proc.stdin.write((json.dumps(obj) + "\n").encode())
+        await proc.stdin.drain()
+
+    await send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "clientInfo": {"name": "puffo-agent", "version": "0"},
+        "capabilities": {}, "protocolVersion": "2025-06-18"}})
+    await send({"jsonrpc": "2.0", "id": 2, "method": "thread/start", "params": {}})
+
+    turn_sent = False
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            return None
+        try:
+            msg = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        method = (msg.get("method") or "").replace(".", "/").lower()
+        if method.startswith("account/ratelimits/updated"):
+            return (msg.get("params") or {}).get("rateLimits")
+        # thread/start ACK carries the id; fire the throwaway turn that makes
+        # codex emit the budget frame.
+        if msg.get("id") == 2 and "result" in msg and not turn_sent:
+            thread_id = _extract_thread_id(msg["result"])
+            if not thread_id:
+                return None
+            await send({"jsonrpc": "2.0", "id": 3, "method": "turn/start", "params": {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "ignore this message"}]}})
+            turn_sent = True
+
+
+async def _probe_codex_rate_limits(codex_bin: str, host_home: Path) -> dict | None:
+    """Spawn a throwaway codex app-server, run one trivial turn, and capture the
+    account budget. Costs one tiny turn (codex has no turn-free budget source).
+    ``None`` on any spawn/timeout/parse failure so the caller can fall back."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            codex_bin, "app-server",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "HOME": str(host_home)},
+            cwd=str(host_home),
+            **no_window_kwargs(),
+        )
+    except (FileNotFoundError, OSError) as exc:
+        logger.debug("usage: codex app-server spawn failed: %s", exc)
+        return None
+    try:
+        return await asyncio.wait_for(
+            _drive_codex_probe(proc), timeout=CODEX_PROBE_TIMEOUT_SECONDS
+        )
+    except (asyncio.TimeoutError, OSError) as exc:
+        logger.debug("usage: codex probe failed: %s", exc)
+        return None
+    finally:
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+
+
 async def collect_usage_snapshot(host_home: Path) -> dict | None:
     """Per-harness budget snapshot for the machine, or ``None`` if nothing to
     report. Shape: ``{"claude-code": {session, weekly, ...}}``."""
@@ -164,8 +251,14 @@ async def collect_usage_snapshot(host_home: Path) -> dict | None:
             if parsed := parse_claude_usage(text):
                 snapshot["claude-code"] = parsed
     if "codex" in harnesses:
-        from .reporter import get_reporter
+        raw = None
+        if codex_bin := resolve_codex_bin():
+            raw = await _probe_codex_rate_limits(codex_bin, host_home)
+        if raw is None:
+            # Probe failed — fall back to the last frame a live codex agent saw.
+            from .reporter import get_reporter
 
-        if parsed := parse_codex_rate_limits(get_reporter().latest_codex_rate_limits()):
+            raw = get_reporter().latest_codex_rate_limits()
+        if parsed := parse_codex_rate_limits(raw):
             snapshot["codex"] = parsed
     return snapshot or None

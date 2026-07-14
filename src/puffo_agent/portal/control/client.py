@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 import aiohttp
 
@@ -33,7 +34,8 @@ log = logging.getLogger("puffo_agent.control")
 
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
-USAGE_INTERVAL_SECONDS = 300.0
+# Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
+USAGE_INTERVAL_SECONDS = 6 * 60 * 60.0
 RESCAN_SECONDS = 5.0
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
@@ -200,8 +202,6 @@ async def post_usage_snapshot(machine, base: str) -> bool:
     """Collect the machine's usage-budget snapshot and POST it to the server.
     Returns True iff there was a snapshot to send. Shared by the periodic loop
     and the on-demand ``refresh_usage`` command."""
-    from pathlib import Path
-
     snapshot = await collect_usage_snapshot(Path.home())
     if not snapshot:
         return False

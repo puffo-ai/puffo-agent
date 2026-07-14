@@ -27,8 +27,8 @@ class AgentStatusReporter:
         self._sender: Sender | None = None
         self._machine = None
         self._cache: dict[str, tuple[float, list[agent_message.Recipient]]] = {}
-        # Latest raw ``account/rateLimits/updated`` payload a codex session saw;
-        # the usage loop reads it for the machine's codex budget snapshot.
+        # Latest ``account/rateLimits/updated`` payload a live codex session saw;
+        # the usage snapshot falls back to it when the active probe can't run.
         self._codex_rate_limits: dict | None = None
 
     def record_codex_rate_limits(self, raw: dict | None) -> None:

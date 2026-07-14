@@ -190,18 +190,174 @@ def test_parse_codex_rate_limits_empty_or_bad():
 
 
 @pytest.mark.asyncio
-async def test_collect_snapshot_includes_codex_from_reporter(monkeypatch):
+async def test_collect_snapshot_codex_from_active_probe(monkeypatch):
+    monkeypatch.setattr(us, "machine_harnesses", lambda: {"codex"})
+    monkeypatch.setattr(us, "resolve_codex_bin", lambda: "codex")
+
+    async def _probe(_bin, _home):
+        return {"primary": {"usedPercent": 7, "windowDurationMins": 300, "resetsAt": 111}}
+
+    monkeypatch.setattr(us, "_probe_codex_rate_limits", _probe)
+    snap = await us.collect_usage_snapshot(Path("."))
+    assert snap == {"codex": {"session": {"used_pct": 7, "resets_at": 111}}}
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_codex_falls_back_to_reporter_when_probe_fails(monkeypatch):
     from puffo_agent.portal.control import reporter as reporter_mod
 
     monkeypatch.setattr(us, "machine_harnesses", lambda: {"codex"})
+    monkeypatch.setattr(us, "resolve_codex_bin", lambda: "codex")
+
+    async def _probe(_bin, _home):
+        return None  # spawn/turn failed
+
+    monkeypatch.setattr(us, "_probe_codex_rate_limits", _probe)
     rep = reporter_mod.AgentStatusReporter()
     rep.record_codex_rate_limits(
-        {"primary": {"usedPercent": 7, "windowDurationMins": 300, "resetsAt": 111}}
+        {"primary": {"usedPercent": 9, "windowDurationMins": 10080, "resetsAt": 222}}
     )
-    monkeypatch.setattr(us, "get_reporter", lambda: rep, raising=False)
     monkeypatch.setattr(reporter_mod, "get_reporter", lambda: rep)
     snap = await us.collect_usage_snapshot(Path("."))
-    assert snap == {"codex": {"session": {"used_pct": 7, "resets_at": 111}}}
+    assert snap == {"codex": {"weekly": {"used_pct": 9, "resets_at": 222}}}
+
+
+@pytest.mark.asyncio
+async def test_collect_snapshot_codex_omitted_when_probe_and_reporter_empty(monkeypatch):
+    from puffo_agent.portal.control import reporter as reporter_mod
+
+    monkeypatch.setattr(us, "machine_harnesses", lambda: {"codex"})
+    monkeypatch.setattr(us, "resolve_codex_bin", lambda: "codex")
+
+    async def _probe(_bin, _home):
+        return None
+
+    monkeypatch.setattr(us, "_probe_codex_rate_limits", _probe)
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: reporter_mod.AgentStatusReporter())
+    assert await us.collect_usage_snapshot(Path(".")) is None
+
+
+# ── codex active probe: JSON-RPC drive over a fake app-server ───────
+
+class _FakeStdin:
+    def __init__(self):
+        self.written: list[bytes] = []
+
+    def write(self, b: bytes) -> None:
+        self.written.append(b)
+
+    async def drain(self) -> None:
+        pass
+
+
+class _FakeStdout:
+    def __init__(self, lines: list[bytes]):
+        self._lines = list(lines)
+
+    async def readline(self) -> bytes:
+        return self._lines.pop(0) if self._lines else b""
+
+
+class _FakeProc:
+    def __init__(self, lines: list[bytes], terminate_raises: bool = False):
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStdout(lines)
+        self._terminate_raises = terminate_raises
+
+    def terminate(self) -> None:
+        if self._terminate_raises:
+            raise ProcessLookupError()
+
+
+def _frame(obj: dict) -> bytes:
+    return (__import__("json").dumps(obj) + "\n").encode()
+
+
+@pytest.mark.asyncio
+async def test_drive_codex_probe_sends_turn_and_returns_ratelimits():
+    limits = {"primary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 111}}
+    proc = _FakeProc([
+        _frame({"id": 1, "result": {}}),
+        _frame({"id": 2, "result": {"thread": {"id": "thr_1"}}}),
+        _frame({"method": "account/rateLimits/updated", "params": {"rateLimits": limits}}),
+    ])
+    assert await us._drive_codex_probe(proc) == limits
+    # The throwaway turn was fired against the started thread.
+    sent = b"".join(proc.stdin.written).decode()
+    assert '"turn/start"' in sent and '"thr_1"' in sent and "ignore this message" in sent
+
+
+@pytest.mark.asyncio
+async def test_drive_codex_probe_no_thread_id_is_none():
+    proc = _FakeProc([_frame({"id": 2, "result": {"model": "x"}})])
+    assert await us._drive_codex_probe(proc) is None
+    assert proc.stdin.written and b"turn/start" not in b"".join(proc.stdin.written)
+
+
+@pytest.mark.asyncio
+async def test_drive_codex_probe_stream_ends_before_frame_is_none():
+    proc = _FakeProc([_frame({"id": 2, "result": {"thread": {"id": "t"}}})])
+    # Turn is sent, but the app-server closes before the budget frame arrives.
+    assert await us._drive_codex_probe(proc) is None
+
+
+@pytest.mark.asyncio
+async def test_drive_codex_probe_skips_malformed_line():
+    limits = {"primary": {"usedPercent": 3, "windowDurationMins": 300}}
+    proc = _FakeProc([
+        b"not json at all\n",
+        _frame({"id": 2, "result": {"thread": {"id": "t"}}}),
+        _frame({"method": "account/rateLimits/updated", "params": {"rateLimits": limits}}),
+    ])
+    assert await us._drive_codex_probe(proc) == limits
+
+
+@pytest.mark.asyncio
+async def test_probe_codex_rate_limits_spawn_failure_is_none(monkeypatch):
+    async def _boom(*a, **k):
+        raise FileNotFoundError("no codex")
+
+    monkeypatch.setattr(us.asyncio, "create_subprocess_exec", _boom)
+    assert await us._probe_codex_rate_limits("codex", Path(".")) is None
+
+
+@pytest.mark.asyncio
+async def test_probe_codex_rate_limits_happy_spawns_and_drives(monkeypatch):
+    limits = {"primary": {"usedPercent": 7, "windowDurationMins": 10080, "resetsAt": 111}}
+    proc = _FakeProc([
+        _frame({"id": 2, "result": {"thread": {"id": "t"}}}),
+        _frame({"method": "account/rateLimits/updated", "params": {"rateLimits": limits}}),
+    ])
+
+    async def _spawn(*a, **k):
+        return proc
+
+    monkeypatch.setattr(us.asyncio, "create_subprocess_exec", _spawn)
+    assert await us._probe_codex_rate_limits("codex", Path(".")) == limits
+
+
+@pytest.mark.asyncio
+async def test_probe_codex_rate_limits_timeout_terminates_and_is_none(monkeypatch):
+    # terminate raises ProcessLookupError → the finally swallows it.
+    proc = _FakeProc([], terminate_raises=True)
+
+    async def _spawn(*a, **k):
+        return proc
+
+    async def _hang(_proc):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(us.asyncio, "create_subprocess_exec", _spawn)
+    monkeypatch.setattr(us, "_drive_codex_probe", _hang)
+    assert await us._probe_codex_rate_limits("codex", Path(".")) is None
+
+
+def test_extract_thread_id_variants():
+    assert us._extract_thread_id({"thread": {"id": "a"}}) == "a"
+    assert us._extract_thread_id({"threadId": "b"}) == "b"
+    assert us._extract_thread_id({"thread": "c"}) == "c"
+    assert us._extract_thread_id({"nope": 1}) is None
+    assert us._extract_thread_id("x") is None
 
 
 def test_reporter_records_and_returns_codex_rate_limits():
