@@ -31,7 +31,18 @@ class InProcessDataClient:
         return None
 
     async def lookup_channel_space(self, channel_id: str) -> str | None:
-        return await self._store.lookup_channel_space(channel_id)
+        space_id = await self._store.lookup_channel_space(channel_id)
+        if space_id is None and channel_id.startswith("ch_"):
+            # PUF-376 (α): a genuinely-member channel can be missing from
+            # the cache if its membership event was dropped during a WS
+            # reconnect (the warm runs on connect, not per-message). Re-
+            # warm from the server — /spaces/<sid>/channels is filtered by
+            # membership, so a re-appear proves membership and an absence
+            # is an authoritative non-member — then re-check before the
+            # caller fails loud. Self-heals on the send attempt itself.
+            await self._client.rewarm_channel_caches()
+            space_id = await self._store.lookup_channel_space(channel_id)
+        return space_id
 
     async def get_channel_roots(
         self,

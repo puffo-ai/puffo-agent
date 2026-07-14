@@ -57,6 +57,10 @@ class PuffoCoreWsClient:
         self.on_message: MessageHandler | None = None
         self.on_event: EventHandler | None = None
         self.on_cert_update: CertHandler | None = None
+        # Fires after every successful (re)connect handshake, before
+        # catch-up. Lets the daemon re-warm caches that a reconnect
+        # window may have left stale (PUF-376).
+        self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
 
     def _build_connect_frame(self) -> str:
         sess = self.keystore.load_session(self.slug)
@@ -168,6 +172,11 @@ class PuffoCoreWsClient:
             self._ws = ws
             self.session_id = await self._handshake(ws)
             logger.info("[%s] WS connected, session=%s", self.slug, self.session_id)
+            if self.on_connect:
+                try:
+                    await self.on_connect()
+                except Exception:
+                    logger.exception("on_connect callback failed")
             await self._catchup()
             await self._listen_loop()
 

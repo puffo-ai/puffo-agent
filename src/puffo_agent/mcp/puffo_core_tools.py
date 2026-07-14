@@ -74,11 +74,12 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
                 f"channel id, call list_channels_in_all_spaces."
             )
         raise RuntimeError(
-            f"agent has no record of channel {channel_id} — it may not "
-            f"be a channel the agent belongs to, or the id may be "
-            f"wrong. Membership events are cached as they arrive over "
-            f"the WS, so a fresh channel becomes addressable as soon "
-            f"as the invite/accept/create event lands."
+            f"agent has no record of channel {channel_id} — either it "
+            f"isn't a channel the agent belongs to, the id is wrong, or "
+            f"you were just added and the membership hasn't propagated to "
+            f"this agent yet (retrying shortly resolves that last case). "
+            f"Call list_channels_in_all_spaces to see the channels the "
+            f"agent can currently reach."
         )
     return space_id
 
