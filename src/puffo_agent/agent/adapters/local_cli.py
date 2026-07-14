@@ -61,10 +61,8 @@ logger = logging.getLogger(__name__)
 # denying. Exposed to the hook via PUFFO_PERMISSION_TIMEOUT.
 PERMISSION_HOOK_TIMEOUT_SECONDS = 300
 
-# Tools the PreToolUse hook intercepts in ``default`` mode. Reads
-# (Read/Glob/Grep) and MCP tools deliberately pass through unsurveyed:
-# reads auto-approve, and MCP tools are the agent's talking-to-the-
-# user path so per-call DMs would be self-referential.
+# PreToolUse-intercepted tools in ``default`` mode. Reads + MCP tools
+# pass through: reads auto-approve, MCP is the talking-to-the-user path.
 PERMISSION_HOOK_FULL_MATCHER = "Bash|Edit|Write|MultiEdit|NotebookEdit|WebFetch|WebSearch"
 
 # ``acceptEdits`` mode: file-edit tools auto-approve, so the hook
@@ -78,10 +76,8 @@ PERMISSION_HOOK_NON_EDIT_MATCHER = "Bash|WebFetch|WebSearch"
 _HOOK_COMMAND_MARKER = "puffo_agent.hooks.permission"
 
 
-# Claude Code accepts five permission modes; only ``bypassPermissions``
-# currently ships working here — the others depend on a permission-
-# proxy DM flow that still needs work. Anything else falls back to
-# ``bypassPermissions`` with a WARNING.
+# Only ``bypassPermissions`` ships working; others need the permission-
+# proxy DM flow. Anything else falls back with a WARNING.
 VALID_PERMISSION_MODES = frozenset({
     "bypassPermissions",
 })
@@ -164,6 +160,7 @@ class LocalCLIAdapter(Adapter):
         owner_username: str = "",
         permission_mode: str = "default",
         sandbox: str = "danger-full-access",
+        task_timeout_seconds: float = 600.0,
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
@@ -184,6 +181,7 @@ class LocalCLIAdapter(Adapter):
         self.owner_username = owner_username
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
         self.sandbox = _sanitise_sandbox(sandbox, agent_id)
+        self.task_timeout_seconds = task_timeout_seconds
         self.desired_skills = list(desired_skills or [])
         self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
@@ -207,11 +205,8 @@ class LocalCLIAdapter(Adapter):
         self.harness = harness
         self.puffo_core_mcp_env: dict[str, str] | None = None
         self._verified = False
-        # claude-code path uses ClaudeSession (long-lived stream-json);
-        # codex path uses CodexSession (long-lived JSON-RPC). hermes
-        # has no long-lived session — every turn is a fresh
-        # ``hermes chat`` subprocess, continuity comes from hermes'
-        # own state.db indexed by per-agent HERMES_HOME + sentinel.
+        # ClaudeSession = long-lived stream-json; CodexSession = long-lived
+        # JSON-RPC; hermes = fresh subprocess per turn (state in HERMES_HOME).
         self._session: ClaudeSession | None = None
         self._codex_session: CodexSession | None = None
         self._hermes_bin: str | None = None
@@ -240,10 +235,7 @@ class LocalCLIAdapter(Adapter):
         self._verify()
         await self._install_desired()
         if self.harness.name() == "codex":
-            # codex has no equivalent of claude-code's cheap "resume
-            # kick" — the App Server doesn't expose a resume-with-
-            # tickle handle in v1. Re-send the full payload, same as
-            # a fresh turn would.
+            # codex has no resume-kick; re-send the full payload like a fresh turn.
             session = self._ensure_codex_session()
             return await session.run_turn(
                 fallback_user_message, ctx.system_prompt,
@@ -277,10 +269,8 @@ class LocalCLIAdapter(Adapter):
             await session.warm(system_prompt)
             return
         if self.harness.name() == "hermes":
-            # hermes is one-shot per turn; no subprocess to keep
-            # warm. ``_verify`` already validated the binary +
-            # seeded HERMES_HOME, so there's nothing left to do
-            # until the first message arrives.
+            # hermes is one-shot per turn; nothing to warm (_verify already seeded
+            # HERMES_HOME).
             return
         session = self._ensure_session()
         if not session.has_persisted_session():
@@ -343,20 +333,15 @@ class LocalCLIAdapter(Adapter):
 
         codex_home = agent_codex_user_dir(self.agent_id)
         codex_home.mkdir(parents=True, exist_ok=True)
-        # AGENTS.md investment goes here so codex picks it up on
-        # ``newConversation``; the file body itself is written by
-        # ``profile_sync.rebuild_agent_codex_md`` (worker startup +
-        # refresh). Writing the dir is just to make sure codex has a
-        # HOME to read from.
+        # AGENTS.md body is written by profile_sync.rebuild_agent_codex_md;
+        # here we only ensure codex has a HOME to read from.
         agents_md = codex_home / "AGENTS.md"
         if not agents_md.exists():
             agents_md.write_text("", encoding="utf-8")
 
-        # Pin ``cli_auth_credentials_store=file`` so codex reads
-        # ``$CODEX_HOME/auth.json`` (not macOS Keychain) — required for
-        # our view/refresh model. Host's own ``~/.codex/config.toml``
-        # MCP entries are merged in so the agent inherits the
-        # operator's catalog (puffo entry below shadows same-name).
+        # cli_auth_credentials_store=file -> codex reads $CODEX_HOME/auth.json
+        # (not Keychain), required for the view/refresh model. Host MCP entries
+        # merged; the puffo entry below shadows same-name.
         host_mcps = read_host_codex_mcp_servers(Path.home())
         # Host wins on collision so the operator's local override
         # beats the catalog default — same precedence as claude's
@@ -404,21 +389,18 @@ class LocalCLIAdapter(Adapter):
             "agent %s: shared host codex auth (%s)",
             self.agent_id, auth_mode,
         )
-        # Subprocess argv — ``codex app-server`` is the documented entry
-        # point for embedding codex as a long-running agent. Resolve
-        # via the shared resolver so PATH + ``PUFFO_CODEX_BIN`` env
-        # override + macOS / Windows / Linux .app bundle paths all
-        # work. LaunchAgent on macOS has a narrow PATH that misses
-        # both ``/opt/homebrew/bin`` and the Codex.app bundle, so the
-        # plain ``shutil.which`` would fail even when the operator
-        # has Codex installed via the desktop app.
+        # ``codex app-server`` is the embedding entry point. Shared resolver
+        # covers $PUFFO_CODEX_BIN + PATH + app bundles (LaunchAgent's narrow
+        # PATH misses /opt/homebrew/bin and the .app bundles).
         codex_bin = resolve_codex_bin()
         if codex_bin is None:
             raise RuntimeError(
-                "codex binary not found. Tried $PUFFO_CODEX_BIN, "
-                "$PATH, and the Codex.app / Windows / Linux bundle "
-                "paths. Install the Codex CLI (`npm install -g "
-                "@openai/codex`), Codex.app, or set "
+                "codex binary not found. Tried $PUFFO_CODEX_BIN, $PATH, "
+                "and the ChatGPT.app / Codex.app / Windows / Linux bundle "
+                "paths. If you recently updated the ChatGPT or Codex "
+                "desktop app, restart puffo-agent so it re-resolves the "
+                "binary. Otherwise install the Codex CLI (`npm install -g "
+                "@openai/codex`) or set "
                 "``PUFFO_CODEX_BIN=/abs/path/to/codex``."
             )
         # codex's fs-sandbox helper self-invokes via the hardcoded path
@@ -474,18 +456,15 @@ class LocalCLIAdapter(Adapter):
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             model=self.model,
+            task_timeout_seconds=self.task_timeout_seconds,
             audit=codex_audit,
         )
         return self._codex_session
 
     # ── hermes (cli-local) ────────────────────────────────────────────
-    # hermes is one-shot per turn: every turn spawns
-    # ``hermes chat --quiet -q <prompt>``. No long-lived session
-    # process to keep warm. State lives in the per-agent
-    # ``HERMES_HOME=<agent_home_dir>/.hermes`` directory which we
-    # seed from the operator's ``~/.hermes`` on first verify so the
-    # agent inherits the operator's provider keys + ``hermes setup``
-    # choices without sharing the operator's chat history.
+    # One-shot per turn: ``hermes chat --quiet -q <prompt>``. HERMES_HOME
+    # seeded from operator's ~/.hermes on first verify (keys + setup
+    # choices, not chat history).
 
     def _verify_hermes(self) -> None:
         """Resolve hermes binary + seed per-agent HERMES_HOME from
@@ -709,10 +688,8 @@ class LocalCLIAdapter(Adapter):
                     self.agent_id, exc,
                 )
 
-        # Hermes turns are always silent — ``--quiet`` stdout doesn't
-        # surface MCP calls, so we can't tell whether send_message
-        # fired. Skip the fallback regardless; reply text kept in
-        # metadata for debug.
+        # --quiet stdout can't show MCP calls, so send_message detection is
+        # impossible; always skip the fallback. Reply kept in metadata for debug.
         return TurnResult(
             reply="",
             tool_calls=len(tool_calls),
@@ -770,11 +747,8 @@ class LocalCLIAdapter(Adapter):
             return
 
         servers = config.setdefault("mcp_servers", {})
-        # No ``tools:`` field — hermes' interactive add saves
-        # ``tools: {include: [...]}`` only when the operator filters.
-        # Omitting it leaves all discovered tools enabled. A bare-list
-        # ``tools:`` is interpreted as a filter and silently drops
-        # everything.
+        # No ``tools:`` field: omitting enables all discovered tools; a
+        # bare-list ``tools:`` acts as a filter and silently drops everything.
         servers["puffo"] = {
             "command": default_python_executable(),
             "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
@@ -950,23 +924,11 @@ class LocalCLIAdapter(Adapter):
         # symmetry with the docker adapter.
         del env_overrides
         cmd = ["claude"]
-        # ``--dangerously-skip-permissions`` bypasses BOTH the per-tool
-        # approval prompt AND the per-project trust dialog. Claude
-        # code's stream-json mode has no UI surface to accept the
-        # trust dialog, so anything short of this flag leaves the
-        # cwd un-trusted, which silently drops MCP servers supplied
-        # via ``--mcp-config`` — exactly the "agent can't see the
-        # puffo MCP" symptom on cli-local. ``--permission-mode
-        # bypassPermissions`` (the previous flag here) only handles
-        # the per-tool prompt path, not the trust dialog, so the MCP
-        # was getting dropped before its tools could even register.
-        # When the bypass mode is anything other than
-        # ``bypassPermissions`` (e.g. the future ``default`` /
-        # ``acceptEdits`` modes that route through the PreToolUse
-        # hook), fall back to ``--permission-mode <mode>`` so the
-        # hook controls each tool category — those modes implicitly
-        # require an operator-supervised setup where the trust
-        # dialog has already been accepted in a real claude session.
+        # --dangerously-skip-permissions bypasses BOTH the per-tool prompt AND
+        # the per-project trust dialog; stream-json has no UI for the dialog,
+        # and an untrusted cwd silently drops --mcp-config servers. Non-bypass
+        # modes route through the PreToolUse hook and presuppose an operator-
+        # accepted trust dialog.
         if self.permission_mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
         else:
@@ -1003,10 +965,8 @@ class LocalCLIAdapter(Adapter):
         if self._verified:
             return
         if self.harness.name() == "codex":
-            # codex has its own binary check (see CodexSession._spawn).
-            # We deliberately skip the claude-seed / link-credentials
-            # bookkeeping below — none of it applies to codex, and
-            # touching ~/.claude/* for a codex agent would be confusing.
+            # codex has its own binary check; the claude-seed / link-credentials
+            # bookkeeping below doesn't apply.
             self._verified = True
             return
         if self.harness.name() == "hermes":
@@ -1037,10 +997,8 @@ class LocalCLIAdapter(Adapter):
             "agent %s: wrote host credential view (%s)",
             self.agent_id, mode,
         )
-        # One-way sync of host skills + MCP registrations. Runs
-        # every start so host edits propagate. The unreachable-
-        # command list is ignored: cli-local runs on the host, so
-        # absolute host paths in MCP commands resolve naturally.
+        # One-way host skills + MCP sync on every start. Unreachable-command
+        # list ignored: cli-local runs on the host, absolute paths resolve.
         skill_count = sync_host_skills(host_home, self.agent_home_dir)
         if skill_count:
             logger.info(
@@ -1054,10 +1012,8 @@ class LocalCLIAdapter(Adapter):
                 "agent %s: merged %d host MCP server registration(s) "
                 "into per-agent .claude.json", self.agent_id, merged_mcp,
             )
-        # Plugins layer — pairs the actual plugin code tree with the
-        # ``enabledPlugins`` array Claude reads from settings.json.
-        # Without both, plugin-provided MCP servers (imessage,
-        # chrome-devtools-mcp, etc.) silently never register.
+        # Plugin tree + enabledPlugins must both land or plugin MCP servers
+        # silently never register.
         plugins_mode = sync_host_plugins(host_home, self.agent_home_dir)
         if plugins_mode not in ("no-host-dir",):
             logger.info(

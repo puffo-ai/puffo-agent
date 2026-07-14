@@ -18,6 +18,30 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   of waiting for the tick. Adds `tzdata` as a dependency so Windows can
   resolve the named timezone in claude's reset times.
 
+- **Per-agent codex turn timeout: `runtime.task_timeout_seconds` in
+  `agent.yml` (PUF-375).** Default stays 600s; raise it for agents
+  running long reasoning or complex tasks. A timed-out turn now posts
+  an operator-facing "⏱ Task exceeded the N-minute timeout" reply
+  instead of silence (and says whether the codex session was reset).
+
+### Fixed
+
+- **codex mid-reconnect turn failures no longer drop the batch or flip
+  a false red (PUF-375).** A `turn failed: Reconnecting... N/M` from
+  the codex App Server is transient — it now routes into the existing
+  retry substrate (re-enqueue + backoff) instead of being swallowed as
+  an unhandled error, and it no longer counts toward the wedged-thread
+  rotation threshold.
+
+- **codex is now discovered inside ChatGPT.app on macOS (PUF-372
+  follow-up).** A ChatGPT desktop-app update moved the bundled codex
+  binary out of Codex.app, leaving agents unable to spawn. The resolver
+  now checks `ChatGPT.app/Contents/Resources/codex` (system and
+  per-user `Applications`, preferred over a leftover Codex.app copy),
+  which also re-points the `~/.local/bin/codex` fs-sandbox shim at the
+  new location. The "codex binary not found" error now names the bundle
+  paths tried and the restart-after-app-update remedy.
+
 ## [1.1.1] — 2026-07-10
 
 ### Fixed
