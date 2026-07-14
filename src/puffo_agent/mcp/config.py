@@ -119,6 +119,7 @@ def write_codex_mcp_config(
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     extra_servers: dict[str, dict] | None = None,
+    provider: dict | None = None,
 ) -> Path:
     """Serialise the per-agent codex config.toml.
 
@@ -140,6 +141,27 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
+    # LiteLLM (or any OpenAI-compatible gateway) custom provider. When present,
+    # codex talks to ``base_url`` via the Responses API using the bearer key in
+    # ``env_key`` (the agent's virtual key) instead of its native ChatGPT OAuth.
+    # ``wire_api = "responses"`` is REQUIRED — codex dropped Chat Completions.
+    if provider and provider.get("base_url"):
+        raw_name = provider.get("name") or "litellm"
+        key = _toml_key(raw_name)
+        model = provider.get("model") or ""
+        if model:
+            lines.append(f'model = "{_toml_escape(model)}"')
+        lines.append(f'model_provider = "{_toml_escape(raw_name)}"')
+        lines.append("")
+        lines.append(f"[model_providers.{key}]")
+        lines.append(
+            f'name = "{_toml_escape(provider.get("display_name") or "LiteLLM gateway")}"'
+        )
+        lines.append(f'base_url = "{_toml_escape(provider["base_url"])}"')
+        lines.append(
+            f'env_key = "{_toml_escape(provider.get("env_key") or "OPENAI_API_KEY")}"'
+        )
+        lines.append(f'wire_api = "{_toml_escape(provider.get("wire_api") or "responses")}"')
     # Host extras first so the puffo entry below shadows any duplicate.
     for name, spec in sorted((extra_servers or {}).items()):
         if name == MCP_SERVER_NAME:
