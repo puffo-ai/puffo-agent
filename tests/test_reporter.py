@@ -27,9 +27,8 @@ def _machine() -> MachineControlIdentity:
 
 
 class _Cfg:
-    def __init__(self, op, harness="claude-code"):
+    def __init__(self, op):
         self.puffo_core = type("PC", (), {"operator_slug": op})()
-        self.runtime = type("RT", (), {"harness": harness})()
 
 
 class _Pairing:
@@ -108,69 +107,3 @@ async def test_emit_noop_when_owner_not_linked(monkeypatch):
     r.set_sender(lambda op, env: sent.append(op))
     await r.emit("scout-1", "turn_complete", {})
     assert sent == []
-
-
-# ── PUF-364: per-harness token accumulation ────────────────────────
-
-
-def _harness_map(monkeypatch, mapping):
-    monkeypatch.setattr(
-        reporter_mod.AgentConfig,
-        "load",
-        lambda slug: _Cfg("op-1", harness=mapping.get(slug, "claude-code")),
-    )
-
-
-def test_record_usage_accumulates_per_harness(monkeypatch):
-    _harness_map(monkeypatch, {"cc-agent": "claude-code", "cx-agent": "codex"})
-    r = reporter_mod.AgentStatusReporter()
-    r.record_turn_usage("cc-agent", 10, 3)
-    r.record_turn_usage("cc-agent", 5, 2)
-    r.record_turn_usage("cx-agent", 100, 40)
-    assert r.snapshot_usage() == {"claude-code": (15, 5), "codex": (100, 40)}
-
-
-def test_snapshot_hides_zero_and_ignores_nonpositive(monkeypatch):
-    _harness_map(monkeypatch, {"a": "claude-code"})
-    r = reporter_mod.AgentStatusReporter()
-    r.record_turn_usage("a", 0, 0)    # no-op
-    r.record_turn_usage("a", -5, -1)  # no-op — server rejects negative deltas
-    assert r.snapshot_usage() == {}
-    r.record_turn_usage("a", 7, 0)
-    assert r.snapshot_usage() == {"claude-code": (7, 0)}
-
-
-def test_commit_usage_subtracts_only_sent_delta(monkeypatch):
-    # A turn accruing DURING the in-flight POST is preserved: snapshot is
-    # taken, more usage lands, commit subtracts only the snapshot.
-    _harness_map(monkeypatch, {"a": "codex"})
-    r = reporter_mod.AgentStatusReporter()
-    r.record_turn_usage("a", 20, 8)
-    snap = r.snapshot_usage()
-    r.record_turn_usage("a", 5, 2)  # lands mid-POST
-    r.commit_usage_sent(snap)
-    assert r.snapshot_usage() == {"codex": (5, 2)}
-
-
-def test_harness_lookup_is_cached(monkeypatch):
-    calls = []
-
-    def _load(slug):
-        calls.append(slug)
-        return _Cfg("op-1", harness="claude-code")
-
-    monkeypatch.setattr(reporter_mod.AgentConfig, "load", _load)
-    r = reporter_mod.AgentStatusReporter()
-    r.record_turn_usage("a", 1, 1)
-    r.record_turn_usage("a", 1, 1)
-    assert calls == ["a"]  # loaded once, cached thereafter
-
-
-def test_record_usage_noop_when_config_unreadable(monkeypatch):
-    def _boom(slug):
-        raise RuntimeError("no config")
-
-    monkeypatch.setattr(reporter_mod.AgentConfig, "load", _boom)
-    r = reporter_mod.AgentStatusReporter()
-    r.record_turn_usage("a", 9, 9)  # must not raise
-    assert r.snapshot_usage() == {}

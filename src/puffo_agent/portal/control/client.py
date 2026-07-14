@@ -27,12 +27,13 @@ from ..state import (
 from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
+from .usage_snapshot import collect_usage_snapshot
 
 log = logging.getLogger("puffo_agent.control")
 
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
-USAGE_INTERVAL_SECONDS = 60.0
+USAGE_INTERVAL_SECONDS = 300.0
 RESCAN_SECONDS = 5.0
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
@@ -564,34 +565,25 @@ class ControlManager:
             await _sleep_or_stop(self._stop, ME_INTERVAL_SECONDS)
 
     async def _usage_loop(self, machine) -> None:
-        """PUF-364: flush accrued per-harness token deltas to the server on a
-        cadence. Commit-on-observed-2xx: a failed/unreachable POST retries next
-        tick (at-least-once, no loss); the trade-off is a rare over-count if the
-        server commits but its 2xx response is lost, since the server side
-        accumulates unconditionally. Acceptable for approximate usage."""
-        from .reporter import get_reporter
+        """Probe each runtime's /usage budget and POST the machine's snapshot.
+        Replace-latest server-side, so a dropped tick just resends next time."""
+        from pathlib import Path
 
         while not self._stop.is_set():
             try:
-                snap = get_reporter().snapshot_usage()
+                snapshot = await collect_usage_snapshot(Path.home())
                 pairings = load_pairings()
-                if snap and pairings:
+                if snapshot and pairings:
                     base = next(iter(pairings.values())).server_url.rstrip("/")
                     path = f"/v2/machines/{machine.machine_id}/usage"
-                    entries = [
-                        {"harness": h, "input_tokens": i, "output_tokens": o}
-                        for h, (i, o) in snap.items()
-                    ]
-                    body = json.dumps({"entries": entries}).encode()
+                    body = json.dumps({"snapshot": snapshot}).encode()
                     headers = machine_auth.signed_headers(machine, "POST", path, body)
                     headers["content-type"] = "application/json"
                     async with create_remote_http_session(base) as session:
                         resp = await session.post(
                             f"{base}{path}", data=body, headers=headers
                         )
-                        if resp.status < 300:
-                            get_reporter().commit_usage_sent(snap)
-                        else:
+                        if resp.status >= 300:
                             log.debug("control: usage report HTTP %s", resp.status)
             except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
                 log.debug("control: usage report failed: %s", exc)

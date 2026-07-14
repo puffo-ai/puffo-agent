@@ -260,12 +260,6 @@ class PuffoAgent:
             kick_text, fallback_text, ctx,
         )
 
-        from ..portal.control.reporter import get_reporter
-
-        get_reporter().record_turn_usage(
-            self.agent_id, result.input_tokens, result.output_tokens
-        )
-
         # Route reply the same way as a normal turn so the consumer
         # picks up AgentAPIError again on consecutive rate-limit
         # failures.
@@ -326,9 +320,6 @@ class PuffoAgent:
         )
         result = await self.adapter.run_turn(ctx)
 
-        get_reporter().record_turn_usage(
-            self.agent_id, result.input_tokens, result.output_tokens
-        )
         asyncio.ensure_future(
             get_reporter().emit(
                 self.agent_id,

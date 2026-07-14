@@ -127,7 +127,7 @@ async def test_create_without_pending_token_rejected(home):
     assert "pending_token" in res["error"]
 
 
-# ── PUF-364: usage-report flush loop ───────────────────────────────
+# ── usage-report snapshot loop ─────────────────────────────────────
 
 
 class _FakeResp:
@@ -150,23 +150,11 @@ class _FakeSession:
         return _FakeResp(self._status)
 
 
-class _FakeReporter:
-    def __init__(self, snap):
-        self._snap = dict(snap)
-        self.committed = []
+def _wire_usage(monkeypatch, *, snapshot, status, calls):
+    async def _collect(_home):
+        return snapshot
 
-    def snapshot_usage(self):
-        return dict(self._snap)
-
-    def commit_usage_sent(self, sent):
-        self.committed.append(sent)
-
-
-def _wire_usage(monkeypatch, *, snap, status, calls):
-    from puffo_agent.portal.control import reporter as reporter_mod
-
-    fake = _FakeReporter(snap)
-    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: fake)
+    monkeypatch.setattr(cc, "collect_usage_snapshot", _collect)
     monkeypatch.setattr(cc, "load_pairings", lambda: {
         "op": types.SimpleNamespace(server_url="https://s/", operator_root_pubkey="R"),
     })
@@ -179,41 +167,32 @@ def _wire_usage(monkeypatch, *, snap, status, calls):
         stop.set()  # run exactly one loop iteration
 
     monkeypatch.setattr(cc, "_sleep_or_stop", _stop_after)
-    return fake
 
 
 @pytest.mark.asyncio
-async def test_usage_loop_posts_and_commits_on_2xx(monkeypatch):
+async def test_usage_loop_posts_the_machine_snapshot(monkeypatch):
     calls = []
-    fake = _wire_usage(
-        monkeypatch, snap={"codex": (140, 40), "claude-code": (3, 1)},
-        status=200, calls=calls,
-    )
+    snap = {"claude-code": {"session": {"used_pct": 41, "resets_at": "x"}}}
+    _wire_usage(monkeypatch, snapshot=snap, status=200, calls=calls)
     await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
-
     assert len(calls) == 1
     assert calls[0]["url"] == "https://s/v2/machines/mac_1/usage"
-    body = json.loads(calls[0]["data"])
-    entries = {e["harness"]: (e["input_tokens"], e["output_tokens"]) for e in body["entries"]}
-    assert entries == {"codex": (140, 40), "claude-code": (3, 1)}
-    assert fake.committed == [{"codex": (140, 40), "claude-code": (3, 1)}]
+    assert json.loads(calls[0]["data"]) == {"snapshot": snap}
 
 
 @pytest.mark.asyncio
-async def test_usage_loop_does_not_commit_on_error(monkeypatch):
+async def test_usage_loop_skips_post_when_no_snapshot(monkeypatch):
     calls = []
-    fake = _wire_usage(monkeypatch, snap={"codex": (5, 2)}, status=500, calls=calls)
+    _wire_usage(monkeypatch, snapshot=None, status=200, calls=calls)
     await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
-
-    assert len(calls) == 1        # POST attempted
-    assert fake.committed == []   # not cleared → same deltas retried next tick
+    assert calls == []
 
 
 @pytest.mark.asyncio
-async def test_usage_loop_skips_post_when_empty(monkeypatch):
+async def test_usage_loop_tolerates_http_error(monkeypatch):
     calls = []
-    fake = _wire_usage(monkeypatch, snap={}, status=200, calls=calls)
+    snap = {"claude-code": {"session": {"used_pct": 1, "resets_at": "x"}}}
+    _wire_usage(monkeypatch, snapshot=snap, status=500, calls=calls)
+    # Best-effort: a 5xx must not raise; the loop finishes its iteration.
     await cc.ControlManager()._usage_loop(types.SimpleNamespace(machine_id="mac_1"))
-
-    assert calls == []            # nothing accrued → no request
-    assert fake.committed == []
+    assert len(calls) == 1
