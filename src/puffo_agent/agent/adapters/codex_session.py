@@ -65,27 +65,19 @@ _NOTIFICATION_PREFIXES = (
     "turn/", "turn.",
 )
 
-# Methods we issue to the App Server. These names are pinned from the
-# live server's error response (it helpfully enumerates every method
-# it knows about when handed an unknown one) — codex 0.x rejects
-# camelCase ``sendUserTurn``/``newConversation`` and ships the
-# slash-namespaced ``thread/*`` and ``turn/*`` families instead.
+# Method names pinned from the live server's unknown-method error:
+# codex 0.x rejects camelCase, ships slash-namespaced thread/* + turn/*.
 METHOD_INITIALIZE = "initialize"
 METHOD_NEW_CONVERSATION = "thread/start"
 METHOD_SEND_USER_TURN = "turn/start"
 METHOD_RESUME_CONVERSATION = "thread/resume"
 METHOD_INTERRUPT_TURN = "turn/interrupt"
 
-# How long to wait for the App Server to acknowledge a request before
-# giving up. The first ``newConversation`` after spawn can be slow
-# (cold model load); ``sendUserTurn`` should be quick to ACK
-# (streaming starts immediately after).
+# Request-ACK timeout; first thread/start after spawn is slow (cold model load).
 REQUEST_TIMEOUT_SECONDS = 60.0
 
-# Turn-level timeout — wall-clock budget for a single user turn from
-# send to ``turn/completed``. Generous; the daemon also caps things
-# at the worker level. Mostly defensive against a wedged App Server
-# that ACKs the request but never streams.
+# Default per-turn wall-clock budget; defensive against an App Server
+# that ACKs but never streams.
 TURN_TIMEOUT_SECONDS = 600.0
 
 # Reacts fast in a small fleet, absorbs single transient hiccups.
@@ -101,22 +93,36 @@ def _looks_like_codex_thread_limit(err_text: str) -> bool:
     return any(p.search(err_text or "") for p in _CODEX_THREAD_LIMIT_PATTERNS)
 
 
-# Verbatim Codex auth-failure signals — anchored so we don't auto-flip on
-# legitimate model/quota errors. ``invalid thread id ... found 0`` is a
-# downstream symptom of an empty conversation_id, not auth — kept out.
-# ``invalidated oauth token`` is codex's human-readable form (distinct from
-# the ``token_invalidated`` JSON field), observed live on a relogin.
+# Mid-turn ``turn failed: Reconnecting... N/M`` is transient — the App
+# Server self-heals; don't drop the batch or count a wedged strike.
+_CODEX_RECONNECT_PATTERN: re.Pattern[str] = re.compile(
+    r"\bReconnecting\b", re.IGNORECASE
+)
+
+
+def _looks_like_codex_reconnect(err_text: str) -> bool:
+    return bool(_CODEX_RECONNECT_PATTERN.search(err_text or ""))
+
+
+def _timeout_budget_label(seconds: float) -> str:
+    """Human label for a turn-timeout budget: minutes when >=60s, else seconds
+    (so a sub-minute budget doesn't render as a nonsensical '0-minute')."""
+    if seconds >= 60:
+        return f"{int(seconds // 60)}-minute"
+    return f"{int(seconds)}-second"
+
+
+# Verbatim codex auth-failure signals, anchored so model/quota errors
+# don't flip auth. "invalid thread id ... found 0" = empty-conversation
+# symptom, not auth. "invalidated oauth token" = human-readable form, seen live.
 _CODEX_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"refresh token (?:was )?revoked", re.IGNORECASE),
     re.compile(r"\btoken_invalidated\b", re.IGNORECASE),
     re.compile(r"invalidated\s+oauth\s+token", re.IGNORECASE),
 )
 
-# A 401 in an OAuth/auth context. Codex surfaces a broken token as a 401 on
-# its API endpoints (``/responses``, ``/backend-api/codex/...``), so require
-# an auth-context marker within the same clause as the ``401`` rather than
-# pinning a single path — bounded distance + no sentence break keeps an
-# unrelated 401 in a log line from tripping it.
+# 401 counts only with an auth-context marker in the same clause; keeps
+# an unrelated 401 in a log line from tripping it.
 _AUTH_401_CONTEXT = (
     r"(?:oauth|invalidated|auth[\s_]error|identity_edge|/responses|/backend-api/codex)"
 )
@@ -137,26 +143,17 @@ def _looks_like_codex_auth_error(err_text: str) -> bool:
         return True
     return any(p.search(text) for p in _CODEX_AUTH_401_PATTERNS)
 
-# Tool names of the puffo MCP server's "this counts as posting a
-# reply" family. When the agent invokes one of these and it completes
-# successfully, the worker treats the turn as "agent already replied"
-# (skipping the [SILENT]-fallback shell auto-post). Names match
-# ``mcp.config.PUFFO_CORE_TOOL_NAMES`` — kept inline as a frozenset to
-# avoid an import-cycle with the MCP package.
+# Puffo MCP "counts as a reply" tools; success skips the [SILENT]-fallback
+# auto-post. Inline frozenset avoids an MCP import cycle.
 _PUFFO_SEND_MESSAGE_TOOLS = frozenset({
     "send_message",
     "send_message_with_attachments",
 })
 
 
-# StreamReader buffer size for the codex subprocess's stdout. The
-# asyncio default is 64 KiB; single notifications from codex
-# (mcpServer/startupStatus/updated carrying the full tool catalog,
-# thread/started carrying a session snapshot, etc.) routinely exceed
-# that, which raises ``LimitOverrunError`` from ``readline()`` and
-# wedges the reader loop. 16 MiB matches ClaudeSession's choice —
-# bounds per-agent memory while comfortably covering every event size
-# seen in practice.
+# codex's chunky single-line notifications (tool catalogs, session
+# snapshots) overrun asyncio's 64 KiB default -> LimitOverrunError wedges
+# the reader. 16 MiB matches ClaudeSession.
 STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
 
 
@@ -182,10 +179,8 @@ class _PendingTurn:
     reply_chunks: list[str] = field(default_factory=list)
     # ``tool_use`` events counted for TurnResult.tool_calls metric.
     tool_calls: int = 0
-    # When the agent invoked a puffo MCP send-message tool, the worker
-    # reads this list off TurnResult.metadata to decide "agent already
-    # posted; don't run the [SILENT]-fallback path". Each entry mirrors
-    # the claude-code adapter's shape: ``{channel, root_id}``.
+    # Worker reads this to skip the [SILENT] fallback ("agent already posted").
+    # Entry shape mirrors the claude-code adapter: {channel, root_id}.
     send_message_targets: list[dict] = field(default_factory=list)
     # Per-turn usage = delta of codex's per-thread cumulative totals from the
     # value standing when this turn's first request completed.
@@ -228,6 +223,7 @@ class CodexSession:
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
         model: str = "",
+        task_timeout_seconds: float = TURN_TIMEOUT_SECONDS,
         audit: Optional[AuditLog] = None,
     ):
         self.agent_id = agent_id
@@ -243,6 +239,8 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
+        # Per-agent turn wall-clock budget; raised via agent.yml for long tasks.
+        self.task_timeout_seconds = task_timeout_seconds
         self.audit = audit
 
         self._proc: asyncio.subprocess.Process | None = None
@@ -253,10 +251,8 @@ class CodexSession:
         self._active_turn: _PendingTurn | None = None
         self._lock = asyncio.Lock()
         self._conversation_id: str = self._load_conversation_id()
-        # ``sandbox`` (+ the other thread/start params) aren't re-sent on
-        # resume, so a sandbox change would silently keep the old policy.
-        # Drop the persisted thread when it was created under a different
-        # sandbox; the next start re-applies the current one.
+        # thread/start params aren't re-sent on resume; a sandbox change would
+        # silently keep the old policy. Drop the thread, next start re-applies.
         if self._conversation_id:
             persisted_sandbox = self._load_persisted_sandbox()
             if persisted_sandbox != self.sandbox:
@@ -266,10 +262,8 @@ class CodexSession:
                     self.agent_id, persisted_sandbox, self.sandbox,
                 )
                 self._conversation_id = ""
-        # The latest system prompt we've been handed. Stored so
-        # ``reload`` can detect a no-op vs a real change, and so a
-        # respawn can re-issue ``newConversation`` with current
-        # instructions when the conversation id is missing or rotted.
+        # Latest system prompt; lets reload detect no-ops and respawn re-issue
+        # thread/start with current instructions.
         self.current_instructions: str = ""
         # Resets on next success; hits THRESHOLD → rotate (drop the
         # persisted conversation id; next _ensure_running starts fresh).
@@ -311,10 +305,7 @@ class CodexSession:
         turn_failed_exc: BaseException | None = None
         rotated_in_branch: bool = False
         try:
-            # turn/start params per codex-rs/app-server protocol:
-            # ``threadId``, ``input`` (array of structured items —
-            # NOT a bare string), plus optional config overrides we
-            # leave out for v1.
+            # ``input`` is an array of structured items, NOT a bare string.
             turn_response = await self._send_raw_request(
                 turn.request_id,
                 METHOD_SEND_USER_TURN,
@@ -325,10 +316,8 @@ class CodexSession:
                     ],
                 },
             )
-            # Some App Server versions complete the turn synchronously
-            # and put the final items in the response payload; others
-            # stream item/* + turn/completed notifications and return
-            # only ``{turn: {id, status: "running"}}``. Handle both.
+            # Some builds complete the turn synchronously in the response; others
+            # stream item/* + turn/completed. Handle both.
             sync_resolved = self._absorb_sync_turn_response(turn, turn_response)
             if sync_resolved:
                 # No need to wait — server already gave us everything.
@@ -336,12 +325,12 @@ class CodexSession:
             else:
                 try:
                     await asyncio.wait_for(
-                        turn.completed, timeout=TURN_TIMEOUT_SECONDS,
+                        turn.completed, timeout=self.task_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "agent %s: codex turn timed out after %ds",
-                        self.agent_id, TURN_TIMEOUT_SECONDS,
+                        self.agent_id, self.task_timeout_seconds,
                     )
                     # Best-effort interrupt so the server stops streaming
                     # output we'll never read.
@@ -359,8 +348,16 @@ class CodexSession:
                     rotated_in_branch = self._propagate_turn_outcome(
                         outcome="timeout",
                     )
+                    # Operator-facing reply so a timeout doesn't surface as
+                    # silence; only claim a reset when rotation actually fired.
+                    label = _timeout_budget_label(self.task_timeout_seconds)
+                    suffix = (
+                        "; the codex session was reset for the next turn."
+                        if rotated_in_branch
+                        else "."
+                    )
                     return TurnResult(
-                        reply="",
+                        reply=f"⏱ Task exceeded the {label} timeout{suffix}",
                         metadata={
                             "codex_turn_timeout": True,
                             "codex_thread_rotated": rotated_in_branch,
@@ -375,13 +372,23 @@ class CodexSession:
 
         if turn_failed_exc is not None:
             err_text = str(turn_failed_exc)
+            # Transient mid-reconnect: non-auth AgentAPIError routes the batch
+            # to the consumer's re-enqueue/backoff instead of the raw
+            # RuntimeError drop; not a wedged strike.
+            if _looks_like_codex_reconnect(err_text):
+                from ..core import AgentAPIError
+                logger.info(
+                    "agent %s: codex mid-reconnect; deferring batch for retry "
+                    "(not a wedged strike): %s", self.agent_id, err_text,
+                )
+                raise AgentAPIError(
+                    f"codex reconnecting (transient): {err_text}", is_auth=False,
+                ) from turn_failed_exc
             self._propagate_turn_outcome(
                 outcome="turn_failed", err_text=err_text,
             )
-            # Codex auth-failures are sticky + operator-actionable (re-run
-            # ``codex login``). Convert to AgentAPIError so the worker's
-            # auth_failed substrate (state-flip + operator DM + refresher
-            # kick) reuses the Claude path.
+            # Sticky + operator-actionable (re-run ``codex login``); is_auth=True
+            # reuses the worker's Claude auth_failed substrate.
             if _looks_like_codex_auth_error(err_text):
                 from ..core import AgentAPIError
                 raise AgentAPIError(
@@ -407,10 +414,8 @@ class CodexSession:
                 duration_ms=int((time.time() - turn.started_at) * 1000),
             )
         self._propagate_turn_outcome(outcome="success")
-        # core.py's reply-routing check: a non-empty
-        # ``send_message_targets`` list means "agent already posted via
-        # MCP, skip the shell fallback." Mirrors the claude-code adapter
-        # shape so the routing logic is harness-agnostic.
+        # Non-empty send_message_targets = already posted via MCP, skip shell
+        # fallback; mirrors the claude-code adapter shape.
         return TurnResult(
             reply=reply,
             input_tokens=turn.input_tokens,
@@ -423,12 +428,26 @@ class CodexSession:
             },
         )
 
-    async def reload(self, new_system_prompt: str) -> None:
-        """Tear the codex App Server process down so the next turn
-        re-spawns it and re-reads config.toml + AGENTS.md."""
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
+        """Tear down the codex App Server so the next turn re-spawns
+        and re-reads config.toml + AGENTS.md. ``with_session=True``
+        also unlinks ``codex_session.json``."""
         self.current_instructions = new_system_prompt
         async with self._lock:
             await self._teardown_locked()
+        if with_session:
+            try:
+                self.session_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't unlink codex session file %s: %s",
+                    self.agent_id, self.session_file, exc,
+                )
+            self._conversation_id = ""
 
     async def aclose(self) -> None:
         async with self._lock:
@@ -599,10 +618,8 @@ class CodexSession:
         proc_alive = self._proc is not None and self._proc.returncode is None
         if proc_alive and self._conversation_id:
             return
-        # A live proc with an empty cid (corrupt session load + warm
-        # race) would make run_turn send ``threadId=""`` and wedge —
-        # respawn so _spawn re-establishes a thread (it raises if
-        # thread/start returns no id).
+        # Live proc + empty cid (corrupt load + warm race) would send
+        # threadId="" and wedge; respawn re-establishes the thread.
         if proc_alive:
             logger.info(
                 "agent %s: codex session has alive proc but empty "
@@ -627,11 +644,7 @@ class CodexSession:
                 cwd=self.cwd,
                 env=self.env,
                 **no_window_kwargs(),
-                # Override asyncio's default 64 KiB StreamReader buffer
-                # — codex emits very chunky single-line JSON
-                # notifications (full tool catalogs on
-                # mcpServer/startupStatus/updated, session snapshots
-                # on thread/started, etc.) that overrun it.
+                # codex's chunky notifications overrun the 64 KiB default.
                 limit=STREAM_READER_LIMIT_BYTES,
             )
         except FileNotFoundError as exc:
@@ -649,10 +662,8 @@ class CodexSession:
             self._stderr_loop(proc.stderr), name=f"codex-stderr-{self.agent_id}",
         )
 
-        # Anything below this point that raises must tear the process
-        # back down — otherwise ``_ensure_running`` on the next turn
-        # sees a "live" proc and skips spawn, sending turn requests
-        # against a half-initialised App Server.
+        # Any raise below must tear the proc down, else next turn sees a "live"
+        # proc and skips spawn against a half-initialised server.
         try:
             await self._bootstrap_session()
         except Exception:
@@ -663,11 +674,8 @@ class CodexSession:
         """Run the initialize handshake + thread/start (or thread/resume).
         Separated from ``_spawn`` so the spawn path can wrap it in a
         try/except that tears down the proc on any failure."""
-        # 1. JSON-RPC initialize handshake. Most JSON-RPC servers
-        # require this before accepting other methods; codex is no
-        # exception. Send a minimal clientInfo + capabilities envelope
-        # and ignore the response — we don't read server capabilities
-        # back yet.
+        # JSON-RPC initialize handshake, required before other methods;
+        # response ignored.
         try:
             await self._send_raw_request(
                 self._reserve_id(),
@@ -720,23 +728,10 @@ class CodexSession:
                 )
                 self._conversation_id = ""
 
-        # thread/start params per codex-rs/app-server-protocol/src/
-        # protocol/v2.rs. The on-wire schema is camelCase (NOT
-        # snake_case — the Python SDK FAQ that suggested otherwise is
-        # describing the Python SDK's wrapper field names, not the
-        # wire JSON). The thread-level sandbox field is bare ``sandbox``
-        # (not ``sandbox_mode``, not ``sandboxMode``) — a single word.
-        #
-        # ``approvalPolicy: "never"`` means **auto-approve everything
-        # without bothering the client**. Confusing name; verified by
-        # live behaviour. Puffo trust model = operator vouches for the
-        # agent + machine, all tools allowed.
-        #
-        # ``sandbox`` is codex's sandbox policy (read-only |
-        # workspace-write | danger-full-access), per-agent via agent.yml.
-        # Default keeps it fully open — cli-local runs as the operator's
-        # UID, so codex's in-process sandbox is mostly cosmetic; the real
-        # boundary is cli-docker's container.
+        # Wire schema is camelCase; the thread-level field is bare ``sandbox``.
+        # ``approvalPolicy: "never"`` = auto-approve everything (confusing name;
+        # verified live). Sandbox default stays open: cli-local runs as the
+        # operator's UID, the real boundary is cli-docker's container.
         new_conv_params: dict[str, Any] = {
             "cwd": self.cwd or os.getcwd(),
             "approvalPolicy": (
@@ -990,10 +985,8 @@ class CodexSession:
             return
 
         if method == "item/permissions/requestApproval":
-            # Mirror back whatever permissions were requested. The
-            # README's example showed result.permissions matching the
-            # request's permission shape; we trust the request body
-            # since approvalPolicy is "never" + bypassPermissions.
+            # Mirror requested permissions back; approvalPolicy "never" +
+            # bypassPermissions.
             requested = params.get("permissions") if isinstance(params, dict) else None
             if accept and requested:
                 await self._reply_to_server_request(
@@ -1007,10 +1000,8 @@ class CodexSession:
             return
 
         if method == "item/tool/call":
-            # codex is invoking a client-registered dynamic tool. We
-            # don't register any (yet). Respond with the contract
-            # shape but mark success=false so codex surfaces the
-            # right error to the model.
+            # No dynamic tools registered; contract shape with success=false so
+            # codex surfaces the right error to the model.
             await self._reply_to_server_request(
                 request_id,
                 {
@@ -1071,6 +1062,13 @@ class CodexSession:
         m = method.replace(".", "/").lower()
         turn = self._active_turn
 
+        # Account-level, arrives with or without an active turn.
+        if m.startswith("account/ratelimits/updated"):
+            from ...portal.control.reporter import get_reporter
+
+            get_reporter().record_codex_rate_limits((params or {}).get("rateLimits"))
+            return
+
         if m.startswith("thread/tokenusage/updated") and turn is not None:
             # codex reports per-turn tokens here (not turn/completed); ``last``
             # refreshes during the turn, final value stands at turn/completed.
@@ -1100,17 +1098,12 @@ class CodexSession:
             if not turn.completed.done():
                 turn.completed.set_result(None)
             return
-        # codex emits both ``turn/failed`` AND a top-level ``error``
-        # notification, depending on whether the error happens
-        # client-side validation or upstream from the model. Treat
-        # both as turn-fatal so the turn future resolves with a clear
-        # error message instead of timing out into "no reply".
+        # turn/failed OR top-level error, depending on where it failed; both
+        # are turn-fatal, else the turn times out into "no reply".
         if (m == "error" or m.startswith("turn/failed")) and turn is not None:
             err = (params or {}).get("error") or params or "(no detail)"
-            # Codex's ``error`` notification wraps the upstream error
-            # JSON-as-string under params.error.message. Unwrap so the
-            # operator sees the actual reason ("model not supported"
-            # etc.) rather than a JSON-soup blob.
+            # error wraps the upstream JSON-as-string under params.error.message;
+            # unwrap for a readable reason.
             err_text = _readable_error(err)
             if not turn.completed.done():
                 turn.completed.set_exception(
@@ -1179,11 +1172,8 @@ class CodexSession:
                         id=str(item.get("id") or ""),
                     )
             elif kind == "mcptoolcall":
-                # Real codex shape per debug logs: ``item/completed``
-                # with ``item.type == "mcpToolCall"``, ``item.server``
-                # == server name, ``item.tool`` == tool name,
-                # ``item.status`` ∈ {"completed", "failed", ...},
-                # ``item.arguments`` == the tool's JSON input.
+                # Real shape: item/completed with item.type == "mcpToolCall" and
+                # server/tool/status/arguments fields.
                 turn.tool_calls += 1
                 status = (item.get("status") or "").lower()
                 server = item.get("server") or ""
@@ -1220,10 +1210,8 @@ class CodexSession:
             pass
 
     def _absorb_turn_usage(self, turn: _PendingTurn, params: dict) -> None:
-        # Fallback for builds that DO inline usage on turn/completed (top-level
-        # or nested under ``turn``). Live codex reports it via
-        # ``thread/tokenUsage/updated`` instead — so don't clobber a value
-        # already captured there with a zero.
+        # Some builds inline usage on turn/completed; live codex reports via
+        # thread/tokenUsage/updated, so don't clobber that with a zero.
         usage = params.get("usage")
         if not usage and isinstance(params.get("turn"), dict):
             usage = params["turn"].get("usage")

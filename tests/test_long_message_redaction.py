@@ -95,7 +95,7 @@ def test_redact_emits_placeholder_with_envelope_id_and_segments():
     assert "segments: 3 (0-indexed, up to 2000 chars each)" in out
     assert "sender: @Alice (alice)" in out
     assert "mcp__puffo__get_post_segment" in out
-    assert "segment=N) where N runs 0..2" in out
+    assert "segment=N, segment_size=2000) where N runs 0..2" in out
     # The placeholder itself shouldn't be longer than the
     # original by an order of magnitude (sanity — a buggy preview
     # that includes the whole payload would defeat the redaction).

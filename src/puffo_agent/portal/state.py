@@ -32,6 +32,8 @@ from typing import Any
 import psutil
 import yaml
 
+from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+
 
 # Where daemon.yml, agents/, etc. live.
 def home_dir() -> Path:
@@ -93,13 +95,9 @@ def shared_fs_dir() -> Path:
     return home_dir() / "shared"
 
 
-# Files copied from the operator's $HOME into a per-agent virtual
-# $HOME on first use. Lift OAuth-essential files only.
-# Note: ``.claude.json`` is a sibling of the ``.claude/`` dir; Claude
-# CLI reads it from ``$HOME/.claude.json`` so we mirror that layout.
-# ``.credentials.json`` is intentionally excluded — set up separately
-# via ``link_host_credentials`` so every agent tracks live OAuth state
-# (matches cli-docker's bind-mount model).
+# OAuth-essential files seeded into the per-agent virtual $HOME.
+# ``.claude.json`` is a sibling of ``.claude/``. ``.credentials.json``
+# excluded; sync_host_claude_code_auth_view owns live OAuth state.
 _CLAUDE_HOME_SEED_PATHS = (
     ".claude/settings.json",
     ".claude.json",
@@ -111,7 +109,7 @@ def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     ``$HOME``. Idempotent — never overwrites an existing file.
 
     ``.credentials.json`` is set up separately via
-    ``link_host_credentials``. Returns True if any file was copied.
+    ``sync_host_claude_code_auth_view``. Returns True if any file was copied.
     """
     import shutil
     agent_home.mkdir(parents=True, exist_ok=True)
@@ -136,8 +134,8 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
 
     Claude Code stores OAuth in Keychain instead of the file on macOS;
     this bridges to the shared-file path used by every other agent.
-    Called on every ``link_host_credentials`` invocation so refreshed
-    tokens propagate. Returns True if the file was written.
+    Called on every ``sync_host_claude_code_auth_view`` invocation so
+    refreshed tokens propagate. Returns True if the file was written.
     """
     import platform
     if platform.system() != "Darwin":
@@ -175,137 +173,112 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
         return False
 
 
-def link_host_credentials(host_home: Path, agent_home: Path) -> str:
-    """Share the operator's ``.credentials.json`` with the agent so
-    OAuth refresh-token rotation propagates automatically.
+def sanitize_claude_code_auth_blob(blob: str) -> str | None:
+    """Strip ``claudeAiOauth.refreshToken`` from the host blob for the
+    agent view. ``None`` on unparseable JSON — never ship a blob we
+    can't vet. Claude Code tolerates the missing field: uses the
+    access token, 401s cleanly rather than attempting a refresh."""
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    oauth = data.get("claudeAiOauth")
+    if isinstance(oauth, dict):
+        oauth.pop("refreshToken", None)
+    return json.dumps(data)
 
-    Anthropic OAuth uses rotating refresh tokens; per-agent copies go
-    stale when the operator re-runs ``claude login``. Sharing one
-    file means any refresh (host, any agent) updates the single file
-    that everyone reads.
 
-    Prefers symlink (free read-through); falls back to copy on
-    Windows-without-Developer-Mode. Hardlinks are intentionally
-    skipped — claude's atomic tmp+rename breaks the shared inode.
-    Per PUF-217, refresh-time writes run with ``HOME=host_home``
-    so claude renames at the host path, not at the agent symlink
-    — the symlink itself is never the rename target.
+def sanitize_codex_auth_blob(blob: str) -> str | None:
+    """Blank (not remove) ``tokens.refresh_token`` for the agent view.
+    ``None`` on unparseable JSON. Codex serde is non-optional on this
+    field — dropping it crashes; empty string parses, ``codex login
+    status`` reports logged-in, and a refresh attempt fails server-side
+    without consuming the real (single-use) token."""
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict):
+        tokens["refresh_token"] = ""
+    return json.dumps(data)
 
-    On macOS, ``_sync_credentials_from_keychain`` materialises the
-    file from the system Keychain first.
 
-    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
-    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-file"``.
+def _write_credential_view(target: Path, blob: str) -> None:
+    """Atomic tmp+rename write at ``target``, mode 0600. ``os.replace``
+    swaps the path entry, so a legacy symlink at ``target`` is replaced,
+    not followed — the host file it pointed at stays untouched."""
+    import stat
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
+    tmp.write_text(blob, encoding="utf-8")
+    try:
+        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    os.replace(tmp, target)
+
+
+def sync_host_claude_code_auth_view(host_home: Path, agent_home: Path) -> str:
+    """Write a refresh-token-free view of the host's
+    ``.credentials.json`` into the agent's virtual ``$HOME`` — only
+    the daemon holds the rotating RT, so agents can't race a refresh
+    into a token-family revocation. Idempotent + self-healing;
+    legacy symlinks migrated in place. Returns ``"view"``,
+    ``"view (fresh)"``, ``"view (migrated-from-symlink)"``,
+    ``"unparseable-host-file"``, ``"write-failed"``, or ``"no-host-file"``.
     """
-    import shutil
     host_creds = host_home / ".claude" / ".credentials.json"
     agent_creds = agent_home / ".claude" / ".credentials.json"
-    # macOS Keychain → file bridge before we read host_creds.
     _sync_credentials_from_keychain(host_home)
-    if not host_creds.exists():
+    try:
+        host_blob = host_creds.read_text(encoding="utf-8")
+    except OSError:
         return "no-host-file"
-    agent_creds.parent.mkdir(parents=True, exist_ok=True)
+    view_blob = sanitize_claude_code_auth_blob(host_blob)
+    if view_blob is None:
+        return "unparseable-host-file"
 
-    # Fast path: existing symlink already points at host_creds.
-    if agent_creds.is_symlink():
+    migrated = agent_creds.is_symlink()
+    if not migrated:
         try:
-            current = os.readlink(agent_creds)
-            if Path(current) == host_creds or current == str(host_creds):
-                return "symlink (already)"
+            if agent_creds.read_text(encoding="utf-8") == view_blob:
+                return "view (fresh)"
         except OSError:
             pass
-
-    # Fast path: copy-mode file already matches host.
-    if (
-        agent_creds.exists()
-        and not agent_creds.is_symlink()
-        and _file_is_up_to_date(agent_creds, host_creds)
-    ):
-        return "copy (fresh)"
-
-    # Tear down whatever's there before a fresh create. Unlink can
-    # fail on Windows races; the next call retries naturally.
     try:
-        if agent_creds.is_symlink() or agent_creds.exists():
-            agent_creds.unlink()
+        _write_credential_view(agent_creds, view_blob)
     except OSError:
-        pass
-
-    try:
-        os.symlink(host_creds, agent_creds)
-        return "symlink"
-    except (OSError, NotImplementedError):
-        pass
-
-    try:
-        shutil.copy2(host_creds, agent_creds)
-        return "copy"
-    except OSError:
-        return "no-host-file"
+        return "write-failed"
+    return "view (migrated-from-symlink)" if migrated else "view"
 
 
-def _file_is_up_to_date(dst: Path, src: Path) -> bool:
-    """True when ``dst`` and ``src`` have matching mtime + size."""
-    try:
-        ds, ss = dst.stat(), src.stat()
-    except OSError:
-        return False
-    return ds.st_mtime == ss.st_mtime and ds.st_size == ss.st_size
-
-
-def link_host_codex_auth(host_home: Path, agent_codex_home: Path) -> str:
-    """Share the operator's ``~/.codex/auth.json`` with the agent's
-    per-agent ``$CODEX_HOME`` so codex finds OAuth credentials there.
-
-    Mirrors ``link_host_credentials``'s symlink-preferred, copy-fallback
-    layout (Windows without Developer Mode rejects ``os.symlink``).
-    The same OAuth refresh-rotation story applies: a symlink lets every
-    agent see token rotations the moment codex (any process — main CLI
-    or another agent) writes back; a copy gets re-synced on the next
-    link call.
-
-    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
-    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-file"``.
-    """
-    import shutil
+def sync_host_codex_auth_view(host_home: Path, agent_codex_home: Path) -> str:
+    """Codex counterpart of ``sync_host_claude_code_auth_view``; RT
+    blanked, not removed (see ``sanitize_codex_auth_blob``). Same
+    return taxonomy."""
     host_auth = host_home / ".codex" / "auth.json"
     agent_auth = agent_codex_home / "auth.json"
-    if not host_auth.exists():
+    try:
+        host_blob = host_auth.read_text(encoding="utf-8")
+    except OSError:
         return "no-host-file"
-    agent_auth.parent.mkdir(parents=True, exist_ok=True)
+    view_blob = sanitize_codex_auth_blob(host_blob)
+    if view_blob is None:
+        return "unparseable-host-file"
 
-    if agent_auth.is_symlink():
+    migrated = agent_auth.is_symlink()
+    if not migrated:
         try:
-            current = os.readlink(agent_auth)
-            if Path(current) == host_auth or current == str(host_auth):
-                return "symlink (already)"
+            if agent_auth.read_text(encoding="utf-8") == view_blob:
+                return "view (fresh)"
         except OSError:
             pass
-
-    if (
-        agent_auth.exists()
-        and not agent_auth.is_symlink()
-        and _file_is_up_to_date(agent_auth, host_auth)
-    ):
-        return "copy (fresh)"
-
     try:
-        if agent_auth.is_symlink() or agent_auth.exists():
-            agent_auth.unlink()
+        _write_credential_view(agent_auth, view_blob)
     except OSError:
-        pass
-
-    try:
-        os.symlink(host_auth, agent_auth)
-        return "symlink"
-    except (OSError, NotImplementedError):
-        pass
-
-    try:
-        shutil.copy2(host_auth, agent_auth)
-        return "copy"
-    except OSError:
-        return "no-host-file"
+        return "write-failed"
+    return "view (migrated-from-symlink)" if migrated else "view"
 
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
@@ -451,8 +424,17 @@ def sync_host_gemini_skills(host_home: Path, project_dir: Path) -> int:
 
 
 # Path prefixes that won't resolve inside the runtime container.
-# ``/home/agent/`` is handled separately because it IS valid inside.
-_HOST_LOCAL_COMMAND_PREFIXES = ("/Users/", "/tmp/", "/var/folders/")
+# ``/home/agent/`` is handled separately because it IS valid inside;
+# ``/opt/puffoagent-pkg`` stays resolvable (prefixes are more specific).
+_HOST_LOCAL_COMMAND_PREFIXES = (
+    "/Users/",
+    "/tmp/",
+    "/var/folders/",
+    "/opt/homebrew/",
+    "/opt/local/",
+    "/Volumes/",
+    "/private/",
+)
 
 
 def _looks_host_local_command(command: str) -> bool:
@@ -467,6 +449,27 @@ def _looks_host_local_command(command: str) -> bool:
     if command.startswith("/home/") and not command.startswith("/home/agent/"):
         return True
     return any(command.startswith(p) for p in _HOST_LOCAL_COMMAND_PREFIXES)
+
+
+def _host_local_token(cfg: dict) -> str | None:
+    """First token in an MCP server cfg that points at a host-only path,
+    or ``None`` when everything resolves inside the container. Scans
+    ``args`` too — a bare ``npx`` / ``uvx`` command often hides the host
+    path in an argument."""
+    if not isinstance(cfg, dict):
+        return None
+    cmd = cfg.get("command") or ""
+    if isinstance(cmd, str) and _looks_host_local_command(cmd):
+        return cmd
+    for arg in cfg.get("args") or []:
+        # /tmp exists in the container: a /tmp arg is a valid output path.
+        if (
+            isinstance(arg, str)
+            and not arg.startswith("/tmp/")
+            and _looks_host_local_command(arg)
+        ):
+            return arg
+    return None
 
 
 def sync_host_mcp_servers(
@@ -503,12 +506,14 @@ def sync_host_mcp_servers(
 
     agent_servers = dict(agent_data.get("mcpServers") or {})
     unreachable: list[tuple[str, str]] = []
+    merged = 0
     for name, cfg in host_servers.items():
+        token = _host_local_token(cfg)
+        if token is not None:
+            unreachable.append((name, token))
+            continue
         agent_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
+        merged += 1
     agent_data["mcpServers"] = agent_servers
 
     try:
@@ -518,7 +523,7 @@ def sync_host_mcp_servers(
         os.replace(tmp, agent_path)
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return merged, unreachable
 
 
 def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
@@ -615,10 +620,7 @@ def sync_host_enabled_plugins(host_home: Path, agent_home: Path) -> int:
     except (OSError, ValueError):
         return 0
     enabled = host_data.get("enabledPlugins")
-    # Claude Code has used both shapes historically — dict
-    # (``{name: true}``) on newer versions, list (``[name, ...]``)
-    # on older. Pass either through unchanged so we don't reshape
-    # something Claude is about to read.
+    # Claude Code has shipped both shapes (dict + list); pass through unchanged.
     if not isinstance(enabled, (list, dict)) or not enabled:
         return 0
 
@@ -683,12 +685,14 @@ def sync_host_gemini_mcp_servers(
 
     merged_servers = dict(agent_data.get("mcpServers") or {})
     unreachable: list[tuple[str, str]] = []
+    merged = 0
     for name, cfg in host_servers.items():
+        token = _host_local_token(cfg)
+        if token is not None:
+            unreachable.append((name, token))
+            continue
         merged_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
+        merged += 1
 
     if extra_servers:
         for name, cfg in extra_servers.items():
@@ -703,7 +707,7 @@ def sync_host_gemini_mcp_servers(
         os.replace(tmp, agent_path)
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return merged, unreachable
 
 
 def daemon_yml_path() -> Path:
@@ -760,6 +764,31 @@ def delete_flag_path(agent_id: str) -> Path:
     """Sentinel for operator-initiated Delete (destructive — no
     archived/ copy retained). Distinct from archive.flag."""
     return agent_dir(agent_id) / ".puffo-agent" / "delete.flag"
+
+
+# Refresh flags — 5 axes touched by MCP refresh() / CLI / control-ws.
+# All under ``<workspace>/.puffo-agent/`` so the location is reachable
+# from both the worker and the MCP subprocess in cli-docker.
+
+
+def refresh_agent_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_agent.flag"
+
+
+def refresh_host_sync_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_host_sync.flag"
+
+
+def refresh_session_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_session.flag"
+
+
+def refresh_model_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_model.flag"
+
+
+def refresh_runtime_flag_path(workspace: Path) -> Path:
+    return workspace / ".puffo-agent" / "refresh_runtime.flag"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -828,26 +857,16 @@ class DaemonConfig:
     skills_dir: str = ""  # absolute path; empty = no shared skills
     reconcile_interval_seconds: float = 2.0
     runtime_heartbeat_seconds: float = 5.0
-    # cli-docker memory caps. Defaults bound each container so one
-    # runaway claude can't poison the VM (vm.overcommit_memory=1 +
-    # uncapped containers can drain swap and surface ENOMEM on
-    # unrelated reads). Operators can opt out with empty strings;
-    # per-agent overrides live on ``runtime``.
+    # cli-docker memory caps: one runaway claude must not drain the VM's
+    # swap. Empty string = opt out; per-agent overrides on ``runtime``.
     docker_memory_limit: str = "1.5g"
     docker_memory_reservation: str = "500m"
-    # Inbound message redaction. When an envelope's text exceeds
-    # ``max_inline_message_chars`` the daemon replaces the body the
-    # LLM sees with a system-message placeholder (carrying
-    # envelope_id, total length, segment count, and a preview), and
-    # the agent fetches the full content one chunk at a time via
-    # the ``get_post_segment`` MCP tool. The original envelope is
-    # stored unmodified in ``messages.db`` — only the prompt-budget
-    # view is redacted. Tuned for Claude's 200k window minus a
-    # generous system-prompt + history headroom; defaults pinned at
-    # 4000/2000 so a single 8-segment paste fits comfortably even
-    # with a verbose primer.
-    max_inline_message_chars: int = 4000
-    segment_chars: int = 2000
+    # Inbound redaction: over-limit envelope bodies become a placeholder
+    # (id, length, segments, preview); the agent pages via get_post_segment.
+    # Only the prompt view is redacted, messages.db keeps the original.
+    # Guards session-lifetime growth; 16000 inlines typical code/log pastes.
+    max_inline_message_chars: int = MAX_INLINE_MESSAGE_CHARS
+    segment_chars: int = MESSAGE_SEGMENT_CHARS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -872,8 +891,10 @@ class DaemonConfig:
             runtime_heartbeat_seconds=float(raw.get("runtime_heartbeat_seconds", 5.0)),
             docker_memory_limit=raw.get("docker_memory_limit", "1.5g"),
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
-            max_inline_message_chars=int(raw.get("max_inline_message_chars", 4000)),
-            segment_chars=int(raw.get("segment_chars", 2000)),
+            max_inline_message_chars=int(
+                raw.get("max_inline_message_chars", MAX_INLINE_MESSAGE_CHARS)
+            ),
+            segment_chars=int(raw.get("segment_chars", MESSAGE_SEGMENT_CHARS)),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
@@ -934,10 +955,8 @@ class TriggerRules:
     on_dm: bool = True
 
 
-## Default puffo-core server. Override per-agent via
-## ``puffo_core.server_url`` for self-hosted relays or local dev.
-## ``api.puffo.ai`` is platform-internal only; client traffic goes
-## through the public ``chat.puffo.ai/relay`` edge.
+## Default puffo-core server; per-agent override via puffo_core.server_url.
+## api.puffo.ai is platform-internal; clients use chat.puffo.ai/relay.
 DEFAULT_PUFFO_SERVER_URL = "https://chat.puffo.ai/relay"
 
 
@@ -995,15 +1014,13 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Agent engine (CLI kinds only):
-    #   - ``claude-code``: ``claude`` CLI with our stream-json session
-    #     protocol, --resume, --model, and the puffo MCP tool suite.
-    #   - ``hermes``: ``hermes chat -q`` one-shot per turn against
-    #     Anthropic, using Claude Code's credential store.
-    #   - ``gemini-cli``: declared, not yet implemented.
-    # Hermes + anthropic billing note: third-party OAuth clients route
-    # to Anthropic's ``extra_usage`` pool, NOT a Claude subscription.
-    # Same token, different ledger.
+    # codex (cli-local) per-turn wall-clock budget in seconds; raise for
+    # agents running long reasoning/complex tasks.
+    task_timeout_seconds: float = 600.0
+    # Agent engine (CLI kinds only): ``claude-code`` (stream-json + resume +
+    # puffo MCP), ``hermes`` (one-shot ``hermes chat -q``), ``gemini-cli``
+    # (declared, unimplemented). Hermes OAuth bills to Anthropic
+    # extra_usage, not a Claude subscription.
     harness: str = "claude-code"  # claude-code | hermes
     # sdk only: cap on agentic-loop iterations per turn. 10 is fine
     # for short Q&A; multi-step work often needs 30-50. CLI kinds
@@ -1023,13 +1040,9 @@ class AgentConfig:
     display_name: str = ""
     # Cached chat avatar URL; server is source of truth.
     avatar_url: str = ""
-    # ``role`` is the long-form (<=140 chars) "what does this agent do"
-    # string; ``role_short`` is the chip label rendered by clients in
-    # member lists. Mirror of the server-side identity profile fields
-    # added in puffo-server's identity_role migration. On every edit
-    # the daemon syncs both up to ``PATCH /identities/self``; the
-    # server derives ``role_short`` from ``role`` when the client
-    # omits it.
+    # role = long-form (<=140 chars); role_short = client chip label.
+    # Synced to PATCH /identities/self on edit; server derives role_short
+    # when omitted.
     role: str = ""
     role_short: str = ""
     puffo_core: PuffoCoreConfig = field(default_factory=PuffoCoreConfig)
@@ -1103,6 +1116,7 @@ class AgentConfig:
                 docker_memory_reservation=rt.get("docker_memory_reservation", ""),
                 permission_mode=rt.get("permission_mode", "bypassPermissions"),
                 sandbox=rt.get("sandbox", "danger-full-access"),
+                task_timeout_seconds=float(rt.get("task_timeout_seconds", 600.0)),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),
             ),
@@ -1173,35 +1187,17 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
-    # Worker-side health, independent of ``status``. Values:
-    #   "ok"                  — refresh-ping passed, a turn cleared a
-    #                           prior abandon, or a credential refresh
-    #                           cleared a prior auth_failed
-    #   "in_progress"         — turn mid-flight; overrides any sticky
-    #                           red so the UI reads alive
-    #   "auth_failed"         — adapter saw 401 / authentication_error
-    #                           (set in worker._handle_suppressed_reply);
-    #                           cleared by the CredentialRefresher's
-    #                           refresh-success callback (PUF-258 wired
-    #                           the clear; PUF-221 owns the set lane)
-    #   "api_error_abandoned" — kick-retry exhausted, batch silently
-    #                           abandoned; cleared on next successful turn
-    #                           (PUF-255's on_turn_success lane)
-    #   "refresh_broken"      — daemon saw N consecutive non-success
-    #                           refresh outcomes; cleared by next
-    #                           REFRESHED. Does not overwrite the two
-    #                           stronger downstream signals above.
-    #   "unhandled_error"     — non-AgentAPIError raised in the turn and
-    #                           no category red was set; cleared by
-    #                           next successful turn
-    #   "codex_thread_wedged" — codex thread rotated after N consecutive
-    #                           turn timeouts/failures OR the verbatim
-    #                           "agent thread limit reached" error.
-    #                           Auto-recovers on next inbound message;
-    #                           cleared on next successful turn. Does
-    #                           NOT overwrite the stronger downstream
-    #                           signals above.
-    #   "unknown"             — no probe yet
+    # Worker-side health, independent of ``status``:
+    #   "ok"                  - clean turn / cleared red
+    #   "in_progress"         - turn mid-flight; overrides sticky reds
+    #   "auth_failed"         - adapter saw 401; cleared by refresh success
+    #   "api_error_abandoned" - kick-retry exhausted; cleared on next good turn
+    #   "refresh_broken"      - N consecutive refresh failures; cleared by next
+    #                           REFRESHED; never overwrites the reds above
+    #   "unhandled_error"     - uncategorised turn raise; cleared on next good turn
+    #   "codex_thread_wedged" - thread rotated (timeouts/failures/thread-limit);
+    #                           auto-recovers; never overwrites stronger reds
+    #   "unknown"             - no probe yet
     health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod

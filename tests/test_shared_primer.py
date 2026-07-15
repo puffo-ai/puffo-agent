@@ -3,9 +3,9 @@ from pathlib import Path
 
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
+    ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
-    reseed_shared_primer,
     sync_shared_skills_codex,
 )
 from puffo_agent.portal.cli import build_parser
@@ -15,46 +15,66 @@ def _tmp() -> Path:
     return Path(tempfile.mkdtemp())
 
 
-# ── reseed_shared_primer ────────────────────────────────────────────
+# ── ensure_shared_primer ────────────────────────────────────────────
 
 
-def test_reseed_creates_on_fresh_dir():
+def test_ensure_creates_on_fresh_dir():
     shared = _tmp() / "shared"
-    actions = reseed_shared_primer(shared)
+    actions = ensure_shared_primer(shared)
     assert actions, "expected managed files to be reported"
     assert all(action == "created" for _, action in actions)
-    # CLAUDE.md landed with this install's content.
     assert (
         (shared / "CLAUDE.md").read_text(encoding="utf-8")
         == DEFAULT_SHARED_CLAUDE_MD
     )
-    # skill files are reported with a posix-style relative path.
     assert any(rel.startswith("skills/") for rel, _ in actions)
 
 
-def test_reseed_is_noop_when_already_current():
+def test_ensure_is_noop_when_already_current():
     shared = _tmp() / "shared"
-    reseed_shared_primer(shared)
-    actions = reseed_shared_primer(shared)
+    ensure_shared_primer(shared)
+    actions = ensure_shared_primer(shared)
     assert all(action == "unchanged" for _, action in actions)
 
 
-def test_reseed_overwrites_edited_file_and_backs_it_up():
+def test_ensure_overwrites_stale_content_without_backup():
+    """No operator-edit protection — stale content is replaced in
+    place. No ``.bak`` is written."""
     shared = _tmp() / "shared"
-    reseed_shared_primer(shared)
+    ensure_shared_primer(shared)
     primer = shared / "CLAUDE.md"
-    primer.write_text("operator's local edit", encoding="utf-8")
+    primer.write_text("stale content", encoding="utf-8")
 
-    by_rel = dict(reseed_shared_primer(shared))
-    assert by_rel["CLAUDE.md"] == "updated (backed up)"
-    # Untouched files aren't churned.
+    by_rel = dict(ensure_shared_primer(shared))
+    assert by_rel["CLAUDE.md"] == "updated"
     assert by_rel["README.md"] == "unchanged"
-    # The edit is recoverable, and the file is back to the install version.
-    assert (
-        (shared / "CLAUDE.md.bak").read_text(encoding="utf-8")
-        == "operator's local edit"
-    )
     assert primer.read_text(encoding="utf-8") == DEFAULT_SHARED_CLAUDE_MD
+    assert not (shared / "CLAUDE.md.bak").exists()
+
+
+def test_ensure_prunes_stale_managed_skills():
+    """A managed skill dir whose id is no longer in ``DEFAULT_SKILLS``
+    is deleted on the next sync. Operator-authored dirs (no
+    ``.puffo-managed`` marker) are preserved."""
+    from puffo_agent.agent.shared_content import _MANAGED_MARKER
+
+    shared = _tmp() / "shared"
+    ensure_shared_primer(shared)
+
+    stale = shared / "skills" / "removed-in-v2"
+    stale.mkdir()
+    (stale / "SKILL.md").write_text("old body", encoding="utf-8")
+    (stale / _MANAGED_MARKER).write_text("m", encoding="utf-8")
+
+    custom = shared / "skills" / "operator-authored"
+    custom.mkdir()
+    (custom / "SKILL.md").write_text("keep me", encoding="utf-8")
+
+    by_rel = dict(ensure_shared_primer(shared))
+    assert by_rel.get("skills/removed-in-v2") == "pruned"
+    assert not stale.exists()
+    assert custom.exists()
+    assert (custom / "SKILL.md").read_text(encoding="utf-8") == "keep me"
 
 
 # ── rebuild_agent_claude_md ─────────────────────────────────────────
@@ -133,9 +153,9 @@ def test_sync_shared_skills_codex_strips_prefix_in_skill_bodies():
     workspace = root / "workspace"
     workspace.mkdir()
 
-    # Reseed populates shared/skills/<id>/SKILL.md with the
-    # DEFAULT_SKILLS bodies (which include mcp__puffo__ refs).
-    reseed_shared_primer(shared)
+    # ensure_shared_primer populates shared/skills/<id>/SKILL.md with
+    # the DEFAULT_SKILLS bodies (which include mcp__puffo__ refs).
+    ensure_shared_primer(shared)
 
     sync_shared_skills_codex(shared, workspace)
 
@@ -195,3 +215,70 @@ def test_cli_reset_primer_unknown_agent_returns_error(monkeypatch):
     # Shared primer still re-seeds; the unknown agent yields a non-zero rc.
     assert args.func(args) == 2
     assert (home / "docker" / "shared" / "CLAUDE.md").exists()
+
+
+# ── primer + skill body correctness invariants ─────────────────────
+
+
+def test_docs_use_msg_envelope_id_format():
+    """Envelope ids are ``msg_<uuid>`` (crypto/message.py stamps them;
+    the server's prefix validator rejects anything else). No agent-facing
+    doc may teach the phantom ``env_`` format."""
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    assert "env_" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "msg_<uuid>" in DEFAULT_SHARED_CLAUDE_MD
+    for skill_id, (description, body) in DEFAULT_SKILLS.items():
+        assert "env_" not in description, f"stale env_ id in {skill_id} description"
+        assert "env_" not in body, f"stale env_ id in {skill_id} body"
+
+
+def test_primer_dm_reply_rule_lives_in_how_to_reply():
+    """The DM ``@<slug>`` rule sits inside 'How to reply' (where
+    agents actually read on reply), not only 100+ lines below."""
+    start = DEFAULT_SHARED_CLAUDE_MD.index("## How to reply")
+    end = DEFAULT_SHARED_CLAUDE_MD.index("## Spaces, channels, DMs")
+    how_to_reply = DEFAULT_SHARED_CLAUDE_MD[start:end]
+    assert "@<sender_slug>" in how_to_reply
+    metadata_block = DEFAULT_SHARED_CLAUDE_MD[:start]
+    assert 'channel="@<sender_slug>"' in metadata_block
+
+
+def test_primer_metadata_example_matches_builder():
+    """The documented metadata block must track what
+    ``agent/core.py`` actually emits: display-name ``sender`` +
+    separate ``sender_slug``, absolute ``.puffo/inbox`` attachment
+    paths, and multi-block batch turns."""
+    assert "- sender_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
+    # Dead field — no code path emits it; batched messages arrive as
+    # full peer blocks in one turn instead.
+    assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "SEVERAL of these blocks" in DEFAULT_SHARED_CLAUDE_MD
+    # Sender-identity enrichment fields documented.
+    assert "- sender_owner_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
+    assert "- is_from_operator: true" in DEFAULT_SHARED_CLAUDE_MD
+    assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
+    # The old, wrong relative form must be gone.
+    assert "- attachments/<envelope_id>" not in DEFAULT_SHARED_CLAUDE_MD
+    # The attachments skill mirrors the same absolute-path convention.
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    description, body = DEFAULT_SKILLS["attachments"]
+    assert "<workspace>/.puffo/inbox/" in description
+    assert "<workspace>/.puffo/inbox/<envelope_id>/<filename>" in body
+
+
+def test_skills_do_not_reference_removed_send_params():
+    """``is_visible_to_human``/``agent_only`` send-side params were
+    replaced by ``visibility_level`` in 1.0.6. The incoming metadata
+    FIELD ``is_visible_to_human`` is still real, so only skill docs
+    are held to this — not the primer's metadata example."""
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+
+    for skill_id, (description, body) in DEFAULT_SKILLS.items():
+        assert "is_visible_to_human" not in description, (
+            f"stale send-param in {skill_id} description"
+        )
+        assert "is_visible_to_human" not in body, (
+            f"stale send-param in {skill_id} body"
+        )

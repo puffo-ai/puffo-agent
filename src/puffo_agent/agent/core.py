@@ -47,9 +47,6 @@ def _user_message_preview(messages: list[dict]) -> str:
         content = m.get("content")
         if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
             body = content.split("- message: ", 1)[1]
-            cut = body.find("\n- followup_messages_since:")
-            if cut != -1:
-                body = body[:cut]
             return " ".join(body.split())[:STATUS_PREVIEW_CHARS]
     return ""
 
@@ -111,28 +108,30 @@ class PuffoAgent:
         text: str,
         direct: bool = False,
         attachments: list[str] | None = None,
-        sender_is_bot: bool = False,
+        sender_is_agent: bool = False,
         mentions: list[dict] | None = None,
         on_progress=None,
         post_id: str = "",
         root_id: str = "",
         create_at: int = 0,
-        followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
+        sender_owner_slug: str = "",
+        is_from_operator: bool = False,
     ) -> str | None:
         self._append_user(
             channel_name, sender, sender_email, text,
             channel_id=channel_id,
             root_id=root_id,
             attachments=attachments,
-            sender_is_bot=sender_is_bot,
+            sender_is_agent=sender_is_agent,
             mentions=mentions,
             post_id=post_id,
             create_at=create_at,
-            followups=followups,
             space_id=space_id,
             space_name=space_name,
+            sender_owner_slug=sender_owner_slug,
+            is_from_operator=is_from_operator,
         )
         return await self._run_turn_and_route(
             channel_name=channel_name,
@@ -151,38 +150,44 @@ class PuffoAgent:
 
         Each entry in ``batch`` is the same decoded-message dict the
         listen handler used to enqueue (envelope_id, sender_slug,
-        text, attachments, mentions, sent_at, sender_is_bot,
+        text, attachments, mentions, sent_at, sender_is_agent,
         is_dm…). The thread/channel context is constant across the
         batch and rides on ``channel_meta`` (channel_id,
         channel_name, space_id, space_name).
 
-        The agent sees every message in order as separate ``user``
-        turns in the shell log so the LLM can reason about who said
-        what and decide on its own how many replies to issue. The
-        ``followups`` field on the old single-message path is gone —
-        every message is a real user turn now.
+        The whole batch is appended as ONE ``user`` log entry (blocks
+        joined with a blank line, same shape as the api-error-retry
+        fallback). CLI adapters transmit only ``ctx.messages[-1]`` per
+        turn — the resume-based session already holds the earlier
+        history — so per-message entries would silently drop all but
+        the last message of the batch.
         """
         if not batch:
             return None
-        for msg in batch:
-            self._append_user(
-                channel_meta.get("channel_name", ""),
-                msg.get("sender_slug", ""),
-                msg.get("sender_email", ""),
-                msg.get("text", ""),
+        blocks = [
+            self._format_user_block(
+                channel_name=channel_meta.get("channel_name", ""),
+                sender=msg.get("sender_slug", ""),
+                sender_email=msg.get("sender_email", ""),
+                text=msg.get("text", ""),
                 channel_id=channel_meta.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
-                sender_is_bot=msg.get("sender_is_bot", False),
+                sender_is_agent=msg.get("sender_is_agent", False),
                 mentions=msg.get("mentions") or [],
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
-                followups=None,
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
                 is_visible_to_human=msg.get("is_visible_to_human", True),
+                sender_owner_slug=msg.get("sender_owner_slug", ""),
+                is_from_operator=msg.get("is_from_operator", False),
             )
+            for msg in batch
+        ]
+        self.log.append({"role": "user", "content": "\n\n".join(blocks)})
+        self._truncate_log()
         # Route logging uses the LAST sender in the batch as the
         # display "trigger" for log lines — purely cosmetic, the
         # agent itself decides who to reply to.
@@ -231,13 +236,15 @@ class PuffoAgent:
                 channel_id=channel_meta.get("channel_id", ""),
                 root_id=root_id,
                 attachments=msg.get("attachments") or [],
-                sender_is_bot=msg.get("sender_is_bot", False),
+                sender_is_agent=msg.get("sender_is_agent", False),
                 mentions=msg.get("mentions") or [],
                 post_id=msg.get("envelope_id", ""),
                 create_at=msg.get("sent_at", 0),
                 space_id=channel_meta.get("space_id", ""),
                 space_name=channel_meta.get("space_name", ""),
                 sender_display_name=msg.get("sender_display_name", ""),
+                sender_owner_slug=msg.get("sender_owner_slug", ""),
+                is_from_operator=msg.get("is_from_operator", False),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
 
@@ -393,15 +400,16 @@ class PuffoAgent:
         attachments: list[str] | None,
         channel_id: str = "",
         root_id: str = "",
-        sender_is_bot: bool = False,
+        sender_is_agent: bool = False,
         mentions: list[dict] | None = None,
         post_id: str = "",
         create_at: int = 0,
-        followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
         sender_display_name: str = "",
         is_visible_to_human: bool = True,
+        sender_owner_slug: str = "",
+        is_from_operator: bool = False,
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -411,15 +419,16 @@ class PuffoAgent:
             attachments=attachments,
             channel_id=channel_id,
             root_id=root_id,
-            sender_is_bot=sender_is_bot,
+            sender_is_agent=sender_is_agent,
             mentions=mentions,
             post_id=post_id,
             create_at=create_at,
-            followups=followups,
             space_id=space_id,
             space_name=space_name,
             sender_display_name=sender_display_name,
             is_visible_to_human=is_visible_to_human,
+            sender_owner_slug=sender_owner_slug,
+            is_from_operator=is_from_operator,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -434,15 +443,16 @@ class PuffoAgent:
         attachments: list[str] | None,
         channel_id: str = "",
         root_id: str = "",
-        sender_is_bot: bool = False,
+        sender_is_agent: bool = False,
         mentions: list[dict] | None = None,
         post_id: str = "",
         create_at: int = 0,
-        followups: list[dict] | None = None,
         space_id: str = "",
         space_name: str = "",
         sender_display_name: str = "",
         is_visible_to_human: bool = True,
+        sender_owner_slug: str = "",
+        is_from_operator: bool = False,
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
@@ -476,7 +486,19 @@ class PuffoAgent:
         display = sender_display_name or sender
         lines.append(f"- sender: {display}")
         lines.append(f"- sender_slug: {sender}")
-        lines.append(f"- sender_type: {'bot' if sender_is_bot else 'human'}")
+        # ``owner_slug`` exists only for agents, so it doubles as the
+        # agent signal here. Display-only — priority banding still
+        # runs on the upstream ``sender_is_agent`` flag.
+        sender_type = "agent" if (sender_is_agent or sender_owner_slug) else "human"
+        lines.append(f"- sender_type: {sender_type}")
+        # ``sender_owner_slug`` fires only for agent senders (their
+        # operator); ``is_from_operator`` only when the sender IS the
+        # agent's own operator. Emit conditionally so older agents
+        # don't see keys their primer doesn't document.
+        if sender_owner_slug:
+            lines.append(f"- sender_owner_slug: {sender_owner_slug}")
+        if is_from_operator:
+            lines.append("- is_from_operator: true")
         lines.append(
             f"- is_visible_to_human: {'true' if is_visible_to_human else 'false'}"
         )
@@ -489,7 +511,7 @@ class PuffoAgent:
                 if m.get("is_self"):
                     suffix = " (you)"
                 else:
-                    kind = "agent" if m.get("is_bot") else "human"
+                    kind = "agent" if m.get("is_agent") else "human"
                     suffix = f" ({kind})"
                 lines.append(f"  - {m['username']}{suffix}")
         if attachments:
@@ -505,19 +527,6 @@ class PuffoAgent:
                         f"image)"
                     )
         lines.append("- message: " + text)
-        if followups:
-            # Messages that arrived in the same thread/channel AFTER
-            # this one was queued. The agent should weigh them before
-            # replying — the conversation may have moved on.
-            lines.append("- followup_messages_since:")
-            for f in followups:
-                ts = f.get("timestamp", "") or _ms_to_iso(f.get("create_at", 0))
-                fid = f.get("id", "")
-                fsender = f.get("sender_username", "") or f.get("sender_id", "")
-                ftext = f.get("text", "") or ""
-                lines.append(
-                    f"  - [{ts} post:{fid}] @{fsender}: {ftext}"
-                )
         return "\n".join(lines)
 
     def _append_assistant(self, channel_name: str, reply: str):

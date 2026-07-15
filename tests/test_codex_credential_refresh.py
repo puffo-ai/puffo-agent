@@ -140,14 +140,14 @@ def test_expires_in_seconds_handles_opaque_access_token(tmp_path):
 
 def test_sync_to_agent_skips_non_codex_agents(tmp_path, monkeypatch):
     """Agent home without a ``.codex/`` subdir is a claude-only agent;
-    we shouldn't clutter it with a stray auth.json symlink."""
+    we shouldn't clutter it with a stray auth.json view."""
     _write_codex_auth(tmp_path)
     b = CodexFileBackend(host_home=tmp_path)
 
     called = []
     monkeypatch.setattr(
-        credential_refresh, "link_host_codex_auth",
-        lambda host, agent_codex: called.append((host, agent_codex)) or "symlink",
+        credential_refresh, "sync_host_codex_auth_view",
+        lambda host, agent_codex: called.append((host, agent_codex)) or "view",
     )
     claude_only_agent = tmp_path / "agent_claude"
     claude_only_agent.mkdir()
@@ -161,8 +161,8 @@ def test_sync_to_agent_links_when_codex_dir_exists(tmp_path, monkeypatch):
 
     called: list[tuple[Path, Path]] = []
     monkeypatch.setattr(
-        credential_refresh, "link_host_codex_auth",
-        lambda host, agent_codex: called.append((host, agent_codex)) or "symlink",
+        credential_refresh, "sync_host_codex_auth_view",
+        lambda host, agent_codex: called.append((host, agent_codex)) or "view",
     )
     codex_agent = tmp_path / "agent_codex"
     (codex_agent / ".codex").mkdir(parents=True)
@@ -346,8 +346,8 @@ def test_refresher_with_codex_backend_ticks_through(tmp_path, monkeypatch):
 
     synced: list[Path] = []
     monkeypatch.setattr(
-        credential_refresh, "link_host_codex_auth",
-        lambda host, agent_codex: synced.append(Path(agent_codex)) or "symlink",
+        credential_refresh, "sync_host_codex_auth_view",
+        lambda host, agent_codex: synced.append(Path(agent_codex)) or "view",
     )
     # Make sure NO refresh subprocess fires when fresh.
     async def fake_exec(*a, **k):
@@ -378,8 +378,8 @@ def test_refresher_with_codex_backend_refreshes_when_close_to_expiry(
         credential_refresh, "_resolve_codex_bin", lambda: "codex",
     )
     monkeypatch.setattr(
-        credential_refresh, "link_host_codex_auth",
-        lambda *a, **k: "symlink",
+        credential_refresh, "sync_host_codex_auth_view",
+        lambda *a, **k: "view",
     )
 
     asyncio.run(r._tick())
@@ -415,7 +415,7 @@ def test_refresher_with_codex_backend_refreshes_when_agent_reports_401(
 
 
 def test_codex_config_pins_auth_store_to_file(tmp_path):
-    """The CodexFileBackend symlink/refresh model only works if each
+    """The CodexFileBackend view/refresh model only works if each
     per-agent codex respects file-mode auth — even when no MCP is
     configured."""
     from puffo_agent.mcp.config import write_codex_mcp_config

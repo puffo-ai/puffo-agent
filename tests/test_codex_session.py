@@ -547,6 +547,167 @@ def test_turn_failed_raises(tmp_path):
     assert "model overloaded" in err
 
 
+RECONNECT_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+msg = r()
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/failed",
+   "params": {"error": {"message": "Reconnecting... 2/5"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_reconnect_turn_routes_to_retry_not_drop(tmp_path):
+    # Non-auth AgentAPIError = the consumer's re-enqueue path; a raw
+    # RuntimeError would be swallowed + dropped by the worker.
+    from puffo_agent.agent.core import AgentAPIError
+
+    fake = _write_fake(tmp_path, RECONNECT_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            await cs.run_turn("hi", "sys")
+            return ("none", None)
+        except AgentAPIError as exc:
+            return ("apierror", exc)
+        except RuntimeError as exc:
+            return ("runtime", exc)
+        finally:
+            await cs.aclose()
+
+    kind, exc = asyncio.run(_run())
+    assert kind == "apierror", f"expected AgentAPIError retry route, got {kind}"
+    assert exc.is_auth is False
+    assert "Reconnecting" in str(exc)
+    # Transient — not a wedged strike.
+    assert cs._consecutive_thread_failures == 0
+
+
+def test_looks_like_codex_reconnect():
+    from puffo_agent.agent.adapters.codex_session import _looks_like_codex_reconnect
+    assert _looks_like_codex_reconnect("codex turn failed: Reconnecting... 2/5")
+    assert _looks_like_codex_reconnect("reconnecting to backend")
+    assert not _looks_like_codex_reconnect("model overloaded")
+    assert not _looks_like_codex_reconnect("agent thread limit reached")
+    assert not _looks_like_codex_reconnect("")
+
+
+RECONNECT_THEN_RECOVER_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+# Turn 1 fails mid-reconnect.
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+w({"jsonrpc": "2.0", "method": "turn/failed",
+   "params": {"error": {"message": "Reconnecting... 2/5"}}})
+
+# Turn 2 (the retry) succeeds on the same thread.
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+   "params": {"threadId": "c1", "turnId": "u2", "itemId": "m", "delta": "recovered"}})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_reconnect_then_retry_recovers_on_same_session(tmp_path):
+    # Mirrors the worker retry path: run_retry_turn re-enters run_turn on the
+    # same session after the AgentAPIError.
+    from puffo_agent.agent.core import AgentAPIError
+
+    fake = _write_fake(tmp_path, RECONNECT_THEN_RECOVER_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            with pytest.raises(AgentAPIError):
+                await cs.run_turn("hi", "sys")
+            return await cs.run_turn("hi again", "sys")
+        finally:
+            await cs.aclose()
+
+    result = asyncio.run(_run())
+    assert result.reply == "recovered"
+    assert cs._consecutive_thread_failures == 0
+
+
+TIMEOUT_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "t1"}}})
+
+# ACK every request (turn/start, turn/interrupt) but never complete a turn.
+while True:
+    msg = r()
+    if msg is None:
+        break
+    if msg.get("id") is not None:
+        w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+'''
+
+
+def test_timeout_reply_reset_claim_matches_rotation(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    fake = _write_fake(tmp_path, TIMEOUT_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        task_timeout_seconds=1.0,
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            r1 = await cs.run_turn("hi", "sys")
+            r2 = await cs.run_turn("still there?", "sys")
+            return r1, r2
+        finally:
+            await cs.aclose()
+
+    r1, r2 = asyncio.run(_run())
+    # First timeout: below the wedged threshold — no rotation, no reset claim.
+    assert "1-second timeout" in r1.reply
+    assert r1.metadata["codex_turn_timeout"] is True
+    assert r1.metadata["codex_thread_rotated"] is False
+    assert "reset" not in r1.reply
+    # Second consecutive timeout rotates; the reply may now claim the reset.
+    assert r2.metadata["codex_thread_rotated"] is True
+    assert "reset for the next turn" in r2.reply
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # reload() updates current_instructions without restarting the process
 # ─────────────────────────────────────────────────────────────────────────────
@@ -992,3 +1153,19 @@ def test_codex_legacy_session_file_treated_as_full_access(tmp_path):
         agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
     )
     assert reset._conversation_id == ""  # now differs → reset
+
+
+def test_account_ratelimits_frame_pushes_to_reporter(tmp_path, monkeypatch):
+    from puffo_agent.portal.control import reporter as reporter_mod
+
+    rep = reporter_mod.AgentStatusReporter()
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: rep)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=["x"],
+        cwd=str(tmp_path),
+    )
+    raw = {"primary": {"usedPercent": 8, "windowDurationMins": 300, "resetsAt": 9}}
+    asyncio.run(cs._handle_notification("account/rateLimits/updated", {"rateLimits": raw}))
+    assert rep.latest_codex_rate_limits() == raw

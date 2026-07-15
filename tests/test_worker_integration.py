@@ -97,7 +97,8 @@ def test_agent_config_default_puffo_core():
 def test_puffo_core_tool_names():
     assert "send_message" in PUFFO_CORE_TOOL_NAMES
     assert "whoami" in PUFFO_CORE_TOOL_NAMES
-    assert "reload_system_prompt" in PUFFO_CORE_TOOL_NAMES
+    assert "refresh" in PUFFO_CORE_TOOL_NAMES
+    assert "reload_system_prompt" not in PUFFO_CORE_TOOL_NAMES
     assert "approve_permission" not in PUFFO_CORE_TOOL_NAMES
     assert len(PUFFO_CORE_TOOL_FQNS) == len(PUFFO_CORE_TOOL_NAMES)
     assert all(t.startswith("mcp__puffo__") for t in PUFFO_CORE_TOOL_FQNS)
@@ -223,8 +224,8 @@ async def test_puffo_core_server_builds():
     assert "whoami" in tool_names
     assert "send_message" in tool_names
     assert "get_channel_history" in tool_names
-    assert "reload_system_prompt" in tool_names
     assert "refresh" in tool_names
+    assert "reload_system_prompt" not in tool_names
     assert "install_skill" in tool_names
     assert "list_skills" in tool_names
     assert "install_mcp_server" in tool_names

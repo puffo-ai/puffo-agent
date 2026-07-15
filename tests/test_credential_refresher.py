@@ -120,7 +120,7 @@ def test_tick_no_refresh_when_fresh_and_no_agent_trigger(tmp_path, monkeypatch):
     def fake_link(host_home, agent_home):
         sync_calls.append((host_home, agent_home))
 
-    monkeypatch.setattr(credential_refresh, "link_host_credentials", fake_link)
+    monkeypatch.setattr(credential_refresh, "sync_host_claude_code_auth_view", fake_link)
 
     asyncio.run(r._tick())
     assert spawned == []
@@ -201,9 +201,9 @@ def test_tick_fans_view_sync_to_registered_agents(tmp_path, monkeypatch):
 
     def fake_link(host_home, agent_home):
         synced.append(Path(agent_home))
-        return "symlink"
+        return "view"
 
-    monkeypatch.setattr(credential_refresh, "link_host_credentials", fake_link)
+    monkeypatch.setattr(credential_refresh, "sync_host_claude_code_auth_view", fake_link)
     asyncio.run(r._tick())
     assert set(synced) == {a, b}
 
@@ -347,20 +347,27 @@ def test_propagate_outcome_failed_increments_counter(tmp_path, monkeypatch):
     assert r._consecutive_non_success == 1
 
 
-def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch):
+def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.state import RuntimeState
+    import logging
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health != "refresh_broken"
     assert REFRESH_BROKEN_THRESHOLD == 2
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "refresh_broken"
+    assert "Claude Code sign-in couldn't be refreshed" in rs.error
     assert "claude auth login" in rs.error
-    assert "unchanged" in rs.error
+    # Outcome-class debug stays in the daemon log, not in runtime.error.
+    assert any(
+        "flipping refresh_broken" in rec.getMessage() and "unchanged" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
@@ -569,16 +576,22 @@ def test_refreshed_outcome_does_not_lift_unrelated_health_to_ok(
     assert rs_after.error == ""
 
 
-def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch):
+def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.state import RuntimeState
+    import logging
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.UNCHANGED)
-    r._propagate_outcome(RefreshOutcome.FAILED)
+    with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
+        r._propagate_outcome(RefreshOutcome.FAILED)
     rs = RuntimeState.load(aid)
     assert rs.health == "refresh_broken"
-    # The flip message reports the LATEST outcome class — UNCHANGED
-    # then FAILED → "failed", not "unchanged".
-    assert "failed" in rs.error
+    assert "Claude Code sign-in couldn't be refreshed" in rs.error
+    assert "claude auth login" in rs.error
+    # Latest-outcome class is logged, not written into runtime.error.
+    assert any(
+        "flipping refresh_broken" in rec.getMessage() and "failed" in rec.getMessage()
+        for rec in caplog.records
+    )
 
 
 # ── PUF-265 v2: Haiku probe model + rate-limit fast retry ────────────

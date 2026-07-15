@@ -8,24 +8,34 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 import aiohttp
 
+from ...crypto.http_session import create_remote_http_session
 from ..state import (
     AgentConfig,
     agent_yml_path,
     archive_flag_path,
+    archived_dir,
     discover_agents,
+    refresh_agent_flag_path,
+    refresh_host_sync_flag_path,
+    refresh_model_flag_path,
+    refresh_session_flag_path,
     restart_flag_path,
 )
 from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
+from .usage_snapshot import collect_usage_snapshot
 
 log = logging.getLogger("puffo_agent.control")
 
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
+# Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
+USAGE_INTERVAL_SECONDS = 6 * 60 * 60.0
 RESCAN_SECONDS = 5.0
 HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
@@ -33,9 +43,103 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
+def _is_already_archived(agent_slug: str) -> bool:
+    # Matches any archived/<slug>-* suffix (-ws-/-del-/bare-stamp).
+    root = archived_dir()
+    if not root.exists():
+        return False
+    prefix = f"{agent_slug}-"
+    return any(
+        child.is_dir() and child.name.startswith(prefix)
+        for child in root.iterdir()
+    )
+
+
 def _touch_flag(path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
+
+
+def _write_flag_payload(path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _apply_refresh(agent_slug: str, params: dict) -> dict:
+    """Control-ws mirror of the MCP ``refresh()`` tool; ``kind`` is
+    rejected here (CLI + tray UI only)."""
+    import time as _time
+
+    if "kind" in params:
+        return {
+            "ok": False,
+            "error": (
+                "refresh over control-ws cannot change runtime kind; "
+                "use puffo-agent CLI or the tray UI."
+            ),
+        }
+    harness = params.get("harness")
+    model = params.get("model")
+    host_sync = bool(params.get("host_sync", False))
+    session = bool(params.get("session", False))
+    if (harness is None) != (model is None):
+        return {
+            "ok": False,
+            "error": "harness and model must be provided together (or both omitted)",
+        }
+
+    try:
+        cfg = AgentConfig.load(agent_slug)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    runtime_kind = cfg.runtime.kind
+    if runtime_kind not in ("cli-local", "cli-docker"):
+        return {
+            "ok": False,
+            "error": (
+                f"refresh requires cli-local or cli-docker; agent is "
+                f"kind={runtime_kind!r}"
+            ),
+        }
+    if (
+        host_sync
+        and runtime_kind == "cli-docker"
+        and not session
+        and harness is None
+    ):
+        return {
+            "ok": False,
+            "error": (
+                "refresh(host_sync=True) on cli-docker requires "
+                "session=True or a harness+model swap"
+            ),
+        }
+
+    workspace = cfg.resolve_workspace_dir()
+    now = int(_time.time())
+    touched: list[str] = []
+    if harness is not None:
+        _write_flag_payload(
+            refresh_model_flag_path(workspace),
+            {"harness": str(harness), "model": str(model), "requested_at": now},
+        )
+        touched.append("refresh_model")
+    else:
+        _write_flag_payload(
+            refresh_agent_flag_path(workspace), {"requested_at": now},
+        )
+        touched.append("refresh_agent")
+        if host_sync:
+            _write_flag_payload(
+                refresh_host_sync_flag_path(workspace), {"requested_at": now},
+            )
+            touched.append("refresh_host_sync")
+        if session:
+            _write_flag_payload(
+                refresh_session_flag_path(workspace), {"requested_at": now},
+            )
+            touched.append("refresh_session")
+    return {"ok": True, "touched": touched}
 
 
 async def _materialize_slug_binding(
@@ -94,6 +198,24 @@ async def _create_agent_command(
     return {"ok": True, "agent_slug": result["agent_id"]}
 
 
+async def post_usage_snapshot(machine, base: str) -> bool:
+    """Collect the machine's usage-budget snapshot and POST it to the server.
+    Returns True iff there was a snapshot to send. Shared by the periodic loop
+    and the on-demand ``refresh_usage`` command."""
+    snapshot = await collect_usage_snapshot(Path.home())
+    if not snapshot:
+        return False
+    path = f"/v2/machines/{machine.machine_id}/usage"
+    body = json.dumps({"snapshot": snapshot}).encode()
+    headers = machine_auth.signed_headers(machine, "POST", path, body)
+    headers["content-type"] = "application/json"
+    async with create_remote_http_session(base) as session:
+        resp = await session.post(f"{base}{path}", data=body, headers=headers)
+        if resp.status >= 300:
+            log.debug("control: usage report HTTP %s", resp.status)
+    return True
+
+
 async def execute_command(
     op: str,
     agent_slug: str | None,
@@ -101,6 +223,7 @@ async def execute_command(
     *,
     server_url: str | None = None,
     paired_root_pubkey: str | None = None,
+    command_id: str | None = None,
 ) -> dict:
     """Apply a decrypted command to local agent state, the same way the local
     bridge handlers do (flip ``agent.yml`` state, drop sentinel flags) so the
@@ -109,6 +232,13 @@ async def execute_command(
     pairing context)."""
     if op in ("pause", "resume", "edit", "archive", "refresh", "set_auto_accept_dm"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
+            # Re-archive of an already-archived agent is idempotent OK.
+            if op == "archive" and agent_slug and _is_already_archived(agent_slug):
+                return {
+                    "ok": True,
+                    "note": "already archived",
+                    "agent_slug": agent_slug,
+                }
             return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
 
     if op == "pause":
@@ -125,8 +255,7 @@ async def execute_command(
         _touch_flag(archive_flag_path(agent_slug))
         return {"ok": True}
     if op == "refresh":
-        _touch_flag(restart_flag_path(agent_slug))
-        return {"ok": True}
+        return _apply_refresh(agent_slug, params)
     if op == "edit":
         cfg = AgentConfig.load(agent_slug)
         patch: dict = {}
@@ -170,6 +299,10 @@ async def execute_command(
                 params["profile"], encoding="utf-8"
             )
             prompt_changed = True
+        if isinstance(params.get("role"), str):
+            from ..api.handlers import _update_profile_role
+
+            _update_profile_role(cfg, params["role"])
         if patch:
             try:
                 from ..api.handlers import _sync_agent_profile
@@ -177,14 +310,13 @@ async def execute_command(
                 await _sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
-        # restart.flag for runtime (spawn-args change); reload.flag
-        # for prompt-only (lazy, preserves the AI session).
-        if cfg.state == "running":
-            if runtime_changed:
-                _touch_flag(restart_flag_path(agent_slug))
-            elif prompt_changed:
-                from ..profile_sync import write_reload_flag
-                write_reload_flag(cfg, reason="control-ws edit")
+        # Prompt-only edits drop refresh_agent.flag; runtime edits
+        # ride the daemon's config-changed respawn.
+        if cfg.state == "running" and prompt_changed and not runtime_changed:
+            _write_flag_payload(
+                refresh_agent_flag_path(cfg.resolve_workspace_dir()),
+                {"requested_at": int(__import__("time").time())},
+            )
         return {"ok": True}
     if op == "set_auto_accept_dm":
         value = params.get("auto_accept_dm")
@@ -200,8 +332,25 @@ async def execute_command(
             from ..profile_sync import write_reload_flag
             write_reload_flag(cfg, reason="control-ws set_auto_accept_dm")
         return {"ok": True, "auto_accept_dm": value}
+    if op == "refresh_usage":
+        # Machine-level (no agent_slug) — re-probe /usage and POST now instead
+        # of waiting for the periodic tick.
+        if not server_url:
+            return {"ok": False, "error": "refresh_usage: no server_url"}
+        posted = await post_usage_snapshot(
+            load_or_create_machine(), server_url.rstrip("/")
+        )
+        return {"ok": True, "posted": posted}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
+    if op == "agent_create_approved":
+        # The operator approved a machine-initiated ws-local create. command_id ==
+        # request_id ties this command to the stashed identity; finalize + pack.
+        from .agent_create import finalize_from_command
+
+        request_id = command_id or str(params.get("request_id") or "")
+        result = await finalize_from_command(request_id, params)
+        return {"ok": True, **result}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
@@ -287,7 +436,7 @@ class MachineControlClient:
         if not pairings:
             return
         base = next(iter(pairings.values())).server_url.rstrip("/")
-        async with aiohttp.ClientSession() as session:
+        async with create_remote_http_session(base) as session:
             async with session.ws_connect(_ws_url(base), heartbeat=None) as ws:
                 await self._send(ws, machine_auth.ws_connect_frame(self.machine))
                 # Initial capability snapshot on connect.
@@ -376,17 +525,27 @@ class MachineControlClient:
                 decrypted["params"],
                 server_url=pairing.server_url,
                 paired_root_pubkey=pairing.operator_root_pubkey,
+                command_id=command_id,
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
+            # Publish the result so `wait-until-command --id <command_id>` returns.
+            if command_id and isinstance(result, dict):
+                from .agent_create import get_registry
+
+                get_registry().record_result(command_id, result)
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
+            if command_id:
+                from .agent_create import get_registry
+
+                get_registry().record_result(command_id, {"ok": False, "error": str(exc)})
 
         if command_id:
             try:
@@ -411,6 +570,7 @@ class ControlManager:
         machine = None
         ws_task: asyncio.Task | None = None
         me_task: asyncio.Task | None = None
+        usage_task: asyncio.Task | None = None
         try:
             while not self._stop.is_set():
                 pairings = load_pairings()
@@ -420,13 +580,15 @@ class ControlManager:
                     client = MachineControlClient(machine)
                     ws_task = asyncio.create_task(client.run(self._stop))
                     me_task = asyncio.create_task(self._me_loop(machine))
+                    usage_task = asyncio.create_task(self._usage_loop(machine))
                 if not pairings and ws_task is not None:
                     ws_task.cancel()
                     me_task.cancel()
-                    ws_task = me_task = None
+                    usage_task.cancel()
+                    ws_task = me_task = usage_task = None
                 await _sleep_or_stop(self._stop, RESCAN_SECONDS)
         finally:
-            for t in (ws_task, me_task):
+            for t in (ws_task, me_task, usage_task):
                 if t is not None:
                     t.cancel()
 
@@ -439,11 +601,24 @@ class ControlManager:
                     body = json.dumps({"agents": len(discover_agents())}).encode()
                     headers = machine_auth.signed_headers(machine, "POST", "/v2/machines/me", body)
                     headers["content-type"] = "application/json"
-                    async with aiohttp.ClientSession() as session:
+                    async with create_remote_http_session(base) as session:
                         await session.post(f"{base}/v2/machines/me", data=body, headers=headers)
             except Exception as exc:  # noqa: BLE001 — best-effort liveness
                 log.debug("control: /me report failed: %s", exc)
             await _sleep_or_stop(self._stop, ME_INTERVAL_SECONDS)
+
+    async def _usage_loop(self, machine) -> None:
+        """Probe each runtime's /usage budget and POST the machine's snapshot.
+        Replace-latest server-side, so a dropped tick just resends next time."""
+        while not self._stop.is_set():
+            try:
+                pairings = load_pairings()
+                if pairings:
+                    base = next(iter(pairings.values())).server_url.rstrip("/")
+                    await post_usage_snapshot(machine, base)
+            except Exception as exc:  # noqa: BLE001 — best-effort; retry next tick
+                log.debug("control: usage report failed: %s", exc)
+            await _sleep_or_stop(self._stop, USAGE_INTERVAL_SECONDS)
 
     def stop(self) -> None:
         self._stop.set()

@@ -22,6 +22,7 @@ handled by the separate ``revoke_pending`` helper.
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import logging
 import shutil
@@ -571,3 +572,199 @@ def cleanup_staging_dir() -> None:
     root = agents_dir() / ".import-staging"
     if root.exists():
         shutil.rmtree(root, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Self-revoke for archive / delete
+# ─────────────────────────────────────────────────────────────────────
+
+
+async def self_revoke_device(
+    *,
+    server_url: str,
+    slug: str,
+    device_id: str,
+    device_signing_key: Ed25519KeyPair,
+    root_signing_key: Ed25519KeyPair,
+    preregistered_subkey: tuple[Ed25519KeyPair, dict] | None = None,
+) -> None:
+    # POST signed by a subkey of THIS device — valid at request-time
+    # even though the revoke is about to apply.
+    revocation = create_device_revocation(root_signing_key, device_id)
+    async with _remote_http_session(server_url) as session:
+        if preregistered_subkey is not None:
+            subkey, cert = preregistered_subkey
+        else:
+            subkey, cert = await _register_subkey_via_device(
+                session,
+                server_url=server_url,
+                slug=slug,
+                device_id=device_id,
+                device_signing_key=device_signing_key,
+            )
+        await _signed_post(
+            session,
+            server_url=server_url,
+            path=f"/devices/{device_id}/revoke",
+            signer_key=subkey,
+            signer_id=cert["subkey_id"],
+            slug=slug,
+            body_dict=revocation,
+        )
+
+
+async def revoke_archived_device(archived_dir: Path, *, slug: str) -> None:
+    keystore = KeyStore(archived_dir / "keys")
+    identity = keystore.load_identity(slug)
+    root_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.root_secret_key)
+    )
+    device_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.device_signing_secret_key)
+    )
+    # Reuse a fresh session subkey if one's already on disk to skip a
+    # redundant /devices/subkeys POST.
+    preregistered: tuple[Ed25519KeyPair, dict] | None = None
+    try:
+        from ..crypto.certs import needs_rotation
+        sess = keystore.load_session(slug)
+        if not needs_rotation(sess.expires_at):
+            preregistered = (
+                Ed25519KeyPair.from_secret_bytes(
+                    decode_secret(sess.subkey_secret_key)
+                ),
+                {"subkey_id": sess.subkey_id},
+            )
+    except FileNotFoundError:
+        pass
+    await self_revoke_device(
+        server_url=identity.server_url,
+        slug=identity.slug,
+        device_id=identity.device_id,
+        device_signing_key=device_signing,
+        root_signing_key=root_signing,
+        preregistered_subkey=preregistered,
+    )
+
+
+def archived_pending_revoke_path(archived_agent_dir: Path) -> Path:
+    return archived_agent_dir / ".puffo-agent" / "pending_revoke.json"
+
+
+def write_archived_pending_revoke(
+    archived_agent_dir: Path,
+    *,
+    server_url: str,
+    slug: str,
+    device_id: str,
+    last_error: str,
+) -> None:
+    path = archived_pending_revoke_path(archived_agent_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "kind": "archive_self_revoke",
+                "server_url": server_url,
+                "slug": slug,
+                "device_id": device_id,
+                "last_error": last_error,
+                "attempted_at": int(time.time() * 1000),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+class _RetryOutcome(enum.Enum):
+    SUCCEEDED = "succeeded"          # revoke posted; marker removed
+    TRANSIENT = "transient"          # server/network blip; retry next sweep
+    UNRETRYABLE = "unretryable"      # bad schema / missing keys; renamed to .broken
+
+
+async def _retry_archived_pending_revoke(
+    archived_path: Path,
+) -> _RetryOutcome:
+    marker = archived_pending_revoke_path(archived_path)
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        server_url = payload["server_url"]
+        slug = payload["slug"]
+        device_id = payload["device_id"]
+    except (OSError, ValueError, KeyError) as exc:
+        logger.warning(
+            "pending revoke at %s is unparseable (%s); renaming to .broken",
+            marker, exc,
+        )
+        _mark_pending_revoke_broken(marker, str(exc))
+        return _RetryOutcome.UNRETRYABLE
+    keystore = KeyStore(archived_path / "keys")
+    try:
+        identity = keystore.load_identity(slug)
+    except FileNotFoundError as exc:
+        logger.warning(
+            "pending revoke at %s: keystore missing (%s); renaming to .broken",
+            marker, exc,
+        )
+        _mark_pending_revoke_broken(marker, f"keystore missing: {exc}")
+        return _RetryOutcome.UNRETRYABLE
+    root_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.root_secret_key)
+    )
+    device_signing = Ed25519KeyPair.from_secret_bytes(
+        decode_secret(identity.device_signing_secret_key)
+    )
+    try:
+        await self_revoke_device(
+            server_url=server_url,
+            slug=slug,
+            device_id=device_id,
+            device_signing_key=device_signing,
+            root_signing_key=root_signing,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "pending revoke retry for %s failed: %s; will try again",
+            archived_path.name, exc,
+        )
+        return _RetryOutcome.TRANSIENT
+    try:
+        marker.unlink()
+    except OSError:
+        pass
+    logger.info("pending revoke retry for %s ok", archived_path.name)
+    return _RetryOutcome.SUCCEEDED
+
+
+def _mark_pending_revoke_broken(marker: Path, reason: str) -> None:
+    # Rename so the next sweep doesn't keep warning; left on disk for
+    # operator inspection.
+    broken = marker.with_suffix(marker.suffix + ".broken")
+    try:
+        marker.replace(broken)
+    except OSError as exc:
+        logger.warning(
+            "could not rename %s to .broken: %s; leaving in place "
+            "(will warn again next sweep)",
+            marker, exc,
+        )
+
+
+async def sweep_archived_pending_revokes() -> int:
+    # Returns count of markers actually retried successfully.
+    from .state import archived_dir
+
+    root = archived_dir()
+    if not root.exists():
+        return 0
+    retried = 0
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        if not archived_pending_revoke_path(entry).exists():
+            continue
+        outcome = await _retry_archived_pending_revoke(entry)
+        if outcome is _RetryOutcome.SUCCEEDED:
+            retried += 1
+    return retried

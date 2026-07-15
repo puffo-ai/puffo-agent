@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 # *same* env without colliding. CLI binary stays `puffo-agent`; home
 # dir stays `~/.puffo-agent/`.
 name = "puffo-agent"
-version = "1.0.5"
+version = "1.1.2"
 description = "Run AI bots on Puffo.ai — local daemon that supervises many bot accounts and handles their LLM loops."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -37,6 +37,8 @@ dependencies = [
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
     "anthropic>=0.25",
+    # Relay TLS trust bundle for hosts with an empty OpenSSL cert store.
+    "certifi>=2024.2.2",
     "cryptography>=43.0",
     "mcp>=1.0",
     # Pillow: dimension-check + downscale inbound image attachments so
@@ -48,6 +50,9 @@ dependencies = [
     "pyside6>=6.7",
     "python-socks>=2.4",
     "pyyaml>=6.0",
+    # IANA tz DB for zoneinfo (Windows has no system tz db) — parsing
+    # claude's /usage reset times to epoch needs the named zone.
+    "tzdata>=2024.1",
     "websockets>=12.0",
 ]
 

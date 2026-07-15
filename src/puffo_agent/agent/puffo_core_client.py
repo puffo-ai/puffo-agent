@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
+from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
@@ -64,6 +65,13 @@ PRIORITY_SYSTEM = 5
 # Operators wanting "right now" can fire the MCP get_user_profile
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
+
+# Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
+DEFAULT_MAX_INPUT_BYTES = 180 * 1000
+
+# Deliberately over-counts the ``_format_user_block`` metadata header so a
+# near-boundary split lands one turn early, never over the cap.
+_BLOCK_METADATA_OVERHEAD_BYTES = 2048
 
 
 @dataclass
@@ -214,15 +222,15 @@ def _parse_operator_pubkey(identity_cert_json: Optional[str]) -> Optional[bytes]
     return op_pk
 
 
-def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
-    """Map (direct, sender_is_bot) to one of the PRIORITY_* bands.
+def _compute_priority(direct: bool, sender_is_agent: bool) -> int:
+    """Map (direct, sender_is_agent) to one of the PRIORITY_* bands.
     PRIORITY_SYSTEM is reserved for a future service-message envelope.
     """
-    if direct and not sender_is_bot:
+    if direct and not sender_is_agent:
         return PRIORITY_MENTIONED_HUMAN
-    if direct and sender_is_bot:
+    if direct and sender_is_agent:
         return PRIORITY_MENTIONED_BOT
-    if not sender_is_bot:
+    if not sender_is_agent:
         return PRIORITY_HUMAN
     return PRIORITY_BOT
 
@@ -292,7 +300,8 @@ def _maybe_redact_long_text(
         f"  preview: {raw_preview}\n"
         "Retrieve the full body one chunk at a time with "
         "mcp__puffo__get_post_segment("
-        f"envelope_id=\"{envelope_id}\", segment=N) where N runs "
+        f"envelope_id=\"{envelope_id}\", segment=N, "
+        f"segment_size={segment_chars}) where N runs "
         f"0..{seg_count - 1}. Fetch only the segments you actually "
         "need — the placeholder above already tells you what kind "
         "of content it is."
@@ -453,10 +462,11 @@ class PuffoCoreMessageClient:
         auto_accept_space_invitations: bool = False,
         auto_accept_dm: bool = True,
         workspace: str = "",
-        max_inline_chars: int = 4000,
-        segment_chars: int = 2000,
+        max_inline_chars: int = MAX_INLINE_MESSAGE_CHARS,
+        segment_chars: int = MESSAGE_SEGMENT_CHARS,
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
+        max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -480,6 +490,7 @@ class PuffoCoreMessageClient:
         # 200k-context model with a verbose system prompt.
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
+        self._max_input_bytes = max(1, int(max_input_bytes))
         self._image_edge_px = int(image_edge_px) or _DEFAULT_IMAGE_EDGE_PX
         self.keystore = keystore
         self.http = http_client
@@ -507,6 +518,11 @@ class PuffoCoreMessageClient:
         # under the same TTL — transient lookup failures self-heal at
         # the next tick instead of pinning a permanent "" miss.
         self._profile_cache: dict[str, tuple[str, str, float]] = {}
+        # slug → (owner_slug, fetched_at_monotonic). Populated by the
+        # same ``/identities/profiles`` call as ``_profile_cache``; empty
+        # for humans, the operator for agents. Same TTL so re-ownership
+        # propagates without a daemon restart.
+        self._owner_slug_cache: dict[str, tuple[str, float]] = {}
         # Invitation event_ids the worker has already processed.
         # Lifetime-scoped — the operator-DM branch isn't idempotent
         # against server-side state, so resetting on reconnect would
@@ -822,12 +838,12 @@ class PuffoCoreMessageClient:
             mentions: list[dict] = []
             for slug in parsed:
                 if slug == self_slug_lower:
-                    mentions.append({"username": self.slug, "is_bot": True, "is_self": True})
+                    mentions.append({"username": self.slug, "is_agent": True, "is_self": True})
                     continue
                 if space_members and slug not in space_members:
                     continue
-                is_bot = space_members.get(slug) == "agent"
-                mentions.append({"username": slug, "is_bot": is_bot, "is_self": False})
+                is_agent = space_members.get(slug) == "agent"
+                mentions.append({"username": slug, "is_agent": is_agent, "is_self": False})
 
             # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
             # (the documented "addressed to you" signal).
@@ -850,10 +866,6 @@ class PuffoCoreMessageClient:
                 )
             else:
                 channel_name = channel_id
-
-            direct = is_dm or is_mention
-            sender_is_bot = False  # puffo-core has no is_bot flag yet
-            priority = _compute_priority(direct, sender_is_bot)
 
             # Thread-batched queue: every message coalesces under
             # its ``root_id`` (the envelope's ``thread_root_id``, or
@@ -890,6 +902,20 @@ class PuffoCoreMessageClient:
             sender_display_name = await self._fetch_display_name(
                 payload.sender_slug,
             )
+            # Cache-hit off ``_fetch_display_name`` above — no extra HTTP.
+            sender_owner_slug = await self._fetch_owner_slug(
+                payload.sender_slug,
+            )
+            is_from_operator = bool(
+                self.operator_slug
+                and payload.sender_slug == self.operator_slug
+            )
+
+            # ``owner_slug`` is agent-only — the is-agent signal the
+            # priority bands were designed around.
+            direct = is_dm or is_mention
+            sender_is_agent = bool(sender_owner_slug)
+            priority = _compute_priority(direct, sender_is_agent)
 
             # Long-message redaction. Operators paste big chunks of
             # code or transcripts that, combined with the agent's
@@ -916,12 +942,14 @@ class PuffoCoreMessageClient:
                 "space_name": space_name,
                 "sender_slug": payload.sender_slug,
                 "sender_display_name": sender_display_name,
+                "sender_owner_slug": sender_owner_slug,
+                "is_from_operator": is_from_operator,
                 "sender_email": "",
                 "text": llm_text,
                 "root_id": payload_thread_root_id or "",
                 "is_dm": is_dm,
                 "attachments": attachment_paths,
-                "sender_is_bot": sender_is_bot,
+                "sender_is_agent": sender_is_agent,
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
@@ -1266,6 +1294,30 @@ class PuffoCoreMessageClient:
                 root_id,
             )
 
+    def _message_block_bytes(self, msg: dict) -> int:
+        """Conservative byte estimate of one formatted block — over-counts
+        so greedy-fill never lets an over-cap block through."""
+        n = len((msg.get("text") or "").encode("utf-8"))
+        for att in (msg.get("attachments") or []):
+            n += len(str(att).encode("utf-8")) + 16
+        for mention in (msg.get("mentions") or []):
+            n += len(str(mention).encode("utf-8")) + 8
+        return n + _BLOCK_METADATA_OVERHEAD_BYTES
+
+    def _greedy_fit_prefix(self, messages: list[dict]) -> int:
+        """Largest K where ``messages[:K]`` fits ``_max_input_bytes``.
+        Always >= 1 — a lone over-budget message dispatches alone (the
+        adapter cap is the backstop) instead of stalling the thread."""
+        budget = self._max_input_bytes
+        total = 0
+        for i, msg in enumerate(messages):
+            size = self._message_block_bytes(msg)
+            sep = 2 if i > 0 else 0  # blocks join with a blank line "\n\n"
+            if i > 0 and total + sep + size > budget:
+                return i
+            total += sep + size
+        return len(messages)
+
     async def _consume_queue(
         self,
         on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
@@ -1306,26 +1358,16 @@ class PuffoCoreMessageClient:
             # arriving mid-dispatch can be rejected at admit time
             # (the durable cursor hasn't advanced yet, so it can't
             # catch it).
-            batch = entry.messages
+            all_msgs = entry.messages
             channel_meta = entry.channel_meta
-            entry.messages = []
-            entry.in_queue = False
-            entry.dispatching_ids = {
-                m.get("envelope_id") for m in batch if m.get("envelope_id")
-            }
 
-            # Safety net: paranoid in-batch dedup right before
-            # dispatch. ``_admit_thread_message``'s in-queue dedup
-            # plus ``dispatching_ids`` should already guarantee
-            # ``batch`` is duplicate-free, but if some upstream race
-            # we haven't characterised slips a duplicate envelope_id
-            # past both, we must NOT hand the same envelope to the
-            # agent twice in one turn. The warning log lets us spot
-            # the offending path if it ever fires.
+            # Paranoid in-batch dedup (before the split, so byte accounting
+            # sees the real set). Admit-time dedup should make this a no-op;
+            # the warning exposes any upstream race that slips one through.
             seen_ids: set[str] = set()
             deduped: list[dict] = []
             dropped: list[str] = []
-            for m in batch:
+            for m in all_msgs:
                 mid = m.get("envelope_id", "")
                 if mid and mid in seen_ids:
                     dropped.append(mid)
@@ -1339,7 +1381,35 @@ class PuffoCoreMessageClient:
                     "for thread %s before dispatch: %s",
                     len(dropped), root_id, dropped,
                 )
-                batch = deduped
+
+            # Greedy-fill: dispatch the FIFO prefix that fits the byte
+            # budget; the remainder stays queued.
+            split = self._greedy_fit_prefix(deduped)
+            batch = deduped[:split]
+            deferred = deduped[split:]
+            entry.dispatching_ids = {
+                m.get("envelope_id") for m in batch if m.get("envelope_id")
+            }
+            if deferred:
+                # Slot stays OPEN so a mid-dispatch arrival appends after the
+                # deferred tail instead of overwriting via the reopen branch;
+                # the cursor covers only ``batch``, so deferred survive restart.
+                entry.messages = deferred
+                entry.in_queue = True
+                self._queue_seq += 1
+                entry.current_seq = self._queue_seq
+                await self._queue.put(
+                    (entry.current_priority, entry.current_seq, root_id)
+                )
+                self._log.info(
+                    "greedy-fill: thread %s dispatching %d/%d msgs, "
+                    "deferring %d to next turn (budget=%d bytes)",
+                    root_id, len(batch), len(deduped), len(deferred),
+                    self._max_input_bytes,
+                )
+            else:
+                entry.messages = []
+                entry.in_queue = False
 
             # Pre-dispatch jitter. When several agents on the same
             # host get activated by the same message (e.g. a channel
@@ -2126,6 +2196,20 @@ class PuffoCoreMessageClient:
         name, _ = await self._fetch_user_profile(slug)
         return name
 
+    async def _fetch_owner_slug(self, slug: str) -> str:
+        """Sender's operator slug (agents only; ``""`` for humans /
+        revoked attestation). Inbound path resolves the display_name
+        just before this so the TTL'd cache is warm — no extra HTTP."""
+        if not slug:
+            return ""
+        now = time.monotonic()
+        cached = self._owner_slug_cache.get(slug)
+        if cached is not None and now - cached[1] < _PROFILE_CACHE_TTL_SECONDS:
+            return cached[0]
+        await self._fetch_user_profile(slug, force_refresh=True)
+        fresh = self._owner_slug_cache.get(slug)
+        return fresh[0] if fresh else ""
+
     def set_profile(self, slug: str, display_name: str, avatar_url: str) -> None:
         """Inject fresh values into the profile cache, bypassing TTL.
         Used by the MCP ``get_user_info`` tool to share its just-
@@ -2157,6 +2241,7 @@ class PuffoCoreMessageClient:
                 return (cached[0], cached[1])
         name = ""
         avatar_url = ""
+        owner_slug = ""
         try:
             data = await self.http.get(
                 f"/identities/profiles?slugs={slug}",
@@ -2165,6 +2250,8 @@ class PuffoCoreMessageClient:
                 if entry.get("slug") == slug:
                     name = (entry.get("display_name") or "").strip()
                     avatar_url = (entry.get("avatar_url") or "").strip()
+                    # Non-empty only for agents (their operator).
+                    owner_slug = (entry.get("owner_slug") or "").strip()
                     break
         except Exception as exc:
             self._log.debug(
@@ -2172,6 +2259,7 @@ class PuffoCoreMessageClient:
                 slug, exc,
             )
         self._profile_cache[slug] = (name, avatar_url, now)
+        self._owner_slug_cache[slug] = (owner_slug, now)
         disk_cache.persist_profile(slug, name, avatar_url)
         if avatar_url:
             asyncio.create_task(self._fetch_and_cache_avatar(avatar_url))
@@ -2651,7 +2739,7 @@ class PuffoCoreMessageClient:
             "root_id": "",
             "is_dm": False,
             "attachments": [],
-            "sender_is_bot": False,
+            "sender_is_agent": False,
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
@@ -2991,7 +3079,7 @@ class PuffoCoreMessageClient:
             "root_id": "",
             "is_dm": False,
             "attachments": [],
-            "sender_is_bot": False,
+            "sender_is_agent": False,
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
@@ -3426,7 +3514,7 @@ class PuffoCoreMessageClient:
         self._last_dm_sender = sender_slug
         await self._admit_thread_message(
             root_id=envelope_id,
-            priority=_compute_priority(direct=True, sender_is_bot=False),
+            priority=_compute_priority(direct=True, sender_is_agent=False),
             msg_dict=msg_dict,
             channel_meta=channel_meta,
         )
@@ -3956,14 +4044,21 @@ class PuffoCoreMessageClient:
             envelope_kind, recipient_slug or channel_id, len(devices),
         )
 
+        # Fallback shares the visibility_level="default" floor; the
+        # note is dropped (no MCP return channel).
+        from ._visibility import resolve_visibility
+        channel_ref = (
+            f"@{recipient_slug}" if envelope_kind == "dm" else (channel_id or "")
+        )
+        effective_visible, _ = await resolve_visibility(
+            "default", channel_ref, text, root_id or "", self.http,
+        )
+
         inp = EncryptInput(
             envelope_kind=envelope_kind,
             sender_slug=self.slug,
             sender_subkey_id=sess.subkey_id,
-            # Fallback path (agent skipped send_message + [SILENT]) —
-            # folded by default; the primer steers agents to
-            # send_message, where they set visibility consciously.
-            is_visible_to_human=False,
+            is_visible_to_human=effective_visible,
             space_id=send_space_id,
             channel_id=send_channel_id,
             recipient_slug=recipient_slug,

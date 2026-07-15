@@ -27,6 +27,16 @@ class AgentStatusReporter:
         self._sender: Sender | None = None
         self._machine = None
         self._cache: dict[str, tuple[float, list[agent_message.Recipient]]] = {}
+        # Latest ``account/rateLimits/updated`` payload a live codex session saw;
+        # the usage snapshot falls back to it when the active probe can't run.
+        self._codex_rate_limits: dict | None = None
+
+    def record_codex_rate_limits(self, raw: dict | None) -> None:
+        if isinstance(raw, dict):
+            self._codex_rate_limits = raw
+
+    def latest_codex_rate_limits(self) -> dict | None:
+        return self._codex_rate_limits
 
     def set_sender(self, sender: Sender | None) -> None:
         """Called by the control client: a sender while the WS is up, None on drop."""
@@ -62,6 +72,23 @@ class AgentStatusReporter:
                 )
         except Exception as exc:  # noqa: BLE001 — best-effort; never break a turn.
             log.debug("reporter: emit failed: %s", exc)
+
+    async def send_to_operator(self, operator_slug: str, payload: dict) -> None:
+        """Send an arbitrary machine_message payload to a specific linked
+        operator. Unlike ``emit`` this raises on failure — callers (e.g. the
+        ws-local create flow) need to surface a non-delivery."""
+        if self._sender is None:
+            raise RuntimeError("control WS not connected")
+        pairing = load_pairings().get(operator_slug)
+        if pairing is None:
+            raise RuntimeError(f"operator {operator_slug!r} is not linked")
+        recipients = await self._recipients(operator_slug, pairing)
+        if not recipients:
+            raise RuntimeError(f"operator {operator_slug!r} has no active devices")
+        envelope = agent_message.build_machine_message_envelope(
+            self._machine_identity(), recipients, payload
+        )
+        await self._sender(operator_slug, envelope)
 
     def _machine_identity(self):
         if self._machine is None:

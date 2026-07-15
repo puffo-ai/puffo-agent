@@ -4,10 +4,462 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.0.5] — 2026-06-29
+## [1.1.2] — 2026-07-14
 
 ### Added
 
+- **Report each machine's CLI usage-budget to puffo-server (PUF-364).**
+  The daemon probes every installed runtime's plan budget — claude-code
+  via `claude -p /usage`, codex via a throwaway app-server driven through
+  one trivial turn (codex only emits its budget after a turn) — normalizes
+  both to `{session, weekly}` with `used_pct` and a unix-epoch `resets_at`,
+  and POSTs the whole per-machine snapshot (latest replaces on the server).
+  Runs every 6h, or immediately on the machine-level `refresh_usage`
+  control command the UI sends. Adds `tzdata` as a dependency so Windows
+  can resolve the named timezone in claude's reset times.
+
+- **Per-agent codex turn timeout: `runtime.task_timeout_seconds` in
+  `agent.yml` (PUF-375).** Default stays 600s; raise it for agents
+  running long reasoning or complex tasks. A timed-out turn now posts
+  an operator-facing "⏱ Task exceeded the N-minute timeout" reply
+  instead of silence (and says whether the codex session was reset).
+
+### Fixed
+
+- **Stop the CLI's model-usage-cap fallback from leaking to operators
+  (PUF-380).** A `You've reached your <Model> limit. Run /usage-credits …`
+  line from the harness now matches the worker's non-auth leak filter.
+  The pattern is model-agnostic and apostrophe-robust, so future models and
+  curly-quote variants are covered without another one-off.
+
+- **codex mid-reconnect turn failures no longer drop the batch or flip
+  a false red (PUF-375).** A `turn failed: Reconnecting... N/M` from
+  the codex App Server is transient — it now routes into the existing
+  retry substrate (re-enqueue + backoff) instead of being swallowed as
+  an unhandled error, and it no longer counts toward the wedged-thread
+  rotation threshold.
+
+- **codex is now discovered inside ChatGPT.app on macOS (PUF-372
+  follow-up).** A ChatGPT desktop-app update moved the bundled codex
+  binary out of Codex.app, leaving agents unable to spawn. The resolver
+  now checks `ChatGPT.app/Contents/Resources/codex` (system and
+  per-user `Applications`, preferred over a leftover Codex.app copy),
+  which also re-points the `~/.local/bin/codex` fs-sandbox shim at the
+  new location. The "codex binary not found" error now names the bundle
+  paths tried and the restart-after-app-update remedy.
+
+## [1.1.1] — 2026-07-10
+
+### Fixed
+
+- **codex `view_image` (and other self-invoking codex tools) work on
+  macOS hosts where codex isn't at `~/.local/bin/codex` (PUF-372).**
+  codex's fs-sandbox helper re-invokes the CLI via that hardcoded path,
+  which doesn't exist on Homebrew / Codex.app installs — the tool died
+  with `execvp() ... No such file or directory`. The daemon now points
+  `~/.local/bin/codex` at the resolved binary before spawning (a real
+  file or live symlink there is never touched; a dangling link from a
+  moved install is re-pointed) and additionally prepends the binary's
+  dir to the subprocess `PATH` for name-based re-invokes.
+
+- **cli-docker no longer injects host-local MCP configs that can't run in
+  the container (PUF-34).** Host-sync now recognizes macOS host-only
+  paths (`/opt/homebrew`, `/opt/local`, `/Volumes`, `/private`) and also
+  catches host paths hidden in `args` behind a bare `npx`/`uvx` launcher.
+  Detected servers are skipped with an actionable warning ("install in
+  the image or bind-mount, then re-sync") instead of being injected as
+  dead config that failed on first use; `/tmp` args stay container-valid
+  (a `/tmp` output path is fine, a `/tmp` binary is still host-staged),
+  and the container's own `/opt/puffoagent-pkg` keeps resolving.
+
+- **Profile edits now take effect on refresh — a changed prompt forces a
+  fresh CLI session (PUF-36).** The CLI bakes the system prompt at
+  session creation, so `--resume` replayed the old one and profile edits
+  appeared silently ignored. The refresh path now compares the rebuilt
+  prompt's primer + profile slice against the current one and drops the
+  session only when that slice actually changed: memory-only rebuilds,
+  no-op refreshes (host-sync, skill installs), display_name/role-chip
+  edits, restarts, and model swaps all keep the conversation; an
+  explicit `refresh(session=True)` still always drops it.
+
+- **Role edits reach the agent's prompt.** Editing role from the web
+  updated `agent.yml` and the server identity but never the
+  `**Role:**` line in `profile.md`, so the in-prompt role stayed stale
+  on both edit paths (local bridge + control-WS). Both now rewrite the
+  first `**Role:**` line; custom profiles without one are untouched.
+
+- **Over-limit message bursts no longer drop the whole batch (PUF-363).**
+  When a thread's queued messages would, concatenated into the single
+  per-turn input block, exceed the harness input-byte budget (Claude
+  Code's 180KB pre-send cap), the consumer now dispatches the largest
+  FIFO prefix that fits and defers the remainder to following turns —
+  split only at message boundaries, nothing dropped, nothing reordered.
+  Previously the adapter rejected the whole over-limit batch with a
+  "reduce or split" reply and every message in it went unprocessed.
+  Codex gets a 4MB safety-net ceiling (it has no adapter input cap).
+
+- **Relay TLS now trusts certifi's CA bundle, so linking works on hosts
+  without a populated OpenSSL cert store.** Linking against
+  `https://chat.puffo.ai` died with `SSL: CERTIFICATE_VERIFY_FAILED —
+  unable to get local issuer certificate` on interpreters whose ambient
+  cert store isn't set up (python.org's macOS Python before running
+  "Install Certificates.command", some uv-managed builds); local testing
+  never caught it because it ran against plain `http://localhost:3000`.
+  `create_remote_http_session` now builds a module-level SSL context
+  that trusts the system store PLUS certifi's bundle (so corporate-proxy
+  roots keep working) and applies it to both the SOCKS `ProxyConnector`
+  and the default `TCPConnector`, and
+  every relay-facing HTTPS/WSS call site (link code mint / redeem /
+  approval poll / unlink, the control-WS reverse channel + `/me` liveness,
+  active-recipient fetch, slug-binding finalize) now routes through that
+  factory instead of a bare `aiohttp.ClientSession()`. `certifi` is now a
+  declared dependency.
+
+### Changed
+
+- **Long-message redaction thresholds raised to 16000/8000 chars**
+  (inline cap / `get_post_segment` page size, from 4000/2000). Per-turn
+  totals are now bounded by greedy-fill batching, so the inline cap only
+  guards session-lifetime context growth — typical code/log pastes
+  inline whole instead of collapsing to a preview placeholder. Both
+  limits now live in one shared `puffo_agent.limits` module, and the
+  redaction placeholder cites `segment_size` explicitly so paging stays
+  aligned on hosts that override the daemon page size.
+
+- **Runbook for Codex Apps connector scope failures.** The `use-host-mcp`
+  skill body now explains that Codex Apps connectors (`mcp__codex_apps__*`
+  — Drive, Gmail, …) are codex-internal, not puffo-managed MCP, so
+  `list_mcp_servers` can't see them and `sync_host_mcp` can't fix them.
+  When writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, the fix is to
+  reconnect the connector in interactive codex (approving write scopes),
+  then `refresh(host_sync=True)` on the agent (`session=True` too on
+  cli-docker) and allow one worker turn. Docs only — no code path change.
+
+### Removed
+
+- **`SETUP_FOR_AI.md`.** The standalone AI-assistant onboarding guide was
+  last meaningfully updated at 0.9.4, had drifted from the current setup
+  flow, was referenced by nothing, and was never packaged. The living
+  onboarding pointer is the hosted `https://chat.puffo.ai/setup.md` plus
+  the in-agent skills.
+
+## [1.1.0] — 2026-07-08
+
+### Added
+
+- **Sender-identity metadata on inbound messages.** Two new fields land
+  in the structured user-block agents see: `sender_owner_slug` names
+  the operator behind an agent sender (present only for agents, sourced
+  from the attestation chain via `/identities/profiles`), and
+  `is_from_operator: true` marks a message from THIS agent's own
+  operator. Both emit conditionally so older agents don't see keys
+  their primer doesn't document. Zero extra HTTP round-trips: the
+  daemon reads `owner_slug` off the same `/identities/profiles` fetch
+  that resolves the sender's display name, caches it under the profile
+  TTL so re-ownership propagates without a daemon restart. Primer
+  documents both. `sender_type` now reads `agent` (was always
+  `human` — the upstream is-bot flag is unset pending a server-side
+  signal, but `owner_slug`'s presence is already a reliable agent
+  marker); the display value is renamed `bot` → `agent` to match the
+  `(agent)` mention suffix.
+
+### Changed
+
+- **Priority bands now receive the real is-agent signal.** The
+  message-queue priority computation had `sender_is_bot` hardcoded
+  `False` (puffo-core exposes no is-bot flag), so every sender landed
+  in the human bands and the agent bands were dead code. `owner_slug`
+  (agent-only, already fetched per sender) now drives the banding:
+  human traffic outranks agent traffic, mentions outrank both floors.
+  Behavior change in agent-dense fleets — an agent's DM/mention ranks
+  below a human's, and agent channel chatter yields to human channel
+  messages when both are queued. The flag is also renamed
+  `sender_is_bot` → `sender_is_agent` throughout, including the
+  message-dict key that rides ws-local bundles (the old key only ever
+  carried a hardcoded `false`, so no consumer could have relied on
+  its value). Mention entries follow suit: `is_bot` → `is_agent`
+  (same bundle surface; the rendered `(agent)` / `(human)` suffixes
+  are unchanged).
+
+- **Dead `followup_messages_since` removed from the primer + code.**
+  No code path has emitted the field since thread batching replaced
+  single-message dispatch, but the primer still documented it —
+  agents went looking for it and misreported batched messages as
+  message loss. The primer now documents the real shape (one turn
+  may carry several metadata blocks) and points agents at
+  `get_thread_history` / `get_channel_history` when mid-turn
+  freshness matters.
+
+### Fixed
+
+- **Multi-message batches reached CLI agents with only the last
+  message.** The thread-batched queue correctly coalesced same-root
+  messages that arrived while an agent was mid-turn, but the shell
+  appended each batch message as its own user log entry — and CLI
+  adapters transmit only the latest entry per turn (the resume-based
+  session already holds prior history), so every batched message
+  except the last was silently dropped before reaching the
+  subprocess, in DMs and channels alike. The whole batch now lands as
+  one user entry (per-message metadata blocks, blank-line separated),
+  fixing all CLI-family runtimes at the shell layer.
+
+## [1.0.8] — 2026-07-08
+
+### Added
+
+- **`puffo-agent machine link --code ABCD-1234`.** Claim a link code
+  the operator generated in the puffo web app (My Agents → Link
+  machine → *Generate code*) instead of minting one on this machine
+  and asking a browser to approve it. The machine registers itself
+  (idempotent) and POSTs `/v2/machines/links/<code>/redeem`; the
+  operator's client then issues the control cert, which the existing
+  approval poll picks up. Codes are case-insensitive and dashes are
+  optional — `abcd-2345`, `ABCD2345`, and `AB-CD-23-45` all normalize
+  to the same code. Without `--code` the mint-and-open-browser flow
+  is unchanged; the daemon still auto-starts. Requires puffo-server's
+  `/redeem` endpoint (paired server PR).
+
+### Fixed
+
+- **Pre-turn stdout drain — no more cron chatter leaking into replies.**
+  Claude Code emits `assistant` events during its internal cron ticks
+  while a turn isn't in flight; those events sat in the subprocess
+  stdout stream until the next turn started and got folded into that
+  turn's reply — visible to the operator as messages like *"News
+  check complete. 3 new items…"* prepended to whatever the agent was
+  actually asked. `ClaudeSession._one_turn` now drains buffered
+  stdout events immediately before writing the turn frame; drained
+  events are audit-logged as `turn.pre_drain` so future cron-behavior
+  patterns are observable without a repro. Per-readline 0.1s timeout
+  (bounds the empty-buffer check) plus a 1.0s wall-time cap keep a
+  chatty pre-turn producer from stalling the turn.
+
+## [1.0.7] — 2026-07-06
+
+### Fixed
+
+- **Refresh-token-free credential views.** Agents no longer hold
+  the rotating single-use refresh token — the daemon writes a
+  sanitized view of `~/.claude/.credentials.json` and
+  `~/.codex/auth.json` into each agent's virtual `$HOME` (view
+  has the access token, refresh token stripped for Claude / blanked
+  to `""` for Codex). Before this, N concurrent claude/codex
+  processes could all try to refresh the same rotating refresh
+  token — the loser presented an already-consumed token and the
+  provider (Anthropic + OpenAI) revoked the entire token family,
+  requiring an operator re-login. With views, only the daemon's
+  `CredentialRefresher` (single-writer, under its `asyncio.Lock`)
+  holds the refresh token, so the race is structurally impossible.
+  Legacy per-agent symlinks are migrated in place on first sync;
+  the host file is never touched. Content-compare on sync doubles
+  as self-healing if an agent-side CLI mangles its view.
+- **Pre-delivery credential-refresh gate is now cross-platform.**
+  Before handing a message batch to a `cli-local` / `cli-docker`
+  claude agent, the worker blocks on the daemon's
+  `CredentialRefresher.ensure_fresh()` through the same single-writer
+  mutex the daemon uses internally. The gate was previously behind
+  `is_macos()`; Anthropic's rotating single-use refresh-token
+  semantics don't care about the OS, so dropping the guard extends
+  the same safety net to Linux and Windows.
+- **Rotating-refresh-token silent-fail visibility.** When Anthropic
+  rotates the refresh token but Claude Code's write of the new one
+  silently drops (both disk and Keychain retain the pre-rotation
+  token, revoked server-side), `claude --print` returns 401
+  `authentication_failed`. `CredentialRefresher._refresh_now` now
+  inspects the probe's stdout/stderr for that marker and, when
+  matched, flips `auth_failed` + DMs the operator with re-login
+  instructions instead of silently retrying every 120s.
+- **macOS: `KeychainBackend` falls through to the disk credentials
+  file when the Keychain entry is missing.** Claude Code 2.x under
+  a launchd session-context can silently fail Keychain writes while
+  still writing `~/.claude/.credentials.json` successfully. The
+  Keychain backend's `expires_in_seconds`, `refresh`, `bootstrap`,
+  `sync_to_agent`, and `poll_external_rotation` now use the disk
+  file as a fallback.
+- **Machine reports the live claude-code model list on foreground
+  `puffo-agent start`.** Previously the model catalog's Anthropic
+  `/v1/models` fetch was only triggered from
+  `AgentDetail.__init__`, so a headless start never warmed the
+  cache and `build_capabilities()` fell back to the static list.
+  `start --background` accidentally worked only because the
+  operator would eventually open the tray UI. Fix: call
+  `model_catalog.prefetch()` from `Daemon.run()` at startup.
+- **Distinct error when an agent passes a bare user slug where a
+  channel id belongs.** `send_message`,
+  `send_message_with_attachments`, `list_channel_members`,
+  `leave_channel`, and `get_channel_history` now return
+  `"'<slug>' is not a channel id — prepend '@' to DM them:
+  send_message(channel='@<slug>', ...); to read a DM use
+  get_dm_history(peer='<slug>'). To find a channel id, call
+  list_channels_in_all_spaces."` instead of the generic membership
+  cache-miss error. A genuine `ch_`-prefixed cache miss keeps the
+  original wording. Injected once in `_resolve_channel_space` so
+  all channel-taking tools share it.
+
+### Changed
+
+- **`ensure_fresh()` fans canonical credentials out to every
+  registered agent before returning True.** Closes the split-brain
+  window where the daemon's view is fresh but an agent's per-agent
+  view is stale.
+- **Agent primer + skill bodies audited for correctness.** Envelope
+  ids documented as `msg_<uuid>` (six references corrected).
+  Attachment paths documented as absolute
+  `<workspace>/.puffo/inbox/<envelope_id>/<filename>`. Metadata
+  example now shows separate `sender` (display name) +
+  `sender_slug` (structural id), the `(agent)` mention suffix,
+  and `followup_messages_since:`. The DM reply rule
+  (`channel="@<sender_slug>"`) moved into "How to reply" next to
+  the `channel_id` guidance. `list_channel_members` and
+  `get_user_info` skill bodies no longer claim `puffo-core has no
+  is_bot flag` — trust metadata `sender_type:` and
+  `(human)` / `(agent)` mention suffixes.
+- **Shared primer tightened.** `DEFAULT_SHARED_CLAUDE_MD` compressed
+  from 267 to 220 lines (~440 tokens saved per turn). No
+  load-bearing information dropped.
+
+### Added
+
+- **Verbose per-source credential-read logs.** `KeychainBackend`
+  logs which source served each read (`source=cache` /
+  `source=keychain` / `source=disk`) at DEBUG level, plus WARN when
+  it falls through disk after a Keychain miss.
+
+## [1.0.6] — 2026-07-01
+
+### Added
+
+- **Three `suggest-*` default skills so agents nudge humans instead
+  of provisioning.** `suggest-agent`, `suggest-channel`, and
+  `suggest-invite` teach every agent to post a puffo-web-app
+  actionable card (from PUF-332) when the conversation surfaces the
+  need for a new agent, channel, or channel member. Bodies live in
+  `agent/shared_content.py::DEFAULT_SKILLS`, so they seed into every
+  cli-local / cli-docker agent's `.claude/skills/` on the next
+  worker startup.
+
+- **Unified `refresh()` MCP tool with four orthogonal axes,
+  replacing `reload_system_prompt` and the old
+  `refresh(model=None)`.** `refresh(harness=None, model=None,
+  host_sync=False, session=False)` backed by five flag files at
+  `<workspace>/.puffo-agent/`: `refresh_agent`, `refresh_host_sync`,
+  `refresh_session`, `refresh_model`, `refresh_runtime`. The worker
+  batches the first three into a single `adapter.reload(prompt,
+  with_session=…)`; the daemon consumes the last two, validates the
+  payload against the installed harness + model catalog, mutates
+  `agent.yml`, and lets the config-changed check drive the respawn.
+  Invalid payloads rename to `.broken`. `refresh_runtime` (kind
+  swap) is CLI + tray-UI only — MCP + control-ws reject `kind`
+  defensively.
+
+- **`puffo-agent agent refresh <id> [--host-sync] [--session]
+  [--model=H:M] [--kind=K]`.** CLI mirror of the MCP tool plus the
+  CLI-only `--kind` axis.
+
+### Changed
+
+- **Auth-expired operator DM reads as instruction, not debug.** Both
+  `format_oauth_expired` (Claude Code) and `format_codex_oauth_expired`
+  now open with a plain-English "my sign-in has expired" header, pin
+  the surface with "On the computer where puffo-agent is running:",
+  and walk the operator through a 4-step ladder (open terminal → run
+  the CLI command → follow browser prompt → come back and message me).
+  Step 4 explicitly anchors on "Once you're signed in, come back here
+  and send me a message" so the operator isn't left wondering "any
+  message like what?". Bilingual (en + zh) preserved.
+
+- **`runtime.error` auth-recovery strings match the DM shape.** Five
+  sites in `credential_refresh.py` + `worker.py` used to render
+  engineer-log voice ("daemon CredentialRefresher saw N consecutive
+  X outcome(s)…", "suppressed from channel post — Check daemon
+  logs") through the `puffo-agent status` CLI + the web pane's
+  health card. All now use the same "Claude Code sign-in expired /
+  couldn't be refreshed. On the computer running puffo-agent, open
+  a terminal and run `claude auth login`, then send this agent a
+  message." shape as the DM. Consecutive-outcome counter moved to
+  a sibling `logger.warning` so the debug detail stays in the
+  daemon log. Rate-limit branch retains the "usually self-recovers,
+  check the daemon log" copy — never suggests `claude auth login`.
+
+- **`ensure_shared_primer` now syncs from code on every worker
+  startup instead of seed-if-missing.** The old idempotent guard
+  protected an operator-edit path nobody used, and silently pinned
+  every install to whatever primer it was first seeded with —
+  visible as agents referencing MCP tools that had been renamed or
+  removed. Managed shared-primer files (`CLAUDE.md`, `README.md`,
+  `skills/<id>/SKILL.md`) now overwrite when content differs, and
+  managed skill dirs whose id disappeared from `DEFAULT_SKILLS` are
+  pruned. Operator-authored skill dirs (no `.puffo-managed` marker)
+  are untouched. `reseed_shared_primer` folded into
+  `ensure_shared_primer`; `puffo-agent agent reset-primer` still
+  exists for forcing a rebuild without waiting for a message.
+
+- **Web-UI + tray-UI Restart routes drop `refresh_agent.flag`
+  instead of `restart.flag`.** The operator-facing "Restart" button
+  wants a CLAUDE.md rebuild + adapter reload, not the daemon-
+  internal teardown-and-recreate. `restart.flag` is now reserved
+  for the credential-refresh success callback. Adapter.reload
+  grows a `with_session=True` kwarg; each adapter unlinks its own
+  session sentinel (`cli_session.json` / `codex_session.json`) so
+  the worker doesn't have to know per-harness paths.
+
+- **Control-WS `op=edit` runtime block no longer drops
+  `restart.flag`.** The daemon's `_worker_needs_restart` check
+  already respawns the worker whenever agent.yml runtime changes;
+  the extra flag was redundant. Prompt-only edits still drop
+  `refresh_agent.flag`.
+
+- **`send_message` and `send_message_with_attachments` collapse
+  `is_visible_to_human: bool` + `agent_only: bool` into a single
+  tri-value `visibility_level` param (default `"default"`).**
+  `"human"` sends visible; `"agent_only"` sends hidden and skips
+  the safety net; `"default"` sends hidden BUT the daemon force-
+  flips to visible for DMs, root-level posts, and messages whose
+  text @-mentions a human — with a note explaining why + nudging
+  the agent toward the explicit level next turn. `"agent_only"`
+  still gets a warning note when the message looks human-targeted
+  (DM / @-mentions human) so the agent can reconsider without
+  being overridden. The same floor runs on the worker's fallback
+  path (agent produced text but skipped the tool), keyed off
+  `visibility_level="default"` semantics. Wire payload unchanged
+  — the envelope still carries `is_visible_to_human: bool`, so
+  interop with older clients and the server schema is preserved.
+
+### Removed
+
+- `reload_system_prompt` MCP tool (replaced by `refresh()`); old
+  `reload.flag` and `refresh.flag` file paths (replaced by
+  `refresh_agent.flag` and `refresh_model.flag` respectively);
+  `write_reload_flag` helper (renamed `write_refresh_agent_flag`);
+  `reseed_shared_primer` (folded into `ensure_shared_primer`).
+
+### Security
+
+- **Archive and delete revoke the agent's device server-side.**
+  Previously the device cert stayed valid forever, so restoring an
+  archived dir resurrected the agent. The archive / delete paths
+  (HTTP API, control WS, CLI) now POST `/devices/<id>/revoke` after
+  moving the dir to `archived/<id>-*-<stamp>/`. Revoke is best-
+  effort: transient failure leaves a `pending_revoke.json` marker
+  that the daemon's startup sweep retries; delete falls back to
+  archive on revoke failure so the keys for retry survive. Recovery
+  needs re-signing a new device cert against the enrollment
+  endpoint with the on-disk root + device_signing keys.
+
+## [1.0.5] — 2026-06-30
+
+### Added
+
+- **Self-service ws-local agent creation.** A new
+  `puffo-agent agent create-ws-local --operator=<slug> --passcode=<code>`
+  lets an attached AI tool request its own ws-local agent: the daemon
+  mints the identity and certs, the linked operator approves in their
+  app — setting the agent's name, avatar, role, soul, and home space —
+  and the daemon finalizes registration and packs the `.puffoagent`
+  bundle. No manual UI export or file copying. The call is non-blocking
+  (it returns a `request_id`; poll completion with
+  `puffo-agent machine wait-until-command --id <request_id>`). Requires
+  the daemon running with `--with-local-bridge`.
 - **Activity log for ws-local agents.** Agents driven by an attached
   tool (the ws-local runtime) now report their turns and tool calls
   to the operator's activity log — the message being worked on, each

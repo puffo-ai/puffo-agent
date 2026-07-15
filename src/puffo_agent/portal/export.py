@@ -208,12 +208,15 @@ SANITIZE_PATHS = (
     "runtime.json",
     "cli_session.json",
     "messages.db",
-    ".puffo-agent/reload.flag",
-    ".puffo-agent/refresh.flag",
     ".puffo-agent/restart.flag",
     ".puffo-agent/archive.flag",
     ".puffo-agent/delete.flag",
     ".puffo-agent/current_turn.json",
+    "workspace/.puffo-agent/refresh_agent.flag",
+    "workspace/.puffo-agent/refresh_host_sync.flag",
+    "workspace/.puffo-agent/refresh_session.flag",
+    "workspace/.puffo-agent/refresh_model.flag",
+    "workspace/.puffo-agent/refresh_runtime.flag",
     "workspace/.claude/.credentials.json",
 )
 

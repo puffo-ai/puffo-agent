@@ -641,14 +641,25 @@ class DockerCLIAdapter(Adapter):
             return
         await session.warm(system_prompt)
 
-    async def reload(self, new_system_prompt: str) -> None:
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
         """Close the in-container claude subprocess so the next turn
-        spawns one that re-reads CLAUDE.md. Container stays up.
-        No-op for hermes (each turn is already fresh).
-        """
+        re-reads CLAUDE.md; container stays up. No-op for hermes.
+        ``with_session=True`` also unlinks ``cli_session.json``."""
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if with_session:
+            try:
+                self.session_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: couldn't unlink session file %s: %s",
+                    self.agent_id, self.session_file, exc,
+                )
 
     async def aclose(self) -> None:
         if self._session is not None:
@@ -845,10 +856,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in unreachable:
                 logger.warning(
-                    "agent %s: host MCP %r command %r looks host-local and "
-                    "won't resolve inside the container. Install the "
-                    "binary in the image or bind-mount it explicitly, "
-                    "otherwise this MCP will fail on first use.",
+                    "agent %s: host MCP %r has host-local path %r that won't "
+                    "resolve inside the container — SKIPPED (not injected). "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
             # Plugins: the actual plugin tree is bind-mounted read-
@@ -902,10 +913,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in gemini_unreachable:
                 logger.warning(
-                    "agent %s: host gemini MCP %r command %r looks "
-                    "host-local and won't resolve inside the container. "
-                    "Install the binary in the image or bind-mount it, "
-                    "otherwise the MCP will fail on first use.",
+                    "agent %s: host gemini MCP %r has host-local path %r "
+                    "that won't resolve inside the container — SKIPPED. "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
 

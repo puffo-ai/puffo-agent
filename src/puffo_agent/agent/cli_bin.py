@@ -196,7 +196,11 @@ def _write_path_cache(name: str, path: str) -> None:
 
 def _codex_bundle_paths() -> list[Path]:
     if sys.platform == "darwin":
+        # ChatGPT.app first — newer builds bundle codex there (moved out
+        # of Codex.app), so a leftover Codex.app copy is the stale one.
         return _expand(
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "~/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "~/Applications/Codex.app/Contents/Resources/codex",
         )

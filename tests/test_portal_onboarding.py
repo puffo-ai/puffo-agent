@@ -122,8 +122,8 @@ async def test_migrate_survives_one_agent_failing(monkeypatch):
 
 # ── F3: link auto-starts the daemon ─────────────────────────────────
 
-def _link_ns():
-    return argparse.Namespace(name=None, server_url="https://x", not_open=True)
+def _link_ns(code=None):
+    return argparse.Namespace(name=None, server_url="https://x", not_open=True, code=code)
 
 
 def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
@@ -135,7 +135,7 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
     monkeypatch.setattr(cli, "is_daemon_alive", lambda: False)
     monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
 
-    async def _fake_run_link(url, name, open_browser=True):
+    async def _fake_run_link(url, name, open_browser=True, code=None):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
@@ -152,7 +152,7 @@ def test_cmd_link_skips_autostart_when_daemon_running(monkeypatch):
     monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
 
-    async def _fake_run_link(url, name, open_browser=True):
+    async def _fake_run_link(url, name, open_browser=True, code=None):
         return 0
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
@@ -266,3 +266,36 @@ def test_friendly_device_name_falls_back_to_hostname(monkeypatch):
     monkeypatch.setattr(link, "_windows_device_name", lambda: None)
     monkeypatch.setattr(link.socket, "gethostname", lambda: "fallback-host")
     assert link.friendly_device_name() == "fallback-host"
+
+# ── F4: user-minted link codes (machine link --code) ────────────────
+
+def test_cmd_link_passes_code_through(monkeypatch):
+    from puffo_agent.portal import cli
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    seen = {}
+
+    async def _fake_run_link(url, name, open_browser=True, code=None):
+        seen["code"] = code
+        return 0
+
+    monkeypatch.setattr(link, "run_link", _fake_run_link)
+    assert cli.cmd_link(_link_ns(code="abcd-2345")) == 0
+    assert seen["code"] == "abcd-2345"
+
+
+def test_cmd_link_defaults_code_to_none(monkeypatch):
+    from puffo_agent.portal import cli
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    seen = {}
+
+    async def _fake_run_link(url, name, open_browser=True, code=None):
+        seen["code"] = code
+        return 0
+
+    monkeypatch.setattr(link, "run_link", _fake_run_link)
+    assert cli.cmd_link(_link_ns()) == 0
+    assert seen["code"] is None

@@ -107,6 +107,33 @@ def test_lets_through_authentication_topic_prose():
     assert _suppress_worker_error_leak(reply) == reply
 
 
+# ── PUF-380 / FB-65 reopen: model-usage-cap fallback ────────────────
+
+
+def test_suppresses_model_usage_cap_fallback():
+    """The CLI's model-quota fallback the fleet cascade leaked (2026-07-13)."""
+    leak = (
+        "You've reached your Fable 5 limit. Run /usage-credits to continue "
+        "or switch models with /model."
+    )
+    assert _suppress_worker_error_leak(leak) is None
+    # Model-agnostic — the next model's variant is caught too, not whack-a-mole.
+    assert _suppress_worker_error_leak(
+        "You've reached your Opus 4.8 limit. Run /usage-credits to continue."
+    ) is None
+    # Curly-apostrophe variant (CLIs vary).
+    assert _suppress_worker_error_leak(
+        "You’ve reached your Fable 5 limit."
+    ) is None
+
+
+def test_lets_through_reached_your_prose_without_limit():
+    """Starts with 'You've reached your' but no '... limit' fallback shape —
+    the pattern requires the limit token, so this legit prose passes through."""
+    reply = "You've reached your goal for today — 5 tasks done. Nice work!"
+    assert _suppress_worker_error_leak(reply) == reply
+
+
 def test_lets_through_empty_reply():
     """``if reply:`` at the call site already short-circuits empty
     replies; the filter shouldn't change that semantics."""
@@ -163,12 +190,9 @@ def test_handle_suppressed_reply_returns_true_on_leak_fallback_scope(tmp_path, m
     )
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
-    # Operator-facing surface: runtime.error populated, NOT a channel
-    # post. The "Check daemon logs" copy is the fallback-scope variant.
-    assert "suppressed from channel post" in runtime.error
-    assert "Check daemon logs" in runtime.error
-    # Auth-class leak is definitive evidence regardless of scope —
-    # flips health so puffo-agent status surfaces it.
+    # Fallback-scope variant points at the daemon log for triage.
+    assert "Check the puffo-agent daemon log" in runtime.error
+    # Auth-class leak flips health regardless of scope.
     assert runtime.health == "auth_failed"
     reloaded = RuntimeState.load("agent-suppress-fallback")
     assert reloaded is not None
@@ -186,9 +210,10 @@ def test_handle_suppressed_reply_returns_true_on_leak_api_retry_scope(tmp_path, 
     )
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
-    # API-retry / auth-class branch: re-login + send-a-message copy.
+    assert "Claude Code sign-in expired" in runtime.error
     assert "claude auth login" in runtime.error
-    assert "send the agent a message" in runtime.error
+    assert "running puffo-agent" in runtime.error
+    assert "send this agent a message" in runtime.error
     assert runtime.health == "auth_failed"
 
 
@@ -207,8 +232,9 @@ def test_handle_suppressed_reply_api_retry_rate_limit_branches_message(tmp_path,
     assert suppressed is True
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= backoff <= _SUPPRESSION_BACKOFF_MAX_SECONDS
     assert runtime.health == "unknown"  # NOT auth_failed
-    assert "rate-limit" in runtime.error
+    assert "Rate-limit" in runtime.error
     assert "self-recovers" in runtime.error
+    # Rate-limit branch must NEVER instruct the operator to relogin.
     assert "claude auth login" not in runtime.error
     assert "agent resume" not in runtime.error
 
@@ -465,9 +491,8 @@ def test_call_site_skips_send_on_suppressed_leak(tmp_path, monkeypatch):
         sleeps=sleeps,
     ))
     assert client.calls == []  # NEVER called when filter suppresses
-    # Operator-side surface populated.
     assert runtime.health == "auth_failed"
-    assert "send the agent a message" in runtime.error
+    assert "send this agent a message" in runtime.error
     # And the call site DID sleep with a backoff in range.
     assert len(sleeps) == 1
     assert _SUPPRESSION_BACKOFF_MIN_SECONDS <= sleeps[0] <= _SUPPRESSION_BACKOFF_MAX_SECONDS

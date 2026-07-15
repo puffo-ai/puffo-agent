@@ -27,13 +27,42 @@ from .host_tools import (
     _install_skill,
     _list_mcp_servers,
     _list_skills,
+    _touch_refresh_flag,
     _uninstall_mcp_server,
     _uninstall_skill,
-    _write_refresh_flag,
+    _write_refresh_model_flag,
 )
 from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
 
 logger = logging.getLogger(__name__)
+
+
+_REFRESH_HARNESSES: tuple[str, ...] = ("claude-code", "codex")
+
+
+def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
+    if harness not in _REFRESH_HARNESSES:
+        raise RuntimeError(
+            f"harness={harness!r} not supported by refresh; "
+            f"choose one of: {list(_REFRESH_HARNESSES)}"
+        )
+    from ..agent.cli_bin import resolve_claude_bin, resolve_codex_bin
+    resolver = {
+        "claude-code": resolve_claude_bin,
+        "codex": resolve_codex_bin,
+    }[harness]
+    if resolver() is None:
+        raise RuntimeError(
+            f"harness={harness!r} not installed on host — the CLI "
+            "binary is missing from PATH."
+        )
+    from ..agent.model_catalog import provider_models
+    supported = [m.id for m in provider_models(harness) if m.id]
+    if (model or "") not in supported:
+        raise RuntimeError(
+            f"model={model!r} not supported by harness={harness!r}; "
+            f"supported: {supported}"
+        )
 
 
 def _register_local_tools(
@@ -52,42 +81,56 @@ def _register_local_tools(
             )
 
     @mcp.tool()
-    async def reload_system_prompt() -> str:
-        """Rebuild your system prompt from disk and restart your
-        claude subprocess so edits take effect on your next message.
-        """
-        flag_path = Path(workspace) / ".puffo-agent" / "reload.flag"
-        try:
-            flag_path.parent.mkdir(parents=True, exist_ok=True)
-            flag_path.write_text(
-                f'{{"requested_at": {int(time.time())}}}\n',
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            raise RuntimeError(f"could not write reload flag: {exc}") from exc
-        return (
-            "reload requested — your system prompt will be rebuilt and "
-            "your claude subprocess restarted before your next message."
-        )
+    async def refresh(
+        harness: Optional[str] = None,
+        model: Optional[str] = None,
+        host_sync: bool = False,
+        session: bool = False,
+    ) -> str:
+        """Refresh your agent state. Four orthogonal axes:
 
-    @mcp.tool()
-    async def refresh(model: Optional[str] = None) -> str:
-        """Respawn your CLI subprocess (claude-code or codex) so it
-        re-discovers skills, MCP servers, and optionally switches to
-        a new model. Not available under hermes / gemini-cli — both
-        run one-shot per turn with no long-lived subprocess to
-        respawn."""
-        if harness and harness not in ("claude-code", "codex"):
+        * no args — rebuild CLAUDE.md + re-sync puffo default skills.
+        * ``host_sync=True`` — also re-sync operator's host skills + MCP.
+        * ``session=True`` — drop CLI session so next spawn is fresh.
+        * ``harness`` + ``model`` (both required together) — swap
+          harness/model, persist to agent.yml, full worker respawn.
+
+        Requires ``cli-local`` / ``cli-docker`` runtime. On cli-docker,
+        ``host_sync=True`` requires ``session=True`` (or harness+model).
+        """
+        if runtime_kind and runtime_kind not in ("cli-local", "cli-docker"):
             raise RuntimeError(
-                f"refresh is only supported under the claude-code "
-                f"and codex harnesses (this agent is using {harness!r})."
+                f"refresh requires cli-local or cli-docker; this agent "
+                f"is running under kind={runtime_kind!r}."
             )
-        _write_refresh_flag(Path(workspace), model)
-        tail = f" (model override: {model!r})" if model is not None else ""
-        return (
-            "refresh requested — your CLI subprocess will respawn "
-            "before your next message" + tail + "."
-        )
+        if (harness is None) != (model is None):
+            raise RuntimeError(
+                "harness and model must be provided together (or both "
+                "omitted)."
+            )
+        if harness is not None:
+            _validate_refresh_model(harness, model)
+        if host_sync and runtime_kind == "cli-docker" and not session and harness is None:
+            raise RuntimeError(
+                "refresh(host_sync=True) on cli-docker requires "
+                "session=True (the container has to restart to pick "
+                "up new host skills/MCP)."
+            )
+        ws = Path(workspace)
+        touched: list[str] = []
+        if harness is not None:
+            _write_refresh_model_flag(ws, harness=harness, model=model or "")
+            touched.append(f"refresh_model (harness={harness!r} model={model!r})")
+        else:
+            _touch_refresh_flag(ws, "refresh_agent")
+            touched.append("refresh_agent")
+            if host_sync:
+                _touch_refresh_flag(ws, "refresh_host_sync")
+                touched.append("refresh_host_sync")
+            if session:
+                _touch_refresh_flag(ws, "refresh_session")
+                touched.append("refresh_session")
+        return "refresh requested: " + ", ".join(touched)
 
     @mcp.tool()
     async def install_skill(name: str, content: str) -> str:

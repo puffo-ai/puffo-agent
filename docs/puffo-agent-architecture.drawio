@@ -1,0 +1,112 @@
+<mxfile host="app.diagrams.net" agent="Codex">
+  <diagram id="puffo-agent-architecture" name="puffo-agent architecture">
+    <mxGraphModel dx="3116" dy="901" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="980" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" parent="1" style="text;html=1;strokeColor=none;fillColor=none;fontSize=22;fontStyle=1;align=left;verticalAlign=middle;" value="puffo-agent architecture" vertex="1">
+          <mxGeometry height="40" width="420" x="40" y="20" as="geometry" />
+        </mxCell>
+        <mxCell id="operator" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F8CECC;strokeColor=#B85450;fontStyle=1;" value="Operator surfaces&#xa;CLI, desktop UI, local web client" vertex="1">
+          <mxGeometry height="90" width="220" x="40" y="100" as="geometry" />
+        </mxCell>
+        <mxCell id="bridge" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#DAE8FC;strokeColor=#6C8EBF;" value="Local bridge&#xa;portal/api/*&#xa;127.0.0.1:63387&#xa;pair, manage, files, logs, ws-local" vertex="1">
+          <mxGeometry height="120" width="250" x="440" y="280" as="geometry" />
+        </mxCell>
+        <mxCell id="cli" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#DAE8FC;strokeColor=#6C8EBF;" value="CLI entrypoint&#xa;puffo_agent.portal.cli:main&#xa;start, stop, status, machine, agent" vertex="1">
+          <mxGeometry height="100" width="250" x="30" y="290" as="geometry" />
+        </mxCell>
+        <mxCell id="daemon" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#D5E8D4;strokeColor=#82B366;fontStyle=1;" value="Daemon reconciler&#xa;portal/daemon.py&#xa;polls agent dirs and sentinel flags&#xa;owns worker lifecycle" vertex="1">
+          <mxGeometry height="130" width="260" x="20" y="500" as="geometry" />
+        </mxCell>
+        <mxCell id="state" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#FFF2CC;strokeColor=#D6B656;" value="On-disk state&#xa;portal/state.py&#xa;~/.puffo-agent&#xa;daemon.yml, agent.yml, flags, runtime.json, messages.db, keys" vertex="1">
+          <mxGeometry height="130" width="280" x="1020" y="490" as="geometry" />
+        </mxCell>
+        <mxCell id="worker" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#D5E8D4;strokeColor=#82B366;fontStyle=1;" value="Per-agent Worker&#xa;portal/worker.py&#xa;builds prompt, adapter, status, listen/send loop" vertex="1">
+          <mxGeometry height="120" width="260" x="10" y="720" as="geometry" />
+        </mxCell>
+        <mxCell id="agentcore" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#D5E8D4;strokeColor=#82B366;" value="Agent shell&#xa;agent/core.py&#xa;conversation log, memory, turn routing, fallback reply handling" vertex="1">
+          <mxGeometry height="115" width="260" x="10" y="920" as="geometry" />
+        </mxCell>
+        <mxCell id="adapters" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#E1D5E7;strokeColor=#9673A6;" value="Runtime adapters&#xa;agent/adapters/*&#xa;chat-local, sdk-local, cli-local, cli-docker, ws-local" vertex="1">
+          <mxGeometry height="115" width="260" x="320" y="1120" as="geometry" />
+        </mxCell>
+        <mxCell id="llm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F5F5F5;strokeColor=#666666;" value="LLM runtimes/providers&#xa;Claude SDK, Claude Code, Codex, Gemini, OpenAI/Anthropic/Google APIs, Docker" vertex="1">
+          <mxGeometry height="115" width="260" x="890" y="1120" as="geometry" />
+        </mxCell>
+        <mxCell id="crypto" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#FFE6CC;strokeColor=#D79B00;" value="Puffo protocol + crypto&#xa;crypto/*&#xa;signed HTTP, WS relay, HPKE/AEAD message envelopes, attachments, keystore" vertex="1">
+          <mxGeometry height="125" width="280" x="450" y="720" as="geometry" />
+        </mxCell>
+        <mxCell id="puffocore" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F5F5F5;strokeColor=#666666;fontStyle=1;" value="Puffo Core server&#xa;relay, certs, blobs, events, control WS" vertex="1">
+          <mxGeometry height="90" width="280" x="590" y="945" as="geometry" />
+        </mxCell>
+        <mxCell id="control" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F8CECC;strokeColor=#B85450;" value="Remote control plane&#xa;portal/control/*&#xa;machine link, pairings, encrypted command envelopes, ack/report" vertex="1">
+          <mxGeometry height="120" width="250" x="1035" y="930" as="geometry" />
+        </mxCell>
+        <mxCell id="remoteweb" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#f8cecc;strokeColor=#b85450;fontSize=17;" value="Remote Agent Portal&#xa;operator commands" vertex="1">
+          <mxGeometry height="130" width="270" x="970" y="110" as="geometry" />
+        </mxCell>
+        <mxCell id="localsvcs" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#DAE8FC;strokeColor=#6C8EBF;" value="Loopback services&#xa;data_service.py :63386&#xa;rpc_service.py :63385&#xa;ws_local/* via bridge" vertex="1">
+          <mxGeometry height="110" width="250" x="-350" y="920" as="geometry" />
+        </mxCell>
+        <mxCell id="mcp" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#E1D5E7;strokeColor=#9673A6;" value="MCP stdio server&#xa;mcp/puffo_core_server.py&#xa;Puffo messaging tools + host skill/MCP/refresh tools" vertex="1">
+          <mxGeometry height="110" width="220" x="340" y="1310" as="geometry" />
+        </mxCell>
+        <mxCell id="tests" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#FFFFFF;strokeColor=#999999;dashed=1;" value="Tests&#xa;pytest suite covers bridge, control, crypto, worker/runtime, MCP, WS-local, UI helpers" vertex="1">
+          <mxGeometry height="60" width="1230" x="200" y="1510" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="operator" style="endArrow=block;html=1;rounded=0;strokeColor=#6C8EBF;" target="bridge" value="HTTP/API calls">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="bridge" style="endArrow=block;html=1;rounded=0;strokeColor=#82B366;" target="state" value="commands write state">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="operator" style="endArrow=block;html=1;rounded=0;strokeColor=#6C8EBF;" target="cli" value="start/stop/status">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="cli" style="endArrow=block;html=1;rounded=0;strokeColor=#82B366;" target="daemon" value="mutates files / starts daemon">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="daemon" style="endArrow=block;html=1;rounded=0;strokeColor=#82B366;" target="state" value="polls desired state">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="daemon" style="endArrow=block;html=1;rounded=0;strokeColor=#82B366;" target="worker" value="spawn/stop/restart">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="worker" style="endArrow=block;html=1;rounded=0;strokeColor=#82B366;" target="agentcore" value="run turns">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="agentcore" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="adapters" value="TurnContext">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="adapters" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="llm" value="subprocess / SDK / API">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" edge="1" parent="1" source="worker" style="endArrow=block;html=1;rounded=0;strokeColor=#D79B00;" target="crypto" value="signed/encrypted traffic">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" edge="1" parent="1" source="crypto" style="endArrow=block;html=1;rounded=0;strokeColor=#D79B00;" target="puffocore" value="HTTP/WS/blobs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" edge="1" parent="1" source="remoteweb" style="endArrow=block;html=1;rounded=0;strokeColor=#B85450;" target="puffocore" value="machine commands">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e13" edge="1" parent="1" source="puffocore" style="endArrow=block;html=1;rounded=0;strokeColor=#B85450;" target="control" value="control WS">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e14" edge="1" parent="1" source="control" style="endArrow=block;html=1;rounded=0;strokeColor=#B85450;" target="state" value="writes agent.yml / flags">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e15" edge="1" parent="1" source="daemon" style="endArrow=block;html=1;rounded=0;strokeColor=#6C8EBF;" target="localsvcs" value="data/RPC/WS-local">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e16" edge="1" parent="1" source="mcp" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="localsvcs" value="tool data + host ops">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e17" edge="1" parent="1" source="adapters" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="mcp" value="MCP config injected">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

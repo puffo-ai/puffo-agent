@@ -34,6 +34,7 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from ..limits import MESSAGE_SEGMENT_CHARS
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
 
@@ -61,6 +62,17 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
     """
     space_id = await cfg.data_client.lookup_channel_space(channel_id)
     if not space_id:
+        # Non-``ch_`` miss is almost always a bare user slug — hint at
+        # the DM path instead of the membership-flavoured error below.
+        if not channel_id.startswith("ch_"):
+            raise RuntimeError(
+                f"'{channel_id}' is not a channel id (channel ids "
+                f"start with 'ch_'). If it's a user slug, prepend "
+                f"'@' to DM them: send_message(channel='@{channel_id}', "
+                f"...); to read a DM conversation use "
+                f"get_dm_history(peer='{channel_id}'). To find a "
+                f"channel id, call list_channels_in_all_spaces."
+            )
         raise RuntimeError(
             f"agent has no record of channel {channel_id} — it may not "
             f"be a channel the agent belongs to, or the id may be "
@@ -176,26 +188,7 @@ async def _supplement_missing_devices(
         )
 
 
-def _coerce_root_visibility(
-    is_visible_to_human: bool, root_id: str,
-) -> tuple[bool, str]:
-    """Root-level (non-threaded) messages can't fold in the human UI —
-    only threaded replies do. When an agent marks a root-level message
-    ``is_visible_to_human=false`` we coerce it back to visible (so the
-    message still goes out) and return a note to splice into the tool
-    response. The agent learns from the tool result on the spot,
-    rather than depending on the primer being current.
-
-    Returns ``(effective_visibility, note)`` — ``note`` is empty
-    unless a coercion happened.
-    """
-    if is_visible_to_human is False and not root_id.strip():
-        return True, (
-            "\nnote: is_visible_to_human=false ignored — root-level "
-            "messages can't fold; sent as visible. Use false only on "
-            "threaded replies (pass root_id)."
-        )
-    return is_visible_to_human, ""
+from ..agent._visibility import resolve_visibility as _resolve_visibility
 
 
 _RESOLVE_ROOT_MAX_DEPTH = 4
@@ -299,22 +292,14 @@ async def _resolve_root_id(
     so the new message threads under the real root instead of
     silently disappearing into a sub-thread.
 
-    Runs *after* ``_coerce_root_visibility`` — the visibility
-    decision is keyed off the agent's *intent* (a non-empty
-    ``root_id`` means "threaded reply"), so a hidden-visibility
-    reply whose ``root_id`` is auto-corrected stays hidden. This
-    helper only retargets which thread the message lands in.
+    On healthy data ``thread_root_id`` is always a true root (its
+    own ``thread_root_id IS NULL`` per ``message_store.py``'s schema
+    contract), so the loop terminates after at most one hop. The
+    multi-step walk + cycle break are corruption defense for relay
+    data shapes the schema shouldn't produce.
 
-    On healthy data ``thread_root_id`` is always a true root
-    (its own ``thread_root_id IS NULL`` per ``message_store.py``'s
-    schema contract), so the loop terminates after at most one
-    hop. The multi-step walk + cycle break are corruption defense
-    for relay data shapes the schema shouldn't produce.
-
-    Returns ``(resolved_root_or_None, note)``. ``None`` is
-    returned only when ``root_id.strip()`` is empty. ``note`` is
-    empty unless a correction or warning happened — shape mirrors
-    ``_coerce_root_visibility``. Lookup miss / transport failure
+    Returns ``(resolved_root_or_None, note)`` — ``None`` only when
+    ``root_id.strip()`` is empty. Lookup miss / transport failure
     falls through with the original id plus a soft warning so the
     send still completes.
     """
@@ -422,8 +407,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def send_message(
         channel: str,
         text: str,
-        is_visible_to_human: bool,
         root_id: str = "",
+        visibility_level: str = "default",
     ) -> str:
         """Post a message to a Puffo.ai channel or DM a user.
 
@@ -433,16 +418,23 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ``list_channels_in_space``) to discover ids — '#name'
             shortcuts are not supported.
         text: message body. Markdown preserved verbatim.
-        is_visible_to_human: REQUIRED — decide whether a human should
-            see this message inline. ``true`` for anything a person
-            needs to read; ``false`` for agent-to-agent coordination
-            chatter, which human clients fold away. There is no
-            default — judge every message. NOTE: ``false`` only takes
-            effect on threaded replies (when ``root_id`` is set) —
-            root-level messages can't fold, so ``false`` on one is
-            ignored and the message is sent visible.
         root_id: optional — reply inside a thread; pass the
             envelope_id of the message you're replying to.
+        visibility_level: one of ``"human"`` | ``"default"`` |
+            ``"agent_only"`` (default: ``"default"``).
+            - ``"human"`` — anything a person should read (replies,
+              status updates, operator pings). Sent visible.
+            - ``"default"`` — agent-to-agent chatter human clients
+              fold away. Sent hidden BUT with safety-net floors: DMs
+              and messages whose text @-mentions a human are forced
+              visible with a note explaining why. Root-level (non-
+              threaded) posts are also forced visible because they
+              can't fold in the UI.
+            - ``"agent_only"`` — you're explicitly telling the daemon
+              this is agent-to-agent traffic; the DM / @-mention
+              safety net is skipped. Use only when you're confident
+              no human is waiting for this reply. Root-level posts
+              are still forced visible (can't fold either way).
         """
         channel_ref = channel.strip()
         if not channel_ref:
@@ -496,8 +488,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             decode_secret(sess.subkey_secret_key)
         )
 
-        effective_visible, fold_note = _coerce_root_visibility(
-            is_visible_to_human, root_id,
+        effective_visible, visibility_note = await _resolve_visibility(
+            visibility_level, channel_ref, text, root_id, cfg.http_client,
         )
         resolved_root, root_note = await _resolve_root_id(
             root_id, cfg.data_client,
@@ -531,7 +523,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ))
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
-            f"{fold_note}"
+            f"{visibility_note}"
             f"{root_note}"
             f"{validate_note}"
         )
@@ -570,6 +562,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "'#<name>' channel addressing isn't supported; pass the "
                 "channel id directly."
             )
+        # Local-store read would return empty on a slug — route non-
+        # ``ch_`` refs through the resolver purely for its hint error.
+        if not channel_ref.startswith("ch_"):
+            await _resolve_channel_space(cfg, channel_ref)
         channel_id = channel_ref
 
         try:
@@ -884,7 +880,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def get_post_segment(
         envelope_id: str,
         segment: int,
-        segment_size: int = 2000,
+        segment_size: int = MESSAGE_SEGMENT_CHARS,
     ) -> str:
         """Page a long message body back in chunks.
 
@@ -906,9 +902,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
           * unknown envelope_id → "message <id> not found in local storage"
           * empty content       → "message <id> has no text body"
 
-        ``segment_size`` defaults to 2000 to match the daemon's
-        default redaction page size; pass the value the placeholder
-        cited if the operator has overridden it on their host.
+        ``segment_size`` defaults to the daemon's default redaction
+        page size; pass the value the placeholder cited if the operator
+        has overridden it on their host.
         """
         envelope_id = (envelope_id or "").strip()
         if not envelope_id:
@@ -956,9 +952,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def send_message_with_attachments(
         paths: list[str],
         channel: str,
-        is_visible_to_human: bool,
         caption: str = "",
         root_id: str = "",
+        visibility_level: str = "default",
     ) -> str:
         """Send a message carrying one or more workspace files to a
         channel or DM.
@@ -970,16 +966,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             paths are rejected.
         channel: same syntax as ``send_message`` (``@<slug>`` or a
             raw channel id).
-        is_visible_to_human: REQUIRED — same semantics as
-            ``send_message``: ``true`` when a person should see this,
-            ``false`` for agent-to-agent chatter that human clients
-            fold away. No default — judge every send. NOTE: ``false``
-            only takes effect on threaded replies (when ``root_id`` is
-            set); on a root-level message it's ignored and the
-            message is sent visible.
         caption: optional text alongside the files.
         root_id: optional thread reply, same semantics as
             ``send_message``'s ``root_id``.
+        visibility_level: same semantics as ``send_message`` —
+            ``"human"`` | ``"default"`` | ``"agent_only"``, default
+            ``"default"``. The @-mention floor keys off ``caption``.
         """
         import mimetypes
         from pathlib import Path
@@ -1111,8 +1103,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             "text": caption,
             "attachments": [m.to_dict() for m in attachment_metas],
         }
-        effective_visible, fold_note = _coerce_root_visibility(
-            is_visible_to_human, root_id,
+        effective_visible, visibility_note = await _resolve_visibility(
+            visibility_level, channel_ref, caption, root_id, cfg.http_client,
         )
         resolved_root, root_note = await _resolve_root_id(
             root_id, cfg.data_client,
@@ -1149,7 +1141,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} bytes "
             f"total) to {channel}{thread_note} "
             f"(envelope_id {envelope.get('envelope_id', '?')})"
-            f"{fold_note}"
+            f"{visibility_note}"
             f"{root_note}"
             f"{validate_note}"
         )

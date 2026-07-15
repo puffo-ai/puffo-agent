@@ -177,27 +177,19 @@ def test_install_skill_allowed_under_claude_code(tmp_path, monkeypatch):
         )
 
 
-def test_refresh_blocked_under_hermes():
-    """refresh is supported on claude-code + codex (both run a
-    long-lived subprocess that can re-read on-disk config on
-    respawn). hermes / gemini-cli run one-shot per turn — there's
-    nothing to respawn, so the tool refuses."""
-    server, _ = _build_mcp_with_harness("hermes")
-    with pytest.raises(
-        RuntimeError,
-        match="only supported under the claude-code and codex harnesses",
-    ):
-        _call_tool(server, "refresh")
-
-
-def test_refresh_allowed_under_codex(tmp_path):
-    """codex is one of the two harnesses with a long-lived
-    subprocess — refresh writes the flag and returns success."""
+def test_refresh_default_writes_refresh_agent_flag(tmp_path):
+    """No-arg refresh drops the baseline ``refresh_agent.flag`` at
+    ``<workspace>/.puffo-agent/``. Kind-gated (cli-local/cli-docker)
+    but NOT harness-gated — hermes agents can still rebuild
+    CLAUDE.md via the same flag."""
     from pathlib import Path
     server, workspace = _build_mcp_with_harness("codex", tmp_path=tmp_path)
     out = _call_tool(server, "refresh")
     assert "refresh requested" in out
-    assert (Path(workspace) / ".puffo-agent" / "refresh.flag").exists()
+    assert "refresh_agent" in out
+    assert (
+        Path(workspace) / ".puffo-agent" / "refresh_agent.flag"
+    ).exists()
 
 
 def test_install_mcp_server_blocked_under_hermes():

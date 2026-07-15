@@ -73,14 +73,13 @@ class Adapter(ABC):
         """
         return None
 
-    async def reload(self, new_system_prompt: str) -> None:
-        """Drop cached runtime state so the next turn re-reads
-        CLAUDE.md / profile / memory from disk. Worker calls this
-        between turns after a ``reload_system_prompt`` MCP tool call.
-        CLI adapters close their long-lived claude subprocess (the
-        container stays up); SDK / chat-only adapters pass system
-        prompt per turn anyway, so the default no-op is correct.
-        """
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
+        """Drop cached runtime state so the next turn re-reads config
+        from disk. ``with_session=True`` also unlinks the session
+        sentinel so the next spawn skips ``--resume``. SDK / chat-only
+        adapters have no cache — default no-op is correct."""
         return None
 
     async def run_retry_turn(

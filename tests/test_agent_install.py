@@ -32,9 +32,11 @@ from puffo_agent.mcp.host_tools import (
     _install_skill,
     _list_mcp_servers,
     _list_skills,
+    _touch_refresh_flag,
     _uninstall_mcp_server,
     _uninstall_skill,
-    _write_refresh_flag,
+    _write_refresh_model_flag,
+    _write_refresh_runtime_flag,
 )
 
 
@@ -497,51 +499,73 @@ def test_list_mcp_servers_default_harness_keeps_claude_behavior(tmp_path):
     assert entries == [("system", "gh", "")]
 
 
-# ── refresh.flag ─────────────────────────────────────────────────────────────
+# ── refresh_*.flag writers ──────────────────────────────────────────────────
 
 
-def test_write_refresh_flag_no_model(tmp_path):
-    path = _write_refresh_flag(tmp_path, None)
+def test_touch_refresh_flag_writes_worker_scope_payload(tmp_path):
+    for name in ("refresh_agent", "refresh_host_sync", "refresh_session"):
+        path = _touch_refresh_flag(tmp_path, name)
+        assert path == tmp_path / ".puffo-agent" / f"{name}.flag"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert isinstance(payload["requested_at"], int)
 
-    assert path == tmp_path / ".puffo-agent" / "refresh.flag"
+
+def test_touch_refresh_flag_rejects_daemon_scope_names(tmp_path):
+    for name in ("refresh_model", "refresh_runtime", "made-up"):
+        with pytest.raises(RuntimeError):
+            _touch_refresh_flag(tmp_path, name)
+
+
+def test_write_refresh_model_flag_carries_harness_and_model(tmp_path):
+    path = _write_refresh_model_flag(
+        tmp_path, harness="codex", model="gpt-5",
+    )
+    assert path == tmp_path / ".puffo-agent" / "refresh_model.flag"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert "requested_at" in payload
-    assert "model" not in payload
+    assert payload["harness"] == "codex"
+    assert payload["model"] == "gpt-5"
+    assert isinstance(payload["requested_at"], int)
 
 
-def test_write_refresh_flag_with_model(tmp_path):
-    path = _write_refresh_flag(tmp_path, "claude-opus-4-6")
+def test_write_refresh_runtime_flag_kind_only(tmp_path):
+    path = _write_refresh_runtime_flag(tmp_path, kind="cli-local")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["model"] == "claude-opus-4-6"
+    assert payload == {"kind": "cli-local", "requested_at": payload["requested_at"]}
 
 
-def test_write_refresh_flag_with_empty_string_clears_model(tmp_path):
-    """Explicit empty-string override = "use daemon default": the
-    worker sets ``adapter.model = ""`` which drops ``--model`` on
-    the next spawn."""
-    path = _write_refresh_flag(tmp_path, "")
+def test_write_refresh_runtime_flag_with_swap(tmp_path):
+    path = _write_refresh_runtime_flag(
+        tmp_path,
+        kind="cli-docker",
+        harness="claude-code",
+        model="claude-sonnet-4-6",
+        provider="anthropic",
+    )
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["model"] == ""
+    assert payload["kind"] == "cli-docker"
+    assert payload["harness"] == "claude-code"
+    assert payload["model"] == "claude-sonnet-4-6"
+    assert payload["provider"] == "anthropic"
 
 
-def test_write_refresh_flag_rejects_non_string_model(tmp_path):
-    with pytest.raises(RuntimeError, match="must be a string"):
-        _write_refresh_flag(tmp_path, 42)  # type: ignore[arg-type]
-
-
-# ── worker: _refresh_from_disk ──────────────────────────────────────────────
+# ── worker: _process_refresh_flags ─────────────────────────────────────────
 
 
 class _FakeAdapter:
-    """Records reload() calls; exposes a mutable ``model`` attribute
-    like the real LocalCLI / DockerCLI / SDK adapters.
-    """
-    def __init__(self, model: str = "claude-sonnet-4-6"):
-        self.model = model
-        self.reload_calls: list[str] = []
+    """Records reload() calls with the with_session kwarg."""
 
-    async def reload(self, new_system_prompt: str) -> None:
-        self.reload_calls.append(new_system_prompt)
+    def __init__(self):
+        self.reload_calls: list[tuple[str, bool]] = []
+
+    async def reload(
+        self, new_system_prompt: str, *, with_session: bool = False,
+    ) -> None:
+        self.reload_calls.append((new_system_prompt, with_session))
+
+
+class _FakePuffo:
+    def __init__(self, prompt: str = "old prompt"):
+        self.system_prompt = prompt
 
 
 def _run(coro):
@@ -549,79 +573,297 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_refresh_from_disk_tears_down_and_deletes_flag(tmp_path):
-    from puffo_agent.portal.worker import _refresh_from_disk
+def test_process_refresh_flags_noop_when_no_flags(tmp_path):
+    from puffo_agent.portal.worker import _process_refresh_flags
     adapter = _FakeAdapter()
-    flag_path = _write_refresh_flag(tmp_path, None)
-
-    _run(_refresh_from_disk(
-        agent_id="t", adapter=adapter, flag_path=flag_path,
+    puffo = _FakePuffo()
+    _run(_process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
     ))
-
-    assert adapter.reload_calls == [""]
-    # Model untouched (no override in flag).
-    assert adapter.model == "claude-sonnet-4-6"
-    assert not flag_path.exists()
+    assert adapter.reload_calls == []
 
 
-def test_refresh_from_disk_applies_model_override(tmp_path):
-    from puffo_agent.portal.worker import _refresh_from_disk
-    adapter = _FakeAdapter(model="claude-sonnet-4-6")
-    flag_path = _write_refresh_flag(tmp_path, "claude-opus-4-6")
+def test_process_refresh_flags_session_only(tmp_path, monkeypatch):
+    """Only session flag set → adapter.reload with with_session=True."""
+    from puffo_agent.portal.worker import _process_refresh_flags
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="preserved")
+    session_flag = tmp_path / "refresh_session.flag"
+    session_flag.write_text("{}", encoding="utf-8")
 
-    _run(_refresh_from_disk(
-        agent_id="t", adapter=adapter, flag_path=flag_path,
+    _run(_process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=session_flag,
     ))
+    assert len(adapter.reload_calls) == 1
+    prompt, with_session = adapter.reload_calls[0]
+    assert prompt == "preserved"
+    assert with_session is True
+    assert not session_flag.exists()
 
-    assert adapter.model == "claude-opus-4-6"
-    assert adapter.reload_calls == [""]
 
+def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypatch):
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt",
+        lambda **_: "new prompt",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo()
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
 
-def test_refresh_from_disk_empty_model_clears_override(tmp_path):
-    from puffo_agent.portal.worker import _refresh_from_disk
-    adapter = _FakeAdapter(model="claude-opus-4-6")
-    flag_path = _write_refresh_flag(tmp_path, "")
-
-    _run(_refresh_from_disk(
-        agent_id="t", adapter=adapter, flag_path=flag_path,
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
     ))
+    assert puffo.system_prompt == "new prompt"
+    assert adapter.reload_calls == [("new prompt", True)]
+    assert not agent_flag.exists()
 
-    # Empty -> respawn omits --model and falls back to daemon default.
-    assert adapter.model == ""
 
+def test_process_refresh_flags_prompt_rebuild_forces_fresh_session(tmp_path, monkeypatch):
+    """A rebuild that changed the prompt drops the CLI session even without
+    an explicit session flag — ``--resume`` would replay the stale baked
+    system prompt."""
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "rebuilt",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="stale")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
 
-def test_refresh_from_disk_deletes_flag_even_on_adapter_failure(tmp_path):
-    """Flag must be removed even on reload() failure, otherwise the
-    worker would retry forever on every subsequent message."""
-    from puffo_agent.portal.worker import _refresh_from_disk
-
-    class _BrokenAdapter(_FakeAdapter):
-        async def reload(self, _):
-            raise RuntimeError("boom")
-
-    flag_path = _write_refresh_flag(tmp_path, None)
-    adapter = _BrokenAdapter()
-
-    _run(_refresh_from_disk(
-        agent_id="t", adapter=adapter, flag_path=flag_path,
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",  # NOT set
     ))
+    assert adapter.reload_calls == [("rebuilt", True)]
 
-    assert not flag_path.exists()
 
+def test_process_refresh_flags_unchanged_rebuild_keeps_session(tmp_path, monkeypatch):
+    """A rebuild that produced the SAME prompt preserves the conversation —
+    only an actual prompt change forces the fresh session."""
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "same",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="same")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
 
-def test_refresh_from_disk_tolerates_corrupt_flag(tmp_path):
-    """Malformed JSON: treat as 'no model override' and still trigger
-    the restart."""
-    from puffo_agent.portal.worker import _refresh_from_disk
-    flag_path = tmp_path / ".puffo-agent" / "refresh.flag"
-    flag_path.parent.mkdir(parents=True)
-    flag_path.write_text("{not json", encoding="utf-8")
-    adapter = _FakeAdapter(model="claude-sonnet-4-6")
-
-    _run(_refresh_from_disk(
-        agent_id="t", adapter=adapter, flag_path=flag_path,
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
     ))
+    assert adapter.reload_calls == [("same", False)]
+    assert not agent_flag.exists()
 
-    assert adapter.reload_calls == [""]
-    assert adapter.model == "claude-sonnet-4-6"
-    assert not flag_path.exists()
+
+def test_process_refresh_flags_session_flag_wins_over_unchanged_rebuild(tmp_path, monkeypatch):
+    """An explicit session flag drops the session even when the rebuilt
+    prompt is unchanged."""
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "same",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="same")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+    session_flag = tmp_path / "refresh_session.flag"
+    session_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=session_flag,
+    ))
+    assert adapter.reload_calls == [("same", True)]
+    assert not session_flag.exists()
+
+
+def test_process_refresh_flags_rebuild_failure_keeps_session(tmp_path, monkeypatch):
+    """If the rebuild raises, the old prompt reloads and the session is
+    preserved (nothing changed, so nothing to force)."""
+    from puffo_agent.portal import worker as worker_mod
+
+    def _boom(**_):
+        raise RuntimeError("rebuild failed")
+
+    monkeypatch.setattr(worker_mod, "_rebuild_managed_system_prompt", _boom)
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="old prompt")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert adapter.reload_calls == [("old prompt", False)]
+    assert not agent_flag.exists()
+
+
+def test_process_refresh_flags_memory_only_change_keeps_session(tmp_path, monkeypatch):
+    """A rebuild whose primer/profile slice is identical — only the memory
+    snapshot differs — preserves the conversation."""
+    from puffo_agent.agent.shared_content import MEMORY_SECTION_HEADER
+    from puffo_agent.portal import worker as worker_mod
+
+    core = "primer\n\n---\n\n# Your role\n\nprofile"
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt",
+        lambda **_: core + "\n\n" + MEMORY_SECTION_HEADER + "NEW memory\n",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt=core + "\n\n" + MEMORY_SECTION_HEADER + "old memory\n")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert len(adapter.reload_calls) == 1
+    _, with_session = adapter.reload_calls[0]
+    assert with_session is False
+    assert puffo.system_prompt.endswith("NEW memory\n")
+
+
+def test_process_refresh_flags_profile_change_with_memory_drops_session(tmp_path, monkeypatch):
+    """A profile-slice change still drops the session even when a memory
+    section is present on both sides."""
+    from puffo_agent.agent.shared_content import MEMORY_SECTION_HEADER
+    from puffo_agent.portal import worker as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt",
+        lambda **_: "NEW profile" + "\n\n" + MEMORY_SECTION_HEADER + "mem\n",
+    )
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="old profile" + "\n\n" + MEMORY_SECTION_HEADER + "mem\n")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert len(adapter.reload_calls) == 1
+    _, with_session = adapter.reload_calls[0]
+    assert with_session is True
+
+
+def test_process_refresh_flags_reload_failure_still_clears_flags(tmp_path, monkeypatch):
+    from puffo_agent.portal import worker as worker_mod
+    monkeypatch.setattr(
+        worker_mod, "_rebuild_managed_system_prompt", lambda **_: "rebuilt",
+    )
+
+    class _ExplodingAdapter:
+        async def reload(self, *_a, **_k):
+            raise RuntimeError("reload failed")
+
+    puffo = _FakePuffo(prompt="stale")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=_ExplodingAdapter(),
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+    ))
+    assert puffo.system_prompt == "rebuilt"
+    assert not agent_flag.exists()
