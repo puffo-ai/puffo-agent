@@ -3268,10 +3268,12 @@ class PuffoCoreMessageClient:
         sender_display, _ = await self._fetch_user_profile(sender_slug)
         label = sender_display or sender_slug
         preview = text if len(text) <= 280 else text[:277] + "…"
+        # `/permission` renders Yes/No buttons in the operator's web/mobile
+        # client (they post `y`/`n`, which the reply handler already accepts).
         prompt = (
-            f"**{label}** ({sender_slug}) is DM-ing me. Reply `y` in "
-            f"this thread to allow (server allowlist + deliver), or "
-            f"`n` to block (server blocklist + drop).\n\n"
+            f"/permission **{label}** ({sender_slug}) is DM-ing me — allow "
+            f"(allowlist + deliver) or block? Tap Yes/No, or reply `y`/`n` "
+            f"in this thread.\n\n"
             f"> {preview}"
         )
         try:

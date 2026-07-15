@@ -311,6 +311,8 @@ async def test_gate_buffers_foreign_dm_and_prompts_operator(tmp_path):
     assert len(client._sent_dms) == 1
     sent = client._sent_dms[0]
     assert sent["to"] == "op-1"
+    # `/permission` prefix → Yes/No buttons in the operator's client.
+    assert sent["text"].startswith("/permission ")
     assert "alice-1234" in sent["text"]
     assert "hello agent" in sent["text"]
     prompt_env = sent["env_id"]
