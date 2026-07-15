@@ -281,9 +281,16 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
             deletes.append((path, body))
             return {}
 
+    owner_of: dict[str, str] = {}
+
+    async def _stub_fetch_owner_slug(slug):
+        return owner_of.get(slug, "")
+
     client.http = _StubHttp()
     client._send_dm = _stub_send_dm  # type: ignore[assignment]
     client._fetch_user_profile = _stub_fetch_user_profile  # type: ignore[assignment]
+    client._fetch_owner_slug = _stub_fetch_owner_slug  # type: ignore[assignment]
+    client._owner_of = owner_of  # type: ignore[attr-defined]  # tests inject owners
 
     admitted: list[dict] = []
 
@@ -299,12 +306,17 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     return client
 
 
-def test_is_foreign_dm_sender_correctly_excludes_operator_and_self():
+@pytest.mark.asyncio
+async def test_is_foreign_dm_sender_excludes_operator_self_and_co_owned_agents():
     client = _make_client(auto_accept_dm=False)
-    assert client._is_foreign_dm_sender("op-1") is False
-    assert client._is_foreign_dm_sender("agent-1") is False
-    assert client._is_foreign_dm_sender("alice-1234") is True
-    assert client._is_foreign_dm_sender("") is False
+    client._owner_of["sibling-agt-9"] = "op-1"          # my operator's agent
+    client._owner_of["other-agt-5"] = "someone-else-2222"  # a different operator's
+    assert await client._is_foreign_dm_sender("op-1") is False
+    assert await client._is_foreign_dm_sender("agent-1") is False
+    assert await client._is_foreign_dm_sender("sibling-agt-9") is False
+    assert await client._is_foreign_dm_sender("other-agt-5") is True
+    assert await client._is_foreign_dm_sender("alice-1234") is True  # human, no owner
+    assert await client._is_foreign_dm_sender("") is False
 
 
 @pytest.mark.asyncio

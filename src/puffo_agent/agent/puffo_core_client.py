@@ -793,8 +793,8 @@ class PuffoCoreMessageClient:
             if (
                 is_dm
                 and not self.auto_accept_dm
-                and self._is_foreign_dm_sender(payload.sender_slug)
                 and payload.sender_slug not in self._dm_allowlisted_senders
+                and await self._is_foreign_dm_sender(payload.sender_slug)
             ):
                 gated = await self._maybe_gate_foreign_dm(
                     sender_slug=payload.sender_slug,
@@ -3308,14 +3308,18 @@ class PuffoCoreMessageClient:
 
     # ─── auto_accept_dm gate ──────────────────────────────────────
 
-    def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
-        # Operator + self are trusted; everyone else is foreign (v1 gates
-        # co-owned agents too).
+    async def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
+        # Operator, self, and agents owned by the same operator are
+        # trusted; everyone else is foreign. Owner lookup is cached (the
+        # inbound path fetches it again at render time — same TTL cache).
         if not sender_slug:
             return False
         if sender_slug == self.operator_slug:
             return False
         if sender_slug == self.slug:
+            return False
+        owner = await self._fetch_owner_slug(sender_slug)
+        if owner and owner == self.operator_slug:
             return False
         return True
 
