@@ -45,6 +45,19 @@ class StatusReporter:
         runtime_provider: Optional[Callable[[], dict[str, Any]]] = None,
     ) -> None:
         self._http = http
+        # Keyless (T23 bridge) transport: the agent authenticates with an
+        # egress-injected ``x-sandbox-token`` and holds NO local signing
+        # identity. Every status wire call here goes through the *signed*
+        # ``PuffoCoreHttpClient.post`` path (``_ensure_subkey`` →
+        # ``load_session`` → ``_rotate_subkey`` → ``load_identity``), which
+        # raises "identity not found: <slug>" for a keyless agent — on every
+        # heartbeat, ``begin_turn`` and ``end_turn``. Reading the flag off the
+        # http client (the SAME signal the tools + worker use;
+        # ``getattr(..., False)`` keeps test fakes and native agents at False)
+        # lets us short-circuit those calls so no ``load_identity`` is ever
+        # attempted. Server liveness for bridge agents is tracked via the
+        # bridge WS, not this heartbeat, so the skip is a clean no-op.
+        self._keyless = bool(getattr(http, "keyless", False))
         self._interval = max(10.0, heartbeat_interval_s)
         self._current_status: str = "idle"
         self._current_message_id: str | None = None
@@ -56,6 +69,12 @@ class StatusReporter:
         self._stop = asyncio.Event()
 
     async def run_heartbeat_loop(self) -> None:
+        if self._keyless:
+            # Bridge agents have no signing identity — the signed
+            # /agents/me/heartbeat route can't authenticate keyless (it
+            # would raise "identity not found"). Skip the loop entirely;
+            # the bridge WS is the liveness signal for these agents.
+            return
         # Send one immediately so a fresh agent doesn't sit
         # offline waiting for the first scheduled tick.
         await self._send_heartbeat()
@@ -74,6 +93,13 @@ class StatusReporter:
     async def begin_turn(self, message_id: str) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = f"run_{uuid.uuid4().hex}"
+        if self._keyless:
+            # No signed /processing/* call for bridge agents (see __init__).
+            # Keep the local busy bookkeeping so the state machine is
+            # unchanged; emit nothing over the wire.
+            self._current_status = "busy"
+            self._current_message_id = message_id
+            return run_id
         if _is_local_only_envelope(message_id):
             # Daemon-minted synthetic envelope (e.g. intro-prompt): no
             # server row, so skip /processing/start — but push an
@@ -105,6 +131,12 @@ class StatusReporter:
         succeeded: bool,
         error_text: str | None = None,
     ) -> None:
+        if self._keyless:
+            # Bridge agents: resolve local status, skip the signed
+            # /processing/end POST (see __init__).
+            self._current_status = "idle" if succeeded else "error"
+            self._current_message_id = None
+            return
         if _is_local_only_envelope(message_id):
             # Symmetric to ``begin_turn`` — no server-side row, but push
             # the idle/error status now instead of waiting for the next
@@ -139,6 +171,13 @@ class StatusReporter:
         ``started_at = ended_at = now`` and skip straight to green.
         """
         if not runs:
+            return
+        if self._keyless:
+            # Bridge agents: mirror the batch outcome into local status,
+            # skip the signed /processing/end:batch POST (see __init__).
+            any_failed = any(not r["succeeded"] for r in runs)
+            self._current_status = "error" if any_failed else "idle"
+            self._current_message_id = None
             return
         payload_runs: list[dict[str, Any]] = []
         for r in runs:
@@ -186,6 +225,12 @@ class StatusReporter:
         """Catch-all for unrecoverable failures; cleared by the
         next successful heartbeat.
         """
+        if self._keyless:
+            # Bridge agents: record the error locally, skip the signed
+            # /agents/me/heartbeat POST (see __init__).
+            self._current_status = "error"
+            self._current_message_id = None
+            return
         try:
             await self._http.post(
                 "/agents/me/heartbeat",
@@ -199,6 +244,11 @@ class StatusReporter:
             logger.warning("report_error errored (%s)", exc)
 
     async def _send_heartbeat(self) -> None:
+        if self._keyless:
+            # Defense-in-depth: every public entry point already short-
+            # circuits for keyless, but guard the actual signed POST too so
+            # no future caller can reintroduce an "identity not found" beat.
+            return
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
