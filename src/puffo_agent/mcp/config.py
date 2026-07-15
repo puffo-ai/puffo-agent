@@ -295,9 +295,15 @@ def puffo_core_mcp_env(
         env["PUFFO_HARNESS"] = harness
     if memory_dir:
         env["PUFFO_MEMORY_DIR"] = memory_dir
-    # T23 bridge transport — no caller passes this yet; adapter env
-    # wiring lands with phase 2.
-    if transport:
+    # T23 phase-2: the cli-local / cli-docker worker call sites now
+    # forward ``pc.transport``. Only ``bridge`` flips the subprocess to
+    # keyless (``puffo_core_server.build_server`` does
+    # ``keyless=(transport == "bridge")``), so emit the env var only for
+    # bridge. Native agents (the default transport, a truthy string)
+    # therefore stay byte-for-byte identical — no PUFFO_CORE_TRANSPORT
+    # key, subprocess keeps ``keyless=False`` and its signed keystore
+    # path.
+    if transport == "bridge":
         env["PUFFO_CORE_TRANSPORT"] = transport
     # Test-only egress shim: forward PUFFO_LOCAL_SANDBOX_TOKEN into the
     # subprocess so its keyless http client can simulate the E2B egress
