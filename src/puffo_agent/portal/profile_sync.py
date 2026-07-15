@@ -84,11 +84,31 @@ async def sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
     """Push ``patch`` (any subset of display_name / avatar_url /
     role / role_short / soul) to the agent's server identity. Signed
     by the AGENT's subkey — callers own their own authorization
-    gating before reaching here. Raises on HTTP / network failure."""
+    gating before reaching here. Raises on HTTP / network failure.
+
+    Keyless (T23 ``bridge`` transport) agents hold NO local signing
+    identity and authenticate with an egress-injected
+    ``x-sandbox-token``. The signed ``PATCH /identities/self`` here
+    would drive ``_ensure_subkey`` → ``_rotate_subkey`` →
+    ``KeyStore.load_identity`` and raise "identity not found: <slug>"
+    on every warm/startup sync. The bridge exposes no profile-sync
+    method, so there is nothing to route the patch over — skip the
+    signed call entirely (native agents fall through unchanged). This
+    is the single choke point every profile-sync caller reaches
+    (sync_full_profile, cli, api handlers, control link), so the guard
+    belongs here."""
+    pc = cfg.puffo_core
+    if pc.transport == "bridge":
+        logger.debug(
+            "sync_agent_profile: skipping signed PATCH for keyless "
+            "bridge agent=%s (no local identity; no bridge sync route)",
+            cfg.id,
+        )
+        return
+
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
-    pc = cfg.puffo_core
     ks = KeyStore.for_agent(cfg.id)
     http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
     try:
