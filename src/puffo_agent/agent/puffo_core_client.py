@@ -3309,11 +3309,8 @@ class PuffoCoreMessageClient:
     # ─── auto_accept_dm gate ──────────────────────────────────────
 
     def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
-        # Operator is always trusted; self can't sender-DM itself (already
-        # short-circuited upstream). Anyone else is "foreign" for v1 —
-        # this conservatively gates same-operator agents too. A future
-        # extension can lookup sender.operator_slug via /identities/profiles
-        # to bypass for co-owned agents.
+        # Operator + self are trusted; everyone else is foreign (v1 gates
+        # co-owned agents too).
         if not sender_slug:
             return False
         if sender_slug == self.operator_slug:

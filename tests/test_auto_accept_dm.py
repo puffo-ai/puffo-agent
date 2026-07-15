@@ -227,6 +227,22 @@ def test_pending_dm_approvals_malformed_file_returns_empty(tmp_path):
     assert load_pending_dm_approvals("alpha") == {}
 
 
+def test_pending_dm_approvals_non_dict_json_returns_empty(tmp_path):
+    import json
+    isolated_home()
+    from puffo_agent.portal.state import agent_dir
+    from puffo_agent.agent.dm_approvals import (
+        load_pending_dm_approvals,
+        pending_dm_approvals_path,
+    )
+
+    agent_dir("alpha").mkdir(parents=True, exist_ok=True)
+    path = pending_dm_approvals_path("alpha")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+    assert load_pending_dm_approvals("alpha") == {}
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Gate logic — manual client surgery, no WS / HTTP
 # ─────────────────────────────────────────────────────────────────────
@@ -392,6 +408,37 @@ async def test_approval_n_posts_blocklist_and_drops_buffered_dm(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_approval_keeps_pending_and_confirms_error_when_post_raises(tmp_path):
+    isolated_home()
+    from puffo_agent.portal.state import agent_dir
+
+    agent_dir("agent-1").mkdir(parents=True, exist_ok=True)
+    client = _make_client(auto_accept_dm=False)
+
+    async def _raising_post(path, body):
+        raise RuntimeError("server unreachable")
+    client.http.post = _raising_post  # type: ignore[assignment]
+
+    await client._maybe_gate_foreign_dm(
+        sender_slug="alice-1234", text="hello", envelope_id="msg_in_1",
+        sent_at=1000, thread_root_id="", attachment_paths=[],
+    )
+    prompt_env_id = client._sent_dms[0]["env_id"]
+    n_before = len(client._sent_dms)
+    handled = await client._maybe_handle_dm_approval_reply(
+        thread_root_id=prompt_env_id, text="y",
+    )
+    assert handled is True
+    # Pending entry KEPT so a retry works once the server is reachable.
+    assert prompt_env_id in client._pending_dm_approvals
+    # Error-confirm DM sent in the prompt thread.
+    assert len(client._sent_dms) == n_before + 1
+    err = client._sent_dms[-1]
+    assert err["root_id"] == prompt_env_id
+    assert "failed" in err["text"].lower()
+
+
+@pytest.mark.asyncio
 async def test_approval_reply_ignores_non_yn_text(tmp_path):
     isolated_home()
     from puffo_agent.portal.state import agent_dir
@@ -427,6 +474,47 @@ async def test_gate_skips_when_operator_slug_missing(tmp_path):
     # Falls through (returns False) so the DM still reaches the agent.
     assert handled is False
     assert client._sent_dms == []
+
+
+@pytest.mark.asyncio
+async def test_gate_delivers_ungated_when_prompt_send_fails(tmp_path):
+    isolated_home()
+    from puffo_agent.portal.state import agent_dir
+
+    agent_dir("agent-1").mkdir(parents=True, exist_ok=True)
+    client = _make_client(auto_accept_dm=False)
+
+    async def _raising_send_dm(slug, text, root_id=""):
+        raise RuntimeError("send failed")
+    client._send_dm = _raising_send_dm  # type: ignore[assignment]
+
+    handled = await client._maybe_gate_foreign_dm(
+        sender_slug="alice-1234", text="hi", envelope_id="msg_1",
+        sent_at=1000, thread_root_id="", attachment_paths=[],
+    )
+    # Prompt couldn't be sent → deliver ungated rather than swallow the DM.
+    assert handled is False
+    assert client._pending_dm_approvals == {}
+
+
+@pytest.mark.asyncio
+async def test_gate_delivers_ungated_when_prompt_has_no_envelope_id(tmp_path):
+    isolated_home()
+    from puffo_agent.portal.state import agent_dir
+
+    agent_dir("agent-1").mkdir(parents=True, exist_ok=True)
+    client = _make_client(auto_accept_dm=False)
+
+    async def _no_env_send_dm(slug, text, root_id=""):
+        return {}
+    client._send_dm = _no_env_send_dm  # type: ignore[assignment]
+
+    handled = await client._maybe_gate_foreign_dm(
+        sender_slug="alice-1234", text="hi", envelope_id="msg_1",
+        sent_at=1000, thread_root_id="", attachment_paths=[],
+    )
+    assert handled is False
+    assert client._pending_dm_approvals == {}
 
 
 # ─────────────────────────────────────────────────────────────────────
