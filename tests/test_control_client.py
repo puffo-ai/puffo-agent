@@ -314,3 +314,12 @@ async def test_edit_applies_inference_level(home):
     res = await execute_command("edit", "scout", {"runtime": {"inference_level": "high"}})
     assert res["ok"] is True
     assert AgentConfig.load("scout").runtime.inference_level == "high"
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_invalid_inference_level(home):
+    write_test_agent(home, "scout")
+    res = await execute_command("edit", "scout", {"runtime": {"inference_level": "turbo"}})
+    assert res["ok"] is False
+    assert "inference_level" in res["error"]
+    assert AgentConfig.load("scout").runtime.inference_level == ""

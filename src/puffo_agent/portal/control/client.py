@@ -285,6 +285,15 @@ async def execute_command(
         # dropped at config.toml write), trust-in like the other fields here.
         rt_in = params.get("runtime")
         if isinstance(rt_in, dict):
+            level_in = rt_in.get("inference_level")
+            if isinstance(level_in, str) and level_in:
+                from ...mcp.config import INFERENCE_LEVELS
+                if level_in not in INFERENCE_LEVELS:
+                    return {
+                        "ok": False,
+                        "error": "runtime.inference_level must be one of: "
+                        + ", ".join(INFERENCE_LEVELS),
+                    }
             rt = cfg.runtime
             for key in ("kind", "provider", "harness", "model", "inference_level"):
                 if isinstance(rt_in.get(key), str):

@@ -1541,12 +1541,19 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
         api_key=str(rt.get("api_key", "")),
         harness=str(rt.get("harness", "claude-code")),
         permission_mode=str(rt.get("permission_mode", "bypassPermissions")),
+        inference_level=str(rt.get("inference_level", "")),
         max_turns=int(rt.get("max_turns", 10)),
     )
     from ..runtime_matrix import validate_triple
     validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
+    from ...mcp.config import INFERENCE_LEVELS
+    if runtime.inference_level and runtime.inference_level not in INFERENCE_LEVELS:
+        raise ProvisionError(
+            "runtime.inference_level must be one of: "
+            + ", ".join(INFERENCE_LEVELS)
+        )
 
     desired_skills = payload.get("desired_skills") or []
     desired_mcps = payload.get("desired_mcps") or []

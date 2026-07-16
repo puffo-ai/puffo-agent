@@ -25,6 +25,7 @@ from pathlib import Path
 
 from ...macos.keychain import is_macos
 from ...mcp.config import (
+    INFERENCE_LEVELS,
     default_python_executable,
     write_cli_mcp_config,
     write_codex_mcp_config,
@@ -939,6 +940,18 @@ class LocalCLIAdapter(Adapter):
             cmd.extend(["--permission-mode", self.permission_mode])
         if self.model:
             cmd.extend(["--model", self.model])
+        # Every enum value is claude-valid; the guard drops yaml-only
+        # codex values (e.g. "minimal") so a harness switch can't break spawns.
+        if self.inference_level:
+            if self.inference_level in INFERENCE_LEVELS:
+                cmd.extend(["--effort", self.inference_level])
+            else:
+                logger.warning(
+                    "agent %s: ignoring inference_level %r for claude-code "
+                    "(expected one of %s)",
+                    self.agent_id, self.inference_level,
+                    ", ".join(INFERENCE_LEVELS),
+                )
         cmd.extend(extra_args)
         return cmd
 

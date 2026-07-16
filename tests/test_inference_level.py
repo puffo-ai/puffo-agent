@@ -108,3 +108,62 @@ def test_legacy_yml_without_field_defaults_empty(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     assert AgentConfig.load(aid).runtime.inference_level == ""
+
+
+# ─── claude-code: --effort on the spawn argv ─────────────────────────
+
+
+def _local_adapter(level: str):
+    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
+
+    a = LocalCLIAdapter.__new__(LocalCLIAdapter)
+    a.agent_id = "t-1"
+    a.permission_mode = "bypassPermissions"
+    a.model = "claude-opus-4-8"
+    a.inference_level = level
+    return a
+
+
+def _docker_adapter(level: str):
+    from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
+
+    a = DockerCLIAdapter.__new__(DockerCLIAdapter)
+    a.agent_id = "t-1"
+    a.container_name = "puffo-t-1"
+    a.model = "claude-opus-4-8"
+    a.inference_level = level
+    return a
+
+
+def test_local_claude_argv_carries_effort():
+    cmd = _local_adapter("xhigh")._build_command([])
+    assert cmd[cmd.index("--effort") + 1] == "xhigh"
+
+
+def test_local_claude_argv_omits_empty_level():
+    assert "--effort" not in _local_adapter("")._build_command([])
+
+
+def test_local_claude_argv_skips_yaml_only_codex_value():
+    assert "--effort" not in _local_adapter("minimal")._build_command([])
+
+
+def test_docker_claude_argv_carries_effort():
+    cmd = _docker_adapter("high")._build_command([])
+    assert cmd[cmd.index("--effort") + 1] == "high"
+
+
+def test_docker_claude_argv_skips_invalid():
+    assert "--effort" not in _docker_adapter("turbo")._build_command([])
+
+
+def test_create_bundle_parses_and_validates_level():
+    """Source pin: the linked-machine create path reads
+    runtime.inference_level and rejects out-of-set values."""
+    import inspect
+
+    from puffo_agent.portal.api import handlers
+
+    src = inspect.getsource(handlers._verify_agent_bundle)
+    assert "inference_level=str(rt.get(\"inference_level\", \"\"))" in src
+    assert "INFERENCE_LEVELS" in src

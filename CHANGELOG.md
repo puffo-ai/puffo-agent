@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-agent inference level (PUF-373).** `runtime.inference_level`
+  (`low|medium|high|xhigh`, empty = harness default) applies to both
+  harnesses: codex gets `model_reasoning_effort` in its config.toml
+  (`xhigh` dropped — no codex tier), claude-code gets `--effort` on the
+  spawn, on cli-local and cli-docker alike. Settable from the portal UI
+  (harness-aware dropdown), the local bridge runtime editor, and a
+  linked machine's create/edit commands — invalid values are rejected
+  at every write surface.
+
 ### Fixed
 
 - **Stale channel cache self-heals (PUF-376).** A membership event
