@@ -1,4 +1,4 @@
-"""PUF-384: catch-up staleness gate.
+"""Catch-up staleness gate.
 
 On WS reconnect / daemon restart / resume-from-pause the server
 redelivers backlog through ``handle_envelope``. Messages older than
@@ -68,16 +68,14 @@ def test_gate_wired_into_listen_before_admit():
     gate = src.index("_is_stale_for_catchup(payload.sent_at)")
     admit = src.index("_admit_thread_message(")
     assert gate < admit, "staleness gate must precede _admit_thread_message"
-    # The DB store must run BEFORE the gate — a skipped envelope is still
-    # persisted (AC #2). Pin the ordering so a refactor can't move the
-    # gate above the store.
+    # A skipped envelope is still persisted — the store precedes the gate.
     store = src.index("self.store.store(")
     assert store < gate, "store.store must precede the staleness gate"
-    # The self-echo + invite/leave intercepts must run regardless of age,
-    # so they sit ahead of the gate.
+    # Self-echo + operator intercepts run regardless of age.
     self_echo = src.index("payload.sender_slug == self.slug")
     leave = src.index("_maybe_handle_leave_reply")
-    assert self_echo < gate and leave < gate
+    permission = src.index("_maybe_handle_permission_reply")
+    assert self_echo < gate and leave < gate and permission < gate
 
 
 def _init_client(catchup_stale_hours: float) -> PuffoCoreMessageClient:
@@ -120,3 +118,58 @@ def test_daemon_config_absent_key_defaults(tmp_path, monkeypatch):
     cfg_path.write_text("default_provider: anthropic\n", encoding="utf-8")
     monkeypatch.setattr(state, "daemon_yml_path", lambda: cfg_path)
     assert state.DaemonConfig.load().catchup_stale_hours == 48.0
+
+
+def _build_via_worker(monkeypatch, tmp_path, daemon_cfg):
+    """Drive worker._build_puffo_core_client with stubbed heavy deps;
+    returns the kwargs the client constructor received."""
+    from puffo_agent.portal import worker
+    from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig, RuntimeConfig
+
+    cfg = AgentConfig(
+        id="agent-test-1234",
+        puffo_core=PuffoCoreConfig(
+            server_url="https://example.test", slug="agent-test-1234",
+            device_id="dev-1", space_id="", operator_slug="",
+        ),
+        runtime=RuntimeConfig(kind="chat-local", harness="claude-code"),
+    )
+    monkeypatch.setattr(
+        worker, "_ensure_agent_identity_imported", lambda *_a, **_k: None,
+    )
+    captured: dict[str, object] = {}
+
+    class DummyClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.puffo_core_client.PuffoCoreMessageClient", DummyClient,
+    )
+    monkeypatch.setattr(
+        "puffo_agent.crypto.keystore.KeyStore", lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.message_store.MessageStore", lambda *_a, **_k: object(),
+    )
+    monkeypatch.setattr(
+        AgentConfig, "resolve_workspace_dir", lambda self: tmp_path,
+    )
+    worker._build_puffo_core_client(cfg, "agent-test-1234", daemon_cfg=daemon_cfg)
+    return captured
+
+
+def test_worker_threads_catchup_stale_hours(monkeypatch, tmp_path):
+    captured = _build_via_worker(
+        monkeypatch, tmp_path, state.DaemonConfig(catchup_stale_hours=12.5),
+    )
+    assert captured.get("catchup_stale_hours") == 12.5
+
+
+def test_worker_defaults_catchup_stale_hours_without_daemon_cfg(monkeypatch, tmp_path):
+    captured = _build_via_worker(monkeypatch, tmp_path, None)
+    assert captured.get("catchup_stale_hours") == DEFAULT_CATCHUP_STALE_HOURS

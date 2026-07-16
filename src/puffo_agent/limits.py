@@ -9,7 +9,6 @@ MAX_INLINE_MESSAGE_CHARS = 16000
 # the redaction placeholder cites it so paging stays aligned.
 MESSAGE_SEGMENT_CHARS = 8000
 
-# PUF-384: on catch-up (reconnect/restart/resume), inbound messages older
-# than this many hours are stored to chat history but skip the LLM
+# Catch-up backlog older than this is stored but skips the LLM
 # pipeline. <= 0 disables the gate.
 DEFAULT_CATCHUP_STALE_HOURS = 48.0

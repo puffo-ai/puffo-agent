@@ -495,12 +495,8 @@ class PuffoCoreMessageClient:
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
         self._max_input_bytes = max(1, int(max_input_bytes))
-        # PUF-384: on catch-up (WS reconnect / restart / resume), the
-        # server redelivers backlog through the same handler. Envelopes
-        # older than this skip the LLM pipeline (still get stored). <= 0
-        # disables the gate so nothing is ever skipped. A sub-millisecond
-        # positive threshold truncates to 0 ms and thus also disables via
-        # the >0 guard — an absurd edge, but safe by construction.
+        # Catch-up backlog older than this skips the LLM (still
+        # stored). <= 0 disables the gate.
         self._catchup_stale_ms = (
             int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
         )
@@ -584,11 +580,9 @@ class PuffoCoreMessageClient:
         self._log = _AgentLogger(logger, {"agent": self.slug})
 
     def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
-        """True when ``sent_at`` (ms since epoch) is older than the
-        catch-up staleness threshold — the envelope should be stored but
-        skip the LLM pipeline. Returns False (gate disabled) when the
-        threshold is <= 0, so a mis-set config can never skip live
-        traffic."""
+        """True when ``sent_at`` (ms epoch) is past the staleness
+        threshold: store the envelope but skip the LLM. <= 0 disables
+        so a mis-set config can never skip live traffic."""
         if self._catchup_stale_ms <= 0:
             return False
         if now_ms is None:
@@ -784,14 +778,9 @@ class PuffoCoreMessageClient:
                     self._last_dm_sender = payload.sender_slug
                     return
 
-            # PUF-384: catch-up staleness gate. On WS reconnect / daemon
-            # restart / resume-from-pause the server redelivers backlog
-            # through this same handler. The envelope is already stored
-            # above; if it's older than the threshold, skip the LLM
-            # pipeline so the agent doesn't burn tokens replaying old
-            # context or fire late replies into moved-on conversations.
-            # Self-echo + invite/leave intercepts above run regardless of
-            # age; live deliveries are seconds-old and pass the gate.
+            # Staleness gate: redelivered catch-up backlog past the
+            # threshold is stored (above) but skips the LLM — no token
+            # burn, no late replies. Intercepts above run at any age.
             if self._is_stale_for_catchup(payload.sent_at):
                 self._log.info(
                     "handle_envelope: staleness-gate-skipped envelope=%s "
