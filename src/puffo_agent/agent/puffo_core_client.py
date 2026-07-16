@@ -29,6 +29,7 @@ from ..crypto.ws_client import PuffoCoreWsClient
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .core import AgentAPIError
+from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
 from .message_store import MessageStore
@@ -541,6 +542,11 @@ class PuffoCoreMessageClient:
         # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
+        # cli-local command-permission prompts awaiting operator y/n,
+        # keyed by prompt-DM envelope_id. The future resolves to the
+        # decision; in-memory only — the requesting hook re-asks or
+        # times out on a daemon restart.
+        self._pending_command_permissions: dict[str, asyncio.Future[bool]] = {}
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
@@ -743,6 +749,12 @@ class PuffoCoreMessageClient:
                 # threaded-only — each leave is confirmed in its own
                 # thread (no direct/bulk path).
                 if await self._maybe_handle_leave_reply(
+                    thread_root_id=payload_thread_root_id or "", text=text_raw,
+                ):
+                    self._last_dm_sender = payload.sender_slug
+                    return
+                # Same gate for cli-local command-permission prompts.
+                if await self._maybe_handle_permission_reply(
                     thread_root_id=payload_thread_root_id or "", text=text_raw,
                 ):
                     self._last_dm_sender = payload.sender_slug
@@ -3148,6 +3160,70 @@ class PuffoCoreMessageClient:
             return f"channel {channel_label} in space {space_label}"
         return f"space {space_label}"
 
+    # ── cli-local command permission (operator-gated) ─────────────────
+
+    async def request_command_permission(
+        self, *, tool_name: str, summary: str, timeout_s: int,
+    ) -> str:
+        """DM the operator a ``/permission`` prompt for a tool call the
+        PreToolUse hook intercepted, and block until they answer or the
+        timeout lapses. Returns ``"allow"`` / ``"deny"`` / ``"timeout"``
+        for the hook to translate into its exit protocol."""
+        if not self.operator_slug:
+            raise RuntimeError("no operator_slug configured")
+        text = format_permission_prompt(
+            f"I want to run **{tool_name}** — allow it?",
+            detail=summary,
+        )
+        envelope = await self._send_dm(self.operator_slug, text, root_id="")
+        env_id = envelope.get("envelope_id", "") if envelope else ""
+        if not env_id:
+            raise RuntimeError("could not deliver the permission DM")
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_command_permissions[env_id] = fut
+        try:
+            approved = await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            try:
+                await self._send_dm(
+                    self.operator_slug,
+                    f"Timed out after {timeout_s}s — I did NOT run "
+                    f"`{tool_name}`.",
+                    root_id=env_id,
+                )
+            except Exception:
+                self._log.exception(
+                    "permission: failed to send timeout notice",
+                )
+            return "timeout"
+        finally:
+            self._pending_command_permissions.pop(env_id, None)
+        return "allow" if approved else "deny"
+
+    async def _maybe_handle_permission_reply(
+        self, *, thread_root_id: str, text: str,
+    ) -> bool:
+        """Operator ``y``/``n`` on a pending command-permission DM.
+        Threaded only. Returns ``True`` when consumed."""
+        fut = self._pending_command_permissions.get(thread_root_id)
+        if fut is None:
+            return False
+        normalized = text.strip().lower()
+        if normalized in ("y", "yes"):
+            approved = True
+        elif normalized in ("n", "no"):
+            approved = False
+        else:
+            return False
+        if not fut.done():
+            fut.set_result(approved)
+        confirm = "Approved ✓ — running it." if approved else "Denied — I won't run it."
+        try:
+            await self._send_dm(self.operator_slug, confirm, root_id=thread_root_id)
+        except Exception:
+            self._log.exception("permission: failed to confirm decision")
+        return True
+
     # ── Agent-initiated leave (operator-gated, mirrors invite) ────────
 
     async def request_leave_approval(
@@ -3184,10 +3260,9 @@ class PuffoCoreMessageClient:
             )
         else:
             target = f"space **{space_label}**({space_id})"
-        reason_line = f" Reason: {reason.strip()}" if reason.strip() else ""
-        text = (
-            f"I'd like to leave {target}.{reason_line} "
-            f"Reply `y` in this thread to approve, or `n` to keep me there."
+        text = format_permission_prompt(
+            f"I'd like to leave {target} — approve, or keep me there?",
+            detail=f"Reason: {reason.strip()}" if reason.strip() else "",
         )
         envelope = await self._send_dm(self.operator_slug, text, root_id="")
         env_id = envelope.get("envelope_id", "") if envelope else ""
@@ -3492,22 +3567,20 @@ class PuffoCoreMessageClient:
         )
         space_label = f"**{space_name}**({space_id})" if space_name else space_id
         if kind == EventKind.INVITE_TO_SPACE:
-            text = (
-                f"{inviter_label} invited me to space {space_label}. "
-                f"They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject — in this thread for "
-                f"this one, or a direct `y`/`n` for all your pending invites."
-            )
+            target = f"space {space_label}"
         else:
             channel_label = (
                 f"**{channel_name}**({channel_id})" if channel_name else channel_id
             )
-            text = (
-                f"{inviter_label} invited me to channel {channel_label} in "
-                f"space {space_label}. They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject — in this thread for "
-                f"this one, or a direct `y`/`n` for all your pending invites."
-            )
+            target = f"channel {channel_label} in space {space_label}"
+        text = format_permission_prompt(
+            f"{inviter_label} invited me to {target}. "
+            f"They aren't my registered operator — accept?",
+            reply_note=(
+                "a direct (non-threaded) `y`/`n` answers all your "
+                "pending invites at once"
+            ),
+        )
         try:
             envelope = await self._send_dm(self.operator_slug, text, root_id="")
         except Exception:

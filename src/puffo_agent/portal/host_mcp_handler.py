@@ -487,3 +487,32 @@ async def request_leave(
         channel_id=channel_id,
         reason=reason or "",
     )
+
+
+async def request_command_permission(
+    ctx: HostMcpContext,
+    *,
+    tool_name: str,
+    summary: str,
+    timeout_s: object,
+) -> str:
+    """PreToolUse hook asked for operator sign-off on a tool call —
+    hand off to the message client, which sends the ``/permission`` DM
+    and blocks until y/n or timeout. Returns allow/deny/timeout."""
+    client = ctx.message_client
+    if client is None:
+        raise RuntimeError(
+            "agent isn't fully warm yet — try again in a moment"
+        )
+    if not tool_name:
+        raise RuntimeError("tool_name is required")
+    try:
+        timeout = int(timeout_s) if timeout_s is not None else 300
+    except (TypeError, ValueError):
+        timeout = 300
+    timeout = max(5, min(timeout, 3600))
+    return await client.request_command_permission(
+        tool_name=str(tool_name),
+        summary=str(summary or ""),
+        timeout_s=timeout,
+    )

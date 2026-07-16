@@ -103,6 +103,17 @@ async def leave_request_route(request: web.Request) -> web.Response:
     )
 
 
+async def permission_request_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/permission-request —
+    ``{tool_name, summary, timeout_s}``. Long-polls until the operator
+    answers the ``/permission`` DM or the timeout lapses; the response
+    ``message`` is ``allow`` / ``deny`` / ``timeout``."""
+    return await _dispatch(
+        request, host_mcp_handler.request_command_permission,
+        body_keys=("tool_name", "summary", "timeout_s"),
+    )
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -116,6 +127,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/leave-request",
         leave_request_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/permission-request",
+        permission_request_route,
     )
     return app
 

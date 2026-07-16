@@ -272,5 +272,6 @@ def test_invite_prompt_copy_mentions_direct_all_pending():
     )
     with open(src_path, "r", encoding="utf-8") as fh:
         body = fh.read()
-    # both invite_to_space + invite_to_channel branches carry it
-    assert body.count("for all your pending invites") >= 2
+    # Space + channel branches share one format_permission_prompt call,
+    # so the bulk-reply note appears once and covers both.
+    assert "pending invites at once" in body
