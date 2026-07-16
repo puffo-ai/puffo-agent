@@ -68,11 +68,38 @@ def test_gate_wired_into_listen_before_admit():
     gate = src.index("_is_stale_for_catchup(payload.sent_at)")
     admit = src.index("_admit_thread_message(")
     assert gate < admit, "staleness gate must precede _admit_thread_message"
+    # The DB store must run BEFORE the gate — a skipped envelope is still
+    # persisted (AC #2). Pin the ordering so a refactor can't move the
+    # gate above the store.
+    store = src.index("self.store.store(")
+    assert store < gate, "store.store must precede the staleness gate"
     # The self-echo + invite/leave intercepts must run regardless of age,
     # so they sit ahead of the gate.
     self_echo = src.index("payload.sender_slug == self.slug")
     leave = src.index("_maybe_handle_leave_reply")
     assert self_echo < gate and leave < gate
+
+
+def _init_client(catchup_stale_hours: float) -> PuffoCoreMessageClient:
+    # Real __init__ with inert deps — exercises the float→ms computation.
+    return PuffoCoreMessageClient(
+        slug="t", device_id="d", space_id="s",
+        keystore=None, http_client=None, message_store=None,
+        catchup_stale_hours=catchup_stale_hours,
+    )
+
+
+def test_init_computes_ms_from_fractional_hours():
+    # 0.5h = 1_800_000 ms; the float→int conversion is exercised.
+    assert _init_client(0.5)._catchup_stale_ms == 1_800_000
+    assert _init_client(48.0)._catchup_stale_ms == _48H_MS
+
+
+def test_init_sub_millisecond_threshold_truncates_to_disabled():
+    # 1e-7 h = 0.36 ms → int truncates to 0 → gate disabled.
+    c = _init_client(1e-7)
+    assert c._catchup_stale_ms == 0
+    assert c._is_stale_for_catchup(0, _NOW) is False
 
 
 def test_daemon_config_default_is_48h():

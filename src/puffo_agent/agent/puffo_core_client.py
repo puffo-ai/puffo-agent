@@ -497,7 +497,9 @@ class PuffoCoreMessageClient:
         # PUF-384: on catch-up (WS reconnect / restart / resume), the
         # server redelivers backlog through the same handler. Envelopes
         # older than this skip the LLM pipeline (still get stored). <= 0
-        # disables the gate so nothing is ever skipped.
+        # disables the gate so nothing is ever skipped. A sub-millisecond
+        # positive threshold truncates to 0 ms and thus also disables via
+        # the >0 guard — an absurd edge, but safe by construction.
         self._catchup_stale_ms = (
             int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
         )
