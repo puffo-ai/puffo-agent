@@ -1592,7 +1592,8 @@ class PuffoCoreMessageClient:
             # real signed accept that's bouncing back over WS.
             # ``original_invite`` is the canonical marker — the
             # operator-signed path never embeds the source invite.
-            if not isinstance(payload.get("original_invite"), dict):
+            original_invite = payload.get("original_invite")
+            if not isinstance(original_invite, dict):
                 return
             space_id = payload.get("space_id") or ""
             channel_id = payload.get("channel_id") or ""
@@ -1609,6 +1610,13 @@ class PuffoCoreMessageClient:
                     "accepted channel (space=%s channel=%s)",
                     space_id, channel_id,
                 )
+            # Auto-accepts skip the /permission ask, so tell the
+            # operator after the fact rather than joining silently.
+            await self._report_auto_accepted_channel_invite(
+                inviter_slug=original_invite.get("signer_slug") or "",
+                space_id=space_id,
+                channel_id=channel_id,
+            )
             return
 
         # Membership-exit events. Pair-wise: the kick path
@@ -2103,6 +2111,39 @@ class PuffoCoreMessageClient:
         except Exception:
             self._log.exception(
                 "failed to report auto-accepted space invite to operator",
+            )
+
+    async def _report_auto_accepted_channel_invite(
+        self, *, inviter_slug: str, space_id: str, channel_id: str,
+    ) -> None:
+        """Tell the operator the server auto-accepted a space-owner's
+        channel invite on the agent's behalf (auto_accept_owner_invite).
+        Best-effort."""
+        if not self.operator_slug:
+            return
+        space_name = await self._resolve_space_name(space_id)
+        channel_name = await self._resolve_channel_name(
+            space_id=space_id, channel_id=channel_id,
+        )
+        space_label = f"**{space_name}**({space_id})" if space_name else space_id
+        channel_label = (
+            f"**{channel_name}**({channel_id})" if channel_name else channel_id
+        )
+        inviter_label = f"@{inviter_slug}" if inviter_slug else "the space owner"
+        if inviter_slug:
+            inviter_display = await self._fetch_display_name(inviter_slug)
+            if inviter_display:
+                inviter_label = f"**{inviter_display}**(@{inviter_slug})"
+        text = (
+            f"Auto-accepted {inviter_label}'s invite to channel "
+            f"{channel_label} in space {space_label} "
+            f"(space-owner invites are auto-accepted)."
+        )
+        try:
+            await self._send_dm(self.operator_slug, text, root_id="")
+        except Exception:
+            self._log.exception(
+                "failed to report auto-accepted channel invite to operator",
             )
 
     async def _inviter_is_operator(self, inviter_slug: str) -> bool:
