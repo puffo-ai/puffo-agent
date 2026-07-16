@@ -3223,6 +3223,13 @@ class PuffoCoreMessageClient:
         try:
             approved = await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
+            # Register before the notice send so a reply racing either
+            # window (pre-pop or later) gets the stale-prompt note.
+            self._timed_out_command_permissions[env_id] = time.time()
+            while len(self._timed_out_command_permissions) > 64:
+                self._timed_out_command_permissions.pop(
+                    next(iter(self._timed_out_command_permissions)),
+                )
             try:
                 await self._send_dm(
                     self.operator_slug,
@@ -3244,17 +3251,28 @@ class PuffoCoreMessageClient:
     ) -> bool:
         """Operator ``y``/``n`` on a pending command-permission DM.
         Threaded only. Returns ``True`` when consumed."""
-        fut = self._pending_command_permissions.get(thread_root_id)
-        # done() = wait_for already timed out but the entry isn't popped
-        # yet; a reply in that window must not be confirmed as acted-on.
-        if fut is None or fut.done():
-            return False
         normalized = text.strip().lower()
         if normalized in ("y", "yes"):
             approved = True
         elif normalized in ("n", "no"):
             approved = False
         else:
+            return False
+        # Late answer to an already-timed-out prompt: never claim it
+        # ran — tell them it's stale instead.
+        if thread_root_id in self._timed_out_command_permissions:
+            try:
+                await self._send_dm(
+                    self.operator_slug,
+                    "That request already timed out — I did NOT run it. "
+                    "Ask me to try again if you still want it.",
+                    root_id=thread_root_id,
+                )
+            except Exception:
+                self._log.exception("permission: failed to send stale note")
+            return True
+        fut = self._pending_command_permissions.get(thread_root_id)
+        if fut is None or fut.done():
             return False
         fut.set_result(approved)
         confirm = "Approved ✓ — running it." if approved else "Denied — I won't run it."

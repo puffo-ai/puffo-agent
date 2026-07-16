@@ -133,6 +133,7 @@ async def test_permission_request_end_to_end_over_socket(app_client_factory):
     client.slug = "agent-1"
     client.operator_slug = "op-1"
     client._pending_command_permissions = {}
+    client._timed_out_command_permissions = {}
     client._log = logging.getLogger("rpc-e2e-test")
     sent: list[dict] = []
 

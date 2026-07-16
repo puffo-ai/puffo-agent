@@ -49,6 +49,7 @@ def _make_client(*, operator_slug: str = "op-1"):
     client._pending_invite_dms = {}
     client._pending_leave_dms = {}
     client._pending_command_permissions = {}
+    client._timed_out_command_permissions = {}
     client._gate_left_spaces = set()
     client._last_dm_sender = ""
     client._log = logging.getLogger("permission-prompt-test")
@@ -205,11 +206,11 @@ async def test_command_permission_ignores_non_yn_reply():
 
 
 @pytest.mark.asyncio
-async def test_late_reply_in_timeout_window_is_not_confirmed():
-    """Race: wait_for already timed out (future cancelled) but the
-    pending entry isn't popped yet — a `y` landing while the timeout
-    notice is being sent must NOT get an "Approved — running it"
-    confirmation for a tool that never ran."""
+async def test_late_reply_in_timeout_window_gets_stale_note():
+    """Race: wait_for already timed out but the pending entry isn't
+    popped yet — a `y` landing while the timeout notice is being sent
+    must NOT get an "Approved — running it" confirmation for a tool
+    that never ran; it gets the stale-prompt note instead."""
     client = _make_client()
     orig_send = client._send_dm
     late: dict = {}
@@ -226,8 +227,47 @@ async def test_late_reply_in_timeout_window_is_not_confirmed():
         tool_name="Bash", summary="", timeout_s=0,
     )
     assert result == "timeout"
-    assert late["handled"] is False  # falls through to the LLM instead
+    assert late["handled"] is True  # consumed — not fed to the LLM
     assert not any("Approved" in d["text"] for d in client._sent_dms)
+    assert any("already timed out" in d["text"] for d in client._sent_dms)
+
+
+@pytest.mark.asyncio
+async def test_late_reply_after_timeout_gets_stale_note():
+    client = _make_client()
+    result = await client.request_command_permission(
+        tool_name="Bash", summary="", timeout_s=0,
+    )
+    assert result == "timeout"
+    prompt_env = client._sent_dms[0]["env_id"]
+    # Minutes later the operator replies in the dead prompt's thread.
+    handled = await client._maybe_handle_permission_reply(
+        thread_root_id=prompt_env, text="y",
+    )
+    assert handled is True
+    note = client._sent_dms[-1]
+    assert note["root_id"] == prompt_env
+    assert "already timed out" in note["text"]
+    # Non-y/n chatter in that thread still falls through to the LLM.
+    assert (
+        await client._maybe_handle_permission_reply(
+            thread_root_id=prompt_env, text="what was this about?",
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_timed_out_registry_is_capped():
+    client = _make_client()
+    for i in range(70):
+        client._timed_out_command_permissions[f"env_old_{i}"] = float(i)
+    await client.request_command_permission(
+        tool_name="Bash", summary="", timeout_s=0,
+    )
+    assert len(client._timed_out_command_permissions) <= 65
+    # Oldest evicted first; the fresh timeout is retained.
+    assert "env_old_0" not in client._timed_out_command_permissions
 
 
 @pytest.mark.asyncio
