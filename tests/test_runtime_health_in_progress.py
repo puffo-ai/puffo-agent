@@ -266,6 +266,7 @@ def test_chain_non_api_error_swallow_falls_back_to_unhandled_error(
 async def test_heartbeat_carries_both_status_and_health():
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
+    mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
     health_value = {"v": "in_progress"}
     reporter = StatusReporter(
         mock_http,
@@ -291,6 +292,7 @@ async def test_heartbeat_without_provider_omits_health_field():
     tests), heartbeat carries the legacy single-stream shape."""
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
+    mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
     reporter = StatusReporter(mock_http)
     reporter._current_status = "idle"
     await reporter._send_heartbeat()
@@ -304,6 +306,7 @@ async def test_heartbeat_without_provider_omits_health_field():
 async def test_heartbeat_provider_exception_does_not_break_heartbeat():
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
+    mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
 
     def broken_provider() -> str:
         raise RuntimeError("runtime not loaded")
