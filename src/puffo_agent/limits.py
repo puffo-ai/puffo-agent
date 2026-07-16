@@ -9,6 +9,5 @@ MAX_INLINE_MESSAGE_CHARS = 16000
 # the redaction placeholder cites it so paging stays aligned.
 MESSAGE_SEGMENT_CHARS = 8000
 
-# Catch-up backlog older than this is stored but skips the LLM
-# pipeline. <= 0 disables the gate.
+# Catch-up older than this is stored but skips the LLM; <= 0 disables.
 DEFAULT_CATCHUP_STALE_HOURS = 48.0

@@ -496,8 +496,7 @@ class PuffoCoreMessageClient:
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
         self._max_input_bytes = max(1, int(max_input_bytes))
-        # Catch-up backlog older than this skips the LLM (still
-        # stored). <= 0 disables the gate.
+        # Catch-up older than this skips the LLM (still stored); <= 0 disables.
         self._catchup_stale_ms = (
             int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
         )
@@ -581,9 +580,8 @@ class PuffoCoreMessageClient:
         self._log = _AgentLogger(logger, {"agent": self.slug})
 
     def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
-        """True when ``sent_at`` (ms epoch) is past the staleness
-        threshold: store the envelope but skip the LLM. <= 0 disables
-        so a mis-set config can never skip live traffic."""
+        """Past the staleness threshold → store but skip the LLM.
+        <= 0 disables so a mis-set config can't skip live traffic."""
         if self._catchup_stale_ms <= 0:
             return False
         if now_ms is None:
@@ -591,9 +589,8 @@ class PuffoCoreMessageClient:
         return sent_at < now_ms - self._catchup_stale_ms
 
     async def _report_stale_processed(self, envelope_id: str) -> None:
-        """Mark a gate-skipped envelope processed server-side (the
-        end:batch UPSERT skips it straight to green) so clients don't
-        show it pending forever. Best-effort."""
+        """Best-effort green run for a gate-skipped envelope so
+        clients don't show it pending forever."""
         try:
             await self.http.post(
                 "/messages/processing/end:batch",
@@ -797,9 +794,7 @@ class PuffoCoreMessageClient:
                     self._last_dm_sender = payload.sender_slug
                     return
 
-            # Staleness gate: redelivered catch-up backlog past the
-            # threshold is stored (above) but skips the LLM — no token
-            # burn, no late replies. Intercepts above run at any age.
+            # Stale catch-up backlog: stored above, skips the LLM.
             if self._is_stale_for_catchup(payload.sent_at):
                 self._log.info(
                     "handle_envelope: staleness-gate-skipped envelope=%s "

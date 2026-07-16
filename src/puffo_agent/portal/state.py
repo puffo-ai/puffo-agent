@@ -871,8 +871,7 @@ class DaemonConfig:
     # Guards session-lifetime growth; 16000 inlines typical code/log pastes.
     max_inline_message_chars: int = MAX_INLINE_MESSAGE_CHARS
     segment_chars: int = MESSAGE_SEGMENT_CHARS
-    # Catch-up backlog older than this is stored but skips the LLM.
-    # <= 0 disables. Fleet-wide; tune per host.
+    # Catch-up older than this is stored but skips the LLM; <= 0 disables.
     catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(

@@ -23,8 +23,7 @@ _NOW = 1_000_000_000_000
 
 
 def _client(catchup_stale_ms: int) -> PuffoCoreMessageClient:
-    """Bare client with only the staleness field set — enough to
-    exercise the predicate without the full listen() harness."""
+    """Bare client — just enough to exercise the predicate."""
     c = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     c._catchup_stale_ms = catchup_stale_ms
     return c
@@ -55,15 +54,13 @@ def test_negative_threshold_disables_gate():
 
 
 def test_now_ms_defaults_to_wall_clock():
-    # A huge-threshold client with an epoch-0 message is always stale
-    # under the real clock — exercises the now_ms=None branch.
+    # Epoch-0 is always stale under the real clock (now_ms=None branch).
     assert _client(_48H_MS)._is_stale_for_catchup(0) is True
 
 
 def test_gate_wired_into_listen_before_admit():
-    """handle_envelope is a closure inside listen(); pin the gate's
-    presence + ordering at the source level so a refactor can't silently
-    drop it or move it past the LLM-admit."""
+    """handle_envelope is a nested closure — pin the gate's ordering
+    at source level."""
     src = inspect.getsource(PuffoCoreMessageClient.listen)
     assert "_is_stale_for_catchup(payload.sent_at)" in src
     assert "staleness-gate-skipped" in src
@@ -126,8 +123,7 @@ def test_daemon_config_absent_key_defaults(tmp_path, monkeypatch):
 
 
 def _build_via_worker(monkeypatch, tmp_path, daemon_cfg):
-    """Drive worker._build_puffo_core_client with stubbed heavy deps;
-    returns the kwargs the client constructor received."""
+    """Build via the worker with stubbed deps; returns ctor kwargs."""
     from puffo_agent.portal import worker
     from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig, RuntimeConfig
 
