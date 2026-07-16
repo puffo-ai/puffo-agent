@@ -251,7 +251,6 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     client.operator_slug = operator_slug
     client.auto_accept_dm = auto_accept_dm
     client._pending_dm_approvals = {}
-    client._dm_allowlisted_senders = set()
     client._last_dm_sender = ""
     client._log = logging.getLogger("auto-accept-dm-test")
 
@@ -289,6 +288,8 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
         return owner_of.get(slug, "")
 
     client.http = _StubHttp()
+    from puffo_agent.agent.contact_cache import ContactCache
+    client._contacts = ContactCache(client.http, client._log)
     client._send_dm = _stub_send_dm  # type: ignore[assignment]
     client._fetch_user_profile = _stub_fetch_user_profile  # type: ignore[assignment]
     client._fetch_owner_slug = _stub_fetch_owner_slug  # type: ignore[assignment]
@@ -402,7 +403,7 @@ async def test_approval_y_allowlists_and_drains_pending_dms(tmp_path):
     )
     assert handled is True
     assert ("/allowlists", {"slugs": ["alice-1234"]}) in client._posts
-    assert "alice-1234" in client._dm_allowlisted_senders
+    assert "alice-1234" in client._contacts._allow
     assert client._pending_dm_approvals == {}
     # Drain scoped-fetched alice's pending DMs + fed them through on_message.
     assert any("kind=dm" in g and "sender=alice-1234" in g for g in client._gets)
@@ -610,3 +611,76 @@ def test_mcp_tool_names_list_has_new_tools():
 
     assert "add_dm_allowlist" in PUFFO_CORE_TOOL_NAMES
     assert "update_dm_blocklist" in PUFFO_CORE_TOOL_NAMES
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Outbound-implies-allowlist (agent DMs a foreign peer first)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_outbound_dm_allowlists_foreign_peer_and_notifies_operator():
+    client = _make_client(auto_accept_dm=False)
+    await client._maybe_allowlist_outbound_dm("charlie-9")
+    assert ("/allowlists", {"slugs": ["charlie-9"]}) in client._posts
+    assert "charlie-9" in client._contacts._allow
+    op_dms = [d for d in client._sent_dms if d["to"] == "op-1"]
+    assert len(op_dms) == 1
+    assert "charlie-9" in op_dms[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_outbound_dm_to_operator_or_co_owned_is_noop():
+    client = _make_client(auto_accept_dm=False)
+    client._owner_of["sibling-agt"] = "op-1"
+    await client._maybe_allowlist_outbound_dm("op-1")
+    await client._maybe_allowlist_outbound_dm("sibling-agt")
+    assert client._posts == []
+    assert client._sent_dms == []
+
+
+@pytest.mark.asyncio
+async def test_outbound_dm_to_pending_sender_does_not_allowlist():
+    client = _make_client(auto_accept_dm=False)
+    # Sender we're currently gating; the ack DM to them echoes back here
+    # and must NOT pre-empt the operator's pending y/n.
+    client._pending_dm_approvals["prompt-1"] = {
+        "sender_slug": "dave-7", "sender_display_name": "Dave",
+    }
+    await client._maybe_allowlist_outbound_dm("dave-7")
+    assert client._posts == []
+    assert "dave-7" not in client._contacts._allow
+
+
+@pytest.mark.asyncio
+async def test_outbound_dm_to_already_allowed_peer_is_noop():
+    import time
+    client = _make_client(auto_accept_dm=False)
+    client._contacts.note_allowed("erin-3")
+    client._contacts._fetched_at = time.monotonic()  # hydrated + fresh
+    await client._maybe_allowlist_outbound_dm("erin-3")
+    assert client._posts == []
+    assert client._sent_dms == []
+
+
+def test_blocked_channel_message_drop_is_wired_in_handle_envelope():
+    """handle_envelope is a closure inside listen(); pin the blocked-
+    sender channel-drop branch at source level so a revert can't slip
+    past the unit tests (the full path is exercised by live smoke)."""
+    import inspect
+    from puffo_agent.agent import puffo_core_client as pcc
+
+    src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
+    assert 'payload.envelope_kind != "dm"' in src
+    assert "_contacts.is_blocked(payload.sender_slug)" in src
+    assert "_BLOCKED_MESSAGE_PLACEHOLDER" in src
+
+
+def test_gate_consults_contact_cache_for_allowlist():
+    """The DM gate must bypass allowlisted senders via the shared cache
+    (not an ad-hoc set), so an operator/MCP allowlist takes effect."""
+    import inspect
+    from puffo_agent.agent import puffo_core_client as pcc
+
+    src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
+    assert "await self._contacts.is_allowed(payload.sender_slug)" in src

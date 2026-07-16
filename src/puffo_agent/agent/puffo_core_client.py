@@ -28,6 +28,7 @@ from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
+from .contact_cache import ContactCache
 from .core import AgentAPIError
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
@@ -78,6 +79,10 @@ _DM_GATE_SENDER_ACK = (
     "Thanks — your message has reached me. I've asked my operator to "
     "approve our conversation, and I'll reply as soon as they do."
 )
+
+# Stored in place of a blocked account's channel-message body: keeps the
+# thread/seq metadata intact for history reads without the content.
+_BLOCKED_MESSAGE_PLACEHOLDER = "[message from a blocked account was dropped]"
 
 
 @dataclass
@@ -557,10 +562,6 @@ class PuffoCoreMessageClient:
         self._pending_dm_approvals: dict[str, dict[str, Any]] = (
             load_pending_dm_approvals(self.slug)
         )
-        # Senders the operator has already allowlisted in this session.
-        # Server-side allowlist is the source of truth; this is a hot-path
-        # cache to skip the per-DM /allowlists check.
-        self._dm_allowlisted_senders: set[str] = set()
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
@@ -584,6 +585,11 @@ class PuffoCoreMessageClient:
         # ``[<agent_slug>]`` prefix so multi-agent daemon logs are
         # filterable per agent.
         self._log = _AgentLogger(logger, {"agent": self.slug})
+
+        # Operator's DM allowlist + blocklist, hydrated from the server.
+        # Single source for every allow/block read (gate, channel drop,
+        # outbound allowlist) — don't hit /allowlists + /blocklists ad hoc.
+        self._contacts = ContactCache(self.http, self._log)
 
     async def listen(
         self,
@@ -706,6 +712,35 @@ class PuffoCoreMessageClient:
             validated_reply_to_id = await self._validate_incoming_parent_id(
                 payload.reply_to_id, payload.channel_id, payload.space_id,
             )
+            # Blocked account's CHANNEL message. The server only drops
+            # blocked senders on the DM path — channel posts fan out to
+            # every member unfiltered — so we drop it here: persist a
+            # redacted placeholder (keeps thread/seq metadata for history)
+            # and ack it, without ever handing the envelope to the agent.
+            if (
+                payload.envelope_kind != "dm"
+                and payload.sender_slug != self.slug
+                and await self._contacts.is_blocked(payload.sender_slug)
+            ):
+                await self.store.store({
+                    "envelope_id": payload.envelope_id,
+                    "envelope_kind": payload.envelope_kind,
+                    "sender_slug": payload.sender_slug,
+                    "channel_id": payload.channel_id,
+                    "space_id": payload.space_id,
+                    "recipient_slug": payload.recipient_slug,
+                    "content_type": "text/plain",
+                    "content": _BLOCKED_MESSAGE_PLACEHOLDER,
+                    "sent_at": payload.sent_at,
+                    "thread_root_id": validated_thread_root_id,
+                    "reply_to_id": validated_reply_to_id,
+                })
+                self._log.info(
+                    "contact: dropped channel message from blocked %s "
+                    "(redacted placeholder stored)",
+                    payload.sender_slug,
+                )
+                return
             await self.store.store({
                 "envelope_id": payload.envelope_id,
                 "envelope_kind": payload.envelope_kind,
@@ -733,6 +768,11 @@ class PuffoCoreMessageClient:
             # it again would feed the agent its own words and trip a
             # turn-by-turn echo loop.
             if payload.sender_slug == self.slug:
+                # Agent-initiated DM to a foreign peer implies consent to
+                # that conversation (like a human DMing first) — allowlist
+                # them so their reply isn't gated.
+                if payload.envelope_kind == "dm":
+                    await self._maybe_allowlist_outbound_dm(payload.recipient_slug)
                 return
 
             # Daemon-side intercept: ``y``/``n`` from the operator on an
@@ -800,7 +840,7 @@ class PuffoCoreMessageClient:
             if (
                 is_dm
                 and not self.auto_accept_dm
-                and payload.sender_slug not in self._dm_allowlisted_senders
+                and not await self._contacts.is_allowed(payload.sender_slug)
                 and await self._is_foreign_dm_sender(payload.sender_slug)
             ):
                 gated = await self._maybe_gate_foreign_dm(
@@ -989,6 +1029,10 @@ class PuffoCoreMessageClient:
         # the warmup. Worst case the first message pays the lazy
         # fetch as before.
         warm_task = asyncio.ensure_future(self._warm_member_caches())
+        # Hydrate the allow/block cache so a restart doesn't re-gate
+        # already-allowlisted senders. Fire-and-forget; a cache miss
+        # before it lands refreshes lazily.
+        asyncio.ensure_future(self._contacts.refresh())
 
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
@@ -3326,6 +3370,53 @@ class PuffoCoreMessageClient:
             return False
         return True
 
+    async def _maybe_allowlist_outbound_dm(self, recipient_slug: str) -> None:
+        """Agent DM'd a foreign peer first → allowlist them (their reply
+        shouldn't need approval) and tell the operator. Best-effort."""
+        if not recipient_slug:
+            return
+        # Never allowlist a sender we're currently gating: the ack DM we
+        # send them echoes back here, and honoring it would pre-empt the
+        # operator's pending y/n.
+        if any(
+            m.get("sender_slug") == recipient_slug
+            for m in self._pending_dm_approvals.values()
+        ):
+            return
+        # Cheap check first: operator / self / co-owned short-circuit
+        # before is_allowed can hit the network (the daemon DMs the
+        # operator constantly — those must not each trigger a refresh).
+        if not await self._is_foreign_dm_sender(recipient_slug):
+            return
+        if await self._contacts.is_allowed(recipient_slug):
+            return
+        try:
+            await self.http.post("/allowlists", {"slugs": [recipient_slug]})
+        except Exception as exc:
+            self._log.warning(
+                "dm_gate: outbound allowlist for %s failed: %s",
+                recipient_slug, exc,
+            )
+            return
+        self._contacts.note_allowed(recipient_slug)
+        if not self.operator_slug:
+            return
+        display = await self._fetch_display_name(recipient_slug)
+        label = (
+            f"**{display}**(@{recipient_slug})" if display else f"@{recipient_slug}"
+        )
+        try:
+            await self._send_dm(
+                self.operator_slug,
+                f"Allowlisted {label} — I messaged them first, so their "
+                "replies won't need approval.",
+                root_id="",
+            )
+        except Exception:
+            self._log.exception(
+                "dm_gate: failed to notify operator of outbound allowlist",
+            )
+
     async def _maybe_gate_foreign_dm(
         self,
         *,
@@ -3430,7 +3521,7 @@ class PuffoCoreMessageClient:
                 await self.http.post(
                     "/allowlists", {"slugs": [sender_slug]},
                 )
-                self._dm_allowlisted_senders.add(sender_slug)
+                self._contacts.note_allowed(sender_slug)
                 await self._drain_pending_from_sender(sender_slug)
                 confirm = (
                     f"Allowed DMs from **{sender_label}** ({sender_slug}). ✓"
@@ -3439,6 +3530,7 @@ class PuffoCoreMessageClient:
                 await self.http.post(
                     "/blocklists", {"target": "user", "id": sender_slug},
                 )
+                self._contacts.note_blocked(sender_slug, True)
                 await self._drop_pending_from_sender(sender_slug)
                 confirm = (
                     f"Blocked **{sender_label}** ({sender_slug}). "

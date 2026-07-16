@@ -109,6 +109,23 @@ class PuffoCoreToolsConfig:
     message_client: Any = None
 
 
+def _note_contact(
+    cfg: "PuffoCoreToolsConfig", slug: str, *,
+    allowed: bool = False, blocked: Optional[bool] = None,
+) -> None:
+    """Reflect an allowlist/blocklist write into the in-process contact
+    cache when the tool runs inside the daemon (ws-local). Out-of-process
+    runtimes (cli-local) pick it up via the cache's TTL / miss refresh."""
+    mc = getattr(cfg, "message_client", None)
+    contacts = getattr(mc, "_contacts", None) if mc is not None else None
+    if contacts is None:
+        return
+    if allowed:
+        contacts.note_allowed(slug)
+    if blocked is not None:
+        contacts.note_blocked(slug, blocked)
+
+
 async def _fetch_device_keys(
     http_client: PuffoCoreHttpClient,
     slugs: list[str],
@@ -1300,6 +1317,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         if not target:
             raise RuntimeError("slug is required")
         await cfg.http_client.post("/allowlists", {"slugs": [target]})
+        _note_contact(cfg, target, allowed=True)
         return f"allowlisted {target}"
 
     @mcp.tool()
@@ -1320,9 +1338,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             await cfg.http_client.post(
                 "/blocklists", {"target": "user", "id": target},
             )
+            _note_contact(cfg, target, blocked=True)
             return f"blocked {target}"
         await cfg.http_client.delete(
             "/blocklists", body={"id": target},
         )
+        _note_contact(cfg, target, blocked=False)
         return f"unblocked {target}"
 
