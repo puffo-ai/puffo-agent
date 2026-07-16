@@ -14,11 +14,14 @@ that CLI flag is non-interactive-mode only.
 
 Env vars set by the spawning adapter:
 
-  PUFFO_URL                base URL (required)
-  PUFFO_BOT_TOKEN          bot's personal access token (required)
-  PUFFO_OPERATOR_USERNAME  who to DM (required; empty -> fail-open)
-  PUFFO_AGENT_ID           shown in the DM (default "unknown")
-  PUFFO_PERMISSION_TIMEOUT poll timeout seconds (default 300)
+  PUFFO_URL                legacy base URL (with PUFFO_BOT_TOKEN)
+  PUFFO_BOT_TOKEN          legacy bot token
+  PUFFO_RPC_URL            puffo-core daemon rpc — used when the
+                           legacy pair is absent; daemon DMs the
+                           operator a /permission card
+  PUFFO_OPERATOR_USERNAME  who to DM (legacy path; empty -> fail-open)
+  PUFFO_AGENT_ID           agent id (rpc path routing + shown in DM)
+  PUFFO_PERMISSION_TIMEOUT decision timeout seconds (default 300)
 
 stdlib-only (urllib + json + time + sys + os) so it can run from
 a minimal interpreter without importing the rest of puffo-agent.
@@ -182,9 +185,40 @@ def poll_for_reply(
     return None
 
 
+def request_via_rpc(
+    rpc_url: str,
+    agent_id: str,
+    tool_name: str,
+    summary: str,
+    timeout_s: int,
+) -> None:
+    """puffo-core transport: the daemon DMs the operator and
+    long-polls the y/n; translate its decision into the PreToolUse
+    exit protocol. Never returns."""
+    try:
+        resp = _http_post(
+            f"{rpc_url.rstrip('/')}/v1/rpc/{agent_id}/permission-request",
+            {"Content-Type": "application/json"},
+            {"tool_name": tool_name, "summary": summary, "timeout_s": timeout_s},
+            # Pad past the daemon's decision window.
+            timeout=timeout_s + 30,
+        )
+    except Exception as exc:
+        _fail_open(f"daemon permission request failed: {exc}")
+    decision = (resp.get("message") or "").strip().lower()
+    if decision == "allow":
+        _allow("operator approved via chat")
+    if decision == "deny":
+        _deny("operator denied via chat")
+    if decision == "timeout":
+        _deny(f"permission request timed out after {timeout_s}s (no operator reply)")
+    _fail_open(f"unexpected daemon decision {decision!r}")
+
+
 def main() -> None:
     base_url = (os.environ.get("PUFFO_URL") or "").rstrip("/")
     bot_token = os.environ.get("PUFFO_BOT_TOKEN") or ""
+    rpc_url = os.environ.get("PUFFO_RPC_URL") or ""
     operator = os.environ.get("PUFFO_OPERATOR_USERNAME") or ""
     agent_id = os.environ.get("PUFFO_AGENT_ID") or "unknown"
     try:
@@ -192,7 +226,22 @@ def main() -> None:
     except ValueError:
         timeout_s = 300
 
+    # No legacy creds (puffo-core deployment) → route through the
+    # daemon's rpc service, which DMs the operator a /permission card.
     if not (base_url and bot_token):
+        if rpc_url:
+            try:
+                raw = sys.stdin.read() or "{}"
+                payload = json.loads(raw)
+            except Exception as exc:
+                _fail_open(f"could not parse hook payload: {exc}")
+            request_via_rpc(
+                rpc_url,
+                agent_id,
+                payload.get("tool_name", "unknown"),
+                summarise_tool_input(payload.get("tool_input", {})),
+                timeout_s,
+            )
         _fail_open("PUFFO_URL / PUFFO_BOT_TOKEN not set")
     if not operator:
         _fail_open("PUFFO_OPERATOR_USERNAME empty — no operator to DM")
