@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stale channel cache self-heals (PUF-376).** A membership event
+  dropped during a WS reconnect used to leave a genuinely-member
+  channel unaddressable by `send_message` until a daemon restart.
+  The member/channel cache now re-warms on every (re)connect, and a
+  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
+  failing loud — on every runtime, including the cli-local /
+  cli-docker data-service path.
+
 ### Added
 
 - **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon

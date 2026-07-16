@@ -1011,8 +1011,7 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = handle_envelope
         self._ws.on_event = self._handle_event
-        # Warm the member/channel caches on every (re)connect
-        # (covers the first connect — no separate startup warm).
+        # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
         await self.store.open()
         try:
@@ -2376,9 +2375,7 @@ class PuffoCoreMessageClient:
         return parent_id
 
     async def rewarm_channel_caches(self) -> None:
-        """On-miss cache re-warm, serialized + 5s-debounced so a burst
-        of misses doesn't stampede the server. A full warm re-syncs
-        every channel at once, so one miss heals the rest."""
+        """On-miss re-warm; serialized + 5s-debounced (no stampede)."""
         async with self._rewarm_lock:
             now = time.monotonic()
             if now - self._last_rewarm < 5.0:
@@ -2387,10 +2384,7 @@ class PuffoCoreMessageClient:
             self._last_rewarm = now
 
     async def _on_ws_connect(self) -> None:
-        """Re-warm on every (re)connect so a membership event missed in
-        the reconnect window self-heals. Fire-and-forget so catch-up
-        isn't blocked; the handle is kept — asyncio only weak-refs
-        scheduled tasks."""
+        """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
         self._warm_task = asyncio.ensure_future(self._warm_member_caches())
 
     async def _warm_member_caches(self) -> None:
@@ -2449,9 +2443,8 @@ class PuffoCoreMessageClient:
         )
 
     async def _warm_channels_for_space(self, space_id: str) -> None:
-        # Invariant: GET /spaces/<sid>/channels is membership-filtered
-        # server-side — presence proves membership, absence proves not.
-        # The cache self-heal rests on this; a test pins it.
+        # Invariant: this endpoint is membership-filtered server-side;
+        # the cache self-heal rests on that (a test pins it).
         try:
             resp = await self.http.get(f"/spaces/{space_id}/channels")
         except Exception:

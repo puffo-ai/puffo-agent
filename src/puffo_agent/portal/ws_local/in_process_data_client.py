@@ -33,9 +33,7 @@ class InProcessDataClient:
     async def lookup_channel_space(self, channel_id: str) -> str | None:
         space_id = await self._store.lookup_channel_space(channel_id)
         if space_id is None and channel_id.startswith("ch_"):
-            # A member channel can be missing if its membership event was
-            # dropped in a reconnect window — re-warm (membership-filtered)
-            # and re-check before the caller fails loud.
+            # Reconnect-dropped membership event → re-warm, re-check.
             await self._client.rewarm_channel_caches()
             space_id = await self._store.lookup_channel_space(channel_id)
         return space_id

@@ -49,8 +49,7 @@ def set_profile_setter(
     _PROFILE_SETTER = fn
 
 
-# Resolves an agent's live PuffoCoreMessageClient so a ``ch_`` lookup
-# miss can re-warm the channel cache before failing loud.
+# Resolves an agent's live message client for the on-miss re-warm.
 _CLIENT_RESOLVER: Optional[Callable[[str], Any]] = None
 
 
@@ -126,9 +125,7 @@ async def lookup_channel_space(request: web.Request) -> web.Response:
     try:
         space_id = await store.lookup_channel_space(channel_id)
         if not space_id and channel_id.startswith("ch_"):
-            # Same self-heal as the in-process path: a membership event
-            # dropped in a reconnect window leaves a member channel
-            # uncached — re-warm from the server, then re-check.
+            # Reconnect-dropped membership event → re-warm, re-check.
             client = _client_for(agent_id)
             if client is not None:
                 await client.rewarm_channel_caches()
