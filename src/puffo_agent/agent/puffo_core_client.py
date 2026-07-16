@@ -73,6 +73,12 @@ DEFAULT_MAX_INPUT_BYTES = 180 * 1000
 # near-boundary split lands one turn early, never over the cap.
 _BLOCK_METADATA_OVERHEAD_BYTES = 2048
 
+# Auto-reply to a foreign sender whose first DM is held pending approval.
+_DM_GATE_SENDER_ACK = (
+    "Thanks — your message has reached me. I've asked my operator to "
+    "approve our conversation, and I'll reply as soon as they do."
+)
+
 
 @dataclass
 class _ThreadEntry:
@@ -3386,6 +3392,15 @@ class PuffoCoreMessageClient:
         except OSError as exc:
             self._log.warning(
                 "auto_accept_dm: failed to persist pending state: %s", exc,
+            )
+        # Let the sender know their DM landed and is awaiting approval so
+        # they're not left waiting on silence. Once per sender (duplicates
+        # returned above); best-effort — never blocks the gate.
+        try:
+            await self._send_dm(sender_slug, _DM_GATE_SENDER_ACK)
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to ack sender %s: %s", sender_slug, exc,
             )
         self._log.info(
             "auto_accept_dm: prompted operator for %s (thread %s); DM held "

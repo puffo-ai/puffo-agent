@@ -343,7 +343,8 @@ async def test_gate_buffers_foreign_dm_and_prompts_operator(tmp_path):
         text="hello agent",
     )
     assert handled is True
-    assert len(client._sent_dms) == 1
+    # Operator prompt + a one-time ack back to the sender.
+    assert len(client._sent_dms) == 2
     sent = client._sent_dms[0]
     assert sent["to"] == "op-1"
     # `/permission` prefix → Yes/No buttons in the operator's client.
@@ -353,6 +354,10 @@ async def test_gate_buffers_foreign_dm_and_prompts_operator(tmp_path):
     prompt_env = sent["env_id"]
     assert prompt_env in client._pending_dm_approvals
     assert client._pending_dm_approvals[prompt_env]["sender_slug"] == "alice-1234"
+    # Sender is told the DM landed and is awaiting approval.
+    ack = client._sent_dms[1]
+    assert ack["to"] == "alice-1234"
+    assert not ack["text"].startswith("/permission")
 
 
 @pytest.mark.asyncio
@@ -370,7 +375,11 @@ async def test_gate_drops_duplicate_sender_while_pending(tmp_path):
         sender_slug="alice-1234", text="bothering you again",
     )
     assert handled is True
-    assert len(client._sent_dms) == 1
+    # Duplicate re-gated but NOT re-prompted: one operator prompt + one
+    # sender ack from the first gate, nothing from the second.
+    op_prompts = [d for d in client._sent_dms if d["to"] == "op-1"]
+    assert len(op_prompts) == 1
+    assert len(client._sent_dms) == 2
 
 
 @pytest.mark.asyncio
