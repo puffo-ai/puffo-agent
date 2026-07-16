@@ -422,8 +422,8 @@ async def update_runtime(request: web.Request) -> web.Response:
 
     Accepts any subset of: ``kind``, ``provider``, ``model``,
     ``harness``, ``api_key``, ``permission_mode``, ``sandbox``,
-    ``allowed_tools``, ``docker_image``, ``max_turns``. Missing fields
-    are untouched. ``harness`` editing requires the corresponding CLI
+    ``inference_level``, ``allowed_tools``, ``docker_image``,
+    ``max_turns``. Missing fields are untouched. ``harness`` editing requires the corresponding CLI
     to already be installed + authenticated on the host
     (`claude login` / `codex login` / ...) — the worker will hit
     auth_failed on first turn otherwise. validate_triple below
@@ -473,6 +473,15 @@ async def update_runtime(request: web.Request) -> web.Response:
                 "danger-full-access"
             )
         rt.sandbox = sandbox
+    if "inference_level" in payload:
+        from ...mcp.config import INFERENCE_LEVELS
+
+        level = str(payload["inference_level"])
+        if level and level not in INFERENCE_LEVELS:
+            return _bad(
+                "inference_level must be one of: " + ", ".join(INFERENCE_LEVELS)
+            )
+        rt.inference_level = level
     if "allowed_tools" in payload:
         tools = payload["allowed_tools"]
         if not isinstance(tools, list):

@@ -236,6 +236,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             owner_username=operator,
             permission_mode=agent_cfg.runtime.permission_mode,
             sandbox=agent_cfg.runtime.sandbox,
+            inference_level=agent_cfg.runtime.inference_level,
             task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
             harness=harness,
             desired_skills=agent_cfg.desired_skills,

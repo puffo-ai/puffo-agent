@@ -279,12 +279,14 @@ async def execute_command(
         if isinstance(params.get("soul"), str):
             patch["soul"] = params["soul"]
             prompt_changed = True
-        # Runtime block (kind/provider/harness/model) — same fields the local
-        # bridge's update_runtime accepts; reject invalid triples before saving.
+        # Runtime block — same fields the local bridge's update_runtime
+        # accepts; reject invalid triples before saving. inference_level is
+        # the web's per-harness effort selector (codex-only for now; xhigh
+        # dropped at config.toml write), trust-in like the other fields here.
         rt_in = params.get("runtime")
         if isinstance(rt_in, dict):
             rt = cfg.runtime
-            for key in ("kind", "provider", "harness", "model"):
+            for key in ("kind", "provider", "harness", "model", "inference_level"):
                 if isinstance(rt_in.get(key), str):
                     setattr(rt, key, rt_in[key])
                     runtime_changed = True

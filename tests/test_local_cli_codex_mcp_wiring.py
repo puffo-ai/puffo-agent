@@ -359,3 +359,57 @@ def test_bundle_discovery_composes_with_stale_symlink_retarget(tmp_path, monkeyp
         assert os.readlink(link) == str(bundle_codex)
     finally:
         cli_bin._resolve_memcache.clear()
+
+
+# ── PUF-373: inference_level plumbs adapter → writer → real config.toml ──
+
+
+def _codex_config_after_inference(tmp_path, monkeypatch, *, inference_level, puffo_core_env):
+    from puffo_agent.agent.adapters import local_cli as lc
+
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(lc, "is_macos", lambda: False)
+    monkeypatch.setattr(lc, "sync_host_codex_auth_view", lambda *a, **k: "shared")
+    monkeypatch.setattr(lc, "resolve_codex_bin", lambda: "/opt/homebrew/bin/codex")
+
+    class _Stop:
+        def __init__(self, *a, **k):
+            raise RuntimeError("stop before spawn")
+
+    monkeypatch.setattr(lc, "CodexSession", _Stop)
+    adapter = _make_adapter(tmp_path, puffo_core_env=puffo_core_env)
+    adapter.inference_level = inference_level
+    with pytest.raises(RuntimeError):
+        adapter._ensure_codex_session()
+    codex_home = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / adapter.agent_id / ".codex"
+    return tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+
+
+def test_inference_level_reaches_config_toml_with_puffo_core(tmp_path, monkeypatch):
+    # End-to-end: adapter plumbs inference_level → the with-puffo_core writer
+    # call site → model_reasoning_effort in the real config.toml on disk.
+    doc = _codex_config_after_inference(
+        tmp_path, monkeypatch, inference_level="high",
+        puffo_core_env={"PUFFO_CORE_SLUG": "a", "PUFFO_WORKSPACE": str(tmp_path)},
+    )
+    assert doc["model_reasoning_effort"] == "high"
+    assert "puffo" in (doc.get("mcp_servers") or {})
+
+
+def test_inference_level_reaches_config_toml_without_puffo_core(tmp_path, monkeypatch):
+    # The without-puffo_core call site plumbs it too.
+    doc = _codex_config_after_inference(
+        tmp_path, monkeypatch, inference_level="low", puffo_core_env=None,
+    )
+    assert doc["model_reasoning_effort"] == "low"
+
+
+def test_xhigh_inference_level_drops_at_writer(tmp_path, monkeypatch):
+    # xhigh reaches the adapter but must not land in config.toml for Codex.
+    doc = _codex_config_after_inference(
+        tmp_path, monkeypatch, inference_level="xhigh", puffo_core_env=None,
+    )
+    assert "model_reasoning_effort" not in doc

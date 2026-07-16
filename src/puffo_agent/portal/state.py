@@ -1018,6 +1018,11 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
+    # PUF-373: provider-agnostic inference level (the web's inference_level
+    # selector: low | medium | high | xhigh). Empty = harness default. For a
+    # Codex agent it's emitted as model_reasoning_effort in config.toml
+    # (xhigh dropped — Codex has no xhigh tier).
+    inference_level: str = ""
     # codex (cli-local) per-turn wall-clock budget in seconds; raise for
     # agents running long reasoning/complex tasks.
     task_timeout_seconds: float = 600.0
@@ -1119,6 +1124,7 @@ class AgentConfig:
                 docker_memory_reservation=rt.get("docker_memory_reservation", ""),
                 permission_mode=rt.get("permission_mode", "bypassPermissions"),
                 sandbox=rt.get("sandbox", "danger-full-access"),
+                inference_level=rt.get("inference_level", ""),
                 task_timeout_seconds=float(rt.get("task_timeout_seconds", 600.0)),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),

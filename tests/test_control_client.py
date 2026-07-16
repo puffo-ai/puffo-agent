@@ -304,3 +304,13 @@ async def test_refresh_usage_without_server_url_errors():
     res = await cc.execute_command("refresh_usage", None, {})
     assert res["ok"] is False
     assert "server_url" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_edit_applies_inference_level(home):
+    # PUF-373: a remote edit (web → linked machine) must apply inference_level
+    # onto the runtime block, not silently drop it.
+    write_test_agent(home, "scout")
+    res = await execute_command("edit", "scout", {"runtime": {"inference_level": "high"}})
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").runtime.inference_level == "high"

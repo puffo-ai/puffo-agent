@@ -160,6 +160,7 @@ class LocalCLIAdapter(Adapter):
         owner_username: str = "",
         permission_mode: str = "default",
         sandbox: str = "danger-full-access",
+        inference_level: str = "",
         task_timeout_seconds: float = 600.0,
         harness=None,
         desired_skills: list[str] | None = None,
@@ -181,6 +182,7 @@ class LocalCLIAdapter(Adapter):
         self.owner_username = owner_username
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
         self.sandbox = _sanitise_sandbox(sandbox, agent_id)
+        self.inference_level = inference_level
         self.task_timeout_seconds = task_timeout_seconds
         self.desired_skills = list(desired_skills or [])
         self.desired_mcps = list(desired_mcps or [])
@@ -355,11 +357,13 @@ class LocalCLIAdapter(Adapter):
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
                 env=self.puffo_core_mcp_env,
                 extra_servers=merged_extras,
+                inference_level=self.inference_level,
             )
         else:
             write_codex_mcp_config(
                 codex_home / "config.toml",
                 extra_servers=merged_extras,
+                inference_level=self.inference_level,
             )
             logger.warning(
                 "agent %s: codex MCP tools unavailable — puffo_core is "

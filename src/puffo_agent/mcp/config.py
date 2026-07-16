@@ -13,13 +13,29 @@ that form.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import site
 import sys
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
+
+# PUF-373: provider-agnostic inference-level enum, mirroring the web's
+# ``AgentCoreInferenceLevel``. The web selector sends ``runtime.inference_level``
+# and its allowed values differ per harness (Vase 2026-07-16): Codex offers
+# low/medium/high, Claude adds xhigh. This is the full superset used to
+# validate the field; the per-harness narrowing happens at emit time.
+INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
+
+# codex `model_reasoning_effort` accepted values (codex-cli). An inference_level
+# is emitted to a Codex agent's config.toml only when it's one of these — so
+# ``xhigh`` (a Claude-only level) is dropped for Codex, which has no xhigh tier.
+# ``minimal`` has no web-selector entry but stays reachable via a direct
+# agent.yml edit for advanced users.
+REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -96,6 +112,7 @@ def write_codex_mcp_config(
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     extra_servers: dict[str, dict] | None = None,
+    inference_level: str | None = None,
 ) -> Path:
     """Serialise the per-agent codex config.toml.
 
@@ -117,6 +134,21 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
+    # PUF-373: map the provider-agnostic inference_level to codex's
+    # model_reasoning_effort. Top-level key must precede any
+    # [mcp_servers.*] table. Only codex-valid levels are emitted — xhigh
+    # (Claude-only) is dropped here rather than written as a config codex
+    # rejects at model-invocation. Web-set values are already constrained
+    # to low/medium/high for Codex; this guards yaml/bridge edits.
+    if inference_level:
+        if inference_level in REASONING_EFFORTS:
+            lines.append(f'model_reasoning_effort = "{inference_level}"')
+        else:
+            logger.warning(
+                "dropping inference_level %r for codex (no matching "
+                "model_reasoning_effort; expected one of %s)",
+                inference_level, ", ".join(REASONING_EFFORTS),
+            )
     # Host extras first so the puffo entry below shadows any duplicate.
     for name, spec in sorted((extra_servers or {}).items()):
         if name == MCP_SERVER_NAME:
