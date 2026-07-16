@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon
+  restart / resume-from-pause, redelivered messages older than
+  `catchup_stale_hours` (daemon.yml, default 48; `<= 0` disables) are
+  stored to chat history and reported processed server-side, but skip
+  the LLM pipeline — no token burn replaying old context, no late
+  replies into conversations that have moved on.
+
 - **cli-local command permission over puffo-core.** The PreToolUse hook
   gains a daemon transport: when the legacy `PUFFO_URL`/`PUFFO_BOT_TOKEN`
   pair is absent, it POSTs `/v1/rpc/{agent}/permission-request` and the

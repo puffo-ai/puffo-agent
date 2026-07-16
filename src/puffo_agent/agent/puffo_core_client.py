@@ -11,11 +11,16 @@ import logging
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
-from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+from ..limits import (
+    DEFAULT_CATCHUP_STALE_HOURS,
+    MAX_INLINE_MESSAGE_CHARS,
+    MESSAGE_SEGMENT_CHARS,
+)
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
@@ -467,6 +472,7 @@ class PuffoCoreMessageClient:
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+        catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -490,6 +496,10 @@ class PuffoCoreMessageClient:
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
         self._max_input_bytes = max(1, int(max_input_bytes))
+        # Catch-up older than this skips the LLM (still stored); <= 0 disables.
+        self._catchup_stale_ms = (
+            int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
+        )
         self._image_edge_px = int(image_edge_px) or _DEFAULT_IMAGE_EDGE_PX
         self.keystore = keystore
         self.http = http_client
@@ -568,6 +578,32 @@ class PuffoCoreMessageClient:
         # ``[<agent_slug>]`` prefix so multi-agent daemon logs are
         # filterable per agent.
         self._log = _AgentLogger(logger, {"agent": self.slug})
+
+    def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
+        """Past the staleness threshold → store but skip the LLM.
+        <= 0 disables so a mis-set config can't skip live traffic."""
+        if self._catchup_stale_ms <= 0:
+            return False
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        return sent_at < now_ms - self._catchup_stale_ms
+
+    async def _report_stale_processed(self, envelope_id: str) -> None:
+        """Best-effort green run for a gate-skipped envelope so
+        clients don't show it pending forever."""
+        try:
+            await self.http.post(
+                "/messages/processing/end:batch",
+                {"runs": [{
+                    "run_id": f"run_{uuid.uuid4().hex}",
+                    "message_id": envelope_id,
+                    "succeeded": True,
+                }]},
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.debug(
+                "stale-processed report failed for %s: %s", envelope_id, exc,
+            )
 
     async def listen(
         self,
@@ -757,6 +793,18 @@ class PuffoCoreMessageClient:
                 ):
                     self._last_dm_sender = payload.sender_slug
                     return
+
+            # Stale catch-up backlog: stored above, skips the LLM.
+            if self._is_stale_for_catchup(payload.sent_at):
+                self._log.info(
+                    "handle_envelope: staleness-gate-skipped envelope=%s "
+                    "(sent_at=%d, threshold_ms=%d, root=%s) — stored, no LLM",
+                    payload.envelope_id, payload.sent_at,
+                    self._catchup_stale_ms,
+                    payload_thread_root_id or payload.envelope_id,
+                )
+                await self._report_stale_processed(payload.envelope_id)
+                return
 
             channel_id = payload.channel_id or ""
             is_dm = payload.envelope_kind == "dm"
