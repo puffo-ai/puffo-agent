@@ -8,6 +8,38 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon
+  restart / resume-from-pause, redelivered messages older than
+  `catchup_stale_hours` (daemon.yml, default 48; `<= 0` disables) are
+  stored to chat history and reported processed server-side, but skip
+  the LLM pipeline — no token burn replaying old context, no late
+  replies into conversations that have moved on.
+
+- **cli-local command permission over puffo-core.** The PreToolUse hook
+  gains a daemon transport: when the legacy `PUFFO_URL`/`PUFFO_BOT_TOKEN`
+  pair is absent, it POSTs `/v1/rpc/{agent}/permission-request` and the
+  daemon DMs the operator a `/permission` card, resolves their threaded
+  `y`/`n`, and returns allow/deny/timeout for the hook's exit protocol.
+  A late reply to a timed-out request gets an "already timed out — I did
+  NOT run it" note instead of a false confirmation.
+
+- **Operator report on auto-accepted channel invites.** Space-owner
+  channel invites are server-auto-accepted with no approval ask; the
+  agent now DMs the operator an informational report (inviter, channel,
+  space) instead of joining silently.
+
+### Changed
+
+- **Every operator y/n ask now renders as a `/permission` card.** Space
+  and channel invite prompts and agent-requested leave approvals build
+  their DM through one shared constructor, so web/mobile clients show
+  consistent Yes/No buttons that post `y`/`n` into the prompt's thread —
+  the same replies the daemon already accepts.
+
+## [1.1.2] — 2026-07-14
+
+### Added
+
 - **Report each machine's CLI usage-budget to puffo-server (PUF-364).**
   The daemon probes every installed runtime's plan budget — claude-code
   via `claude -p /usage`, codex via a throwaway app-server driven through
@@ -25,6 +57,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   instead of silence (and says whether the codex session was reset).
 
 ### Fixed
+
+- **Stop the CLI's model-usage-cap fallback from leaking to operators
+  (PUF-380).** A `You've reached your <Model> limit. Run /usage-credits …`
+  line from the harness now matches the worker's non-auth leak filter.
+  The pattern is model-agnostic and apostrophe-robust, so future models and
+  curly-quote variants are covered without another one-off.
 
 - **codex mid-reconnect turn failures no longer drop the batch or flip
   a false red (PUF-375).** A `turn failed: Reconnecting... N/M` from

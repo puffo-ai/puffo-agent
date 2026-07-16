@@ -32,7 +32,11 @@ from typing import Any
 import psutil
 import yaml
 
-from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+from ..limits import (
+    DEFAULT_CATCHUP_STALE_HOURS,
+    MAX_INLINE_MESSAGE_CHARS,
+    MESSAGE_SEGMENT_CHARS,
+)
 
 
 # Where daemon.yml, agents/, etc. live.
@@ -867,6 +871,8 @@ class DaemonConfig:
     # Guards session-lifetime growth; 16000 inlines typical code/log pastes.
     max_inline_message_chars: int = MAX_INLINE_MESSAGE_CHARS
     segment_chars: int = MESSAGE_SEGMENT_CHARS
+    # Catch-up older than this is stored but skips the LLM; <= 0 disables.
+    catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -895,6 +901,9 @@ class DaemonConfig:
                 raw.get("max_inline_message_chars", MAX_INLINE_MESSAGE_CHARS)
             ),
             segment_chars=int(raw.get("segment_chars", MESSAGE_SEGMENT_CHARS)),
+            catchup_stale_hours=float(
+                raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
+            ),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
@@ -939,6 +948,7 @@ class DaemonConfig:
             "docker_memory_reservation": self.docker_memory_reservation,
             "max_inline_message_chars": self.max_inline_message_chars,
             "segment_chars": self.segment_chars,
+            "catchup_stale_hours": self.catchup_stale_hours,
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),

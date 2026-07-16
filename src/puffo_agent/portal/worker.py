@@ -21,7 +21,11 @@ from typing import Awaitable, Callable, Optional
 
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
-from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+from ..limits import (
+    DEFAULT_CATCHUP_STALE_HOURS,
+    MAX_INLINE_MESSAGE_CHARS,
+    MESSAGE_SEGMENT_CHARS,
+)
 from ..agent.status_reporter import StatusReporter
 from .runtime_matrix import (
     RUNTIME_CLI_DOCKER,
@@ -375,6 +379,11 @@ def _build_puffo_core_client(
     segment_chars = (
         daemon_cfg.segment_chars if daemon_cfg is not None else MESSAGE_SEGMENT_CHARS
     )
+    catchup_stale_hours = (
+        daemon_cfg.catchup_stale_hours
+        if daemon_cfg is not None
+        else DEFAULT_CATCHUP_STALE_HOURS
+    )
 
     # The inbound-image downscale cap follows the harness's effective model
     # (Opus 4.7+ resolves 2576px, else 1568px).
@@ -402,6 +411,7 @@ def _build_puffo_core_client(
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
         max_input_bytes=max_input_bytes,
+        catchup_stale_hours=catchup_stale_hours,
     )
 
 
@@ -427,6 +437,8 @@ _NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     # Subscription-plan quotas (the prod miss the reviewer surfaced).
     re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
+    # Model-usage-cap fallback ("reached your <Model> limit …"); model-agnostic + apostrophe-robust (`.?`).
+    re.compile(r"^\s*You.?ve reached your\b.*?\blimit\b", re.IGNORECASE),
     re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
     # CLI-emitted server 429 / 5xx.
     re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
