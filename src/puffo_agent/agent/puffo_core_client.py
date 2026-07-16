@@ -15,7 +15,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
-from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+from ..limits import (
+    DEFAULT_CATCHUP_STALE_HOURS,
+    MAX_INLINE_MESSAGE_CHARS,
+    MESSAGE_SEGMENT_CHARS,
+)
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
@@ -466,6 +470,7 @@ class PuffoCoreMessageClient:
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+        catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -489,6 +494,13 @@ class PuffoCoreMessageClient:
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
         self._max_input_bytes = max(1, int(max_input_bytes))
+        # PUF-384: on catch-up (WS reconnect / restart / resume), the
+        # server redelivers backlog through the same handler. Envelopes
+        # older than this skip the LLM pipeline (still get stored). <= 0
+        # disables the gate so nothing is ever skipped.
+        self._catchup_stale_ms = (
+            int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
+        )
         self._image_edge_px = int(image_edge_px) or _DEFAULT_IMAGE_EDGE_PX
         self.keystore = keystore
         self.http = http_client
@@ -564,6 +576,18 @@ class PuffoCoreMessageClient:
         # ``[<agent_slug>]`` prefix so multi-agent daemon logs are
         # filterable per agent.
         self._log = _AgentLogger(logger, {"agent": self.slug})
+
+    def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
+        """True when ``sent_at`` (ms since epoch) is older than the
+        catch-up staleness threshold — the envelope should be stored but
+        skip the LLM pipeline. Returns False (gate disabled) when the
+        threshold is <= 0, so a mis-set config can never skip live
+        traffic."""
+        if self._catchup_stale_ms <= 0:
+            return False
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        return sent_at < now_ms - self._catchup_stale_ms
 
     async def listen(
         self,
@@ -747,6 +771,24 @@ class PuffoCoreMessageClient:
                 ):
                     self._last_dm_sender = payload.sender_slug
                     return
+
+            # PUF-384: catch-up staleness gate. On WS reconnect / daemon
+            # restart / resume-from-pause the server redelivers backlog
+            # through this same handler. The envelope is already stored
+            # above; if it's older than the threshold, skip the LLM
+            # pipeline so the agent doesn't burn tokens replaying old
+            # context or fire late replies into moved-on conversations.
+            # Self-echo + invite/leave intercepts above run regardless of
+            # age; live deliveries are seconds-old and pass the gate.
+            if self._is_stale_for_catchup(payload.sent_at):
+                self._log.info(
+                    "handle_envelope: staleness-gate-skipped envelope=%s "
+                    "(sent_at=%d, threshold_ms=%d, root=%s) — stored, no LLM",
+                    payload.envelope_id, payload.sent_at,
+                    self._catchup_stale_ms,
+                    payload_thread_root_id or payload.envelope_id,
+                )
+                return
 
             channel_id = payload.channel_id or ""
             is_dm = payload.envelope_kind == "dm"

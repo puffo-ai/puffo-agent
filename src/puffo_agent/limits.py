@@ -8,3 +8,8 @@ MAX_INLINE_MESSAGE_CHARS = 16000
 # Page size (chars) that ``get_post_segment`` returns redacted bodies in;
 # the redaction placeholder cites it so paging stays aligned.
 MESSAGE_SEGMENT_CHARS = 8000
+
+# PUF-384: on catch-up (reconnect/restart/resume), inbound messages older
+# than this many hours are stored to chat history but skip the LLM
+# pipeline. <= 0 disables the gate.
+DEFAULT_CATCHUP_STALE_HOURS = 48.0
