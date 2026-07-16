@@ -2,13 +2,15 @@
 
 On WS reconnect / daemon restart / resume-from-pause the server
 redelivers backlog through ``handle_envelope``. Messages older than
-``catchup_stale_hours`` are stored to chat history but skip the LLM
-pipeline so the agent doesn't burn tokens replaying old context or fire
-late replies into conversations that have moved on.
+``catchup_stale_hours`` are stored to chat history and reported
+processed server-side, but skip the LLM pipeline.
 """
 from __future__ import annotations
 
 import inspect
+import logging
+
+import pytest
 
 import puffo_agent.portal.state as state
 from puffo_agent.agent.puffo_core_client import (
@@ -76,6 +78,9 @@ def test_gate_wired_into_listen_before_admit():
     leave = src.index("_maybe_handle_leave_reply")
     permission = src.index("_maybe_handle_permission_reply")
     assert self_echo < gate and leave < gate and permission < gate
+    # A skipped envelope is still reported processed server-side.
+    report = src.index("_report_stale_processed(payload.envelope_id)")
+    assert gate < report < admit
 
 
 def _init_client(catchup_stale_hours: float) -> PuffoCoreMessageClient:
@@ -173,3 +178,37 @@ def test_worker_threads_catchup_stale_hours(monkeypatch, tmp_path):
 def test_worker_defaults_catchup_stale_hours_without_daemon_cfg(monkeypatch, tmp_path):
     captured = _build_via_worker(monkeypatch, tmp_path, None)
     assert captured.get("catchup_stale_hours") == DEFAULT_CATCHUP_STALE_HOURS
+
+
+class _StubHttp:
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.posts: list[tuple[str, dict]] = []
+
+    async def post(self, path, body):
+        if self.fail:
+            raise RuntimeError("server unreachable")
+        self.posts.append((path, body))
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_report_stale_processed_posts_green_run():
+    c = _client(_48H_MS)
+    c.http = _StubHttp()
+    c._log = logging.getLogger("staleness-test")
+    await c._report_stale_processed("msg_old_1")
+    path, body = c.http.posts[0]
+    assert path == "/messages/processing/end:batch"
+    (run,) = body["runs"]
+    assert run["message_id"] == "msg_old_1"
+    assert run["succeeded"] is True
+    assert run["run_id"].startswith("run_")
+
+
+@pytest.mark.asyncio
+async def test_report_stale_processed_swallows_http_failure():
+    c = _client(_48H_MS)
+    c.http = _StubHttp(fail=True)
+    c._log = logging.getLogger("staleness-test")
+    await c._report_stale_processed("msg_old_1")  # must not raise

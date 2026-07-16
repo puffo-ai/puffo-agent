@@ -11,6 +11,7 @@ import logging
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
@@ -589,6 +590,24 @@ class PuffoCoreMessageClient:
             now_ms = int(time.time() * 1000)
         return sent_at < now_ms - self._catchup_stale_ms
 
+    async def _report_stale_processed(self, envelope_id: str) -> None:
+        """Mark a gate-skipped envelope processed server-side (the
+        end:batch UPSERT skips it straight to green) so clients don't
+        show it pending forever. Best-effort."""
+        try:
+            await self.http.post(
+                "/messages/processing/end:batch",
+                {"runs": [{
+                    "run_id": f"run_{uuid.uuid4().hex}",
+                    "message_id": envelope_id,
+                    "succeeded": True,
+                }]},
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.debug(
+                "stale-processed report failed for %s: %s", envelope_id, exc,
+            )
+
     async def listen(
         self,
         on_message: Callable[..., Coroutine[Any, Any, Any]],
@@ -789,6 +808,7 @@ class PuffoCoreMessageClient:
                     self._catchup_stale_ms,
                     payload_thread_root_id or payload.envelope_id,
                 )
+                await self._report_stale_processed(payload.envelope_id)
                 return
 
             channel_id = payload.channel_id or ""
