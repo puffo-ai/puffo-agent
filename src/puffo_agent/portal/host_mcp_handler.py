@@ -496,9 +496,8 @@ async def request_command_permission(
     summary: str,
     timeout_s: object,
 ) -> str:
-    """PreToolUse hook asked for operator sign-off on a tool call —
-    hand off to the message client, which sends the ``/permission`` DM
-    and blocks until y/n or timeout. Returns allow/deny/timeout."""
+    """Hand a hook's permission ask to the message client; blocks
+    until y/n or timeout. Returns allow/deny/timeout."""
     client = ctx.message_client
     if client is None:
         raise RuntimeError(

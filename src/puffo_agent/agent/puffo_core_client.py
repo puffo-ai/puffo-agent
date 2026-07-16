@@ -543,8 +543,7 @@ class PuffoCoreMessageClient:
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
         # cli-local command-permission prompts awaiting operator y/n,
-        # keyed by prompt-DM envelope_id. In-memory only — the hook
-        # times out and re-asks after a daemon restart.
+        # keyed by prompt-DM envelope_id. In-memory only.
         self._pending_command_permissions: dict[str, asyncio.Future[bool]] = {}
 
         # channel_id → space_id learned from inbound envelopes. The
@@ -1609,8 +1608,7 @@ class PuffoCoreMessageClient:
                     "accepted channel (space=%s channel=%s)",
                     space_id, channel_id,
                 )
-            # Auto-accepts skip the /permission ask, so tell the
-            # operator after the fact rather than joining silently.
+            # No /permission ask on auto-accept — report, don't join silently.
             await self._report_auto_accepted_channel_invite(
                 inviter_slug=original_invite.get("signer_slug") or "",
                 space_id=space_id,
@@ -2115,9 +2113,8 @@ class PuffoCoreMessageClient:
     async def _report_auto_accepted_channel_invite(
         self, *, inviter_slug: str, space_id: str, channel_id: str,
     ) -> None:
-        """Tell the operator the server auto-accepted a space-owner's
-        channel invite on the agent's behalf (auto_accept_owner_invite).
-        Best-effort."""
+        """Best-effort operator report for a server-auto-accepted
+        owner channel invite."""
         if not self.operator_slug:
             return
         # Names only — raw ids are operator noise.
@@ -3204,10 +3201,8 @@ class PuffoCoreMessageClient:
     async def request_command_permission(
         self, *, tool_name: str, summary: str, timeout_s: int,
     ) -> str:
-        """DM the operator a ``/permission`` prompt for a tool call the
-        PreToolUse hook intercepted, and block until they answer or the
-        timeout lapses. Returns ``"allow"`` / ``"deny"`` / ``"timeout"``
-        for the hook to translate into its exit protocol."""
+        """Block on the operator's y/n for a hook-intercepted tool
+        call. Returns ``allow`` / ``deny`` / ``timeout``."""
         if not self.operator_slug:
             raise RuntimeError("no operator_slug configured")
         text = format_permission_prompt(
@@ -3223,8 +3218,8 @@ class PuffoCoreMessageClient:
         try:
             approved = await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
-            # Register before the notice send so a reply racing either
-            # window (pre-pop or later) gets the stale-prompt note.
+            # Register before the notice send — a racing reply must
+            # see the timeout.
             self._timed_out_command_permissions[env_id] = time.time()
             while len(self._timed_out_command_permissions) > 64:
                 self._timed_out_command_permissions.pop(
@@ -3258,8 +3253,7 @@ class PuffoCoreMessageClient:
             approved = False
         else:
             return False
-        # Late answer to an already-timed-out prompt: never claim it
-        # ran — tell them it's stale instead.
+        # Late answer to a timed-out prompt: never claim it ran.
         if thread_root_id in self._timed_out_command_permissions:
             try:
                 await self._send_dm(

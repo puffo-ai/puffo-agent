@@ -192,17 +192,15 @@ def request_via_rpc(
     summary: str,
     timeout_s: int,
 ) -> None:
-    """puffo-core transport: the daemon owns the operator DM. POST the
-    request to the daemon's rpc service, which sends a ``/permission``
-    DM and long-polls the y/n for us; translate its decision into the
-    PreToolUse exit protocol. Never returns."""
+    """puffo-core transport: the daemon DMs the operator and
+    long-polls the y/n; translate its decision into the PreToolUse
+    exit protocol. Never returns."""
     try:
         resp = _http_post(
             f"{rpc_url.rstrip('/')}/v1/rpc/{agent_id}/permission-request",
             {"Content-Type": "application/json"},
             {"tool_name": tool_name, "summary": summary, "timeout_s": timeout_s},
-            # The daemon holds the request open for the whole decision
-            # window; pad so the transport outlives it.
+            # Pad past the daemon's decision window.
             timeout=timeout_s + 30,
         )
     except Exception as exc:

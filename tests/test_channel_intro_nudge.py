@@ -573,8 +573,7 @@ async def test_handle_event_fires_intro_on_synthetic_auto_accept():
 
 @pytest.mark.asyncio
 async def test_synthetic_auto_accept_reports_to_operator():
-    """Auto-accepting must not be silent — the operator gets an
-    informational DM naming the inviter, channel, and space."""
+    """Auto-accepts DM the operator a report instead of joining silently."""
     store = await _make_store()
     client = _make_client(store)
     client.slug = "agent-1"

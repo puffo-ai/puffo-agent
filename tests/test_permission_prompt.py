@@ -207,10 +207,8 @@ async def test_command_permission_ignores_non_yn_reply():
 
 @pytest.mark.asyncio
 async def test_late_reply_in_timeout_window_gets_stale_note():
-    """Race: wait_for already timed out but the pending entry isn't
-    popped yet — a `y` landing while the timeout notice is being sent
-    must NOT get an "Approved — running it" confirmation for a tool
-    that never ran; it gets the stale-prompt note instead."""
+    """A `y` racing the timeout-notice send must get the stale note,
+    never "Approved — running it" for a tool that never ran."""
     client = _make_client()
     orig_send = client._send_dm
     late: dict = {}
