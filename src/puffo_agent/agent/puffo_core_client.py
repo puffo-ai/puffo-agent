@@ -562,10 +562,10 @@ class PuffoCoreMessageClient:
         # the message arrived from. Falls back to ``self.space_id``
         # when no inbound envelope on this channel has been seen.
         self._channel_space: dict[str, str] = {}
-        # PUF-376: serialize + debounce on-demand cache re-warms so
-        # concurrent channel-cache misses don't stampede the server.
+        # Serialize + debounce on-demand cache re-warms (no stampede).
         self._rewarm_lock = asyncio.Lock()
         self._last_rewarm = 0.0
+        self._warm_task: asyncio.Future | None = None
 
         # Lazy caches for human-readable space + channel names; names
         # aren't on the WS payload so we resolve via ``GET /spaces``
@@ -1011,9 +1011,8 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = handle_envelope
         self._ws.on_event = self._handle_event
-        # Warm the member/channel caches on every (re)connect (PUF-376).
-        # Fires on the first connect too, so no separate startup warm
-        # task is needed; fire-and-forget so it doesn't block listen.
+        # Warm the member/channel caches on every (re)connect
+        # (covers the first connect — no separate startup warm).
         self._ws.on_connect = self._on_ws_connect
         await self.store.open()
         try:
@@ -1021,7 +1020,11 @@ class PuffoCoreMessageClient:
         finally:
             consumer_task.cancel()
             invite_poll_task.cancel()
-            for task in (consumer_task, invite_poll_task):
+            if self._warm_task is not None:
+                self._warm_task.cancel()
+            for task in (consumer_task, invite_poll_task, self._warm_task):
+                if task is None:
+                    continue
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -2373,18 +2376,9 @@ class PuffoCoreMessageClient:
         return parent_id
 
     async def rewarm_channel_caches(self) -> None:
-        """On-demand re-warm when a cache-miss looks like a genuinely-
-        member channel dropped during a WS reconnect (PUF-376 α).
-        Serialized + 5s-debounced so a burst of misses doesn't stampede
-        the server; no-op if a re-warm already ran in the last few
-        seconds.
-
-        Trade-off: a *different* channel that goes stale within the 5s
-        window won't get its own re-warm and fails loud until the window
-        lapses — acceptable because a full warm re-syncs *all* the
-        agent's channels at once (one miss heals the rest), and the
-        on-(re)connect warm covers the steady state.
-        """
+        """On-miss cache re-warm, serialized + 5s-debounced so a burst
+        of misses doesn't stampede the server. A full warm re-syncs
+        every channel at once, so one miss heals the rest."""
         async with self._rewarm_lock:
             now = time.monotonic()
             if now - self._last_rewarm < 5.0:
@@ -2393,15 +2387,11 @@ class PuffoCoreMessageClient:
             self._last_rewarm = now
 
     async def _on_ws_connect(self) -> None:
-        """Re-warm caches on every (re)connect so a membership event
-        missed during the reconnect window self-heals rather than
-        staying stale until a daemon restart (PUF-376 γ). Fire-and-
-        forget so it doesn't block catch-up / listen — unlike the
-        on-miss path (``rewarm_channel_caches`` behind
-        ``lookup_channel_space``), which awaits because it must re-check
-        the store before deciding to fail loud.
-        """
-        asyncio.ensure_future(self._warm_member_caches())
+        """Re-warm on every (re)connect so a membership event missed in
+        the reconnect window self-heals. Fire-and-forget so catch-up
+        isn't blocked; the handle is kept — asyncio only weak-refs
+        scheduled tasks."""
+        self._warm_task = asyncio.ensure_future(self._warm_member_caches())
 
     async def _warm_member_caches(self) -> None:
         """Background prefetch on ``listen()`` startup: walks ``GET
@@ -2459,14 +2449,9 @@ class PuffoCoreMessageClient:
         )
 
     async def _warm_channels_for_space(self, space_id: str) -> None:
-        # PUF-376 invariant: GET /spaces/<sid>/channels is filtered by
-        # channel membership server-side. The self-heal rests on this —
-        # a channel appearing here proves membership, absence proves
-        # non-membership. If the server ever returns all space channels
-        # regardless of membership, the re-warm silently regresses to
-        # proving space-access (the bug the removed /spaces fallback
-        # had). test_channel_cache_selfheal pins it: a non-member
-        # channel must NOT get cached.
+        # Invariant: GET /spaces/<sid>/channels is membership-filtered
+        # server-side — presence proves membership, absence proves not.
+        # The cache self-heal rests on this; a test pins it.
         try:
             resp = await self.http.get(f"/spaces/{space_id}/channels")
         except Exception:

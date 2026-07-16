@@ -49,6 +49,28 @@ def set_profile_setter(
     _PROFILE_SETTER = fn
 
 
+# Resolves an agent's live PuffoCoreMessageClient so a ``ch_`` lookup
+# miss can re-warm the channel cache before failing loud.
+_CLIENT_RESOLVER: Optional[Callable[[str], Any]] = None
+
+
+def set_client_resolver(fn: Optional[Callable[[str], Any]]) -> None:
+    """Daemon-side hook; ``None`` clears (tests + shutdown)."""
+    global _CLIENT_RESOLVER
+    _CLIENT_RESOLVER = fn
+
+
+def _client_for(agent_id: str) -> Any:
+    resolver = _CLIENT_RESOLVER
+    if resolver is None:
+        return None
+    try:
+        return resolver(agent_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("data-service: client resolver raised")
+        return None
+
+
 @dataclass
 class _AppState:
     # One MessageStore per agent_id, opened lazily and held for the
@@ -103,6 +125,14 @@ async def lookup_channel_space(request: web.Request) -> web.Response:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
         space_id = await store.lookup_channel_space(channel_id)
+        if not space_id and channel_id.startswith("ch_"):
+            # Same self-heal as the in-process path: a membership event
+            # dropped in a reconnect window leaves a member channel
+            # uncached — re-warm from the server, then re-check.
+            client = _client_for(agent_id)
+            if client is not None:
+                await client.rewarm_channel_caches()
+                space_id = await store.lookup_channel_space(channel_id)
     except Exception as exc:
         logger.exception(
             "data-service: lookup_channel_space failed (agent=%s ch=%s)",

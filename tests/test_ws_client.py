@@ -492,9 +492,8 @@ async def test_callback_exception_does_not_kill_loop():
 
 @pytest.mark.asyncio
 async def test_on_connect_failure_does_not_kill_the_loop():
-    """PUF-376: on_connect fires the cache re-warm; a warm that throws
-    (e.g. a network blip mid-warm) must not tear down the connection —
-    catch-up + listen still run."""
+    """An on_connect callback that throws must not tear down the
+    connection — catch-up + listen still run."""
     ks, _ = _make_keystore()
     server = FakeWsServer()
     await server.start()

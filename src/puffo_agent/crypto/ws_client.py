@@ -58,8 +58,7 @@ class PuffoCoreWsClient:
         self.on_event: EventHandler | None = None
         self.on_cert_update: CertHandler | None = None
         # Fires after every successful (re)connect handshake, before
-        # catch-up. Lets the daemon re-warm caches that a reconnect
-        # window may have left stale (PUF-376).
+        # catch-up — lets the daemon re-warm reconnect-stale caches.
         self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
 
     def _build_connect_frame(self) -> str:

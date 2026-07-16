@@ -1,15 +1,6 @@
-"""PUF-376: channel-cache self-heal.
-
-A membership event missed during a WS reconnect used to leave a
-genuinely-member channel uncached — send-path fail-loud with no
-self-heal until daemon restart, while list-path (server-query) showed
-it. Fixes:
-  (α) on a ``ch_`` cache-miss the in-process data client re-warms from
-      the server (membership-filtered) + re-checks before failing loud.
-  (γ) the warm re-runs on every WS (re)connect, not just first connect.
-Plus Nova's membership-filter invariant: the warm only caches channels
-the server returns (proving membership), never all space channels.
-"""
+"""Channel-cache self-heal: on a ``ch_`` lookup miss the data
+clients re-warm from the server (membership-filtered) and re-check
+before failing loud; the warm also re-runs on every WS (re)connect."""
 
 from __future__ import annotations
 
@@ -69,7 +60,7 @@ async def test_lookup_hit_skips_rewarm():
     daemon.rewarm_channel_caches.assert_not_awaited()
 
 
-# ── membership-filter invariant (Nova's insurance) ───────────────────
+# ── membership-filter invariant ──────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_warm_caches_only_server_returned_channels(monkeypatch):
@@ -121,3 +112,111 @@ async def test_rewarm_is_debounced():
     await client.rewarm_channel_caches()
     await client.rewarm_channel_caches()  # within the 5s window → skipped
     assert len(calls) == 1
+
+
+# ── data-service (cli-local / cli-docker MCP path) on-miss re-warm ───
+
+def _isolated_home() -> str:
+    import os
+    import tempfile
+    from pathlib import Path
+
+    home = tempfile.mkdtemp(prefix="puffo-agent-selfheal-")
+    os.environ["PUFFO_AGENT_HOME"] = home
+    os.environ["PUFFO_HOME"] = home
+    Path(home, "agents").mkdir(parents=True, exist_ok=True)
+    return home
+
+
+async def _seed_empty_agent(home: str, agent_id: str):
+    from pathlib import Path
+
+    from puffo_agent.agent.message_store import MessageStore
+
+    agent_path = Path(home) / "agents" / agent_id
+    agent_path.mkdir(parents=True, exist_ok=True)
+    db_path = agent_path / "messages.db"
+    store = MessageStore(db_path)
+    await store.open()
+    await store.close()
+    return db_path
+
+
+@pytest.mark.asyncio
+async def test_data_service_lookup_rewarms_and_heals():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.agent.message_store import MessageStore
+    from puffo_agent.portal import data_service as ds
+
+    home = _isolated_home()
+    db_path = await _seed_empty_agent(home, "agent-heal-1")
+
+    class _FakeClient:
+        async def rewarm_channel_caches(self):
+            # The real warm writes through to the same messages.db.
+            store = MessageStore(db_path)
+            await store.open()
+            await store.mark_channel_space("ch_healed", "sp_9")
+            await store.close()
+
+    ds.set_client_resolver(lambda aid: _FakeClient() if aid == "agent-heal-1" else None)
+    try:
+        app = ds.build_app(ds.DataServiceConfig())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/v1/data/agent-heal-1/channels/ch_healed/space")
+            assert resp.status == 200
+            assert (await resp.json())["space_id"] == "sp_9"
+    finally:
+        ds.set_client_resolver(None)
+
+
+@pytest.mark.asyncio
+async def test_data_service_lookup_404_when_rewarm_doesnt_heal():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.portal import data_service as ds
+
+    home = _isolated_home()
+    await _seed_empty_agent(home, "agent-heal-2")
+    rewarmed: list[int] = []
+
+    class _FakeClient:
+        async def rewarm_channel_caches(self):
+            rewarmed.append(1)
+
+    ds.set_client_resolver(lambda aid: _FakeClient())
+    try:
+        app = ds.build_app(ds.DataServiceConfig())
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.get("/v1/data/agent-heal-2/channels/ch_ghost/space")
+            assert resp.status == 404
+            assert rewarmed == [1]  # tried; authoritative miss
+    finally:
+        ds.set_client_resolver(None)
+
+
+@pytest.mark.asyncio
+async def test_data_service_lookup_404_without_resolver():
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from puffo_agent.portal import data_service as ds
+
+    home = _isolated_home()
+    await _seed_empty_agent(home, "agent-heal-3")
+    ds.set_client_resolver(None)
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/v1/data/agent-heal-3/channels/ch_x/space")
+        assert resp.status == 404
+
+
+def test_daemon_registers_client_resolver():
+    """Source pin: the daemon wires + clears the data-service resolver."""
+    import inspect
+
+    from puffo_agent.portal import daemon as daemon_mod
+
+    src = inspect.getsource(daemon_mod)
+    assert "set_client_resolver(self._resolve_message_client)" in src
+    assert "set_client_resolver(None)" in src
