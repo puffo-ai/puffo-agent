@@ -14,11 +14,14 @@ that CLI flag is non-interactive-mode only.
 
 Env vars set by the spawning adapter:
 
-  PUFFO_URL                base URL (required)
-  PUFFO_BOT_TOKEN          bot's personal access token (required)
-  PUFFO_OPERATOR_USERNAME  who to DM (required; empty -> fail-open)
-  PUFFO_AGENT_ID           shown in the DM (default "unknown")
-  PUFFO_PERMISSION_TIMEOUT poll timeout seconds (default 300)
+  PUFFO_URL                legacy base URL (with PUFFO_BOT_TOKEN)
+  PUFFO_BOT_TOKEN          legacy bot token
+  PUFFO_RPC_URL            puffo-core daemon rpc — used when the
+                           legacy pair is absent; daemon DMs the
+                           operator a /permission card
+  PUFFO_OPERATOR_USERNAME  who to DM (legacy path; empty -> fail-open)
+  PUFFO_AGENT_ID           agent id (rpc path routing + shown in DM)
+  PUFFO_PERMISSION_TIMEOUT decision timeout seconds (default 300)
 
 stdlib-only (urllib + json + time + sys + os) so it can run from
 a minimal interpreter without importing the rest of puffo-agent.
@@ -225,10 +228,8 @@ def main() -> None:
     except ValueError:
         timeout_s = 300
 
-    # puffo-core deployments have no PUFFO_URL/PUFFO_BOT_TOKEN — route
-    # through the daemon's rpc service instead (it DMs the operator a
-    # /permission card). Legacy Mattermost transport keeps priority
-    # when both are configured.
+    # No legacy creds (puffo-core deployment) → route through the
+    # daemon's rpc service, which DMs the operator a /permission card.
     if not (base_url and bot_token):
         if rpc_url:
             try:

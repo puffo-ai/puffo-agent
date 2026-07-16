@@ -205,6 +205,32 @@ async def test_command_permission_ignores_non_yn_reply():
 
 
 @pytest.mark.asyncio
+async def test_late_reply_in_timeout_window_is_not_confirmed():
+    """Race: wait_for already timed out (future cancelled) but the
+    pending entry isn't popped yet — a `y` landing while the timeout
+    notice is being sent must NOT get an "Approved — running it"
+    confirmation for a tool that never ran."""
+    client = _make_client()
+    orig_send = client._send_dm
+    late: dict = {}
+
+    async def _send_with_interleaved_reply(slug, text, root_id=""):
+        if "Timed out" in text and "handled" not in late:
+            late["handled"] = await client._maybe_handle_permission_reply(
+                thread_root_id=root_id, text="y",
+            )
+        return await orig_send(slug, text, root_id)
+
+    client._send_dm = _send_with_interleaved_reply  # type: ignore[assignment]
+    result = await client.request_command_permission(
+        tool_name="Bash", summary="", timeout_s=0,
+    )
+    assert result == "timeout"
+    assert late["handled"] is False  # falls through to the LLM instead
+    assert not any("Approved" in d["text"] for d in client._sent_dms)
+
+
+@pytest.mark.asyncio
 async def test_command_permission_requires_operator():
     client = _make_client(operator_slug="")
     with pytest.raises(RuntimeError):

@@ -121,6 +121,49 @@ async def test_permission_request_400_when_worker_cold(app_client_factory):
     assert "warm" in (await resp.json())["error"]
 
 
+@pytest.mark.asyncio
+async def test_permission_request_end_to_end_over_socket(app_client_factory):
+    """Route → handler → real request_command_permission over a live
+    socket, with the operator's `y` landing while the RPC is held open."""
+    import asyncio
+    import logging
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    client.slug = "agent-1"
+    client.operator_slug = "op-1"
+    client._pending_command_permissions = {}
+    client._log = logging.getLogger("rpc-e2e-test")
+    sent: list[dict] = []
+
+    async def _stub_send_dm(slug, text, root_id=""):
+        env_id = f"env_{len(sent) + 1}"
+        sent.append({"to": slug, "text": text, "root_id": root_id, "env_id": env_id})
+        return {"envelope_id": env_id}
+
+    client._send_dm = _stub_send_dm  # type: ignore[assignment]
+    rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid, message_client=client))
+    app_client = await app_client_factory()
+
+    async def _reply_when_prompted():
+        while not sent:
+            await asyncio.sleep(0.01)
+        await client._maybe_handle_permission_reply(
+            thread_root_id=sent[0]["env_id"], text="y",
+        )
+
+    replier = asyncio.ensure_future(_reply_when_prompted())
+    resp = await app_client.post(
+        "/v1/rpc/agent-1/permission-request",
+        json={"tool_name": "Bash", "summary": "- command: ls", "timeout_s": 10},
+    )
+    await replier
+    assert resp.status == 200
+    assert (await resp.json()) == {"message": "allow"}
+    assert sent[0]["text"].startswith("/permission ")
+    assert any("Approved" in d["text"] for d in sent)
+
+
 # ─── hook transport (puffo-core branch) ───────────────────────────────
 
 
@@ -221,6 +264,20 @@ def test_hook_main_routes_to_rpc_when_no_legacy_creds(monkeypatch, capsys):
     assert captured["tool_name"] == "Bash"
     assert "ls" in captured["summary"]
     assert captured["timeout_s"] == 45
+
+
+def test_hook_main_rpc_branch_fails_open_on_bad_stdin(monkeypatch, capsys):
+    from puffo_agent.hooks import permission as hook
+
+    monkeypatch.delenv("PUFFO_URL", raising=False)
+    monkeypatch.delenv("PUFFO_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("PUFFO_RPC_URL", "http://127.0.0.1:63385")
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("{not json"))
+    with pytest.raises(SystemExit) as exc:
+        hook.main()
+    assert exc.value.code == 0
+    assert "could not parse hook payload" in capsys.readouterr().err
 
 
 def test_hook_main_fails_open_without_any_transport(monkeypatch, capsys):

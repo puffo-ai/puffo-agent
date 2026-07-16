@@ -543,9 +543,8 @@ class PuffoCoreMessageClient:
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
         # cli-local command-permission prompts awaiting operator y/n,
-        # keyed by prompt-DM envelope_id. The future resolves to the
-        # decision; in-memory only — the requesting hook re-asks or
-        # times out on a daemon restart.
+        # keyed by prompt-DM envelope_id. In-memory only — the hook
+        # times out and re-asks after a daemon restart.
         self._pending_command_permissions: dict[str, asyncio.Future[bool]] = {}
 
         # channel_id → space_id learned from inbound envelopes. The
@@ -2121,8 +2120,7 @@ class PuffoCoreMessageClient:
         Best-effort."""
         if not self.operator_slug:
             return
-        # Names only — ids are noise to the operator; bare id is the
-        # fallback when a name can't be resolved.
+        # Names only — raw ids are operator noise.
         space_name = await self._resolve_space_name(space_id)
         channel_name = await self._resolve_channel_name(
             space_id=space_id, channel_id=channel_id,
@@ -3247,7 +3245,9 @@ class PuffoCoreMessageClient:
         """Operator ``y``/``n`` on a pending command-permission DM.
         Threaded only. Returns ``True`` when consumed."""
         fut = self._pending_command_permissions.get(thread_root_id)
-        if fut is None:
+        # done() = wait_for already timed out but the entry isn't popped
+        # yet; a reply in that window must not be confirmed as acted-on.
+        if fut is None or fut.done():
             return False
         normalized = text.strip().lower()
         if normalized in ("y", "yes"):
@@ -3256,8 +3256,7 @@ class PuffoCoreMessageClient:
             approved = False
         else:
             return False
-        if not fut.done():
-            fut.set_result(approved)
+        fut.set_result(approved)
         confirm = "Approved ✓ — running it." if approved else "Denied — I won't run it."
         try:
             await self._send_dm(self.operator_slug, confirm, root_id=thread_root_id)
