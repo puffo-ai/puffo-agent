@@ -562,6 +562,10 @@ class PuffoCoreMessageClient:
         # the message arrived from. Falls back to ``self.space_id``
         # when no inbound envelope on this channel has been seen.
         self._channel_space: dict[str, str] = {}
+        # Serialize + debounce on-demand cache re-warms (no stampede).
+        self._rewarm_lock = asyncio.Lock()
+        self._last_rewarm = 0.0
+        self._warm_task: asyncio.Future | None = None
 
         # Lazy caches for human-readable space + channel names; names
         # aren't on the WS payload so we resolve via ``GET /spaces``
@@ -999,11 +1003,6 @@ class PuffoCoreMessageClient:
             self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon, on_turn_success),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
-        # Fire-and-forget; the WS subscribe below doesn't wait for
-        # the warmup. Worst case the first message pays the lazy
-        # fetch as before.
-        warm_task = asyncio.ensure_future(self._warm_member_caches())
-
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
             keystore=self.keystore,
@@ -1012,14 +1011,19 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = handle_envelope
         self._ws.on_event = self._handle_event
+        # Re-warms caches on every (re)connect, first connect included.
+        self._ws.on_connect = self._on_ws_connect
         await self.store.open()
         try:
             await self._ws.run()
         finally:
             consumer_task.cancel()
             invite_poll_task.cancel()
-            warm_task.cancel()
-            for task in (consumer_task, invite_poll_task, warm_task):
+            if self._warm_task is not None:
+                self._warm_task.cancel()
+            for task in (consumer_task, invite_poll_task, self._warm_task):
+                if task is None:
+                    continue
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -2370,6 +2374,19 @@ class PuffoCoreMessageClient:
             return None
         return parent_id
 
+    async def rewarm_channel_caches(self) -> None:
+        """On-miss re-warm; serialized + 5s-debounced (no stampede)."""
+        async with self._rewarm_lock:
+            now = time.monotonic()
+            if now - self._last_rewarm < 5.0:
+                return
+            await self._warm_member_caches()
+            self._last_rewarm = now
+
+    async def _on_ws_connect(self) -> None:
+        """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
+        self._warm_task = asyncio.ensure_future(self._warm_member_caches())
+
     async def _warm_member_caches(self) -> None:
         """Background prefetch on ``listen()`` startup: walks ``GET
         /spaces`` and fans out parallel member + channel fetches per
@@ -2426,6 +2443,8 @@ class PuffoCoreMessageClient:
         )
 
     async def _warm_channels_for_space(self, space_id: str) -> None:
+        # Invariant: this endpoint is membership-filtered server-side;
+        # the cache self-heal rests on that (a test pins it).
         try:
             resp = await self.http.get(f"/spaces/{space_id}/channels")
         except Exception:
