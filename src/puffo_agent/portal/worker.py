@@ -107,6 +107,11 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     if kind == "chat-local":
         from ..agent.adapters.chat_only import ChatOnlyAdapter
         provider = _build_legacy_provider(daemon_cfg, agent_cfg.runtime)
+        # Tool wiring is deferred: the in-process puffo_core dispatch
+        # needs the live message client, which Worker._run() builds
+        # after this adapter — it injects ``adapter.tool_dispatch``
+        # there via _build_chat_local_tool_dispatch(). Mirrors how
+        # sdk-local wires its MCP tools below, minus the subprocess.
         return ChatOnlyAdapter(provider)
 
     if kind == "sdk-local":
@@ -333,6 +338,38 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
         return OpenAIProvider(api_key=api_key, model=model, base_url=base_url)
 
     raise RuntimeError(f"unknown provider {provider_name!r}")
+
+
+def _build_chat_local_tool_dispatch(client) -> dict:
+    """In-process puffo_core tool dispatch for the chat-local adapter.
+
+    Mirrors ``ws_local.route._build_tool_dispatch``: the same
+    PuffoCoreToolsConfig wired off the live message client, narrowed
+    to the send tools the chat-local provider advertises as Anthropic
+    tool schemas. Without this executor, the model's ``tool_use``
+    blocks would parse but never post.
+    """
+    from ..mcp.puffo_core_tools import PuffoCoreToolsConfig
+    from .ws_local.in_process_data_client import InProcessDataClient
+    from .ws_local.tool_dispatch import build_dispatch
+
+    cfg = PuffoCoreToolsConfig(
+        slug=client.slug,
+        device_id=client.device_id,
+        keystore=client.keystore,
+        http_client=client.http,
+        data_client=InProcessDataClient(client.store, client),
+        space_id=getattr(client, "space_id", None),
+        workspace=getattr(client, "workspace", None),
+        message_client=client,
+        # T23: only the daemon-owned bridge WS may drive keyless sends;
+        # None on native agents keeps the signed-crypto path.
+        bridge_client=getattr(client, "_bridge", None),
+    )
+    return build_dispatch(
+        cfg,
+        allowed=frozenset({"send_message", "send_message_with_attachments"}),
+    )
 
 
 def _puffo_cli_keystore_dir() -> Path:
@@ -1164,6 +1201,16 @@ class Worker:
                 self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
             )
             self._client = client
+
+            # chat-local: now that the message client exists, inject
+            # the in-process puffo_core send-tool dispatch so the
+            # model's structured send_message calls post for real
+            # (the counterpart of sdk-local's mcp_servers_override).
+            from ..agent.adapters.chat_only import ChatOnlyAdapter
+            if isinstance(self._adapter, ChatOnlyAdapter):
+                self._adapter.tool_dispatch = (
+                    _build_chat_local_tool_dispatch(client)
+                )
         except Exception as e:
             logger.error("agent %s: failed to initialise: %s", agent_id, e, exc_info=True)
             self.runtime.status = "error"
