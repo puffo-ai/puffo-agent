@@ -25,9 +25,13 @@ class FakeHttp:
     HttpError or unexpected exceptions.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, keyless: bool = False) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.side_effect: BaseException | None = None
+        # Mirrors ``PuffoCoreHttpClient.keyless``. Native agents (the
+        # default) leave this False; keyless bridge agents set it True so
+        # the reporter skips every signed status POST.
+        self.keyless = keyless
 
     async def post(self, path: str, body: dict | None = None):
         self.calls.append((path, body or {}))
@@ -379,3 +383,157 @@ async def test_end_turn_batch_all_local_only_skips_http():
     assert path == "/agents/me/heartbeat"
     assert body["status"] == "idle"
     assert rep._current_status == "idle"
+
+
+# ── Keyless (bridge) transport: skip signed load_identity ──────────
+#
+# A keyless bridge agent has no local signing identity; every signed
+# ``post`` would raise "identity not found" inside PuffoCoreHttpClient.
+# The reporter must never reach the wire for these agents. The fake
+# below makes ANY post raise, so a leaked POST fails loudly instead of
+# silently — proving the guards short-circuit before ``self._http.post``.
+
+
+class _ExplodingKeylessHttp:
+    """Keyless http whose ``post`` mimics the real failure — the signed
+    path raising because ``load_identity`` can't find a keyless agent's
+    identity file. A correctly-guarded reporter never calls ``post``, so
+    this exception must never surface."""
+
+    keyless = True
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    async def post(self, path: str, body: dict | None = None):
+        self.calls.append((path, body or {}))
+        raise RuntimeError("identity not found: agent-abc1")
+
+
+@pytest.mark.asyncio
+async def test_keyless_begin_turn_no_http_returns_run_id():
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    run_id = await rep.begin_turn("msg_42")
+
+    assert run_id.startswith("run_")
+    assert http.calls == []  # never touched the signed wire
+    assert rep._current_status == "busy"
+    assert rep._current_message_id == "msg_42"
+
+
+@pytest.mark.asyncio
+async def test_keyless_end_turn_no_http_flips_status():
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep._current_status = "busy"
+    rep._current_message_id = "msg_5"
+
+    await rep.end_turn("msg_5", "run_x", succeeded=True)
+    assert http.calls == []
+    assert rep._current_status == "idle"
+    assert rep._current_message_id is None
+
+    rep._current_status = "busy"
+    await rep.end_turn("msg_5", "run_y", succeeded=False, error_text="boom")
+    assert http.calls == []
+    assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_keyless_end_turn_batch_no_http_flips_status():
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.end_turn_batch([
+        {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
+        {"run_id": "run_b", "message_id": "msg_b", "succeeded": True},
+    ])
+    assert http.calls == []
+    assert rep._current_status == "idle"
+    assert rep._current_message_id is None
+
+    await rep.end_turn_batch([
+        {"run_id": "run_c", "message_id": "msg_c", "succeeded": False},
+    ])
+    assert http.calls == []
+    assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_keyless_end_turn_batch_empty_still_no_op():
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.end_turn_batch([])
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_keyless_report_error_no_http_sets_error():
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.report_error("fatal")
+    assert http.calls == []
+    assert rep._current_status == "error"
+    assert rep._current_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_keyless_heartbeat_loop_is_immediate_noop():
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=10.0)
+
+    # The loop must return at once (not spin waiting on the interval) and
+    # never touch the signed heartbeat route.
+    await asyncio.wait_for(rep.run_heartbeat_loop(), timeout=1.0)
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_heartbeat_guarded_directly():
+    """Defense-in-depth: even a direct ``_send_heartbeat`` call (e.g. a
+    future caller) must not POST for a keyless agent."""
+    http = _ExplodingKeylessHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep._current_status = "busy"
+    rep._current_message_id = "msg_z"
+
+    await rep._send_heartbeat()
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_native_reporter_defaults_to_signed_path():
+    """A reporter over a non-keyless http client (FakeHttp default, and
+    every native agent) keeps firing signed POSTs — the guard is strictly
+    opt-in on ``http.keyless``."""
+    http = FakeHttp()  # keyless=False by default
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    assert rep._keyless is False
+
+    run_id = await rep.begin_turn("msg_native")
+    assert http.calls == [
+        ("/messages/msg_native/processing/start", {"run_id": run_id}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reporter_keyless_defaults_false_without_attr():
+    """An http fake lacking the ``keyless`` attribute entirely resolves to
+    native (False) via ``getattr(..., False)`` — no AttributeError."""
+
+    class _BareHttp:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, path, body=None):
+            self.calls.append((path, body or {}))
+            return {}
+
+    http = _BareHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    assert rep._keyless is False
+    await rep.begin_turn("msg_bare")
+    assert len(http.calls) == 1

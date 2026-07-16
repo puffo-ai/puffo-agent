@@ -204,6 +204,92 @@ async def test_sync_full_profile_skips_soul_when_profile_md_absent(monkeypatch):
     assert body["display_name"] == "No MD"
 
 
+# ── keyless (T23 bridge) transport: skip signed PATCH ─────────────
+#
+# A keyless bridge agent has no local signing identity — the signed
+# ``PATCH /identities/self`` would drive ``load_identity`` and raise
+# "identity not found: <slug>" on every warm/startup sync. The fake
+# below makes constructing / using the http client fail loudly, so a
+# leaked signed call surfaces instead of silently no-op'ing.
+
+
+class _ExplodingKeylessHttp:
+    """Mirrors the real keyless failure: the signed PATCH path raising
+    because ``load_identity`` can't find a keyless agent's identity file.
+    A correctly-guarded sync never constructs this client."""
+
+    def __init__(self, *a, **kw):
+        raise RuntimeError("identity not found: bridge-bot")
+
+
+@pytest.mark.asyncio
+async def test_sync_full_profile_skips_signed_patch_for_bridge_agent(monkeypatch):
+    home = isolated_home()
+    write_test_agent(home, "bridge-bot")
+    cfg = AgentConfig.load("bridge-bot")
+    cfg.display_name = "Bridge Bot"
+    # Keyless bridge transport — no local signing identity.
+    cfg.puffo_core.transport = "bridge"
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _ExplodingKeylessHttp,
+    )
+
+    # Must return cleanly WITHOUT ever building the signed client.
+    await sync_full_profile(cfg)
+
+
+@pytest.mark.asyncio
+async def test_sync_agent_profile_skips_signed_patch_for_bridge_agent(monkeypatch):
+    from puffo_agent.portal.profile_sync import sync_agent_profile
+
+    home = isolated_home()
+    write_test_agent(home, "bridge-bot2")
+    cfg = AgentConfig.load("bridge-bot2")
+    cfg.puffo_core.transport = "bridge"
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _ExplodingKeylessHttp,
+    )
+
+    await sync_agent_profile(cfg, {"display_name": "x"})
+
+
+@pytest.mark.asyncio
+async def test_native_sync_agent_profile_still_signs(monkeypatch):
+    """The guard is strictly opt-in on ``transport == 'bridge'`` — a
+    native agent (default transport) keeps issuing the signed PATCH."""
+    from puffo_agent.portal.profile_sync import sync_agent_profile
+
+    home = isolated_home()
+    write_test_agent(home, "native-bot")
+    cfg = AgentConfig.load("native-bot")
+    assert cfg.puffo_core.transport == "native"
+
+    posted: list[tuple[str, dict]] = []
+
+    class _FakeHttp:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def patch(self, path: str, body: dict) -> dict:
+            posted.append((path, body))
+            return {}
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _FakeHttp,
+    )
+    await sync_agent_profile(cfg, {"display_name": "Native"})
+
+    assert posted == [("/identities/self", {"display_name": "Native"})]
+
+
 # ── control-WS op=edit flag differentiation ──────────────────────
 
 
