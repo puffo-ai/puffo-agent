@@ -257,7 +257,7 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
 
     sent_dms: list[dict] = []
 
-    async def _stub_send_dm(slug, text, root_id=""):
+    async def _stub_send_dm(slug, text, root_id):  # mirror real _send_dm arity
         env_id = f"prompt_env_{len(sent_dms) + 1}"
         sent_dms.append({"to": slug, "text": text, "root_id": root_id, "env_id": env_id})
         return {"envelope_id": env_id}

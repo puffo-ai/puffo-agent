@@ -3397,7 +3397,7 @@ class PuffoCoreMessageClient:
         # they're not left waiting on silence. Once per sender (duplicates
         # returned above); best-effort — never blocks the gate.
         try:
-            await self._send_dm(sender_slug, _DM_GATE_SENDER_ACK)
+            await self._send_dm(sender_slug, _DM_GATE_SENDER_ACK, root_id="")
         except Exception as exc:
             self._log.warning(
                 "auto_accept_dm: failed to ack sender %s: %s", sender_slug, exc,
