@@ -605,9 +605,12 @@ async def test_synthetic_auto_accept_reports_to_operator():
     # Informational, not a /permission ask — nothing to decide.
     assert not report["text"].startswith("/permission")
     assert "Auto-accepted" in report["text"]
-    assert "**Alice**(@alice-0001)" in report["text"]
-    assert "**general**(ch_1)" in report["text"]
-    assert "**Team**(sp_1)" in report["text"]
+    # Names only — raw ids are operator noise.
+    assert "**Alice**" in report["text"]
+    assert "**general**" in report["text"]
+    assert "**Team**" in report["text"]
+    assert "ch_1" not in report["text"]
+    assert "sp_1" not in report["text"]
     await store.close()
 
 

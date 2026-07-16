@@ -2121,19 +2121,19 @@ class PuffoCoreMessageClient:
         Best-effort."""
         if not self.operator_slug:
             return
+        # Names only — ids are noise to the operator; bare id is the
+        # fallback when a name can't be resolved.
         space_name = await self._resolve_space_name(space_id)
         channel_name = await self._resolve_channel_name(
             space_id=space_id, channel_id=channel_id,
         )
-        space_label = f"**{space_name}**({space_id})" if space_name else space_id
-        channel_label = (
-            f"**{channel_name}**({channel_id})" if channel_name else channel_id
-        )
+        space_label = f"**{space_name or space_id}**"
+        channel_label = f"**{channel_name or channel_id}**"
         inviter_label = f"@{inviter_slug}" if inviter_slug else "the space owner"
         if inviter_slug:
             inviter_display = await self._fetch_display_name(inviter_slug)
             if inviter_display:
-                inviter_label = f"**{inviter_display}**(@{inviter_slug})"
+                inviter_label = f"**{inviter_display}**"
         text = (
             f"Auto-accepted {inviter_label}'s invite to channel "
             f"{channel_label} in space {space_label} "
