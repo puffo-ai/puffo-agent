@@ -11,11 +11,16 @@ import logging
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
-from ..limits import MAX_INLINE_MESSAGE_CHARS, MESSAGE_SEGMENT_CHARS
+from ..limits import (
+    DEFAULT_CATCHUP_STALE_HOURS,
+    MAX_INLINE_MESSAGE_CHARS,
+    MESSAGE_SEGMENT_CHARS,
+)
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
@@ -30,6 +35,7 @@ from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .contact_cache import ContactCache
 from .core import AgentAPIError
+from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
 from .message_store import MessageStore
@@ -478,6 +484,7 @@ class PuffoCoreMessageClient:
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
+        catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -502,6 +509,10 @@ class PuffoCoreMessageClient:
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
         self._max_input_bytes = max(1, int(max_input_bytes))
+        # Catch-up older than this skips the LLM (still stored); <= 0 disables.
+        self._catchup_stale_ms = (
+            int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
+        )
         self._image_edge_px = int(image_edge_px) or _DEFAULT_IMAGE_EDGE_PX
         self.keystore = keystore
         self.http = http_client
@@ -554,14 +565,16 @@ class PuffoCoreMessageClient:
         # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
-        # Foreign-sender DM approval gate (auto_accept_dm=False path).
-        # Keyed by the operator-facing prompt DM's envelope_id so an
-        # in-thread y/n from the operator routes back to the buffered
-        # message. Survives daemon restart via disk persistence.
+        # Foreign-sender DM approval gate. Keyed by the operator-facing
+        # prompt DM's envelope_id so an in-thread y/n routes back to the
+        # sender. Survives daemon restart via disk persistence.
         from .dm_approvals import load_pending_dm_approvals
         self._pending_dm_approvals: dict[str, dict[str, Any]] = (
             load_pending_dm_approvals(self.slug)
         )
+        # cli-local command-permission prompts awaiting operator y/n,
+        # keyed by prompt-DM envelope_id. In-memory only.
+        self._pending_command_permissions: dict[str, asyncio.Future[bool]] = {}
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
@@ -569,6 +582,10 @@ class PuffoCoreMessageClient:
         # the message arrived from. Falls back to ``self.space_id``
         # when no inbound envelope on this channel has been seen.
         self._channel_space: dict[str, str] = {}
+        # Serialize + debounce on-demand cache re-warms (no stampede).
+        self._rewarm_lock = asyncio.Lock()
+        self._last_rewarm = 0.0
+        self._warm_task: asyncio.Future | None = None
 
         # Lazy caches for human-readable space + channel names; names
         # aren't on the WS payload so we resolve via ``GET /spaces``
@@ -590,6 +607,32 @@ class PuffoCoreMessageClient:
         # Single source for every allow/block read (gate, channel drop,
         # outbound allowlist) — don't hit /allowlists + /blocklists ad hoc.
         self._contacts = ContactCache(self.http, self._log)
+
+    def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
+        """Past the staleness threshold → store but skip the LLM.
+        <= 0 disables so a mis-set config can't skip live traffic."""
+        if self._catchup_stale_ms <= 0:
+            return False
+        if now_ms is None:
+            now_ms = int(time.time() * 1000)
+        return sent_at < now_ms - self._catchup_stale_ms
+
+    async def _report_stale_processed(self, envelope_id: str) -> None:
+        """Best-effort green run for a gate-skipped envelope so
+        clients don't show it pending forever."""
+        try:
+            await self.http.post(
+                "/messages/processing/end:batch",
+                {"runs": [{
+                    "run_id": f"run_{uuid.uuid4().hex}",
+                    "message_id": envelope_id,
+                    "succeeded": True,
+                }]},
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log.debug(
+                "stale-processed report failed for %s: %s", envelope_id, exc,
+            )
 
     async def listen(
         self,
@@ -807,13 +850,32 @@ class PuffoCoreMessageClient:
                 ):
                     self._last_dm_sender = payload.sender_slug
                     return
-                # auto_accept_dm=False foreign-sender approval reply.
+                # Same gate for cli-local command-permission prompts.
+                if await self._maybe_handle_permission_reply(
+                    thread_root_id=payload_thread_root_id or "", text=text_raw,
+                ):
+                    self._last_dm_sender = payload.sender_slug
+                    return
+                # Operator's y/n reply to a foreign-DM approval prompt.
                 if await self._maybe_handle_dm_approval_reply(
                     thread_root_id=payload_thread_root_id or "",
                     text=text_raw,
                 ):
                     self._last_dm_sender = payload.sender_slug
                     return
+
+            # Stale catch-up backlog: stored above, skips the LLM (and
+            # the foreign-DM gate below — no prompts for old backlog).
+            if self._is_stale_for_catchup(payload.sent_at):
+                self._log.info(
+                    "handle_envelope: staleness-gate-skipped envelope=%s "
+                    "(sent_at=%d, threshold_ms=%d, root=%s) — stored, no LLM",
+                    payload.envelope_id, payload.sent_at,
+                    self._catchup_stale_ms,
+                    payload_thread_root_id or payload.envelope_id,
+                )
+                await self._report_stale_processed(payload.envelope_id)
+                return
 
             channel_id = payload.channel_id or ""
             is_dm = payload.envelope_kind == "dm"
@@ -1025,15 +1087,6 @@ class PuffoCoreMessageClient:
             self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon, on_turn_success),
         )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
-        # Fire-and-forget; the WS subscribe below doesn't wait for
-        # the warmup. Worst case the first message pays the lazy
-        # fetch as before.
-        warm_task = asyncio.ensure_future(self._warm_member_caches())
-        # Hydrate the allow/block cache so a restart doesn't re-gate
-        # already-allowlisted senders. Fire-and-forget; a cache miss
-        # before it lands refreshes lazily.
-        asyncio.ensure_future(self._contacts.refresh())
-
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
             keystore=self.keystore,
@@ -1042,14 +1095,19 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = handle_envelope
         self._ws.on_event = self._handle_event
+        # Re-warms caches on every (re)connect, first connect included.
+        self._ws.on_connect = self._on_ws_connect
         await self.store.open()
         try:
             await self._ws.run()
         finally:
             consumer_task.cancel()
             invite_poll_task.cancel()
-            warm_task.cancel()
-            for task in (consumer_task, invite_poll_task, warm_task):
+            if self._warm_task is not None:
+                self._warm_task.cancel()
+            for task in (consumer_task, invite_poll_task, self._warm_task):
+                if task is None:
+                    continue
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -1668,7 +1726,8 @@ class PuffoCoreMessageClient:
             # real signed accept that's bouncing back over WS.
             # ``original_invite`` is the canonical marker — the
             # operator-signed path never embeds the source invite.
-            if not isinstance(payload.get("original_invite"), dict):
+            original_invite = payload.get("original_invite")
+            if not isinstance(original_invite, dict):
                 return
             space_id = payload.get("space_id") or ""
             channel_id = payload.get("channel_id") or ""
@@ -1685,6 +1744,12 @@ class PuffoCoreMessageClient:
                     "accepted channel (space=%s channel=%s)",
                     space_id, channel_id,
                 )
+            # No /permission ask on auto-accept — report, don't join silently.
+            await self._report_auto_accepted_channel_invite(
+                inviter_slug=original_invite.get("signer_slug") or "",
+                space_id=space_id,
+                channel_id=channel_id,
+            )
             return
 
         # Membership-exit events. Pair-wise: the kick path
@@ -2181,6 +2246,37 @@ class PuffoCoreMessageClient:
                 "failed to report auto-accepted space invite to operator",
             )
 
+    async def _report_auto_accepted_channel_invite(
+        self, *, inviter_slug: str, space_id: str, channel_id: str,
+    ) -> None:
+        """Best-effort operator report for a server-auto-accepted
+        owner channel invite."""
+        if not self.operator_slug:
+            return
+        # Names only — raw ids are operator noise.
+        space_name = await self._resolve_space_name(space_id)
+        channel_name = await self._resolve_channel_name(
+            space_id=space_id, channel_id=channel_id,
+        )
+        space_label = f"**{space_name or space_id}**"
+        channel_label = f"**{channel_name or channel_id}**"
+        inviter_label = f"@{inviter_slug}" if inviter_slug else "the space owner"
+        if inviter_slug:
+            inviter_display = await self._fetch_display_name(inviter_slug)
+            if inviter_display:
+                inviter_label = f"**{inviter_display}**"
+        text = (
+            f"Auto-accepted {inviter_label}'s invite to channel "
+            f"{channel_label} in space {space_label} "
+            f"(space-owner invites are auto-accepted)."
+        )
+        try:
+            await self._send_dm(self.operator_slug, text, root_id="")
+        except Exception:
+            self._log.exception(
+                "failed to report auto-accepted channel invite to operator",
+            )
+
     async def _inviter_is_operator(self, inviter_slug: str) -> bool:
         """True iff ``inviter_slug``'s root pubkey matches our
         operator pubkey. Fails closed (returns ``False``) when either
@@ -2362,6 +2458,26 @@ class PuffoCoreMessageClient:
             return None
         return parent_id
 
+    async def rewarm_channel_caches(self) -> None:
+        """On-miss re-warm; serialized + 5s-debounced (no stampede)."""
+        async with self._rewarm_lock:
+            now = time.monotonic()
+            if now - self._last_rewarm < 5.0:
+                return
+            await self._warm_member_caches()
+            self._last_rewarm = now
+
+    async def _on_ws_connect(self) -> None:
+        """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
+        self._warm_task = asyncio.ensure_future(
+            asyncio.gather(
+                self._warm_member_caches(),
+                # Allow/block hydration rides the same tick so a restart
+                # doesn't re-gate already-allowlisted senders.
+                self._contacts.refresh(),
+            )
+        )
+
     async def _warm_member_caches(self) -> None:
         """Background prefetch on ``listen()`` startup: walks ``GET
         /spaces`` and fans out parallel member + channel fetches per
@@ -2418,6 +2534,8 @@ class PuffoCoreMessageClient:
         )
 
     async def _warm_channels_for_space(self, space_id: str) -> None:
+        # Invariant: this endpoint is membership-filtered server-side;
+        # the cache self-heal rests on that (a test pins it).
         try:
             resp = await self.http.get(f"/spaces/{space_id}/channels")
         except Exception:
@@ -3236,6 +3354,86 @@ class PuffoCoreMessageClient:
             return f"channel {channel_label} in space {space_label}"
         return f"space {space_label}"
 
+    # ── cli-local command permission (operator-gated) ─────────────────
+
+    async def request_command_permission(
+        self, *, tool_name: str, summary: str, timeout_s: int,
+    ) -> str:
+        """Block on the operator's y/n for a hook-intercepted tool
+        call. Returns ``allow`` / ``deny`` / ``timeout``."""
+        if not self.operator_slug:
+            raise RuntimeError("no operator_slug configured")
+        text = format_permission_prompt(
+            f"I want to run **{tool_name}** — allow it?",
+            detail=summary,
+        )
+        envelope = await self._send_dm(self.operator_slug, text, root_id="")
+        env_id = envelope.get("envelope_id", "") if envelope else ""
+        if not env_id:
+            raise RuntimeError("could not deliver the permission DM")
+        fut: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pending_command_permissions[env_id] = fut
+        try:
+            approved = await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            # Register before the notice send — a racing reply must
+            # see the timeout.
+            self._timed_out_command_permissions[env_id] = time.time()
+            while len(self._timed_out_command_permissions) > 64:
+                self._timed_out_command_permissions.pop(
+                    next(iter(self._timed_out_command_permissions)),
+                )
+            try:
+                await self._send_dm(
+                    self.operator_slug,
+                    f"Timed out after {timeout_s}s — I did NOT run "
+                    f"`{tool_name}`.",
+                    root_id=env_id,
+                )
+            except Exception:
+                self._log.exception(
+                    "permission: failed to send timeout notice",
+                )
+            return "timeout"
+        finally:
+            self._pending_command_permissions.pop(env_id, None)
+        return "allow" if approved else "deny"
+
+    async def _maybe_handle_permission_reply(
+        self, *, thread_root_id: str, text: str,
+    ) -> bool:
+        """Operator ``y``/``n`` on a pending command-permission DM.
+        Threaded only. Returns ``True`` when consumed."""
+        normalized = text.strip().lower()
+        if normalized in ("y", "yes"):
+            approved = True
+        elif normalized in ("n", "no"):
+            approved = False
+        else:
+            return False
+        # Late answer to a timed-out prompt: never claim it ran.
+        if thread_root_id in self._timed_out_command_permissions:
+            try:
+                await self._send_dm(
+                    self.operator_slug,
+                    "That request already timed out — I did NOT run it. "
+                    "Ask me to try again if you still want it.",
+                    root_id=thread_root_id,
+                )
+            except Exception:
+                self._log.exception("permission: failed to send stale note")
+            return True
+        fut = self._pending_command_permissions.get(thread_root_id)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(approved)
+        confirm = "Approved ✓ — running it." if approved else "Denied — I won't run it."
+        try:
+            await self._send_dm(self.operator_slug, confirm, root_id=thread_root_id)
+        except Exception:
+            self._log.exception("permission: failed to confirm decision")
+        return True
+
     # ── Agent-initiated leave (operator-gated, mirrors invite) ────────
 
     async def request_leave_approval(
@@ -3272,10 +3470,9 @@ class PuffoCoreMessageClient:
             )
         else:
             target = f"space **{space_label}**({space_id})"
-        reason_line = f" Reason: {reason.strip()}" if reason.strip() else ""
-        text = (
-            f"I'd like to leave {target}.{reason_line} "
-            f"Reply `y` in this thread to approve, or `n` to keep me there."
+        text = format_permission_prompt(
+            f"I'd like to leave {target} — approve, or keep me there?",
+            detail=f"Reason: {reason.strip()}" if reason.strip() else "",
         )
         envelope = await self._send_dm(self.operator_slug, text, root_id="")
         env_id = envelope.get("envelope_id", "") if envelope else ""
@@ -3448,13 +3645,10 @@ class PuffoCoreMessageClient:
         sender_display, _ = await self._fetch_user_profile(sender_slug)
         label = sender_display or sender_slug
         preview = text if len(text) <= 280 else text[:277] + "…"
-        # `/permission` renders Yes/No buttons in the operator's web/mobile
-        # client (they post `y`/`n`, which the reply handler already accepts).
-        prompt = (
-            f"/permission **{label}** ({sender_slug}) is DM-ing me — allow "
-            f"(allowlist + deliver) or block? Tap Yes/No, or reply `y`/`n` "
-            f"in this thread.\n\n"
-            f"> {preview}"
+        prompt = format_permission_prompt(
+            f"**{label}** ({sender_slug}) is DM-ing me — allow "
+            f"(allowlist + deliver) or block?",
+            detail=preview,
         )
         try:
             envelope = await self._send_dm(self.operator_slug, prompt, root_id="")
@@ -3870,22 +4064,20 @@ class PuffoCoreMessageClient:
         )
         space_label = f"**{space_name}**({space_id})" if space_name else space_id
         if kind == EventKind.INVITE_TO_SPACE:
-            text = (
-                f"{inviter_label} invited me to space {space_label}. "
-                f"They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject — in this thread for "
-                f"this one, or a direct `y`/`n` for all your pending invites."
-            )
+            target = f"space {space_label}"
         else:
             channel_label = (
                 f"**{channel_name}**({channel_id})" if channel_name else channel_id
             )
-            text = (
-                f"{inviter_label} invited me to channel {channel_label} in "
-                f"space {space_label}. They aren't my registered operator. "
-                f"Reply `y` to accept or `n` to reject — in this thread for "
-                f"this one, or a direct `y`/`n` for all your pending invites."
-            )
+            target = f"channel {channel_label} in space {space_label}"
+        text = format_permission_prompt(
+            f"{inviter_label} invited me to {target}. "
+            f"They aren't my registered operator — accept?",
+            reply_note=(
+                "a direct (non-threaded) `y`/`n` answers all your "
+                "pending invites at once"
+            ),
+        )
         try:
             envelope = await self._send_dm(self.operator_slug, text, root_id="")
         except Exception:

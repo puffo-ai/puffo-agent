@@ -16,6 +16,7 @@ wrapper on top — covered by manual smoke tests.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import tempfile
@@ -56,6 +57,9 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._channel_space = {}
     # Written by ``_handle_event``'s ``invite_to_*`` branch.
     client._inviter_by_invitation_event_id = {}
+    # Empty → the auto-accept operator report short-circuits; the
+    # report itself is covered by its own test below.
+    client.operator_slug = ""
 
     async def _stub_space_name(space_id: str) -> str:
         return "Team" if space_id == "sp_1" else space_id
@@ -564,6 +568,48 @@ async def test_handle_event_fires_intro_on_synthetic_auto_accept():
 
     assert client._queue.qsize() == 1
     assert await store.has_channel_intro_been_prompted("ch_1") is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_auto_accept_reports_to_operator():
+    """Auto-accepts DM the operator a report instead of joining silently."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+    client.operator_slug = "op-1"
+    client._log = logging.getLogger("nudge-test")
+
+    sent: list[dict] = []
+
+    async def _stub_send_dm(slug, text, root_id=""):
+        sent.append({"to": slug, "text": text, "root_id": root_id})
+        return {"envelope_id": "env_report_1"}
+
+    async def _stub_display_name(slug):
+        return "Alice"
+
+    client._send_dm = _stub_send_dm  # type: ignore[assignment]
+    client._fetch_display_name = _stub_display_name  # type: ignore[assignment]
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert len(sent) == 1
+    report = sent[0]
+    assert report["to"] == "op-1"
+    assert report["root_id"] == ""
+    # Informational, not a /permission ask — nothing to decide.
+    assert not report["text"].startswith("/permission")
+    assert "Auto-accepted" in report["text"]
+    # Names only — raw ids are operator noise.
+    assert "**Alice**" in report["text"]
+    assert "**general**" in report["text"]
+    assert "**Team**" in report["text"]
+    assert "ch_1" not in report["text"]
+    assert "sp_1" not in report["text"]
     await store.close()
 
 

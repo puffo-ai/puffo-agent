@@ -29,7 +29,12 @@ from .credential_refresh import (
     FileBackend,
     KeychainBackend,
 )
-from .data_service import set_profile_setter, start_data_service, stop_data_service
+from .data_service import (
+    set_client_resolver,
+    set_profile_setter,
+    start_data_service,
+    stop_data_service,
+)
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
 from .state import (
@@ -128,6 +133,7 @@ class Daemon:
             self.daemon_cfg.bridge, ws_local_hub=self.ws_local_hub,
         )
         set_profile_setter(self._set_worker_profile_cache)
+        set_client_resolver(self._resolve_message_client)
         set_rpc_resolver(self._resolve_host_mcp_context)
         # Bridge pins 63387 (browser clients hard-code it). Both
         # fallbacks scan from 63388 onward so neither collides with
@@ -191,6 +197,7 @@ class Daemon:
                     pass
             await stop_api_server(api_runner)
             set_profile_setter(None)
+            set_client_resolver(None)
             set_rpc_resolver(None)
             await stop_data_service(data_runner)
             await stop_rpc_service(rpc_runner)
@@ -401,6 +408,11 @@ class Daemon:
         if worker is None:
             return None
         return worker.host_mcp_context()
+
+    def _resolve_message_client(self, agent_id: str):
+        """Data-service shim for the on-miss channel-cache re-warm."""
+        ctx = self._resolve_host_mcp_context(agent_id)
+        return ctx.message_client if ctx is not None else None
 
     async def _stop_worker(self, agent_id: str) -> None:
         worker = self.workers.pop(agent_id, None)

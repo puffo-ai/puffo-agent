@@ -4,6 +4,48 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Stale channel cache self-heals (PUF-376).** A membership event
+  dropped during a WS reconnect used to leave a genuinely-member
+  channel unaddressable by `send_message` until a daemon restart.
+  The member/channel cache now re-warms on every (re)connect, and a
+  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
+  failing loud — on every runtime, including the cli-local /
+  cli-docker data-service path.
+
+### Added
+
+- **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon
+  restart / resume-from-pause, redelivered messages older than
+  `catchup_stale_hours` (daemon.yml, default 48; `<= 0` disables) are
+  stored to chat history and reported processed server-side, but skip
+  the LLM pipeline — no token burn replaying old context, no late
+  replies into conversations that have moved on.
+
+- **cli-local command permission over puffo-core.** The PreToolUse hook
+  gains a daemon transport: when the legacy `PUFFO_URL`/`PUFFO_BOT_TOKEN`
+  pair is absent, it POSTs `/v1/rpc/{agent}/permission-request` and the
+  daemon DMs the operator a `/permission` card, resolves their threaded
+  `y`/`n`, and returns allow/deny/timeout for the hook's exit protocol.
+  A late reply to a timed-out request gets an "already timed out — I did
+  NOT run it" note instead of a false confirmation.
+
+- **Operator report on auto-accepted channel invites.** Space-owner
+  channel invites are server-auto-accepted with no approval ask; the
+  agent now DMs the operator an informational report (inviter, channel,
+  space) instead of joining silently.
+
+### Changed
+
+- **Every operator y/n ask now renders as a `/permission` card.** Space
+  and channel invite prompts and agent-requested leave approvals build
+  their DM through one shared constructor, so web/mobile clients show
+  consistent Yes/No buttons that post `y`/`n` into the prompt's thread —
+  the same replies the daemon already accepts.
+
 ## [1.1.2] — 2026-07-14
 
 ### Added

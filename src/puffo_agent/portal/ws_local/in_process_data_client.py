@@ -31,7 +31,12 @@ class InProcessDataClient:
         return None
 
     async def lookup_channel_space(self, channel_id: str) -> str | None:
-        return await self._store.lookup_channel_space(channel_id)
+        space_id = await self._store.lookup_channel_space(channel_id)
+        if space_id is None and channel_id.startswith("ch_"):
+            # Reconnect-dropped membership event → re-warm, re-check.
+            await self._client.rewarm_channel_caches()
+            space_id = await self._store.lookup_channel_space(channel_id)
+        return space_id
 
     async def get_channel_roots(
         self,

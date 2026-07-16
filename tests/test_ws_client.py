@@ -488,3 +488,45 @@ async def test_callback_exception_does_not_kill_loop():
     assert "env_fail" in acked_ids, "failed message should still be ACKed"
     assert "env_ok" in acked_ids, "second message should be ACKed"
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_connect_failure_does_not_kill_the_loop():
+    """An on_connect callback that throws must not tear down the
+    connection — catch-up + listen still run."""
+    ks, _ = _make_keystore()
+    server = FakeWsServer()
+    await server.start()
+
+    received = []
+
+    async def on_msg(envelope):
+        received.append(envelope)
+
+    async def boom():
+        raise RuntimeError("warm blew up")
+
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": 1, "envelope": {"envelope_id": "env_p1", "sender_slug": "bob"}},
+    ]
+
+    client = PuffoCoreWsClient(
+        f"http://127.0.0.1:{server.port}", ks, "alice-0001", http,
+    )
+    client.ws_url = f"ws://127.0.0.1:{server.port}"
+    client.on_message = on_msg
+    client.on_connect = boom  # raises — must be swallowed, not kill the WS
+
+    task = asyncio.create_task(client.connect_once())
+    await asyncio.sleep(0.5)
+    client.stop()
+    try:
+        await asyncio.wait_for(task, timeout=2)
+    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
+        pass
+
+    # Catch-up still delivered the pending message → the on_connect
+    # exception was caught, not propagated out of connect_once.
+    assert [e["envelope_id"] for e in received] == ["env_p1"]
+    await server.stop()
