@@ -787,9 +787,10 @@ class PuffoCoreMessageClient:
             else:
                 raw_text = str(payload.content) if payload.content else ""
 
-            # auto_accept_dm=False foreign-DM gate. Buffer + DM operator
-            # for approval before the LLM sees the message. Allowlisted
-            # senders bypass — server allowlist is the source of truth.
+            # auto_accept_dm=False foreign-DM gate. Prompt the operator and
+            # hold the DM un-acked in /messages/pending (returning False
+            # skips the ack) until they allow/block. Allowlisted senders
+            # bypass — server allowlist is the source of truth.
             if (
                 is_dm
                 and not self.auto_accept_dm
@@ -799,13 +800,9 @@ class PuffoCoreMessageClient:
                 gated = await self._maybe_gate_foreign_dm(
                     sender_slug=payload.sender_slug,
                     text=raw_text,
-                    envelope_id=payload.envelope_id,
-                    sent_at=payload.sent_at,
-                    thread_root_id=payload_thread_root_id or "",
-                    attachment_paths=attachment_paths,
                 )
                 if gated:
-                    return
+                    return False
 
             # Stash the sender so `send_fallback_message("")` can route replies.
             # Always overwrite — first-write would pin replies to a
@@ -3328,22 +3325,19 @@ class PuffoCoreMessageClient:
         *,
         sender_slug: str,
         text: str,
-        envelope_id: str,
-        sent_at: int,
-        thread_root_id: str,
-        attachment_paths: list[str],
     ) -> bool:
-        """Foreign DM with ``auto_accept_dm=False``: buffer + prompt
-        operator. Returns True when intercepted (caller skips dispatch).
+        """Foreign DM with ``auto_accept_dm=False``: prompt the operator.
+        Returns True when gated — the caller then returns False so the DM
+        stays un-acked in /messages/pending, drained on approval.
 
-        Drops a second DM from the same sender while the first is still
-        pending operator review (one prompt per sender at a time).
+        Only one prompt per sender at a time; further DMs from that sender
+        stay in pending too (the operator's one y/n covers all of them).
         """
         for entry in self._pending_dm_approvals.values():
             if entry.get("sender_slug") == sender_slug:
                 self._log.info(
-                    "auto_accept_dm: dropping additional DM from %s "
-                    "while prior approval is pending",
+                    "auto_accept_dm: already prompted for %s; holding "
+                    "further DMs in pending",
                     sender_slug,
                 )
                 return True
@@ -3385,11 +3379,6 @@ class PuffoCoreMessageClient:
         self._pending_dm_approvals[prompt_env_id] = {
             "sender_slug": sender_slug,
             "sender_display_name": sender_display,
-            "buffered_text": text,
-            "buffered_envelope_id": envelope_id,
-            "buffered_sent_at": int(sent_at),
-            "buffered_root_id": thread_root_id,
-            "buffered_attachment_paths": list(attachment_paths or []),
         }
         from .dm_approvals import save_pending_dm_approvals
         try:
@@ -3399,9 +3388,9 @@ class PuffoCoreMessageClient:
                 "auto_accept_dm: failed to persist pending state: %s", exc,
             )
         self._log.info(
-            "auto_accept_dm: buffered DM from %s (envelope=%s) pending "
-            "operator approval in thread %s",
-            sender_slug, envelope_id, prompt_env_id,
+            "auto_accept_dm: prompted operator for %s (thread %s); DM held "
+            "in /messages/pending",
+            sender_slug, prompt_env_id,
         )
         return True
 
@@ -3427,7 +3416,7 @@ class PuffoCoreMessageClient:
                     "/allowlists", {"slugs": [sender_slug]},
                 )
                 self._dm_allowlisted_senders.add(sender_slug)
-                await self._deliver_approved_dm(meta)
+                await self._drain_pending_from_sender(sender_slug)
                 confirm = (
                     f"Allowed DMs from **{sender_label}** ({sender_slug}). ✓"
                 )
@@ -3435,6 +3424,7 @@ class PuffoCoreMessageClient:
                 await self.http.post(
                     "/blocklists", {"target": "user", "id": sender_slug},
                 )
+                await self._drop_pending_from_sender(sender_slug)
                 confirm = (
                     f"Blocked **{sender_label}** ({sender_slug}). "
                     "Server will drop future messages from this sender."
@@ -3477,47 +3467,73 @@ class PuffoCoreMessageClient:
             )
         return True
 
-    async def _deliver_approved_dm(self, meta: dict) -> None:
-        sender_slug = meta.get("sender_slug", "")
-        text = meta.get("buffered_text", "")
-        envelope_id = meta.get("buffered_envelope_id", "") or (
-            f"approved_{int(time.time() * 1000)}"
+    async def _drain_pending_from_sender(self, sender_slug: str) -> None:
+        # Re-fed through on_message so gated DMs take the same decrypt +
+        # priority-queue path as live arrivals, then acked.
+        if not sender_slug or self._ws is None or self._ws.on_message is None:
+            return
+        try:
+            data = await self.http.get(
+                f"/messages/pending?kind=dm&sender={sender_slug}"
+            )
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: drain fetch for %s failed: %s", sender_slug, exc,
+            )
+            return
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        acked: list[str] = []
+        for item in messages:
+            envelope = item.get("envelope", item)
+            try:
+                result = await self._ws.on_message(envelope)
+            except Exception:
+                self._log.exception("auto_accept_dm: drain handle failed")
+                continue
+            eid = envelope.get("envelope_id")
+            # False would mean still-gated (not expected post-allowlist).
+            if eid and result is not False:
+                acked.append(eid)
+        if acked:
+            try:
+                await self.http.post("/messages/ack", {"envelope_ids": acked})
+            except Exception as exc:
+                self._log.warning(
+                    "auto_accept_dm: drain ack for %s failed: %s", sender_slug, exc,
+                )
+        self._log.info(
+            "auto_accept_dm: drained %d pending DM(s) from %s",
+            len(acked), sender_slug,
         )
-        sent_at = int(meta.get("buffered_sent_at", 0)) or int(time.time())
-        sender_display = (
-            meta.get("sender_display_name", "") or sender_slug
-        )
-        msg_dict = {
-            "channel_id": "",
-            "channel_name": "Direct message",
-            "space_id": "",
-            "space_name": "",
-            "sender_slug": sender_slug,
-            "sender_display_name": sender_display,
-            "sender_email": "",
-            "text": text,
-            "root_id": meta.get("buffered_root_id", "") or "",
-            "is_dm": True,
-            "attachments": list(meta.get("buffered_attachment_paths") or []),
-            "sender_is_bot": False,
-            "mentions": [],
-            "envelope_id": envelope_id,
-            "sent_at": sent_at,
-            "is_visible_to_human": True,
-        }
-        channel_meta = {
-            "channel_id": "",
-            "channel_name": "Direct message",
-            "space_id": "",
-            "space_name": "",
-            "is_dm": True,
-        }
-        self._last_dm_sender = sender_slug
-        await self._admit_thread_message(
-            root_id=envelope_id,
-            priority=_compute_priority(direct=True, sender_is_agent=False),
-            msg_dict=msg_dict,
-            channel_meta=channel_meta,
+
+    async def _drop_pending_from_sender(self, sender_slug: str) -> None:
+        # Ack-discard a blocked sender's pending DMs; never seen by the agent.
+        if not sender_slug:
+            return
+        try:
+            data = await self.http.get(
+                f"/messages/pending?kind=dm&sender={sender_slug}"
+            )
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: drop fetch for %s failed: %s", sender_slug, exc,
+            )
+            return
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        eids = [
+            (item.get("envelope", item)).get("envelope_id") for item in messages
+        ]
+        eids = [e for e in eids if e]
+        if eids:
+            try:
+                await self.http.post("/messages/ack", {"envelope_ids": eids})
+            except Exception as exc:
+                self._log.warning(
+                    "auto_accept_dm: drop ack for %s failed: %s", sender_slug, exc,
+                )
+        self._log.info(
+            "auto_accept_dm: dropped %d pending DM(s) from blocked %s",
+            len(eids), sender_slug,
         )
 
     @staticmethod

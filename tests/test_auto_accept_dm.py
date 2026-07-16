@@ -201,11 +201,6 @@ def test_pending_dm_approvals_round_trip(tmp_path):
         "prompt_env_id_1": {
             "sender_slug": "alice-1234",
             "sender_display_name": "Alice",
-            "buffered_text": "hello",
-            "buffered_envelope_id": "msg_abc",
-            "buffered_sent_at": 1000,
-            "buffered_root_id": "",
-            "buffered_attachment_paths": [],
         }
     }
     save_pending_dm_approvals("alpha", pending)
@@ -272,11 +267,18 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
 
     posts: list[tuple] = []
     deletes: list[tuple] = []
+    gets: list[str] = []
+    pending_rows: list[dict] = []  # tests set what /messages/pending returns
 
     class _StubHttp:
         async def post(self, path, body):
             posts.append((path, body))
             return {}
+
+        async def get(self, path):
+            gets.append(path)
+            return {"messages": list(pending_rows)}
+
         async def delete(self, path, body=None):
             deletes.append((path, body))
             return {}
@@ -292,17 +294,26 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     client._fetch_owner_slug = _stub_fetch_owner_slug  # type: ignore[assignment]
     client._owner_of = owner_of  # type: ignore[attr-defined]  # tests inject owners
 
-    admitted: list[dict] = []
+    # Stub WS whose on_message the drain feeds re-fetched envelopes through.
+    handled: list[dict] = []
 
-    async def _stub_admit_thread_message(*, root_id, priority, msg_dict, channel_meta):
-        admitted.append({"root_id": root_id, "msg_dict": msg_dict, "channel_meta": channel_meta})
+    async def _stub_on_message(envelope):
+        handled.append(envelope)
+        return None  # not gated → ack
 
-    client._admit_thread_message = _stub_admit_thread_message  # type: ignore[assignment]
+    class _StubWs:
+        on_message = None
+
+    ws = _StubWs()
+    ws.on_message = _stub_on_message  # type: ignore[assignment]
+    client._ws = ws  # type: ignore[assignment]
 
     client._sent_dms = sent_dms  # type: ignore[attr-defined]
     client._posts = posts  # type: ignore[attr-defined]
     client._deletes = deletes  # type: ignore[attr-defined]
-    client._admitted = admitted  # type: ignore[attr-defined]
+    client._gets = gets  # type: ignore[attr-defined]
+    client._pending_rows = pending_rows  # type: ignore[attr-defined]
+    client._handled = handled  # type: ignore[attr-defined]
     return client
 
 
@@ -330,10 +341,6 @@ async def test_gate_buffers_foreign_dm_and_prompts_operator(tmp_path):
     handled = await client._maybe_gate_foreign_dm(
         sender_slug="alice-1234",
         text="hello agent",
-        envelope_id="msg_inbound_1",
-        sent_at=1000,
-        thread_root_id="",
-        attachment_paths=[],
     )
     assert handled is True
     assert len(client._sent_dms) == 1
@@ -357,30 +364,29 @@ async def test_gate_drops_duplicate_sender_while_pending(tmp_path):
     client = _make_client(auto_accept_dm=False)
 
     await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hello", envelope_id="msg_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
+        sender_slug="alice-1234", text="hello",
     )
     handled = await client._maybe_gate_foreign_dm(
         sender_slug="alice-1234", text="bothering you again",
-        envelope_id="msg_2", sent_at=2000, thread_root_id="",
-        attachment_paths=[],
     )
     assert handled is True
     assert len(client._sent_dms) == 1
 
 
 @pytest.mark.asyncio
-async def test_approval_y_posts_allowlist_and_delivers_buffered_dm(tmp_path):
+async def test_approval_y_allowlists_and_drains_pending_dms(tmp_path):
     isolated_home()
     from puffo_agent.portal.state import agent_dir
 
     agent_dir("agent-1").mkdir(parents=True, exist_ok=True)
     client = _make_client(auto_accept_dm=False)
-    await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hello", envelope_id="msg_in_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
-    )
+    await client._maybe_gate_foreign_dm(sender_slug="alice-1234", text="hello")
     prompt_env_id = client._sent_dms[0]["env_id"]
+    # Two DMs from alice held un-acked in /messages/pending.
+    client._pending_rows.extend([
+        {"envelope": {"envelope_id": "env_a", "sender_slug": "alice-1234"}},
+        {"envelope": {"envelope_id": "env_b", "sender_slug": "alice-1234"}},
+    ])
 
     handled = await client._maybe_handle_dm_approval_reply(
         thread_root_id=prompt_env_id, text="y",
@@ -389,25 +395,25 @@ async def test_approval_y_posts_allowlist_and_delivers_buffered_dm(tmp_path):
     assert ("/allowlists", {"slugs": ["alice-1234"]}) in client._posts
     assert "alice-1234" in client._dm_allowlisted_senders
     assert client._pending_dm_approvals == {}
-    assert len(client._admitted) == 1
-    delivered = client._admitted[0]
-    assert delivered["msg_dict"]["sender_slug"] == "alice-1234"
-    assert delivered["msg_dict"]["text"] == "hello"
-    assert delivered["msg_dict"]["is_dm"] is True
+    # Drain scoped-fetched alice's pending DMs + fed them through on_message.
+    assert any("kind=dm" in g and "sender=alice-1234" in g for g in client._gets)
+    assert [e.get("envelope_id") for e in client._handled] == ["env_a", "env_b"]
+    # Then acked exactly those.
+    assert ("/messages/ack", {"envelope_ids": ["env_a", "env_b"]}) in client._posts
 
 
 @pytest.mark.asyncio
-async def test_approval_n_posts_blocklist_and_drops_buffered_dm(tmp_path):
+async def test_approval_n_blocklists_and_drops_pending_dms(tmp_path):
     isolated_home()
     from puffo_agent.portal.state import agent_dir
 
     agent_dir("agent-1").mkdir(parents=True, exist_ok=True)
     client = _make_client(auto_accept_dm=False)
-    await client._maybe_gate_foreign_dm(
-        sender_slug="bob-7777", text="spam spam", envelope_id="msg_in_2",
-        sent_at=2000, thread_root_id="", attachment_paths=[],
-    )
+    await client._maybe_gate_foreign_dm(sender_slug="bob-7777", text="spam spam")
     prompt_env_id = client._sent_dms[0]["env_id"]
+    client._pending_rows.append(
+        {"envelope": {"envelope_id": "env_x", "sender_slug": "bob-7777"}}
+    )
 
     handled = await client._maybe_handle_dm_approval_reply(
         thread_root_id=prompt_env_id, text="n",
@@ -415,8 +421,9 @@ async def test_approval_n_posts_blocklist_and_drops_buffered_dm(tmp_path):
     assert handled is True
     assert ("/blocklists", {"target": "user", "id": "bob-7777"}) in client._posts
     assert client._pending_dm_approvals == {}
-    # Blocked: the buffered message must NOT be delivered.
-    assert client._admitted == []
+    # Dropped: acked without handing anything to the agent.
+    assert client._handled == []
+    assert ("/messages/ack", {"envelope_ids": ["env_x"]}) in client._posts
 
 
 @pytest.mark.asyncio
@@ -432,8 +439,7 @@ async def test_approval_keeps_pending_and_confirms_error_when_post_raises(tmp_pa
     client.http.post = _raising_post  # type: ignore[assignment]
 
     await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hello", envelope_id="msg_in_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
+        sender_slug="alice-1234", text="hello",
     )
     prompt_env_id = client._sent_dms[0]["env_id"]
     n_before = len(client._sent_dms)
@@ -458,8 +464,7 @@ async def test_approval_reply_ignores_non_yn_text(tmp_path):
     agent_dir("agent-1").mkdir(parents=True, exist_ok=True)
     client = _make_client(auto_accept_dm=False)
     await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hello", envelope_id="msg_in_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
+        sender_slug="alice-1234", text="hello",
     )
     prompt_env_id = client._sent_dms[0]["env_id"]
 
@@ -480,8 +485,7 @@ async def test_gate_skips_when_operator_slug_missing(tmp_path):
     client = _make_client(auto_accept_dm=False, operator_slug="")
 
     handled = await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hello", envelope_id="msg_in_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
+        sender_slug="alice-1234", text="hello",
     )
     # Falls through (returns False) so the DM still reaches the agent.
     assert handled is False
@@ -501,8 +505,7 @@ async def test_gate_delivers_ungated_when_prompt_send_fails(tmp_path):
     client._send_dm = _raising_send_dm  # type: ignore[assignment]
 
     handled = await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hi", envelope_id="msg_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
+        sender_slug="alice-1234", text="hi",
     )
     # Prompt couldn't be sent → deliver ungated rather than swallow the DM.
     assert handled is False
@@ -522,8 +525,7 @@ async def test_gate_delivers_ungated_when_prompt_has_no_envelope_id(tmp_path):
     client._send_dm = _no_env_send_dm  # type: ignore[assignment]
 
     handled = await client._maybe_gate_foreign_dm(
-        sender_slug="alice-1234", text="hi", envelope_id="msg_1",
-        sent_at=1000, thread_root_id="", attachment_paths=[],
+        sender_slug="alice-1234", text="hi",
     )
     assert handled is False
     assert client._pending_dm_approvals == {}
