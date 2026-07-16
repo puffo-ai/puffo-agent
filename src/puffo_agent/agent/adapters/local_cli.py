@@ -372,6 +372,23 @@ class LocalCLIAdapter(Adapter):
         # sync_host_mcp_servers.
         merged_extras: dict[str, dict] = dict(self._desired_codex_extras)
         merged_extras.update(host_mcps)
+        # LiteLLM gateway path: when the agent carries a virtual key + gateway
+        # URL (set by AIM in agent.yml), codex authenticates to the gateway with
+        # the VK via the Responses API instead of ChatGPT OAuth. base_url must
+        # end in /v1 (codex POSTs to {base_url}/responses).
+        gateway_provider = None
+        if self.llm_base_url and self.llm_api_key:
+            base = self.llm_base_url.rstrip("/")
+            if not base.endswith("/v1"):
+                base = base + "/v1"
+            gateway_provider = {
+                "name": "litellm",
+                "display_name": "LiteLLM gateway",
+                "base_url": base,
+                "env_key": "OPENAI_API_KEY",
+                "model": self.model or "codex",
+                "wire_api": "responses",
+            }
         if self.puffo_core_mcp_env:
             write_codex_mcp_config(
                 codex_home / "config.toml",
@@ -379,11 +396,13 @@ class LocalCLIAdapter(Adapter):
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
                 env=self.puffo_core_mcp_env,
                 extra_servers=merged_extras,
+                provider=gateway_provider,
             )
         else:
             write_codex_mcp_config(
                 codex_home / "config.toml",
                 extra_servers=merged_extras,
+                provider=gateway_provider,
             )
             logger.warning(
                 "agent %s: codex MCP tools unavailable — puffo_core is "
@@ -401,18 +420,28 @@ class LocalCLIAdapter(Adapter):
             **os.environ,
             "CODEX_HOME": str(codex_home),
         }
-        auth_mode = sync_host_codex_auth_view(Path.home(), codex_home)
-        if auth_mode == "no-host-file":
-            raise RuntimeError(
-                f"agent {self.agent_id!r}: codex needs auth — run "
-                "`codex login` in your own shell so ~/.codex/auth.json "
-                "exists; cli-local + cli-docker only support codex's "
-                "OAuth (ChatGPT account) credentials, not raw API keys."
+        if gateway_provider:
+            # Gateway/VK path: the custom provider's env_key holds the VK; codex
+            # sends it as the bearer to the LiteLLM gateway. No ChatGPT OAuth,
+            # so the host auth.json gate below is bypassed entirely.
+            env["OPENAI_API_KEY"] = self.llm_api_key
+            logger.info(
+                "agent %s: codex → LiteLLM gateway %s (model=%s, VK auth, no OAuth)",
+                self.agent_id, gateway_provider["base_url"], gateway_provider["model"],
             )
-        logger.info(
-            "agent %s: shared host codex auth (%s)",
-            self.agent_id, auth_mode,
-        )
+        else:
+            auth_mode = sync_host_codex_auth_view(Path.home(), codex_home)
+            if auth_mode == "no-host-file":
+                raise RuntimeError(
+                    f"agent {self.agent_id!r}: codex needs auth — either set "
+                    "runtime.llm_base_url + runtime.api_key (LiteLLM gateway VK "
+                    "path), or run `codex login` in your own shell so "
+                    "~/.codex/auth.json exists (ChatGPT OAuth path)."
+                )
+            logger.info(
+                "agent %s: shared host codex auth (%s)",
+                self.agent_id, auth_mode,
+            )
         # Subprocess argv — ``codex app-server`` is the documented entry
         # point for embedding codex as a long-running agent. Resolve
         # via the shared resolver so PATH + ``PUFFO_CODEX_BIN`` env

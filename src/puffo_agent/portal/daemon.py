@@ -341,6 +341,13 @@ class Daemon:
     def _register_with_refresher(
         self, agent_cfg: AgentConfig, worker: Worker,
     ) -> None:
+        # Gateway/VK mode: nothing to refresh (static VK via LiteLLM). Skip
+        # registration so the periodic refresh loop never probes the provider
+        # (api.openai.com for codex) and flips refresh_broken.
+        # getattr: a runtime without the field is simply not in gateway mode —
+        # never let a missing optional field crash worker startup.
+        if (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip():
+            return
         refresher = self._refresher_for(agent_cfg)
         refresher.register_agent(agent_home_dir(agent_cfg.id))
         agent_id = agent_cfg.id
@@ -379,6 +386,14 @@ class Daemon:
         return self._refresher_for(agent_cfg).notify_refresh_needed
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
+        # Gateway/VK mode (runtime.llm_base_url set): the LLM key is a static
+        # per-agent virtual key routed through LiteLLM — there is NO OAuth token
+        # to refresh. Returning None makes the worker skip the pre-delivery
+        # refresh gate, so a turn isn't blocked (and deferred ~40s) by a spurious
+        # api.openai.com probe that 401s. Native-auth harnesses keep the refresh.
+        # getattr: see _register_with_refresher — a missing field means OAuth mode.
+        if (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip():
+            return None
         return self._refresher_for(agent_cfg).ensure_fresh
 
     def _set_worker_profile_cache(
