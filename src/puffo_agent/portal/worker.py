@@ -228,6 +228,11 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 # at /home/agent/.puffo-agent-state (docker_cli also
                 # pins this at its env-override sites).
                 memory_dir="/home/agent/.puffo-agent-state/memory",
+                # T23 phase-2: forward the transport so a keyless
+                # ``bridge`` agent's subprocess MCP sets keyless=True
+                # (unsigned /v2/cloud-agents/* path). Only "bridge" is
+                # emitted downstream; native is inert.
+                transport=pc.transport,
             )
         return adapter
 
@@ -284,6 +289,12 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
                 memory_dir=str(agent_cfg.resolve_memory_dir()),
+                # T23 phase-2: forward the transport so a keyless
+                # ``bridge`` agent's subprocess MCP sets keyless=True
+                # (unsigned /v2/cloud-agents/* path) instead of hitting
+                # the signed keystore path and raising identity-not-found.
+                # Only "bridge" is emitted downstream; native is inert.
+                transport=pc.transport,
             )
         return adapter
 
