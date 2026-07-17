@@ -279,8 +279,7 @@ async def execute_command(
         if isinstance(params.get("soul"), str):
             patch["soul"] = params["soul"]
             prompt_changed = True
-        # Runtime block — same fields the local bridge's update_runtime
-        # accepts; invalid values rejected before saving.
+        # mirrors the bridge's update_runtime fields
         rt_in = params.get("runtime")
         if isinstance(rt_in, dict):
             level_in = rt_in.get("inference_level")

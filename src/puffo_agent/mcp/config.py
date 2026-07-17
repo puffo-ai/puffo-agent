@@ -23,12 +23,10 @@ logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
 
-# Provider-agnostic enum (mirrors the web's AgentCoreInferenceLevel);
-# validation superset — per-harness narrowing happens at emit time.
+# Web enum superset; per-harness narrowing at emit.
 INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 
-# codex model_reasoning_effort values; xhigh (claude-only) is dropped at
-# emit, "minimal" stays reachable via a direct agent.yml edit.
+# codex model_reasoning_effort values.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
@@ -128,8 +126,7 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
-    # Top-level key must precede [mcp_servers.*] tables; drop
-    # codex-invalid levels rather than emit a config that breaks turns.
+    # top-level key must precede [mcp_servers.*] tables
     if inference_level:
         if inference_level in REASONING_EFFORTS:
             lines.append(f'model_reasoning_effort = "{inference_level}"')

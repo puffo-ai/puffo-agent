@@ -940,7 +940,7 @@ class LocalCLIAdapter(Adapter):
             cmd.extend(["--permission-mode", self.permission_mode])
         if self.model:
             cmd.extend(["--model", self.model])
-        # Guard drops yaml-only codex values (e.g. "minimal").
+        # drops codex-only yaml values
         if self.inference_level:
             if self.inference_level in INFERENCE_LEVELS:
                 cmd.extend(["--effort", self.inference_level])

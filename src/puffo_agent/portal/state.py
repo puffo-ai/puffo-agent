@@ -1018,8 +1018,7 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Inference level (low|medium|high|xhigh; empty = harness default).
-    # codex → config.toml model_reasoning_effort; claude-code → --effort.
+    # "" = harness default; codex → config.toml, claude-code → --effort
     inference_level: str = ""
     # codex (cli-local) per-turn wall-clock budget in seconds; raise for
     # agents running long reasoning/complex tasks.

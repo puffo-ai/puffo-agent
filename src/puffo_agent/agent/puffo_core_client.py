@@ -566,7 +566,6 @@ class PuffoCoreMessageClient:
         self._rewarm_lock = asyncio.Lock()
         self._last_rewarm = 0.0
         self._warm_task: asyncio.Future | None = None
-        # Gate-skipped envelopes awaiting a batched processing report.
         self._stale_report_buf: list[str] = []
         self._stale_flush_task: asyncio.Future | None = None
 
@@ -596,11 +595,7 @@ class PuffoCoreMessageClient:
         return sent_at < now_ms - self._catchup_stale_ms
 
     def _report_stale_processed(self, envelope_id: str) -> None:
-        """Best-effort green run for a gate-skipped envelope so clients
-        don't show it pending forever. Buffered + flushed as ONE
-        end:batch POST — a per-envelope await here stretched a big
-        catch-up past the WS keepalive window, so the batch ack never
-        sent and the same backlog redelivered forever."""
+        """Batched best-effort processing report; never blocks catch-up."""
         self._stale_report_buf.append(envelope_id)
         if self._stale_flush_task is None or self._stale_flush_task.done():
             self._stale_flush_task = asyncio.ensure_future(
@@ -608,10 +603,8 @@ class PuffoCoreMessageClient:
             )
 
     async def _flush_stale_reports(self) -> None:
-        # Let the catch-up burst finish accumulating before flushing.
-        await asyncio.sleep(1.0)
-        # Loop: envelopes appended while a chunk POST is in flight get
-        # picked up here instead of stranding until the next report.
+        await asyncio.sleep(1.0)  # coalesce the burst
+        # re-sweeps mid-flush arrivals
         while self._stale_report_buf:
             buf, self._stale_report_buf = self._stale_report_buf, []
             await self._post_stale_runs(buf)
@@ -625,8 +618,7 @@ class PuffoCoreMessageClient:
             }
             for mid in buf
         ]
-        # Chunked so a weeks-long backlog stays under request-size limits.
-        for i in range(0, len(runs), 200):
+        for i in range(0, len(runs), 200):  # request-size cap
             try:
                 await self.http.post(
                     "/messages/processing/end:batch",

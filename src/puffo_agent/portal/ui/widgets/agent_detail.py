@@ -272,7 +272,6 @@ class AgentDetail(QWidget):
         self._model = QComboBox()
         layout.addRow("Model", self._model)
 
-        # Inference level; value set follows the harness.
         self._effort = QComboBox()
         layout.addRow("Effort", self._effort)
 
@@ -678,7 +677,7 @@ class AgentDetail(QWidget):
     def _populate_effort_combo(self, harness: str, current: str) -> None:
         from ....mcp.config import INFERENCE_LEVELS
 
-        # codex has no xhigh tier (dropped at config.toml write anyway).
+        # codex: no xhigh tier
         levels = [
             lv for lv in INFERENCE_LEVELS
             if not (harness == "codex" and lv == "xhigh")
