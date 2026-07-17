@@ -8,6 +8,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Heartbeat reports `inference_level` (PUF-373).** The runtime info in
+  the agent heartbeat now carries the configured inference level so the
+  web edit UI can display the current value instead of always showing
+  the harness default.
+
 - **Per-agent inference level (PUF-373).** `runtime.inference_level`
   (`low|medium|high|xhigh`, empty = harness default) applies to both
   harnesses: codex gets `model_reasoning_effort` in its config.toml

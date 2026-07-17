@@ -979,6 +979,7 @@ class Worker:
             "provider": rt.provider,
             "harness": rt.harness,
             "model": rt.model,
+            "inference_level": rt.inference_level,
         }
 
     async def _run_ws_local(self) -> None:
