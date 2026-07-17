@@ -188,23 +188,71 @@ class _StubHttp:
         return {}
 
 
-@pytest.mark.asyncio
-async def test_report_stale_processed_posts_green_run():
+def _report_client(fail: bool = False):
+    import asyncio as _a
+
     c = _client(_48H_MS)
-    c.http = _StubHttp()
+    c.http = _StubHttp(fail=fail)
     c._log = logging.getLogger("staleness-test")
-    await c._report_stale_processed("msg_old_1")
+    c._stale_report_buf = []
+    c._stale_flush_task = None
+    return c
+
+
+@pytest.mark.asyncio
+async def test_reports_batch_into_one_post():
+    """A catch-up burst must flush as ONE end:batch POST — the old
+    per-envelope await stretched catch-up past the WS keepalive window
+    and the backlog redelivered forever."""
+    c = _report_client()
+    for i in range(3):
+        c._report_stale_processed(f"msg_old_{i}")
+    await c._stale_flush_task
+    assert len(c.http.posts) == 1
     path, body = c.http.posts[0]
     assert path == "/messages/processing/end:batch"
-    (run,) = body["runs"]
-    assert run["message_id"] == "msg_old_1"
-    assert run["succeeded"] is True
-    assert run["run_id"].startswith("run_")
+    assert [r["message_id"] for r in body["runs"]] == [
+        "msg_old_0", "msg_old_1", "msg_old_2",
+    ]
+    assert all(r["succeeded"] is True for r in body["runs"])
+    assert c._stale_report_buf == []
 
 
 @pytest.mark.asyncio
-async def test_report_stale_processed_swallows_http_failure():
-    c = _client(_48H_MS)
-    c.http = _StubHttp(fail=True)
-    c._log = logging.getLogger("staleness-test")
-    await c._report_stale_processed("msg_old_1")  # must not raise
+async def test_reports_chunk_at_200():
+    c = _report_client()
+    for i in range(450):
+        c._report_stale_processed(f"msg_{i}")
+    await c._stale_flush_task
+    sizes = [len(b["runs"]) for _p, b in c.http.posts]
+    assert sizes == [200, 200, 50]
+
+
+@pytest.mark.asyncio
+async def test_report_during_flush_is_not_stranded():
+    import asyncio
+
+    c = _report_client()
+    orig_post = c.http.post
+    late: dict = {}
+
+    async def _post_and_inject(path, body):
+        # A new stale envelope lands while the first chunk POST is in
+        # flight — the flush loop must pick it up.
+        if "injected" not in late:
+            late["injected"] = True
+            c._report_stale_processed("msg_late")
+        return await orig_post(path, body)
+
+    c.http.post = _post_and_inject
+    c._report_stale_processed("msg_first")
+    await c._stale_flush_task
+    reported = [r["message_id"] for _p, b in c.http.posts for r in b["runs"]]
+    assert "msg_first" in reported and "msg_late" in reported
+
+
+@pytest.mark.asyncio
+async def test_report_flush_swallows_http_failure():
+    c = _report_client(fail=True)
+    c._report_stale_processed("msg_old_1")
+    await c._stale_flush_task  # must not raise

@@ -274,6 +274,7 @@ def _make_agent_cfg(
         harness="claude-code",
         model="",
         permission_mode="bypassPermissions",
+        inference_level="",
         docker_image="",
         docker_memory_limit="",
         docker_memory_reservation="",

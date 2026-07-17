@@ -855,3 +855,43 @@ async def test_role_edit_rewrites_profile_md_role_line(monkeypatch):
     text = profile.read_text(encoding="utf-8")
     assert "**Role:** coder: new description\n" in text
     assert "helper: old" not in text
+
+
+async def test_update_runtime_applies_inference_level():
+    # PUF-373: the local bridge runtime editor accepts inference_level.
+    from puffo_agent.portal.state import AgentConfig
+
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home, "codex-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    server = TestServer(build_app(DaemonConfig().bridge))
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"inference_level": "medium"}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/codex-bot/runtime", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/codex-bot/runtime", data=body, headers=h)
+        assert r.status == 200, await r.text()
+    assert AgentConfig.load("codex-bot").runtime.inference_level == "medium"
+
+
+async def test_update_runtime_rejects_invalid_inference_level():
+    user = make_user()
+    home = isolated_home()
+    write_test_agent(
+        home, "codex-bot2",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+    server = TestServer(build_app(DaemonConfig().bridge))
+    async with TestClient(server) as c:
+        await _pair(c, user)
+        body = json.dumps({"inference_level": "turbo"}).encode("utf-8")
+        h = signed_headers(user, "PATCH", "/v1/agents/codex-bot2/runtime", body)
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        r = await c.patch("/v1/agents/codex-bot2/runtime", data=body, headers=h)
+        assert r.status == 400, await r.text()

@@ -105,6 +105,8 @@ class PuffoCoreWsClient:
             )
             if not messages:
                 return
+            # HTTP, not WS-frame (no pong until the listen loop → WS dies
+            # mid-catch-up); chunked so progress survives a death.
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
@@ -116,10 +118,23 @@ class PuffoCoreWsClient:
                 eid = envelope.get("envelope_id")
                 if eid:
                     envelope_ids.append(eid)
-            if envelope_ids and self._ws:
-                await self._send_ack(envelope_ids)
+                if len(envelope_ids) >= 25:
+                    await self._ack_http(envelope_ids)
+                    envelope_ids = []
+            if envelope_ids:
+                await self._ack_http(envelope_ids)
         except Exception:
             logger.exception("Catch-up failed")
+
+    async def _ack_http(self, envelope_ids: list[str]) -> None:
+        try:
+            await self.http_client.post(
+                "/messages/ack", {"envelope_ids": list(envelope_ids)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "catch-up HTTP ack failed (%d ids): %s", len(envelope_ids), exc,
+            )
 
     async def _send_ack(self, envelope_ids: list[str]) -> None:
         if self._ws:
