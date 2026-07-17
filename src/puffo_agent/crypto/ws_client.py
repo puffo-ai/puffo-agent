@@ -105,10 +105,14 @@ class PuffoCoreWsClient:
             )
             if not messages:
                 return
-            # Ack in chunks as we go — a single end-of-loop ack loses ALL
-            # progress when a big backlog outlives the WS keepalive window,
-            # and the whole batch redelivers on every reconnect (a loop).
-            # Chunked, each cycle converges even if the connection dies.
+            # Ack in chunks over HTTP as we go. WS-frame acks don't
+            # work here: the server's app-level pings get no pong until
+            # the listen loop starts, so it drops the connection mid-
+            # catch-up and every frame after that lands in a dead pipe —
+            # one end-of-loop ack then loses ALL progress and the same
+            # backlog redelivers on every reconnect (an infinite loop).
+            # HTTP acks land regardless of the WS's fate, so each cycle
+            # converges.
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
@@ -120,13 +124,23 @@ class PuffoCoreWsClient:
                 eid = envelope.get("envelope_id")
                 if eid:
                     envelope_ids.append(eid)
-                if len(envelope_ids) >= 25 and self._ws:
-                    await self._send_ack(envelope_ids)
+                if len(envelope_ids) >= 25:
+                    await self._ack_http(envelope_ids)
                     envelope_ids = []
-            if envelope_ids and self._ws:
-                await self._send_ack(envelope_ids)
+            if envelope_ids:
+                await self._ack_http(envelope_ids)
         except Exception:
             logger.exception("Catch-up failed")
+
+    async def _ack_http(self, envelope_ids: list[str]) -> None:
+        try:
+            await self.http_client.post(
+                "/messages/ack", {"envelope_ids": list(envelope_ids)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "catch-up HTTP ack failed (%d ids): %s", len(envelope_ids), exc,
+            )
 
     async def _send_ack(self, envelope_ids: list[str]) -> None:
         if self._ws:

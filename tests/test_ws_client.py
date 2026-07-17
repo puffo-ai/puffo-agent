@@ -120,11 +120,17 @@ class FakeHttpClient:
 
     def __init__(self):
         self.pending_messages: list[dict] = []
+        self.ack_posts: list[list[str]] = []
         self._ensure_subkey_called = False
 
     async def get(self, path: str):
         if path == "/messages/pending":
             return {"messages": self.pending_messages}
+        return {}
+
+    async def post(self, path: str, body: dict):
+        if path == "/messages/ack":
+            self.ack_posts.append(list(body.get("envelope_ids") or []))
         return {}
 
     async def _ensure_subkey(self):
@@ -276,9 +282,8 @@ async def test_catchup_on_connect():
     assert received[0]["envelope_id"] == "env_pending1"
     assert received[1]["envelope_id"] == "env_pending2"
 
-    ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
-    assert len(ack_frames) == 1
-    assert sorted(ack_frames[0]["envelope_ids"]) == ["env_pending1", "env_pending2"]
+    assert len(http.ack_posts) == 1
+    assert sorted(http.ack_posts[0]) == ["env_pending1", "env_pending2"]
     await server.stop()
 
 
@@ -564,9 +569,9 @@ async def test_catchup_acks_in_chunks():
     except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
         pass
 
-    ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
-    # 60 messages at 25/chunk → 25 + 25 + 10.
-    assert [len(f["envelope_ids"]) for f in ack_frames] == [25, 25, 10]
-    acked = [e for f in ack_frames for e in f["envelope_ids"]]
+    # 60 messages at 25/chunk → 25 + 25 + 10, over HTTP (immune to a
+    # WS death mid-catch-up).
+    assert [len(c) for c in http.ack_posts] == [25, 25, 10]
+    acked = [e for c in http.ack_posts for e in c]
     assert acked == [f"env_{i}" for i in range(60)]
     await server.stop()
