@@ -530,3 +530,43 @@ async def test_on_connect_failure_does_not_kill_the_loop():
     # exception was caught, not propagated out of connect_once.
     assert [e["envelope_id"] for e in received] == ["env_p1"]
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_catchup_acks_in_chunks():
+    """A big backlog must ack incrementally — one end-of-loop ack loses
+    all progress when the connection dies mid-catch-up and the whole
+    batch redelivers forever."""
+    ks, _ = _make_keystore()
+    server = FakeWsServer()
+    await server.start()
+
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": i, "envelope": {"envelope_id": f"env_{i}", "sender_slug": "bob"}}
+        for i in range(60)
+    ]
+
+    client = PuffoCoreWsClient(
+        f"http://127.0.0.1:{server.port}", ks, "alice-0001", http,
+    )
+    client.ws_url = f"ws://127.0.0.1:{server.port}"
+
+    async def on_msg(envelope):
+        return None
+
+    client.on_message = on_msg
+    task = asyncio.create_task(client.connect_once())
+    await asyncio.sleep(0.8)
+    client.stop()
+    try:
+        await asyncio.wait_for(task, timeout=2)
+    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
+        pass
+
+    ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
+    # 60 messages at 25/chunk → 25 + 25 + 10.
+    assert [len(f["envelope_ids"]) for f in ack_frames] == [25, 25, 10]
+    acked = [e for f in ack_frames for e in f["envelope_ids"]]
+    assert acked == [f"env_{i}" for i in range(60)]
+    await server.stop()

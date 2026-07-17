@@ -105,6 +105,10 @@ class PuffoCoreWsClient:
             )
             if not messages:
                 return
+            # Ack in chunks as we go — a single end-of-loop ack loses ALL
+            # progress when a big backlog outlives the WS keepalive window,
+            # and the whole batch redelivers on every reconnect (a loop).
+            # Chunked, each cycle converges even if the connection dies.
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
@@ -116,6 +120,9 @@ class PuffoCoreWsClient:
                 eid = envelope.get("envelope_id")
                 if eid:
                     envelope_ids.append(eid)
+                if len(envelope_ids) >= 25 and self._ws:
+                    await self._send_ack(envelope_ids)
+                    envelope_ids = []
             if envelope_ids and self._ws:
                 await self._send_ack(envelope_ids)
         except Exception:
