@@ -30,7 +30,8 @@ linking, and `agent` for the bots themselves.
   `https://chat.puffo.ai/relay`; point at a self-hosted server via each
   agent's `puffo_core.server_url`.
 - **Per runtime kind** (see [Runtime kinds](#61-runtime-kinds) below):
-  - `chat-local` — none beyond the provider key.
+  - `chat-local` — `pip install puffo-agent[chat-local]` (the anthropic /
+    openai SDKs, cloud-slimmed out of the base install) + the provider key.
   - `sdk-local` — `pip install puffo-agent[sdk]`.
   - `cli-local` — by default, `claude` CLI on `$PATH` + `claude login`
     on the host. With `runtime.harness=codex`, instead requires the
@@ -381,7 +382,7 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 
 | Runtime&nbsp;kind | What runs | Requires |
 | --- | --- | --- |
-| `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | provider key |
+| `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | `puffo-agent[chat-local]` + provider key |
 | `sdk-local` | Claude Agent SDK, in-process (anthropic only). | `puffo-agent[sdk]` |
 | `cli-local` | A CLI harness as a host subprocess — Claude Code, `codex`, or `hermes` (alpha). Shell + skills on the host. | `claude` / `codex` / `hermes` login |
 | `cli-docker` | Same as `cli-local`, in a per-agent container. `claude-code` / `hermes` / `gemini-cli`. | Docker |

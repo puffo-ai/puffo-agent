@@ -344,10 +344,16 @@ def _downscale_oversized_image(
     try:
         from PIL import Image
     except ImportError:
+        # Pillow is the cloud-slim ``attachments`` extra, absent from the
+        # base (cli-local template) install. The dimension guard is
+        # best-effort — a missing SDK must NOT crash message delivery — so
+        # we log the actionable fix and no-op rather than raising an
+        # obscure ImportError up the delivery path.
         logger.warning(
             "Pillow missing — inbound images aren't dimension-checked; "
-            "a many-image request can then reject an oversized one "
-            "(pip install pillow)",
+            "a many-image request can then reject an oversized one. "
+            "Rebuild the template with \"pip install "
+            "'puffo-agent[attachments]'\" to enable the image guard.",
         )
         return False
     try:
