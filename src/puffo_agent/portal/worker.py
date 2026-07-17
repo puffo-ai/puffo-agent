@@ -318,7 +318,28 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
     base_url = runtime.llm_base_url or None
 
     if provider_name == "anthropic":
-        from ..agent.providers.anthropic_provider import AnthropicProvider
+        try:
+            from ..agent.providers.anthropic_provider import AnthropicProvider
+        except ImportError as exc:
+            # Only re-attribute to a missing extra when the *anthropic*
+            # package itself is what's absent. An ImportError whose missing
+            # module is something else (a broken transitive dep of an
+            # installed anthropic SDK, a partial wheel, an internal
+            # submodule) is a genuine failure — re-raise it unchanged rather
+            # than misdirect the operator to reinstall an already-present
+            # package.
+            if (exc.name or "") != "anthropic" and not (
+                exc.name or ""
+            ).startswith("anthropic."):
+                raise
+            # The Anthropic SDK is a cloud-slim extra, absent from the base
+            # (cli-local template) install. Surface the fix, not a raw
+            # ModuleNotFoundError buried in the worker traceback.
+            raise RuntimeError(
+                "chat-local provider=anthropic needs the Anthropic SDK, "
+                "which isn't in the base install — rebuild the template "
+                "with \"pip install 'puffo-agent[anthropic]'\""
+            ) from exc
         api_key = runtime.api_key or daemon_cfg.anthropic.api_key
         model = runtime.model or daemon_cfg.anthropic.model or "claude-sonnet-4-6"
         if not api_key:
@@ -328,7 +349,20 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
         return AnthropicProvider(api_key=api_key, model=model, base_url=base_url)
 
     if provider_name == "openai":
-        from ..agent.providers.openai_provider import OpenAIProvider
+        try:
+            from ..agent.providers.openai_provider import OpenAIProvider
+        except ImportError as exc:
+            # See the anthropic branch: only re-attribute when the *openai*
+            # package itself is missing; re-raise any other ImportError.
+            if (exc.name or "") != "openai" and not (
+                exc.name or ""
+            ).startswith("openai."):
+                raise
+            raise RuntimeError(
+                "chat-local provider=openai needs the OpenAI SDK, which "
+                "isn't in the base install — rebuild the template with "
+                "\"pip install 'puffo-agent[openai]'\""
+            ) from exc
         api_key = runtime.api_key or daemon_cfg.openai.api_key
         model = runtime.model or daemon_cfg.openai.model or "gpt-4o"
         if not api_key:
