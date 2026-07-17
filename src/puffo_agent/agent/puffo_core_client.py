@@ -28,6 +28,7 @@ from ..crypto.message import (
     RecipientDevice,
     decrypt_message,
     encrypt_message,
+    read_plaintext_message,
 )
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
@@ -671,7 +672,18 @@ class PuffoCoreMessageClient:
             # every other message goes through; the dispatch-to-
             # worker step below short-circuits on ``sender_slug ==
             # self.slug`` to prevent a retrigger loop.
-            sender_slug = envelope.get("sender_slug", "")
+            # Plaintext envelopes carry no outer routing — the sender is
+            # named inside the signed payload; verify in the clear (no decrypt).
+            is_plaintext = envelope.get("type") == "plaintext_message_envelope"
+            if is_plaintext:
+                sender_slug = (
+                    envelope.get("signed_payload", {})
+                    .get("payload", {})
+                    .get("sender_slug", "")
+                )
+            else:
+                sender_slug = envelope.get("sender_slug", "")
+
             try:
                 sender_pks = await self._key_cache.get_signing_keys(sender_slug)
             except Exception as e:
@@ -681,15 +693,18 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # Try each pubkey until one decrypts. On total failure,
+            def _open(pk: bytes) -> MessagePayload:
+                if is_plaintext:
+                    return read_plaintext_message(envelope, pk)
+                return decrypt_message(envelope, self.device_id, kem_kp, pk)
+
+            # Try each pubkey until one verifies. On total failure,
             # invalidate + retry once with a fresh pull to handle
             # subkey rotation since the cache was populated.
             payload = None
             for pk in sender_pks:
                 try:
-                    payload = decrypt_message(
-                        envelope, self.device_id, kem_kp, pk,
-                    )
+                    payload = _open(pk)
                     break
                 except Exception:
                     continue
@@ -700,9 +715,7 @@ class PuffoCoreMessageClient:
                     sender_pks = await self._key_cache.get_signing_keys(sender_slug)
                     for pk in sender_pks:
                         try:
-                            payload = decrypt_message(
-                                envelope, self.device_id, kem_kp, pk,
-                            )
+                            payload = _open(pk)
                             break
                         except Exception:
                             continue
