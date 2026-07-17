@@ -6,17 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-
-- **Stale channel cache self-heals (PUF-376).** A membership event
-  dropped during a WS reconnect used to leave a genuinely-member
-  channel unaddressable by `send_message` until a daemon restart.
-  The member/channel cache now re-warms on every (re)connect, and a
-  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
-  failing loud — on every runtime, including the cli-local /
-  cli-docker data-service path.
+## [1.1.3] — 2026-07-17
 
 ### Added
+
+- **Heartbeat reports `inference_level` (PUF-373).** The runtime info in
+  the agent heartbeat now carries the configured inference level so the
+  web edit UI can display the current value instead of always showing
+  the harness default.
+
+- **Per-agent inference level (PUF-373).** `runtime.inference_level`
+  (`low|medium|high|xhigh`, empty = harness default) applies to both
+  harnesses: codex gets `model_reasoning_effort` in its config.toml
+  (`xhigh` dropped — no codex tier), claude-code gets `--effort` on the
+  spawn, on cli-local and cli-docker alike. Settable from the portal UI
+  (harness-aware dropdown), the local bridge runtime editor, and a
+  linked machine's create/edit commands — invalid values are rejected
+  at every write surface.
 
 - **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon
   restart / resume-from-pause, redelivered messages older than
@@ -45,6 +51,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   their DM through one shared constructor, so web/mobile clients show
   consistent Yes/No buttons that post `y`/`n` into the prompt's thread —
   the same replies the daemon already accepts.
+
+### Fixed
+
+- **Catch-up redelivery loop on large backlogs.** Observed live as a
+  paused-for-weeks agent redelivering the same 200+ messages every
+  ~70s forever. Three compounding causes fixed: per-envelope
+  processing reports stretched catch-up past the WS keepalive window
+  (now buffered into one chunked `end:batch` POST); the single
+  end-of-loop ack lost all progress when the connection died (now
+  acked every 25 envelopes); and WS-frame acks landed in a dead pipe —
+  the server's pings get no pong until the listen loop starts — so
+  catch-up acks now go over HTTP `POST /messages/ack` (matching the
+  web client's pending-drain) and pending shrinks monotonically.
+
+- **Stale channel cache self-heals (PUF-376).** A membership event
+  dropped during a WS reconnect used to leave a genuinely-member
+  channel unaddressable by `send_message` until a daemon restart.
+  The member/channel cache now re-warms on every (re)connect, and a
+  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
+  failing loud — on every runtime, including the cli-local /
+  cli-docker data-service path.
 
 ## [1.1.2] — 2026-07-14
 
