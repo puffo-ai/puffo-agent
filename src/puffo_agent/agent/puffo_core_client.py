@@ -566,6 +566,9 @@ class PuffoCoreMessageClient:
         self._rewarm_lock = asyncio.Lock()
         self._last_rewarm = 0.0
         self._warm_task: asyncio.Future | None = None
+        # Gate-skipped envelopes awaiting a batched processing report.
+        self._stale_report_buf: list[str] = []
+        self._stale_flush_task: asyncio.Future | None = None
 
         # Lazy caches for human-readable space + channel names; names
         # aren't on the WS payload so we resolve via ``GET /spaces``
@@ -592,22 +595,48 @@ class PuffoCoreMessageClient:
             now_ms = int(time.time() * 1000)
         return sent_at < now_ms - self._catchup_stale_ms
 
-    async def _report_stale_processed(self, envelope_id: str) -> None:
-        """Best-effort green run for a gate-skipped envelope so
-        clients don't show it pending forever."""
-        try:
-            await self.http.post(
-                "/messages/processing/end:batch",
-                {"runs": [{
-                    "run_id": f"run_{uuid.uuid4().hex}",
-                    "message_id": envelope_id,
-                    "succeeded": True,
-                }]},
+    def _report_stale_processed(self, envelope_id: str) -> None:
+        """Best-effort green run for a gate-skipped envelope so clients
+        don't show it pending forever. Buffered + flushed as ONE
+        end:batch POST — a per-envelope await here stretched a big
+        catch-up past the WS keepalive window, so the batch ack never
+        sent and the same backlog redelivered forever."""
+        self._stale_report_buf.append(envelope_id)
+        if self._stale_flush_task is None or self._stale_flush_task.done():
+            self._stale_flush_task = asyncio.ensure_future(
+                self._flush_stale_reports()
             )
-        except Exception as exc:  # noqa: BLE001
-            self._log.debug(
-                "stale-processed report failed for %s: %s", envelope_id, exc,
-            )
+
+    async def _flush_stale_reports(self) -> None:
+        # Let the catch-up burst finish accumulating before flushing.
+        await asyncio.sleep(1.0)
+        # Loop: envelopes appended while a chunk POST is in flight get
+        # picked up here instead of stranding until the next report.
+        while self._stale_report_buf:
+            buf, self._stale_report_buf = self._stale_report_buf, []
+            await self._post_stale_runs(buf)
+
+    async def _post_stale_runs(self, buf: list[str]) -> None:
+        runs = [
+            {
+                "run_id": f"run_{uuid.uuid4().hex}",
+                "message_id": mid,
+                "succeeded": True,
+            }
+            for mid in buf
+        ]
+        # Chunked so a weeks-long backlog stays under request-size limits.
+        for i in range(0, len(runs), 200):
+            try:
+                await self.http.post(
+                    "/messages/processing/end:batch",
+                    {"runs": runs[i:i + 200]},
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log.debug(
+                    "stale-processed flush failed (%d runs): %s",
+                    len(runs[i:i + 200]), exc,
+                )
 
     async def listen(
         self,
@@ -807,7 +836,7 @@ class PuffoCoreMessageClient:
                     self._catchup_stale_ms,
                     payload_thread_root_id or payload.envelope_id,
                 )
-                await self._report_stale_processed(payload.envelope_id)
+                self._report_stale_processed(payload.envelope_id)
                 return
 
             channel_id = payload.channel_id or ""

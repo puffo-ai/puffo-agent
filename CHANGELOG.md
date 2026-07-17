@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Catch-up redelivery loop on large stale backlogs.** The staleness
+  gate reported each skipped envelope with its own awaited HTTP POST;
+  a weeks-long backlog stretched catch-up past the WS keepalive window,
+  the batch ack never sent, and the same backlog redelivered on every
+  reconnect. Reports are now buffered and flushed as one chunked
+  end:batch POST off the catch-up path.
+
 - **Stale channel cache self-heals (PUF-376).** A membership event
   dropped during a WS reconnect used to leave a genuinely-member
   channel unaddressable by `send_message` until a daemon restart.
