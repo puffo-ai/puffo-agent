@@ -1018,10 +1018,8 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # PUF-373: provider-agnostic inference level (the web's inference_level
-    # selector: low | medium | high | xhigh). Empty = harness default. For a
-    # Codex agent it's emitted as model_reasoning_effort in config.toml
-    # (xhigh dropped — Codex has no xhigh tier).
+    # Inference level (low|medium|high|xhigh; empty = harness default).
+    # codex → config.toml model_reasoning_effort; claude-code → --effort.
     inference_level: str = ""
     # codex (cli-local) per-turn wall-clock budget in seconds; raise for
     # agents running long reasoning/complex tasks.

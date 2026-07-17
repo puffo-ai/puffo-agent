@@ -280,9 +280,7 @@ async def execute_command(
             patch["soul"] = params["soul"]
             prompt_changed = True
         # Runtime block — same fields the local bridge's update_runtime
-        # accepts; reject invalid triples before saving. inference_level is
-        # the web's per-harness effort selector (codex-only for now; xhigh
-        # dropped at config.toml write), trust-in like the other fields here.
+        # accepts; invalid values rejected before saving.
         rt_in = params.get("runtime")
         if isinstance(rt_in, dict):
             level_in = rt_in.get("inference_level")

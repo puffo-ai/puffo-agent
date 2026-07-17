@@ -19,12 +19,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- **Catch-up redelivery loop on large stale backlogs.** The staleness
-  gate reported each skipped envelope with its own awaited HTTP POST;
-  a weeks-long backlog stretched catch-up past the WS keepalive window,
-  the batch ack never sent, and the same backlog redelivered on every
-  reconnect. Reports are now buffered and flushed as one chunked
-  end:batch POST off the catch-up path.
+- **Catch-up redelivery loop on large backlogs.** Observed live as a
+  paused-for-weeks agent redelivering the same 200+ messages every
+  ~70s forever. Three compounding causes fixed: per-envelope
+  processing reports stretched catch-up past the WS keepalive window
+  (now buffered into one chunked `end:batch` POST); the single
+  end-of-loop ack lost all progress when the connection died (now
+  acked every 25 envelopes); and WS-frame acks landed in a dead pipe —
+  the server's pings get no pong until the listen loop starts — so
+  catch-up acks now go over HTTP `POST /messages/ack` (matching the
+  web client's pending-drain) and pending shrinks monotonically.
 
 - **Stale channel cache self-heals (PUF-376).** A membership event
   dropped during a WS reconnect used to leave a genuinely-member

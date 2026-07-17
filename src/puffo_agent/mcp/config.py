@@ -23,18 +23,12 @@ logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
 
-# PUF-373: provider-agnostic inference-level enum, mirroring the web's
-# ``AgentCoreInferenceLevel``. The web selector sends ``runtime.inference_level``
-# and its allowed values differ per harness (Vase 2026-07-16): Codex offers
-# low/medium/high, Claude adds xhigh. This is the full superset used to
-# validate the field; the per-harness narrowing happens at emit time.
+# Provider-agnostic enum (mirrors the web's AgentCoreInferenceLevel);
+# validation superset — per-harness narrowing happens at emit time.
 INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 
-# codex `model_reasoning_effort` accepted values (codex-cli). An inference_level
-# is emitted to a Codex agent's config.toml only when it's one of these — so
-# ``xhigh`` (a Claude-only level) is dropped for Codex, which has no xhigh tier.
-# ``minimal`` has no web-selector entry but stays reachable via a direct
-# agent.yml edit for advanced users.
+# codex model_reasoning_effort values; xhigh (claude-only) is dropped at
+# emit, "minimal" stays reachable via a direct agent.yml edit.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
@@ -134,12 +128,8 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
-    # PUF-373: map the provider-agnostic inference_level to codex's
-    # model_reasoning_effort. Top-level key must precede any
-    # [mcp_servers.*] table. Only codex-valid levels are emitted — xhigh
-    # (Claude-only) is dropped here rather than written as a config codex
-    # rejects at model-invocation. Web-set values are already constrained
-    # to low/medium/high for Codex; this guards yaml/bridge edits.
+    # Top-level key must precede [mcp_servers.*] tables; drop
+    # codex-invalid levels rather than emit a config that breaks turns.
     if inference_level:
         if inference_level in REASONING_EFFORTS:
             lines.append(f'model_reasoning_effort = "{inference_level}"')

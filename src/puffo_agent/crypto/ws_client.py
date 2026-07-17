@@ -105,14 +105,10 @@ class PuffoCoreWsClient:
             )
             if not messages:
                 return
-            # Ack in chunks over HTTP as we go. WS-frame acks don't
-            # work here: the server's app-level pings get no pong until
-            # the listen loop starts, so it drops the connection mid-
-            # catch-up and every frame after that lands in a dead pipe —
-            # one end-of-loop ack then loses ALL progress and the same
-            # backlog redelivers on every reconnect (an infinite loop).
-            # HTTP acks land regardless of the WS's fate, so each cycle
-            # converges.
+            # Ack in HTTP chunks: WS-frame acks die with the connection
+            # (no pong until the listen loop starts → server drops it
+            # mid-catch-up) and a lost end-of-loop ack redelivers the
+            # whole backlog forever. HTTP chunks always converge.
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
