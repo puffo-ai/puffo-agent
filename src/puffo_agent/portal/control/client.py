@@ -345,6 +345,38 @@ async def execute_command(
         request_id = command_id or str(params.get("request_id") or "")
         result = await finalize_from_command(request_id, params)
         return {"ok": True, **result}
+    if op in (
+        "auth-claude",
+        "auth-codex",
+        "auth-claude-token",
+        "auth-codex-token",
+        "cancel-auth-claude",
+        "cancel-auth-codex",
+    ):
+        from ...agent.auth_refresh import Provider, get_auth_refresh_coordinator
+
+        coord = get_auth_refresh_coordinator()
+        if coord is None:
+            return {"ok": False, "error": "auth-refresh coordinator not initialised"}
+        operator_slug = str(params.get("operator_slug") or "")
+        if op == "auth-claude":
+            return await coord.start_claude(operator_slug)
+        if op == "auth-claude-token":
+            token = str(params.get("token") or "")
+            if not token:
+                return {"ok": False, "error": "token required"}
+            return await coord.submit_claude_token(token, operator_slug)
+        if op == "cancel-auth-claude":
+            return await coord.cancel(Provider.CLAUDE)
+        if op == "auth-codex":
+            return await coord.start_codex(operator_slug)
+        if op == "auth-codex-token":
+            return {
+                "ok": False,
+                "error": "codex uses device-code auth; no token paste-back needed",
+            }
+        if op == "cancel-auth-codex":
+            return await coord.cancel(Provider.CODEX)
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
