@@ -675,7 +675,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
-            thread_root_id=resolved_root,
+            # DMs are linear: a DM reply goes top-level so it renders inline
+            # instead of hiding behind an "N replies" thread badge in the main
+            # view. Mirrors the keyless send_message DM guard above and the
+            # native send_fallback_message DM fix. Channels keep threading.
+            thread_root_id=(None if envelope_kind == "dm" else resolved_root),
             content_type="text/plain",
             content=text,
             recipients=devices,
@@ -1404,7 +1408,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             channel_id=channel_id,
             recipient_slug=recipient_slug,
-            thread_root_id=resolved_root,
+            # DMs are linear: a DM reply goes top-level so it renders inline
+            # instead of hiding behind an "N replies" thread badge in the main
+            # view. Mirrors the native send_message DM guard (~678). Channels
+            # keep threading.
+            thread_root_id=(None if envelope_kind == "dm" else resolved_root),
             content_type=ATTACHMENT_CONTENT_TYPE,
             content=body_content,
             recipients=devices,

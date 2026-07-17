@@ -570,13 +570,16 @@ async def test_b_send_message_channel_threads_on_bridge(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_b_send_message_dm_threads_on_bridge(tmp_path):
-    """DM route of ``send_message`` also threads. With the DM root seeded
-    locally, resolution + same-channel validation keep it, so both
-    ``thread_root_id`` and ``reply_to_id`` carry it — proving the DM
-    branch is wired, not silently dropping the ids."""
+async def test_b_send_message_dm_toplevel_on_bridge(tmp_path):
+    """DM route of ``send_message`` posts TOP-LEVEL: even with a real DM
+    root seeded locally (so resolution + same-channel validation would
+    otherwise keep it), the DM reply drops ``thread_root_id`` /
+    ``reply_to_id`` so it renders inline in the linear DM view instead of
+    hiding behind an "N replies" thread badge. Channels keep threading —
+    see ``test_b_send_message_channel_threads_on_bridge``."""
     ms = MessageStore(str(tmp_path / "b_dm_thread.db"))
-    # Seed a real DM root so thread_root_id survives validation.
+    # Seed a real DM root: proves the top-level behavior is the DM guard,
+    # not a resolution/validation miss silently dropping the id.
     await ms.store({
         "envelope_id": "dm_root", "envelope_kind": "dm",
         "sender_slug": "alice-0001", "channel_id": None,
@@ -595,18 +598,20 @@ async def test_b_send_message_dm_threads_on_bridge(tmp_path):
     assert len(sends) == 1
     body = sends[0]
     assert body["recipient_slug"] == "alice-0001"
-    assert body["thread_root_id"] == "dm_root"
-    assert body["reply_to_id"] == "dm_root"
+    # DM reply is top-level: no thread keys ride the body.
+    assert "thread_root_id" not in body
+    assert "reply_to_id" not in body
     assert bridge.sent == []
     assert "msg_bridgeack" in result
 
 
 @pytest.mark.asyncio
-async def test_send_fallback_message_threads_on_bridge(tmp_path):
-    """``send_fallback_message`` passes ``root_id`` through as BOTH
-    ``thread_root_id`` and ``reply_to_id`` on the bridge, for the channel
-    route and the DM route (native's fallback path threads unresolved
-    too)."""
+async def test_send_fallback_message_channel_threads_dm_toplevel_on_bridge(tmp_path):
+    """``send_fallback_message`` on the bridge (the keyless path cloud/E2B
+    agents use): a CHANNEL reply keeps threading — ``root_id`` rides as
+    both ``thread_root_id`` and ``reply_to_id``; a DM reply posts
+    TOP-LEVEL — both thread keys are dropped so it renders inline instead
+    of behind an "N replies" badge."""
     bridge = FakeBridge()
     client = _bridge_client(tmp_path, bridge, db="fallback_thread.db")
     await client.store.mark_channel_space("ch_a", "sp_1")
@@ -620,12 +625,14 @@ async def test_send_fallback_message_threads_on_bridge(tmp_path):
     assert len(bridge.sent) == 2
     chan = bridge.sent[0]
     assert chan["channel_id"] == "ch_a" and chan["space_id"] == "sp_1"
+    # Channel reply still threads (unchanged).
     assert chan["thread_root_id"] == "msg_root"
     assert chan["reply_to_id"] == "msg_root"
     dm = bridge.sent[1]
     assert dm["recipient_slug"] == "carol-0001"
-    assert dm["thread_root_id"] == "msg_root2"
-    assert dm["reply_to_id"] == "msg_root2"
+    # DM reply is top-level: no thread ids even though a root_id was passed.
+    assert dm["thread_root_id"] is None
+    assert dm["reply_to_id"] is None
 
 
 @pytest.mark.asyncio

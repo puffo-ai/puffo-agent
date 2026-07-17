@@ -4056,8 +4056,16 @@ class PuffoCoreMessageClient:
             ack = await self._bridge.send_send(
                 plaintext=text,
                 recipient_slug=recipient,
-                thread_root_id=root_id or None,
-                reply_to_id=root_id or None,
+                # DM fallback replies go top-level so they render inline in
+                # the linear DM conversation. Threading a DM reply under the
+                # incoming message buries it behind a "N replies" thread badge
+                # in the main view — the human never sees the answer inline and
+                # it reads as the agent going silent. This is the keyless/bridge
+                # path the cloud/E2B agents use; it mirrors the native DM
+                # fallback fix below and the keyless send_message DM tool.
+                # Channels keep threading (root_id) as before.
+                thread_root_id=None,
+                reply_to_id=None,
             )
             self._log.info(
                 "send_fallback_message[bridge] sent: kind=dm recipient=%s "
