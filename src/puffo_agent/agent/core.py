@@ -183,6 +183,7 @@ class PuffoAgent:
                 is_visible_to_human=msg.get("is_visible_to_human", True),
                 sender_owner_slug=msg.get("sender_owner_slug", ""),
                 is_from_operator=msg.get("is_from_operator", False),
+                is_encrypted=msg.get("is_encrypted", True),
             )
             for msg in batch
         ]
@@ -245,6 +246,7 @@ class PuffoAgent:
                 sender_display_name=msg.get("sender_display_name", ""),
                 sender_owner_slug=msg.get("sender_owner_slug", ""),
                 is_from_operator=msg.get("is_from_operator", False),
+                is_encrypted=msg.get("is_encrypted", True),
             ))
         fallback_text = "\n\n".join(fallback_chunks)
 
@@ -410,6 +412,7 @@ class PuffoAgent:
         is_visible_to_human: bool = True,
         sender_owner_slug: str = "",
         is_from_operator: bool = False,
+        is_encrypted: bool = True,
     ):
         content = self._format_user_block(
             channel_name=channel_name,
@@ -429,6 +432,7 @@ class PuffoAgent:
             is_visible_to_human=is_visible_to_human,
             sender_owner_slug=sender_owner_slug,
             is_from_operator=is_from_operator,
+            is_encrypted=is_encrypted,
         )
         self.log.append({"role": "user", "content": content})
         self._truncate_log()
@@ -453,12 +457,15 @@ class PuffoAgent:
         is_visible_to_human: bool = True,
         sender_owner_slug: str = "",
         is_from_operator: bool = False,
+        is_encrypted: bool = True,
     ) -> str:
         # Structured markdown block keeps context metadata distinct
         # from message content, preventing the LLM from echoing
         # "[#channel] @user:" style prefixes back into replies. Format
         # is documented to the model in DEFAULT_SHARED_CLAUDE_MD.
         lines: list[str] = []
+        if post_id:
+            lines.append(f"- post_id: {post_id}")
         if space_name:
             lines.append("- space: " + space_name)
         if space_id:
@@ -466,13 +473,13 @@ class PuffoAgent:
         lines.append("- channel: " + (channel_name or channel_id))
         if channel_id:
             lines.append(f"- channel_id: {channel_id}")
-        if post_id:
-            lines.append(f"- post_id: {post_id}")
         # thread_root_id is the root post id to pass as send_message's
         # root_id. For a top-level post the root is the post itself.
         thread_root = root_id or post_id
         if thread_root:
             lines.append(f"- thread_root_id: {thread_root}")
+        # Legacy/system messages read as encrypted.
+        lines.append(f"- is_encrypted: {str(is_encrypted).lower()}")
         ts_iso = _ms_to_iso(create_at)
         if ts_iso:
             lines.append(f"- timestamp: {ts_iso}")

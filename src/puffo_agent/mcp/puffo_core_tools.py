@@ -90,6 +90,11 @@ def _ts_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
 
 
+def _enc_tag(m: Any) -> str:
+    """`[encrypted]`/`[plaintext]` tag; legacy rows default to encrypted."""
+    return "[encrypted]" if getattr(m, "is_encrypted", True) else "[plaintext]"
+
+
 @dataclass
 class PuffoCoreToolsConfig:
     slug: str
@@ -591,7 +596,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 if entry.reply_count > 0 else ""
             )
             lines.append(
-                f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
+                f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
             )
         return "\n".join(lines)
 
@@ -623,7 +628,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)
             text = str(m.content).replace("\n", " ") if m.content else ""
-            lines.append(f"{ts}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
+            lines.append(f"{ts}  {_enc_tag(m)}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
         return "\n".join(lines)
 
     @mcp.tool()
@@ -669,7 +674,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ts = _ts_to_iso(m.sent_at)
             text = str(m.content).replace("\n", " ") if m.content else ""
             lines.append(
-                f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
+                f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
             )
         return "\n".join(lines)
 
@@ -874,6 +879,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             lines.append(f"channel_id: {msg.channel_id}")
         if msg.thread_root_id:
             lines.append(f"thread_root_id: {msg.thread_root_id}")
+        lines.append(f"is_encrypted: {str(getattr(msg, 'is_encrypted', True)).lower()}")
         lines.append(f"message:\n{content_str}")
         return "\n".join(lines)
 

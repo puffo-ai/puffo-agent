@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Receive plaintext (non-E2EE) messages.** The daemon now accepts the
+  `plaintext_message_envelope` format: the signed body is verified in the
+  clear (no HPKE/AEAD, the payload's own `sender_slug` is authoritative)
+  and routed through the same store/dispatch sink as E2EE. Receive-only —
+  sending stays E2EE. Pairs with the core + puffo-server plaintext work.
+
+- **`is_encrypted` on every message.** Everything the agent sees — the
+  live inbound metadata block and the `get_post` / `get_channel_history` /
+  `get_dm_history` / `get_thread_history` tools — now shows whether a
+  message was end-to-end encrypted or sent in the clear. Stored per
+  message (a SQLite migration backfills pre-existing rows as encrypted).
+
 ## [1.1.3] — 2026-07-17
 
 ### Added

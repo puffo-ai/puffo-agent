@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS messages (
     sent_at INTEGER NOT NULL,
     received_at INTEGER NOT NULL,
     thread_root_id TEXT,
-    reply_to_id TEXT
+    reply_to_id TEXT,
+    is_encrypted INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_channel
@@ -103,6 +104,8 @@ class StoredMessage:
     received_at: int
     thread_root_id: Optional[str] = None
     reply_to_id: Optional[str] = None
+    # False only for a plaintext (non-E2EE) message; absent/legacy rows are True.
+    is_encrypted: bool = True
 
 
 @dataclass
@@ -140,6 +143,14 @@ class MessageStore:
             "PRAGMA mmap_size=268435456;"
         )
         await self._db.executescript(_SCHEMA)
+        # Pre-existing DBs: everything before this column was E2EE → default 1.
+        cur = await self._db.execute("PRAGMA table_info(messages)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "is_encrypted" not in cols:
+            await self._db.execute(
+                "ALTER TABLE messages ADD COLUMN is_encrypted INTEGER NOT NULL DEFAULT 1"
+            )
+            await self._db.commit()
 
     async def close(self) -> None:
         if self._db:
@@ -166,6 +177,7 @@ class MessageStore:
             sent_at = payload.get("sent_at", _now_ms())
             thread_root_id = payload.get("thread_root_id")
             reply_to_id = payload.get("reply_to_id")
+            is_encrypted = payload.get("is_encrypted", True)
         else:
             envelope_id = payload.envelope_id
             envelope_kind = payload.envelope_kind
@@ -178,6 +190,7 @@ class MessageStore:
             sent_at = payload.sent_at
             thread_root_id = getattr(payload, "thread_root_id", None)
             reply_to_id = getattr(payload, "reply_to_id", None)
+            is_encrypted = getattr(payload, "is_encrypted", True)
 
         content_str = json.dumps(content) if not isinstance(content, str) else content
         if received_at is None:
@@ -187,12 +200,12 @@ class MessageStore:
             """INSERT OR IGNORE INTO messages
             (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
              recipient_slug, content_type, content, sent_at, received_at,
-             thread_root_id, reply_to_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             thread_root_id, reply_to_id, is_encrypted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 envelope_id, envelope_kind, sender_slug, channel_id, space_id,
                 recipient_slug, content_type, content_str, sent_at, received_at,
-                thread_root_id, reply_to_id,
+                thread_root_id, reply_to_id, 1 if is_encrypted else 0,
             ),
         )
         await db.commit()
@@ -634,4 +647,5 @@ class MessageStore:
             received_at=row["received_at"],
             thread_root_id=row["thread_root_id"],
             reply_to_id=row["reply_to_id"],
+            is_encrypted=bool(row["is_encrypted"]),
         )

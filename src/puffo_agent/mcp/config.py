@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import site
+import os
 import sys
 from pathlib import Path
 
@@ -277,6 +278,11 @@ def puffo_core_mcp_env(
         "PUFFO_RPC_URL": rpc_url,
         **_python_user_base_env(runtime_kind),
     }
+    # Forward the daemon's PYTHONPATH so a worktree checkout drives the MCP
+    # subprocess too (unset in prod). Skipped for docker — host path is moot there.
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath and "docker" not in runtime_kind:
+        env["PYTHONPATH"] = pythonpath
     if agent_id:
         env["PUFFO_AGENT_ID"] = agent_id
     if space_id:
