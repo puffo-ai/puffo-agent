@@ -478,8 +478,7 @@ class PuffoAgent:
         thread_root = root_id or post_id
         if thread_root:
             lines.append(f"- thread_root_id: {thread_root}")
-        # Always present: was this message end-to-end encrypted or sent in the
-        # clear (plaintext). Legacy/system messages read as encrypted.
+        # Legacy/system messages read as encrypted.
         lines.append(f"- is_encrypted: {str(is_encrypted).lower()}")
         ts_iso = _ms_to_iso(create_at)
         if ts_iso:

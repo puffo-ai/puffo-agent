@@ -1765,3 +1765,44 @@ async def test_resolve_rejects_unknown_level():
         await resolve_visibility("visible", "ch_x", "hi", "msg_root", http)
     with pytest.raises(RuntimeError):
         await resolve_visibility("", "ch_x", "hi", "msg_root", http)
+
+
+async def _store_msg(ms, eid, *, is_encrypted, channel_id="ch_1", thread_root_id=None):
+    await ms.store({
+        "envelope_id": eid,
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": channel_id,
+        "space_id": "sp_test",
+        "content_type": "text/plain",
+        "content": f"body {eid}",
+        "sent_at": _now_ms(),
+        "thread_root_id": thread_root_id,
+        "is_encrypted": is_encrypted,
+    })
+
+
+@pytest.mark.asyncio
+async def test_get_post_shows_is_encrypted():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_plain", is_encrypted=False)
+    result = await _call(_build_tools(cfg), "get_post", {"post_ref": "msg_plain"})
+    assert "is_encrypted: false" in result
+
+
+@pytest.mark.asyncio
+async def test_get_channel_history_tags_encryption():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_enc", is_encrypted=True)
+    await _store_msg(ms, "msg_plain", is_encrypted=False)
+    result = await _call(_build_tools(cfg), "get_channel_history", {"channel": "ch_1"})
+    assert "[encrypted]" in result and "[plaintext]" in result
+
+
+@pytest.mark.asyncio
+async def test_get_thread_history_tags_encryption():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_root", is_encrypted=True)
+    await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
+    result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
+    assert "[plaintext]" in result

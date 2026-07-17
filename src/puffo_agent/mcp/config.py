@@ -259,9 +259,8 @@ def puffo_core_mcp_env(
         "PUFFO_RPC_URL": rpc_url,
         **_python_user_base_env(runtime_kind),
     }
-    # Forward the daemon's PYTHONPATH so a worktree / editable checkout of the
-    # daemon also drives the MCP subprocess. Unset in prod (a no-op); skipped
-    # for docker where a host path is meaningless inside the container.
+    # Forward the daemon's PYTHONPATH so a worktree checkout drives the MCP
+    # subprocess too (unset in prod). Skipped for docker — host path is moot there.
     pythonpath = os.environ.get("PYTHONPATH")
     if pythonpath and "docker" not in runtime_kind:
         env["PYTHONPATH"] = pythonpath

@@ -91,9 +91,7 @@ def _ts_to_iso(ms: int) -> str:
 
 
 def _enc_tag(m: Any) -> str:
-    """Per-message transport-security tag so the agent can always tell an
-    E2EE message from one delivered in the clear. Legacy rows read as
-    encrypted."""
+    """`[encrypted]`/`[plaintext]` tag; legacy rows default to encrypted."""
     return "[encrypted]" if getattr(m, "is_encrypted", True) else "[plaintext]"
 
 

@@ -143,8 +143,7 @@ class MessageStore:
             "PRAGMA mmap_size=268435456;"
         )
         await self._db.executescript(_SCHEMA)
-        # Backfill is_encrypted on a pre-existing DB — every message stored
-        # before this column existed was E2EE, so default to 1 (encrypted).
+        # Pre-existing DBs: everything before this column was E2EE → default 1.
         cur = await self._db.execute("PRAGMA table_info(messages)")
         cols = {row[1] for row in await cur.fetchall()}
         if "is_encrypted" not in cols:

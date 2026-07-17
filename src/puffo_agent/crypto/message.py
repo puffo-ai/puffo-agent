@@ -308,10 +308,9 @@ def read_plaintext_message(
 ) -> MessagePayload:
     """Verify a non-E2EE ``plaintext_message_envelope`` and return its payload.
 
-    The signed payload rides in the clear (no HPKE/AEAD). The signature
-    covers the canonicalized ``payload`` subtree, exactly as in the E2EE
-    path — there is no outer envelope to cross-check ``sender_slug`` against,
-    so the payload's own ``sender_slug`` is authoritative.
+    No HPKE/AEAD — the signature covers the canonicalized ``payload`` as in
+    the E2EE path. There's no outer envelope, so the payload's own
+    ``sender_slug`` is authoritative (no cross-check).
     """
     envelope_id = envelope["envelope_id"]
     signed = envelope["signed_payload"]
