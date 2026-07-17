@@ -755,6 +755,7 @@ class PuffoCoreMessageClient:
                 "sent_at": payload.sent_at,
                 "thread_root_id": validated_thread_root_id,
                 "reply_to_id": validated_reply_to_id,
+                "is_encrypted": not is_plaintext,
             })
             # Rebind for downstream code (root_id resolution at the
             # batch-coalesce step, channel_meta construction, etc.) so
@@ -988,6 +989,7 @@ class PuffoCoreMessageClient:
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
                 "is_visible_to_human": payload.is_visible_to_human,
+                "is_encrypted": not is_plaintext,
             }
             channel_meta = {
                 "channel_id": channel_id,
@@ -2830,6 +2832,7 @@ class PuffoCoreMessageClient:
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
+            "is_encrypted": True,
         }
         channel_meta = {
             "channel_id": channel_id,
@@ -3170,6 +3173,7 @@ class PuffoCoreMessageClient:
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
+            "is_encrypted": True,
         }
         channel_meta = {
             "channel_id": channel_id,

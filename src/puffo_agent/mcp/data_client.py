@@ -32,6 +32,7 @@ class StoredMessageDict:
     received_at: int
     thread_root_id: Optional[str]
     reply_to_id: Optional[str]
+    is_encrypted: bool = True
 
 
 # Re-exported from ``message_store`` so both the network-backed
@@ -66,6 +67,7 @@ def _msg_from_dict(d: dict[str, Any]) -> StoredMessageDict:
         received_at=int(d.get("received_at", 0)),
         thread_root_id=d.get("thread_root_id"),
         reply_to_id=d.get("reply_to_id"),
+        is_encrypted=bool(d.get("is_encrypted", True)),
     )
 
 

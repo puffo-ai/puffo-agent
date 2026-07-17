@@ -363,3 +363,52 @@ async def test_thread_messages_since_filter():
     # Strictly after reply_1's sent_at → only reply_2.
     assert [m.envelope_id for m in msgs] == ["reply_2"]
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_is_encrypted_defaults_true_when_absent():
+    store = _temp_store()
+    await store.store(_channel_payload("env_enc"))  # payload carries no is_encrypted
+    msg = await store.get_message_by_envelope("env_enc")
+    assert msg is not None and msg.is_encrypted is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_is_encrypted_false_for_plaintext():
+    store = _temp_store()
+    p = _channel_payload("env_plain")
+    p["is_encrypted"] = False
+    await store.store(p)
+    msg = await store.get_message_by_envelope("env_plain")
+    assert msg is not None and msg.is_encrypted is False
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_is_encrypted_migration_backfills_legacy_rows_true():
+    import sqlite3
+
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "messages.db")
+    # Legacy schema without is_encrypted + a pre-fix (E2EE) row.
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE messages (envelope_id TEXT PRIMARY KEY, envelope_kind TEXT NOT NULL, "
+        "sender_slug TEXT NOT NULL, channel_id TEXT, space_id TEXT, recipient_slug TEXT, "
+        "content_type TEXT NOT NULL DEFAULT 'text/plain', content TEXT NOT NULL, "
+        "sent_at INTEGER NOT NULL, received_at INTEGER NOT NULL, thread_root_id TEXT, reply_to_id TEXT)"
+    )
+    con.execute(
+        "INSERT INTO messages (envelope_id, envelope_kind, sender_slug, channel_id, "
+        "content_type, content, sent_at, received_at) VALUES "
+        "('env_old','channel','alice-0001','ch_1','text/plain','old msg',1,1)"
+    )
+    con.commit()
+    con.close()
+
+    store = MessageStore(path)
+    await store.open()  # runs the ALTER-TABLE migration
+    msg = await store.get_message_by_envelope("env_old")
+    assert msg is not None and msg.is_encrypted is True  # legacy row backfilled encrypted
+    await store.close()

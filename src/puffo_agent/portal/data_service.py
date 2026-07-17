@@ -358,6 +358,7 @@ def _msg_to_dict(m: Any) -> dict[str, Any]:
         "received_at": m.received_at,
         "thread_root_id": m.thread_root_id,
         "reply_to_id": m.reply_to_id,
+        "is_encrypted": m.is_encrypted,
     }
 
 

@@ -39,13 +39,15 @@ the operator runs; your specific role is in *Your role* below.
 Every user message carries a metadata block:
 
 ```
+- post_id: <msg_<uuid>>          # this envelope's id
 - space: <space_name>            # absent for DMs
 - space_id: <sp_<uuid>>          # absent for DMs
 - channel: <channel_name>        # "Direct message" for DMs
 - channel_id: <ch_<uuid>>        # send_message(channel=...); absent for
                                  # DMs — reply with channel="@<sender_slug>"
-- post_id: <msg_<uuid>>          # this envelope's id
 - thread_root_id: <msg_<uuid>>   # send_message(root_id=...) to reply in-thread
+- is_encrypted: true | false     # true = end-to-end encrypted; false = sent in
+                                 # the clear (plaintext, signature-only)
 - timestamp: <ISO-8601>
 - sender: <display_name>         # human-readable name for prose
 - sender_slug: <slug>            # structural id — @-mentions + DM routing
