@@ -71,6 +71,7 @@ class FakeBridge:
         scripted: list[dict] | None = None,
         ack: dict | None = None,
         blobs: dict[str, bytes] | None = None,
+        spaces: list[dict] | None = None,
     ):
         self._scripted = list(scripted or [])
         self._ack = ack or {
@@ -82,6 +83,11 @@ class FakeBridge:
         # F1: every send_ack call records its envelope_ids, so a test can
         # assert exactly one ack per handled bridge message.
         self.acked: list[list[str]] = []
+        # added_to_space: send_list_spaces calls are counted so a test
+        # can assert the re-list refresh fired; ``spaces`` is the canned
+        # entry list the reply carries.
+        self.list_spaces_count = 0
+        self._spaces = list(spaces or [])
         self.connect_count = 0
         self.fetch_pending_count = 0
         self.close_count = 0
@@ -115,6 +121,10 @@ class FakeBridge:
     ) -> dict:
         self.acked.append(list(envelope_ids))
         return {"type": "ack_result", "acked": list(envelope_ids)}
+
+    async def send_list_spaces(self, *, timeout: float = 30.0) -> dict:
+        self.list_spaces_count += 1
+        return {"type": "spaces", "spaces": list(self._spaces)}
 
     async def send_send(
         self, *, plaintext, recipient_slug=None, space_id=None,
@@ -1572,3 +1582,138 @@ def test_message_payload_to_dict_omits_attachments():
     )
     d = p.to_payload_dict()
     assert "attachments" not in d
+
+
+# --------------------------------------------------------------------------
+# added_to_space: server push on Space add triggers an eager spaces refresh
+# --------------------------------------------------------------------------
+
+
+def _persist_space_spy(monkeypatch):
+    """Divert ``disk_cache.persist_space`` into a recorder so the tests
+    neither write into the real ``home_dir()`` cache nor depend on it."""
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        pcc_mod.disk_cache, "persist_space",
+        lambda sid, name: calls.append((sid, name)),
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_added_to_space_triggers_list_spaces_refresh(
+    tmp_path, monkeypatch,
+):
+    """An inbound ``{"type": "added_to_space", "space_id": ...}`` frame
+    (server ``AgentServerMsg::AddedToSpace``) schedules exactly one
+    ``list_spaces`` re-issue off the dispatcher — async, never awaited
+    inline (which would deadlock ``frames()``) — and the reply warms the
+    space-name + disk caches so the new space is in the known set."""
+    persisted = _persist_space_spy(monkeypatch)
+    bridge = FakeBridge(spaces=[{"id": "sp_new", "name": "New Space"}])
+    client = await _open_dispatch_client(tmp_path, bridge, db="ats.db")
+
+    await client._dispatch_bridge_frame(
+        {"type": "added_to_space", "space_id": "sp_new"},
+    )
+    # Scheduled, not awaited inline: one task in flight after dispatch.
+    assert len(client._ack_tasks) == 1
+    await asyncio.gather(*client._ack_tasks)
+
+    assert bridge.list_spaces_count == 1
+    assert client._space_name_cache["sp_new"] == "New Space"
+    assert ("sp_new", "New Space") in persisted
+    # The done-callback cleaned the task set up afterwards.
+    assert client._ack_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_added_to_space_duplicate_is_harmless_relist(
+    tmp_path, monkeypatch,
+):
+    """A duplicate ``added_to_space`` for an already-known space is a
+    harmless re-list: the refresh runs again but ``setdefault`` keeps the
+    existing cache entry, and nothing raises."""
+    _persist_space_spy(monkeypatch)
+    bridge = FakeBridge(spaces=[{"id": "sp_known", "name": "Server Name"}])
+    client = await _open_dispatch_client(tmp_path, bridge, db="ats_dup.db")
+    client._space_name_cache["sp_known"] = "Cached Name"
+
+    for _ in range(2):
+        await client._dispatch_bridge_frame(
+            {"type": "added_to_space", "space_id": "sp_known"},
+        )
+        await asyncio.gather(*client._ack_tasks)
+
+    assert bridge.list_spaces_count == 2
+    # setdefault: the pre-existing entry survives the duplicate push.
+    assert client._space_name_cache["sp_known"] == "Cached Name"
+    assert client._ack_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_added_to_space_missing_space_id_and_failed_refresh_survive(
+    tmp_path, monkeypatch, caplog,
+):
+    """Malformed push (no ``space_id``) still refreshes without raising,
+    and a refresh whose ``list_spaces`` blows up logs + drops instead of
+    crashing the dispatch loop (fail-soft, like the F1 ack)."""
+    _persist_space_spy(monkeypatch)
+    bridge = FakeBridge(spaces=[{"id": "sp_1", "name": "One"}])
+    client = await _open_dispatch_client(tmp_path, bridge, db="ats_bad.db")
+
+    # Missing space_id → refresh still runs, nothing raises.
+    await client._dispatch_bridge_frame({"type": "added_to_space"})
+    await asyncio.gather(*client._ack_tasks)
+    assert bridge.list_spaces_count == 1
+    assert client._space_name_cache.get("sp_1") == "One"
+
+    # list_spaces failure → warning, loop survives.
+    async def _boom(*, timeout=30.0):
+        raise RuntimeError("bridge fell over")
+
+    bridge.send_list_spaces = _boom  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        await client._dispatch_bridge_frame(
+            {"type": "added_to_space", "space_id": "sp_2"},
+        )
+        await asyncio.gather(*client._ack_tasks)
+    assert "bridge spaces refresh failed" in caplog.text
+    assert client._ack_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_added_to_space_over_full_listen_loop(tmp_path, monkeypatch):
+    """End-to-end over ``_listen_bridge``: a live ``added_to_space``
+    frame drives the ``list_spaces`` refresh on the real loop (not just a
+    direct dispatch call)."""
+    persisted = _persist_space_spy(monkeypatch)
+
+    class _RefreshBridge(FakeBridge):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.refreshed = asyncio.Event()
+
+        async def send_list_spaces(self, *, timeout: float = 30.0) -> dict:
+            resp = await super().send_list_spaces(timeout=timeout)
+            self.refreshed.set()
+            return resp
+
+    bridge = _RefreshBridge(
+        scripted=[{"type": "added_to_space", "space_id": "sp_live"}],
+        spaces=[{"id": "sp_live", "name": "Live Space"}],
+    )
+    client = _bridge_client(tmp_path, bridge, db="ats_live.db")
+
+    async def on_message(root_id, batch, channel_meta):  # pragma: no cover
+        pass
+
+    await _drive_listen_until(
+        client, on_message=on_message, done=bridge.refreshed,
+    )
+    if client._ack_tasks:
+        await asyncio.gather(*client._ack_tasks, return_exceptions=True)
+
+    assert bridge.list_spaces_count == 1
+    assert client._space_name_cache.get("sp_live") == "Live Space"
+    assert ("sp_live", "Live Space") in persisted
