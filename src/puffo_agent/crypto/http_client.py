@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -14,6 +15,15 @@ from .keystore import KeyStore, Session, decode_secret
 from .primitives import Ed25519KeyPair
 
 logger = logging.getLogger(__name__)
+
+# aiohttp raises one of these when a pooled keep-alive connection is dead.
+# The common trigger for a cloud agent is an E2B pause/resume: the sandbox is
+# snapshotted mid-connection and resumes with a socket that *looks* open but is
+# dead on the far end (the same failure mode as the codex wake dead-zone). The
+# cached ``ClientSession`` is neither ``None`` nor ``.closed``, so ``_get_session``
+# keeps handing it back and every reused-session request fails forever. Recovery
+# is to drop the session and retry once on a fresh connection.
+_CONNECTION_ERRORS = (aiohttp.ClientConnectionError, asyncio.TimeoutError)
 
 
 class HttpError(Exception):
@@ -39,6 +49,20 @@ class PuffoCoreHttpClient:
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
+
+    async def _reset_session(self) -> None:
+        """Drop the cached session so the next request opens a fresh connection.
+
+        Called after a connection error: the pooled socket is dead (e.g. frozen
+        across an E2B pause/resume) and would otherwise fail every reused-session
+        request forever, since ``_get_session`` only rebuilds when the session is
+        ``.closed``."""
+        sess, self._session = self._session, None
+        if sess is not None and not sess.closed:
+            try:
+                await sess.close()
+            except Exception as exc:  # noqa: BLE001 - best-effort teardown of a dead session
+                logger.debug("error closing stale session (%s)", exc)
 
     def _load_signing_key(self) -> tuple[Ed25519KeyPair, str]:
         sess = self.keystore.load_session(self.slug)
@@ -121,7 +145,19 @@ class PuffoCoreHttpClient:
         auth = sign_request(signing_key, self.slug, signer_id, method, path, body)
         headers = auth.to_dict()
         url = f"{self.server_url}{path}"
+        try:
+            return await self._issue_json(method, url, body, headers)
+        except _CONNECTION_ERRORS as exc:
+            logger.info(
+                "connection error on %s %s (%s); resetting session and retrying once",
+                method, path, exc,
+            )
+            await self._reset_session()
+            return await self._issue_json(method, url, body, headers)
 
+    async def _issue_json(
+        self, method: str, url: str, body: bytes, headers: dict,
+    ) -> tuple[int, Any]:
         http = await self._get_session()
         async with http.request(method, url, data=body or None, headers=headers) as resp:
             text = await resp.text()
@@ -147,6 +183,17 @@ class PuffoCoreHttpClient:
         auth = sign_request(signing_key, self.slug, signer_id, method, path, b"")
         headers = auth.to_dict()
         url = f"{self.server_url}{path}"
+        try:
+            return await self._issue_bytes(method, url, headers)
+        except _CONNECTION_ERRORS as exc:
+            logger.info(
+                "connection error on %s %s (%s); resetting session and retrying once",
+                method, path, exc,
+            )
+            await self._reset_session()
+            return await self._issue_bytes(method, url, headers)
+
+    async def _issue_bytes(self, method: str, url: str, headers: dict) -> bytes:
         http = await self._get_session()
         async with http.request(method, url, headers=headers) as resp:
             if resp.status == 401:
