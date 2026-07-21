@@ -331,6 +331,26 @@ async def run_link(
     return 0
 
 
+async def fetch_operator_display_name(server_url: str, operator_slug: str) -> str:
+    """Resolve a linked operator's human display name via the machine-authed
+    ``GET /v2/machines/{id}/operators/{slug}`` endpoint (PUF-393). Returns ""
+    on any failure — the Operators tab falls back to the slug, so this is
+    never fatal."""
+    machine = load_or_create_machine()
+    base = server_url.rstrip("/")
+    path = f"/v2/machines/{machine.machine_id}/operators/{operator_slug}"
+    try:
+        async with create_remote_http_session(base) as session:
+            headers = machine_auth.signed_headers(machine, "GET", path)
+            async with session.get(f"{base}{path}", headers=headers) as resp:
+                if resp.status != 200:
+                    return ""
+                data = await resp.json()
+    except Exception:  # noqa: BLE001 — best-effort; slug is the fallback
+        return ""
+    return str(data.get("display_name") or "")
+
+
 async def run_unlink(operator_slug: str, expected_server_url: str | None = None) -> int:
     """Revoke an operator pairing server-side + locally, and pause that
     operator's agents on this machine. ``expected_server_url`` is an optional

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -27,9 +28,12 @@ from PySide6.QtWidgets import (
 from ...control.link import (
     DEFAULT_SERVER_URL,
     await_link_approval,
+    fetch_operator_display_name,
     friendly_device_name,
     mint_link_code,
+    run_unlink,
 )
+from ...control.operator_names import OperatorNameCache
 from ...control.store import load_pairings
 
 
@@ -167,9 +171,16 @@ class _LinkDialog(QDialog):
 class OperatorsView(QWidget):
     """Lists linked operators + a button to mint a new link code."""
 
+    # Marshal background-thread results onto the UI thread.
+    _name_resolved = Signal(str, str)  # (operator_slug, display_name)
+    _unlink_done = Signal(str, bool, str)  # (operator_slug, ok, error)
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._render_key: Optional[tuple] = None
+        self._names = OperatorNameCache()
+        self._name_resolved.connect(self._on_name_resolved)
+        self._unlink_done.connect(self._on_unlink_done)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(16, 14, 16, 14)
@@ -212,11 +223,39 @@ class OperatorsView(QWidget):
             pairings = load_pairings()
         except Exception:  # noqa: BLE001 — a corrupt file shouldn't crash the UI
             pairings = {}
-        key = tuple((p.operator_slug, p.server_url, p.name) for p in pairings.values())
+        values = list(pairings.values())
+        self._resolve_names(values)
+        # Include the resolved label so a name arriving later re-renders the card.
+        key = tuple(
+            (p.operator_slug, p.server_url, p.name, self._names.label(p.operator_slug))
+            for p in values
+        )
         if key == self._render_key:
             return
         self._render_key = key
-        self._rebuild(list(pairings.values()))
+        self._rebuild(values)
+
+    def _resolve_names(self, pairings: list) -> None:
+        """Kick a background fetch for each operator whose display name is
+        unresolved or stale. Results arrive via ``_name_resolved``."""
+        by_slug = {p.operator_slug: p.server_url for p in pairings}
+        for slug in self._names.slugs_to_fetch(list(by_slug)):
+            self._names.mark_pending(slug)
+            server_url = by_slug[slug]
+
+            def worker(slug=slug, server_url=server_url) -> None:
+                try:
+                    name = asyncio.run(fetch_operator_display_name(server_url, slug))
+                except Exception:  # noqa: BLE001 — best-effort; slug is the fallback
+                    name = ""
+                self._name_resolved.emit(slug, name)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+    def _on_name_resolved(self, slug: str, name: str) -> None:
+        self._names.resolved(slug, name)
+        self._render_key = None  # force a re-render to pick up the new label
+        self.poll()
 
     def _rebuild(self, pairings: list) -> None:
         # Drop existing rows, keep the trailing stretch (last item).
@@ -242,17 +281,75 @@ class OperatorsView(QWidget):
         lay = QVBoxLayout(card)
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(2)
+
+        top = QHBoxLayout()
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
         name = QLabel(p.name or p.operator_slug)
         name.setStyleSheet("font-size: 11pt; font-weight: 600; color: #111827; border: 0;")
-        lay.addWidget(name)
-        slug = QLabel(p.operator_slug)
+        text_col.addWidget(name)
+        # Secondary label = operator display name (falls back to the slug until
+        # it resolves / for legacy pairings). Slug stays copy-selectable.
+        display = self._names.label(p.operator_slug)
+        slug = QLabel(display)
         slug.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        slug.setStyleSheet("font-family: monospace; color: #6b7280; font-size: 9pt; border: 0;")
-        lay.addWidget(slug)
+        slug.setStyleSheet("color: #6b7280; font-size: 9pt; border: 0;")
+        text_col.addWidget(slug)
         url = QLabel(p.server_url)
         url.setStyleSheet("color: #9ca3af; font-size: 9pt; border: 0;")
-        lay.addWidget(url)
+        text_col.addWidget(url)
+        top.addLayout(text_col, stretch=1)
+
+        disconnect = QPushButton("Disconnect")
+        disconnect.setCursor(Qt.PointingHandCursor)
+        disconnect.setStyleSheet(
+            "QPushButton { color: #b91c1c; border: 1px solid #fecaca;"
+            "  border-radius: 6px; padding: 4px 10px; background: #fff; }"
+            "QPushButton:hover { background: #fef2f2; }"
+        )
+        disconnect.clicked.connect(lambda: self._on_disconnect(p, disconnect))
+        top.addWidget(disconnect, alignment=Qt.AlignTop)
+        lay.addLayout(top)
         return card
+
+    def _on_disconnect(self, p, button: QPushButton) -> None:
+        display = self._names.label(p.operator_slug)
+        answer = QMessageBox.question(
+            self,
+            "Disconnect operator",
+            f"Disconnect from {display}?\n\n"
+            "Agents linked to this operator will be paused.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        button.setEnabled(False)
+        button.setText("Disconnecting…")
+        slug = p.operator_slug
+        server_url = p.server_url
+
+        def worker() -> None:
+            try:
+                rc = asyncio.run(run_unlink(slug, expected_server_url=server_url))
+                self._unlink_done.emit(slug, rc == 0, "" if rc == 0 else f"exit {rc}")
+            except Exception as exc:  # noqa: BLE001 — surfaced in the dialog
+                self._unlink_done.emit(slug, False, str(exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_unlink_done(self, slug: str, ok: bool, error: str) -> None:
+        if ok:
+            # run_unlink deleted the pairing; re-render drops the card.
+            self._render_key = None
+            self.poll()
+            return
+        QMessageBox.warning(
+            self,
+            "Disconnect failed",
+            f"Could not disconnect from {self._names.label(slug)}: {error}",
+        )
+        self.poll()  # restore the card's button to its normal state
 
     def _open_link_dialog(self) -> None:
         dlg = _LinkDialog(self)
