@@ -53,6 +53,17 @@ def test_slugs_to_fetch_refetches_when_stale():
     assert c.slugs_to_fetch(["a"]) == ["a"]
 
 
+def test_concurrent_polls_dont_double_fetch_same_slug():
+    # Two poll cycles can fire before the first fetch returns; once a slug is
+    # marked pending, the next poll must not schedule a duplicate fetch.
+    c = OperatorNameCache(clock=lambda: 0.0)
+    first = c.slugs_to_fetch(["a"])
+    assert first == ["a"]
+    for s in first:
+        c.mark_pending(s)
+    assert c.slugs_to_fetch(["a"]) == []
+
+
 def test_empty_result_is_cached_no_refetch_storm():
     # A failed fetch ("") must be cached so the 500ms poll doesn't re-fire it
     # every cycle; it still re-tries after the refresh window (server ships late).
