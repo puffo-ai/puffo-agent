@@ -499,6 +499,27 @@ class CloudBridgeClient:
             frame["limit"] = limit
         await ws.send_json(frame)
 
+    async def send_status(
+        self,
+        status: str,
+        *,
+        current_message_id: Optional[str] = None,
+        error_text: Optional[str] = None,
+    ) -> None:
+        """Report runtime status over the bridge — the keyless equivalent of the
+        signed ``POST /agents/me/heartbeat`` + processing-run status flips. A
+        keyless bridge agent has no signing key, so it can't call those HTTP
+        routes; the server folds this frame into the same ``agent_status`` row +
+        WS broadcast, so the operator's status dot + Log are identical.
+        Fire-and-forget (no reply frame)."""
+        ws = await self._require_ws()
+        frame: dict[str, Any] = {"type": "status", "status": status}
+        if current_message_id is not None:
+            frame["current_message_id"] = current_message_id
+        if error_text is not None:
+            frame["error_text"] = error_text
+        await ws.send_json(frame)
+
     def _discard_waiter(
         self, queue: "asyncio.Queue", fut: "asyncio.Future",
     ) -> None:

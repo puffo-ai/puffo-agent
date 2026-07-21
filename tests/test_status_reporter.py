@@ -481,13 +481,16 @@ async def test_keyless_report_error_no_http_sets_error():
 
 
 @pytest.mark.asyncio
-async def test_keyless_heartbeat_loop_is_immediate_noop():
+async def test_keyless_heartbeat_loop_never_posts_http():
     http = _ExplodingKeylessHttp()
+    # No status_sender: the loop runs but every keyless beat is a no-op, and
+    # it must NEVER touch the signed heartbeat route.
     rep = StatusReporter(http, heartbeat_interval_s=10.0)
 
-    # The loop must return at once (not spin waiting on the interval) and
-    # never touch the signed heartbeat route.
-    await asyncio.wait_for(rep.run_heartbeat_loop(), timeout=1.0)
+    task = asyncio.ensure_future(rep.run_heartbeat_loop())
+    await asyncio.sleep(0.05)  # let the immediate beat run
+    rep.stop()
+    await asyncio.wait_for(task, timeout=1.0)
     assert http.calls == []
 
 
@@ -537,3 +540,97 @@ async def test_reporter_keyless_defaults_false_without_attr():
     assert rep._keyless is False
     await rep.begin_turn("msg_bare")
     assert len(http.calls) == 1
+
+
+# --- keyless: report status over the bridge (status_sender) ------------------
+
+
+class _CaptureSender:
+    """Fake bridge status sink; records every (status, mid, err) emitted."""
+
+    def __init__(self, *, boom: bool = False) -> None:
+        self.calls: list[tuple[str, str | None, str | None]] = []
+        self._boom = boom
+
+    async def __call__(self, status, *, current_message_id=None, error_text=None):
+        self.calls.append((status, current_message_id, error_text))
+        if self._boom:
+            raise RuntimeError("bridge ws closed")
+
+
+@pytest.mark.asyncio
+async def test_keyless_begin_turn_emits_busy_over_bridge():
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender()
+    rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
+
+    run_id = await rep.begin_turn("msg_42")
+    assert run_id.startswith("run_")
+    assert http.calls == []  # never touched the signed wire
+    assert sender.calls == [("busy", "msg_42", None)]
+    assert rep._current_status == "busy"
+
+
+@pytest.mark.asyncio
+async def test_keyless_end_turn_emits_idle_and_error_over_bridge():
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender()
+    rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
+
+    await rep.end_turn("msg_5", "run_x", succeeded=True)
+    assert sender.calls == [("idle", None, None)]
+
+    sender.calls.clear()
+    await rep.end_turn("msg_6", "run_y", succeeded=False, error_text="boom")
+    assert sender.calls == [("error", None, "boom")]
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_keyless_end_turn_batch_emits_over_bridge():
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender()
+    rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
+
+    await rep.end_turn_batch([
+        {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
+    ])
+    assert sender.calls == [("idle", None, None)]
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_keyless_send_heartbeat_emits_current_status_over_bridge():
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender()
+    rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
+    rep._current_status = "busy"
+    rep._current_message_id = "msg_z"
+
+    await rep._send_heartbeat()
+    assert http.calls == []
+    assert sender.calls == [("busy", "msg_z", None)]
+
+
+@pytest.mark.asyncio
+async def test_keyless_report_error_emits_over_bridge():
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender()
+    rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
+
+    await rep.report_error("fatal")
+    assert sender.calls == [("error", None, "fatal")]
+    assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_keyless_emit_failure_is_swallowed():
+    """A failed bridge send must never block a turn (mirrors the HTTP path)."""
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender(boom=True)
+    rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
+
+    # Must not raise despite the sender exploding.
+    run_id = await rep.begin_turn("msg_1")
+    assert run_id.startswith("run_")
+    assert rep._current_status == "busy"

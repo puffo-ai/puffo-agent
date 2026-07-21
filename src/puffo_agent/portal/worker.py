@@ -1117,6 +1117,14 @@ class Worker:
                 client.http,
                 runtime_health_provider=lambda: self.runtime.health,
                 runtime_provider=self._runtime_info,
+                # Keyless bridge agents can't sign the HTTP status routes — report
+                # status over the (already token-authed) bridge WS instead. None
+                # on native agents, so they keep the signed HTTP path unchanged.
+                status_sender=(
+                    client._bridge.send_status
+                    if getattr(client, "_bridge", None) is not None
+                    else None
+                ),
             )
             point = AttachPoint(
                 slug=self.agent_cfg.puffo_core.slug,
@@ -1659,6 +1667,13 @@ class Worker:
                 client.http,
                 runtime_health_provider=lambda: self.runtime.health,
                 runtime_provider=self._runtime_info,
+                # Keyless bridge agents report status over the bridge WS (they
+                # can't sign the HTTP routes); None on native agents.
+                status_sender=(
+                    client._bridge.send_status
+                    if getattr(client, "_bridge", None) is not None
+                    else None
+                ),
             )
             if hasattr(client, "http")
             else None
