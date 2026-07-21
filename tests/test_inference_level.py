@@ -293,3 +293,16 @@ def test_daemon_marks_flag_broken_on_bad_level(tmp_path, monkeypatch):
     assert loaded.runtime.inference_level == "low"  # unchanged
     assert not flag.exists()
     assert flag.with_suffix(".flag.broken").exists()
+
+
+def test_refresh_docstring_documents_inference_level_axis():
+    """AC 7 source-pin: the refresh MCP tool advertises inference_level as an
+    orthogonal axis so agents discover it; guards a future refactor from
+    silently dropping it from the docs."""
+    import inspect
+
+    from puffo_agent.mcp import puffo_core_server
+
+    src = inspect.getsource(puffo_core_server._register_local_tools)
+    assert "Five orthogonal axes" in src
+    assert "inference_level" in src
