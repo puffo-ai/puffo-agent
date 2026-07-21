@@ -65,6 +65,16 @@ def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
         )
 
 
+def _validate_refresh_inference_level(harness: str, level: str) -> None:
+    from .config import supported_inference_levels
+    levels = supported_inference_levels(harness)
+    if level not in levels:
+        raise RuntimeError(
+            f"inference_level={level!r} not supported by "
+            f"harness={harness or '(unknown)'!r}; choose one of: {list(levels)}"
+        )
+
+
 def _register_local_tools(
     mcp: FastMCP,
     workspace: str,
@@ -72,6 +82,10 @@ def _register_local_tools(
     harness: str = "",
 ) -> None:
     """Register system/local tools that don't depend on the messaging API."""
+
+    # Agent's current harness (the closure arg, shadowed by the tool's own
+    # ``harness`` param) — needed to validate a standalone inference_level.
+    agent_current_harness = harness
 
     def _require_claude_code(tool: str) -> None:
         if harness and harness != "claude-code":
@@ -86,14 +100,19 @@ def _register_local_tools(
         model: Optional[str] = None,
         host_sync: bool = False,
         session: bool = False,
+        inference_level: Optional[str] = None,
     ) -> str:
-        """Refresh your agent state. Four orthogonal axes:
+        """Refresh your agent state. Five orthogonal axes:
 
         * no args — rebuild CLAUDE.md + re-sync puffo default skills.
         * ``host_sync=True`` — also re-sync operator's host skills + MCP.
         * ``session=True`` — drop CLI session so next spawn is fresh.
         * ``harness`` + ``model`` (both required together) — swap
           harness/model, persist to agent.yml, full worker respawn.
+        * ``inference_level`` — set reasoning effort (persist to
+          agent.yml + respawn). Standalone or alongside a harness+model
+          swap. Valid values are per-harness (codex: minimal/low/medium/
+          high; claude-code: low/medium/high/xhigh).
 
         Requires ``cli-local`` / ``cli-docker`` runtime. On cli-docker,
         ``host_sync=True`` requires ``session=True`` (or harness+model).
@@ -110,7 +129,15 @@ def _register_local_tools(
             )
         if harness is not None:
             _validate_refresh_model(harness, model)
-        if host_sync and runtime_kind == "cli-docker" and not session and harness is None:
+        if inference_level is not None:
+            effective_harness = (
+                harness if harness is not None else (agent_current_harness or "")
+            )
+            _validate_refresh_inference_level(effective_harness, inference_level)
+        # A pending respawn (harness/model or inference_level) already
+        # restarts the worker, so it subsumes host_sync's container bounce.
+        respawns = harness is not None or inference_level is not None
+        if host_sync and runtime_kind == "cli-docker" and not session and not respawns:
             raise RuntimeError(
                 "refresh(host_sync=True) on cli-docker requires "
                 "session=True (the container has to restart to pick "
@@ -118,9 +145,19 @@ def _register_local_tools(
             )
         ws = Path(workspace)
         touched: list[str] = []
-        if harness is not None:
-            _write_refresh_model_flag(ws, harness=harness, model=model or "")
-            touched.append(f"refresh_model (harness={harness!r} model={model!r})")
+        if respawns:
+            _write_refresh_model_flag(
+                ws,
+                harness=harness or "",
+                model=model or "",
+                inference_level=inference_level or "",
+            )
+            parts: list[str] = []
+            if harness is not None:
+                parts.append(f"harness={harness!r} model={model!r}")
+            if inference_level is not None:
+                parts.append(f"inference_level={inference_level!r}")
+            touched.append("refresh_model (" + ", ".join(parts) + ")")
         else:
             _touch_refresh_flag(ws, "refresh_agent")
             touched.append("refresh_agent")

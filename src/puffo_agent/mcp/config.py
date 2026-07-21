@@ -30,6 +30,19 @@ INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 # codex model_reasoning_effort values.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
+
+def supported_inference_levels(harness: str) -> tuple[str, ...]:
+    """Reasoning-effort values a harness accepts. codex uses its own
+    ``model_reasoning_effort`` set (has ``minimal``, no ``xhigh``);
+    claude-code uses the web superset (has ``xhigh``, no ``minimal``).
+    Unknown harness gets the union so the caller stays permissive and
+    the daemon re-validates against the resolved harness."""
+    if harness == "codex":
+        return REASONING_EFFORTS
+    if harness == "claude-code":
+        return INFERENCE_LEVELS
+    return tuple(dict.fromkeys(INFERENCE_LEVELS + REASONING_EFFORTS))
+
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 

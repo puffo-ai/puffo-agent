@@ -808,6 +808,16 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
         )
 
 
+def _validate_daemon_inference_level(harness: str, level: str) -> None:
+    from ..mcp.config import supported_inference_levels
+    levels = supported_inference_levels(harness)
+    if level not in levels:
+        raise ValueError(
+            f"inference_level={level!r} not supported by "
+            f"harness={harness!r}; choose one of: {list(levels)}"
+        )
+
+
 def _mark_flag_broken(flag_path: Path, reason: str) -> None:
     """Rename a refresh_*.flag to ``<name>.broken`` for operator
     inspection; agent.yml is untouched."""
@@ -851,7 +861,15 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             payload = json.loads(model_flag.read_text(encoding="utf-8") or "{}")
             harness = str(payload.get("harness") or "")
             model = str(payload.get("model") or "")
-            _validate_daemon_refresh_model(harness, model)
+            level = str(payload.get("inference_level") or "")
+            # harness+model swap and a standalone inference_level (PUF-392)
+            # ride the same flag; validate only what's present.
+            swap_model = bool(harness or model)
+            if swap_model:
+                _validate_daemon_refresh_model(harness, model)
+            if level:
+                effective_harness = harness or agent_cfg.runtime.harness
+                _validate_daemon_inference_level(effective_harness, level)
         except Exception as exc:
             logger.warning(
                 "agent %s: refresh_model.flag invalid (%s); marking broken",
@@ -859,13 +877,17 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             )
             _mark_flag_broken(model_flag, str(exc))
         else:
-            agent_cfg.runtime.harness = harness
-            agent_cfg.runtime.model = model
+            if swap_model:
+                agent_cfg.runtime.harness = harness
+                agent_cfg.runtime.model = model
+            if level:
+                agent_cfg.runtime.inference_level = level
             try:
                 agent_cfg.save()
                 logger.info(
-                    "agent %s: refresh_model applied (harness=%r model=%r)",
-                    agent_id, harness, model,
+                    "agent %s: refresh_model applied "
+                    "(harness=%r model=%r inference_level=%r)",
+                    agent_id, harness, model, level,
                 )
             except Exception as exc:
                 logger.warning(

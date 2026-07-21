@@ -361,15 +361,22 @@ def _touch_refresh_flag(workspace: Path, name: str) -> Path:
 
 
 def _write_refresh_model_flag(
-    workspace: Path, *, harness: str, model: str,
+    workspace: Path, *, harness: str = "", model: str = "",
+    inference_level: str = "",
 ) -> Path:
-    """Drop ``refresh_model.flag`` with ``{harness, model, requested_at}``."""
+    """Drop ``refresh_model.flag`` with ``{harness, model, requested_at}``.
+
+    ``inference_level`` rides the same flag (PUF-392): it can accompany a
+    harness+model swap or be set on its own, in which case harness/model
+    are empty and the daemon applies only the effort change."""
     flag_path = workspace / ".puffo-agent" / "refresh_model.flag"
     payload = {
         "harness": harness,
         "model": model,
         "requested_at": int(time.time()),
     }
+    if inference_level:
+        payload["inference_level"] = inference_level
     try:
         flag_path.parent.mkdir(parents=True, exist_ok=True)
         flag_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")

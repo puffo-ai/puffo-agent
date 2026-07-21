@@ -167,3 +167,129 @@ def test_create_bundle_parses_and_validates_level():
     src = inspect.getsource(handlers._verify_agent_bundle)
     assert "inference_level=str(rt.get(\"inference_level\", \"\"))" in src
     assert "INFERENCE_LEVELS" in src
+
+
+# ─── PUF-392: inference_level via the self-serve refresh MCP ──────────
+
+
+import json  # noqa: E402
+import pytest  # noqa: E402
+
+from puffo_agent.mcp.config import supported_inference_levels  # noqa: E402
+from puffo_agent.mcp.puffo_core_server import (  # noqa: E402
+    _validate_refresh_inference_level,
+)
+from puffo_agent.portal.daemon import (  # noqa: E402
+    _process_daemon_refresh_flags,
+    _validate_daemon_inference_level,
+)
+from puffo_agent.portal.state import refresh_model_flag_path  # noqa: E402
+
+
+def test_supported_levels_are_per_harness():
+    assert supported_inference_levels("codex") == REASONING_EFFORTS
+    assert supported_inference_levels("claude-code") == INFERENCE_LEVELS
+    # codex has minimal but not xhigh; claude-code the reverse.
+    assert "xhigh" not in supported_inference_levels("codex")
+    assert "minimal" not in supported_inference_levels("claude-code")
+
+
+def test_supported_levels_unknown_harness_is_permissive_union():
+    levels = supported_inference_levels("")
+    assert set(levels) == set(INFERENCE_LEVELS) | set(REASONING_EFFORTS)
+
+
+@pytest.mark.parametrize(
+    "harness,level",
+    [("codex", "medium"), ("codex", "minimal"), ("claude-code", "high"),
+     ("claude-code", "xhigh"), ("", "medium")],
+)
+def test_refresh_validator_accepts_in_set(harness, level):
+    _validate_refresh_inference_level(harness, level)  # no raise
+
+
+@pytest.mark.parametrize(
+    "harness,level",
+    [("codex", "xhigh"), ("claude-code", "minimal"), ("codex", "turbo")],
+)
+def test_refresh_validator_rejects_out_of_set(harness, level):
+    with pytest.raises(RuntimeError):
+        _validate_refresh_inference_level(harness, level)
+
+
+def test_daemon_validator_rejects_codex_xhigh():
+    with pytest.raises(ValueError):
+        _validate_daemon_inference_level("codex", "xhigh")
+    _validate_daemon_inference_level("codex", "high")  # no raise
+
+
+def _codex_agent(tmp_path, monkeypatch, aid="codex-refresh", level=""):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    from puffo_agent.portal.state import AgentConfig, RuntimeConfig
+    cfg = AgentConfig(
+        id=aid,
+        display_name=aid,
+        runtime=RuntimeConfig(
+            kind="cli-local", harness="codex", model="gpt-5.6",
+            inference_level=level,
+        ),
+    )
+    cfg.save()
+    return cfg
+
+
+def _write_model_flag(cfg, **payload):
+    flag = refresh_model_flag_path(cfg.resolve_workspace_dir())
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text(json.dumps({"requested_at": 0, **payload}) + "\n", encoding="utf-8")
+    return flag
+
+
+def test_daemon_applies_standalone_inference_level(tmp_path, monkeypatch):
+    # AC 1: refresh(inference_level=...) with no harness/model persists the
+    # effort to agent.yml and consumes the flag (respawn is the config-changed
+    # check's job, driven by runtime inequality).
+    from puffo_agent.portal.state import AgentConfig
+    cfg = _codex_agent(tmp_path, monkeypatch)
+    flag = _write_model_flag(cfg, harness="", model="", inference_level="medium")
+
+    _process_daemon_refresh_flags("codex-refresh")
+
+    loaded = AgentConfig.load("codex-refresh")
+    assert loaded.runtime.inference_level == "medium"
+    assert loaded.runtime.harness == "codex"  # untouched
+    assert not flag.exists()
+
+
+def test_daemon_applies_harness_model_and_level_together(tmp_path, monkeypatch):
+    # AC 2: all three persist from one flag.
+    from puffo_agent.portal.state import AgentConfig
+    cfg = _codex_agent(tmp_path, monkeypatch)
+    _write_model_flag(
+        cfg, harness="claude-code", model="claude-opus-4-8", inference_level="xhigh",
+    )
+    # claude-code CLI must resolve for the harness+model validation to pass;
+    # skip if it's not installed in this env.
+    from puffo_agent.agent.cli_bin import resolve_claude_bin
+    if resolve_claude_bin() is None:
+        pytest.skip("claude-code CLI not installed")
+
+    _process_daemon_refresh_flags("codex-refresh")
+
+    loaded = AgentConfig.load("codex-refresh")
+    assert loaded.runtime.harness == "claude-code"
+    assert loaded.runtime.inference_level == "xhigh"
+
+
+def test_daemon_marks_flag_broken_on_bad_level(tmp_path, monkeypatch):
+    # AC 3: xhigh on a codex agent → no persistence, flag goes .broken.
+    from puffo_agent.portal.state import AgentConfig
+    cfg = _codex_agent(tmp_path, monkeypatch, level="low")
+    flag = _write_model_flag(cfg, harness="", model="", inference_level="xhigh")
+
+    _process_daemon_refresh_flags("codex-refresh")
+
+    loaded = AgentConfig.load("codex-refresh")
+    assert loaded.runtime.inference_level == "low"  # unchanged
+    assert not flag.exists()
+    assert flag.with_suffix(".flag.broken").exists()
