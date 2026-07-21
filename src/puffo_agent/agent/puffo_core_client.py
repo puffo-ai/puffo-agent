@@ -854,6 +854,14 @@ class PuffoCoreMessageClient:
                 "bridge backfill complete: pending_delivered (count=%s)",
                 frame.get("count"),
             )
+            # Seed the channel→space map for every channel we're already a
+            # member of, so a proactive post to a pre-existing channel works
+            # from boot (not only after the first inbound message there).
+            # Scheduled async — awaiting send_list_spaces inline would deadlock
+            # frames(), which must keep receiving to deliver the 'spaces' reply.
+            task = asyncio.create_task(self._refresh_bridge_spaces())
+            self._ack_tasks.add(task)
+            task.add_done_callback(self._ack_tasks.discard)
         elif kind == "added_to_space":
             # Server push (AgentServerMsg::AddedToSpace) the moment this
             # agent is added to a Space — refresh the known-spaces view
@@ -900,16 +908,23 @@ class PuffoCoreMessageClient:
             )
 
     async def _refresh_bridge_spaces(self, trigger_space_id: str = "") -> None:
-        """Re-issue ``list_spaces`` over the bridge WS after an
-        ``added_to_space`` push so the new space enters the agent's
-        known set eagerly (name cache + disk cache) rather than lazily
-        on the next tool call. Idempotent: a duplicate ``added_to_space``
-        for an already-known space is a harmless re-list (``setdefault``
-        keeps the existing entries). Fail-soft: a failed refresh logs
-        and drops — the MCP ``list_spaces`` tool reads the authoritative
-        route live, so a lost refresh is at worst a stale name cache,
-        never a missed membership. Native transport never calls this
-        (no ``_bridge``).
+        """Re-issue ``list_spaces`` over the bridge WS so the agent's known
+        spaces + channels enter its caches eagerly rather than lazily on the
+        next tool call. Called after an ``added_to_space`` push and once on
+        startup (after ``pending_delivered``).
+
+        As well as the space name/disk caches, this seeds the channel→space
+        map for **every channel the agent can see** — so it can post to a
+        channel it belongs to WITHOUT first receiving a message there. Without
+        this, the daemon's ``lookup_channel_space`` 404s for a member channel
+        until an inbound message arrives, and the post is rejected as "no
+        record of channel".
+
+        Idempotent (``setdefault`` / upserting ``mark_channel_space``).
+        Fail-soft: a failed refresh logs and drops — the MCP ``list_spaces``
+        tool reads the authoritative route live, so a lost refresh is at worst
+        a stale cache, never a missed membership. Native transport never calls
+        this (no ``_bridge``).
         """
         bridge = self._bridge
         if bridge is None:
@@ -917,6 +932,7 @@ class PuffoCoreMessageClient:
         try:
             resp = await bridge.send_list_spaces()
             entries = resp.get("spaces") or []
+            seeded_channels = 0
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
@@ -927,10 +943,23 @@ class PuffoCoreMessageClient:
                 if sid and name:
                     self._space_name_cache.setdefault(sid, name)
                     disk_cache.persist_space(sid, name)
+                # Seed channel→space for every channel the agent can see
+                # (public + private it's a member of), so a proactive post to
+                # a member channel resolves without an inbound message first.
+                if sid:
+                    for ch in entry.get("channels") or []:
+                        if not isinstance(ch, dict):
+                            continue
+                        cid = ch.get("channel_id") or ch.get("id") or ""
+                        if not cid:
+                            continue
+                        self._channel_space[cid] = sid
+                        await self.store.mark_channel_space(cid, sid)
+                        seeded_channels += 1
             self._log.info(
-                "bridge spaces refresh: %d spaces listed "
+                "bridge spaces refresh: %d spaces listed, %d channels seeded "
                 "(trigger space_id=%s)",
-                len(entries), trigger_space_id or "<missing>",
+                len(entries), seeded_channels, trigger_space_id or "<missing>",
             )
         except Exception:  # noqa: BLE001 — a failed refresh must not crash the loop
             self._log.warning(
