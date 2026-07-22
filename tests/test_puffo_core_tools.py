@@ -14,7 +14,10 @@ from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encod
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.agent._visibility import resolve_visibility
 from puffo_agent.mcp.puffo_core_tools import (
+    NOTE_PRESETS,
     PuffoCoreToolsConfig,
+    _format_note,
+    _parse_note,
     _resolve_root_id,
     _validate_root_same_channel,
     register_core_tools,
@@ -1765,3 +1768,210 @@ async def test_resolve_rejects_unknown_level():
         await resolve_visibility("visible", "ch_x", "hi", "msg_root", http)
     with pytest.raises(RuntimeError):
         await resolve_visibility("", "ch_x", "hi", "msg_root", http)
+
+
+# ---- sticky notes ---------------------------------------------------------
+
+
+def test_format_and_parse_note_roundtrip():
+    color, label = NOTE_PRESETS["waiting"]
+    text = _format_note(color, label, "review PR #238", ["bob-0002", "carol-3"])
+    assert text.splitlines()[0] == "/note"
+    parsed = _parse_note(text)
+    assert parsed["label"] == "Waiting"
+    assert parsed["message"] == "review PR #238"
+    assert parsed["mentions"] == ["bob-0002", "carol-3"]
+
+
+def test_parse_note_rejects_non_note():
+    assert _parse_note("hello world") is None
+    # ``/note`` buried mid-message is not a note.
+    assert _parse_note("hi\n/note\nlabel: X") is None
+
+
+def test_format_note_omits_empty_message_and_mentions():
+    text = _format_note("#c9f748", "Complete", "", [])
+    assert text == "/note\ncolor: #c9f748\nlabel: Complete"
+
+
+async def _seed_note_root(ms, http):
+    """Root post in ch_abc + the send-path plumbing add_note needs."""
+    recipient_kem = KemKeyPair.generate()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    await ms.store({
+        "envelope_id": "msg_root",
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": "ch_abc",
+        "space_id": "sp_test",
+        "content_type": "text/plain",
+        "content": "root post",
+        "sent_at": _now_ms(),
+    })
+    http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
+        "members": [{"slug": "alice-0001", "role": "owner"}],
+    }
+    http.responses["/certs/sync?slugs=alice-0001"] = {
+        "entries": [{
+            "seq": 1, "kind": "device_cert", "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_recipient_1",
+                "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_note_posts_into_thread():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "add_note", {
+        "root_id": "msg_root", "preset": "waiting",
+        "message": "review PR", "mentions": ["bob-0002"],
+    })
+    assert "posted" in result
+    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
+    assert len(post_calls) == 1
+    path, envelope = post_calls[0]
+    assert path == "/messages"
+    # add_note resolves the channel from the root and reuses the send path;
+    # thread-root threading is covered by the send_message tests.
+    assert envelope["channel_id"] == "ch_abc"
+
+
+@pytest.mark.asyncio
+async def test_add_note_rejects_bad_preset():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {"root_id": "msg_root", "preset": "bogus"})
+    assert "preset" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_note_unknown_root_errors():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {"root_id": "msg_nope", "preset": "waiting"})
+    assert "root" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_note_processing_rejects_mentions():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {
+            "root_id": "msg_root", "preset": "processing",
+            "mentions": ["bob-0002"],
+        })
+    assert "self-report" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_note_processing_without_mentions_posts():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "add_note", {
+        "root_id": "msg_root", "preset": "processing", "message": "on it",
+    })
+    assert "posted" in result
+
+
+@pytest.mark.asyncio
+async def test_add_note_custom_color_posts():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "add_note", {
+        "root_id": "msg_root", "color": "#38bdf8", "label": "Blocked",
+        "message": "waiting on infra", "mentions": ["bob-0002"],
+    })
+    assert "posted" in result
+
+
+@pytest.mark.asyncio
+async def test_add_note_preset_and_color_conflict():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {
+            "root_id": "msg_root", "preset": "waiting", "color": "#38bdf8",
+        })
+    assert "mutually exclusive" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_note_custom_color_requires_label():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {"root_id": "msg_root", "color": "#38bdf8"})
+    assert "label" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_add_note_label_without_color_errors():
+    cfg, http, ms = _setup()
+    await _seed_note_root(ms, http)
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {"root_id": "msg_root", "label": "Blocked"})
+    assert "label" in str(exc.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_notes_tool_formats_active_note():
+    cfg, http, ms = _setup()
+    base = _now_ms()
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": base,
+    })
+    await ms.store({
+        "envelope_id": "msg_note", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "/note\ncolor: #db4cac\nlabel: Waiting\nmessage: do it\nmentions: @bob-0002",
+        "sent_at": base + 100, "thread_root_id": "msg_root",
+    })
+    mcp = _build_tools(cfg)
+    out = await _call(mcp, "get_channel_notes", {"channel": "ch_abc"})
+    assert "note:msg_note" in out
+    assert "[Waiting]" in out
+    assert "for @bob-0002" in out
+
+
+@pytest.mark.asyncio
+async def test_get_thread_notes_tool_limit_one():
+    cfg, http, ms = _setup()
+    base = _now_ms()
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": base,
+    })
+    for i, label in enumerate(["Waiting", "Complete"]):
+        await ms.store({
+            "envelope_id": f"msg_note_{i}", "envelope_kind": "channel",
+            "sender_slug": "alice-0001", "channel_id": "ch_abc",
+            "space_id": "sp_test", "content_type": "text/plain",
+            "content": f"/note\ncolor: #db4cac\nlabel: {label}",
+            "sent_at": base + 100 + i, "thread_root_id": "msg_root",
+        })
+    mcp = _build_tools(cfg)
+    out = await _call(mcp, "get_thread_notes", {"root_id": "msg_root", "limit": 1})
+    assert "msg_note_1" in out       # Complete is newest → in effect
+    assert "msg_note_0" not in out

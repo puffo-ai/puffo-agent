@@ -279,6 +279,66 @@ class DataClient:
             logger.warning("data-service: get_thread_messages transport: %s", exc)
             return []
 
+    async def get_channel_notes(
+        self, channel_id: str, limit: int = 20,
+    ) -> list[StoredMessageDict]:
+        """Active sticky-notes in ``channel_id`` — one per thread
+        (newest ``/note`` per thread), newest-first."""
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/channels/notes"
+        )
+        params = {"channel": channel_id, "limit": str(limit)}
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}{path}", params=params,
+            ) as resp:
+                if resp.status == 404:
+                    raise DataNotFound(f"channel not found: {channel_id}")
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "data-service: get_channel_notes %s -> %d %s",
+                        path, resp.status, body,
+                    )
+                    return []
+                data = await resp.json()
+                return [_msg_from_dict(m) for m in (data.get("messages") or [])]
+        except aiohttp.ClientError as exc:
+            logger.warning("data-service: get_channel_notes transport: %s", exc)
+            return []
+
+    async def get_thread_notes(
+        self, root_id: str, limit: int = 20,
+    ) -> list[StoredMessageDict]:
+        """``/note`` messages in the thread at ``root_id``, newest-first.
+        ``limit=1`` is the note currently in effect."""
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/threads/{urllib.parse.quote(root_id, safe='')}/notes"
+        )
+        params = {"limit": str(limit)}
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}{path}", params=params,
+            ) as resp:
+                if resp.status == 404:
+                    raise DataNotFound(f"thread root not found: {root_id}")
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "data-service: get_thread_notes %s -> %d %s",
+                        path, resp.status, body,
+                    )
+                    return []
+                data = await resp.json()
+                return [_msg_from_dict(m) for m in (data.get("messages") or [])]
+        except aiohttp.ClientError as exc:
+            logger.warning("data-service: get_thread_notes transport: %s", exc)
+            return []
+
     async def get_message_by_envelope(
         self, envelope_id: str,
     ) -> StoredMessageDict | None:

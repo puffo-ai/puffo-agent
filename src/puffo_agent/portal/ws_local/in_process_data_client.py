@@ -75,6 +75,16 @@ class InProcessDataClient:
             after_ts=after_ts,
         )
 
+    async def get_channel_notes(
+        self, channel_id: str, limit: int = 20,
+    ) -> list["StoredMessage"]:
+        return await self._store.get_channel_notes(channel_id, limit=limit)
+
+    async def get_thread_notes(
+        self, root_id: str, limit: int = 20,
+    ) -> list["StoredMessage"]:
+        return await self._store.get_thread_notes(root_id, limit=limit)
+
     async def get_message_by_envelope(self, envelope_id: str) -> Any:
         return await self._store.get_message_by_envelope(envelope_id)
 

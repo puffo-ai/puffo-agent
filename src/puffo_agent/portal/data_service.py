@@ -322,6 +322,65 @@ async def list_thread_messages(request: web.Request) -> web.Response:
     })
 
 
+async def list_channel_notes(request: web.Request) -> web.Response:
+    """Active sticky-notes in a channel — one per thread (the newest
+    ``/note`` message), newest-first. Query params: ``channel``
+    (required), ``limit``."""
+    agent_id = request.match_info["agent_id"]
+    channel_id = request.query.get("channel", "")
+    if not channel_id:
+        return web.json_response(
+            {"error": "channel query param required"}, status=400,
+        )
+    limit, err = _parse_int_param(request.query.get("limit", "20"), "limit")
+    if err is not None:
+        return err
+    limit = max(1, min(limit or 20, 200))
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"error": "agent db not found"}, status=404)
+    try:
+        notes = await store.get_channel_notes(channel_id, limit=limit)
+    except DataNotFound:
+        return web.json_response({"error": "channel not found"}, status=404)
+    except Exception as exc:
+        logger.exception(
+            "data-service: get_channel_notes failed (agent=%s ch=%s)",
+            agent_id, channel_id,
+        )
+        return web.json_response(
+            {"error": f"notes fetch failed: {exc}"}, status=500,
+        )
+    return web.json_response({"messages": [_msg_to_dict(m) for m in notes]})
+
+
+async def list_thread_notes(request: web.Request) -> web.Response:
+    """``/note`` messages in a thread, newest-first. ``limit=1`` is the
+    note currently in effect. Query param: ``limit``."""
+    agent_id = request.match_info["agent_id"]
+    root_id = request.match_info["root_id"]
+    limit, err = _parse_int_param(request.query.get("limit", "20"), "limit")
+    if err is not None:
+        return err
+    limit = max(1, min(limit or 20, 200))
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"error": "agent db not found"}, status=404)
+    try:
+        notes = await store.get_thread_notes(root_id, limit=limit)
+    except DataNotFound:
+        return web.json_response({"error": "thread root not found"}, status=404)
+    except Exception as exc:
+        logger.exception(
+            "data-service: get_thread_notes failed (agent=%s root=%s)",
+            agent_id, root_id,
+        )
+        return web.json_response(
+            {"error": f"thread notes fetch failed: {exc}"}, status=500,
+        )
+    return web.json_response({"messages": [_msg_to_dict(m) for m in notes]})
+
+
 async def get_message_by_envelope(request: web.Request) -> web.Response:
     """GET a single message by envelope_id. 404 if not stored."""
     agent_id = request.match_info["agent_id"]
@@ -427,6 +486,14 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     app.router.add_get(
         "/v1/data/{agent_id}/channels/roots",
         list_channel_roots,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/channels/notes",
+        list_channel_notes,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/threads/{root_id}/notes",
+        list_thread_notes,
     )
     app.router.add_get(
         "/v1/data/{agent_id}/threads/{root_id}",

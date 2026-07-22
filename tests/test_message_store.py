@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.message_store import (
     ChannelRoot,
+    DataNotFound,
     MessageStore,
     StoredMessage,
 )
@@ -16,6 +17,15 @@ from puffo_agent.agent.message_store import (
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _note_content(label="Waiting", message="do it", mentions=("bob-0002",)):
+    lines = ["/note", "color: #db4cac", f"label: {label}"]
+    if message:
+        lines.append(f"message: {message}")
+    if mentions:
+        lines.append("mentions: " + " ".join(f"@{m}" for m in mentions))
+    return "\n".join(lines)
 
 
 def _temp_store() -> MessageStore:
@@ -362,4 +372,117 @@ async def test_thread_messages_since_filter():
     )
     # Strictly after reply_1's sent_at → only reply_2.
     assert [m.envelope_id for m in msgs] == ["reply_2"]
+    await store.close()
+
+
+# ---- sticky notes ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_notes_active_per_thread_newest_first():
+    store = _temp_store()
+    await store.open()
+    base = _now_ms()
+    # Thread A: root + two notes (n2 supersedes n1).
+    await store.store(_channel_payload("root_a", sent_at=base))
+    await store.store(_channel_payload(
+        "note_a1", sent_at=base + 100, thread_root_id="root_a",
+        content=_note_content(label="Waiting"),
+    ))
+    await store.store(_channel_payload(
+        "note_a2", sent_at=base + 200, thread_root_id="root_a",
+        content=_note_content(label="Processing"),
+    ))
+    # Thread B: root + one note.
+    await store.store(_channel_payload("root_b", sent_at=base + 50))
+    await store.store(_channel_payload(
+        "note_b1", sent_at=base + 150, thread_root_id="root_b",
+        content=_note_content(label="Complete"),
+    ))
+    # A plain reply that is not a note must be ignored.
+    await store.store(_channel_payload(
+        "reply_plain", sent_at=base + 300, thread_root_id="root_a",
+        content="just chatter",
+    ))
+
+    notes = await store.get_channel_notes("ch_1")
+    # One per thread, newest-first by the note's sent_at: A's head is
+    # note_a2 (base+200), B's is note_b1 (base+150).
+    assert [m.envelope_id for m in notes] == ["note_a2", "note_b1"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_notes_unknown_channel_raises():
+    store = _temp_store()
+    await store.open()
+    with pytest.raises(DataNotFound):
+        await store.get_channel_notes("ch_missing")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_notes_empty_when_no_notes():
+    store = _temp_store()
+    await store.open()
+    await store.store(_channel_payload("root_a", content="hello"))
+    assert await store.get_channel_notes("ch_1") == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_newest_first_and_limit_one():
+    store = _temp_store()
+    await store.open()
+    base = _now_ms()
+    await store.store(_channel_payload("root_a", sent_at=base))
+    await store.store(_channel_payload(
+        "note_1", sent_at=base + 100, thread_root_id="root_a",
+        content=_note_content(label="Waiting"),
+    ))
+    await store.store(_channel_payload(
+        "note_2", sent_at=base + 200, thread_root_id="root_a",
+        content=_note_content(label="Complete"),
+    ))
+
+    alln = await store.get_thread_notes("root_a")
+    assert [m.envelope_id for m in alln] == ["note_2", "note_1"]
+    # limit=1 → the note currently in effect.
+    active = await store.get_thread_notes("root_a", limit=1)
+    assert [m.envelope_id for m in active] == ["note_2"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_unknown_root_raises():
+    store = _temp_store()
+    await store.open()
+    with pytest.raises(DataNotFound):
+        await store.get_thread_notes("msg_missing")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_empty_when_no_notes():
+    store = _temp_store()
+    await store.open()
+    await store.store(_channel_payload("root_a", content="hello"))
+    await store.store(_channel_payload(
+        "reply_1", thread_root_id="root_a", content="chatter",
+    ))
+    assert await store.get_thread_notes("root_a") == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_note_on_top_level_message_keys_by_envelope():
+    # A /note posted as its own top-level message (no thread_root_id)
+    # keys on its own envelope_id, so it still surfaces once per thread.
+    store = _temp_store()
+    await store.open()
+    await store.store(_channel_payload(
+        "note_top", content=_note_content(label="Waiting"),
+    ))
+    notes = await store.get_channel_notes("ch_1")
+    assert [m.envelope_id for m in notes] == ["note_top"]
     await store.close()

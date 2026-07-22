@@ -537,6 +537,59 @@ class MessageStore:
             rows = await cursor.fetchall()
         return [self._row_to_msg(r) for r in reversed(rows)]
 
+    async def get_channel_notes(
+        self, channel_id: str, limit: int = 20,
+    ) -> list[StoredMessage]:
+        """Active sticky-notes in ``channel_id`` — one per thread (the
+        newest ``/note`` message keyed by thread root), newest-first.
+
+        A note is a ``/note``-prefixed message describing a thread's
+        status; the latest per thread is the one in effect, so this
+        collapses each thread to its head note. Raises ``DataNotFound``
+        for an unknown channel (same rationale as ``get_channel_roots``).
+        """
+        if not await self.channel_exists(channel_id):
+            raise DataNotFound(f"channel not found: {channel_id}")
+        db = await self._ensure_db()
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT m.*, ROW_NUMBER() OVER ("
+            "    PARTITION BY COALESCE(m.thread_root_id, m.envelope_id) "
+            "    ORDER BY m.sent_at DESC, m.envelope_id DESC"
+            "  ) AS rn "
+            "  FROM messages m "
+            "  WHERE m.channel_id = ? AND m.content LIKE '/note%'"
+            ") WHERE rn = 1 "
+            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        )
+        params = [channel_id, max(1, min(int(limit), 200))]
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
+    async def get_thread_notes(
+        self, root_id: str, limit: int = 20,
+    ) -> list[StoredMessage]:
+        """``/note`` messages in the thread anchored at ``root_id``,
+        newest-first. ``limit=1`` returns just the note currently in
+        effect. Raises ``DataNotFound`` when the root was never stored.
+        """
+        if not root_id:
+            raise DataNotFound("thread root not found: (empty)")
+        if not await self.has_message(root_id):
+            raise DataNotFound(f"thread root not found: {root_id}")
+        db = await self._ensure_db()
+        sql = (
+            "SELECT * FROM messages "
+            "WHERE (envelope_id = ? OR thread_root_id = ?) "
+            "AND content LIKE '/note%' "
+            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        )
+        params = [root_id, root_id, max(1, min(int(limit), 200))]
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
     async def get_last_processed_sent_at(self, root_id: str) -> int:
         """``sent_at`` of the last message in the most recently
         dispatched batch for this thread, or ``0`` if the agent has

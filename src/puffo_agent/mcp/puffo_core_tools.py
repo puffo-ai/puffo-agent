@@ -90,6 +90,77 @@ def _ts_to_iso(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
 
 
+# Sticky-note presets: preset -> (pill color hex, fixed label). Mirrors the
+# web client's NOTE_PRESETS (parse-note-command.ts).
+NOTE_PRESETS: dict[str, tuple[str, str]] = {
+    "waiting": ("#db4cac", "Waiting"),
+    "processing": ("#fde047", "Processing"),
+    "complete": ("#c9f748", "Complete"),
+}
+NOTE_LABEL_MAX = 32
+
+
+def _format_note(color: str, label: str, message: str, mentions: list[str]) -> str:
+    """Build a canonical ``/note`` body — the same wire format the web
+    client parses into a pill (parse-note-command.ts)."""
+    lines = ["/note", f"color: {color}", f"label: {label}"]
+    if message:
+        lines.append(f"message: {message}")
+    if mentions:
+        lines.append("mentions: " + " ".join(f"@{m.lstrip('@')}" for m in mentions))
+    return "\n".join(lines)
+
+
+def _parse_note(content: Any) -> Optional[dict[str, Any]]:
+    """Extract label/message/mentions from a ``/note`` body, or None if
+    it isn't a note. ``/note`` must be the first non-blank line."""
+    lines = str(content or "").replace("\r\n", "\n").split("\n")
+    marker = -1
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        if s.lower() == "/note":
+            marker = i
+        break
+    if marker == -1:
+        return None
+    fields: dict[str, str] = {}
+    mentions: list[str] = []
+    for ln in lines[marker + 1:]:
+        s = ln.strip()
+        if not s or ":" not in s:
+            continue
+        key, _, val = s.partition(":")
+        key = key.strip().lower()
+        val = val.strip()
+        if key == "mentions":
+            for tok in val.split():
+                tok = tok.lstrip("@")
+                if tok and tok not in mentions:
+                    mentions.append(tok)
+        elif key in ("color", "label", "message"):
+            fields.setdefault(key, val)
+    return {
+        "label": fields.get("label") or "Note",
+        "message": fields.get("message", ""),
+        "mentions": mentions,
+    }
+
+
+def _fmt_note_line(m: Any) -> str:
+    """One output line for a note message (both note tools share it)."""
+    note = _parse_note(m.content) or {"label": "Note", "message": "", "mentions": []}
+    ts = _ts_to_iso(m.sent_at)
+    root = m.thread_root_id or m.envelope_id
+    body = str(note["message"]).replace("\n", " ")
+    tail = ("  for " + " ".join(f"@{x}" for x in note["mentions"])) if note["mentions"] else ""
+    return (
+        f"{ts}  note:{m.envelope_id}  thread:{root}  "
+        f"[{note['label']}] @{m.sender_slug}: {body}{tail}"
+    )
+
+
 @dataclass
 class PuffoCoreToolsConfig:
     slug: str
@@ -437,6 +508,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               no human is waiting for this reply. Root-level posts
               are still forced visible (can't fold either way).
         """
+        return await _send_impl(channel, text, root_id, visibility_level)
+
+    async def _send_impl(
+        channel: str,
+        text: str,
+        root_id: str,
+        visibility_level: str,
+    ) -> str:
         channel_ref = channel.strip()
         if not channel_ref:
             raise RuntimeError("channel is required")
@@ -672,6 +751,148 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
             )
         return "\n".join(lines)
+
+    @mcp.tool()
+    async def get_channel_notes(channel: str, limit: int = 20) -> str:
+        """List the **active sticky-notes** in a channel — one per
+        thread (the note currently in effect), newest-first.
+
+        A note is a short status marker on a thread, shown as a colored
+        pill in human clients: a label (Waiting / Processing / Complete),
+        an optional message, and @mentions. Use this to scan what's
+        pending across a channel without reading every thread; drill
+        into one thread's note history with ``get_thread_notes``.
+
+        ``channel`` is a raw ``ch_<uuid>`` (no ``#name`` shortcut).
+        Output lines:
+        ``<ts>  note:<id>  thread:<root>  [<label>] @<sender>: <msg>  for @a @b``."""
+        limit = max(1, min(int(limit), 200))
+        channel_ref = channel.strip()
+        if channel_ref.startswith("#"):
+            raise RuntimeError(
+                "'#<name>' channel addressing isn't supported; pass the "
+                "channel id directly."
+            )
+        if not channel_ref.startswith("ch_"):
+            await _resolve_channel_space(cfg, channel_ref)
+        try:
+            notes = await cfg.data_client.get_channel_notes(channel_ref, limit=limit)
+        except DataNotFound:
+            return f"(no such channel: {channel_ref})"
+        if not notes:
+            return "(no active notes in this channel)"
+        return "\n".join(_fmt_note_line(m) for m in notes)
+
+    @mcp.tool()
+    async def get_thread_notes(root_id: str, limit: int = 20) -> str:
+        """List the ``/note`` status markers on one thread, newest-first.
+        ``limit=1`` returns just the note currently in effect (the latest
+        wins, like stacking sticky-notes).
+
+        ``root_id`` is the thread root envelope_id (``msg_<uuid>``).
+        Output lines:
+        ``<ts>  note:<id>  thread:<root>  [<label>] @<sender>: <msg>  for @a @b``."""
+        if not root_id.strip():
+            raise RuntimeError("root_id required")
+        limit = max(1, min(int(limit), 200))
+        try:
+            notes = await cfg.data_client.get_thread_notes(root_id.strip(), limit=limit)
+        except DataNotFound:
+            return f"(no such thread: {root_id.strip()})"
+        if not notes:
+            return "(no notes on this thread)"
+        return "\n".join(_fmt_note_line(m) for m in notes)
+
+    @mcp.tool()
+    async def add_note(
+        root_id: str,
+        preset: str = "",
+        message: str = "",
+        mentions: Optional[list[str]] = None,
+        color: str = "",
+        label: str = "",
+    ) -> str:
+        """Post a **sticky-note** onto a thread — a status marker that
+        shows as a colored pill in human clients. The newest note on a
+        thread is the one in effect; it supersedes older ones.
+
+        Pass EITHER a ``preset`` OR a custom ``color`` (+ ``label``);
+        the two are mutually exclusive. With neither, defaults to
+        ``waiting``.
+
+        - ``root_id`` — the thread root envelope_id (``msg_<uuid>``) the
+          note is about. Posted as a reply in that thread.
+        - ``preset`` — ``waiting`` | ``processing`` | ``complete``:
+          - ``waiting`` (pink) — blocked on someone: ``mentions`` = who
+            should act, ``message`` = what to do.
+          - ``processing`` (yellow) — you're working on it (self-report).
+            **Passing ``mentions`` is rejected**; the mention is you.
+          - ``complete`` (green) — done (self-report). **Passing
+            ``mentions`` is rejected**; the mention is you. ``message``
+            = the delivery summary.
+        - ``color`` — a custom pill color (hex, e.g. ``#38bdf8``) for a
+          status that doesn't fit a preset. Requires ``label`` (<=32
+          chars) and must not be combined with a preset. Custom notes
+          take ``mentions`` freely.
+        - ``label`` — the pill text; **required with ``color``**, and
+          only valid for a custom note (presets set their own label).
+        - ``message`` — the note body.
+        - ``mentions`` — slugs who should act (waiting + custom only)."""
+        preset_key = (preset or "").strip().lower()
+        color = color.strip()
+        label = label.strip()
+        mention_list = [m.lstrip("@") for m in (mentions or []) if m and m.strip()]
+        if color:
+            # Custom note: no preset, and a label is required.
+            if preset_key:
+                raise RuntimeError(
+                    "color and preset are mutually exclusive — pass one"
+                )
+            if not label:
+                raise RuntimeError("a custom color requires a label")
+            note_color = color
+            note_label = label[:NOTE_LABEL_MAX]
+            note_mentions = mention_list
+        else:
+            if label:
+                raise RuntimeError(
+                    "label is only for a custom note — pass a color too, "
+                    "or use a preset"
+                )
+            preset_key = preset_key or "waiting"
+            if preset_key not in NOTE_PRESETS:
+                raise RuntimeError(
+                    "preset must be one of: waiting, processing, complete"
+                )
+            note_color, note_label = NOTE_PRESETS[preset_key]
+            if preset_key in ("processing", "complete"):
+                if mention_list:
+                    raise RuntimeError(
+                        f"{preset_key} notes are self-reports; don't pass mentions"
+                    )
+                note_mentions = [cfg.slug]
+            else:  # waiting
+                note_mentions = mention_list
+        note_text = _format_note(note_color, note_label, message.strip(), note_mentions)
+
+        root_ref = root_id.strip()
+        if not root_ref:
+            raise RuntimeError("root_id required")
+        root_msg = await cfg.data_client.get_message_by_envelope(root_ref)
+        if root_msg is None:
+            raise RuntimeError(f"unknown root message: {root_ref}")
+        if root_msg.channel_id:
+            channel_ref = root_msg.channel_id
+        elif root_msg.envelope_kind == "dm":
+            channel_ref = (
+                f"@{root_msg.recipient_slug}"
+                if root_msg.sender_slug == cfg.slug
+                else f"@{root_msg.sender_slug}"
+            )
+        else:
+            raise RuntimeError("cannot resolve a channel/DM for that root")
+        # Notes are status markers meant for humans → always sent visible.
+        return await _send_impl(channel_ref, note_text, root_ref, "human")
 
     @mcp.tool()
     async def list_spaces() -> str:
