@@ -1878,3 +1878,57 @@ async def test_send_message_wiped_root_forces_visible_as_root_level(monkeypatch)
     assert "not in local cache" in result
     assert captured["inp"].thread_root_id is None
     assert captured["inp"].is_visible_to_human is True
+
+@pytest.mark.asyncio
+async def test_send_message_dm_rejects_channel_root():
+    """DM sends scope-check too: a channel message as root rejects."""
+    cfg, http, ms = _setup()
+    _seed_recipient(http, "alice-0001")
+    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = (
+        http.responses["/certs/sync?slugs=alice-0001"]
+    )
+    await ms.store({
+        "envelope_id": "msg_channel_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message", {
+            "channel": "@alice-0001",
+            "text": "dm reply",
+            "root_id": "msg_channel_root",
+        })
+    assert "DM" in str(excinfo.value)
+    assert "alice-0001" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_cross_channel_root_rejected(tmp_path):
+    """The attachments send path wires the same scope rejection."""
+    cfg, http, ms = _setup()
+    cfg.workspace = tmp_path
+    (tmp_path / "hello.txt").write_bytes(b"hello attachments")
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    http.responses["/blobs/upload"] = {"blob_id": "blob_xyz"}
+    await ms.store({
+        "envelope_id": "msg_elsewhere", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_OTHER",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message_with_attachments", {
+            "channel": "ch_abc",
+            "caption": "misdirected attachment reply",
+            "paths": ["hello.txt"],
+            "root_id": "msg_elsewhere",
+        })
+    assert "ch_OTHER" in str(excinfo.value)
