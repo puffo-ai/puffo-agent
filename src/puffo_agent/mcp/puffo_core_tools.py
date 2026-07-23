@@ -1275,9 +1275,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def get_dm_allowlists() -> str:
-        """List the operator's DM allowlist (peers whose DMs skip the
-        approval gate). Operator-scoped — shared across all of the
-        operator's agents."""
+        """List your DM allowlist (peers whose DMs skip the approval
+        gate). Per-agent — every identity keeps its own list; this
+        reads yours only."""
         data = await cfg.http_client.get("/allowlists")
         slugs = sorted(
             e.get("peer_slug", "")
@@ -1290,9 +1290,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def get_dm_blocklists() -> str:
-        """List the operator's DM blocklist (senders whose messages are
-        silently dropped). Operator-scoped — shared across all of the
-        operator's agents."""
+        """List your DM blocklist (senders whose messages are silently
+        dropped). Per-agent — every identity keeps its own list; this
+        reads yours only."""
         data = await cfg.http_client.get("/blocklists")
         slugs = sorted(
             b.get("id", "")
@@ -1305,11 +1305,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def add_dm_allowlist(slug: str) -> str:
-        """Mark a user as DM-allowed for your operator. Future DMs from
-        this sender skip the ``auto_accept_dm`` approval prompt and
-        deliver directly. Idempotent: re-allowlisting an entry is a
-        no-op. Operator-scoped on the server — all of the operator's
-        agents share one allowlist.
+        """Allow a user to DM you. Future DMs from this sender skip
+        the ``auto_accept_dm`` approval prompt and deliver directly.
+        Idempotent: re-allowlisting an entry is a no-op. Per-agent —
+        only your own allowlist changes; other agents are unaffected.
 
         slug: peer to allow (e.g. ``alice-1234``).
         """
@@ -1322,11 +1321,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def update_dm_blocklist(slug: str, on: bool) -> str:
-        """Block (``on=True``) or unblock (``on=False``) a sender for
-        your operator. Server-enforced — blocked senders' messages are
-        silently dropped at the server, so the agent never sees them.
-        Operator-scoped: all of the operator's agents share one
-        blocklist.
+        """Block (``on=True``) or unblock (``on=False``) a sender.
+        Server-enforced — blocked senders' messages are silently
+        dropped at the server, so you never see them. Per-agent —
+        only your own blocklist changes; other agents are unaffected.
 
         slug: peer to (un)block (e.g. ``alice-1234``).
         on: ``True`` adds to blocklist, ``False`` removes.

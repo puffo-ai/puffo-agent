@@ -1,5 +1,6 @@
-"""Operator-scoped DM contact cache (allowlist + blocklist), hydrated
-from puffo-server. Single read/write point for every allow/block
+"""The agent's own DM contact cache (allowlist + blocklist), hydrated
+from puffo-server. Per-agent — the server scopes both lists to the
+authenticated identity. Single read/write point for every allow/block
 decision — never hit /allowlists + /blocklists ad hoc.
 """
 
