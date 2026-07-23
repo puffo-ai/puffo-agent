@@ -56,6 +56,7 @@ from .state import (
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_runtime_flag_path,
+    refresh_session_flag_path,
     refresh_token_request_path,
     restart_flag_path,
     stop_request_path,
@@ -156,6 +157,9 @@ class Daemon:
 
         control_manager = ControlManager()
         control_task = asyncio.ensure_future(control_manager.run())
+
+        # Must run before the first reconcile spawns any worker.
+        _respawn_codex_on_mcp_change_at_startup()
 
         try:
             while not self._stop.is_set():
@@ -681,6 +685,58 @@ async def _sweep_archived_pending_revokes_at_startup() -> None:
         logger.warning("archived pending revoke sweep errored: %s", exc)
 
 
+def _mcp_fingerprint_path() -> Path:
+    return home_dir() / "mcp_tool_fingerprint"
+
+
+def _respawn_codex_on_mcp_change_at_startup() -> None:
+    """Drop cli-local codex sessions when the MCP tool surface changed so
+    they reload tools — codex caches MCP once (openai/codex#7767). First
+    run just records the fingerprint."""
+    import json
+
+    from ..mcp.puffo_core_server import mcp_tool_fingerprint
+
+    try:
+        current = mcp_tool_fingerprint()
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("startup: mcp fingerprint failed: %s", exc)
+        return
+    fp_path = _mcp_fingerprint_path()
+    previous = (
+        fp_path.read_text(encoding="utf-8").strip() if fp_path.exists() else ""
+    )
+    if previous and previous != current:
+        for agent_id in discover_agents():
+            try:
+                cfg = AgentConfig.load(agent_id)
+            except Exception:  # noqa: BLE001
+                continue
+            rt = cfg.runtime
+            if rt.kind != "cli-local" or rt.harness != "codex":
+                continue
+            try:
+                flag = refresh_session_flag_path(cfg.resolve_workspace_dir())
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text(
+                    json.dumps({"requested_at": int(time.time())}) + "\n",
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "startup: mcp surface changed — dropping codex session for "
+                    "%s so it reloads tools", agent_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "startup: couldn't drop codex session for %s: %s",
+                    agent_id, exc,
+                )
+    try:
+        fp_path.write_text(current + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("startup: couldn't persist mcp fingerprint: %s", exc)
+
+
 async def _migrate_linked_agents_at_startup() -> None:
     """For each already-linked operator, stamp machine_id on its owned agents
     so locals created/paused before the link become remote. Best-effort."""
@@ -808,6 +864,16 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
         )
 
 
+def _validate_daemon_inference_level(harness: str, level: str) -> None:
+    from ..mcp.config import supported_inference_levels
+    levels = supported_inference_levels(harness)
+    if level not in levels:
+        raise ValueError(
+            f"inference_level={level!r} not supported by "
+            f"harness={harness!r}; choose one of: {list(levels)}"
+        )
+
+
 def _mark_flag_broken(flag_path: Path, reason: str) -> None:
     """Rename a refresh_*.flag to ``<name>.broken`` for operator
     inspection; agent.yml is untouched."""
@@ -851,7 +917,14 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             payload = json.loads(model_flag.read_text(encoding="utf-8") or "{}")
             harness = str(payload.get("harness") or "")
             model = str(payload.get("model") or "")
-            _validate_daemon_refresh_model(harness, model)
+            level = str(payload.get("inference_level") or "")
+            # Both ride the same flag; validate only what's present.
+            swap_model = bool(harness or model)
+            if swap_model:
+                _validate_daemon_refresh_model(harness, model)
+            if level:
+                effective_harness = harness or agent_cfg.runtime.harness
+                _validate_daemon_inference_level(effective_harness, level)
         except Exception as exc:
             logger.warning(
                 "agent %s: refresh_model.flag invalid (%s); marking broken",
@@ -859,13 +932,17 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             )
             _mark_flag_broken(model_flag, str(exc))
         else:
-            agent_cfg.runtime.harness = harness
-            agent_cfg.runtime.model = model
+            if swap_model:
+                agent_cfg.runtime.harness = harness
+                agent_cfg.runtime.model = model
+            if level:
+                agent_cfg.runtime.inference_level = level
             try:
                 agent_cfg.save()
                 logger.info(
-                    "agent %s: refresh_model applied (harness=%r model=%r)",
-                    agent_id, harness, model,
+                    "agent %s: refresh_model applied "
+                    "(harness=%r model=%r inference_level=%r)",
+                    agent_id, harness, model, level,
                 )
             except Exception as exc:
                 logger.warning(
