@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.4] — 2026-07-22
 
 ### Fixed
 
@@ -25,6 +25,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   correctly treated as root-level and forced visible. Previously it
   could ship hidden — and root-level messages can't fold, so it was
   invisible in every client.
+
+- **cli-local codex agents reload MCP tools after a tool-surface change
+  (PUF-392).** Codex snapshots its MCP tools at session start and never
+  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
+  so a change to the puffo tool surface (e.g. the new `inference_level`
+  arg) left a resumed codex session on a stale set — it saw the doc but
+  the callable tool never updated. The daemon now fingerprints the tool
+  surface on boot and, when it changed, drops each cli-local codex
+  agent's CLI session so a fresh conversation reloads the tools
+  (claude-code, cli-docker, and ws-local are unaffected).
 
 ### Added
 
@@ -54,18 +64,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `get_dm_history` / `get_thread_history` tools — now shows whether a
   message was end-to-end encrypted or sent in the clear. Stored per
   message (a SQLite migration backfills pre-existing rows as encrypted).
-
-### Fixed
-
-- **cli-local codex agents reload MCP tools after a tool-surface change
-  (PUF-392).** Codex snapshots its MCP tools at session start and never
-  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
-  so a change to the puffo tool surface (e.g. the new `inference_level`
-  arg) left a resumed codex session on a stale set — it saw the doc but
-  the callable tool never updated. The daemon now fingerprints the tool
-  surface on boot and, when it changed, drops each cli-local codex
-  agent's CLI session so a fresh conversation reloads the tools
-  (claude-code, cli-docker, and ws-local are unaffected).
 
 ## [1.1.3] — 2026-07-17
 
