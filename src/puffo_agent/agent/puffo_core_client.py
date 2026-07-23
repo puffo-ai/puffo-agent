@@ -34,6 +34,7 @@ from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
+from .contact_cache import ContactCache
 from .core import AgentAPIError
 from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
@@ -83,6 +84,16 @@ DEFAULT_MAX_INPUT_BYTES = 180 * 1000
 # Deliberately over-counts the ``_format_user_block`` metadata header so a
 # near-boundary split lands one turn early, never over the cap.
 _BLOCK_METADATA_OVERHEAD_BYTES = 2048
+
+# Auto-reply to a foreign sender whose first DM is held pending approval.
+_DM_GATE_SENDER_ACK = (
+    "Thanks — your message has reached me. I've asked my operator to "
+    "approve our conversation, and I'll reply as soon as they do."
+)
+
+# Stored in place of a blocked account's channel-message body: keeps the
+# thread/seq metadata intact for history reads without the content.
+_BLOCKED_MESSAGE_PLACEHOLDER = "[message from a blocked account was dropped]"
 
 
 @dataclass
@@ -471,6 +482,7 @@ class PuffoCoreMessageClient:
         message_store: MessageStore,
         operator_slug: str = "",
         auto_accept_space_invitations: bool = False,
+        auto_accept_dm: bool = False,
         workspace: str = "",
         max_inline_chars: int = MAX_INLINE_MESSAGE_CHARS,
         segment_chars: int = MESSAGE_SEGMENT_CHARS,
@@ -488,6 +500,7 @@ class PuffoCoreMessageClient:
         # invites. Empty string falls back to log-only handling.
         self.operator_slug = operator_slug
         self.auto_accept_space_invitations = bool(auto_accept_space_invitations)
+        self.auto_accept_dm = bool(auto_accept_dm)
         # Absolute path to the agent's workspace. Inbound attachments
         # are decrypted into ``<workspace>/.puffo/inbox/<envelope_id>/``.
         self.workspace = workspace
@@ -557,9 +570,16 @@ class PuffoCoreMessageClient:
         # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
+        # DM approval gate, keyed by the prompt DM's envelope_id so an
+        # in-thread y/n routes back to the sender. Disk-persisted.
+        from .dm_approvals import load_pending_dm_approvals
+        self._pending_dm_approvals: dict[str, dict[str, Any]] = (
+            load_pending_dm_approvals(self.slug)
+        )
         # cli-local command-permission prompts awaiting operator y/n,
         # keyed by prompt-DM envelope_id. In-memory only.
         self._pending_command_permissions: dict[str, asyncio.Future[bool]] = {}
+        self._timed_out_command_permissions: dict[str, float] = {}
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
@@ -589,6 +609,9 @@ class PuffoCoreMessageClient:
         # ``[<agent_slug>]`` prefix so multi-agent daemon logs are
         # filterable per agent.
         self._log = _AgentLogger(logger, {"agent": self.slug})
+
+        # Single source for every allow/block read — see contact_cache.py.
+        self._contacts = ContactCache(self.http, self._log)
 
     def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
         """Past the staleness threshold → store but skip the LLM.
@@ -763,6 +786,43 @@ class PuffoCoreMessageClient:
             validated_reply_to_id = await self._validate_incoming_parent_id(
                 payload.reply_to_id, payload.channel_id, payload.space_id,
             )
+            # Blocked sender's DM: ack-and-drop before persistence.
+            if (
+                payload.envelope_kind == "dm"
+                and payload.sender_slug != self.slug
+                and await self._contacts.is_blocked(payload.sender_slug)
+            ):
+                self._log.info(
+                    "dm_gate: dropped DM from blocked %s", payload.sender_slug,
+                )
+                return
+
+            # Blocked sender's CHANNEL message: the server only filters DMs,
+            # so drop here — redacted placeholder keeps thread metadata.
+            if (
+                payload.envelope_kind != "dm"
+                and payload.sender_slug != self.slug
+                and await self._contacts.is_blocked(payload.sender_slug)
+            ):
+                await self.store.store({
+                    "envelope_id": payload.envelope_id,
+                    "envelope_kind": payload.envelope_kind,
+                    "sender_slug": payload.sender_slug,
+                    "channel_id": payload.channel_id,
+                    "space_id": payload.space_id,
+                    "recipient_slug": payload.recipient_slug,
+                    "content_type": "text/plain",
+                    "content": _BLOCKED_MESSAGE_PLACEHOLDER,
+                    "sent_at": payload.sent_at,
+                    "thread_root_id": validated_thread_root_id,
+                    "reply_to_id": validated_reply_to_id,
+                })
+                self._log.info(
+                    "contact: dropped channel message from blocked %s "
+                    "(redacted placeholder stored)",
+                    payload.sender_slug,
+                )
+                return
             await self.store.store({
                 "envelope_id": payload.envelope_id,
                 "envelope_kind": payload.envelope_kind,
@@ -791,6 +851,10 @@ class PuffoCoreMessageClient:
             # it again would feed the agent its own words and trip a
             # turn-by-turn echo loop.
             if payload.sender_slug == self.slug:
+                # DMing a foreign peer first implies consent — allowlist
+                # them so their reply isn't gated.
+                if payload.envelope_kind == "dm":
+                    await self._maybe_allowlist_outbound_dm(payload.recipient_slug)
                 return
 
             # Daemon-side intercept: ``y``/``n`` from the operator on an
@@ -831,8 +895,15 @@ class PuffoCoreMessageClient:
                 ):
                     self._last_dm_sender = payload.sender_slug
                     return
+                # Operator's y/n reply to a foreign-DM approval prompt.
+                if await self._maybe_handle_dm_approval_reply(
+                    thread_root_id=payload_thread_root_id or "",
+                    text=text_raw,
+                ):
+                    self._last_dm_sender = payload.sender_slug
+                    return
 
-            # Stale catch-up backlog: stored above, skips the LLM.
+            # Stale catch-up backlog: stored above, skips the LLM and the gate.
             if self._is_stale_for_catchup(payload.sent_at):
                 self._log.info(
                     "handle_envelope: staleness-gate-skipped envelope=%s "
@@ -861,6 +932,27 @@ class PuffoCoreMessageClient:
                     )
             else:
                 raw_text = str(payload.content) if payload.content else ""
+
+            # DM gate ladder (block dropped above): trusted senders become
+            # contacts; everyone else gets the throttled FYI, then
+            # contact/shared-space pass, the rest hold for approval.
+            if is_dm:
+                if not await self._is_foreign_dm_sender(payload.sender_slug):
+                    await self._ensure_trusted_contact(payload.sender_slug)
+                else:
+                    # FYI precedes any permission prompt by contract.
+                    await self._maybe_send_dm_notice(payload.sender_slug)
+                    if (
+                        not self.auto_accept_dm
+                        and not await self._contacts.is_allowed(payload.sender_slug)
+                        and not await self._shares_space_with(payload.sender_slug)
+                    ):
+                        gated = await self._maybe_gate_foreign_dm(
+                            sender_slug=payload.sender_slug,
+                            text=raw_text,
+                        )
+                        if gated:
+                            return False
 
             # Stash the sender so `send_fallback_message("")` can route replies.
             # Always overwrite — first-write would pin replies to a
@@ -2481,7 +2573,14 @@ class PuffoCoreMessageClient:
 
     async def _on_ws_connect(self) -> None:
         """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
-        self._warm_task = asyncio.ensure_future(self._warm_member_caches())
+        self._warm_task = asyncio.ensure_future(
+            asyncio.gather(
+                self._warm_member_caches(),
+                # Allow/block hydration rides the same tick so a restart
+                # doesn't re-gate already-allowlisted senders.
+                self._contacts.refresh(),
+            )
+        )
 
     async def _warm_member_caches(self) -> None:
         """Background prefetch on ``listen()`` startup: walks ``GET
@@ -3556,6 +3655,361 @@ class PuffoCoreMessageClient:
                 "failed to confirm leave-reply outcome to operator",
             )
         return True
+
+    # ─── auto_accept_dm gate ──────────────────────────────────────
+
+    async def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
+        # Operator, self, and co-owned agents are trusted; everyone else
+        # is foreign. Owner lookup shares the render-time TTL cache.
+        if not sender_slug:
+            return False
+        if sender_slug == self.operator_slug:
+            return False
+        if sender_slug == self.slug:
+            return False
+        owner = await self._fetch_owner_slug(sender_slug)
+        if owner and owner == self.operator_slug:
+            return False
+        return True
+
+    async def _ensure_trusted_contact(self, slug: str) -> None:
+        """Operator / co-owned senders become contacts on first DM."""
+        if not slug or slug == self.slug:
+            return
+        if await self._contacts.is_allowed(slug):
+            return
+        try:
+            await self.http.post("/allowlists", {"slugs": [slug]})
+        except Exception as exc:
+            self._log.warning(
+                "dm_gate: contact add for trusted %s failed: %s", slug, exc,
+            )
+            return
+        self._contacts.note_allowed(slug)
+
+    async def _shares_space_with(self, sender_slug: str) -> bool:
+        """Sender shares a space with the agent. Fails closed — an
+        unreachable membership API falls through to the approval gate."""
+        try:
+            data = await self.http.get("/spaces")
+        except Exception as exc:
+            self._log.warning(
+                "dm_gate: /spaces fetch for shared-space check failed: %s", exc,
+            )
+            return False
+        for entry in data.get("spaces") or []:
+            space_id = entry.get("space_id") or ""
+            if not space_id:
+                continue
+            members = await self._get_space_members(space_id)
+            if sender_slug in members:
+                return True
+        return False
+
+    _DM_NOTICE_INTERVAL_MS = 72 * 3600 * 1000
+
+    async def _maybe_send_dm_notice(self, sender_slug: str) -> None:
+        """Operator FYI for every non-trusted sender (contacts included):
+        first DM immediately, then one per 72h; persisted."""
+        if not self.operator_slug:
+            return
+        try:
+            last = await self.store.get_dm_notice(sender_slug)
+        except Exception:
+            last = None
+        now_ms = int(time.time() * 1000)
+        if last is not None and now_ms - last < self._DM_NOTICE_INTERVAL_MS:
+            return
+        display = await self._fetch_display_name(sender_slug)
+        label = (
+            f"**{display}** ({sender_slug})" if display else f"@{sender_slug}"
+        )
+        try:
+            await self._send_dm(
+                self.operator_slug,
+                f"FYI, {label} is sending direct messages to me.",
+                root_id="",
+            )
+        except Exception as exc:
+            self._log.warning(
+                "dm_notice: failed to notify operator about %s: %s",
+                sender_slug, exc,
+            )
+            return
+        try:
+            await self.store.set_dm_notice(sender_slug, now_ms)
+        except Exception as exc:
+            self._log.warning("dm_notice: failed to persist ts: %s", exc)
+
+    async def _maybe_allowlist_outbound_dm(self, recipient_slug: str) -> None:
+        """Agent DM'd a foreign peer first → allowlist them; best-effort."""
+        if not recipient_slug:
+            return
+        # Never allowlist a sender we're currently gating — the ack DM
+        # echoes back here and would pre-empt the operator's y/n.
+        if any(
+            m.get("sender_slug") == recipient_slug
+            for m in self._pending_dm_approvals.values()
+        ):
+            return
+        # Replying is not consent — only a genuinely agent-initiated
+        # first DM allowlists. A stored inbound DM means they wrote first.
+        try:
+            if await self.store.has_dm_from(recipient_slug):
+                return
+        except Exception:
+            return
+        # Trusted short-circuit before is_allowed can hit the network
+        # (the daemon DMs the operator constantly).
+        if not await self._is_foreign_dm_sender(recipient_slug):
+            return
+        if await self._contacts.is_allowed(recipient_slug):
+            return
+        try:
+            await self.http.post("/allowlists", {"slugs": [recipient_slug]})
+        except Exception as exc:
+            self._log.warning(
+                "dm_gate: outbound allowlist for %s failed: %s",
+                recipient_slug, exc,
+            )
+            return
+        self._contacts.note_allowed(recipient_slug)
+        if not self.operator_slug:
+            return
+        display = await self._fetch_display_name(recipient_slug)
+        label = (
+            f"**{display}**(@{recipient_slug})" if display else f"@{recipient_slug}"
+        )
+        try:
+            await self._send_dm(
+                self.operator_slug,
+                f"Allowlisted {label} — I messaged them first, so their "
+                "replies won't need approval.",
+                root_id="",
+            )
+        except Exception:
+            self._log.exception(
+                "dm_gate: failed to notify operator of outbound allowlist",
+            )
+
+    async def _maybe_gate_foreign_dm(
+        self,
+        *,
+        sender_slug: str,
+        text: str,
+    ) -> bool:
+        """Prompt the operator for a held foreign DM. True = gated (caller
+        skips the ack; the DM waits in /messages/pending). One prompt per
+        sender — further DMs ride the same y/n.
+        """
+        for entry in self._pending_dm_approvals.values():
+            if entry.get("sender_slug") == sender_slug:
+                self._log.info(
+                    "auto_accept_dm: already prompted for %s; holding "
+                    "further DMs in pending",
+                    sender_slug,
+                )
+                return True
+        if not self.operator_slug:
+            self._log.warning(
+                "auto_accept_dm=False but no operator_slug configured; "
+                "delivering DM from %s without approval",
+                sender_slug,
+            )
+            return False
+        sender_display, _ = await self._fetch_user_profile(sender_slug)
+        label = sender_display or sender_slug
+        preview = text if len(text) <= 280 else text[:277] + "…"
+        prompt = format_permission_prompt(
+            f"**{label}** ({sender_slug}) is DM-ing me — allow "
+            f"(allowlist + deliver) or block?",
+            detail=preview,
+        )
+        try:
+            envelope = await self._send_dm(self.operator_slug, prompt, root_id="")
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to send approval prompt for %s: %s; "
+                "delivering DM without approval",
+                sender_slug, exc,
+            )
+            return False
+        prompt_env_id = envelope.get("envelope_id", "") if envelope else ""
+        if not prompt_env_id:
+            self._log.warning(
+                "auto_accept_dm: approval prompt for %s got no envelope_id; "
+                "delivering DM without approval",
+                sender_slug,
+            )
+            return False
+        self._pending_dm_approvals[prompt_env_id] = {
+            "sender_slug": sender_slug,
+            "sender_display_name": sender_display,
+        }
+        from .dm_approvals import save_pending_dm_approvals
+        try:
+            save_pending_dm_approvals(self.slug, self._pending_dm_approvals)
+        except OSError as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to persist pending state: %s", exc,
+            )
+        # Ack the sender so they're not waiting on silence. Once per
+        # sender; best-effort — never blocks the gate.
+        try:
+            await self._send_dm(sender_slug, _DM_GATE_SENDER_ACK, root_id="")
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to ack sender %s: %s", sender_slug, exc,
+            )
+        self._log.info(
+            "auto_accept_dm: prompted operator for %s (thread %s); DM held "
+            "in /messages/pending",
+            sender_slug, prompt_env_id,
+        )
+        return True
+
+    async def _maybe_handle_dm_approval_reply(
+        self, *, thread_root_id: str, text: str,
+    ) -> bool:
+        meta = self._pending_dm_approvals.get(thread_root_id)
+        if meta is None:
+            return False
+        normalized = text.strip().lower()
+        if normalized in ("y", "yes"):
+            approved = True
+        elif normalized in ("n", "no"):
+            approved = False
+        else:
+            return False
+
+        sender_slug = meta.get("sender_slug", "")
+        sender_label = meta.get("sender_display_name") or sender_slug
+        try:
+            if approved:
+                await self.http.post(
+                    "/allowlists", {"slugs": [sender_slug]},
+                )
+                self._contacts.note_allowed(sender_slug)
+                await self._drain_pending_from_sender(sender_slug)
+                confirm = (
+                    f"Allowed DMs from **{sender_label}** ({sender_slug}). ✓"
+                )
+            else:
+                await self.http.post(
+                    "/blocklists", {"target": "user", "id": sender_slug},
+                )
+                self._contacts.note_blocked(sender_slug, True)
+                await self._drop_pending_from_sender(sender_slug)
+                confirm = (
+                    f"Blocked **{sender_label}** ({sender_slug}). "
+                    "Server will drop future messages from this sender."
+                )
+        except Exception as exc:
+            self._log.exception(
+                "auto_accept_dm: %s reply for %s failed",
+                "approve" if approved else "block", sender_slug,
+            )
+            confirm = (
+                f"{'Approval' if approved else 'Block'} for "
+                f"**{sender_label}** failed: {exc}. The pending entry is "
+                "kept; reply again once the server is reachable."
+            )
+            try:
+                await self._send_dm(
+                    self.operator_slug, confirm, root_id=thread_root_id,
+                )
+            except Exception:
+                self._log.exception(
+                    "auto_accept_dm: failed to send error confirmation",
+                )
+            return True
+
+        self._pending_dm_approvals.pop(thread_root_id, None)
+        from .dm_approvals import save_pending_dm_approvals
+        try:
+            save_pending_dm_approvals(self.slug, self._pending_dm_approvals)
+        except OSError as exc:
+            self._log.warning(
+                "auto_accept_dm: failed to persist pending state: %s", exc,
+            )
+        try:
+            await self._send_dm(
+                self.operator_slug, confirm, root_id=thread_root_id,
+            )
+        except Exception:
+            self._log.exception(
+                "auto_accept_dm: failed to confirm outcome to operator",
+            )
+        return True
+
+    async def _drain_pending_from_sender(self, sender_slug: str) -> None:
+        # Re-fed through on_message so gated DMs take the same decrypt +
+        # priority-queue path as live arrivals, then acked.
+        if not sender_slug or self._ws is None or self._ws.on_message is None:
+            return
+        try:
+            data = await self.http.get(
+                f"/messages/pending?kind=dm&sender={sender_slug}"
+            )
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: drain fetch for %s failed: %s", sender_slug, exc,
+            )
+            return
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        acked: list[str] = []
+        for item in messages:
+            envelope = item.get("envelope", item)
+            try:
+                result = await self._ws.on_message(envelope)
+            except Exception:
+                self._log.exception("auto_accept_dm: drain handle failed")
+                continue
+            eid = envelope.get("envelope_id")
+            # False would mean still-gated (not expected post-allowlist).
+            if eid and result is not False:
+                acked.append(eid)
+        if acked:
+            try:
+                await self.http.post("/messages/ack", {"envelope_ids": acked})
+            except Exception as exc:
+                self._log.warning(
+                    "auto_accept_dm: drain ack for %s failed: %s", sender_slug, exc,
+                )
+        self._log.info(
+            "auto_accept_dm: drained %d pending DM(s) from %s",
+            len(acked), sender_slug,
+        )
+
+    async def _drop_pending_from_sender(self, sender_slug: str) -> None:
+        # Ack-discard a blocked sender's pending DMs; never seen by the agent.
+        if not sender_slug:
+            return
+        try:
+            data = await self.http.get(
+                f"/messages/pending?kind=dm&sender={sender_slug}"
+            )
+        except Exception as exc:
+            self._log.warning(
+                "auto_accept_dm: drop fetch for %s failed: %s", sender_slug, exc,
+            )
+            return
+        messages = data.get("messages", []) if isinstance(data, dict) else []
+        eids = [
+            (item.get("envelope", item)).get("envelope_id") for item in messages
+        ]
+        eids = [e for e in eids if e]
+        if eids:
+            try:
+                await self.http.post("/messages/ack", {"envelope_ids": eids})
+            except Exception as exc:
+                self._log.warning(
+                    "auto_accept_dm: drop ack for %s failed: %s", sender_slug, exc,
+                )
+        self._log.info(
+            "auto_accept_dm: dropped %d pending DM(s) from blocked %s",
+            len(eids), sender_slug,
+        )
 
     @staticmethod
     def _leave_target_label(meta: dict) -> str:

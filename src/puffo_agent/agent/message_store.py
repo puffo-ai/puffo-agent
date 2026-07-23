@@ -75,6 +75,13 @@ CREATE TABLE IF NOT EXISTS channel_space_map (
     space_id TEXT NOT NULL,
     learned_at INTEGER NOT NULL
 );
+
+-- Last "FYI, X is DMing me" notice per foreign sender, so the 72h
+-- throttle survives daemon restarts.
+CREATE TABLE IF NOT EXISTS dm_notices (
+    sender_slug TEXT PRIMARY KEY,
+    last_notified_at INTEGER NOT NULL
+);
 """
 
 
@@ -602,6 +609,42 @@ class MessageStore:
             (channel_id,),
         ) as cursor:
             return await cursor.fetchone() is not None
+
+    async def get_dm_notice(self, sender_slug: str) -> int | None:
+        """Epoch-ms of the last FYI notice for ``sender_slug``, or None."""
+        if not sender_slug:
+            return None
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT last_notified_at FROM dm_notices WHERE sender_slug = ?",
+            (sender_slug,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else None
+
+    async def has_dm_from(self, sender_slug: str) -> bool:
+        """Any stored inbound DM from ``sender_slug``."""
+        if not sender_slug:
+            return False
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT 1 FROM messages WHERE envelope_kind = 'dm' "
+            "AND sender_slug = ? LIMIT 1",
+            (sender_slug,),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def set_dm_notice(self, sender_slug: str, notified_at: int) -> None:
+        if not sender_slug:
+            return
+        db = await self._ensure_db()
+        await db.execute(
+            """INSERT INTO dm_notices (sender_slug, last_notified_at)
+               VALUES (?, ?)
+               ON CONFLICT(sender_slug) DO UPDATE SET last_notified_at = excluded.last_notified_at""",
+            (sender_slug, notified_at),
+        )
+        await db.commit()
 
     async def mark_channel_intro_prompted(self, channel_id: str) -> None:
         """Record that an intro nudge has been enqueued for

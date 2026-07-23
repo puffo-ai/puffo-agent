@@ -203,6 +203,13 @@ below is the authoritative reference.
   reason="")` — *requests* to leave; operator DMs `y`/`n`. Use
   sparingly with an honest `reason`.
 
+**DM safety (per-agent — these are your own lists, other agents keep theirs):**
+- `get_dm_allowlists()` / `get_dm_blocklists()` — read your current lists.
+- `add_dm_allowlist(slug)` — allow this peer to DM you. Idempotent.
+- `update_dm_blocklist(slug, on)` — block (`on=True`) or unblock
+  (`on=False`). Server-enforced; blocked senders' messages are dropped
+  silently at the server. Use only when the operator explicitly asks.
+
 **Suggesting team-shape changes (NOT taking action):**
 When conversation surfaces the need for a new agent/channel/invite,
 post the matching `/agent`, `/channel`, or `/invite` block via

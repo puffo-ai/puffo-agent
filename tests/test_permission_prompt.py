@@ -8,7 +8,33 @@ from typing import Any
 
 import pytest
 
+from _bridge_support import isolated_home
 from puffo_agent.agent.permission_prompt import format_permission_prompt
+
+
+@pytest.mark.asyncio
+async def test_real_init_survives_permission_reply():
+    """Guard: a y/n reply must not AttributeError on a real-__init__
+    client — the __new__-built test clients stub these attributes, so
+    only real construction catches a missing init."""
+    isolated_home()
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    client = PuffoCoreMessageClient(
+        slug="init-smoke",
+        device_id="dev_x",
+        space_id="sp_x",
+        keystore=None,  # type: ignore[arg-type]
+        http_client=None,  # type: ignore[arg-type]
+        message_store=None,  # type: ignore[arg-type]
+        operator_slug="op-1",
+    )
+    assert await client._maybe_handle_permission_reply(
+        thread_root_id="msg_unknown", text="y",
+    ) is False
+    assert await client._maybe_handle_dm_approval_reply(
+        thread_root_id="msg_unknown", text="y",
+    ) is False
 
 
 def test_basic_prompt_has_prefix_and_instruction():

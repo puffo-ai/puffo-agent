@@ -110,13 +110,15 @@ class PuffoCoreWsClient:
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
+                skip_ack = False
                 if self.on_message:
                     try:
-                        await self.on_message(envelope)
+                        # False = hold un-acked until the operator decides.
+                        skip_ack = await self.on_message(envelope) is False
                     except Exception:
                         logger.exception("on_message callback failed during catch-up")
                 eid = envelope.get("envelope_id")
-                if eid:
+                if eid and not skip_ack:
                     envelope_ids.append(eid)
                 if len(envelope_ids) >= 25:
                     await self._ack_http(envelope_ids)
@@ -152,13 +154,15 @@ class PuffoCoreWsClient:
 
         elif msg_type == "message":
             envelope = msg.get("envelope", {})
+            skip_ack = False
             if self.on_message:
                 try:
-                    await self.on_message(envelope)
+                    # False = hold un-acked (gated foreign DM stays pending).
+                    skip_ack = await self.on_message(envelope) is False
                 except Exception:
                     logger.exception("on_message callback failed")
             eid = envelope.get("envelope_id")
-            if eid:
+            if eid and not skip_ack:
                 await self._send_ack([eid])
 
         elif msg_type == "cert_update":

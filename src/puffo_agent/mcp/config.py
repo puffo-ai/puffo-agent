@@ -66,6 +66,10 @@ PUFFO_CORE_TOOL_NAMES = (
     "sync_host_mcp",
     "leave_space",
     "leave_channel",
+    "get_dm_allowlists",
+    "get_dm_blocklists",
+    "add_dm_allowlist",
+    "update_dm_blocklist",
     "refresh",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(

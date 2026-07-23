@@ -34,6 +34,8 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "list_spaces",
     "list_channels_in_space",
     "list_channels_in_all_spaces",
+    "get_dm_allowlists",
+    "get_dm_blocklists",
     # membership
     "leave_space",
     "leave_channel",

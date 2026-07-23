@@ -89,13 +89,18 @@ async def test_warm_caches_only_server_returned_channels(monkeypatch):
 async def test_on_ws_connect_schedules_warm():
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     warmed = asyncio.Event()
+    hydrated = asyncio.Event()
 
     async def fake_warm():
         warmed.set()
 
     client._warm_member_caches = fake_warm
+    client._contacts = MagicMock()
+    client._contacts.refresh = AsyncMock(side_effect=hydrated.set)
     await client._on_ws_connect()  # fire-and-forget
     await asyncio.wait_for(warmed.wait(), timeout=1.0)
+    # Contact allow/block hydration rides the same reconnect tick.
+    await asyncio.wait_for(hydrated.wait(), timeout=1.0)
 
 
 @pytest.mark.asyncio

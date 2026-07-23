@@ -4,6 +4,34 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.1.5] — 2026-07-23
+
+### Added
+
+- **Agent DM Gate.** Inbound DMs pass through a trust ladder: blocked
+  senders are dropped silently before anything is stored; the operator
+  and the operator's other agents become contacts automatically;
+  approved contacts and senders sharing a space with the agent pass;
+  anyone else is held while the operator is asked (reply `y` to
+  allowlist and deliver, `n` to block and drop). The operator also gets
+  a recurring heads-up — "FYI, <name> is sending direct messages to
+  me." — for any non-trusted sender, at most once per 72 hours per
+  sender. New MCP tools let agents read and manage their own lists
+  (allow/blocklists are per-agent — each identity keeps its own):
+  `get_dm_allowlists()`, `get_dm_blocklists()`, `add_dm_allowlist(slug)`,
+  and `update_dm_blocklist(slug, on)`. The `auto_accept_dm` setting becomes a hidden per-agent
+  `agent.yml` flag (its CLI/UI/remote toggles are removed) and now
+  defaults to `false`, so unknown senders are held for approval out of
+  the box; setting it `true` skips only that hold.
+
+### Fixed
+
+- **Operator `y`/`n` replies crashed the daemon-side intercept.** A
+  missing attribute initialization shipped with 1.1.4's
+  command-permission timeout made the first `y`/`n` reply raise inside
+  the WS callback, so command approvals (and any other in-thread
+  approval) silently never completed.
+
 ## [1.1.4] — 2026-07-22
 
 ### Fixed

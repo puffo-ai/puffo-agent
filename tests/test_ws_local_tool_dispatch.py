@@ -36,6 +36,8 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "list_spaces",
         "list_channels_in_space",
         "list_channels_in_all_spaces",
+        "get_dm_allowlists",
+        "get_dm_blocklists",
         # membership
         "leave_space",
         "leave_channel",
