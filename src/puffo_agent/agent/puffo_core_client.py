@@ -73,9 +73,8 @@ PRIORITY_SYSTEM = 5
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
-# Hops the admit-time thread-root walk will follow. Healthy data resolves in
-# one hop (a root's own thread_root_id is NULL); anything deeper is a corrupt
-# chain we refuse to trust — the reply is admitted as its own root instead.
+# Healthy data resolves in one hop (a root's own thread_root_id is NULL);
+# deeper chains are corrupt and the reply is admitted as its own root.
 _INCOMING_ROOT_MAX_DEPTH = 8
 
 # Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
@@ -755,17 +754,9 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # PUF-227-A: strict cache-validation invariant for incoming
-            # ids. Any thread_root_id / reply_to_id that doesn't point
-            # to a same-channel parent in our local message_store gets
-            # wiped to None before storage — the agent's local view
-            # never honors a thread linkage that can't be resolved here.
-            # Catches the Scout-class symptom: a server / UI / sender
-            # that stamps a cross-channel id can't poison the recipient
-            # daemon's thread state.
-            # thread_root_id additionally resolves to the canonical root: a
-            # sender stamping a reply id would otherwise index this row under
-            # a non-root, and that corruption then rides our own sends out.
+            # Incoming thread linkage normalizes before storage:
+            # thread_root_id resolves to the canonical same-scope root
+            # (else None); reply_to_id must name a cached same-scope parent.
             validated_thread_root_id = await self._resolve_incoming_thread_root(
                 payload.thread_root_id, payload.channel_id, payload.space_id,
             )
@@ -2439,15 +2430,10 @@ class PuffoCoreMessageClient:
         expected_space_id: Optional[str],
     ) -> Optional[str]:
         """Canonical thread root for an incoming ``thread_root_id``, resolved
-        at admit time so the row lands correct in ``messages.db``.
-
-        A sender can stamp a *reply's* envelope id instead of the thread root;
-        walking to the real root here stops that reply from indexing under a
-        non-root (and stops the corrupt chain propagating to what we send).
-        Returns ``None`` — admit as a new root — when the reference isn't
-        cached, leaves the channel/space, or can't be trusted (cycle / too
-        deep). ``reply_to_id`` keeps using ``_validate_incoming_parent_id``:
-        it names the direct parent, not the root.
+        at admit time. Returns ``None`` — admit as a new root — when the
+        reference isn't cached, leaves the channel/space, or can't be
+        trusted (cycle / too deep). ``reply_to_id`` is different: it names
+        the direct parent, not the root.
         """
         if not parent_id:
             return parent_id
