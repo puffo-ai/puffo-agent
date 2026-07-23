@@ -4,7 +4,7 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.5] — 2026-07-23
 
 ### Added
 
@@ -23,6 +23,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `agent.yml` flag (its CLI/UI/remote toggles are removed) and now
   defaults to `false`, so unknown senders are held for approval out of
   the box; setting it `true` skips only that hold.
+
+### Fixed
+
+- **Operator `y`/`n` replies crashed the daemon-side intercept.** A
+  missing attribute initialization shipped with 1.1.4's
+  command-permission timeout made the first `y`/`n` reply raise inside
+  the WS callback, so command approvals (and any other in-thread
+  approval) silently never completed.
 
 ## [1.1.4] — 2026-07-22
 
