@@ -169,7 +169,7 @@ def test_create_bundle_parses_and_validates_level():
     assert "INFERENCE_LEVELS" in src
 
 
-# ─── PUF-392: inference_level via the self-serve refresh MCP ──────────
+# ─── inference_level via the self-serve refresh MCP ──────────
 
 
 import json  # noqa: E402
@@ -246,7 +246,7 @@ def _write_model_flag(cfg, **payload):
 
 
 def test_daemon_applies_standalone_inference_level(tmp_path, monkeypatch):
-    # AC 1: refresh(inference_level=...) with no harness/model persists the
+    # Standalone: refresh(inference_level=...) with no harness/model persists
     # effort to agent.yml and consumes the flag (respawn is the config-changed
     # check's job, driven by runtime inequality).
     from puffo_agent.portal.state import AgentConfig
@@ -262,7 +262,7 @@ def test_daemon_applies_standalone_inference_level(tmp_path, monkeypatch):
 
 
 def test_daemon_applies_harness_model_and_level_together(tmp_path, monkeypatch):
-    # AC 2: all three persist from one flag.
+    # harness + model + level all persist from one flag.
     from puffo_agent.portal.state import AgentConfig
     cfg = _codex_agent(tmp_path, monkeypatch)
     _write_model_flag(
@@ -282,7 +282,7 @@ def test_daemon_applies_harness_model_and_level_together(tmp_path, monkeypatch):
 
 
 def test_daemon_marks_flag_broken_on_bad_level(tmp_path, monkeypatch):
-    # AC 3: xhigh on a codex agent → no persistence, flag goes .broken.
+    # xhigh on a codex agent → no persistence, flag goes .broken.
     from puffo_agent.portal.state import AgentConfig
     cfg = _codex_agent(tmp_path, monkeypatch, level="low")
     flag = _write_model_flag(cfg, harness="", model="", inference_level="xhigh")
@@ -296,7 +296,7 @@ def test_daemon_marks_flag_broken_on_bad_level(tmp_path, monkeypatch):
 
 
 def test_refresh_docstring_documents_inference_level_axis():
-    """AC 7 source-pin: the refresh MCP tool advertises inference_level as an
+    """Source-pin: the refresh MCP tool advertises inference_level as an
     orthogonal axis so agents discover it; guards a future refactor from
     silently dropping it from the docs."""
     import inspect
@@ -306,3 +306,82 @@ def test_refresh_docstring_documents_inference_level_axis():
     src = inspect.getsource(puffo_core_server._register_local_tools)
     assert "Five orthogonal axes" in src
     assert "inference_level" in src
+
+
+# ─── refresh MCP tool: inference_level orchestration ─────────────────
+
+
+def _refresh_tool(workspace, *, harness="codex", runtime_kind="cli-local"):
+    """Capture the ``refresh`` closure by registering the local tools
+    against a fake FastMCP."""
+    from puffo_agent.mcp import puffo_core_server
+
+    captured: dict = {}
+
+    class _FakeMcp:
+        def tool(self, *a, **k):
+            def deco(fn):
+                captured[fn.__name__] = fn
+                return fn
+            return deco
+
+    puffo_core_server._register_local_tools(
+        _FakeMcp(), str(workspace), runtime_kind=runtime_kind, harness=harness,
+    )
+    return captured["refresh"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_tool_standalone_level_writes_flag(tmp_path):
+    refresh = _refresh_tool(tmp_path, harness="codex")
+    out = await refresh(inference_level="medium")
+    assert "inference_level='medium'" in out
+    payload = json.loads(
+        (tmp_path / ".puffo-agent" / "refresh_model.flag").read_text(encoding="utf-8")
+    )
+    assert payload["inference_level"] == "medium"
+    assert payload["harness"] == "" and payload["model"] == ""
+
+
+@pytest.mark.asyncio
+async def test_refresh_tool_standalone_level_validates_against_current_harness(tmp_path):
+    # codex agent + xhigh (claude-code-only) → rejected, no flag written.
+    refresh = _refresh_tool(tmp_path, harness="codex")
+    with pytest.raises(RuntimeError):
+        await refresh(inference_level="xhigh")
+    assert not (tmp_path / ".puffo-agent" / "refresh_model.flag").exists()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tool_level_subsumes_host_sync_on_docker(tmp_path):
+    # host_sync on cli-docker normally needs session=True; a respawn
+    # (inference_level) subsumes the container bounce → no raise.
+    refresh = _refresh_tool(tmp_path, harness="codex", runtime_kind="cli-docker")
+    out = await refresh(host_sync=True, inference_level="low")
+    assert "inference_level='low'" in out
+
+
+def test_refresh_skill_documents_inference_level_axis():
+    # The agent-facing skill (rendered into CLAUDE.md) must advertise the
+    # axis too, not just the tool docstring, or agents can't discover it.
+    from puffo_agent.agent.shared_content import DEFAULT_SKILL_REFRESH
+
+    assert "inference_level" in DEFAULT_SKILL_REFRESH
+    assert "Four orthogonal" not in DEFAULT_SKILL_REFRESH
+
+
+@pytest.mark.asyncio
+async def test_refresh_tool_no_axes_touches_agent_flag(tmp_path):
+    # No respawn axis → worker-scope refresh, no model flag.
+    refresh = _refresh_tool(tmp_path, harness="codex")
+    out = await refresh()
+    assert "refresh_agent" in out
+    assert not (tmp_path / ".puffo-agent" / "refresh_model.flag").exists()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tool_host_sync_and_session_touch_flags(tmp_path):
+    refresh = _refresh_tool(tmp_path, harness="codex", runtime_kind="cli-local")
+    out = await refresh(host_sync=True, session=True)
+    for name in ("refresh_agent", "refresh_host_sync", "refresh_session"):
+        assert name in out

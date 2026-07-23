@@ -366,7 +366,7 @@ def _write_refresh_model_flag(
 ) -> Path:
     """Drop ``refresh_model.flag`` with ``{harness, model, requested_at}``.
 
-    ``inference_level`` rides the same flag (PUF-392): it can accompany a
+    ``inference_level`` rides the same flag: it can accompany a
     harness+model swap or be set on its own, in which case harness/model
     are empty and the daemon applies only the effort change."""
     flag_path = workspace / ".puffo-agent" / "refresh_model.flag"

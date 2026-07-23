@@ -862,8 +862,8 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             harness = str(payload.get("harness") or "")
             model = str(payload.get("model") or "")
             level = str(payload.get("inference_level") or "")
-            # harness+model swap and a standalone inference_level (PUF-392)
-            # ride the same flag; validate only what's present.
+            # harness+model swap and a standalone inference_level ride the
+            # same flag; validate only what's present.
             swap_model = bool(harness or model)
             if swap_model:
                 _validate_daemon_refresh_model(harness, model)
