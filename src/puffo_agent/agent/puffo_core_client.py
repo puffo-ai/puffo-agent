@@ -941,18 +941,20 @@ class PuffoCoreMessageClient:
             else:
                 raw_text = str(payload.content) if payload.content else ""
 
-            # DM gate ladder (block already dropped above): contact passes;
-            # operator / co-owned senders become contacts; foreign
-            # non-contacts get the throttled FYI, then either pass on a
-            # shared space or (auto_accept_dm=False) hold for approval.
+            # DM gate ladder (block already dropped above): operator /
+            # co-owned senders become contacts; every other sender —
+            # contacts included — gets the throttled FYI, then contacts
+            # pass, shared-space senders pass, and the rest
+            # (auto_accept_dm=False) hold for approval.
             if is_dm:
                 if not await self._is_foreign_dm_sender(payload.sender_slug):
                     await self._ensure_trusted_contact(payload.sender_slug)
-                elif not await self._contacts.is_allowed(payload.sender_slug):
+                else:
                     # FYI precedes any permission prompt by contract.
                     await self._maybe_send_dm_notice(payload.sender_slug)
                     if (
                         not self.auto_accept_dm
+                        and not await self._contacts.is_allowed(payload.sender_slug)
                         and not await self._shares_space_with(payload.sender_slug)
                     ):
                         gated = await self._maybe_gate_foreign_dm(

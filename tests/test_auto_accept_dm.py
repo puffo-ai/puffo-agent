@@ -779,3 +779,15 @@ def test_gate_ladder_wiring_order():
     assert fyi < gate, "FYI must precede the permission prompt"
     shared = src.index("_shares_space_with(payload.sender_slug)")
     assert fyi < shared < gate, "shared-space pass sits between FYI and gate"
+
+
+def test_gate_ladder_fyi_covers_contacts_too():
+    """FYI exempts only the operator and co-owned agents — an allowlisted
+    contact's DM still notifies, so the is_allowed check must sit AFTER
+    the notice call in the ladder."""
+    import inspect
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+    src = inspect.getsource(PuffoCoreMessageClient)
+    fyi = src.index("_maybe_send_dm_notice(payload.sender_slug)")
+    allowed = src.index("_contacts.is_allowed(payload.sender_slug)", fyi)
+    assert fyi < allowed, "FYI must fire before the contact-pass check"
