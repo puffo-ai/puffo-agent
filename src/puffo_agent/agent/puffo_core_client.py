@@ -570,9 +570,8 @@ class PuffoCoreMessageClient:
         # so the WS echo's ``_on_left_space`` skips its now-duplicate DM.
         self._pending_leave_dms: dict[str, dict[str, Any]] = {}
         self._gate_left_spaces: set[str] = set()
-        # Foreign-sender DM approval gate. Keyed by the operator-facing
-        # prompt DM's envelope_id so an in-thread y/n routes back to the
-        # sender. Survives daemon restart via disk persistence.
+        # DM approval gate, keyed by the prompt DM's envelope_id so an
+        # in-thread y/n routes back to the sender. Disk-persisted.
         from .dm_approvals import load_pending_dm_approvals
         self._pending_dm_approvals: dict[str, dict[str, Any]] = (
             load_pending_dm_approvals(self.slug)
@@ -610,9 +609,7 @@ class PuffoCoreMessageClient:
         # filterable per agent.
         self._log = _AgentLogger(logger, {"agent": self.slug})
 
-        # Operator's DM allowlist + blocklist, hydrated from the server.
-        # Single source for every allow/block read (gate, channel drop,
-        # outbound allowlist) — don't hit /allowlists + /blocklists ad hoc.
+        # Single source for every allow/block read — see contact_cache.py.
         self._contacts = ContactCache(self.http, self._log)
 
     def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
@@ -800,11 +797,9 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # Blocked account's CHANNEL message. The server only drops
-            # blocked senders on the DM path — channel posts fan out to
-            # every member unfiltered — so we drop it here: persist a
-            # redacted placeholder (keeps thread/seq metadata for history)
-            # and ack it, without ever handing the envelope to the agent.
+            # Blocked sender's CHANNEL message: the server only filters the
+            # DM path, so drop here — store a redacted placeholder (keeps
+            # thread/seq metadata) and ack.
             if (
                 payload.envelope_kind != "dm"
                 and payload.sender_slug != self.slug
@@ -857,8 +852,7 @@ class PuffoCoreMessageClient:
             # it again would feed the agent its own words and trip a
             # turn-by-turn echo loop.
             if payload.sender_slug == self.slug:
-                # Agent-initiated DM to a foreign peer implies consent to
-                # that conversation (like a human DMing first) — allowlist
+                # DMing a foreign peer first implies consent — allowlist
                 # them so their reply isn't gated.
                 if payload.envelope_kind == "dm":
                     await self._maybe_allowlist_outbound_dm(payload.recipient_slug)
@@ -941,11 +935,9 @@ class PuffoCoreMessageClient:
             else:
                 raw_text = str(payload.content) if payload.content else ""
 
-            # DM gate ladder (block already dropped above): operator /
-            # co-owned senders become contacts; every other sender —
-            # contacts included — gets the throttled FYI, then contacts
-            # pass, shared-space senders pass, and the rest
-            # (auto_accept_dm=False) hold for approval.
+            # DM gate ladder (block dropped above): trusted senders become
+            # contacts; everyone else gets the throttled FYI, then
+            # contact/shared-space pass, the rest hold for approval.
             if is_dm:
                 if not await self._is_foreign_dm_sender(payload.sender_slug):
                     await self._ensure_trusted_contact(payload.sender_slug)
@@ -3669,9 +3661,8 @@ class PuffoCoreMessageClient:
     # ─── auto_accept_dm gate ──────────────────────────────────────
 
     async def _is_foreign_dm_sender(self, sender_slug: str) -> bool:
-        # Operator, self, and agents owned by the same operator are
-        # trusted; everyone else is foreign. Owner lookup is cached (the
-        # inbound path fetches it again at render time — same TTL cache).
+        # Operator, self, and co-owned agents are trusted; everyone else
+        # is foreign. Owner lookup shares the render-time TTL cache.
         if not sender_slug:
             return False
         if sender_slug == self.operator_slug:
@@ -3721,9 +3712,9 @@ class PuffoCoreMessageClient:
     _DM_NOTICE_INTERVAL_MS = 72 * 3600 * 1000
 
     async def _maybe_send_dm_notice(self, sender_slug: str) -> None:
-        """Throttled operator FYI for foreign non-contact DM traffic:
-        first DM notifies immediately, then one notice per 72h per
-        sender. The timestamp persists so restarts don't re-fire."""
+        """Throttled operator FYI for every non-trusted sender (contacts
+        included; only operator/co-owned are exempt): first DM notifies
+        immediately, then one per 72h. Persisted across restarts."""
         if not self.operator_slug:
             return
         try:
@@ -3759,17 +3750,15 @@ class PuffoCoreMessageClient:
         shouldn't need approval) and tell the operator. Best-effort."""
         if not recipient_slug:
             return
-        # Never allowlist a sender we're currently gating: the ack DM we
-        # send them echoes back here, and honoring it would pre-empt the
-        # operator's pending y/n.
+        # Never allowlist a sender we're currently gating — the ack DM
+        # echoes back here and would pre-empt the operator's y/n.
         if any(
             m.get("sender_slug") == recipient_slug
             for m in self._pending_dm_approvals.values()
         ):
             return
-        # Cheap check first: operator / self / co-owned short-circuit
-        # before is_allowed can hit the network (the daemon DMs the
-        # operator constantly — those must not each trigger a refresh).
+        # Trusted short-circuit before is_allowed can hit the network
+        # (the daemon DMs the operator constantly).
         if not await self._is_foreign_dm_sender(recipient_slug):
             return
         if await self._contacts.is_allowed(recipient_slug):
@@ -3865,9 +3854,8 @@ class PuffoCoreMessageClient:
             self._log.warning(
                 "auto_accept_dm: failed to persist pending state: %s", exc,
             )
-        # Let the sender know their DM landed and is awaiting approval so
-        # they're not left waiting on silence. Once per sender (duplicates
-        # returned above); best-effort — never blocks the gate.
+        # Ack the sender so they're not waiting on silence. Once per
+        # sender; best-effort — never blocks the gate.
         try:
             await self._send_dm(sender_slug, _DM_GATE_SENDER_ACK, root_id="")
         except Exception as exc:

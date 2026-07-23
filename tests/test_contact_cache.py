@@ -138,3 +138,9 @@ async def test_empty_slug_is_neither_allowed_nor_blocked():
     assert await c.is_allowed("") is False
     assert await c.is_blocked("") is False
     assert http.get_calls == []  # short-circuits before any fetch
+
+
+def test_note_blocked_empty_slug_is_noop():
+    c = ContactCache(_FakeHttp(), log)
+    c.note_blocked("", True)
+    assert c._block == set()

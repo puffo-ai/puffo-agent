@@ -1,12 +1,6 @@
-"""Per-agent DM contact cache: the operator's allowlist + blocklist,
-hydrated from puffo-server and shared by every runtime (chat / cli /
-sdk / ws-local) through the one ``PuffoCoreMessageClient``.
-
-Single read/write point for allow/block decisions — the foreign-DM
-gate, the blocked-sender channel drop, and the approval / outbound
-writers all go through here instead of hitting ``/allowlists`` +
-``/blocklists`` ad hoc. Operator-scoped on the server, so one cache
-covers all of the operator's agents on this host.
+"""Operator-scoped DM contact cache (allowlist + blocklist), hydrated
+from puffo-server. Single read/write point for every allow/block
+decision — never hit /allowlists + /blocklists ad hoc.
 """
 
 from __future__ import annotations
@@ -23,9 +17,8 @@ class ContactCache:
         self._http = http_client
         self._log = log
         self._ttl = ttl
-        # A miss on the hot path refreshes at most this often, so an
-        # allowlist entry added elsewhere (another device / MCP tool)
-        # is honored well before the TTL without hammering the server.
+        # Miss-refresh cap: entries added elsewhere are honored well
+        # before the TTL without hammering the server.
         self._miss_refresh_interval = miss_refresh_interval
         self._allow: set[str] = set()
         self._block: set[str] = set()
@@ -63,19 +56,17 @@ class ContactCache:
             await self.refresh()
 
     async def is_allowed(self, slug: str) -> bool:
-        """DM-gate path. A miss triggers a (rate-limited) refresh so an
-        allowlist added on another device / via MCP is honored promptly,
-        not only after the TTL."""
+        """DM-gate path: a miss triggers a rate-limited refresh so a
+        just-added entry lands before the TTL."""
         if not slug:
             return False
         await self._maybe_refresh(on_miss=slug not in self._allow)
         return slug in self._allow
 
     async def is_blocked(self, slug: str) -> bool:
-        """Channel-drop path. TTL freshness only — no miss refresh: this
-        runs on every channel message and the common case is 'not
-        blocked', so a new block lands within the TTL window rather than
-        forcing a fetch per message."""
+        """Channel-drop path: TTL only — misses are the norm here (most
+        senders aren't blocked), so a miss-refresh would degenerate into
+        a fetch per message."""
         if not slug:
             return False
         await self._maybe_refresh(on_miss=False)

@@ -791,3 +791,36 @@ def test_gate_ladder_fyi_covers_contacts_too():
     fyi = src.index("_maybe_send_dm_notice(payload.sender_slug)")
     allowed = src.index("_contacts.is_allowed(payload.sender_slug)", fyi)
     assert fyi < allowed, "FYI must fire before the contact-pass check"
+
+
+@pytest.mark.asyncio
+async def test_shares_space_skips_malformed_space_rows():
+    client = _make_client(auto_accept_dm=False)
+    client._spaces_rows.append({"name": "no id here"})
+    client._spaces_rows.append({"space_id": "sp_2"})
+    client._space_members_stub["sp_2"] = {"alice-1234": "human"}
+    assert await client._shares_space_with("alice-1234") is True
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_store_read_failure_still_notifies():
+    client = _make_client(auto_accept_dm=True)
+
+    async def _read_boom(slug):
+        raise RuntimeError("db locked")
+
+    client.store.get_dm_notice = _read_boom  # type: ignore[assignment]
+    await client._maybe_send_dm_notice("alice-1234")
+    assert any("FYI" in d["text"] for d in client._sent_dms)
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_store_write_failure_does_not_crash():
+    client = _make_client(auto_accept_dm=True)
+
+    async def _write_boom(slug, ts):
+        raise RuntimeError("db locked")
+
+    client.store.set_dm_notice = _write_boom  # type: ignore[assignment]
+    await client._maybe_send_dm_notice("alice-1234")
+    assert any("FYI" in d["text"] for d in client._sent_dms)
