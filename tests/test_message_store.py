@@ -412,3 +412,18 @@ async def test_is_encrypted_migration_backfills_legacy_rows_true():
     msg = await store.get_message_by_envelope("env_old")
     assert msg is not None and msg.is_encrypted is True  # legacy row backfilled encrypted
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_has_dm_from():
+    store = _temp_store()
+    await store.open()
+
+    assert not await store.has_dm_from("alice-1")
+    await store.store(_channel_payload("env_ch", sender_slug="alice-1"))
+    assert not await store.has_dm_from("alice-1")  # channel post doesn't count
+    await store.store(_dm_payload("env_dm", "alice-1", "agent-9"))
+    assert await store.has_dm_from("alice-1")
+    assert not await store.has_dm_from("")
+
+    await store.close()

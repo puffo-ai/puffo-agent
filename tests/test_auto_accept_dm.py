@@ -255,12 +255,16 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     class _StubNoticeStore:
         def __init__(self):
             self.notices: dict[str, int] = {}
+            self.dm_senders: set[str] = set()
 
         async def get_dm_notice(self, slug):
             return self.notices.get(slug)
 
         async def set_dm_notice(self, slug, ts):
             self.notices[slug] = ts
+
+        async def has_dm_from(self, slug):
+            return slug in self.dm_senders
 
     client.store = _StubNoticeStore()  # type: ignore[assignment]
 
@@ -613,6 +617,30 @@ async def test_outbound_dm_to_operator_or_co_owned_is_noop():
     client._owner_of["sibling-agt"] = "op-1"
     await client._maybe_allowlist_outbound_dm("op-1")
     await client._maybe_allowlist_outbound_dm("sibling-agt")
+    assert client._posts == []
+    assert client._sent_dms == []
+
+
+@pytest.mark.asyncio
+async def test_outbound_reply_to_inbound_dm_does_not_allowlist():
+    client = _make_client(auto_accept_dm=True)
+    # They wrote first (inbound DM on record) — replying is not consent.
+    client.store.dm_senders.add("frank-5")
+    await client._maybe_allowlist_outbound_dm("frank-5")
+    assert client._posts == []
+    assert "frank-5" not in client._contacts._allow
+    assert client._sent_dms == []
+
+
+@pytest.mark.asyncio
+async def test_outbound_dm_skips_allowlist_when_store_read_fails():
+    client = _make_client(auto_accept_dm=True)
+
+    async def _boom(slug):
+        raise RuntimeError("db locked")
+
+    client.store.has_dm_from = _boom  # type: ignore[assignment]
+    await client._maybe_allowlist_outbound_dm("gina-2")
     assert client._posts == []
     assert client._sent_dms == []
 

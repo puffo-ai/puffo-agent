@@ -3751,6 +3751,13 @@ class PuffoCoreMessageClient:
             for m in self._pending_dm_approvals.values()
         ):
             return
+        # Replying is not consent — only a genuinely agent-initiated
+        # first DM allowlists. A stored inbound DM means they wrote first.
+        try:
+            if await self.store.has_dm_from(recipient_slug):
+                return
+        except Exception:
+            return
         # Trusted short-circuit before is_allowed can hit the network
         # (the daemon DMs the operator constantly).
         if not await self._is_foreign_dm_sender(recipient_slug):

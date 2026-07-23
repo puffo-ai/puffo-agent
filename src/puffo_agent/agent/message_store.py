@@ -622,6 +622,18 @@ class MessageStore:
             row = await cur.fetchone()
         return int(row[0]) if row else None
 
+    async def has_dm_from(self, sender_slug: str) -> bool:
+        """Any stored inbound DM from ``sender_slug``."""
+        if not sender_slug:
+            return False
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT 1 FROM messages WHERE envelope_kind = 'dm' "
+            "AND sender_slug = ? LIMIT 1",
+            (sender_slug,),
+        ) as cur:
+            return await cur.fetchone() is not None
+
     async def set_dm_notice(self, sender_slug: str, notified_at: int) -> None:
         if not sender_slug:
             return
