@@ -158,9 +158,7 @@ class Daemon:
         control_manager = ControlManager()
         control_task = asyncio.ensure_future(control_manager.run())
 
-        # Before the first reconcile spawns any worker: if the puffo MCP
-        # tool surface changed, drop cli-local codex sessions so they
-        # reload tools instead of resuming a stale snapshot.
+        # Must run before the first reconcile spawns any worker.
         _respawn_codex_on_mcp_change_at_startup()
 
         try:
@@ -692,12 +690,10 @@ def _mcp_fingerprint_path() -> Path:
 
 
 def _respawn_codex_on_mcp_change_at_startup() -> None:
-    """Codex snapshots its MCP tools at session start and never reloads
-    them (openai/codex#7767), so an in-place change to the puffo tool
-    surface leaves a resumed codex session on a stale tool set. On boot,
-    if the fingerprint changed since last run, drop the CLI session of
-    every cli-local codex agent so it opens a fresh codex conversation
-    and reloads the tools. First run just records the fingerprint."""
+    """On boot, if the puffo MCP tool surface changed since last run, drop
+    every cli-local codex agent's CLI session so it opens a fresh codex
+    conversation and reloads the tools — codex snapshots MCP once and never
+    reloads (openai/codex#7767). First run just records the fingerprint."""
     import json
 
     from ..mcp.puffo_core_server import mcp_tool_fingerprint

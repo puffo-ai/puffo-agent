@@ -76,12 +76,10 @@ def _validate_refresh_inference_level(harness: str, level: str) -> None:
 
 
 def mcp_tool_fingerprint() -> str:
-    """Stable hash of the puffo MCP tool surface — every tool name plus
-    its parameter names (core + local). Changes when a tool is
-    added/removed or its signature changes (e.g. a new ``inference_level``
-    arg). Codex snapshots MCP at session start and never reloads it
-    (openai/codex#7767), so a shift here is the signal that a resumed
-    codex session is now stale."""
+    """Stable hash of the puffo MCP tool surface (core + local tool names
+    + parameter names). Changes on any tool add/remove/signature shift —
+    the signal a codex session (which snapshots MCP once, openai/codex#7767)
+    is now stale."""
     import hashlib
     import inspect
     import json
@@ -127,8 +125,8 @@ def _register_local_tools(
 ) -> None:
     """Register system/local tools that don't depend on the messaging API."""
 
-    # Agent's current harness (the closure arg, shadowed by the tool's own
-    # ``harness`` param) — needed to validate a standalone inference_level.
+    # Closure harness (the tool's own ``harness`` param shadows it below) —
+    # used to validate a standalone inference_level.
     agent_current_harness = harness
 
     def _require_claude_code(tool: str) -> None:

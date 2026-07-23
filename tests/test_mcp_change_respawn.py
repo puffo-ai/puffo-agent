@@ -71,3 +71,32 @@ def test_changed_fingerprint_respawns_only_cli_local_codex(tmp_path, monkeypatch
     assert not _has_session_flag(claude_local)
     assert not _has_session_flag(ws_agent)
     assert _mcp_fingerprint_path().read_text().strip() == mcp_tool_fingerprint()
+
+
+def test_changed_fingerprint_skips_unloadable_agent(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    good = _agent("codex-good", kind="cli-local", harness="codex")
+    # A broken agent.yml must be skipped, not crash the sweep.
+    from puffo_agent.portal.state import agent_yml_path
+    bad = agent_yml_path("codex-bad")
+    bad.parent.mkdir(parents=True, exist_ok=True)
+    bad.write_text("::: not valid yaml :::", encoding="utf-8")
+    _mcp_fingerprint_path().write_text("STALE\n", encoding="utf-8")
+
+    _respawn_codex_on_mcp_change_at_startup()
+
+    assert _has_session_flag(good)
+    assert _mcp_fingerprint_path().read_text().strip() == mcp_tool_fingerprint()
+
+
+def test_respawn_survives_fingerprint_failure(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    from puffo_agent.mcp import puffo_core_server as s
+
+    def _boom():
+        raise RuntimeError("fingerprint blew up")
+
+    monkeypatch.setattr(s, "mcp_tool_fingerprint", _boom)
+    # Best-effort: return without raising and without recording a fingerprint.
+    _respawn_codex_on_mcp_change_at_startup()
+    assert not _mcp_fingerprint_path().exists()

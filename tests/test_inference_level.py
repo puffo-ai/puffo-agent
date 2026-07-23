@@ -246,9 +246,7 @@ def _write_model_flag(cfg, **payload):
 
 
 def test_daemon_applies_standalone_inference_level(tmp_path, monkeypatch):
-    # Standalone: refresh(inference_level=...) with no harness/model persists
-    # effort to agent.yml and consumes the flag (respawn is the config-changed
-    # check's job, driven by runtime inequality).
+    # Standalone effort swap persists to agent.yml and consumes the flag.
     from puffo_agent.portal.state import AgentConfig
     cfg = _codex_agent(tmp_path, monkeypatch)
     flag = _write_model_flag(cfg, harness="", model="", inference_level="medium")
@@ -385,3 +383,38 @@ async def test_refresh_tool_host_sync_and_session_touch_flags(tmp_path):
     out = await refresh(host_sync=True, session=True)
     for name in ("refresh_agent", "refresh_host_sync", "refresh_session"):
         assert name in out
+
+
+@pytest.mark.asyncio
+async def test_refresh_tool_combined_harness_model_and_level(tmp_path, monkeypatch):
+    # Combined path: harness+model+level in one call. Stub the CLI-dependent
+    # model validator so the tool orchestration is what's exercised.
+    from puffo_agent.mcp import puffo_core_server as s
+    monkeypatch.setattr(s, "_validate_refresh_model", lambda h, m: None)
+    refresh = _refresh_tool(tmp_path, harness="codex")
+    out = await refresh(
+        harness="claude-code", model="claude-opus-4-8", inference_level="xhigh",
+    )
+    assert "harness='claude-code'" in out
+    assert "inference_level='xhigh'" in out
+    payload = json.loads(
+        (tmp_path / ".puffo-agent" / "refresh_model.flag").read_text(encoding="utf-8")
+    )
+    assert payload["harness"] == "claude-code"
+    assert payload["inference_level"] == "xhigh"
+
+
+def test_daemon_applies_all_three_without_cli(tmp_path, monkeypatch):
+    # Deterministic combined-apply (no CLI): stub the model validator.
+    from puffo_agent.portal import daemon as d
+    from puffo_agent.portal.state import AgentConfig
+    monkeypatch.setattr(d, "_validate_daemon_refresh_model", lambda h, m: None)
+    cfg = _codex_agent(tmp_path, monkeypatch)
+    _write_model_flag(
+        cfg, harness="claude-code", model="claude-opus-4-8", inference_level="xhigh",
+    )
+    d._process_daemon_refresh_flags("codex-refresh")
+    loaded = AgentConfig.load("codex-refresh")
+    assert loaded.runtime.harness == "claude-code"
+    assert loaded.runtime.model == "claude-opus-4-8"
+    assert loaded.runtime.inference_level == "xhigh"

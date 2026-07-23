@@ -32,11 +32,9 @@ REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:
-    """Reasoning-effort values a harness accepts. codex uses its own
-    ``model_reasoning_effort`` set (has ``minimal``, no ``xhigh``);
-    claude-code uses the web superset (has ``xhigh``, no ``minimal``).
-    Unknown harness gets the union so the caller stays permissive and
-    the daemon re-validates against the resolved harness."""
+    """Reasoning-effort values a harness accepts (codex has ``minimal``,
+    no ``xhigh``; claude-code the reverse). Unknown harness → the union,
+    so the caller stays permissive and the daemon re-validates."""
     if harness == "codex":
         return REASONING_EFFORTS
     if harness == "claude-code":
