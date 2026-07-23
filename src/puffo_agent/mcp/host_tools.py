@@ -364,8 +364,7 @@ def _write_refresh_model_flag(
     workspace: Path, *, harness: str = "", model: str = "",
     inference_level: str = "",
 ) -> Path:
-    """Drop ``refresh_model.flag``. ``inference_level`` rides the same
-    flag — standalone (empty harness/model) or with a harness+model swap."""
+    """Drop ``refresh_model.flag`` (``inference_level`` rides it too)."""
     flag_path = workspace / ".puffo-agent" / "refresh_model.flag"
     payload = {
         "harness": harness,

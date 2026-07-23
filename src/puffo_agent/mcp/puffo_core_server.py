@@ -76,10 +76,7 @@ def _validate_refresh_inference_level(harness: str, level: str) -> None:
 
 
 def mcp_tool_fingerprint() -> str:
-    """Stable hash of the puffo MCP tool surface (core + local tool names
-    + parameter names). Changes on any tool add/remove/signature shift —
-    the signal a codex session (which snapshots MCP once, openai/codex#7767)
-    is now stale."""
+    """Hash of the puffo MCP tool surface — tool names + their params."""
     import hashlib
     import inspect
     import json
@@ -125,8 +122,7 @@ def _register_local_tools(
 ) -> None:
     """Register system/local tools that don't depend on the messaging API."""
 
-    # Closure harness (the tool's own ``harness`` param shadows it below) —
-    # used to validate a standalone inference_level.
+    # Closure harness — the tool's own ``harness`` param shadows it below.
     agent_current_harness = harness
 
     def _require_claude_code(tool: str) -> None:
@@ -176,8 +172,7 @@ def _register_local_tools(
                 harness if harness is not None else (agent_current_harness or "")
             )
             _validate_refresh_inference_level(effective_harness, inference_level)
-        # A pending respawn (harness/model or inference_level) already
-        # restarts the worker, so it subsumes host_sync's container bounce.
+        # A pending respawn already restarts the worker, subsuming host_sync.
         respawns = harness is not None or inference_level is not None
         if host_sync and runtime_kind == "cli-docker" and not session and not respawns:
             raise RuntimeError(

@@ -690,10 +690,9 @@ def _mcp_fingerprint_path() -> Path:
 
 
 def _respawn_codex_on_mcp_change_at_startup() -> None:
-    """On boot, if the puffo MCP tool surface changed since last run, drop
-    every cli-local codex agent's CLI session so it opens a fresh codex
-    conversation and reloads the tools — codex snapshots MCP once and never
-    reloads (openai/codex#7767). First run just records the fingerprint."""
+    """Drop cli-local codex sessions when the MCP tool surface changed so
+    they reload tools — codex caches MCP once (openai/codex#7767). First
+    run just records the fingerprint."""
     import json
 
     from ..mcp.puffo_core_server import mcp_tool_fingerprint
@@ -919,8 +918,7 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             harness = str(payload.get("harness") or "")
             model = str(payload.get("model") or "")
             level = str(payload.get("inference_level") or "")
-            # harness+model swap and a standalone inference_level ride the
-            # same flag; validate only what's present.
+            # Both ride the same flag; validate only what's present.
             swap_model = bool(harness or model)
             if swap_model:
                 _validate_daemon_refresh_model(harness, model)

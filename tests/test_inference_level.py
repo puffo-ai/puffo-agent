@@ -266,8 +266,7 @@ def test_daemon_applies_harness_model_and_level_together(tmp_path, monkeypatch):
     _write_model_flag(
         cfg, harness="claude-code", model="claude-opus-4-8", inference_level="xhigh",
     )
-    # claude-code CLI must resolve for the harness+model validation to pass;
-    # skip if it's not installed in this env.
+    # Needs the claude-code CLI for harness+model validation; skip if absent.
     from puffo_agent.agent.cli_bin import resolve_claude_bin
     if resolve_claude_bin() is None:
         pytest.skip("claude-code CLI not installed")
@@ -352,16 +351,14 @@ async def test_refresh_tool_standalone_level_validates_against_current_harness(t
 
 @pytest.mark.asyncio
 async def test_refresh_tool_level_subsumes_host_sync_on_docker(tmp_path):
-    # host_sync on cli-docker normally needs session=True; a respawn
-    # (inference_level) subsumes the container bounce → no raise.
+    # A respawn (inference_level) subsumes the cli-docker host_sync gate.
     refresh = _refresh_tool(tmp_path, harness="codex", runtime_kind="cli-docker")
     out = await refresh(host_sync=True, inference_level="low")
     assert "inference_level='low'" in out
 
 
 def test_refresh_skill_documents_inference_level_axis():
-    # The agent-facing skill (rendered into CLAUDE.md) must advertise the
-    # axis too, not just the tool docstring, or agents can't discover it.
+    # The skill (in CLAUDE.md) must advertise the axis, not just the docstring.
     from puffo_agent.agent.shared_content import DEFAULT_SKILL_REFRESH
 
     assert "inference_level" in DEFAULT_SKILL_REFRESH
@@ -387,8 +384,7 @@ async def test_refresh_tool_host_sync_and_session_touch_flags(tmp_path):
 
 @pytest.mark.asyncio
 async def test_refresh_tool_combined_harness_model_and_level(tmp_path, monkeypatch):
-    # Combined path: harness+model+level in one call. Stub the CLI-dependent
-    # model validator so the tool orchestration is what's exercised.
+    # Combined path; stub the CLI-dependent model validator.
     from puffo_agent.mcp import puffo_core_server as s
     monkeypatch.setattr(s, "_validate_refresh_model", lambda h, m: None)
     refresh = _refresh_tool(tmp_path, harness="codex")
