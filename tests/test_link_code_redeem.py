@@ -397,7 +397,7 @@ def test_mint_create_code_rejected(monkeypatch):
         asyncio.run(mint_link_code("https://relay", "Box"))
 
 
-# ── PUF-393: fetch_operator_display_name ─────────────────────────────
+# ── fetch_operator_display_name ─────────────────────────────
 
 
 def test_fetch_operator_display_name_ok(monkeypatch):
@@ -434,4 +434,13 @@ def test_fetch_operator_display_name_network_error_returns_empty(monkeypatch):
         raise OSError("connection refused")
 
     monkeypatch.setattr(link_mod, "create_remote_http_session", boom)
+    assert asyncio.run(fetch_operator_display_name("https://x.example", "alice-1")) == ""
+
+
+def test_fetch_operator_display_name_non_dict_body_returns_empty(monkeypatch):
+    # A 200 whose JSON isn't an object must fall back to "" (not crash).
+    _patch_session(
+        monkeypatch,
+        {("GET", "/operators/alice-1"): [_FakeResp(200, json_body=["nope"])]},
+    )
     assert asyncio.run(fetch_operator_display_name("https://x.example", "alice-1")) == ""

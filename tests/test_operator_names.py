@@ -1,6 +1,5 @@
-"""PUF-393: OperatorNameCache scheduling/fallback logic + source-pins for the
-Qt Operators-tab wiring (PySide6 isn't importable in this env, so the widget is
-pinned by reading its source rather than instantiating it)."""
+"""OperatorNameCache scheduling/fallback logic + source-pins for the Qt
+Operators-tab wiring (real widget tests live in test_ui_operators_view.py)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -74,7 +73,7 @@ def test_empty_result_is_cached_no_refetch_storm():
     assert c.slugs_to_fetch(["a"]) == []
 
 
-# ── Source-pins: Operators-tab Qt wiring (can't import PySide6 here) ──────────
+# ── Source-pins: Operators-tab Qt wiring ──────────
 
 
 def _operators_view_src() -> str:

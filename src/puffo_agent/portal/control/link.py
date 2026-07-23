@@ -332,10 +332,9 @@ async def run_link(
 
 
 async def fetch_operator_display_name(server_url: str, operator_slug: str) -> str:
-    """Resolve a linked operator's human display name via the machine-authed
-    ``GET /v2/machines/{id}/operators/{slug}`` endpoint (PUF-393). Returns ""
-    on any failure — the Operators tab falls back to the slug, so this is
-    never fatal."""
+    """A linked operator's display name via the machine-authed
+    ``GET /v2/machines/{id}/operators/{slug}``; "" on any failure (the
+    Operators tab falls back to the slug)."""
     machine = load_or_create_machine()
     base = server_url.rstrip("/")
     path = f"/v2/machines/{machine.machine_id}/operators/{operator_slug}"
@@ -348,7 +347,7 @@ async def fetch_operator_display_name(server_url: str, operator_slug: str) -> st
                 data = await resp.json()
     except Exception:  # noqa: BLE001 — best-effort; slug is the fallback
         return ""
-    return str(data.get("display_name") or "")
+    return str(data.get("display_name") or "") if isinstance(data, dict) else ""
 
 
 async def run_unlink(operator_slug: str, expected_server_url: str | None = None) -> int:

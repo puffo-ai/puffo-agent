@@ -288,8 +288,7 @@ class OperatorsView(QWidget):
         name = QLabel(p.name or p.operator_slug)
         name.setStyleSheet("font-size: 11pt; font-weight: 600; color: #111827; border: 0;")
         text_col.addWidget(name)
-        # Secondary label = operator display name (falls back to the slug until
-        # it resolves / for legacy pairings). Slug stays copy-selectable.
+        # Secondary label = display name, slug until it resolves. Copy-selectable.
         display = self._names.label(p.operator_slug)
         slug = QLabel(display)
         slug.setTextInteractionFlags(Qt.TextSelectableByMouse)

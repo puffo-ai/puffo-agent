@@ -1,17 +1,11 @@
-"""PUF-393: operator display-name cache for the Operators tab.
-
-The desktop UI resolves operator display names on demand (via the machine-
-authed ``fetch_operator_display_name``) and caches them here. Kept Qt-free so
-the fetch-scheduling + label-fallback logic is unit-testable without PySide6 —
-the view owns only the threading + signal marshaling.
-"""
+"""Operator display-name cache for the Operators tab. Qt-free so the
+fetch-scheduling + label-fallback logic is unit-testable without PySide6."""
 from __future__ import annotations
 
 import time
 from typing import Callable
 
-# Re-resolve a name at most this often, so a rename (or a server that only
-# gained the endpoint after the UI started) is picked up without hammering.
+# Cap re-resolves so a rename (or a late-shipping endpoint) is picked up.
 REFRESH_AFTER_SECONDS = 300.0
 
 
@@ -47,7 +41,7 @@ class OperatorNameCache:
         self._pending.add(slug)
 
     def resolved(self, slug: str, name: str) -> None:
-        """Record a fetch result (empty name is cached too — it just falls back
-        to the slug — so a failed fetch doesn't re-fire every poll)."""
+        """Record a fetch result; an empty name is cached too, so a failed
+        fetch doesn't re-fire every poll."""
         self._pending.discard(slug)
         self._names[slug] = (name, self._clock())
