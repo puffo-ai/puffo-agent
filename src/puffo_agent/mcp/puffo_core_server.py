@@ -75,6 +75,50 @@ def _validate_refresh_inference_level(harness: str, level: str) -> None:
         )
 
 
+def mcp_tool_fingerprint() -> str:
+    """Stable hash of the puffo MCP tool surface — every tool name plus
+    its parameter names (core + local). Changes when a tool is
+    added/removed or its signature changes (e.g. a new ``inference_level``
+    arg). Codex snapshots MCP at session start and never reloads it
+    (openai/codex#7767), so a shift here is the signal that a resumed
+    codex session is now stale."""
+    import hashlib
+    import inspect
+    import json
+    import types
+
+    from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
+
+    captured: dict[str, list[str]] = {}
+
+    class _Capture:
+        def tool(self, *a, **k):
+            def deco(fn):
+                captured[fn.__name__] = list(inspect.signature(fn).parameters)
+                return fn
+            return deco
+
+        def resource(self, *a, **k):
+            return lambda fn: fn
+
+        def prompt(self, *a, **k):
+            return lambda fn: fn
+
+    dummy = PuffoCoreToolsConfig(
+        slug="", device_id="",
+        keystore=types.SimpleNamespace(),
+        http_client=types.SimpleNamespace(),
+        data_client=types.SimpleNamespace(),
+    )
+    cap = _Capture()
+    register_core_tools(cap, dummy)
+    _register_local_tools(cap, "", "", "")
+    payload = json.dumps(
+        {name: captured[name] for name in sorted(captured)}, sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _register_local_tools(
     mcp: FastMCP,
     workspace: str,

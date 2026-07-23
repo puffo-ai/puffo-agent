@@ -56,6 +56,7 @@ from .state import (
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_runtime_flag_path,
+    refresh_session_flag_path,
     refresh_token_request_path,
     restart_flag_path,
     stop_request_path,
@@ -156,6 +157,11 @@ class Daemon:
 
         control_manager = ControlManager()
         control_task = asyncio.ensure_future(control_manager.run())
+
+        # Before the first reconcile spawns any worker: if the puffo MCP
+        # tool surface changed, drop cli-local codex sessions so they
+        # reload tools instead of resuming a stale snapshot.
+        _respawn_codex_on_mcp_change_at_startup()
 
         try:
             while not self._stop.is_set():
@@ -679,6 +685,61 @@ async def _sweep_archived_pending_revokes_at_startup() -> None:
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("archived pending revoke sweep errored: %s", exc)
+
+
+def _mcp_fingerprint_path() -> Path:
+    return home_dir() / "mcp_tool_fingerprint"
+
+
+def _respawn_codex_on_mcp_change_at_startup() -> None:
+    """Codex snapshots its MCP tools at session start and never reloads
+    them (openai/codex#7767), so an in-place change to the puffo tool
+    surface leaves a resumed codex session on a stale tool set. On boot,
+    if the fingerprint changed since last run, drop the CLI session of
+    every cli-local codex agent so it opens a fresh codex conversation
+    and reloads the tools. First run just records the fingerprint."""
+    import json
+
+    from ..mcp.puffo_core_server import mcp_tool_fingerprint
+
+    try:
+        current = mcp_tool_fingerprint()
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("startup: mcp fingerprint failed: %s", exc)
+        return
+    fp_path = _mcp_fingerprint_path()
+    previous = (
+        fp_path.read_text(encoding="utf-8").strip() if fp_path.exists() else ""
+    )
+    if previous and previous != current:
+        for agent_id in discover_agents():
+            try:
+                cfg = AgentConfig.load(agent_id)
+            except Exception:  # noqa: BLE001
+                continue
+            rt = cfg.runtime
+            if rt.kind != "cli-local" or rt.harness != "codex":
+                continue
+            try:
+                flag = refresh_session_flag_path(cfg.resolve_workspace_dir())
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text(
+                    json.dumps({"requested_at": int(time.time())}) + "\n",
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "startup: mcp surface changed — dropping codex session for "
+                    "%s so it reloads tools", agent_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "startup: couldn't drop codex session for %s: %s",
+                    agent_id, exc,
+                )
+    try:
+        fp_path.write_text(current + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("startup: couldn't persist mcp fingerprint: %s", exc)
 
 
 async def _migrate_linked_agents_at_startup() -> None:
