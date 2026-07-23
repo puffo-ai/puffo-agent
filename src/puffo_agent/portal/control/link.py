@@ -332,9 +332,8 @@ async def run_link(
 
 
 async def fetch_operator_display_name(server_url: str, operator_slug: str) -> str:
-    """A linked operator's display name via the machine-authed
-    ``GET /v2/machines/{id}/operators/{slug}``; "" on any failure (the
-    Operators tab falls back to the slug)."""
+    """A linked operator's display name (machine-authed); "" on any failure —
+    the Operators tab falls back to the slug."""
     machine = load_or_create_machine()
     base = server_url.rstrip("/")
     path = f"/v2/machines/{machine.machine_id}/operators/{operator_slug}"

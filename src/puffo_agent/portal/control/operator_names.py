@@ -1,5 +1,4 @@
-"""Operator display-name cache for the Operators tab. Qt-free so the
-fetch-scheduling + label-fallback logic is unit-testable without PySide6."""
+"""Operator display-name cache for the Operators tab; Qt-free + unit-testable."""
 from __future__ import annotations
 
 import time
@@ -41,7 +40,6 @@ class OperatorNameCache:
         self._pending.add(slug)
 
     def resolved(self, slug: str, name: str) -> None:
-        """Record a fetch result; an empty name is cached too, so a failed
-        fetch doesn't re-fire every poll."""
+        """Record a fetch result; empty is cached too so failures don't re-fire."""
         self._pending.discard(slug)
         self._names[slug] = (name, self._clock())

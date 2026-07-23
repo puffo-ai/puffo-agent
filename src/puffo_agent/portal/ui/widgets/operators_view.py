@@ -225,7 +225,7 @@ class OperatorsView(QWidget):
             pairings = {}
         values = list(pairings.values())
         self._resolve_names(values)
-        # Include the resolved label so a name arriving later re-renders the card.
+        # Label in the key so a late-arriving name re-renders.
         key = tuple(
             (p.operator_slug, p.server_url, p.name, self._names.label(p.operator_slug))
             for p in values
@@ -236,8 +236,7 @@ class OperatorsView(QWidget):
         self._rebuild(values)
 
     def _resolve_names(self, pairings: list) -> None:
-        """Kick a background fetch for each operator whose display name is
-        unresolved or stale. Results arrive via ``_name_resolved``."""
+        """Background-fetch each operator whose display name is unresolved/stale."""
         by_slug = {p.operator_slug: p.server_url for p in pairings}
         for slug in self._names.slugs_to_fetch(list(by_slug)):
             self._names.mark_pending(slug)
