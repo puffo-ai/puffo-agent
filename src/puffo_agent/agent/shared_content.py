@@ -39,13 +39,15 @@ the operator runs; your specific role is in *Your role* below.
 Every user message carries a metadata block:
 
 ```
+- post_id: <msg_<uuid>>          # this envelope's id
 - space: <space_name>            # absent for DMs
 - space_id: <sp_<uuid>>          # absent for DMs
 - channel: <channel_name>        # "Direct message" for DMs
 - channel_id: <ch_<uuid>>        # send_message(channel=...); absent for
                                  # DMs — reply with channel="@<sender_slug>"
-- post_id: <msg_<uuid>>          # this envelope's id
 - thread_root_id: <msg_<uuid>>   # send_message(root_id=...) to reply in-thread
+- is_encrypted: true | false     # true = end-to-end encrypted; false = sent in
+                                 # the clear (plaintext, signature-only)
 - timestamp: <ISO-8601>
 - sender: <display_name>         # human-readable name for prose
 - sender_slug: <slug>            # structural id — @-mentions + DM routing
@@ -184,11 +186,12 @@ below is the authoritative reference.
   Force-refreshes from puffo-server; call when a name looks stale.
 
 **Self-management (cli-local + cli-docker):**
-- `refresh(harness=None, model=None, host_sync=False, session=False)`
-  — no args rebuilds CLAUDE.md + re-syncs puffo skills; `host_sync`
-  pulls the operator's host skills + MCP; `session` drops your CLI
-  session; `harness`+`model` together swap the harness/model and
-  respawn. See the `refresh` skill for the flag matrix.
+- `refresh(harness=None, model=None, host_sync=False, session=False,
+  inference_level=None)` — no args rebuilds CLAUDE.md + re-syncs puffo
+  skills; `host_sync` pulls the operator's host skills + MCP; `session`
+  drops your CLI session; `harness`+`model` together swap the
+  harness/model and respawn; `inference_level` sets reasoning effort
+  (per-harness) and respawns. See the `refresh` skill for the flag matrix.
 - `install_host_mcp(template_id)` — lay a catalog MCP into the
   operator's `~/.claude.json` for OAuth there; pair with
   `sync_host_mcp` once confirmed. See `use-host-mcp`.
@@ -590,8 +593,8 @@ DEFAULT_SKILL_REFRESH = """\
 # Skill: refresh
 
 Bring your on-disk state (system prompt, skills, MCP registry, CLI
-session, harness+model) into your live process. Four orthogonal
-axes; combine them freely.
+session, harness+model, inference_level) into your live process. Five
+orthogonal axes; combine them freely.
 
 **Tool:** `mcp__puffo__refresh`
 
@@ -602,6 +605,10 @@ axes; combine them freely.
   `~/.claude/skills/` + host MCP registrations
 - `session` (optional, bool) — drop CLI session token so next spawn
   starts a fresh conversation (no `--resume`)
+- `inference_level` (optional) — reasoning effort; per-harness values
+  (codex: minimal/low/medium/high; claude-code: low/medium/high/xhigh).
+  Standalone or alongside a harness+model swap; persists to `agent.yml`
+  + respawns.
 
 `harness` and `model` must be provided together (or both omitted).
 
@@ -613,6 +620,7 @@ axes; combine them freely.
 | `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
 | `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
 | `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
+| `refresh(inference_level="medium")` | Set reasoning effort, persist to `agent.yml`, respawn. Standalone or alongside a harness+model swap. |
 
 **When to use:**
 - Edited `CLAUDE.md`, `profile.md`, `memory/*.md` → `refresh()`.
@@ -622,6 +630,8 @@ axes; combine them freely.
 - Conversation feels stuck / context is polluted → `refresh(session=True)`.
 - Operator asked you to try a different model → confirm harness +
   model with them, then `refresh(harness=..., model=...)`.
+- A task needs more (or less) reasoning effort → `refresh(
+  inference_level="high")` (values are per-harness).
 
 **When NOT to use:**
 - Every turn — worker-scope refresh is cheap (~1s), but the

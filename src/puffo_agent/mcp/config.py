@@ -13,13 +13,31 @@ that form.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import site
+import os
 import sys
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
+
+# Web enum superset; per-harness narrowing at emit.
+INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
+
+# codex model_reasoning_effort values.
+REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def supported_inference_levels(harness: str) -> tuple[str, ...]:
+    """Reasoning-effort values a harness accepts; unknown → the union."""
+    if harness == "codex":
+        return REASONING_EFFORTS
+    if harness == "claude-code":
+        return INFERENCE_LEVELS
+    return tuple(dict.fromkeys(INFERENCE_LEVELS + REASONING_EFFORTS))
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -98,6 +116,7 @@ def write_codex_mcp_config(
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     extra_servers: dict[str, dict] | None = None,
+    inference_level: str | None = None,
 ) -> Path:
     """Serialise the per-agent codex config.toml.
 
@@ -119,6 +138,16 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
+    # top-level key must precede [mcp_servers.*] tables
+    if inference_level:
+        if inference_level in REASONING_EFFORTS:
+            lines.append(f'model_reasoning_effort = "{inference_level}"')
+        else:
+            logger.warning(
+                "dropping inference_level %r for codex (no matching "
+                "model_reasoning_effort; expected one of %s)",
+                inference_level, ", ".join(REASONING_EFFORTS),
+            )
     # Host extras first so the puffo entry below shadows any duplicate.
     for name, spec in sorted((extra_servers or {}).items()):
         if name == MCP_SERVER_NAME:
@@ -260,6 +289,11 @@ def puffo_core_mcp_env(
         "PUFFO_RPC_URL": rpc_url,
         **_python_user_base_env(runtime_kind),
     }
+    # Forward the daemon's PYTHONPATH so a worktree checkout drives the MCP
+    # subprocess too (unset in prod). Skipped for docker — host path is moot there.
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath and "docker" not in runtime_kind:
+        env["PYTHONPATH"] = pythonpath
     if agent_id:
         env["PUFFO_AGENT_ID"] = agent_id
     if space_id:

@@ -525,6 +525,17 @@ def test_write_refresh_model_flag_carries_harness_and_model(tmp_path):
     assert payload["harness"] == "codex"
     assert payload["model"] == "gpt-5"
     assert isinstance(payload["requested_at"], int)
+    # No inference_level passed → key omitted.
+    assert "inference_level" not in payload
+
+
+def test_write_refresh_model_flag_carries_inference_level(tmp_path):
+    # A standalone effort swap rides the same flag with empty harness/model.
+    path = _write_refresh_model_flag(tmp_path, inference_level="medium")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["inference_level"] == "medium"
+    assert payload["harness"] == ""
+    assert payload["model"] == ""
 
 
 def test_write_refresh_runtime_flag_kind_only(tmp_path):

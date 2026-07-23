@@ -422,8 +422,8 @@ async def update_runtime(request: web.Request) -> web.Response:
 
     Accepts any subset of: ``kind``, ``provider``, ``model``,
     ``harness``, ``api_key``, ``permission_mode``, ``sandbox``,
-    ``allowed_tools``, ``docker_image``, ``max_turns``. Missing fields
-    are untouched. ``harness`` editing requires the corresponding CLI
+    ``inference_level``, ``allowed_tools``, ``docker_image``,
+    ``max_turns``. Missing fields are untouched. ``harness`` editing requires the corresponding CLI
     to already be installed + authenticated on the host
     (`claude login` / `codex login` / ...) — the worker will hit
     auth_failed on first turn otherwise. validate_triple below
@@ -473,6 +473,15 @@ async def update_runtime(request: web.Request) -> web.Response:
                 "danger-full-access"
             )
         rt.sandbox = sandbox
+    if "inference_level" in payload:
+        from ...mcp.config import INFERENCE_LEVELS
+
+        level = str(payload["inference_level"])
+        if level and level not in INFERENCE_LEVELS:
+            return _bad(
+                "inference_level must be one of: " + ", ".join(INFERENCE_LEVELS)
+            )
+        rt.inference_level = level
     if "allowed_tools" in payload:
         tools = payload["allowed_tools"]
         if not isinstance(tools, list):
@@ -1532,12 +1541,19 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
         api_key=str(rt.get("api_key", "")),
         harness=str(rt.get("harness", "claude-code")),
         permission_mode=str(rt.get("permission_mode", "bypassPermissions")),
+        inference_level=str(rt.get("inference_level", "")),
         max_turns=int(rt.get("max_turns", 10)),
     )
     from ..runtime_matrix import validate_triple
     validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
+    from ...mcp.config import INFERENCE_LEVELS
+    if runtime.inference_level and runtime.inference_level not in INFERENCE_LEVELS:
+        raise ProvisionError(
+            "runtime.inference_level must be one of: "
+            + ", ".join(INFERENCE_LEVELS)
+        )
 
     desired_skills = payload.get("desired_skills") or []
     desired_mcps = payload.get("desired_mcps") or []

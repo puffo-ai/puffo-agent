@@ -159,6 +159,7 @@ class AgentDetail(QWidget):
             (self._runtime_kind, "currentTextChanged"),
             (self._harness,      "currentTextChanged"),
             (self._model,        "currentTextChanged"),
+            (self._effort,       "currentTextChanged"),
         ):
             getattr(w, sig).connect(self._check_dirty)
         self._check_dirty()
@@ -271,6 +272,9 @@ class AgentDetail(QWidget):
 
         self._model = QComboBox()
         layout.addRow("Model", self._model)
+
+        self._effort = QComboBox()
+        layout.addRow("Effort", self._effort)
 
         # Read-only access policy: claude-code shows its permission mode;
         # codex shows the sandbox + approval policy.
@@ -402,6 +406,7 @@ class AgentDetail(QWidget):
         self._set_combo(self._runtime_kind, cfg.runtime.kind)
         self._set_combo(self._harness, cfg.runtime.harness)
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
+        self._populate_effort_combo(cfg.runtime.harness, cfg.runtime.inference_level)
         self._access.setText(self._access_summary(cfg.runtime.harness, cfg))
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
@@ -447,6 +452,7 @@ class AgentDetail(QWidget):
             self._runtime_kind.currentText(),
             self._harness.currentText(),
             self._model.currentData() or "",
+            self._effort.currentData() or "",
         )
 
     def _check_dirty(self) -> None:
@@ -677,8 +683,26 @@ class AgentDetail(QWidget):
     def _on_harness_changed(self, harness: str) -> None:
         current = self._model.currentText()
         self._populate_model_combo(harness, current)
+        self._populate_effort_combo(harness, self._effort.currentData() or "")
         if self._cfg is not None:
             self._access.setText(self._access_summary(harness, self._cfg))
+
+    def _populate_effort_combo(self, harness: str, current: str) -> None:
+        from ....mcp.config import INFERENCE_LEVELS
+
+        # codex: no xhigh tier
+        levels = [
+            lv for lv in INFERENCE_LEVELS
+            if not (harness == "codex" and lv == "xhigh")
+        ]
+        self._effort.blockSignals(True)
+        self._effort.clear()
+        self._effort.addItem("(default)", "")
+        for lv in levels:
+            self._effort.addItem(lv, lv)
+        idx = self._effort.findData(current)
+        self._effort.setCurrentIndex(idx if idx >= 0 else 0)
+        self._effort.blockSignals(False)
 
     def _access_summary(self, harness: str, cfg) -> str:
         """Read-only access line: permission mode for claude-code,
@@ -751,6 +775,7 @@ class AgentDetail(QWidget):
         cfg.runtime.harness = harness
         cfg.runtime.model = model
         cfg.puffo_core.auto_accept_dm = self._auto_accept_dm.isChecked()
+        cfg.runtime.inference_level = self._effort.currentData() or ""
         try:
             cfg.save()
             _update_profile_summary(cfg, soul)

@@ -248,3 +248,224 @@ async def test_validate_wipes_on_store_lookup_exception(monkeypatch):
     )
     assert out is None
     await store.close()
+
+
+# ── thread-root normalization (admit-time) ────────────────────────
+#
+# thread_root_id additionally resolves to the canonical root so a sender
+# stamping a reply id can't index the row under a non-root. reply_to_id
+# keeps naming the direct parent.
+
+
+async def _seed_reply(
+    store: MessageStore,
+    *,
+    envelope_id: str,
+    thread_root_id: str | None,
+    channel_id: str | None,
+    space_id: str | None,
+) -> None:
+    await store.store({
+        "envelope_id": envelope_id,
+        "envelope_kind": "channel" if channel_id else "dm",
+        "sender_slug": "sam-0001",
+        "channel_id": channel_id,
+        "space_id": space_id,
+        "content_type": "text/plain",
+        "content": f"reply {envelope_id}",
+        "sent_at": _now_ms(),
+        "thread_root_id": thread_root_id,
+        "reply_to_id": None,
+    })
+
+
+@pytest.mark.asyncio
+async def test_resolve_corrects_a_reply_pointer_to_the_real_root():
+    """Rule 1: same channel but not a root → walk up to the root."""
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_root", channel_id="ch_gtm", space_id="sp_1",
+    )
+    await _seed_reply(
+        store, envelope_id="env_reply", thread_root_id="env_root",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_reply", "ch_gtm", "sp_1",
+    )
+    assert out == "env_root"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_walks_a_multi_hop_corrupt_chain():
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_root", channel_id="ch_gtm", space_id="sp_1",
+    )
+    await _seed_reply(
+        store, envelope_id="env_a", thread_root_id="env_root",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    await _seed_reply(
+        store, envelope_id="env_b", thread_root_id="env_a",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_b", "ch_gtm", "sp_1",
+    )
+    assert out == "env_root"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_passes_through_a_real_root():
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_root", channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_root", "ch_gtm", "sp_1",
+    )
+    assert out == "env_root"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_treats_a_self_rooted_envelope_as_a_root():
+    """The synthetic system envelopes (intro nudge) store their own id as
+    thread_root_id — that's a root, not a cycle."""
+    store = await _make_store()
+    await _seed_reply(
+        store, envelope_id="env_intro", thread_root_id="env_intro",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_intro", "ch_gtm", "sp_1",
+    )
+    assert out == "env_intro"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_wipes_a_cross_channel_root():
+    """Rule 2: different channel → no root, admit as a new root."""
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_other", channel_id="ch_other", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_other", "ch_gtm", "sp_1",
+    )
+    assert out is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_wipes_when_a_mid_chain_hop_leaves_the_channel():
+    """The walk re-checks scope at every hop, not just the first."""
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_other", channel_id="ch_other", space_id="sp_1",
+    )
+    await _seed_reply(
+        store, envelope_id="env_reply", thread_root_id="env_other",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_reply", "ch_gtm", "sp_1",
+    )
+    assert out is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_wipes_when_root_not_in_local_cache():
+    store = await _make_store()
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_missing", "ch_gtm", "sp_1",
+    )
+    assert out is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_wipes_on_a_cycle():
+    store = await _make_store()
+    await _seed_reply(
+        store, envelope_id="env_a", thread_root_id="env_b",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    await _seed_reply(
+        store, envelope_id="env_b", thread_root_id="env_a",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_a", "ch_gtm", "sp_1",
+    )
+    assert out is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_wipes_a_chain_deeper_than_the_cap():
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_0", channel_id="ch_gtm", space_id="sp_1",
+    )
+    for i in range(1, 10):
+        await _seed_reply(
+            store, envelope_id=f"env_{i}", thread_root_id=f"env_{i - 1}",
+            channel_id="ch_gtm", space_id="sp_1",
+        )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_9", "ch_gtm", "sp_1",
+    )
+    assert out is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_works_for_dms_where_channel_id_is_none():
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_dm_root", channel_id=None, space_id=None,
+    )
+    await _seed_reply(
+        store, envelope_id="env_dm_reply", thread_root_id="env_dm_root",
+        channel_id=None, space_id=None,
+    )
+    client = _bare_client(store)
+    out = await client._resolve_incoming_thread_root(
+        "env_dm_reply", None, None,
+    )
+    assert out == "env_dm_root"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_to_id_still_names_the_direct_parent():
+    """Only thread_root_id normalizes — reply_to_id must NOT walk up."""
+    store = await _make_store()
+    await _seed_parent(
+        store, envelope_id="env_root", channel_id="ch_gtm", space_id="sp_1",
+    )
+    await _seed_reply(
+        store, envelope_id="env_reply", thread_root_id="env_root",
+        channel_id="ch_gtm", space_id="sp_1",
+    )
+    client = _bare_client(store)
+    out = await client._validate_incoming_parent_id(
+        "env_reply", "ch_gtm", "sp_1",
+    )
+    assert out == "env_reply"
+    await store.close()

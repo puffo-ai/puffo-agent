@@ -120,11 +120,17 @@ class FakeHttpClient:
 
     def __init__(self):
         self.pending_messages: list[dict] = []
+        self.ack_posts: list[list[str]] = []
         self._ensure_subkey_called = False
 
     async def get(self, path: str):
         if path == "/messages/pending":
             return {"messages": self.pending_messages}
+        return {}
+
+    async def post(self, path: str, body: dict):
+        if path == "/messages/ack":
+            self.ack_posts.append(list(body.get("envelope_ids") or []))
         return {}
 
     async def _ensure_subkey(self):
@@ -276,9 +282,8 @@ async def test_catchup_on_connect():
     assert received[0]["envelope_id"] == "env_pending1"
     assert received[1]["envelope_id"] == "env_pending2"
 
-    ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
-    assert len(ack_frames) == 1
-    assert sorted(ack_frames[0]["envelope_ids"]) == ["env_pending1", "env_pending2"]
+    assert len(http.ack_posts) == 1
+    assert sorted(http.ack_posts[0]) == ["env_pending1", "env_pending2"]
     await server.stop()
 
 
@@ -529,4 +534,44 @@ async def test_on_connect_failure_does_not_kill_the_loop():
     # Catch-up still delivered the pending message → the on_connect
     # exception was caught, not propagated out of connect_once.
     assert [e["envelope_id"] for e in received] == ["env_p1"]
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_catchup_acks_in_chunks():
+    """A big backlog must ack incrementally — one end-of-loop ack loses
+    all progress when the connection dies mid-catch-up and the whole
+    batch redelivers forever."""
+    ks, _ = _make_keystore()
+    server = FakeWsServer()
+    await server.start()
+
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": i, "envelope": {"envelope_id": f"env_{i}", "sender_slug": "bob"}}
+        for i in range(60)
+    ]
+
+    client = PuffoCoreWsClient(
+        f"http://127.0.0.1:{server.port}", ks, "alice-0001", http,
+    )
+    client.ws_url = f"ws://127.0.0.1:{server.port}"
+
+    async def on_msg(envelope):
+        return None
+
+    client.on_message = on_msg
+    task = asyncio.create_task(client.connect_once())
+    await asyncio.sleep(0.8)
+    client.stop()
+    try:
+        await asyncio.wait_for(task, timeout=2)
+    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
+        pass
+
+    # 60 messages at 25/chunk → 25 + 25 + 10, over HTTP (immune to a
+    # WS death mid-catch-up).
+    assert [len(c) for c in http.ack_posts] == [25, 25, 10]
+    acked = [e for c in http.ack_posts for e in c]
+    assert acked == [f"env_{i}" for i in range(60)]
     await server.stop()

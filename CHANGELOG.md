@@ -4,19 +4,84 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.4] — 2026-07-22
 
 ### Fixed
 
-- **Stale channel cache self-heals (PUF-376).** A membership event
-  dropped during a WS reconnect used to leave a genuinely-member
-  channel unaddressable by `send_message` until a daemon restart.
-  The member/channel cache now re-warms on every (re)connect, and a
-  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
-  failing loud — on every runtime, including the cli-local /
-  cli-docker data-service path.
+- **Thread-root integrity, both directions.** Incoming `thread_root_id`
+  now normalizes to the canonical root before a message is stored: a
+  reference to a non-root walks up to the true root, and a reference
+  that is cross-channel, unknown, or corrupt (cycle / over-deep chain)
+  is admitted as a new root instead. Outbound sends apply matching
+  rules — a `root_id` naming a daemon-local system message (which has
+  no server row) ships as a new top-level message, a root from another
+  channel or DM is rejected with a correctable error, and a non-root
+  auto-corrects to its thread root. Previously a reply to a system
+  message triggered a spurious "thread chain looks corrupt" warning,
+  and DM sends skipped root validation entirely.
+
+- **Hidden root-level posts.** Outbound visibility is now decided after
+  thread-root resolution, so a message whose root gets wiped is
+  correctly treated as root-level and forced visible. Previously it
+  could ship hidden — and root-level messages can't fold, so it was
+  invisible in every client.
+
+- **cli-local codex agents reload MCP tools after a tool-surface change
+  (PUF-392).** Codex snapshots its MCP tools at session start and never
+  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
+  so a change to the puffo tool surface (e.g. the new `inference_level`
+  arg) left a resumed codex session on a stale set — it saw the doc but
+  the callable tool never updated. The daemon now fingerprints the tool
+  surface on boot and, when it changed, drops each cli-local codex
+  agent's CLI session so a fresh conversation reloads the tools
+  (claude-code, cli-docker, and ws-local are unaffected).
 
 ### Added
+
+- **Operators tab: display names + per-card Disconnect.** Each linked
+  operator's card now shows the operator's human display name (resolved
+  on demand via a machine-authed lookup, falling back to the slug for
+  legacy pairings and until the server endpoint ships) plus a
+  **Disconnect** button — confirm dialog → revoke the pairing (server +
+  local) and pause that operator's agents.
+
+- **Self-serve `inference_level` via `refresh` (PUF-392).** Agents can
+  now `refresh(inference_level="...")` to change reasoning effort
+  mid-session — standalone or alongside a harness+model swap — which
+  persists to `agent.yml` and respawns the worker. Values are validated
+  per-harness (codex: `minimal|low|medium|high`; claude-code:
+  `low|medium|high|xhigh`), matching the effort axis PUF-373 added, so an
+  agent no longer needs a manual `agent.yml` edit or a web round-trip.
+
+- **Receive plaintext (non-E2EE) messages.** The daemon now accepts the
+  `plaintext_message_envelope` format: the signed body is verified in the
+  clear (no HPKE/AEAD, the payload's own `sender_slug` is authoritative)
+  and routed through the same store/dispatch sink as E2EE. Receive-only —
+  sending stays E2EE. Pairs with the core + puffo-server plaintext work.
+
+- **`is_encrypted` on every message.** Everything the agent sees — the
+  live inbound metadata block and the `get_post` / `get_channel_history` /
+  `get_dm_history` / `get_thread_history` tools — now shows whether a
+  message was end-to-end encrypted or sent in the clear. Stored per
+  message (a SQLite migration backfills pre-existing rows as encrypted).
+
+## [1.1.3] — 2026-07-17
+
+### Added
+
+- **Heartbeat reports `inference_level` (PUF-373).** The runtime info in
+  the agent heartbeat now carries the configured inference level so the
+  web edit UI can display the current value instead of always showing
+  the harness default.
+
+- **Per-agent inference level (PUF-373).** `runtime.inference_level`
+  (`low|medium|high|xhigh`, empty = harness default) applies to both
+  harnesses: codex gets `model_reasoning_effort` in its config.toml
+  (`xhigh` dropped — no codex tier), claude-code gets `--effort` on the
+  spawn, on cli-local and cli-docker alike. Settable from the portal UI
+  (harness-aware dropdown), the local bridge runtime editor, and a
+  linked machine's create/edit commands — invalid values are rejected
+  at every write surface.
 
 - **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon
   restart / resume-from-pause, redelivered messages older than
@@ -45,6 +110,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   their DM through one shared constructor, so web/mobile clients show
   consistent Yes/No buttons that post `y`/`n` into the prompt's thread —
   the same replies the daemon already accepts.
+
+### Fixed
+
+- **Catch-up redelivery loop on large backlogs.** Observed live as a
+  paused-for-weeks agent redelivering the same 200+ messages every
+  ~70s forever. Three compounding causes fixed: per-envelope
+  processing reports stretched catch-up past the WS keepalive window
+  (now buffered into one chunked `end:batch` POST); the single
+  end-of-loop ack lost all progress when the connection died (now
+  acked every 25 envelopes); and WS-frame acks landed in a dead pipe —
+  the server's pings get no pong until the listen loop starts — so
+  catch-up acks now go over HTTP `POST /messages/ack` (matching the
+  web client's pending-drain) and pending shrinks monotonically.
+
+- **Stale channel cache self-heals (PUF-376).** A membership event
+  dropped during a WS reconnect used to leave a genuinely-member
+  channel unaddressable by `send_message` until a daemon restart.
+  The member/channel cache now re-warms on every (re)connect, and a
+  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
+  failing loud — on every runtime, including the cli-local /
+  cli-docker data-service path.
 
 ## [1.1.2] — 2026-07-14
 

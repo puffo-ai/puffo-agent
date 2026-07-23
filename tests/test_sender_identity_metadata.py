@@ -82,3 +82,34 @@ def test_mention_suffixes_render_from_is_agent():
     assert "  - me-0001 (you)" in block
     assert "  - nova-bot-1234 (agent)" in block
     assert "  - alice-1234 (human)" in block
+
+
+def test_is_encrypted_defaults_true_in_block():
+    block = _block()  # no is_encrypted passed → legacy/default
+    assert "- is_encrypted: true" in block
+
+
+def test_plaintext_message_block_flags_is_encrypted_false():
+    block = _block(is_encrypted=False)
+    assert "- is_encrypted: false" in block
+
+
+def test_encrypted_message_block_flags_is_encrypted_true():
+    block = _block(is_encrypted=True)
+    assert "- is_encrypted: true" in block
+
+
+def test_metadata_block_field_order():
+    block = _block(
+        post_id="msg_1", space_id="sp_1", space_name="S", channel_id="ch_1",
+        channel_name="C", root_id="msg_root", is_encrypted=False,
+    )
+    lines = block.splitlines()
+
+    def idx(prefix: str) -> int:
+        return next(i for i, ln in enumerate(lines) if ln.startswith(prefix))
+
+    assert (
+        idx("- post_id:") < idx("- space_id:") < idx("- channel_id:")
+        < idx("- thread_root_id:") < idx("- is_encrypted:") < idx("- sender:")
+    )

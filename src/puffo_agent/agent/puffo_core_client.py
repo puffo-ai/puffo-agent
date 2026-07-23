@@ -28,6 +28,7 @@ from ..crypto.message import (
     RecipientDevice,
     decrypt_message,
     encrypt_message,
+    read_plaintext_message,
 )
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
@@ -72,6 +73,10 @@ PRIORITY_SYSTEM = 5
 # Operators wanting "right now" can fire the MCP get_user_profile
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
+
+# Healthy data resolves in one hop (a root's own thread_root_id is NULL);
+# deeper chains are corrupt and the reply is admitted as its own root.
+_INCOMING_ROOT_MAX_DEPTH = 8
 
 # Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
 DEFAULT_MAX_INPUT_BYTES = 180 * 1000
@@ -586,6 +591,8 @@ class PuffoCoreMessageClient:
         self._rewarm_lock = asyncio.Lock()
         self._last_rewarm = 0.0
         self._warm_task: asyncio.Future | None = None
+        self._stale_report_buf: list[str] = []
+        self._stale_flush_task: asyncio.Future | None = None
 
         # Lazy caches for human-readable space + channel names; names
         # aren't on the WS payload so we resolve via ``GET /spaces``
@@ -617,22 +624,41 @@ class PuffoCoreMessageClient:
             now_ms = int(time.time() * 1000)
         return sent_at < now_ms - self._catchup_stale_ms
 
-    async def _report_stale_processed(self, envelope_id: str) -> None:
-        """Best-effort green run for a gate-skipped envelope so
-        clients don't show it pending forever."""
-        try:
-            await self.http.post(
-                "/messages/processing/end:batch",
-                {"runs": [{
-                    "run_id": f"run_{uuid.uuid4().hex}",
-                    "message_id": envelope_id,
-                    "succeeded": True,
-                }]},
+    def _report_stale_processed(self, envelope_id: str) -> None:
+        """Batched best-effort processing report; never blocks catch-up."""
+        self._stale_report_buf.append(envelope_id)
+        if self._stale_flush_task is None or self._stale_flush_task.done():
+            self._stale_flush_task = asyncio.ensure_future(
+                self._flush_stale_reports()
             )
-        except Exception as exc:  # noqa: BLE001
-            self._log.debug(
-                "stale-processed report failed for %s: %s", envelope_id, exc,
-            )
+
+    async def _flush_stale_reports(self) -> None:
+        await asyncio.sleep(1.0)  # coalesce the burst
+        # re-sweeps mid-flush arrivals
+        while self._stale_report_buf:
+            buf, self._stale_report_buf = self._stale_report_buf, []
+            await self._post_stale_runs(buf)
+
+    async def _post_stale_runs(self, buf: list[str]) -> None:
+        runs = [
+            {
+                "run_id": f"run_{uuid.uuid4().hex}",
+                "message_id": mid,
+                "succeeded": True,
+            }
+            for mid in buf
+        ]
+        for i in range(0, len(runs), 200):  # request-size cap
+            try:
+                await self.http.post(
+                    "/messages/processing/end:batch",
+                    {"runs": runs[i:i + 200]},
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log.debug(
+                    "stale-processed flush failed (%d runs): %s",
+                    len(runs[i:i + 200]), exc,
+                )
 
     async def listen(
         self,
@@ -696,7 +722,18 @@ class PuffoCoreMessageClient:
             # every other message goes through; the dispatch-to-
             # worker step below short-circuits on ``sender_slug ==
             # self.slug`` to prevent a retrigger loop.
-            sender_slug = envelope.get("sender_slug", "")
+            # Plaintext envelopes carry no outer routing — the sender is
+            # named inside the signed payload; verify in the clear (no decrypt).
+            is_plaintext = envelope.get("type") == "plaintext_message_envelope"
+            if is_plaintext:
+                sender_slug = (
+                    envelope.get("signed_payload", {})
+                    .get("payload", {})
+                    .get("sender_slug", "")
+                )
+            else:
+                sender_slug = envelope.get("sender_slug", "")
+
             try:
                 sender_pks = await self._key_cache.get_signing_keys(sender_slug)
             except Exception as e:
@@ -706,15 +743,18 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # Try each pubkey until one decrypts. On total failure,
+            def _open(pk: bytes) -> MessagePayload:
+                if is_plaintext:
+                    return read_plaintext_message(envelope, pk)
+                return decrypt_message(envelope, self.device_id, kem_kp, pk)
+
+            # Try each pubkey until one verifies. On total failure,
             # invalidate + retry once with a fresh pull to handle
             # subkey rotation since the cache was populated.
             payload = None
             for pk in sender_pks:
                 try:
-                    payload = decrypt_message(
-                        envelope, self.device_id, kem_kp, pk,
-                    )
+                    payload = _open(pk)
                     break
                 except Exception:
                     continue
@@ -725,9 +765,7 @@ class PuffoCoreMessageClient:
                     sender_pks = await self._key_cache.get_signing_keys(sender_slug)
                     for pk in sender_pks:
                         try:
-                            payload = decrypt_message(
-                                envelope, self.device_id, kem_kp, pk,
-                            )
+                            payload = _open(pk)
                             break
                         except Exception:
                             continue
@@ -741,15 +779,10 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # PUF-227-A: strict cache-validation invariant for incoming
-            # ids. Any thread_root_id / reply_to_id that doesn't point
-            # to a same-channel parent in our local message_store gets
-            # wiped to None before storage — the agent's local view
-            # never honors a thread linkage that can't be resolved here.
-            # Catches the Scout-class symptom: a server / UI / sender
-            # that stamps a cross-channel id can't poison the recipient
-            # daemon's thread state.
-            validated_thread_root_id = await self._validate_incoming_parent_id(
+            # Incoming thread linkage normalizes before storage:
+            # thread_root_id resolves to the canonical same-scope root
+            # (else None); reply_to_id must name a cached same-scope parent.
+            validated_thread_root_id = await self._resolve_incoming_thread_root(
                 payload.thread_root_id, payload.channel_id, payload.space_id,
             )
             validated_reply_to_id = await self._validate_incoming_parent_id(
@@ -796,6 +829,7 @@ class PuffoCoreMessageClient:
                 "sent_at": payload.sent_at,
                 "thread_root_id": validated_thread_root_id,
                 "reply_to_id": validated_reply_to_id,
+                "is_encrypted": not is_plaintext,
             })
             # Rebind for downstream code (root_id resolution at the
             # batch-coalesce step, channel_meta construction, etc.) so
@@ -874,7 +908,7 @@ class PuffoCoreMessageClient:
                     self._catchup_stale_ms,
                     payload_thread_root_id or payload.envelope_id,
                 )
-                await self._report_stale_processed(payload.envelope_id)
+                self._report_stale_processed(payload.envelope_id)
                 return
 
             channel_id = payload.channel_id or ""
@@ -1059,6 +1093,7 @@ class PuffoCoreMessageClient:
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
                 "is_visible_to_human": payload.is_visible_to_human,
+                "is_encrypted": not is_plaintext,
             }
             channel_meta = {
                 "channel_id": channel_id,
@@ -2424,25 +2459,40 @@ class PuffoCoreMessageClient:
         """
         if not parent_id:
             return parent_id
+        parent = await self._validated_parent(
+            parent_id, expected_channel_id, expected_space_id,
+            log_label="_validate_incoming_parent_id",
+        )
+        return parent_id if parent is not None else None
+
+    async def _validated_parent(
+        self,
+        parent_id: str,
+        expected_channel_id: Optional[str],
+        expected_space_id: Optional[str],
+        *,
+        log_label: str,
+    ) -> Any:
+        """Parent envelope from the local store, or None when it isn't cached
+        or sits in a different channel/space. ``log_label`` keeps the wipe
+        lines greppable per caller.
+        """
         try:
             parent = await self.store.get_message_by_envelope(parent_id)
         except Exception as exc:
             self._log.warning(
-                "_validate_incoming_parent_id: lookup failed for %s: %s",
-                parent_id, exc,
+                "%s: lookup failed for %s: %s", log_label, parent_id, exc,
             )
             return None
         if parent is None:
             self._log.info(
-                "_validate_incoming_parent_id: wiped %s — parent not in local cache",
-                parent_id,
+                "%s: wiped %s — parent not in local cache", log_label, parent_id,
             )
             return None
         if expected_channel_id and parent.channel_id != expected_channel_id:
             self._log.info(
-                "_validate_incoming_parent_id: wiped %s — parent channel "
-                "%r != incoming channel %r",
-                parent_id, parent.channel_id, expected_channel_id,
+                "%s: wiped %s — parent channel %r != incoming channel %r",
+                log_label, parent_id, parent.channel_id, expected_channel_id,
             )
             return None
         if (
@@ -2451,12 +2501,58 @@ class PuffoCoreMessageClient:
             and parent.space_id != expected_space_id
         ):
             self._log.info(
-                "_validate_incoming_parent_id: wiped %s — parent space "
-                "%r != incoming space %r",
-                parent_id, parent.space_id, expected_space_id,
+                "%s: wiped %s — parent space %r != incoming space %r",
+                log_label, parent_id, parent.space_id, expected_space_id,
             )
             return None
-        return parent_id
+        return parent
+
+    async def _resolve_incoming_thread_root(
+        self,
+        parent_id: Optional[str],
+        expected_channel_id: Optional[str],
+        expected_space_id: Optional[str],
+    ) -> Optional[str]:
+        """Canonical thread root for an incoming ``thread_root_id``, resolved
+        at admit time. Returns ``None`` — admit as a new root — when the
+        reference isn't cached, leaves the channel/space, or can't be
+        trusted (cycle / too deep). ``reply_to_id`` is different: it names
+        the direct parent, not the root.
+        """
+        if not parent_id:
+            return parent_id
+        current = parent_id
+        seen: set[str] = set()
+        for _ in range(_INCOMING_ROOT_MAX_DEPTH):
+            if current in seen:
+                self._log.info(
+                    "_resolve_incoming_thread_root: wiped %s — cycle in thread chain",
+                    parent_id,
+                )
+                return None
+            seen.add(current)
+            parent = await self._validated_parent(
+                current, expected_channel_id, expected_space_id,
+                log_label="_resolve_incoming_thread_root",
+            )
+            if parent is None:
+                return None
+            # NULL root = a real root; self-reference = the synthetic system
+            # envelopes, which store their own id as the root.
+            if not parent.thread_root_id or parent.thread_root_id == current:
+                if current != parent_id:
+                    self._log.info(
+                        "_resolve_incoming_thread_root: corrected %s → %s "
+                        "(pointed at a reply, not the root)",
+                        parent_id, current,
+                    )
+                return current
+            current = parent.thread_root_id
+        self._log.info(
+            "_resolve_incoming_thread_root: wiped %s — chain deeper than %d",
+            parent_id, _INCOMING_ROOT_MAX_DEPTH,
+        )
+        return None
 
     async def rewarm_channel_caches(self) -> None:
         """On-miss re-warm; serialized + 5s-debounced (no stampede)."""
@@ -2908,6 +3004,7 @@ class PuffoCoreMessageClient:
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
+            "is_encrypted": True,
         }
         channel_meta = {
             "channel_id": channel_id,
@@ -3248,6 +3345,7 @@ class PuffoCoreMessageClient:
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
+            "is_encrypted": True,
         }
         channel_meta = {
             "channel_id": channel_id,

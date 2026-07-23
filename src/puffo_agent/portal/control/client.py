@@ -279,12 +279,20 @@ async def execute_command(
         if isinstance(params.get("soul"), str):
             patch["soul"] = params["soul"]
             prompt_changed = True
-        # Runtime block (kind/provider/harness/model) — same fields the local
-        # bridge's update_runtime accepts; reject invalid triples before saving.
+        # mirrors the bridge's update_runtime fields
         rt_in = params.get("runtime")
         if isinstance(rt_in, dict):
+            level_in = rt_in.get("inference_level")
+            if isinstance(level_in, str) and level_in:
+                from ...mcp.config import INFERENCE_LEVELS
+                if level_in not in INFERENCE_LEVELS:
+                    return {
+                        "ok": False,
+                        "error": "runtime.inference_level must be one of: "
+                        + ", ".join(INFERENCE_LEVELS),
+                    }
             rt = cfg.runtime
-            for key in ("kind", "provider", "harness", "model"):
+            for key in ("kind", "provider", "harness", "model", "inference_level"):
                 if isinstance(rt_in.get(key), str):
                     setattr(rt, key, rt_in[key])
                     runtime_changed = True

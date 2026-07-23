@@ -1024,6 +1024,8 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
+    # "" = harness default; codex → config.toml, claude-code → --effort
+    inference_level: str = ""
     # codex (cli-local) per-turn wall-clock budget in seconds; raise for
     # agents running long reasoning/complex tasks.
     task_timeout_seconds: float = 600.0
@@ -1126,6 +1128,7 @@ class AgentConfig:
                 docker_memory_reservation=rt.get("docker_memory_reservation", ""),
                 permission_mode=rt.get("permission_mode", "bypassPermissions"),
                 sandbox=rt.get("sandbox", "danger-full-access"),
+                inference_level=rt.get("inference_level", ""),
                 task_timeout_seconds=float(rt.get("task_timeout_seconds", 600.0)),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),

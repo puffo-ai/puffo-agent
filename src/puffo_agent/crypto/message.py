@@ -299,6 +299,32 @@ def decrypt_message(
     if payload_dict.get("sender_slug") != envelope["sender_slug"]:
         raise ValueError("sender_slug mismatch")
 
+    return _message_payload_from_dict(payload_dict, envelope_id)
+
+
+def read_plaintext_message(
+    envelope: dict,
+    sender_public_key: bytes,
+) -> MessagePayload:
+    """Verify a non-E2EE ``plaintext_message_envelope`` and return its payload.
+
+    No HPKE/AEAD — the signature covers the canonicalized ``payload`` as in
+    the E2EE path. There's no outer envelope, so the payload's own
+    ``sender_slug`` is authoritative (no cross-check).
+    """
+    envelope_id = envelope["envelope_id"]
+    signed = envelope["signed_payload"]
+    payload_dict = signed["payload"]
+    sig_bytes = base64url_decode(signed["signature"])
+
+    canonical = canonicalize_for_signing(payload_dict)
+    if not ed25519_verify(sender_public_key, canonical, sig_bytes):
+        raise ValueError("signature verification failed")
+
+    return _message_payload_from_dict(payload_dict, envelope_id)
+
+
+def _message_payload_from_dict(payload_dict: dict, envelope_id: str) -> MessagePayload:
     return MessagePayload(
         payload_type=payload_dict["type"],
         version=payload_dict["version"],
