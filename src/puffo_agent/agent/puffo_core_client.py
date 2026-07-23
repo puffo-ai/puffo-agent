@@ -579,6 +579,7 @@ class PuffoCoreMessageClient:
         # cli-local command-permission prompts awaiting operator y/n,
         # keyed by prompt-DM envelope_id. In-memory only.
         self._pending_command_permissions: dict[str, asyncio.Future[bool]] = {}
+        self._timed_out_command_permissions: dict[str, float] = {}
 
         # channel_id → space_id learned from inbound envelopes. The
         # agent's config carries one "home" space_id, but cross-space
