@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Operators tab: display names + per-card Disconnect.** Each linked
+  operator's card now shows the operator's human display name (resolved
+  on demand via a machine-authed lookup, falling back to the slug for
+  legacy pairings and until the server endpoint ships) plus a
+  **Disconnect** button — confirm dialog → revoke the pairing (server +
+  local) and pause that operator's agents.
+
 - **Receive plaintext (non-E2EE) messages.** The daemon now accepts the
   `plaintext_message_envelope` format: the signed body is verified in the
   clear (no HPKE/AEAD, the payload's own `sender_slug` is authoritative)
