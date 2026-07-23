@@ -20,8 +20,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   (allow/blocklists are per-agent — each identity keeps its own):
   `get_dm_allowlists()`, `get_dm_blocklists()`, `add_dm_allowlist(slug)`,
   and `update_dm_blocklist(slug, on)`. The `auto_accept_dm` setting becomes a hidden per-agent
-  `agent.yml` flag (its CLI/UI/remote toggles are removed); leaving it
-  `true` skips only the hold-for-approval step.
+  `agent.yml` flag (its CLI/UI/remote toggles are removed) and now
+  defaults to `false`, so unknown senders are held for approval out of
+  the box; setting it `true` skips only that hold.
 
 ## [1.1.4] — 2026-07-22
 

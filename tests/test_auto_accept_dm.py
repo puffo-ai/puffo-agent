@@ -20,11 +20,11 @@ from _bridge_support import isolated_home
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_puffo_core_config_default_auto_accept_dm_is_true():
+def test_puffo_core_config_default_auto_accept_dm_is_false():
     from puffo_agent.portal.state import PuffoCoreConfig
 
     pc = PuffoCoreConfig()
-    assert pc.auto_accept_dm is True
+    assert pc.auto_accept_dm is False
 
 
 def test_agent_yml_round_trip_preserves_auto_accept_dm(tmp_path, monkeypatch):
@@ -58,7 +58,7 @@ def test_agent_yml_round_trip_preserves_auto_accept_dm(tmp_path, monkeypatch):
     assert reloaded.puffo_core.auto_accept_dm is False
 
 
-def test_agent_yml_missing_auto_accept_dm_defaults_to_true(tmp_path):
+def test_agent_yml_missing_auto_accept_dm_defaults_to_false(tmp_path):
     isolated_home()
     import yaml
     from puffo_agent.portal.state import AgentConfig, agent_dir
@@ -82,7 +82,7 @@ def test_agent_yml_missing_auto_accept_dm_defaults_to_true(tmp_path):
         }),
         encoding="utf-8",
     )
-    assert AgentConfig.load("alpha").puffo_core.auto_accept_dm is True
+    assert AgentConfig.load("alpha").puffo_core.auto_accept_dm is False
 
 
 # ─────────────────────────────────────────────────────────────────────

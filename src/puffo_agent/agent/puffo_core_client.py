@@ -482,7 +482,7 @@ class PuffoCoreMessageClient:
         message_store: MessageStore,
         operator_slug: str = "",
         auto_accept_space_invitations: bool = False,
-        auto_accept_dm: bool = True,
+        auto_accept_dm: bool = False,
         workspace: str = "",
         max_inline_chars: int = MAX_INLINE_MESSAGE_CHARS,
         segment_chars: int = MESSAGE_SEGMENT_CHARS,

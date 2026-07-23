@@ -984,10 +984,10 @@ class PuffoCoreConfig:
     # Hidden knob (no UI, agent.yml only): when true, space invites from
     # non-operators are auto-accepted, then the operator is DM'd a report.
     auto_accept_space_invitations: bool = False
-    # Hidden yaml-only flag (no CLI/UI/control-op surface). False = the
-    # DM-gate ladder holds unknown senders for operator approval; True
-    # (default) bypasses only that hold — block/FYI still apply.
-    auto_accept_dm: bool = True
+    # Hidden yaml-only flag (no CLI/UI/control-op surface). False
+    # (default) = the DM-gate ladder holds unknown senders for operator
+    # approval; True bypasses only that hold — block/FYI still apply.
+    auto_accept_dm: bool = False
 
     def is_configured(self) -> bool:
         return bool(self.server_url and self.slug and self.device_id and self.space_id)
@@ -1113,7 +1113,7 @@ class AgentConfig:
                 auto_accept_space_invitations=bool(
                     pc.get("auto_accept_space_invitations", False)
                 ),
-                auto_accept_dm=bool(pc.get("auto_accept_dm", True)),
+                auto_accept_dm=bool(pc.get("auto_accept_dm", False)),
             ),
             runtime=RuntimeConfig(
                 kind=kind,
