@@ -73,6 +73,10 @@ PRIORITY_SYSTEM = 5
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
+# Healthy data resolves in one hop (a root's own thread_root_id is NULL);
+# deeper chains are corrupt and the reply is admitted as its own root.
+_INCOMING_ROOT_MAX_DEPTH = 8
+
 # Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
 DEFAULT_MAX_INPUT_BYTES = 180 * 1000
 
@@ -750,15 +754,10 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # PUF-227-A: strict cache-validation invariant for incoming
-            # ids. Any thread_root_id / reply_to_id that doesn't point
-            # to a same-channel parent in our local message_store gets
-            # wiped to None before storage — the agent's local view
-            # never honors a thread linkage that can't be resolved here.
-            # Catches the Scout-class symptom: a server / UI / sender
-            # that stamps a cross-channel id can't poison the recipient
-            # daemon's thread state.
-            validated_thread_root_id = await self._validate_incoming_parent_id(
+            # Incoming thread linkage normalizes before storage:
+            # thread_root_id resolves to the canonical same-scope root
+            # (else None); reply_to_id must name a cached same-scope parent.
+            validated_thread_root_id = await self._resolve_incoming_thread_root(
                 payload.thread_root_id, payload.channel_id, payload.space_id,
             )
             validated_reply_to_id = await self._validate_incoming_parent_id(
@@ -2376,25 +2375,40 @@ class PuffoCoreMessageClient:
         """
         if not parent_id:
             return parent_id
+        parent = await self._validated_parent(
+            parent_id, expected_channel_id, expected_space_id,
+            log_label="_validate_incoming_parent_id",
+        )
+        return parent_id if parent is not None else None
+
+    async def _validated_parent(
+        self,
+        parent_id: str,
+        expected_channel_id: Optional[str],
+        expected_space_id: Optional[str],
+        *,
+        log_label: str,
+    ) -> Any:
+        """Parent envelope from the local store, or None when it isn't cached
+        or sits in a different channel/space. ``log_label`` keeps the wipe
+        lines greppable per caller.
+        """
         try:
             parent = await self.store.get_message_by_envelope(parent_id)
         except Exception as exc:
             self._log.warning(
-                "_validate_incoming_parent_id: lookup failed for %s: %s",
-                parent_id, exc,
+                "%s: lookup failed for %s: %s", log_label, parent_id, exc,
             )
             return None
         if parent is None:
             self._log.info(
-                "_validate_incoming_parent_id: wiped %s — parent not in local cache",
-                parent_id,
+                "%s: wiped %s — parent not in local cache", log_label, parent_id,
             )
             return None
         if expected_channel_id and parent.channel_id != expected_channel_id:
             self._log.info(
-                "_validate_incoming_parent_id: wiped %s — parent channel "
-                "%r != incoming channel %r",
-                parent_id, parent.channel_id, expected_channel_id,
+                "%s: wiped %s — parent channel %r != incoming channel %r",
+                log_label, parent_id, parent.channel_id, expected_channel_id,
             )
             return None
         if (
@@ -2403,12 +2417,58 @@ class PuffoCoreMessageClient:
             and parent.space_id != expected_space_id
         ):
             self._log.info(
-                "_validate_incoming_parent_id: wiped %s — parent space "
-                "%r != incoming space %r",
-                parent_id, parent.space_id, expected_space_id,
+                "%s: wiped %s — parent space %r != incoming space %r",
+                log_label, parent_id, parent.space_id, expected_space_id,
             )
             return None
-        return parent_id
+        return parent
+
+    async def _resolve_incoming_thread_root(
+        self,
+        parent_id: Optional[str],
+        expected_channel_id: Optional[str],
+        expected_space_id: Optional[str],
+    ) -> Optional[str]:
+        """Canonical thread root for an incoming ``thread_root_id``, resolved
+        at admit time. Returns ``None`` — admit as a new root — when the
+        reference isn't cached, leaves the channel/space, or can't be
+        trusted (cycle / too deep). ``reply_to_id`` is different: it names
+        the direct parent, not the root.
+        """
+        if not parent_id:
+            return parent_id
+        current = parent_id
+        seen: set[str] = set()
+        for _ in range(_INCOMING_ROOT_MAX_DEPTH):
+            if current in seen:
+                self._log.info(
+                    "_resolve_incoming_thread_root: wiped %s — cycle in thread chain",
+                    parent_id,
+                )
+                return None
+            seen.add(current)
+            parent = await self._validated_parent(
+                current, expected_channel_id, expected_space_id,
+                log_label="_resolve_incoming_thread_root",
+            )
+            if parent is None:
+                return None
+            # NULL root = a real root; self-reference = the synthetic system
+            # envelopes, which store their own id as the root.
+            if not parent.thread_root_id or parent.thread_root_id == current:
+                if current != parent_id:
+                    self._log.info(
+                        "_resolve_incoming_thread_root: corrected %s → %s "
+                        "(pointed at a reply, not the root)",
+                        parent_id, current,
+                    )
+                return current
+            current = parent.thread_root_id
+        self._log.info(
+            "_resolve_incoming_thread_root: wiped %s — chain deeper than %d",
+            parent_id, _INCOMING_ROOT_MAX_DEPTH,
+        )
+        return None
 
     async def rewarm_channel_caches(self) -> None:
         """On-miss re-warm; serialized + 5s-debounced (no stampede)."""

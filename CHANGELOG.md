@@ -6,6 +6,26 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Thread-root integrity, both directions.** Incoming `thread_root_id`
+  now normalizes to the canonical root before a message is stored: a
+  reference to a non-root walks up to the true root, and a reference
+  that is cross-channel, unknown, or corrupt (cycle / over-deep chain)
+  is admitted as a new root instead. Outbound sends apply matching
+  rules — a `root_id` naming a daemon-local system message (which has
+  no server row) ships as a new top-level message, a root from another
+  channel or DM is rejected with a correctable error, and a non-root
+  auto-corrects to its thread root. Previously a reply to a system
+  message triggered a spurious "thread chain looks corrupt" warning,
+  and DM sends skipped root validation entirely.
+
+- **Hidden root-level posts.** Outbound visibility is now decided after
+  thread-root resolution, so a message whose root gets wiped is
+  correctly treated as root-level and forced visible. Previously it
+  could ship hidden — and root-level messages can't fold, so it was
+  invisible in every client.
+
 ### Added
 
 - **Operators tab: display names + per-card Disconnect.** Each linked

@@ -15,8 +15,7 @@ from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.agent._visibility import resolve_visibility
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
-    _resolve_root_id,
-    _validate_root_same_channel,
+    _resolve_outgoing_root,
     register_core_tools,
 )
 
@@ -283,6 +282,13 @@ async def test_send_message_threaded_false_not_coerced():
         }],
         "has_more": False,
     }
+    await ms.store({
+        "envelope_id": "msg_root_abc", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
     mcp = _build_tools(cfg)
     result = await _call(
         mcp,
@@ -363,6 +369,13 @@ async def test_send_message_agent_only_dm_stays_hidden_with_warning():
         ],
         "has_more": False,
     }
+    await ms.store({
+        "envelope_id": "msg_root_dm", "envelope_kind": "dm",
+        "sender_slug": "alice-0001", "channel_id": None,
+        "space_id": None, "recipient_slug": "agent-0001",
+        "content_type": "text/plain", "content": "root",
+        "sent_at": _now_ms(), "thread_root_id": None,
+    })
     mcp = _build_tools(cfg)
     result = await _call(
         mcp,
@@ -374,9 +387,6 @@ async def test_send_message_agent_only_dm_stays_hidden_with_warning():
             "root_id": "msg_root_dm",
         },
     )
-    # NB: msg_root_dm isn't in local cache, so validate_root wipes it
-    # with its own warning note — assert the visibility warning is
-    # present alongside, don't insist on it being alone.
     assert "posted" in result
     assert "sent hidden per" in result
     assert "DM" in result
@@ -1061,7 +1071,7 @@ async def test_send_message_with_attachments_requires_workspace():
     assert "workspace" in str(exc_info.value).lower()
 
 
-# PUF-200: _resolve_root_id
+# Send-side root resolution: walk + scope rejection + system-envelope rules.
 
 
 class _FakeDataClient:
@@ -1080,6 +1090,9 @@ class _FakeDataClient:
         *,
         channel_id: str | None = None,
         space_id: str | None = None,
+        sender_slug: str = "alice-0001",
+        envelope_kind: str = "channel",
+        recipient_slug: str | None = None,
     ) -> None:
         class _Msg:
             pass
@@ -1088,6 +1101,9 @@ class _FakeDataClient:
         m.thread_root_id = thread_root_id
         m.channel_id = channel_id
         m.space_id = space_id
+        m.sender_slug = sender_slug
+        m.envelope_kind = envelope_kind
+        m.recipient_slug = recipient_slug
         self.messages[envelope_id] = m
 
     async def get_message_by_envelope(self, envelope_id: str):
@@ -1097,121 +1113,204 @@ class _FakeDataClient:
         return self.messages.get(envelope_id)
 
 
+async def _resolve(dc, root_id, **kw):
+    defaults = dict(self_slug="agent-0001", channel_id=None, space_id=None, dm_peer=None)
+    defaults.update(kw)
+    return await _resolve_outgoing_root(root_id, dc, **defaults)
+
+
 @pytest.mark.asyncio
-async def test_resolve_root_id_empty_skips_lookup():
+async def test_outgoing_root_empty_skips_lookup():
     dc = _FakeDataClient()
-    resolved, note = await _resolve_root_id("", dc)
-    assert resolved is None
-    assert note == ""
-    assert dc.calls == []
-    # Whitespace-only is also treated as empty.
-    resolved, note = await _resolve_root_id("   ", dc)
-    assert resolved is None and note == ""
-    assert dc.calls == []
+    resolved, note = await _resolve(dc, "")
+    assert resolved is None and note == "" and dc.calls == []
+    resolved, note = await _resolve(dc, "   ")
+    assert resolved is None and note == "" and dc.calls == []
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_true_root_unchanged():
+async def test_outgoing_root_true_root_unchanged():
     dc = _FakeDataClient()
     dc.add("msg_root", thread_root_id=None)
-    resolved, note = await _resolve_root_id("msg_root", dc)
-    assert resolved == "msg_root"
-    assert note == ""
-    assert dc.calls == ["msg_root"]
+    resolved, note = await _resolve(dc, "msg_root")
+    assert resolved == "msg_root" and note == ""
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_reply_auto_corrected():
+async def test_outgoing_root_reply_auto_corrected():
     dc = _FakeDataClient()
     dc.add("msg_root", thread_root_id=None)
     dc.add("msg_reply", thread_root_id="msg_root")
-    resolved, note = await _resolve_root_id("msg_reply", dc)
+    resolved, note = await _resolve(dc, "msg_reply")
     assert resolved == "msg_root"
     assert "auto-corrected" in note
-    assert "msg_reply" in note and "msg_root" in note
-    assert "thread_root_id" in note and "post_id" in note
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_depth_two_chain_walks_to_root():
+async def test_outgoing_root_depth_two_chain_walks_to_root():
     dc = _FakeDataClient()
     dc.add("msg_root", thread_root_id=None)
     dc.add("msg_mid", thread_root_id="msg_root")
     dc.add("msg_leaf", thread_root_id="msg_mid")
-    resolved, note = await _resolve_root_id("msg_leaf", dc)
+    resolved, note = await _resolve(dc, "msg_leaf")
     assert resolved == "msg_root"
-    assert "auto-corrected" in note
     assert dc.calls == ["msg_leaf", "msg_mid", "msg_root"]
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_lookup_miss_falls_through_with_warning():
+async def test_outgoing_root_lookup_miss_wipes_to_none():
     dc = _FakeDataClient()
-    resolved, note = await _resolve_root_id("msg_unknown", dc)
-    assert resolved == "msg_unknown"
-    assert "could not verify" in note
-    assert "not in local store" in note
-    assert "thread_root_id" in note
+    resolved, note = await _resolve(dc, "msg_unknown")
+    assert resolved is None
+    assert "not in local cache" in note
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_transport_error_falls_through_with_warning():
-    dc = _FakeDataClient()
-    dc.exc = RuntimeError("simulated transport blip")
-    resolved, note = await _resolve_root_id("msg_anything", dc)
-    assert resolved == "msg_anything"
-    assert "could not verify" in note
-    assert "lookup failed" in note
-
-
-@pytest.mark.asyncio
-async def test_resolve_root_id_data_not_found_treated_as_lookup_miss():
-    """``DataClient.get_message_by_envelope`` raises ``DataNotFound``
-    (rather than returning None) when the data service is reachable
-    but the agent never recorded the envelope. The resolver should
-    treat that the same as a None return — fall through with the
-    "not in local store" warning, not the broader "lookup failed"
-    one."""
+async def test_outgoing_root_data_not_found_treated_as_miss():
     from puffo_agent.agent.message_store import DataNotFound
     dc = _FakeDataClient()
     dc.exc = DataNotFound("msg_only_on_server")
-    resolved, note = await _resolve_root_id("msg_only_on_server", dc)
-    assert resolved == "msg_only_on_server"
-    assert "could not verify" in note
-    assert "not in local store" in note
-    assert "lookup failed" not in note
+    resolved, note = await _resolve(dc, "msg_only_on_server")
+    assert resolved is None
+    assert "not in local cache" in note
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_cycle_preserves_root_id_with_warning():
-    """Cycle is corrupt data — don't auto-correct to a node we
-    can't trust. Preserve the original ``root_id`` and surface a
-    loud warning so the operator can investigate."""
+async def test_outgoing_root_transport_error_wipes_to_none():
+    dc = _FakeDataClient()
+    dc.exc = RuntimeError("simulated transport blip")
+    resolved, note = await _resolve(dc, "msg_anything")
+    assert resolved is None
+    assert "could not be verified" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cycle_preserves_root_id_with_warning():
     dc = _FakeDataClient()
     dc.add("msg_a", thread_root_id="msg_b")
     dc.add("msg_b", thread_root_id="msg_a")
-    resolved, note = await _resolve_root_id("msg_a", dc)
+    resolved, note = await _resolve(dc, "msg_a")
     assert resolved == "msg_a"
-    assert "could not resolve" in note
     assert "cycle detected" in note
 
 
 @pytest.mark.asyncio
-async def test_resolve_root_id_depth_cap_preserves_root_id_with_warning():
-    """Same corruption-defense path for a chain deeper than the
-    cap — preserve ``root_id``, warn loudly, don't auto-correct."""
+async def test_outgoing_root_depth_cap_preserves_root_id_with_warning():
     dc = _FakeDataClient()
-    # Chain deeper than _RESOLVE_ROOT_MAX_DEPTH (4): leaf → l4 → l3 → l2 → l1 → root
-    dc.add("msg_leaf", thread_root_id="msg_l4")
-    dc.add("msg_l4", thread_root_id="msg_l3")
-    dc.add("msg_l3", thread_root_id="msg_l2")
-    dc.add("msg_l2", thread_root_id="msg_l1")
-    dc.add("msg_l1", thread_root_id="msg_root")
-    dc.add("msg_root", thread_root_id=None)
-    resolved, note = await _resolve_root_id("msg_leaf", dc)
-    assert resolved == "msg_leaf"
-    assert "could not resolve" in note
+    for i in range(9):
+        dc.add(f"msg_l{i}", thread_root_id=f"msg_l{i + 1}")
+    dc.add("msg_l9", thread_root_id=None)
+    resolved, note = await _resolve(dc, "msg_l0")
+    assert resolved == "msg_l0"
     assert "deeper than" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_system_sender_wiped_to_new_root():
+    """Rule 1: daemon-minted system envelope -> send as a new top-level."""
+    dc = _FakeDataClient()
+    dc.add("intro-prompt-1", thread_root_id="intro-prompt-1", sender_slug="system")
+    resolved, note = await _resolve(dc, "intro-prompt-1")
+    assert resolved is None
+    assert "system message" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_self_reference_wiped_to_new_root():
+    """Rule 2: self-referencing root (non-system sender) -> same wipe."""
+    dc = _FakeDataClient()
+    dc.add("msg_weird", thread_root_id="msg_weird")
+    resolved, note = await _resolve(dc, "msg_weird")
+    assert resolved is None
+    assert "system message" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_walk_into_system_root_wiped():
+    """Rule 1 via rule 4: a reply whose chain tops out at a system
+    envelope wipes instead of auto-correcting to a dangling id."""
+    dc = _FakeDataClient()
+    dc.add("intro-prompt-1", thread_root_id="intro-prompt-1", sender_slug="system")
+    dc.add("msg_reply", thread_root_id="intro-prompt-1")
+    resolved, note = await _resolve(dc, "msg_reply")
+    assert resolved is None
+    assert "system message" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cross_channel_rejected():
+    """Rule 3: cross-channel reference is an agent error -> reject."""
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_general", space_id="sp_1")
+    with pytest.raises(RuntimeError) as ei:
+        await _resolve(dc, "msg_root", channel_id="ch_gtm", space_id="sp_1")
+    assert "ch_general" in str(ei.value)
+    assert "ch_gtm" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cross_space_rejected():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x", space_id="sp_OTHER")
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "msg_root", channel_id="ch_x", space_id="sp_1")
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_same_channel_passes_scope():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x", space_id="sp_1")
+    resolved, note = await _resolve(dc, "msg_root", channel_id="ch_x", space_id="sp_1")
+    assert resolved == "msg_root" and note == ""
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_dm_target_rejects_channel_message():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x")
+    with pytest.raises(RuntimeError) as ei:
+        await _resolve(dc, "msg_root", dm_peer="alice-0001")
+    assert "DM" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_dm_target_rejects_wrong_peer():
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_root", thread_root_id=None, envelope_kind="dm",
+        sender_slug="bob-0002", recipient_slug="agent-0001",
+    )
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "msg_root", dm_peer="alice-0001")
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_dm_target_accepts_both_directions():
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_in", thread_root_id=None, envelope_kind="dm",
+        sender_slug="alice-0001", recipient_slug="agent-0001",
+    )
+    dc.add(
+        "msg_out", thread_root_id=None, envelope_kind="dm",
+        sender_slug="agent-0001", recipient_slug="alice-0001",
+    )
+    for mid in ("msg_in", "msg_out"):
+        resolved, note = await _resolve(dc, mid, dm_peer="alice-0001")
+        assert resolved == mid and note == ""
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cross_scope_rejects_before_system_wipe():
+    """A system envelope from ANOTHER channel must reject (rule 3), not
+    silently become a top-level post in the wrong channel (rule 1)."""
+    dc = _FakeDataClient()
+    dc.add(
+        "intro-prompt-1", thread_root_id="intro-prompt-1",
+        sender_slug="system", channel_id="ch_other",
+    )
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "intro-prompt-1", channel_id="ch_x")
 
 
 def _spy_encrypt_input(monkeypatch):
@@ -1452,116 +1551,7 @@ async def test_core_tools_registered():
     assert expected.issubset(tool_names)
 
 
-# PUF-227-A: _validate_root_same_channel — strict cache + channel-
-# match validation, applied AFTER _resolve_root_id on the sender path.
 
-
-@pytest.mark.asyncio
-async def test_validate_root_passes_through_when_no_root_id():
-    """``resolved_root=None`` is the top-level-post case; helper is a
-    no-op and returns no warning."""
-    dc = _FakeDataClient()
-    out, note = await _validate_root_same_channel(None, "ch_x", "sp_1", dc)
-    assert out is None
-    assert note == ""
-
-
-@pytest.mark.asyncio
-async def test_validate_root_passes_through_when_parent_in_same_channel():
-    """Parent envelope exists locally + matches outbound channel +
-    space → pass through unchanged, no warning."""
-    dc = _FakeDataClient()
-    dc.add("msg_root", thread_root_id=None, channel_id="ch_x", space_id="sp_1")
-    out, note = await _validate_root_same_channel("msg_root", "ch_x", "sp_1", dc)
-    assert out == "msg_root"
-    assert note == ""
-
-
-@pytest.mark.asyncio
-async def test_validate_root_wipes_when_parent_in_different_channel():
-    """Scout's PUF-227 symptom shape on the sender side. Parent
-    exists in cache but its channel doesn't match outbound — wipe
-    to None + emit warning."""
-    dc = _FakeDataClient()
-    dc.add(
-        "msg_root",
-        thread_root_id=None,
-        channel_id="ch_general",
-        space_id="sp_1",
-    )
-    out, note = await _validate_root_same_channel(
-        "msg_root", "ch_gtm", "sp_1", dc,
-    )
-    assert out is None
-    assert "different" in note.lower() or "belongs to" in note.lower()
-    assert "ch_general" in note
-    assert "ch_gtm" in note
-
-
-@pytest.mark.asyncio
-async def test_validate_root_wipes_when_parent_not_in_cache():
-    """Strict per operator's Q1(a): parent-not-in-cache → wipe to
-    None. No permissive fallback."""
-    dc = _FakeDataClient()
-    out, note = await _validate_root_same_channel(
-        "msg_unknown", "ch_x", "sp_1", dc,
-    )
-    assert out is None
-    assert "not in local cache" in note
-    assert "msg_unknown" in note
-
-
-@pytest.mark.asyncio
-async def test_validate_root_wipes_when_parent_in_different_space():
-    """Cross-space parent — same defense as cross-channel."""
-    dc = _FakeDataClient()
-    dc.add(
-        "msg_root",
-        thread_root_id=None,
-        channel_id="ch_x",
-        space_id="sp_OTHER",
-    )
-    out, note = await _validate_root_same_channel(
-        "msg_root", "ch_x", "sp_1", dc,
-    )
-    assert out is None
-    assert "different" in note.lower() or "belongs to space" in note.lower()
-    assert "sp_OTHER" in note
-
-
-@pytest.mark.asyncio
-async def test_validate_root_wipes_on_lookup_transport_error():
-    """Strict mode: if the local-cache lookup itself errors out
-    (sqlite hiccup, DataClient transport blip), treat as 'not
-    verified' and wipe — don't ship an unverifiable id."""
-    dc = _FakeDataClient()
-    dc.exc = RuntimeError("simulated lookup failure")
-    out, note = await _validate_root_same_channel(
-        "msg_any", "ch_x", "sp_1", dc,
-    )
-    assert out is None
-    assert "could not be verified" in note
-    assert "lookup failed" in note
-
-
-@pytest.mark.asyncio
-async def test_validate_root_dm_envelope_no_channel_id_passes_through():
-    """DM context: no channel_id to compare against; helper still
-    enforces cache presence but skips the channel-match check.
-    (Cross-DM-thread validation is out of scope for this ticket per
-    the build plan.)"""
-    dc = _FakeDataClient()
-    dc.add(
-        "msg_dm_root",
-        thread_root_id=None,
-        channel_id=None,
-        space_id=None,
-    )
-    out, note = await _validate_root_same_channel(
-        "msg_dm_root", None, None, dc,
-    )
-    assert out == "msg_dm_root"
-    assert note == ""
 
 
 # resolve_visibility — one entry point that combines level parsing,
@@ -1806,3 +1796,139 @@ async def test_get_thread_history_tags_encryption():
     await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
     result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
     assert "[plaintext]" in result
+
+# Send-side thread-root rules, end to end through the send_message tool.
+
+
+@pytest.mark.asyncio
+async def test_send_message_system_root_ships_as_new_top_level(monkeypatch):
+    """Replying to a daemon-minted intro nudge (self-referencing system
+    envelope, no server row) ships as a new top-level message."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    await ms.store({
+        "envelope_id": "intro-prompt-xyz", "envelope_kind": "channel",
+        "sender_slug": "system", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "welcome!", "sent_at": _now_ms(),
+        "thread_root_id": "intro-prompt-xyz",
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "hello, thanks for the intro",
+        "visibility_level": "human",
+        "root_id": "intro-prompt-xyz",
+    })
+
+    assert "posted" in result
+    assert "system message" in result
+    assert captured["inp"].thread_root_id is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_cross_channel_root_rejected():
+    """A root from another channel rejects the send outright — the
+    agent gets a correctable error instead of a misfiled message."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    await ms.store({
+        "envelope_id": "msg_elsewhere", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_OTHER",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message", {
+            "channel": "ch_abc",
+            "text": "misdirected reply",
+            "root_id": "msg_elsewhere",
+        })
+    assert "ch_OTHER" in str(excinfo.value)
+    assert "ch_abc" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_wiped_root_forces_visible_as_root_level(monkeypatch):
+    """Ordering contract: root resolution runs BEFORE the visibility
+    floors. A wiped root makes the message root-level, which cannot fold
+    in the UI — 'default' must coerce it visible instead of shipping an
+    invisible hidden top-level post."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "agent chatter",
+        "visibility_level": "default",
+        "root_id": "msg_never_recorded",
+    })
+
+    assert "posted" in result
+    assert "not in local cache" in result
+    assert captured["inp"].thread_root_id is None
+    assert captured["inp"].is_visible_to_human is True
+
+@pytest.mark.asyncio
+async def test_send_message_dm_rejects_channel_root():
+    """DM sends scope-check too: a channel message as root rejects."""
+    cfg, http, ms = _setup()
+    _seed_recipient(http, "alice-0001")
+    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = (
+        http.responses["/certs/sync?slugs=alice-0001"]
+    )
+    await ms.store({
+        "envelope_id": "msg_channel_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message", {
+            "channel": "@alice-0001",
+            "text": "dm reply",
+            "root_id": "msg_channel_root",
+        })
+    assert "DM" in str(excinfo.value)
+    assert "alice-0001" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_cross_channel_root_rejected(tmp_path):
+    """The attachments send path wires the same scope rejection."""
+    cfg, http, ms = _setup()
+    cfg.workspace = tmp_path
+    (tmp_path / "hello.txt").write_bytes(b"hello attachments")
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    http.responses["/blobs/upload"] = {"blob_id": "blob_xyz"}
+    await ms.store({
+        "envelope_id": "msg_elsewhere", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_OTHER",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message_with_attachments", {
+            "channel": "ch_abc",
+            "caption": "misdirected attachment reply",
+            "paths": ["hello.txt"],
+            "root_id": "msg_elsewhere",
+        })
+    assert "ch_OTHER" in str(excinfo.value)
