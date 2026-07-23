@@ -283,17 +283,6 @@ class AgentDetail(QWidget):
         self._access.setWordWrap(True)
         layout.addRow("Access", self._access)
 
-        self._auto_accept_dm = QCheckBox(
-            "Auto-accept DMs from anyone"
-        )
-        self._auto_accept_dm.setToolTip(
-            "When off, DMs from anyone other than the operator are "
-            "buffered and the operator is prompted (threaded y/n DM "
-            "per sender) before the agent sees the message. y → "
-            "allowlist + deliver; n → blocklist + drop."
-        )
-        layout.addRow("DM policy", self._auto_accept_dm)
-
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
@@ -402,7 +391,6 @@ class AgentDetail(QWidget):
         self._role.setText(cfg.role)
         self._role_short.setText(cfg.role_short)
         self._soul.setPlainText(_profile_summary(cfg))
-        self._auto_accept_dm.setChecked(cfg.puffo_core.auto_accept_dm)
         self._set_combo(self._runtime_kind, cfg.runtime.kind)
         self._set_combo(self._harness, cfg.runtime.harness)
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
@@ -774,7 +762,6 @@ class AgentDetail(QWidget):
         cfg.runtime.provider = provider
         cfg.runtime.harness = harness
         cfg.runtime.model = model
-        cfg.puffo_core.auto_accept_dm = self._auto_accept_dm.isChecked()
         cfg.runtime.inference_level = self._effort.currentData() or ""
         try:
             cfg.save()

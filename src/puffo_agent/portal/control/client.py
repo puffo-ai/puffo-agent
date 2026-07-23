@@ -230,7 +230,7 @@ async def execute_command(
     reconcile loop applies it — a single-writer model. ``create`` additionally
     finalizes the pending identity with puffo-server (needs the operator
     pairing context)."""
-    if op in ("pause", "resume", "edit", "archive", "refresh", "set_auto_accept_dm"):
+    if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.
             if op == "archive" and agent_slug and _is_already_archived(agent_slug):
@@ -326,20 +326,6 @@ async def execute_command(
                 {"requested_at": int(__import__("time").time())},
             )
         return {"ok": True}
-    if op == "set_auto_accept_dm":
-        value = params.get("auto_accept_dm")
-        if not isinstance(value, bool):
-            return {
-                "ok": False,
-                "error": "set_auto_accept_dm requires bool 'auto_accept_dm'",
-            }
-        cfg = AgentConfig.load(agent_slug)
-        cfg.puffo_core.auto_accept_dm = value
-        cfg.save()
-        if cfg.state == "running":
-            from ..profile_sync import write_reload_flag
-            write_reload_flag(cfg, reason="control-ws set_auto_accept_dm")
-        return {"ok": True, "auto_accept_dm": value}
     if op == "refresh_usage":
         # Machine-level (no agent_slug) — re-probe /usage and POST now instead
         # of waiting for the periodic tick.

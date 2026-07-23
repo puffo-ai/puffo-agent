@@ -90,11 +90,15 @@ def test_agent_yml_missing_auto_accept_dm_defaults_to_true(tmp_path):
 # ─────────────────────────────────────────────────────────────────────
 
 
-def test_cli_dm_accept_flips_flag_on_disk(tmp_path, capsys):
+def test_auto_accept_dm_is_a_hidden_yaml_flag(tmp_path):
+    """auto_accept_dm mirrors auto_accept_space_invitations: a yaml-only
+    flag with no CLI subcommand, UI checkbox, or control op."""
     isolated_home()
     import yaml
     from puffo_agent.portal.state import AgentConfig, agent_dir
-    from puffo_agent.portal.cli import cmd_agent_dm_accept
+    from puffo_agent.portal import cli as cli_mod
+    from puffo_agent.portal.control import client as control_mod
+    import inspect
 
     adir = agent_dir("alpha")
     adir.mkdir(parents=True, exist_ok=True)
@@ -103,82 +107,17 @@ def test_cli_dm_accept_flips_flag_on_disk(tmp_path, capsys):
             "id": "alpha",
             "state": "paused",
             "display_name": "Alpha",
-            "puffo_core": {"slug": "alpha-bot"},
+            "puffo_core": {"slug": "alpha-bot", "auto_accept_dm": False},
             "runtime": {"kind": "chat-local"},
         }),
         encoding="utf-8",
     )
-
-    args = argparse.Namespace(id="alpha", mode="off")
-    assert cmd_agent_dm_accept(args) == 0
+    # The yaml field still loads (and defaults True when absent).
     assert AgentConfig.load("alpha").puffo_core.auto_accept_dm is False
 
-    args = argparse.Namespace(id="alpha", mode="on")
-    assert cmd_agent_dm_accept(args) == 0
-    assert AgentConfig.load("alpha").puffo_core.auto_accept_dm is True
-
-
-def test_cli_dm_accept_unknown_agent_exits_nonzero(tmp_path, capsys):
-    isolated_home()
-    from puffo_agent.portal.cli import cmd_agent_dm_accept
-
-    args = argparse.Namespace(id="ghost", mode="off")
-    assert cmd_agent_dm_accept(args) == 2
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Linked-machine control op
-# ─────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_control_set_auto_accept_dm_flips_flag(tmp_path):
-    isolated_home()
-    import yaml
-    from puffo_agent.portal.state import AgentConfig, agent_dir
-    from puffo_agent.portal.control.client import execute_command
-
-    adir = agent_dir("alpha")
-    adir.mkdir(parents=True, exist_ok=True)
-    (adir / "agent.yml").write_text(
-        yaml.safe_dump({
-            "id": "alpha",
-            "state": "paused",
-            "display_name": "Alpha",
-            "puffo_core": {"slug": "alpha-bot"},
-            "runtime": {"kind": "chat-local"},
-        }),
-        encoding="utf-8",
-    )
-
-    result = await execute_command(
-        op="set_auto_accept_dm", agent_slug="alpha",
-        params={"auto_accept_dm": False},
-    )
-    assert result == {"ok": True, "auto_accept_dm": False}
-    assert AgentConfig.load("alpha").puffo_core.auto_accept_dm is False
-
-
-@pytest.mark.asyncio
-async def test_control_set_auto_accept_dm_rejects_non_bool(tmp_path):
-    isolated_home()
-    import yaml
-    from puffo_agent.portal.state import agent_dir
-    from puffo_agent.portal.control.client import execute_command
-
-    adir = agent_dir("alpha")
-    adir.mkdir(parents=True, exist_ok=True)
-    (adir / "agent.yml").write_text(
-        yaml.safe_dump({"id": "alpha", "display_name": "Alpha"}),
-        encoding="utf-8",
-    )
-
-    result = await execute_command(
-        op="set_auto_accept_dm", agent_slug="alpha",
-        params={"auto_accept_dm": "yes"},
-    )
-    assert result["ok"] is False
-    assert "bool" in result["error"]
+    # No mutation surfaces remain.
+    assert not hasattr(cli_mod, "cmd_agent_dm_accept")
+    assert "set_auto_accept_dm" not in inspect.getsource(control_mod.execute_command)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -269,6 +208,8 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     gets: list[str] = []
     pending_rows: list[dict] = []  # tests set what /messages/pending returns
 
+    spaces_rows: list[dict] = []  # what GET /spaces returns
+
     class _StubHttp:
         async def post(self, path, body):
             posts.append((path, body))
@@ -276,6 +217,8 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
 
         async def get(self, path):
             gets.append(path)
+            if path == "/spaces":
+                return {"spaces": list(spaces_rows)}
             return {"messages": list(pending_rows)}
 
         async def delete(self, path, body=None):
@@ -308,6 +251,32 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     ws = _StubWs()
     ws.on_message = _stub_on_message  # type: ignore[assignment]
     client._ws = ws  # type: ignore[assignment]
+
+    class _StubNoticeStore:
+        def __init__(self):
+            self.notices: dict[str, int] = {}
+
+        async def get_dm_notice(self, slug):
+            return self.notices.get(slug)
+
+        async def set_dm_notice(self, slug, ts):
+            self.notices[slug] = ts
+
+    client.store = _StubNoticeStore()  # type: ignore[assignment]
+
+    async def _stub_fetch_display_name(slug):
+        return slug.title()
+
+    client._fetch_display_name = _stub_fetch_display_name  # type: ignore[assignment]
+
+    space_members: dict[str, dict[str, str]] = {}
+
+    async def _stub_get_space_members(space_id):
+        return space_members.get(space_id, {})
+
+    client._get_space_members = _stub_get_space_members  # type: ignore[assignment]
+    client._space_members_stub = space_members  # type: ignore[attr-defined]
+    client._spaces_rows = spaces_rows  # type: ignore[attr-defined]
 
     client._sent_dms = sent_dms  # type: ignore[attr-defined]
     client._posts = posts  # type: ignore[attr-defined]
@@ -684,3 +653,129 @@ def test_gate_consults_contact_cache_for_allowlist():
 
     src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
     assert "await self._contacts.is_allowed(payload.sender_slug)" in src
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DM Gate ladder: trusted contacts, shared-space pass, 72h FYI
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_trusted_contact_added_once():
+    client = _make_client(auto_accept_dm=True)
+    await client._ensure_trusted_contact("op-1")
+    assert ("/allowlists", {"slugs": ["op-1"]}) in client._posts
+    client._posts.clear()
+    # Cached as allowed now — second DM doesn't re-POST.
+    await client._ensure_trusted_contact("op-1")
+    assert client._posts == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_contact_noop_for_self_and_empty():
+    client = _make_client(auto_accept_dm=True)
+    await client._ensure_trusted_contact("agent-1")
+    await client._ensure_trusted_contact("")
+    assert client._posts == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_contact_post_failure_not_cached():
+    client = _make_client(auto_accept_dm=True)
+
+    async def _boom(path, body):
+        raise RuntimeError("allowlists down")
+
+    client.http.post = _boom  # type: ignore[assignment]
+    await client._ensure_trusted_contact("op-1")
+    assert await client._contacts.is_allowed("op-1") is False
+
+
+@pytest.mark.asyncio
+async def test_shares_space_with_member():
+    client = _make_client(auto_accept_dm=False)
+    client._spaces_rows.append({"space_id": "sp_1"})
+    client._space_members_stub["sp_1"] = {"alice-1234": "human"}
+    assert await client._shares_space_with("alice-1234") is True
+    assert await client._shares_space_with("stranger-9") is False
+
+
+@pytest.mark.asyncio
+async def test_shares_space_fails_closed_on_fetch_error():
+    client = _make_client(auto_accept_dm=False)
+
+    async def _boom(path):
+        raise RuntimeError("spaces down")
+
+    client.http.get = _boom  # type: ignore[assignment]
+    assert await client._shares_space_with("alice-1234") is False
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_first_time_notifies_and_persists():
+    client = _make_client(auto_accept_dm=True)
+    await client._maybe_send_dm_notice("alice-1234")
+    fyi = [d for d in client._sent_dms if "FYI" in d["text"]]
+    assert len(fyi) == 1
+    assert fyi[0]["to"] == "op-1"
+    assert "Alice-1234" in fyi[0]["text"]
+    assert "is sending direct messages to me" in fyi[0]["text"]
+    assert client.store.notices["alice-1234"] > 0
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_throttled_within_72h():
+    client = _make_client(auto_accept_dm=True)
+    await client._maybe_send_dm_notice("alice-1234")
+    await client._maybe_send_dm_notice("alice-1234")
+    fyi = [d for d in client._sent_dms if "FYI" in d["text"]]
+    assert len(fyi) == 1
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_fires_again_after_72h():
+    import time as _time
+    client = _make_client(auto_accept_dm=True)
+    stale = int(_time.time() * 1000) - (72 * 3600 * 1000 + 60_000)
+    client.store.notices["alice-1234"] = stale
+    await client._maybe_send_dm_notice("alice-1234")
+    fyi = [d for d in client._sent_dms if "FYI" in d["text"]]
+    assert len(fyi) == 1
+    assert client.store.notices["alice-1234"] > stale
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_send_failure_does_not_persist():
+    client = _make_client(auto_accept_dm=True)
+
+    async def _boom(slug, text, root_id):
+        raise RuntimeError("dm down")
+
+    client._send_dm = _boom  # type: ignore[assignment]
+    await client._maybe_send_dm_notice("alice-1234")
+    # Not recorded → the next DM retries the notice.
+    assert "alice-1234" not in client.store.notices
+
+
+@pytest.mark.asyncio
+async def test_dm_notice_noop_without_operator():
+    client = _make_client(auto_accept_dm=True, operator_slug="")
+    await client._maybe_send_dm_notice("alice-1234")
+    assert client._sent_dms == []
+
+
+def test_gate_ladder_wiring_order():
+    """handle_envelope's ladder order is the contract: blocked-DM drop
+    before persistence; FYI before the permission prompt; shared-space
+    check gates the prompt."""
+    import inspect
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+    src = inspect.getsource(PuffoCoreMessageClient)
+    drop = src.index("dm_gate: dropped DM from blocked")
+    store = src.index('"envelope_id": payload.envelope_id', drop)
+    assert drop < store, "blocked-DM drop must precede persistence"
+    fyi = src.index("_maybe_send_dm_notice(payload.sender_slug)")
+    gate = src.index("_maybe_gate_foreign_dm(", fyi)
+    assert fyi < gate, "FYI must precede the permission prompt"
+    shared = src.index("_shares_space_with(payload.sender_slug)")
+    assert fyi < shared < gate, "shared-space pass sits between FYI and gate"

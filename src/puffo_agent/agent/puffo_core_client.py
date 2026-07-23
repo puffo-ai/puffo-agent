@@ -788,6 +788,18 @@ class PuffoCoreMessageClient:
             validated_reply_to_id = await self._validate_incoming_parent_id(
                 payload.reply_to_id, payload.channel_id, payload.space_id,
             )
+            # Blocked sender's DM: ack-and-drop before persistence — never
+            # stored, never dispatched; the sender learns nothing.
+            if (
+                payload.envelope_kind == "dm"
+                and payload.sender_slug != self.slug
+                and await self._contacts.is_blocked(payload.sender_slug)
+            ):
+                self._log.info(
+                    "dm_gate: dropped DM from blocked %s", payload.sender_slug,
+                )
+                return
+
             # Blocked account's CHANNEL message. The server only drops
             # blocked senders on the DM path — channel posts fan out to
             # every member unfiltered — so we drop it here: persist a
@@ -929,22 +941,26 @@ class PuffoCoreMessageClient:
             else:
                 raw_text = str(payload.content) if payload.content else ""
 
-            # auto_accept_dm=False foreign-DM gate. Prompt the operator and
-            # hold the DM un-acked in /messages/pending (returning False
-            # skips the ack) until they allow/block. Allowlisted senders
-            # bypass — server allowlist is the source of truth.
-            if (
-                is_dm
-                and not self.auto_accept_dm
-                and not await self._contacts.is_allowed(payload.sender_slug)
-                and await self._is_foreign_dm_sender(payload.sender_slug)
-            ):
-                gated = await self._maybe_gate_foreign_dm(
-                    sender_slug=payload.sender_slug,
-                    text=raw_text,
-                )
-                if gated:
-                    return False
+            # DM gate ladder (block already dropped above): contact passes;
+            # operator / co-owned senders become contacts; foreign
+            # non-contacts get the throttled FYI, then either pass on a
+            # shared space or (auto_accept_dm=False) hold for approval.
+            if is_dm:
+                if not await self._is_foreign_dm_sender(payload.sender_slug):
+                    await self._ensure_trusted_contact(payload.sender_slug)
+                elif not await self._contacts.is_allowed(payload.sender_slug):
+                    # FYI precedes any permission prompt by contract.
+                    await self._maybe_send_dm_notice(payload.sender_slug)
+                    if (
+                        not self.auto_accept_dm
+                        and not await self._shares_space_with(payload.sender_slug)
+                    ):
+                        gated = await self._maybe_gate_foreign_dm(
+                            sender_slug=payload.sender_slug,
+                            text=raw_text,
+                        )
+                        if gated:
+                            return False
 
             # Stash the sender so `send_fallback_message("")` can route replies.
             # Always overwrite — first-write would pin replies to a
@@ -3664,6 +3680,77 @@ class PuffoCoreMessageClient:
         if owner and owner == self.operator_slug:
             return False
         return True
+
+    async def _ensure_trusted_contact(self, slug: str) -> None:
+        """Operator / co-owned senders become contacts on first DM."""
+        if not slug or slug == self.slug:
+            return
+        if await self._contacts.is_allowed(slug):
+            return
+        try:
+            await self.http.post("/allowlists", {"slugs": [slug]})
+        except Exception as exc:
+            self._log.warning(
+                "dm_gate: contact add for trusted %s failed: %s", slug, exc,
+            )
+            return
+        self._contacts.note_allowed(slug)
+
+    async def _shares_space_with(self, sender_slug: str) -> bool:
+        """True when the sender is a member of any space the agent is in.
+        Fails closed — an unreachable membership API falls through to the
+        approval gate instead of silently admitting."""
+        try:
+            data = await self.http.get("/spaces")
+        except Exception as exc:
+            self._log.warning(
+                "dm_gate: /spaces fetch for shared-space check failed: %s", exc,
+            )
+            return False
+        for entry in data.get("spaces") or []:
+            space_id = entry.get("space_id") or ""
+            if not space_id:
+                continue
+            members = await self._get_space_members(space_id)
+            if sender_slug in members:
+                return True
+        return False
+
+    _DM_NOTICE_INTERVAL_MS = 72 * 3600 * 1000
+
+    async def _maybe_send_dm_notice(self, sender_slug: str) -> None:
+        """Throttled operator FYI for foreign non-contact DM traffic:
+        first DM notifies immediately, then one notice per 72h per
+        sender. The timestamp persists so restarts don't re-fire."""
+        if not self.operator_slug:
+            return
+        try:
+            last = await self.store.get_dm_notice(sender_slug)
+        except Exception:
+            last = None
+        now_ms = int(time.time() * 1000)
+        if last is not None and now_ms - last < self._DM_NOTICE_INTERVAL_MS:
+            return
+        display = await self._fetch_display_name(sender_slug)
+        label = (
+            f"**{display}** ({sender_slug})" if display else f"@{sender_slug}"
+        )
+        try:
+            await self._send_dm(
+                self.operator_slug,
+                f"FYI, {label} is sending direct messages to me.",
+                root_id="",
+            )
+        except Exception as exc:
+            self._log.warning(
+                "dm_notice: failed to notify operator about %s: %s",
+                sender_slug, exc,
+            )
+            return
+        try:
+            await self.store.set_dm_notice(sender_slug, now_ms)
+        except Exception as exc:
+            self._log.warning("dm_notice: failed to persist ts: %s", exc)
 
     async def _maybe_allowlist_outbound_dm(self, recipient_slug: str) -> None:
         """Agent DM'd a foreign peer first → allowlist them (their reply
