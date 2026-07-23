@@ -15,6 +15,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   **Disconnect** button — confirm dialog → revoke the pairing (server +
   local) and pause that operator's agents.
 
+- **Self-serve `inference_level` via `refresh` (PUF-392).** Agents can
+  now `refresh(inference_level="...")` to change reasoning effort
+  mid-session — standalone or alongside a harness+model swap — which
+  persists to `agent.yml` and respawns the worker. Values are validated
+  per-harness (codex: `minimal|low|medium|high`; claude-code:
+  `low|medium|high|xhigh`), matching the effort axis PUF-373 added, so an
+  agent no longer needs a manual `agent.yml` edit or a web round-trip.
+
 - **Receive plaintext (non-E2EE) messages.** The daemon now accepts the
   `plaintext_message_envelope` format: the signed body is verified in the
   clear (no HPKE/AEAD, the payload's own `sender_slug` is authoritative)
@@ -26,6 +34,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `get_dm_history` / `get_thread_history` tools — now shows whether a
   message was end-to-end encrypted or sent in the clear. Stored per
   message (a SQLite migration backfills pre-existing rows as encrypted).
+
+### Fixed
+
+- **cli-local codex agents reload MCP tools after a tool-surface change
+  (PUF-392).** Codex snapshots its MCP tools at session start and never
+  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
+  so a change to the puffo tool surface (e.g. the new `inference_level`
+  arg) left a resumed codex session on a stale set — it saw the doc but
+  the callable tool never updated. The daemon now fingerprints the tool
+  surface on boot and, when it changed, drops each cli-local codex
+  agent's CLI session so a fresh conversation reloads the tools
+  (claude-code, cli-docker, and ws-local are unaffected).
 
 ## [1.1.3] — 2026-07-17
 
