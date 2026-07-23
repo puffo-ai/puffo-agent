@@ -16,7 +16,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   allowlist and deliver, `n` to block and drop). The operator also gets
   a recurring heads-up — "FYI, <name> is sending direct messages to
   me." — for any non-trusted sender, at most once per 72 hours per
-  sender. The `auto_accept_dm` setting becomes a hidden per-agent
+  sender. New MCP tools let agents read and manage the lists:
+  `get_dm_allowlists()`, `get_dm_blocklists()`, `add_dm_allowlist(slug)`,
+  and `update_dm_blocklist(slug, on)`. The `auto_accept_dm` setting becomes a hidden per-agent
   `agent.yml` flag (its CLI/UI/remote toggles are removed); leaving it
   `true` skips only the hold-for-approval step.
 

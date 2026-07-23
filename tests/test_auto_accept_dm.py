@@ -519,6 +519,8 @@ class _StubHttp:
     def __init__(self):
         self.posts: list[tuple] = []
         self.deletes: list[tuple] = []
+        self.allow_entries: list[dict] = []
+        self.block_rows: list[dict] = []
 
     async def post(self, path, body):
         self.posts.append((path, body))
@@ -526,6 +528,13 @@ class _StubHttp:
 
     async def delete(self, path, body=None):
         self.deletes.append((path, body))
+        return {}
+
+    async def get(self, path):
+        if path == "/allowlists":
+            return {"entries": list(self.allow_entries)}
+        if path == "/blocklists":
+            return {"blocks": list(self.block_rows)}
         return {}
 
 
@@ -824,3 +833,48 @@ async def test_dm_notice_store_write_failure_does_not_crash():
     client.store.set_dm_notice = _write_boom  # type: ignore[assignment]
     await client._maybe_send_dm_notice("alice-1234")
     assert any("FYI" in d["text"] for d in client._sent_dms)
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_dm_allowlists_lists_sorted_slugs():
+    mcp, http = _build_mcp_with_tools()
+    http.allow_entries = [
+        {"peer_slug": "zed-9", "added_at": 2},
+        {"peer_slug": "alice-1234", "added_at": 1},
+        {"added_at": 3},  # malformed row skipped
+    ]
+    tool = mcp._tool_manager._tools["get_dm_allowlists"]
+    out = await tool.fn()
+    assert out == "DM allowlist:\n- alice-1234\n- zed-9"
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_dm_allowlists_empty():
+    mcp, http = _build_mcp_with_tools()
+    tool = mcp._tool_manager._tools["get_dm_allowlists"]
+    assert await tool.fn() == "DM allowlist is empty."
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_dm_blocklists_filters_user_targets():
+    mcp, http = _build_mcp_with_tools()
+    http.block_rows = [
+        {"target": "user", "id": "spammer-1"},
+        {"target": "channel", "id": "ch_x"},  # non-user rows excluded
+        {"target": "user"},  # malformed row skipped
+    ]
+    tool = mcp._tool_manager._tools["get_dm_blocklists"]
+    assert await tool.fn() == "DM blocklist:\n- spammer-1"
+
+
+@pytest.mark.asyncio
+async def test_mcp_get_dm_blocklists_empty():
+    mcp, http = _build_mcp_with_tools()
+    tool = mcp._tool_manager._tools["get_dm_blocklists"]
+    assert await tool.fn() == "DM blocklist is empty."
+
+
+def test_mcp_tool_names_include_read_tools():
+    from puffo_agent.mcp.config import PUFFO_CORE_TOOL_NAMES
+    assert "get_dm_allowlists" in PUFFO_CORE_TOOL_NAMES
+    assert "get_dm_blocklists" in PUFFO_CORE_TOOL_NAMES

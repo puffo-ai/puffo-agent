@@ -1274,6 +1274,36 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
 
     @mcp.tool()
+    async def get_dm_allowlists() -> str:
+        """List the operator's DM allowlist (peers whose DMs skip the
+        approval gate). Operator-scoped — shared across all of the
+        operator's agents."""
+        data = await cfg.http_client.get("/allowlists")
+        slugs = sorted(
+            e.get("peer_slug", "")
+            for e in (data.get("entries") or [])
+            if e.get("peer_slug")
+        )
+        if not slugs:
+            return "DM allowlist is empty."
+        return "DM allowlist:\n" + "\n".join(f"- {s}" for s in slugs)
+
+    @mcp.tool()
+    async def get_dm_blocklists() -> str:
+        """List the operator's DM blocklist (senders whose messages are
+        silently dropped). Operator-scoped — shared across all of the
+        operator's agents."""
+        data = await cfg.http_client.get("/blocklists")
+        slugs = sorted(
+            b.get("id", "")
+            for b in (data.get("blocks") or [])
+            if b.get("target") == "user" and b.get("id")
+        )
+        if not slugs:
+            return "DM blocklist is empty."
+        return "DM blocklist:\n" + "\n".join(f"- {s}" for s in slugs)
+
+    @mcp.tool()
     async def add_dm_allowlist(slug: str) -> str:
         """Mark a user as DM-allowed for your operator. Future DMs from
         this sender skip the ``auto_accept_dm`` approval prompt and

@@ -204,6 +204,7 @@ below is the authoritative reference.
   sparingly with an honest `reason`.
 
 **DM safety (operator-scoped, shared across all of your operator's agents):**
+- `get_dm_allowlists()` / `get_dm_blocklists()` — read the current lists.
 - `add_dm_allowlist(slug)` — allow this peer to DM. Idempotent.
 - `update_dm_blocklist(slug, on)` — block (`on=True`) or unblock
   (`on=False`). Server-enforced; blocked senders' messages are dropped
