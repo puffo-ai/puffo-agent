@@ -113,8 +113,7 @@ class PuffoCoreWsClient:
                 skip_ack = False
                 if self.on_message:
                     try:
-                        # False = hold un-acked (a gated foreign DM stays
-                        # in /messages/pending until the operator decides).
+                        # False = hold un-acked until the operator decides.
                         skip_ack = await self.on_message(envelope) is False
                     except Exception:
                         logger.exception("on_message callback failed during catch-up")

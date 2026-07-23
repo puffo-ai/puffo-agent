@@ -1,13 +1,6 @@
-"""Per-agent pending DM-approval persistence.
-
-When ``auto_accept_dm=false`` and a foreign sender DMs the agent,
-the daemon buffers the message + prompts the operator. The prompt
-DM's envelope_id keys the pending entry so the operator's in-thread
-y/n reply (matching ``thread_root_id == prompt_envelope_id``) routes
-back to the right buffered message.
-
-State survives daemon restart so a prompt DM the operator missed
-during a restart window still gets honored on next reply.
+"""Per-agent pending DM-approval persistence. Entries are keyed by the
+prompt DM's envelope_id (in-thread y/n routes via thread_root_id) and
+survive daemon restarts.
 """
 
 from __future__ import annotations

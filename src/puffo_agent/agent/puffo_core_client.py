@@ -785,8 +785,7 @@ class PuffoCoreMessageClient:
             validated_reply_to_id = await self._validate_incoming_parent_id(
                 payload.reply_to_id, payload.channel_id, payload.space_id,
             )
-            # Blocked sender's DM: ack-and-drop before persistence — never
-            # stored, never dispatched; the sender learns nothing.
+            # Blocked sender's DM: ack-and-drop before persistence.
             if (
                 payload.envelope_kind == "dm"
                 and payload.sender_slug != self.slug
@@ -797,9 +796,8 @@ class PuffoCoreMessageClient:
                 )
                 return
 
-            # Blocked sender's CHANNEL message: the server only filters the
-            # DM path, so drop here — store a redacted placeholder (keeps
-            # thread/seq metadata) and ack.
+            # Blocked sender's CHANNEL message: the server only filters DMs,
+            # so drop here — redacted placeholder keeps thread metadata.
             if (
                 payload.envelope_kind != "dm"
                 and payload.sender_slug != self.slug
@@ -904,8 +902,7 @@ class PuffoCoreMessageClient:
                     self._last_dm_sender = payload.sender_slug
                     return
 
-            # Stale catch-up backlog: stored above, skips the LLM (and
-            # the foreign-DM gate below — no prompts for old backlog).
+            # Stale catch-up backlog: stored above, skips the LLM and the gate.
             if self._is_stale_for_catchup(payload.sent_at):
                 self._log.info(
                     "handle_envelope: staleness-gate-skipped envelope=%s "
@@ -3690,9 +3687,8 @@ class PuffoCoreMessageClient:
         self._contacts.note_allowed(slug)
 
     async def _shares_space_with(self, sender_slug: str) -> bool:
-        """True when the sender is a member of any space the agent is in.
-        Fails closed — an unreachable membership API falls through to the
-        approval gate instead of silently admitting."""
+        """Sender shares a space with the agent. Fails closed — an
+        unreachable membership API falls through to the approval gate."""
         try:
             data = await self.http.get("/spaces")
         except Exception as exc:
@@ -3712,9 +3708,8 @@ class PuffoCoreMessageClient:
     _DM_NOTICE_INTERVAL_MS = 72 * 3600 * 1000
 
     async def _maybe_send_dm_notice(self, sender_slug: str) -> None:
-        """Throttled operator FYI for every non-trusted sender (contacts
-        included; only operator/co-owned are exempt): first DM notifies
-        immediately, then one per 72h. Persisted across restarts."""
+        """Operator FYI for every non-trusted sender (contacts included):
+        first DM immediately, then one per 72h; persisted."""
         if not self.operator_slug:
             return
         try:
@@ -3746,8 +3741,7 @@ class PuffoCoreMessageClient:
             self._log.warning("dm_notice: failed to persist ts: %s", exc)
 
     async def _maybe_allowlist_outbound_dm(self, recipient_slug: str) -> None:
-        """Agent DM'd a foreign peer first → allowlist them (their reply
-        shouldn't need approval) and tell the operator. Best-effort."""
+        """Agent DM'd a foreign peer first → allowlist them; best-effort."""
         if not recipient_slug:
             return
         # Never allowlist a sender we're currently gating — the ack DM
@@ -3796,12 +3790,9 @@ class PuffoCoreMessageClient:
         sender_slug: str,
         text: str,
     ) -> bool:
-        """Foreign DM with ``auto_accept_dm=False``: prompt the operator.
-        Returns True when gated — the caller then returns False so the DM
-        stays un-acked in /messages/pending, drained on approval.
-
-        Only one prompt per sender at a time; further DMs from that sender
-        stay in pending too (the operator's one y/n covers all of them).
+        """Prompt the operator for a held foreign DM. True = gated (caller
+        skips the ack; the DM waits in /messages/pending). One prompt per
+        sender — further DMs ride the same y/n.
         """
         for entry in self._pending_dm_approvals.values():
             if entry.get("sender_slug") == sender_slug:
