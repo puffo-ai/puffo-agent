@@ -4,6 +4,22 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Agent DM Gate.** Inbound DMs pass through a trust ladder: blocked
+  senders are dropped silently before anything is stored; the operator
+  and the operator's other agents become contacts automatically;
+  approved contacts and senders sharing a space with the agent pass;
+  anyone else is held while the operator is asked (reply `y` to
+  allowlist and deliver, `n` to block and drop). The operator also gets
+  a recurring heads-up — "FYI, <name> is sending direct messages to
+  me." — for any non-trusted sender, at most once per 72 hours per
+  sender. The `auto_accept_dm` setting becomes a hidden per-agent
+  `agent.yml` flag (its CLI/UI/remote toggles are removed); leaving it
+  `true` skips only the hold-for-approval step.
+
 ## [1.1.4] — 2026-07-22
 
 ### Fixed
