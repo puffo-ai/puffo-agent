@@ -23,6 +23,7 @@ from puffo_agent.portal.control import link as link_mod  # noqa: E402
 from puffo_agent.portal.control.link import (  # noqa: E402
     ControlError,
     LinkError,
+    fetch_operator_display_name,
     mint_link_code,
     normalize_link_code,
     redeem_link_code,
@@ -394,3 +395,52 @@ def test_mint_create_code_rejected(monkeypatch):
     )
     with pytest.raises(LinkError, match="could not create code"):
         asyncio.run(mint_link_code("https://relay", "Box"))
+
+
+# ── fetch_operator_display_name ─────────────────────────────
+
+
+def test_fetch_operator_display_name_ok(monkeypatch):
+    _patch_session(
+        monkeypatch,
+        {
+            ("GET", "/operators/alice-1"): [
+                _FakeResp(200, json_body={"operator_slug": "alice-1", "display_name": "Alice"})
+            ]
+        },
+    )
+    name = asyncio.run(fetch_operator_display_name("https://x.example", "alice-1"))
+    assert name == "Alice"
+
+
+def test_fetch_operator_display_name_non_200_returns_empty(monkeypatch):
+    _patch_session(
+        monkeypatch,
+        {("GET", "/operators/alice-1"): [_FakeResp(403, text="not linked")]},
+    )
+    assert asyncio.run(fetch_operator_display_name("https://x.example", "alice-1")) == ""
+
+
+def test_fetch_operator_display_name_missing_field_returns_empty(monkeypatch):
+    _patch_session(
+        monkeypatch,
+        {("GET", "/operators/alice-1"): [_FakeResp(200, json_body={"operator_slug": "alice-1"})]},
+    )
+    assert asyncio.run(fetch_operator_display_name("https://x.example", "alice-1")) == ""
+
+
+def test_fetch_operator_display_name_network_error_returns_empty(monkeypatch):
+    def boom(*_a, **_k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(link_mod, "create_remote_http_session", boom)
+    assert asyncio.run(fetch_operator_display_name("https://x.example", "alice-1")) == ""
+
+
+def test_fetch_operator_display_name_non_dict_body_returns_empty(monkeypatch):
+    # A 200 whose JSON isn't an object must fall back to "" (not crash).
+    _patch_session(
+        monkeypatch,
+        {("GET", "/operators/alice-1"): [_FakeResp(200, json_body=["nope"])]},
+    )
+    assert asyncio.run(fetch_operator_display_name("https://x.example", "alice-1")) == ""

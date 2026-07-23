@@ -8,6 +8,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Operators tab: display names + per-card Disconnect.** Each linked
+  operator's card now shows the operator's human display name (resolved
+  on demand via a machine-authed lookup, falling back to the slug for
+  legacy pairings and until the server endpoint ships) plus a
+  **Disconnect** button — confirm dialog → revoke the pairing (server +
+  local) and pause that operator's agents.
+
 - **Self-serve `inference_level` via `refresh` (PUF-392).** Agents can
   now `refresh(inference_level="...")` to change reasoning effort
   mid-session — standalone or alongside a harness+model swap — which
