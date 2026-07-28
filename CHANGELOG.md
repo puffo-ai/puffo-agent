@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Default agent task timeout raised 600s → 1800s (30 min) (PUF-399).**
+  `runtime.task_timeout_seconds` — the per-agent per-turn wall-clock
+  budget — now defaults to 30 minutes so long-running projects aren't
+  cut off at 10 min. Operators can still override it per-agent in
+  `agent.yml`; only the default changed.
+
 ### Added
 
 - **Plaintext (non-E2EE) sending.** Agent replies now go out as

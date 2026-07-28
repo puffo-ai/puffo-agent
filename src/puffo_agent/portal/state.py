@@ -1024,9 +1024,9 @@ class RuntimeConfig:
     sandbox: str = "danger-full-access"
     # "" = harness default; codex → config.toml, claude-code → --effort
     inference_level: str = ""
-    # codex (cli-local) per-turn wall-clock budget in seconds; raise for
-    # agents running long reasoning/complex tasks.
-    task_timeout_seconds: float = 600.0
+    # codex (cli-local) per-turn wall-clock budget in seconds (default 30 min);
+    # raise it for agents running even longer reasoning/complex tasks.
+    task_timeout_seconds: float = 1800.0
     # Agent engine (CLI kinds only): ``claude-code`` (stream-json + resume +
     # puffo MCP), ``hermes`` (one-shot ``hermes chat -q``), ``gemini-cli``
     # (declared, unimplemented). Hermes OAuth bills to Anthropic
@@ -1127,7 +1127,7 @@ class AgentConfig:
                 permission_mode=rt.get("permission_mode", "bypassPermissions"),
                 sandbox=rt.get("sandbox", "danger-full-access"),
                 inference_level=rt.get("inference_level", ""),
-                task_timeout_seconds=float(rt.get("task_timeout_seconds", 600.0)),
+                task_timeout_seconds=float(rt.get("task_timeout_seconds", 1800.0)),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),
             ),

@@ -78,7 +78,7 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 
 # Default per-turn wall-clock budget; defensive against an App Server
 # that ACKs but never streams.
-TURN_TIMEOUT_SECONDS = 600.0
+TURN_TIMEOUT_SECONDS = 1800.0
 
 # Reacts fast in a small fleet, absorbs single transient hiccups.
 CODEX_THREAD_WEDGED_THRESHOLD = 2

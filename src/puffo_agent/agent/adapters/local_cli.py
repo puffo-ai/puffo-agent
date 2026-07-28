@@ -162,7 +162,7 @@ class LocalCLIAdapter(Adapter):
         permission_mode: str = "default",
         sandbox: str = "danger-full-access",
         inference_level: str = "",
-        task_timeout_seconds: float = 600.0,
+        task_timeout_seconds: float = 1800.0,
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,

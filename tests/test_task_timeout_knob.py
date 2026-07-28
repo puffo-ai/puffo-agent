@@ -1,5 +1,5 @@
 """RuntimeConfig.task_timeout_seconds round-trips through agent.yml,
-defaults to 600s, and reaches the CodexSession."""
+defaults to 1800s (30 min), and reaches the CodexSession."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ def home(tmp_path, monkeypatch) -> Path:
     return tmp_path
 
 
-def test_default_is_600():
+def test_default_is_1800():
     from puffo_agent.portal.state import RuntimeConfig
-    assert RuntimeConfig().task_timeout_seconds == 600.0
+    assert RuntimeConfig().task_timeout_seconds == 1800.0
 
 
 def test_round_trips(home):
@@ -24,13 +24,13 @@ def test_round_trips(home):
     cfg = AgentConfig(
         id="codex-slow",
         display_name="codex-slow",
-        runtime=RuntimeConfig(kind="cli-local", harness="codex", task_timeout_seconds=1800.0),
+        runtime=RuntimeConfig(kind="cli-local", harness="codex", task_timeout_seconds=900.0),
     )
     cfg.save()
-    assert AgentConfig.load("codex-slow").runtime.task_timeout_seconds == 1800.0
+    assert AgentConfig.load("codex-slow").runtime.task_timeout_seconds == 900.0
 
 
-def test_legacy_yml_without_field_defaults_600(home):
+def test_legacy_yml_without_field_defaults_1800(home):
     from puffo_agent.portal.state import AgentConfig, agent_yml_path
     aid = "legacy-codex"
     yml = agent_yml_path(aid)
@@ -50,7 +50,7 @@ def test_legacy_yml_without_field_defaults_600(home):
         "triggers: {on_mention: true, on_dm: true}\n",
         encoding="utf-8",
     )
-    assert AgentConfig.load(aid).runtime.task_timeout_seconds == 600.0
+    assert AgentConfig.load(aid).runtime.task_timeout_seconds == 1800.0
 
 
 def test_codex_session_stores_timeout():
