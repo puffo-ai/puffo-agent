@@ -1,10 +1,4 @@
-"""PUF-401: role_short is single-source-derived from role.
-
-Covers the canonical ``derive_role_short`` (state.py), the thin
-bridge/CLI wrappers delegating to it, the control-WS role-write path
-that used to orphan role_short, and the daemon-startup backfill that
-repairs a stale role_short instead of reverting the server to it.
-"""
+"""role_short is single-source-derived from role, on every write path."""
 
 from __future__ import annotations
 
@@ -254,12 +248,7 @@ async def test_startup_backfill_preserves_behavior_fields(monkeypatch):
     assert _FakeHttp.posted[-1]["soul"] == "I lead product."
 
 
-# ─── deprecated explicit-override → accept-but-warn (PUF-401) ──────
-# The bridge PATCH and the CLI `agent profile` are the two live
-# override surfaces; both now derive authoritatively and log a
-# deprecation warning when a differing explicit role_short is dropped
-# (never silently). Provision + `agent create` share this exact
-# derive-and-warn logic.
+# ─── deprecated explicit-override → accept-but-warn ───────────────
 
 
 _HOST = {"Host": "127.0.0.1:63387"}
