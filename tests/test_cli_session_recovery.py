@@ -798,3 +798,79 @@ def test_drain_swallows_readline_error_and_hands_off_to_main_loop(tmp_path):
     out = asyncio.run(drive())
     assert out.metadata.get("stream_error") == "readline_limit"
     assert out.reply == ""
+
+
+# ── Session rotation on model change (PUF-159) ───────────────────────────────
+#
+# A transcript born under one model must not be --resume'd under another:
+# cross-family replay injects the old model's thinking blocks into the new
+# provider's API (a kimi-born session resumed under an Anthropic model makes
+# claude-code send clear_thinking_20251015 without thinking enabled → 400 on
+# every turn until the session rotates).
+
+
+def _write_session_file(tmp_path: Path, sid: str, model: str | None) -> Path:
+    data: dict = {"session_id": sid, "updated_at": 1}
+    if model is not None:
+        data["model"] = model
+    f = tmp_path / "session.json"
+    f.write_text(json.dumps(data), encoding="utf-8")
+    return f
+
+
+def _make_model_session(tmp_path: Path, model: str) -> ClaudeSession:
+    return ClaudeSession(
+        agent_id="test-agent",
+        session_file=tmp_path / "session.json",
+        build_command=lambda args: ["true"],
+        cwd=str(tmp_path),
+        env={},
+        audit=None,
+        model=model,
+    )
+
+
+def test_session_rotates_when_model_changed(tmp_path, caplog):
+    _write_session_file(tmp_path, "sess-kimi", "kimi-k3")
+    with caplog.at_level(logging.INFO):
+        session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == ""  # fresh session, no --resume
+    assert not (tmp_path / "session.json").exists()  # stale file dropped
+    assert "rotating CLI session" in caplog.text
+
+
+def test_session_kept_when_model_unchanged(tmp_path):
+    _write_session_file(tmp_path, "sess-opus", "claude-opus-4-7")
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == "sess-opus"
+    assert (tmp_path / "session.json").exists()
+
+
+def test_legacy_session_file_without_model_is_kept(tmp_path):
+    # Pre-PUF-159 files carry no model — keep them (one gratuitous reset per
+    # fleet on upgrade would be worse); the model lands on the next save.
+    _write_session_file(tmp_path, "sess-legacy", None)
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == "sess-legacy"
+
+
+def test_session_kept_when_no_model_configured(tmp_path):
+    # model="" (legacy caller) → scoping disabled entirely.
+    _write_session_file(tmp_path, "sess-any", "kimi-k3")
+    session = _make_model_session(tmp_path, "")
+    assert session._session_id == "sess-any"
+
+
+def test_save_records_model(tmp_path):
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    session._save_session_id("sess-new")
+    data = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert data["session_id"] == "sess-new"
+    assert data["model"] == "claude-opus-4-7"
+
+
+def test_save_omits_model_when_unset(tmp_path):
+    session = _make_model_session(tmp_path, "")
+    session._save_session_id("sess-new")
+    data = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert "model" not in data

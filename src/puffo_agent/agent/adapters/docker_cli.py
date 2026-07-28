@@ -697,6 +697,7 @@ class DockerCLIAdapter(Adapter):
                 self.agent_id,
             ),
             extra_args=extra,
+            model=self.model,
         )
         return self._session
 

@@ -192,6 +192,7 @@ class ClaudeSession:
         env: Optional[dict[str, str]] = None,
         audit: Optional["AuditLog"] = None,
         extra_args: Optional[list[str]] = None,
+        model: str = "",
     ):
         """
         ``build_command(extra_args, env_overrides)`` returns the full
@@ -203,6 +204,15 @@ class ClaudeSession:
 
         ``audit`` is optional; when set, each turn appends structured
         events for operators to tail.
+
+        ``model`` scopes the persisted session to the model that
+        produced it: a transcript born under one model must not be
+        ``--resume``d under another. Cross-family replay injects the
+        old model's thinking blocks into the new provider's API — a
+        kimi-born session resumed under an Anthropic model makes
+        claude-code send ``clear_thinking_20251015`` without thinking
+        enabled, and every turn 400s until the session rotates
+        (PUF-159). Empty = legacy behavior (no scoping).
         """
         self.agent_id = agent_id
         self.session_file = session_file
@@ -210,6 +220,7 @@ class ClaudeSession:
         self.cwd = cwd
         self.env = env
         self.audit = audit
+        self.model = (model or "").strip()
         # Extra claude CLI flags re-applied on every spawn (typically
         # --mcp-config / --permission-prompt-tool).
         self.extra_args = list(extra_args or [])
@@ -412,11 +423,27 @@ class ClaudeSession:
             data = json.loads(self.session_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return ""
+        stored_model = (data.get("model") or "").strip()
+        if self.model and stored_model and stored_model != self.model:
+            # Model changed since this transcript was recorded — resuming
+            # it would replay the old model's thinking blocks into the new
+            # provider (PUF-159). Rotate: drop the file, start fresh.
+            logger.info(
+                "agent %s: model changed %s -> %s; rotating CLI session %s",
+                self.agent_id,
+                stored_model,
+                self.model,
+                (data.get("session_id") or "")[:8],
+            )
+            self._clear_session_file()
+            return ""
         return (data.get("session_id") or "").strip()
 
     def _save_session_id(self, sid: str) -> None:
         self._session_id = sid
         data = {"session_id": sid, "updated_at": int(time.time())}
+        if self.model:
+            data["model"] = self.model
         self.session_file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.session_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -424,6 +451,9 @@ class ClaudeSession:
 
     def _clear_session_id(self) -> None:
         self._session_id = ""
+        self._clear_session_file()
+
+    def _clear_session_file(self) -> None:
         try:
             self.session_file.unlink()
         except OSError:
