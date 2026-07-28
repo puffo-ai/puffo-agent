@@ -37,6 +37,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   paths (LLM replies, MCP tools, daemon system DMs); attachments
   remain encrypted blob references.
 
+### Fixed
+
+- **Cap `mcp` below 2.0.** The 2.x SDK dropped the bundled
+  `mcp.server.fastmcp`; pin `mcp>=1.0,<2` until the tool servers move
+  to the standalone `fastmcp` package.
+
 ## [1.1.5] — 2026-07-23
 
 ### Added

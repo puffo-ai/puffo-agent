@@ -40,7 +40,7 @@ dependencies = [
     # Relay TLS trust bundle for hosts with an empty OpenSSL cert store.
     "certifi>=2024.2.2",
     "cryptography>=43.0",
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     # Pillow: dimension-check + downscale inbound image attachments so
     # an oversized image can't poison the agent's claude session.
     "pillow>=10.0",
