@@ -64,6 +64,16 @@ def test_codex_session_stores_timeout():
     assert s.task_timeout_seconds == 42.0
 
 
+def test_codex_session_defaults_to_1800():
+    from puffo_agent.agent.adapters.codex_session import CodexSession
+    s = CodexSession(
+        agent_id="a",
+        session_file=Path("/tmp/nonexistent-codex-session.json"),
+        argv=["codex", "app-server"],
+    )
+    assert s.task_timeout_seconds == 1800.0
+
+
 def test_local_cli_adapter_plumbs_timeout_to_codex_session(tmp_path, monkeypatch):
     from puffo_agent.agent.adapters import local_cli as lc
     from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
