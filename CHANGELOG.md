@@ -8,6 +8,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`role_short` is now single-source-derived from `role` (PUF-401).**
+  The chip label is always derived from the `<short>: <description>`
+  role on every write path (bridge, CLI, provision, control-WS, agent
+  detail) instead of being stored independently, so it can no longer
+  orphan a stale value. Explicit `role_short` / `--role-short` is
+  deprecated: still accepted for backward compatibility but ignored,
+  with a warning when the supplied value differs from the derived one.
+  A daemon-startup backfill repairs a stale on-disk `role_short` before
+  the first server sync, so a restart fixes the chip instead of pushing
+  the stale value back.
+
 - **Default agent task timeout raised 600s → 1800s (30 min) (PUF-399).**
   `runtime.task_timeout_seconds` — the per-agent per-turn wall-clock
   budget — now defaults to 30 minutes so long-running projects aren't
