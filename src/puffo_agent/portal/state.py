@@ -1042,13 +1042,9 @@ MAX_ROLE_SHORT_LEN = 32
 
 
 def derive_role_short(role: str) -> str:
-    """Canonical mirror of puffo-server's ``profiles::derive_role_short``:
-    pull a short chip label out of a ``<short>: <description>``-shaped role
-    string. Returns ``""`` for any shape the server would also reject (no
-    colon, empty prefix, whitespace in the prefix, empty suffix, prefix
-    longer than ``MAX_ROLE_SHORT_LEN``). ``role_short`` is single-source
-    derived from ``role`` (PUF-401); this is the one implementation — the
-    bridge and CLI wrappers delegate here."""
+    """Canonical mirror of puffo-server's ``derive_role_short``: the chip
+    label from a ``<short>: <description>`` role, or ``""`` for any shape the
+    server rejects. The single source — bridge/CLI wrappers delegate here."""
     if ":" not in role:
         return ""
     colon_pos = role.index(":")
