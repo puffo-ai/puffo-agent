@@ -600,6 +600,18 @@ async def update_profile(request: web.Request) -> web.Response:
         return _bad(
             f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters",
         )
+    # role_short is single-source-derived from role (PUF-401). An explicit
+    # role_short is still accepted for backward compat but ignored; warn when
+    # the supplied value would actually differ from the derived one so a
+    # deprecated caller learns the value was dropped (never silently).
+    if isinstance(new_role_short, str) and isinstance(new_role, str):
+        _derived = _derive_role_short(new_role)
+        if new_role_short.strip() and new_role_short.strip() != _derived:
+            logger.warning(
+                "bridge: 'role_short' is deprecated (PUF-401); ignoring "
+                "provided %r, using role-derived %r for agent=%s",
+                new_role_short, _derived, agent_id,
+            )
 
     avatar_bytes: bytes | None = None
     if avatar_b64 is not None:
@@ -1512,6 +1524,12 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
     # role_short is single-source-derived from role (PUF-401); role_short_raw
     # is still accepted on the wire (validated above) but ignored.
     role_short = _derive_role_short(role) if role else ""
+    if isinstance(role_short_raw, str) and role_short_raw.strip() and role_short_raw.strip() != role_short:
+        logger.warning(
+            "provision: 'role_short' is deprecated (PUF-401); ignoring "
+            "provided %r, using role-derived %r for agent=%s",
+            role_short_raw, role_short, agent_id,
+        )
     profile_text = payload.get("profile")
     if not isinstance(profile_text, str) or not profile_text.strip():
         raise ProvisionError("profile (markdown body) is required")

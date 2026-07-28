@@ -490,6 +490,12 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     # role_short is single-source-derived from role (PUF-401); --role-short
     # is still accepted on the CLI (validated above) but ignored.
     role_short = _derive_role_short_cli(role) if role else ""
+    if role_short_raw and role_short_raw != role_short:
+        print(
+            f"warning: --role-short is deprecated (PUF-401); ignoring "
+            f"{role_short_raw!r}, using role-derived {role_short!r}",
+            file=sys.stderr,
+        )
 
     target.mkdir(parents=True)
 
@@ -950,6 +956,19 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if role_short_arg is not None and len(role_short_arg) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
+    # role_short is single-source-derived from role (PUF-401); --role-short is
+    # accepted but ignored. Warn when the supplied value would differ from the
+    # authoritative derived one so it's never dropped silently.
+    if role_short_arg is not None and role_short_arg.strip():
+        _authoritative = _derive_role_short_cli(
+            role_arg if isinstance(role_arg, str) else cfg.role
+        )
+        if role_short_arg.strip() != _authoritative:
+            print(
+                f"warning: --role-short is deprecated (PUF-401); ignoring "
+                f"{role_short_arg!r}, using role-derived {_authoritative!r}",
+                file=sys.stderr,
+            )
 
     # Build the wire patch + apply locally in lock-step. agent.yml
     # writes happen first so a server-side hiccup doesn't lose what
@@ -986,9 +1005,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if "role" in patch:
         print(f"  role:         {cfg.role!r}")
     if "role_short" in patch:
-        print(f"  role_short:   {cfg.role_short!r}  (explicit)")
-    elif "role" in patch:
-        print(f"  role_short:   {cfg.role_short!r}  (server-derived)")
+        print(f"  role_short:   {cfg.role_short!r}  (derived from role)")
     return 0
 
 

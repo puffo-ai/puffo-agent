@@ -8,6 +8,8 @@ repairs a stale role_short instead of reverting the server to it.
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import sys
 
@@ -15,7 +17,18 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from _bridge_support import isolated_home, write_test_agent  # noqa: E402
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+from _bridge_support import (  # noqa: E402
+    isolated_home,
+    make_user,
+    pair_request_body,
+    signed_headers,
+    write_test_agent,
+)
+from puffo_agent.crypto.encoding import base64url_encode  # noqa: E402
+from puffo_agent.portal.api.server import build_app  # noqa: E402
+from puffo_agent.portal.state import DaemonConfig  # noqa: E402
 
 from puffo_agent.portal.api.handlers import _derive_role_short  # noqa: E402
 from puffo_agent.portal.cli import _derive_role_short_cli  # noqa: E402
@@ -239,3 +252,90 @@ async def test_startup_backfill_preserves_behavior_fields(monkeypatch):
     # soul section still in profile.md; synced body unchanged
     assert profile_path.read_text(encoding="utf-8").count("# Soul") == 1
     assert _FakeHttp.posted[-1]["soul"] == "I lead product."
+
+
+# ─── deprecated explicit-override → accept-but-warn (PUF-401) ──────
+# The bridge PATCH and the CLI `agent profile` are the two live
+# override surfaces; both now derive authoritatively and log a
+# deprecation warning when a differing explicit role_short is dropped
+# (never silently). Provision + `agent create` share this exact
+# derive-and-warn logic.
+
+
+_HOST = {"Host": "127.0.0.1:63387"}
+
+
+@pytest.mark.asyncio
+async def test_bridge_update_profile_warns_on_explicit_role_short(
+    monkeypatch, caplog
+):
+    home = isolated_home()
+    user = make_user()
+    write_test_agent(
+        home,
+        "chip-bot",
+        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
+    )
+
+    async def _noop_sync(cfg, patch):
+        return None
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.api.handlers._sync_agent_profile", _noop_sync
+    )
+
+    app = build_app(DaemonConfig().bridge)
+    server = TestServer(app)
+    async with TestClient(server) as c:
+        body = pair_request_body(user)
+        h = signed_headers(user, "POST", "/v1/pair", body)
+        h.update(_HOST)
+        assert (await c.post("/v1/pair", data=body, headers=h)).status == 200
+
+        payload = json.dumps(
+            {"role": "coder: main puffo-core coder", "role_short": "BOGUS"}
+        ).encode("utf-8")
+        h = signed_headers(
+            user, "PATCH", "/v1/agents/chip-bot/profile", payload
+        )
+        h.update(_HOST)
+        h["content-type"] = "application/json"
+        with caplog.at_level("WARNING"):
+            r = await c.patch(
+                "/v1/agents/chip-bot/profile", data=payload, headers=h
+            )
+        assert r.status == 200, await r.text()
+        # derived value wins over the explicit override
+        assert (await r.json())["role_short"] == "coder"
+    # the drop is announced, not silent
+    assert "deprecated (PUF-401)" in caplog.text
+    assert "BOGUS" in caplog.text
+
+
+def test_cli_agent_profile_warns_on_explicit_role_short(
+    monkeypatch, capsys
+):
+    home = isolated_home()
+    write_test_agent(home, "chip-bot")
+
+    async def _noop_sync(cfg, patch):
+        return None
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.profile_sync.sync_agent_profile", _noop_sync
+    )
+
+    args = argparse.Namespace(
+        id="chip-bot",
+        role="coder: main puffo-core coder",
+        role_short="BOGUS",
+        display_name=None,
+    )
+    from puffo_agent.portal.cli import cmd_agent_profile
+
+    assert cmd_agent_profile(args) == 0
+    err = capsys.readouterr().err
+    assert "deprecated (PUF-401)" in err
+    assert "BOGUS" in err
+    # derive still wins on disk
+    assert AgentConfig.load("chip-bot").role_short == "coder"
