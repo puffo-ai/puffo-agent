@@ -10,7 +10,7 @@ import logging
 import time
 from typing import Any
 
-from .state import AgentConfig
+from .state import AgentConfig, derive_role_short
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,17 @@ async def sync_full_profile(cfg: AgentConfig) -> None:
     ``# Soul`` section extracted from profile.md. Soul is omitted
     when profile.md is missing OR has no soul-like heading — the
     server's stored value is preserved rather than clobbered."""
+    # PUF-401 backfill: role_short is single-source-derived from role.
+    # An offline hand-edit or a legacy orphaned role-write can leave a
+    # stale role_short on disk; correct + persist it BEFORE syncing so a
+    # restart repairs the chip instead of reverting the server to the
+    # stale value. Idempotent: no write (no thrash) when they already
+    # match, and left untouched when role is empty.
+    if cfg.role:
+        derived = derive_role_short(cfg.role)
+        if cfg.role_short != derived:
+            cfg.role_short = derived
+            cfg.save()
     patch: dict[str, Any] = {
         "display_name": cfg.display_name,
         "role": cfg.role,

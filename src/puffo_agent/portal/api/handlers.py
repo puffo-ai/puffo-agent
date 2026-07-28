@@ -35,6 +35,7 @@ from ..state import (
     agent_yml_path,
     archive_flag_path,
     delete_flag_path,
+    derive_role_short,
     discover_agents,
     is_valid_agent_id,
     refresh_agent_flag_path,
@@ -634,8 +635,9 @@ async def update_profile(request: web.Request) -> web.Response:
         profile_patch["avatar_url"] = new_avatar_url
     if isinstance(new_role, str):
         profile_patch["role"] = new_role
-    if isinstance(new_role_short, str):
-        profile_patch["role_short"] = new_role_short
+        # role_short is single-source-derived from role (PUF-401); push the
+        # derived chip so the server stores the single-source value.
+        profile_patch["role_short"] = _derive_role_short(new_role)
 
     new_profile_summary = payload.get("profile_summary")
     stripped_summary: str | None = None
@@ -655,10 +657,9 @@ async def update_profile(request: web.Request) -> web.Response:
         cfg.avatar_url = new_avatar_url
     if isinstance(new_role, str):
         cfg.role = new_role
-        if not isinstance(new_role_short, str):
-            cfg.role_short = _derive_role_short(new_role)
-    if isinstance(new_role_short, str):
-        cfg.role_short = new_role_short
+        # role_short is single-source-derived from role (PUF-401); any
+        # explicit role_short on the wire is accepted but ignored.
+        cfg.role_short = _derive_role_short(new_role)
     cfg.save()
     if isinstance(new_role, str):
         _update_profile_role(cfg, new_role)
@@ -713,24 +714,9 @@ async def update_profile(request: web.Request) -> web.Response:
 
 
 def _derive_role_short(role: str) -> str:
-    """Local mirror of puffo-server's ``derive_role_short``: pull a
-    short chip label out of a ``<short>: <description>``-shaped role
-    string. Returns ``""`` for any shape the server would also
-    reject (no colon, empty prefix, whitespace in prefix, empty
-    suffix, prefix > ``MAX_ROLE_SHORT_LEN``). Kept in sync with
-    ``profiles::derive_role_short`` in puffo-server."""
-    if ":" not in role:
-        return ""
-    colon_pos = role.index(":")
-    candidate = role[:colon_pos].strip()
-    rest = role[colon_pos + 1:].strip()
-    if not candidate or not rest:
-        return ""
-    if len(candidate) > MAX_ROLE_SHORT_LEN:
-        return ""
-    if any(ch.isspace() for ch in candidate):
-        return ""
-    return candidate
+    """Thin wrapper over :func:`state.derive_role_short` — the single
+    canonical implementation (PUF-401). Kept for existing call-sites."""
+    return derive_role_short(role)
 
 
 def _update_profile_summary(cfg: AgentConfig, new_summary: str) -> None:
@@ -1523,11 +1509,9 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
         raise ProvisionError(f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters")
     if not role and role_short_raw:
         raise ProvisionError("role_short cannot be set without role")
-    role_short = (
-        role_short_raw.strip() if isinstance(role_short_raw, str)
-        else _derive_role_short(role) if role
-        else ""
-    )
+    # role_short is single-source-derived from role (PUF-401); role_short_raw
+    # is still accepted on the wire (validated above) but ignored.
+    role_short = _derive_role_short(role) if role else ""
     profile_text = payload.get("profile")
     if not isinstance(profile_text, str) or not profile_text.strip():
         raise ProvisionError("profile (markdown body) is required")

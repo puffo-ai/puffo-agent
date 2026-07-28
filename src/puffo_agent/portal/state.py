@@ -1038,6 +1038,31 @@ class RuntimeConfig:
     max_turns: int = 10
 
 
+MAX_ROLE_SHORT_LEN = 32
+
+
+def derive_role_short(role: str) -> str:
+    """Canonical mirror of puffo-server's ``profiles::derive_role_short``:
+    pull a short chip label out of a ``<short>: <description>``-shaped role
+    string. Returns ``""`` for any shape the server would also reject (no
+    colon, empty prefix, whitespace in the prefix, empty suffix, prefix
+    longer than ``MAX_ROLE_SHORT_LEN``). ``role_short`` is single-source
+    derived from ``role`` (PUF-401); this is the one implementation — the
+    bridge and CLI wrappers delegate here."""
+    if ":" not in role:
+        return ""
+    colon_pos = role.index(":")
+    candidate = role[:colon_pos].strip()
+    rest = role[colon_pos + 1:].strip()
+    if not candidate or not rest:
+        return ""
+    if len(candidate) > MAX_ROLE_SHORT_LEN:
+        return ""
+    if any(ch.isspace() for ch in candidate):
+        return ""
+    return candidate
+
+
 @dataclass
 class AgentConfig:
     """Contents of ~/.puffo-agent/agents/<id>/agent.yml.
