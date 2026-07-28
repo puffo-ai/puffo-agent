@@ -384,7 +384,7 @@ def test_looks_like_codex_thread_limit_helper():
 # _propagate_turn_outcome at the success / turn_failed sites. Uses the
 # same fake-codex-app-server pattern as test_codex_session.py so the
 # wire shape matches what real codex emits. Timeout coverage is
-# omitted because TURN_TIMEOUT_SECONDS = 600s makes the wire-level
+# omitted because TURN_TIMEOUT_SECONDS = 1800s makes the wire-level
 # path impractical to exercise; the bookkeeping for the timeout outcome
 # is fully covered by the direct ``_propagate_turn_outcome(outcome=
 # "timeout")`` tests above.
