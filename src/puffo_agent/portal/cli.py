@@ -449,8 +449,7 @@ def _resolve_api_key_for_create(
 
 
 def _derive_role_short_cli(role: str) -> str:
-    """Thin wrapper over :func:`state.derive_role_short` — the single
-    canonical implementation (PUF-401). Kept for existing call-sites."""
+    """Thin wrapper over the canonical :func:`state.derive_role_short`."""
     return derive_role_short(role)
 
 
@@ -487,8 +486,6 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     if role_short_raw and len(role_short_raw) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
-    # role_short is single-source-derived from role (PUF-401); --role-short
-    # is still accepted on the CLI (validated above) but ignored.
     role_short = _derive_role_short_cli(role) if role else ""
     if role_short_raw and role_short_raw != role_short:
         print(
@@ -956,9 +953,6 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if role_short_arg is not None and len(role_short_arg) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
-    # role_short is single-source-derived from role (PUF-401); --role-short is
-    # accepted but ignored. Warn when the supplied value would differ from the
-    # authoritative derived one so it's never dropped silently.
     if role_short_arg is not None and role_short_arg.strip():
         _authoritative = _derive_role_short_cli(
             role_arg if isinstance(role_arg, str) else cfg.role
@@ -981,8 +975,6 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if isinstance(role_arg, str):
         cfg.role = role_arg
         patch["role"] = role_arg
-        # role_short is single-source-derived from role (PUF-401);
-        # --role-short is accepted but ignored (derive wins).
         cfg.role_short = _derive_role_short_cli(role_arg)
         patch["role_short"] = cfg.role_short
 

@@ -600,10 +600,6 @@ async def update_profile(request: web.Request) -> web.Response:
         return _bad(
             f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters",
         )
-    # role_short is single-source-derived from role (PUF-401). An explicit
-    # role_short is still accepted for backward compat but ignored; warn when
-    # the supplied value would actually differ from the derived one so a
-    # deprecated caller learns the value was dropped (never silently).
     if isinstance(new_role_short, str) and isinstance(new_role, str):
         _derived = _derive_role_short(new_role)
         if new_role_short.strip() and new_role_short.strip() != _derived:
@@ -647,8 +643,6 @@ async def update_profile(request: web.Request) -> web.Response:
         profile_patch["avatar_url"] = new_avatar_url
     if isinstance(new_role, str):
         profile_patch["role"] = new_role
-        # role_short is single-source-derived from role (PUF-401); push the
-        # derived chip so the server stores the single-source value.
         profile_patch["role_short"] = _derive_role_short(new_role)
 
     new_profile_summary = payload.get("profile_summary")
@@ -669,8 +663,6 @@ async def update_profile(request: web.Request) -> web.Response:
         cfg.avatar_url = new_avatar_url
     if isinstance(new_role, str):
         cfg.role = new_role
-        # role_short is single-source-derived from role (PUF-401); any
-        # explicit role_short on the wire is accepted but ignored.
         cfg.role_short = _derive_role_short(new_role)
     cfg.save()
     if isinstance(new_role, str):
@@ -726,8 +718,7 @@ async def update_profile(request: web.Request) -> web.Response:
 
 
 def _derive_role_short(role: str) -> str:
-    """Thin wrapper over :func:`state.derive_role_short` — the single
-    canonical implementation (PUF-401). Kept for existing call-sites."""
+    """Thin wrapper over the canonical :func:`state.derive_role_short`."""
     return derive_role_short(role)
 
 
@@ -1521,8 +1512,6 @@ def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
         raise ProvisionError(f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters")
     if not role and role_short_raw:
         raise ProvisionError("role_short cannot be set without role")
-    # role_short is single-source-derived from role (PUF-401); role_short_raw
-    # is still accepted on the wire (validated above) but ignored.
     role_short = _derive_role_short(role) if role else ""
     if isinstance(role_short_raw, str) and role_short_raw.strip() and role_short_raw.strip() != role_short:
         logger.warning(

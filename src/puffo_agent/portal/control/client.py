@@ -269,8 +269,6 @@ async def execute_command(
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
             patch["role"] = params["role"]
-            # role_short is single-source-derived from role (PUF-401);
-            # keep it in lock-step so it never orphans on this write path.
             cfg.role_short = derive_role_short(params["role"])
             patch["role_short"] = cfg.role_short
             prompt_changed = True

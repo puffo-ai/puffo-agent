@@ -757,8 +757,6 @@ class AgentDetail(QWidget):
 
         cfg.display_name = self._display_name.text().strip() or cfg.display_name
         cfg.role = role
-        # role_short is single-source-derived from role (PUF-401); the
-        # role_short field is accepted but ignored (derive wins).
         cfg.role_short = derive_role_short(role)
         cfg.runtime.kind = runtime_kind
         cfg.runtime.provider = provider
