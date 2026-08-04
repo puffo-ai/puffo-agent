@@ -528,3 +528,39 @@ async def test_f3_send_list_spaces_timeout_discards_waiter_then_next_resolves():
             await consumer
         except (asyncio.CancelledError, Exception):
             pass
+
+
+def test_fresh_tls_context_is_rebuilt_per_call_not_cached():
+    """PUF-192: the helper must return a NEW verifying SSLContext each call,
+    never a reused singleton — that's what lets a reconnect pick up E2B's
+    proxy CA if it landed after the process (and aiohttp's cached default
+    context) was created."""
+    import ssl as _ssl
+
+    a = bridge_client_mod._fresh_tls_context()
+    b = bridge_client_mod._fresh_tls_context()
+    assert isinstance(a, _ssl.SSLContext)
+    assert a is not b, "must be rebuilt per call, not a cached singleton"
+    assert a.verify_mode == _ssl.CERT_REQUIRED, "must be a verifying default context"
+
+
+@pytest.mark.asyncio
+async def test_connect_passes_a_fresh_tls_context_to_ws_connect(monkeypatch):
+    """PUF-192: connect() must hand ws_connect an explicit per-connect
+    SSLContext, bypassing aiohttp's import-time cached default so a boot-time
+    E2B-proxy-CA race self-heals on the next reconnect."""
+    import ssl as _ssl
+
+    captured: dict = {}
+
+    async def _capture_ws_connect(self, *a, **k):
+        captured["ssl"] = k.get("ssl")
+        raise OSError("stop-after-capture")  # we only need the kwarg
+
+    monkeypatch.setattr(aiohttp.ClientSession, "ws_connect", _capture_ws_connect)
+    c = CloudBridgeClient("http://127.0.0.1:1", "sbx", "slug")
+    with pytest.raises(OSError):
+        await c.connect()
+    assert isinstance(captured["ssl"], _ssl.SSLContext), (
+        "connect() must pass a fresh SSLContext to ws_connect (PUF-192)"
+    )

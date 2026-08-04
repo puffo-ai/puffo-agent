@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import ssl
 import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
@@ -30,6 +31,23 @@ logger = logging.getLogger(__name__)
 # Module constant (not class attribute) so tests can monkeypatch a
 # short interval. Server recv-timeout is 90s.
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _fresh_tls_context() -> ssl.SSLContext:
+    """A fresh default TLS trust context, rebuilt on every (re)connect.
+
+    aiohttp caches its default verified ``SSLContext`` at import time (the
+    module-level ``connector._SSL_CONTEXT_VERIFIED`` singleton) and reuses it for
+    the whole process. E2B's egress proxy TLS-intercepts the relay host to inject
+    ``x-sandbox-token`` and installs its ``E2B Proxy CA`` into the sandbox system
+    trust store at boot (~boot + 2s). If the daemon imports aiohttp *before* that
+    CA lands — a boot-time race — the cached context never picks it up and every
+    connection to the intercepted relay loops on ``CERTIFICATE_VERIFY_FAILED``
+    until the process is restarted. Building the context here re-reads the system
+    trust store on each call, so a lost boot race self-heals on the next connect.
+    See PUF-192.
+    """
+    return ssl.create_default_context()
 
 
 class BridgeError(Exception):
@@ -97,6 +115,7 @@ class CloudBridgeClient:
             try:
                 self._ws = await self._session.ws_connect(
                     self._url, headers=headers, heartbeat=None,
+                    ssl=_fresh_tls_context(),
                 )
             except aiohttp.WSServerHandshakeError as exc:
                 raise BridgeError(
@@ -252,6 +271,7 @@ class CloudBridgeClient:
             ) as session:
                 async with session.post(
                     url, data=data, headers=headers,
+                    ssl=_fresh_tls_context(),
                 ) as resp:
                     body = await resp.read()
                     if resp.status // 100 != 2:
@@ -287,7 +307,9 @@ class CloudBridgeClient:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=300),
             ) as session:
-                async with session.get(url, headers=headers) as resp:
+                async with session.get(
+                    url, headers=headers, ssl=_fresh_tls_context(),
+                ) as resp:
                     if resp.status != 200:
                         logger.warning(
                             "cloud bridge: blob download failed "
@@ -324,6 +346,7 @@ class CloudBridgeClient:
             ) as session:
                 async with session.request(
                     method, url, headers=headers, json=json_body,
+                    ssl=_fresh_tls_context(),
                 ) as resp:
                     body = await resp.read()
                     if not body:
