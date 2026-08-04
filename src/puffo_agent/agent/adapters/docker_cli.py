@@ -155,6 +155,7 @@ class DockerCLIAdapter(Adapter):
         memory_limit: str = "",
         memory_reservation: str = "",
         desired_skills: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
@@ -195,6 +196,8 @@ class DockerCLIAdapter(Adapter):
         # Installed into the bind-mounted .claude/skills/ on first
         # start (see _ensure_started). MCPs are rejected upstream.
         self.desired_skills = list(desired_skills or [])
+        # PUF-409: whitelisted per-agent env; becomes `docker exec -e K=V`.
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir

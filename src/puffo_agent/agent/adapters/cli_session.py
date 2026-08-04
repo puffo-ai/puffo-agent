@@ -193,6 +193,7 @@ class ClaudeSession:
         audit: Optional["AuditLog"] = None,
         extra_args: Optional[list[str]] = None,
         model: str = "",
+        env_overrides: Optional[dict[str, str]] = None,
     ):
         """
         ``build_command(extra_args, env_overrides)`` returns the full
@@ -201,6 +202,11 @@ class ClaudeSession:
         is merged on the host); cli-docker prepends ``["docker",
         "exec", "-i", ...]`` plus ``-e KEY=VALUE`` for each
         ``env_overrides`` entry.
+
+        ``env_overrides`` carries the agent's whitelisted per-agent env
+        (PUF-409), e.g. ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``. The docker
+        adapter needs them here because its subprocess env is the daemon's,
+        not the container's.
 
         ``audit`` is optional; when set, each turn appends structured
         events for operators to tail.
@@ -224,6 +230,9 @@ class ClaudeSession:
         # Extra claude CLI flags re-applied on every spawn (typically
         # --mcp-config / --permission-prompt-tool).
         self.extra_args = list(extra_args or [])
+        self.env_overrides = {
+            str(k): str(v) for k, v in (env_overrides or {}).items()
+        }
 
         self._proc: asyncio.subprocess.Process | None = None
         self._system_prompt_seen: str | None = None
@@ -508,14 +517,16 @@ class ClaudeSession:
         if self._session_id:
             args.extend(["--resume", self._session_id])
 
-        # ``env_overrides`` is reserved for future per-spawn env
-        # injection. Today's spawn doesn't set anything — adding
-        # NODE_OPTIONS=--max-old-space-size made things worse on
-        # constrained Docker Desktop VMs (V8 delayed GC, RSS
-        # climbed). The real fix for resume contention is serialised
-        # warm in worker.py + per-container memory caps in
-        # docker_cli.py.
-        env_overrides: dict[str, str] = {}
+        # PUF-409: per-agent env overrides (whitelisted at the edit-command
+        # boundary) are injected per spawn. For the docker adapter these
+        # become ``docker exec -e KEY=VALUE``; the local adapter already has
+        # them in the process env it hands to this session.
+        #
+        # Note the historical caveat this hook carries: NODE_OPTIONS=
+        # --max-old-space-size made things worse on constrained Docker
+        # Desktop VMs (V8 delayed GC, RSS climbed), which is why the
+        # whitelist stays narrow rather than becoming a general env passthrough.
+        env_overrides: dict[str, str] = dict(self.env_overrides)
         cmd = self.build_command(args, env_overrides)
         logger.info(
             "agent %s: spawning claude session (resume=%s)",
@@ -778,6 +789,7 @@ class ClaudeSession:
         # a duplicate). Empty ``root_id`` = top-level post.
         send_message_targets: list[dict] = []
         input_tokens = 0
+        context_tokens = 0
         output_tokens = 0
         event_types_seen: list[str] = []
 
@@ -871,6 +883,13 @@ class ClaudeSession:
                     usage.get("cache_creation_input_tokens", 0) or 0
                 )
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
+                # PUF-409: the whole prompt the model saw this turn — uncached
+                # + newly-cached + cache-read. This is what auto-compact
+                # measures against the context window, so it's the number the
+                # operator's "current context" reading needs.
+                context_tokens = input_tokens + int(
+                    usage.get("cache_read_input_tokens", 0) or 0
+                )
                 # Fallback for CLI versions where the assembled text
                 # reply only appears on ``result.result``.
                 result_text = event.get("result") or ""
@@ -915,6 +934,7 @@ class ClaudeSession:
             tool_calls=tool_calls,
             metadata={
                 "session_id": self._session_id,
+                "context_tokens": context_tokens,
                 "tool_names": tool_names_used,
                 "send_message_targets": send_message_targets,
                 # Per-frame assistant text — used by the shell to

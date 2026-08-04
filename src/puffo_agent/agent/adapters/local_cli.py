@@ -166,11 +166,17 @@ class LocalCLIAdapter(Adapter):
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
     ):
         self.agent_id = agent_id
+        # PUF-409: per-agent env injected at spawn. Whitelisted upstream at the
+        # edit-command boundary; layered over os.environ but under the vars the
+        # adapter owns (HOME, credentials, hook wiring) so an override can't
+        # break the subprocess's isolation.
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.model = model
         self.workspace_dir = workspace_dir
         self.claude_dir = claude_dir
@@ -380,6 +386,7 @@ class LocalCLIAdapter(Adapter):
 
         env = {
             **os.environ,
+            **self.env_overrides,
             "CODEX_HOME": str(codex_home),
         }
         auth_mode = sync_host_codex_auth_view(Path.home(), codex_home)
@@ -595,6 +602,7 @@ class LocalCLIAdapter(Adapter):
         )
         env = {
             **os.environ,
+            **self.env_overrides,
             "HERMES_HOME": str(self._hermes_home),
         }
         cmd = [
@@ -789,6 +797,7 @@ class LocalCLIAdapter(Adapter):
         # consumed by the per-tool-call hook subprocess.
         env = {
             **os.environ,
+            **self.env_overrides,
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
@@ -806,6 +815,7 @@ class LocalCLIAdapter(Adapter):
             ),
             extra_args=extra,
             model=self.model,
+            env_overrides=self.env_overrides,
         )
         return self._session
 

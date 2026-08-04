@@ -330,6 +330,26 @@ class PuffoAgent:
             )
         )
 
+        # PUF-409: context-window telemetry, piggybacked on turn completion so
+        # the operator's panel updates exactly when the number changes. Only
+        # harnesses that report a context size (claude-code today) emit it;
+        # the rest send no event rather than a misleading zero.
+        context_tokens = result.metadata.get("context_tokens")
+        if isinstance(context_tokens, int) and context_tokens > 0:
+            from ..portal.control.context_telemetry import build_context_telemetry
+
+            asyncio.ensure_future(
+                get_reporter().emit(
+                    self.agent_id,
+                    "context_telemetry",
+                    build_context_telemetry(
+                        model=getattr(self.adapter, "model", "") or "",
+                        current_context_tokens=context_tokens,
+                        env_overrides=getattr(self.adapter, "env_overrides", None),
+                    ),
+                )
+            )
+
         # Reply routing:
         #   a. send_message called → return None (MCP already posted).
         #   b. else if [SILENT] in assistant.text → silent.
