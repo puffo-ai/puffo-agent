@@ -338,16 +338,21 @@ class PuffoAgent:
         if isinstance(context_tokens, int) and context_tokens > 0:
             from ..portal.control.context_telemetry import build_context_telemetry
 
-            asyncio.ensure_future(
-                get_reporter().emit(
-                    self.agent_id,
-                    "context_telemetry",
-                    build_context_telemetry(
-                        model=getattr(self.adapter, "model", "") or "",
-                        current_context_tokens=context_tokens,
-                        env_overrides=getattr(self.adapter, "env_overrides", None),
-                    ),
+            telemetry = build_context_telemetry(
+                model=getattr(self.adapter, "model", "") or "",
+                current_context_tokens=context_tokens,
+                env_overrides=getattr(self.adapter, "env_overrides", None),
+            )
+            if telemetry["override_unhonored"]:
+                self.logger.warning(
+                    "agent %s: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE appears to be "
+                    "ignored by this claude-code build (context %d exceeds the "
+                    "configured threshold without compacting) — reporting the "
+                    "default threshold instead",
+                    self.agent_id, context_tokens,
                 )
+            asyncio.ensure_future(
+                get_reporter().emit(self.agent_id, "context_telemetry", telemetry)
             )
 
         # Reply routing:

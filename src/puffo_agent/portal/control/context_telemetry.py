@@ -90,6 +90,23 @@ def compact_threshold_tokens(window: int, pct: float | None) -> int:
     return min(int(window * pct / 100), default)
 
 
+def override_appears_unhonored(
+    current_context_tokens: int, threshold: int, pct: float | None
+) -> bool:
+    """True when an active pct override looks like it isn't being applied.
+
+    ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`` is an internal claude-code knob, so a
+    future CLI could stop reading it — silently, since nothing reports back.
+    The tell is behavioural: context that sails well past the threshold we
+    computed without a compact landing. One turn *at* the threshold is normal
+    (that's the turn that triggers it), so a full headroom of slack is allowed
+    before calling it unhonored.
+    """
+    if pct is None:
+        return False
+    return current_context_tokens > threshold + COMPACT_HEADROOM_TOKENS
+
+
 def build_context_telemetry(
     *,
     model: str = "",
@@ -109,6 +126,12 @@ def build_context_telemetry(
     threshold = compact_threshold_tokens(window, pct)
     default_threshold = compact_threshold_tokens(window, None)
     current = max(0, int(current_context_tokens or 0))
+    unhonored = override_appears_unhonored(current, threshold, pct)
+    if unhonored:
+        # Report the behaviour we can see, not the setting we asked for: the
+        # panel must stop claiming a threshold that isn't taking effect.
+        threshold = default_threshold
+        pct = None
     return {
         "max_context": window,
         "current_context": current,
@@ -117,5 +140,9 @@ def build_context_telemetry(
         # would actually honour it.
         "auto_compact_threshold_pct": pct,
         "threshold_is_default": threshold == default_threshold,
+        # True when an override was set but claude-code appears to ignore it
+        # (knob removed upstream). UI surfaces "not applying" rather than a
+        # stale promise.
+        "override_unhonored": unhonored,
         "used_pct": round(current / window * 100, 1) if window > 0 else 0.0,
     }

@@ -231,3 +231,51 @@ def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
     assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "50"
     # HOME is adapter-owned and must survive any override attempt.
     assert env["HOME"] == str(adapter.agent_home_dir)
+
+
+# ── override-unhonored detector (PUF-409, Vase risk-accept condition) ──
+
+
+def test_override_honored_while_context_is_below_threshold():
+    out = build_context_telemetry(
+        model="claude-sonnet-5",
+        current_context_tokens=99_000,
+        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"},
+        env={},
+    )
+    assert out["override_unhonored"] is False
+    assert out["auto_compact_threshold"] == 100_000
+
+
+def test_one_turn_at_the_threshold_is_not_treated_as_unhonored():
+    # The turn that trips auto-compact necessarily reaches the threshold.
+    out = build_context_telemetry(
+        model="claude-sonnet-5",
+        current_context_tokens=105_000,
+        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"},
+        env={},
+    )
+    assert out["override_unhonored"] is False
+
+
+def test_context_sailing_past_the_threshold_reports_unhonored():
+    # 50% of 200K = 100K; a turn at 160K means no compact happened, so the
+    # knob is not being applied by this claude-code build.
+    out = build_context_telemetry(
+        model="claude-sonnet-5",
+        current_context_tokens=160_000,
+        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"},
+        env={},
+    )
+    assert out["override_unhonored"] is True
+    # Must report observed behaviour, not the setting we asked for.
+    assert out["auto_compact_threshold"] == 187_000
+    assert out["auto_compact_threshold_pct"] is None
+    assert out["threshold_is_default"] is True
+
+
+def test_no_override_never_reports_unhonored():
+    out = build_context_telemetry(
+        model="claude-sonnet-5", current_context_tokens=199_000, env={},
+    )
+    assert out["override_unhonored"] is False
