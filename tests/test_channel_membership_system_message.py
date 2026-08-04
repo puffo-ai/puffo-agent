@@ -37,6 +37,7 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._channel_space = {}
     client._space_name_cache = {}
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     client._space_members = {}
     client._processed_membership_event_ids = set()
 

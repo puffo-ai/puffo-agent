@@ -602,6 +602,10 @@ class PuffoCoreMessageClient:
         # fallback when lookup fails so the LLM never sees a blank.
         self._space_name_cache: dict[str, str] = {}
         self._channel_name_cache: dict[str, str] = {}
+        # PUF-411: channel_id → format policy. True = E2EE-only, False =
+        # plaintext-only, None (or absent) = owner set no policy, so the
+        # send decision falls back to the source-based rules.
+        self._channel_encrypted: dict[str, Optional[bool]] = {}
 
         # Per-space member cache (slug → identity_type) for mention
         # scoping + bot-vs-human labelling. Lazy, session-lifetime.
@@ -1923,6 +1927,7 @@ class PuffoCoreMessageClient:
         for cid in [c for c, s in self._channel_space.items() if s == space_id]:
             self._channel_space.pop(cid, None)
             self._channel_name_cache.pop(cid, None)
+            self._channel_encrypted.pop(cid, None)
         self._space_name_cache.pop(space_id, None)
         self._space_members.pop(space_id, None)
         try:
@@ -1942,6 +1947,7 @@ class PuffoCoreMessageClient:
             return
         self._channel_space.pop(channel_id, None)
         self._channel_name_cache.pop(channel_id, None)
+        self._channel_encrypted.pop(channel_id, None)
         try:
             await self.store.unmark_channel_space(channel_id)
         except Exception:
@@ -2663,13 +2669,61 @@ class PuffoCoreMessageClient:
             # populated these isn't clobbered with potentially older
             # data we just fetched.
             self._channel_space.setdefault(cid, space_id)
+            # PUF-411: policy is authoritative from the server on every
+            # fetch, so it overwrites rather than setdefault — a stale
+            # cached value is exactly what the send guard would trip on.
+            policy = ch.get("is_encrypted")
+            self._channel_encrypted[cid] = (
+                bool(policy) if policy is not None else None
+            )
             if name:
                 self._channel_name_cache.setdefault(cid, name)
-                disk_cache.persist_channel(cid, name, space_id)
+                disk_cache.persist_channel(
+                    cid, name, space_id, self._channel_encrypted[cid],
+                )
             try:
                 await self.store.mark_channel_space(cid, space_id)
             except Exception:
                 pass
+
+    def channel_policy(self, channel_id: str) -> Optional[bool]:
+        """PUF-411: cached format policy, falling back to disk.
+
+        None means "no policy" — either the owner never set one or we've
+        never seen the channel. Both cases must behave identically: leave
+        the send decision to the source-based rules.
+        """
+        if not channel_id:
+            return None
+        if channel_id in self._channel_encrypted:
+            return self._channel_encrypted[channel_id]
+        cached = disk_cache.load_channel(channel_id) or {}
+        policy = cached.get("is_encrypted")
+        return bool(policy) if policy is not None else None
+
+    async def refresh_channel_policy(self, channel_id: str) -> Optional[bool]:
+        """Re-read one channel's policy from the server.
+
+        The send path calls this after the server rejects a format, so it
+        deliberately skips ``rewarm_channel_caches``' 5s debounce — the
+        retry needs the value now, not on the next tick.
+        """
+        space_id = self._channel_space.get(channel_id) or ""
+        if not space_id:
+            try:
+                space_id = await self.store.lookup_channel_space(channel_id) or ""
+            except Exception:
+                space_id = ""
+        if not space_id:
+            return self.channel_policy(channel_id)
+        try:
+            await self._warm_channels_for_space(space_id)
+        except Exception:
+            self._log.debug(
+                "refresh_channel_policy(%s) failed; keeping cached value",
+                channel_id,
+            )
+        return self.channel_policy(channel_id)
 
     async def _bulk_fetch_profiles(self, slugs: list[str]) -> None:
         """Batch ``/identities/profiles?slugs=...``; chunked so a

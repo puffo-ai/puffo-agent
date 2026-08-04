@@ -24,7 +24,7 @@ from ..crypto.attachments import (
     encrypt_attachment,
 )
 from ..crypto.encoding import base64url_decode, base64url_encode
-from ..crypto.http_client import PuffoCoreHttpClient
+from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
     build_plaintext_message,
@@ -42,13 +42,100 @@ from ._host_mcp import PuffoRpcClient
 logger = logging.getLogger(__name__)
 
 
-async def _send_encryption_required(cfg, resolved_root):
+async def _send_encryption_required(cfg, resolved_root, channel_id=None):
     """Daemon-level send-mode decision. Data-client shims without the
     method (older harnesses) fail safe to E2EE."""
     getter = getattr(cfg.data_client, "get_send_encryption", None)
     if getter is None:
         return True
-    return await getter(cfg.slug, resolved_root or None)
+    try:
+        return await getter(cfg.slug, resolved_root or None, channel_id or None)
+    except TypeError:
+        # PUF-411 widened this signature; a shim pinned to the old
+        # 2-arg shape still answers the source-based question correctly.
+        return await getter(cfg.slug, resolved_root or None)
+
+
+def _format_mismatch(exc: Exception) -> Optional[bool]:
+    """The channel policy the server just told us to use, or None.
+
+    PUF-410's two send endpoints each reject the other's format with a
+    400. The retry needs to know which way to flip, and the only signal
+    is the message — so this reads it rather than assuming the opposite
+    of what we sent (which would loop on an unrelated 400).
+    """
+    if not isinstance(exc, HttpError) or exc.status != 400:
+        return None
+    body = (exc.body or "").lower()
+    if "is plaintext; send via" in body:
+        return False
+    if "is encrypted; send a sealed envelope" in body:
+        return True
+    return None
+
+
+async def _post_respecting_channel_format(
+    cfg, inp, signing_key, encrypt: bool,
+    recipient_slugs: list, channel_id: Optional[str],
+) -> dict:
+    """Send via the endpoint the channel's format policy demands.
+
+    PUF-411. A policy flip between our cache read and the write comes
+    back as a 400 naming the format the channel now wants. We take the
+    server's word for it, rebuild in that shape and send once more.
+
+    Exactly one retry: a second rejection of the shape the server itself
+    just asked for is a server bug, not a race, and retrying would only
+    amplify it. Device keys are re-fetched per attempt because the
+    plaintext path doesn't resolve them at all.
+    """
+    for attempt in (0, 1):
+        devices: list = []
+        if encrypt:
+            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
+            if not devices:
+                raise RuntimeError("no recipient devices found")
+        inp.recipients = devices
+        try:
+            if encrypt:
+                envelope, content_key = encrypt_message_with_content_key(
+                    inp, signing_key,
+                )
+                # Server expects the envelope at the top level, not wrapped.
+                resp = await cfg.http_client.post("/messages", envelope) or {}
+                missing = resp.get("missing_devices") or []
+                if missing:
+                    asyncio.create_task(_supplement_missing_devices(
+                        cfg.http_client, envelope, content_key,
+                        recipient_slugs, missing,
+                    ))
+            else:
+                envelope = build_plaintext_message(inp, signing_key)
+                await cfg.http_client.post("/v2/messages/plaintext", envelope)
+            return envelope
+        except Exception as exc:
+            wanted = _format_mismatch(exc)
+            if wanted is None or wanted == encrypt or attempt == 1:
+                raise
+            logger.info(
+                "channel %s wants %s; resending",
+                channel_id or "?", "e2ee" if wanted else "plaintext",
+            )
+            encrypt = wanted
+            # Best-effort: leave the daemon's cache correct so the next
+            # send doesn't pay for the same round trip.
+            await _refresh_channel_policy(cfg, channel_id)
+    raise RuntimeError("unreachable: send retry loop exhausted")
+
+
+async def _refresh_channel_policy(cfg, channel_id: Optional[str]) -> None:
+    getter = getattr(cfg.data_client, "refresh_channel_policy", None)
+    if getter is None or not channel_id:
+        return
+    try:
+        await getter(channel_id)
+    except Exception as exc:  # noqa: BLE001 — the send already recovered
+        logger.debug("refresh_channel_policy(%s) failed: %s", channel_id, exc)
 
 
 async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
@@ -485,12 +572,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             dm_peer=recipient_slug,
         )
-        encrypt = await _send_encryption_required(cfg, resolved_root)
-        devices: list = []
-        if encrypt:
-            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-            if not devices:
-                raise RuntimeError("no recipient devices found")
+        encrypt = await _send_encryption_required(cfg, resolved_root, channel_id)
         # Visibility floors key off the RESOLVED root — a wiped root makes
         # this a root-level post, which can't fold in the UI.
         effective_visible, visibility_note = await _resolve_visibility(
@@ -507,23 +589,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             thread_root_id=resolved_root,
             content_type="text/plain",
             content=text,
-            recipients=devices,
+            recipients=[],
         )
-        if encrypt:
-            envelope, content_key = encrypt_message_with_content_key(
-                inp, signing_key,
-            )
-            # Server expects the envelope at the top level, not wrapped.
-            resp = await cfg.http_client.post("/messages", envelope) or {}
-            missing = resp.get("missing_devices") or []
-            if missing:
-                asyncio.create_task(_supplement_missing_devices(
-                    cfg.http_client, envelope, content_key,
-                    recipient_slugs, missing,
-                ))
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            await cfg.http_client.post("/v2/messages/plaintext", envelope)
+        envelope = await _post_respecting_channel_format(
+            cfg, inp, signing_key, encrypt, recipient_slugs, channel_id,
+        )
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
             f"{visibility_note}"
@@ -1109,14 +1179,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             dm_peer=recipient_slug,
         )
-        encrypt = await _send_encryption_required(cfg, resolved_root)
-        devices: list = []
-        if encrypt:
-            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-            if not devices:
-                raise RuntimeError(
-                    "send_message_with_attachments: no recipient devices found"
-                )
+        encrypt = await _send_encryption_required(cfg, resolved_root, channel_id)
         effective_visible, visibility_note = await _resolve_visibility(
             visibility_level, channel_ref, caption, resolved_root or "", cfg.http_client,
         )
@@ -1131,22 +1194,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             thread_root_id=resolved_root,
             content_type=ATTACHMENT_CONTENT_TYPE,
             content=body_content,
-            recipients=devices,
+            recipients=[],
         )
-        if encrypt:
-            envelope, content_key = encrypt_message_with_content_key(
-                inp, signing_key,
-            )
-            resp = await cfg.http_client.post("/messages", envelope) or {}
-            missing = resp.get("missing_devices") or []
-            if missing:
-                asyncio.create_task(_supplement_missing_devices(
-                    cfg.http_client, envelope, content_key,
-                    recipient_slugs, missing,
-                ))
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            await cfg.http_client.post("/v2/messages/plaintext", envelope)
+        envelope = await _post_respecting_channel_format(
+            cfg, inp, signing_key, encrypt, recipient_slugs, channel_id,
+        )
         names = ", ".join(t.name for t in targets)
         thread_note = f" in thread {resolved_root}" if resolved_root else ""
         return (

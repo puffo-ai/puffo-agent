@@ -79,7 +79,15 @@ def persist_space(space_id: str, name: str) -> None:
         logger.debug("persist_space(%s) failed: %s", space_id, exc)
 
 
-def persist_channel(channel_id: str, name: str, space_id: str = "") -> None:
+def persist_channel(
+    channel_id: str,
+    name: str,
+    space_id: str = "",
+    is_encrypted: Optional[bool] = None,
+) -> None:
+    # PUF-411. ``is_encrypted`` None = the channel owner set no format
+    # policy, which is every channel that predates PUF-410. Stored as null
+    # rather than omitted so a reader can tell "no policy" from "not cached".
     if not channel_id or not name:
         return
     try:
@@ -89,6 +97,7 @@ def persist_channel(channel_id: str, name: str, space_id: str = "") -> None:
                 "channel_id": channel_id,
                 "name": name,
                 "space_id": space_id,
+                "is_encrypted": is_encrypted,
                 "fetched_at": int(time.time()),
             },
         )

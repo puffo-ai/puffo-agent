@@ -52,6 +52,7 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     # /channels response so the immediately-following
     # ``_resolve_channel_name`` inside the intro nudge becomes a hit.
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     # Read by ``_maybe_announce_membership_change`` on the OTHER-signer
     # accept_channel_invite path; empty so the predicate bails cleanly.
     client._channel_space = {}

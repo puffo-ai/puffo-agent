@@ -35,9 +35,20 @@ async def encryption_required(
     key: str,
     store: Any,
     thread_root_id: str | None,
+    channel_policy: bool | None = None,
 ) -> bool:
     """The OR of the two rules. An unknown/unstored root counts as
-    encrypted (store rows also default is_encrypted=True for legacy)."""
+    encrypted (store rows also default is_encrypted=True for legacy).
+
+    PUF-411: an explicit channel policy short-circuits both rules, in
+    either direction. That includes forcing plaintext on a channel the
+    owner marked plaintext even when the thread root was encrypted —
+    the alternative isn't a safer send, it's a rejected one, because the
+    server refuses a sealed write there. ``None`` means no policy is set
+    (every channel predating PUF-410), leaving the rules untouched.
+    """
+    if channel_policy is not None:
+        return channel_policy
     if turn_bundle_encrypted(key):
         return True
     if not thread_root_id:
