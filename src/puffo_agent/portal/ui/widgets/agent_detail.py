@@ -49,7 +49,7 @@ from ...runtime_matrix import (
     harness_applies,
     validate_triple,
 )
-from ...state import AgentConfig, derive_role_short
+from ...state import AgentConfig, derive_role_short, validate_env_overrides
 from ..names import resolve_display_name
 from .avatar import initial_pixmap
 
@@ -283,6 +283,29 @@ class AgentDetail(QWidget):
         self._access.setWordWrap(True)
         layout.addRow("Access", self._access)
 
+        # PUF-409. Bands are percent-of-window; "95 (default)" clears the
+        # override rather than sending 95, because on a 1M-context model 95%
+        # lands ~37K BELOW claude-code's own default (window - 13000) and the
+        # label would be a lie. Empty = claude-code's default on any window.
+        self._autocompact = QComboBox()
+        for label, value in (
+            ("95% (default)", ""),
+            ("75%", "75"),
+            ("50%", "50"),
+            ("30%", "30"),
+        ):
+            self._autocompact.addItem(label, value)
+        self._autocompact.setToolTip(
+            "Compact the agent's context earlier to cut cold-read cost. "
+            "Takes effect on the agent's next spawn."
+        )
+        layout.addRow("Auto-compact at", self._autocompact)
+
+        self._context_usage = QLabel("—")
+        self._context_usage.setStyleSheet("color: #6b7280;")
+        self._context_usage.setWordWrap(True)
+        layout.addRow("Context", self._context_usage)
+
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
@@ -396,6 +419,7 @@ class AgentDetail(QWidget):
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
         self._populate_effort_combo(cfg.runtime.harness, cfg.runtime.inference_level)
         self._access.setText(self._access_summary(cfg.runtime.harness, cfg))
+        self._populate_autocompact(cfg)
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
         # ws-local agents bring their own brain — runtime / harness / model
@@ -441,6 +465,7 @@ class AgentDetail(QWidget):
             self._harness.currentText(),
             self._model.currentData() or "",
             self._effort.currentData() or "",
+            self._autocompact.currentData() or "",
         )
 
     def _check_dirty(self) -> None:
@@ -692,6 +717,37 @@ class AgentDetail(QWidget):
         self._effort.setCurrentIndex(idx if idx >= 0 else 0)
         self._effort.blockSignals(False)
 
+    def _populate_autocompact(self, cfg: AgentConfig) -> None:
+        """Select the persisted band and render the context readout.
+
+        A value claude-code would ignore (out of range, or hand-edited junk in
+        agent.yml) falls back to the default entry — the panel must not show a
+        setting that isn't in force.
+        """
+        from ...control.context_telemetry import (
+            build_context_telemetry,
+            parse_threshold_pct,
+        )
+
+        raw = cfg.env_overrides.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
+        pct = parse_threshold_pct(raw)
+        wanted = "" if pct is None else str(int(pct)) if float(pct).is_integer() else str(pct)
+        idx = self._autocompact.findData(wanted)
+        self._autocompact.blockSignals(True)
+        self._autocompact.setCurrentIndex(idx if idx >= 0 else 0)
+        self._autocompact.blockSignals(False)
+
+        t = build_context_telemetry(
+            model=cfg.runtime.model, env_overrides=cfg.env_overrides,
+        )
+        window_k = t["max_context"] // 1000
+        threshold_k = t["auto_compact_threshold"] // 1000
+        suffix = " (default)" if t["threshold_is_default"] else ""
+        self._context_usage.setText(
+            f"{window_k}K window · compacts at ~{threshold_k}K{suffix}. "
+            "Live usage shows in the web app; changes apply on next spawn."
+        )
+
     def _access_summary(self, harness: str, cfg) -> str:
         """Read-only access line: permission mode for claude-code,
         sandbox + approval policy for codex."""
@@ -763,6 +819,22 @@ class AgentDetail(QWidget):
         cfg.runtime.harness = harness
         cfg.runtime.model = model
         cfg.runtime.inference_level = self._effort.currentData() or ""
+        # Same validator the remote edit-agent command runs, so the desktop
+        # and web paths can't drift on what's accepted.
+        pct = self._autocompact.currentData() or ""
+        try:
+            merged = dict(cfg.env_overrides)
+            for key, value in validate_env_overrides(
+                {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": pct}
+            ).items():
+                if value == "":
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            cfg.env_overrides = merged
+        except ValueError as exc:
+            QMessageBox.warning(self, "Save", str(exc))
+            return
         try:
             cfg.save()
             _update_profile_summary(cfg, soul)

@@ -279,3 +279,34 @@ def test_no_override_never_reports_unhonored():
         model="claude-sonnet-5", current_context_tokens=199_000, env={},
     )
     assert out["override_unhonored"] is False
+
+
+# ── desktop-GUI band encoding (PUF-409) ──────────────────────────
+
+
+def test_default_band_clears_rather_than_sending_95():
+    # The GUI's "95% (default)" band sends "" so the label is true on EVERY
+    # window: on a 1M model a literal 95 would compact ~37K early.
+    from puffo_agent.portal.control.context_telemetry import compact_threshold_tokens
+
+    for window in (200_000, 1_000_000):
+        cleared = compact_threshold_tokens(window, parse_threshold_pct(""))
+        assert cleared == compact_threshold_tokens(window, None)
+    # ...and the literal-95 encoding would NOT have been the default at 1M.
+    assert compact_threshold_tokens(1_000_000, 95) != compact_threshold_tokens(
+        1_000_000, None
+    )
+
+
+def test_junk_persisted_value_falls_back_to_default_band():
+    # A hand-edited agent.yml carrying something claude-code ignores must
+    # render as the default band, not as an active setting.
+    assert parse_threshold_pct("999") is None
+    out = build_context_telemetry(
+        model="claude-sonnet-5",
+        current_context_tokens=1_000,
+        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "999"},
+        env={},
+    )
+    assert out["threshold_is_default"] is True
+    assert out["auto_compact_threshold_pct"] is None
