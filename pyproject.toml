@@ -37,7 +37,7 @@ dependencies = [
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
     "cryptography>=43.0",
-    "mcp>=1.0",
+    "mcp>=1.0,<2",  # mcp 2.x moved FastMCP out of `mcp.server.fastmcp` (now the standalone `fastmcp` pkg); our MCP servers import the 1.x path
     # Pillow stays in the BASE install (not an extra): the inbound-image
     # dimension guard (_downscale_oversized_image) runs on the shared
     # PuffoCoreClient delivery path for EVERY runtime kind — including the
