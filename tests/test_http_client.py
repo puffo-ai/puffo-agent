@@ -527,3 +527,27 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
                 assert "x-puffo-signature" in self.captured_headers
         finally:
             await client.close()
+
+
+def test_create_remote_http_session_uses_a_fresh_verifying_tls_context():
+    """PUF-192: the remote session must carry a fresh, verifying SSLContext
+    (not aiohttp's import-time cached default singleton), rebuilt per call — so a
+    session recreated after E2B (re)generates its per-sandbox proxy CA on a cold
+    restore picks the new CA up instead of looping on CERTIFICATE_VERIFY_FAILED."""
+    import ssl as _ssl
+
+    from puffo_agent.crypto.http_session import create_remote_http_session
+
+    async def _check():
+        s1 = create_remote_http_session("https://relay.example/relay")
+        s2 = create_remote_http_session("https://relay.example/relay")
+        try:
+            c1, c2 = s1.connector._ssl, s2.connector._ssl
+            assert isinstance(c1, _ssl.SSLContext)
+            assert c1.verify_mode == _ssl.CERT_REQUIRED
+            assert c1 is not c2, "must be a fresh context per call, not cached"
+        finally:
+            await s1.close()
+            await s2.close()
+
+    asyncio.run(_check())
