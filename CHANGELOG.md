@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-agent Claude Code auto-compaction controls and context telemetry.**
+  Operators can select the default 95%, 75%, 50%, or 30% threshold from the
+  desktop or web edit path. Changes restart only the affected worker, apply to
+  local and Docker CLI sessions, and report estimated context usage without
+  blocking turns.
+
 ### Fixed
 
 - **Skill ids ending in a newline are no longer accepted.** The daemon

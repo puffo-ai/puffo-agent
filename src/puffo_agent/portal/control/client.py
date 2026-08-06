@@ -304,26 +304,17 @@ async def execute_command(
             result = validate_triple(rt.kind, rt.provider, rt.harness)
             if not result.ok:
                 return {"ok": False, "error": f"runtime: {result.error}"}
-        # PUF-409: per-agent env overrides (e.g. the auto-compact threshold).
-        # Merged rather than replaced so a caller setting one key can't silently
-        # drop the others; "" clears a key.
         if "env_overrides" in params:
-            from ..state import validate_env_overrides
+            from ..state import merge_env_overrides
 
             try:
-                incoming = validate_env_overrides(params.get("env_overrides"))
+                merged = merge_env_overrides(
+                    cfg.env_overrides, params.get("env_overrides")
+                )
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
-            merged = dict(cfg.env_overrides)
-            for key, value in incoming.items():
-                if value == "":
-                    merged.pop(key, None)
-                else:
-                    merged[key] = value
             if merged != cfg.env_overrides:
                 cfg.env_overrides = merged
-                # Env is read at subprocess spawn, so the change lands on the
-                # next respawn — same lifecycle as a runtime edit.
                 runtime_changed = True
         cfg.save()
         if isinstance(params.get("profile"), str):

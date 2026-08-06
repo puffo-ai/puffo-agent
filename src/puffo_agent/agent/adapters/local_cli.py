@@ -172,10 +172,7 @@ class LocalCLIAdapter(Adapter):
         puffo_core_keys_dir: str = "",
     ):
         self.agent_id = agent_id
-        # PUF-409: per-agent env injected at spawn. Whitelisted upstream at the
-        # edit-command boundary; layered over os.environ but under the vars the
-        # adapter owns (HOME, credentials, hook wiring) so an override can't
-        # break the subprocess's isolation.
+        # Adapter-owned variables below take precedence over these overrides.
         self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.model = model
         self.workspace_dir = workspace_dir
@@ -386,7 +383,6 @@ class LocalCLIAdapter(Adapter):
 
         env = {
             **os.environ,
-            **self.env_overrides,
             "CODEX_HOME": str(codex_home),
         }
         auth_mode = sync_host_codex_auth_view(Path.home(), codex_home)
@@ -602,7 +598,6 @@ class LocalCLIAdapter(Adapter):
         )
         env = {
             **os.environ,
-            **self.env_overrides,
             "HERMES_HOME": str(self._hermes_home),
         }
         cmd = [

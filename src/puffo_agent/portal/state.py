@@ -1040,21 +1040,12 @@ class RuntimeConfig:
 
 MAX_ROLE_SHORT_LEN = 32
 
-# PUF-409: only these env vars may be set per-agent from the edit-agent
-# command. Deliberately tiny — an unbounded env passthrough would let a
-# remote edit rewrite PATH/HOME or inject credentials into the subprocess.
+# Prevent remote edits from rewriting process identity or credentials.
 ENV_OVERRIDE_WHITELIST = frozenset({"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"})
 
 
 def validate_env_overrides(raw: object) -> dict[str, str]:
-    """Validate an ``env_overrides`` payload, returning the normalised map.
-
-    Raises ``ValueError`` with an operator-readable message. Values are
-    checked per-key: ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`` is the auto-compact
-    threshold as a percent of the context window. claude-code only honours
-    ``0 < pct <= 100`` (outside that it silently falls back to its default),
-    so anything else is rejected here rather than accepted-and-ignored.
-    """
+    """Validate and normalize a partial ``env_overrides`` update."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
@@ -1068,25 +1059,34 @@ def validate_env_overrides(raw: object) -> dict[str, str]:
                 f"env_overrides key {key!r} is not allowed (allowed: {allowed})"
             )
         text = str(value).strip()
-        if key == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
-            # Empty clears the override (back to claude-code's default).
-            if not text:
-                out[key] = ""
-                continue
-            try:
-                pct = float(text)
-            except ValueError:
-                raise ValueError(
-                    f"{key} must be a number between 1 and 100; got {text!r}"
-                ) from None
-            if not (0 < pct <= 100):
-                raise ValueError(
-                    f"{key} must be >0 and <=100 (claude-code ignores anything "
-                    f"else); got {text!r}"
-                )
-            text = str(int(pct)) if pct.is_integer() else str(pct)
+        if not text:
+            out[key] = ""
+            continue
+        try:
+            pct = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{key} must be a number between 1 and 100; got {text!r}"
+            ) from None
+        if not (0 < pct <= 100):
+            raise ValueError(
+                f"{key} must be >0 and <=100 (claude-code ignores anything "
+                f"else); got {text!r}"
+            )
+        text = str(int(pct)) if pct.is_integer() else str(pct)
         out[key] = text
     return out
+
+
+def merge_env_overrides(current: object, updates: object) -> dict[str, str]:
+    """Apply a validated partial update; empty values remove keys."""
+    merged = dict(validate_env_overrides(current))
+    for key, value in validate_env_overrides(updates).items():
+        if value:
+            merged[key] = value
+        else:
+            merged.pop(key, None)
+    return merged
 
 
 def derive_role_short(role: str) -> str:
@@ -1137,9 +1137,7 @@ class AgentConfig:
     # de-duped against whatever host already provides.
     desired_skills: list[str] = field(default_factory=list)
     desired_mcps: list[str] = field(default_factory=list)
-    # PUF-409: per-agent environment overrides injected at spawn, on top of
-    # the daemon's own environment. Keys are whitelisted at the edit-command
-    # boundary (ENV_OVERRIDE_WHITELIST) — this is not a general escape hatch.
+    # Whitelisted per-agent subprocess environment.
     env_overrides: dict[str, str] = field(default_factory=dict)
     created_at: int = 0
 
@@ -1213,8 +1211,6 @@ class AgentConfig:
             ),
             desired_skills=list(raw.get("desired_skills") or []),
             desired_mcps=list(raw.get("desired_mcps") or []),
-            # Stringify both sides: yaml happily parses `70` as an int, but the
-            # value goes straight into a subprocess env where only str is legal.
             env_overrides={
                 str(k): str(v) for k, v in (raw.get("env_overrides") or {}).items()
             },

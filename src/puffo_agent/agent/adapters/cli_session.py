@@ -203,10 +203,7 @@ class ClaudeSession:
         "exec", "-i", ...]`` plus ``-e KEY=VALUE`` for each
         ``env_overrides`` entry.
 
-        ``env_overrides`` carries the agent's whitelisted per-agent env
-        (PUF-409), e.g. ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``. The docker
-        adapter needs them here because its subprocess env is the daemon's,
-        not the container's.
+        ``env_overrides`` is also passed to ``build_command`` for Docker exec.
 
         ``audit`` is optional; when set, each turn appends structured
         events for operators to tail.
@@ -517,15 +514,8 @@ class ClaudeSession:
         if self._session_id:
             args.extend(["--resume", self._session_id])
 
-        # PUF-409: per-agent env overrides (whitelisted at the edit-command
-        # boundary) are injected per spawn. For the docker adapter these
-        # become ``docker exec -e KEY=VALUE``; the local adapter already has
-        # them in the process env it hands to this session.
-        #
-        # Note the historical caveat this hook carries: NODE_OPTIONS=
-        # --max-old-space-size made things worse on constrained Docker
-        # Desktop VMs (V8 delayed GC, RSS climbed), which is why the
-        # whitelist stays narrow rather than becoming a general env passthrough.
+        # Keep this upstream whitelist narrow: a prior NODE_OPTIONS memory cap
+        # increased RSS on constrained Docker Desktop VMs.
         env_overrides: dict[str, str] = dict(self.env_overrides)
         cmd = self.build_command(args, env_overrides)
         logger.info(
@@ -883,10 +873,7 @@ class ClaudeSession:
                     usage.get("cache_creation_input_tokens", 0) or 0
                 )
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
-                # PUF-409: the whole prompt the model saw this turn — uncached
-                # + newly-cached + cache-read. This is what auto-compact
-                # measures against the context window, so it's the number the
-                # operator's "current context" reading needs.
+                # Cache reads still occupy the current context window.
                 context_tokens = input_tokens + int(
                     usage.get("cache_read_input_tokens", 0) or 0
                 )

@@ -201,6 +201,7 @@ def test_input_tokens_include_cache_creation(tmp_path):
 
     out = asyncio.run(drive())
     assert out.input_tokens == 3 + 331  # cache read (142928) excluded
+    assert out.metadata["context_tokens"] == 3 + 331 + 142928
     assert out.output_tokens == 26
 
 

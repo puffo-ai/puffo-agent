@@ -291,7 +291,6 @@ def _make_agent_cfg(
         runtime=runtime,
         desired_skills=desired_skills or [],
         desired_mcps=desired_mcps or [],
-        # Mirrors AgentConfig's PUF-409 field; build_adapter reads it.
         env_overrides={},
         puffo_core=puffo_core,
         resolve_workspace_dir=lambda: Path("/tmp/ws"),

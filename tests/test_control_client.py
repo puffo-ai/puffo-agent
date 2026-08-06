@@ -327,7 +327,6 @@ async def test_edit_rejects_invalid_inference_level(home):
 
 @pytest.mark.asyncio
 async def test_edit_sets_env_override_threshold(home):
-    # PUF-409: the UI's threshold selector rides the existing edit command.
     write_test_agent(home, "scout")
     res = await execute_command(
         "edit", "scout",
@@ -341,7 +340,6 @@ async def test_edit_sets_env_override_threshold(home):
 
 @pytest.mark.asyncio
 async def test_edit_rejects_non_whitelisted_env_key(home):
-    # An unbounded env passthrough would let a remote edit rewrite PATH.
     write_test_agent(home, "scout")
     res = await execute_command(
         "edit", "scout", {"env_overrides": {"PATH": "/tmp/evil"}},
@@ -378,7 +376,6 @@ async def test_edit_empty_value_clears_the_override(home):
 
 @pytest.mark.asyncio
 async def test_edit_env_overrides_preserves_untouched_fields(home):
-    # Merge, not replace: setting the threshold must not wipe display_name.
     write_test_agent(home, "scout")
     await execute_command("edit", "scout", {"display_name": "Scout One"})
     res = await execute_command(
@@ -389,3 +386,19 @@ async def test_edit_env_overrides_preserves_untouched_fields(home):
     cfg = AgentConfig.load("scout")
     assert cfg.display_name == "Scout One"
     assert cfg.env_overrides == {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_env_edits_are_idempotent(home):
+    import asyncio
+
+    write_test_agent(home, "scout")
+    params = {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}}
+    results = await asyncio.gather(
+        *(execute_command("edit", "scout", params) for _ in range(8))
+    )
+
+    assert all(result["ok"] is True for result in results)
+    assert AgentConfig.load("scout").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+    }

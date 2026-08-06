@@ -49,7 +49,8 @@ from ...runtime_matrix import (
     harness_applies,
     validate_triple,
 )
-from ...state import AgentConfig, derive_role_short, validate_env_overrides
+from ...control.context_telemetry import DEFAULT_COMPACT_THRESHOLD_PCT
+from ...state import AgentConfig, derive_role_short, merge_env_overrides
 from ..names import resolve_display_name
 from .avatar import initial_pixmap
 
@@ -160,6 +161,7 @@ class AgentDetail(QWidget):
             (self._harness,      "currentTextChanged"),
             (self._model,        "currentTextChanged"),
             (self._effort,       "currentTextChanged"),
+            (self._autocompact,  "currentTextChanged"),
         ):
             getattr(w, sig).connect(self._check_dirty)
         self._check_dirty()
@@ -283,13 +285,9 @@ class AgentDetail(QWidget):
         self._access.setWordWrap(True)
         layout.addRow("Access", self._access)
 
-        # PUF-409. Bands are percent-of-window; "95 (default)" clears the
-        # override rather than sending 95, because on a 1M-context model 95%
-        # lands ~37K BELOW claude-code's own default (window - 13000) and the
-        # label would be a lie. Empty = claude-code's default on any window.
         self._autocompact = QComboBox()
         for label, value in (
-            ("95% (default)", ""),
+            (f"Default ({DEFAULT_COMPACT_THRESHOLD_PCT:g}%)", ""),
             ("75%", "75"),
             ("50%", "50"),
             ("30%", "30"),
@@ -297,7 +295,7 @@ class AgentDetail(QWidget):
             self._autocompact.addItem(label, value)
         self._autocompact.setToolTip(
             "Compact the agent's context earlier to cut cold-read cost. "
-            "Takes effect on the agent's next spawn."
+            "Saving restarts the agent."
         )
         layout.addRow("Auto-compact at", self._autocompact)
 
@@ -305,6 +303,9 @@ class AgentDetail(QWidget):
         self._context_usage.setStyleSheet("color: #6b7280;")
         self._context_usage.setWordWrap(True)
         layout.addRow("Context", self._context_usage)
+        self._runtime_kind.currentTextChanged.connect(
+            self._update_autocompact_enabled
+        )
 
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
@@ -420,6 +421,7 @@ class AgentDetail(QWidget):
         self._populate_effort_combo(cfg.runtime.harness, cfg.runtime.inference_level)
         self._access.setText(self._access_summary(cfg.runtime.harness, cfg))
         self._populate_autocompact(cfg)
+        self._update_autocompact_enabled()
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
         # ws-local agents bring their own brain — runtime / harness / model
@@ -699,6 +701,21 @@ class AgentDetail(QWidget):
         self._populate_effort_combo(harness, self._effort.currentData() or "")
         if self._cfg is not None:
             self._access.setText(self._access_summary(harness, self._cfg))
+        self._update_autocompact_enabled()
+
+    def _update_autocompact_enabled(self, *_args) -> None:
+        applies = (
+            self._runtime_kind.currentText() in {"cli-local", "cli-docker"}
+            and self._harness.currentText() == "claude-code"
+        )
+        self._autocompact.setEnabled(applies)
+        self._context_usage.setEnabled(applies)
+        reason = "" if applies else "Auto-compact thresholds apply only to Claude Code."
+        self._autocompact.setToolTip(
+            "Compact the agent's context earlier; saving restarts the agent."
+            if applies else reason
+        )
+        self._context_usage.setToolTip(reason)
 
     def _populate_effort_combo(self, harness: str, current: str) -> None:
         from ....mcp.config import INFERENCE_LEVELS
@@ -718,12 +735,7 @@ class AgentDetail(QWidget):
         self._effort.blockSignals(False)
 
     def _populate_autocompact(self, cfg: AgentConfig) -> None:
-        """Select the persisted band and render the context readout.
-
-        A value claude-code would ignore (out of range, or hand-edited junk in
-        agent.yml) falls back to the default entry — the panel must not show a
-        setting that isn't in force.
-        """
+        """Select the effective band and render its estimated threshold."""
         from ...control.context_telemetry import (
             build_context_telemetry,
             parse_threshold_pct,
@@ -738,14 +750,16 @@ class AgentDetail(QWidget):
         self._autocompact.blockSignals(False)
 
         t = build_context_telemetry(
-            model=cfg.runtime.model, env_overrides=cfg.env_overrides,
+            model=cfg.runtime.model,
+            env_overrides=cfg.env_overrides,
+            env={} if cfg.runtime.kind == "cli-docker" else None,
         )
         window_k = t["max_context"] // 1000
         threshold_k = t["auto_compact_threshold"] // 1000
         suffix = " (default)" if t["threshold_is_default"] else ""
         self._context_usage.setText(
-            f"{window_k}K window · compacts at ~{threshold_k}K{suffix}. "
-            "Live usage shows in the web app; changes apply on next spawn."
+            f"{window_k}K window · estimated compact point ~{threshold_k}K{suffix}. "
+            "Live usage shows in the web app; saving restarts the agent."
         )
 
     def _access_summary(self, harness: str, cfg) -> str:
@@ -819,19 +833,12 @@ class AgentDetail(QWidget):
         cfg.runtime.harness = harness
         cfg.runtime.model = model
         cfg.runtime.inference_level = self._effort.currentData() or ""
-        # Same validator the remote edit-agent command runs, so the desktop
-        # and web paths can't drift on what's accepted.
         pct = self._autocompact.currentData() or ""
         try:
-            merged = dict(cfg.env_overrides)
-            for key, value in validate_env_overrides(
-                {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": pct}
-            ).items():
-                if value == "":
-                    merged.pop(key, None)
-                else:
-                    merged[key] = value
-            cfg.env_overrides = merged
+            cfg.env_overrides = merge_env_overrides(
+                cfg.env_overrides,
+                {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": pct},
+            )
         except ValueError as exc:
             QMessageBox.warning(self, "Save", str(exc))
             return

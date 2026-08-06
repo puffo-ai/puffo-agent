@@ -1,0 +1,152 @@
+from __future__ import annotations
+
+import os
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtWidgets import QApplication
+
+from _bridge_support import write_test_agent
+from puffo_agent.portal.state import AgentConfig
+from puffo_agent.portal.ui.widgets import agent_detail
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def agent_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(home))
+    monkeypatch.setenv("PUFFO_HOME", str(home))
+    write_test_agent(str(home), "threshold-ui")
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.harness = "claude-code"
+    cfg.env_overrides = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}
+    cfg.save()
+    monkeypatch.setattr(agent_detail, "prefetch", lambda: None)
+    return home
+
+
+def test_threshold_control_uses_honest_default_label(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    assert view._autocompact.itemText(0) == "Default (95%)"
+    assert view._autocompact.currentData() == "50"
+    assert "estimated compact point" in view._context_usage.text()
+    assert "1000K window" in view._context_usage.text()
+    assert view._autocompact.isEnabled()
+
+
+@pytest.mark.parametrize(
+    ("runtime_kind", "harness"),
+    [("cli-local", "codex"), ("ws-local", "claude-code")],
+)
+def test_threshold_control_disables_when_not_applicable(
+    qapp, agent_home, runtime_kind, harness
+):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    view._runtime_kind.setCurrentText(runtime_kind)
+    view._harness.setCurrentText(harness)
+    qapp.processEvents()
+
+    assert not view._autocompact.isEnabled()
+    assert "only to Claude Code" in view._autocompact.toolTip()
+
+
+def test_threshold_selection_participates_in_dirty_state(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    assert not view._save_btn.isEnabled()
+
+    view._autocompact.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert view._save_btn.isEnabled()
+
+
+def test_save_persists_selected_threshold(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    view._autocompact.setCurrentIndex(view._autocompact.findData("75"))
+
+    view._on_save()
+
+    assert AgentConfig.load("threshold-ui").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+    }
+
+
+def test_save_default_clears_existing_threshold(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    view._autocompact.setCurrentIndex(0)
+
+    view._on_save()
+
+    assert AgentConfig.load("threshold-ui").env_overrides == {}
+
+
+def test_save_reports_validator_failure(qapp, agent_home, monkeypatch):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    warnings = []
+    monkeypatch.setattr(
+        agent_detail,
+        "merge_env_overrides",
+        lambda _current, _updates: (_ for _ in ()).throw(
+            ValueError("invalid threshold")
+        ),
+    )
+    monkeypatch.setattr(
+        agent_detail.QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    view._on_save()
+
+    assert warnings
+    assert "invalid threshold" in warnings[0][-1]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("_role_short", "界" * 20, "role_short"),
+        (
+            "_soul",
+            "界" * (agent_detail.MAX_PROFILE_SUMMARY_BYTES + 1),
+            "soul",
+        ),
+    ],
+)
+def test_save_rejects_oversized_utf8_fields(
+    qapp, agent_home, monkeypatch, field, value, message
+):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    warnings = []
+    monkeypatch.setattr(
+        agent_detail.QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+    widget = getattr(view, field)
+    if field == "_soul":
+        widget.setPlainText(value)
+    else:
+        widget.setText(value)
+
+    view._on_save()
+
+    assert warnings
+    assert message in warnings[0][-1]

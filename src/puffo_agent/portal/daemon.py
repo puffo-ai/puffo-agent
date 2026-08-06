@@ -836,6 +836,7 @@ def _worker_needs_restart(old, new) -> bool:
         old.puffo_core != new.puffo_core
         or old.profile != new.profile
         or old.runtime != new.runtime
+        or old.env_overrides != new.env_overrides
     )
 
 

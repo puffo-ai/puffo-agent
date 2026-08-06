@@ -196,8 +196,9 @@ class DockerCLIAdapter(Adapter):
         # Installed into the bind-mounted .claude/skills/ on first
         # start (see _ensure_started). MCPs are rejected upstream.
         self.desired_skills = list(desired_skills or [])
-        # PUF-409: whitelisted per-agent env; becomes `docker exec -e K=V`.
         self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
+        # Docker exec does not inherit the daemon's host environment.
+        self.context_telemetry_env = self.env_overrides
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
@@ -701,6 +702,7 @@ class DockerCLIAdapter(Adapter):
             ),
             extra_args=extra,
             model=self.model,
+            env_overrides=self.env_overrides,
         )
         return self._session
 
