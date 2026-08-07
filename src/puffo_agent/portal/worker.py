@@ -978,7 +978,6 @@ class Worker:
                     max_context=limits[0],
                     auto_compact_threshold=limits[1],
                     env_overrides=self.agent_cfg.env_overrides,
-                    agent_id=self.agent_cfg.id,
                 )
             )
             max_context = int(info["max_context"] or 0)
