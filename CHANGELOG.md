@@ -14,7 +14,69 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   local and Docker CLI sessions, and report estimated context usage without
   blocking turns.
 
+- **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
+  runs `codex app-server` in its own container while reusing the
+  operator's Codex account credentials. Per-agent Codex state, skills,
+  Puffo MCP tools, and container-reachable host MCP registrations are
+  mounted or synchronized into the runtime.
+
+### Changed
+
+- **`cli-docker` now supports only Claude Code and Codex.** Gemini CLI
+  and Hermes were removed from the Docker runtime matrix and bundled
+  image. Hermes remains available through `cli-local`.
+
 ### Fixed
+
+- **Codex host MCP sync now includes portable OAuth credentials.** Codex
+  agents use the file-backed MCP OAuth store, and `sync_host_mcp()` copies
+  the selected credential into the isolated agent home for both
+  `cli-local` and `cli-docker`. Encrypted OS-keyring credentials are
+  detected and reported instead of being falsely reported as synchronized.
+
+- **Codex Docker workers now discover their synchronized MCP servers.**
+  The in-container Puffo MCP subprocess reads the mounted Codex home
+  instead of retaining an inaccessible host path in `CODEX_HOME`.
+
+- **Docker Desktop is now discovered even when it is missing from the
+  daemon's `PATH`.** Docker uses the same cached resolver as Claude Code
+  and Codex, including an explicit `PUFFO_DOCKER_BIN` override,
+  reconstructed user `PATH`, and known desktop-app locations. Every
+  Docker subprocess uses the resolved absolute path, and the desktop
+  home page now shows that install location instead of the Hermes
+  “Coming soon” placeholder. Live paths and known installations take
+  precedence over the executable-validated, user-writable disk cache.
+
+- **Transient Docker failures no longer trigger container recreation.**
+  Container and harness probes distinguish an explicit stale result
+  from an unavailable Docker daemon, refuse `docker rm -f` when state is
+  unknown, and preserve the host-mounted workspace and Codex session
+  during legitimate rebuilds. Docker control commands now have bounded
+  timeouts and kill and reap their child process on timeout or
+  cancellation.
+
+- **`cli-docker` Codex setup now matches the selected harness.** CLI
+  creation resolves and validates Codex before persisting an OpenAI
+  Docker agent, host Codex skills are synchronized into its isolated
+  home, and remote MCP bearer-token environment variable names are
+  forwarded through `docker exec` without exposing their values.
+  Desired MCP templates with host-only commands are skipped for both
+  container harnesses instead of failing later at first tool use.
+
+- **Codex shell commands now run in the cli-docker workspace.** The
+  app-server process runs through `docker exec`, but new threads
+  previously inherited the daemon's host cwd. On Windows that passed a
+  `C:\\...` path into the Linux container, so even read-only commands
+  failed before shell creation. Container threads now use `/workspace`
+  and rotate legacy sessions that persisted the invalid cwd; switching
+  back to `cli-local` also rotates a container thread whose `/workspace`
+  cwd cannot exist on the host.
+
+- **Puffo MCP tools now start inside `cli-docker`.** The image pins the
+  MCP SDK below 2.0 and includes the complete non-GUI dependency set
+  required by the in-container Puffo MCP server. Previously the server
+  exited during import, leaving tools such as
+  `mcp__puffo__send_message` unavailable to Claude Code.
 
 - **Skill ids ending in a newline are no longer accepted.** The daemon
   validated ids with Python's `$`, which also matches immediately before

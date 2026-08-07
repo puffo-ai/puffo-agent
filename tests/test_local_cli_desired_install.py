@@ -274,6 +274,68 @@ def test_install_desired_mcp_stdio_codex_path_returns_extras_no_disk_write(tmp_p
     assert not (tmp_path / ".claude.json").exists()
 
 
+@pytest.mark.parametrize("harness_name", ["claude-code", "codex"])
+def test_containerized_desired_mcp_skips_host_local_command(
+    tmp_path, caplog, harness_name,
+):
+    http = FakeHttp({
+        "/v2/mcp-templates/host-only": {
+            "id": "host-only",
+            "type": "stdio",
+            "command": "/Users/operator/bin/mcp-server",
+        },
+    })
+    with caplog.at_level(
+        logging.WARNING,
+        logger="puffo_agent.agent.adapters.desired_install",
+    ):
+        extras = _run(install_desired(
+            http=http,
+            agent_home=tmp_path,
+            workspace_dir=tmp_path,
+            agent_id="a1",
+            harness_name=harness_name,
+            desired_skills=[],
+            desired_mcps=["host-only"],
+            containerized=True,
+        ))
+
+    assert extras == {}
+    assert not (tmp_path / ".claude.json").exists()
+    assert any(
+        "cannot resolve inside the container" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("harness_name", ["claude-code", "codex"])
+def test_containerized_desired_mcp_keeps_portable_command(tmp_path, harness_name):
+    http = FakeHttp({
+        "/v2/mcp-templates/portable": {
+            "id": "portable",
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "portable-server"],
+        },
+    })
+    extras = _run(install_desired(
+        http=http,
+        agent_home=tmp_path,
+        workspace_dir=tmp_path,
+        agent_id="a1",
+        harness_name=harness_name,
+        desired_skills=[],
+        desired_mcps=["portable"],
+        containerized=True,
+    ))
+
+    if harness_name == "codex":
+        assert extras["portable"]["command"] == "npx"
+    else:
+        data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+        assert data["mcpServers"]["portable"]["command"] == "npx"
+
+
 def test_install_desired_mcp_sse_claude_writes_url(tmp_path):
     http = FakeHttp({
         "/v2/mcp-templates/remote": {

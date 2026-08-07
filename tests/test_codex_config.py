@@ -126,6 +126,7 @@ def test_extra_servers_pass_through_when_puffo_unconfigured(tmp_path):
     write_codex_mcp_config(dest, extra_servers=extras)
     doc = _read_toml(dest)
     assert doc["cli_auth_credentials_store"] == "file"
+    assert doc["mcp_oauth_credentials_store"] == "file"
     servers = doc.get("mcp_servers") or {}
     assert "filesystem" in servers
     assert "puffo" not in servers

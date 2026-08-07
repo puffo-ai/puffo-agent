@@ -21,10 +21,10 @@ anthropic:
 
 openai:
   api_key: ""                    # https://platform.openai.com/ — used by chat-local + sdk-local only
-  model:   "gpt-4o"              # also used as the default model for cli-local + harness=codex
+  model:   "gpt-4o"              # default for cli-local/cli-docker + harness=codex
 
 google:
-  api_key: ""                    # required for cli-docker + harness=gemini-cli
+  api_key: ""
   model:   "gemini-2.5-pro"
 
 # Optional: absolute path to a directory of shared Claude Code

@@ -1,15 +1,13 @@
-"""Docker CLI adapter.
+"""Docker CLI adapter for Claude Code and Codex.
 
-Runs the Claude Code CLI inside a per-agent Docker container. The
-container is the sandbox; Claude Code runs with
-``--dangerously-skip-permissions`` inside.
+Each agent runs its selected CLI in a dedicated container. Claude Code
+uses its stream-json protocol; Codex uses its app-server JSON-RPC
+protocol. The container is the sandbox, so Claude Code runs with
+``--dangerously-skip-permissions``.
 
-Auth: each agent gets its own isolated claude identity at
-``~/.puffo-agent/agents/<id>/.claude/`` (sessions, history, cache,
-settings — seeded once from the operator's real ``~/.claude``). The
-``.credentials.json`` file alone is a single-file bind-mount of the
-host's copy so every agent shares one rotating-refresh-token source
-and avoids the race per-agent copies would hit.
+Per-agent ``.claude`` and ``.codex`` directories are bind-mounted into
+the container. The daemon owns credential refresh and writes sanitized
+credential views into those directories, matching ``cli-local``.
 
 A second bind-mount exposes ``~/.puffo-agent/shared/`` at
 ``/workspace/.shared`` so all agents on this host can cooperate at
@@ -18,10 +16,8 @@ the filesystem level.
 Lifecycle:
   - container: one per agent (``puffo-<id>``), started lazily,
     ``docker stop`` on ``aclose()``.
-  - claude: one long-lived stream-json subprocess inside the
-    container, kept alive across turns by ``ClaudeSession``.
-  - session id: persisted to ``cli_session.json`` so daemon /
-    container restarts re-spawn with ``--resume <id>``.
+  - harness: one long-lived ClaudeSession or CodexSession subprocess.
+  - session ids persist on the host so daemon/container restarts resume.
 
 Image: bundled inline as a Dockerfile string, built on first use.
 Users can override via ``runtime.docker_image`` to skip the build.
@@ -30,32 +26,30 @@ Users can override via ``runtime.docker_image`` to skip the build.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import shutil
-import time
+import os
 from pathlib import Path
 
+from ..cli_bin import resolve_docker_bin
 from ...mcp.config import (
     INFERENCE_LEVELS,
     write_cli_mcp_config,
-)
-from .hermes_helpers import (
-    HERMES_NO_RESUME_SIGNATURE,
-    hermes_model_id,
-    parse_hermes_reply,
-    stitch_hermes_prompt,
+    write_codex_mcp_config,
 )
 from ...portal.state import (
+    filter_container_mcp_servers,
+    read_host_codex_mcp_servers,
     seed_claude_home,
+    sync_host_claude_code_auth_view,
+    sync_host_codex_auth_view,
+    sync_host_codex_skills,
     sync_host_enabled_plugins,
-    sync_host_gemini_mcp_servers,
-    sync_host_gemini_skills,
     sync_host_mcp_servers,
     sync_host_skills,
 )
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
+from .codex_session import CodexSession
 
 
 logger = logging.getLogger(__name__)
@@ -73,7 +67,8 @@ def _puffo_agent_pkg_dir() -> Path:
 # Bump on Dockerfile changes so existing hosts rebuild without manual
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
-DEFAULT_IMAGE = "puffo/agent-runtime:v11"
+DEFAULT_IMAGE = "puffo/agent-runtime:v15"
+CONTAINER_LAYOUT_VERSION = "15"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
@@ -81,8 +76,13 @@ DEFAULT_IMAGE = "puffo/agent-runtime:v11"
 # verification.
 CLAUDE_CODE_NPM_VERSION = "2.1.117"
 
-# Pinned Gemini CLI version (same reproducibility rationale).
-GEMINI_CLI_NPM_VERSION = "0.38.2"
+# Pinned Codex CLI version. Keep this aligned with the app-server
+# protocol exercised by ``CodexSession``.
+CODEX_NPM_VERSION = "0.145.0"
+
+DOCKER_COMMAND_TIMEOUT_SECONDS = 60.0
+DOCKER_BUILD_TIMEOUT_SECONDS = 900.0
+_PROBE_FALSE_EXIT = 42
 
 # Kept minimal. The claude CLI refuses --dangerously-skip-permissions
 # as root, so we create a non-root ``agent`` user. UID doesn't need
@@ -103,22 +103,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 
 RUN npm install -g \\
         @anthropic-ai/claude-code@__CLAUDE_CODE_VERSION__ \\
-        @google/gemini-cli@__GEMINI_CLI_VERSION__
+        @openai/codex@__CODEX_VERSION__
 
 # Puffo MCP tools server deps. ``--break-system-packages`` is
 # required on Debian bookworm (PEP 668); acceptable since the
 # container is single-purpose and disposable. ``uv`` ships ``uvx``
 # (Python counterpart of ``npx``) so agents can register stdio MCPs
 # without per-server pip/npm install.
-#
-# hermes-agent: the alternative harness. Installed from git because
-# upstream isn't on PyPI. Billing for OAuth-token usage routes to
-# Anthropic's ``extra_usage`` pool — not the Claude subscription.
 RUN pip3 install --break-system-packages --no-cache-dir \\
-        "mcp>=1.0" "aiohttp>=3.9" "uv>=0.5" \\
-        "cryptography>=43" "pyhpke>=0.6" "aiosqlite>=0.20" "pyyaml>=6.0" \\
-     && pip3 install --break-system-packages --no-cache-dir \\
-        "git+https://github.com/NousResearch/hermes-agent.git@main"
+        "mcp>=1.0,<2" "aiohttp>=3.9" "aiohttp-socks>=0.10" \\
+        "aiosqlite>=0.20" "certifi>=2024.2.2" "cryptography>=43" \\
+        "pillow>=10.0" "psutil>=5.9" "pyhpke>=0.6" "python-socks>=2.4" \\
+        "pyyaml>=6.0" "tzdata>=2024.1" "uv>=0.5" "websockets>=12.0"
 
 RUN useradd -m -u 2000 -s /bin/bash agent
 USER agent
@@ -133,7 +129,7 @@ CMD ["sh", "-c", "set -eu; mkdir -p /workspace/.puffo-agent; touch /workspace/.p
 """.replace(
     "__CLAUDE_CODE_VERSION__", CLAUDE_CODE_NPM_VERSION,
 ).replace(
-    "__GEMINI_CLI_VERSION__", GEMINI_CLI_NPM_VERSION,
+    "__CODEX_VERSION__", CODEX_NPM_VERSION,
 )
 
 
@@ -149,13 +145,16 @@ class DockerCLIAdapter(Adapter):
         agent_home_dir: str,
         shared_fs_dir: str,
         owner_username: str = "",
+        permission_mode: str = "bypassPermissions",
+        sandbox: str = "danger-full-access",
         inference_level: str = "",
+        task_timeout_seconds: float = 1800.0,
         harness=None,
-        google_api_key: str = "",
         memory_limit: str = "",
         memory_reservation: str = "",
         desired_skills: list[str] | None = None,
         env_overrides: dict[str, str] | None = None,
+        desired_mcps: list[str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
@@ -167,9 +166,8 @@ class DockerCLIAdapter(Adapter):
         self.claude_dir = claude_dir
         self.session_file = Path(session_file)
         self.container_name = f"puffo-{agent_id}"
-        # Agent's virtual $HOME; only .claude (and .gemini, .claude.json)
-        # are bind-mounted in, not the whole home, so the container's
-        # default home skeleton stays intact.
+        # Per-agent harness state is mounted into the container without
+        # replacing its complete home directory.
         self.agent_home_dir = Path(agent_home_dir)
         self.claude_home_src = self.agent_home_dir / ".claude"
         # Cross-agent cooperation dir; same mount in every container
@@ -177,10 +175,10 @@ class DockerCLIAdapter(Adapter):
         # isolation.
         self.shared_fs_dir = Path(shared_fs_dir)
         self.owner_username = owner_username
+        self.permission_mode = permission_mode
+        self.sandbox = sandbox
         self.inference_level = inference_level
-        # Only used when harness is gemini-cli (passed via
-        # ``docker exec -e GEMINI_API_KEY=...``).
-        self.google_api_key = google_api_key
+        self.task_timeout_seconds = task_timeout_seconds
         # Optional cgroup caps. ``--memory`` is a hard ceiling that
         # OOM-kills processes in this container only; ``--memory-
         # reservation`` is a soft floor. Bound a runaway claude so it
@@ -192,25 +190,28 @@ class DockerCLIAdapter(Adapter):
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
+        if harness.name() not in {"claude-code", "codex"}:
+            raise RuntimeError(
+                f"agent {agent_id!r}: cli-docker supports only "
+                "claude-code and codex harnesses"
+            )
         self.harness = harness
-        # Installed into the bind-mounted .claude/skills/ on first
-        # start (see _ensure_started). MCPs are rejected upstream.
         self.desired_skills = list(desired_skills or [])
         self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         # Docker exec does not inherit the daemon's host environment.
         self.context_telemetry_env = self.env_overrides
+        self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
+        self._desired_codex_extras: dict[str, dict] = {}
+        self._codex_bearer_env_names: tuple[str, ...] = ()
         self._desired_installed = False
         self._started_lock = asyncio.Lock()
         self._started = False
+        self._docker_bin = "docker"
         self._session: ClaudeSession | None = None
-        # Has the puffo MCP server been registered with the
-        # in-container hermes config yet? Registration is idempotent
-        # (remove + add) so a flag mismatch is safe. The gemini path
-        # writes MCP config upfront via ``_ensure_started`` instead.
-        self._hermes_mcp_registered = False
+        self._codex_session: CodexSession | None = None
         # Set post-construction by worker.py. When non-None, claude-
         # code is routed at ``puffo_core_server``. Values must be
         # CONTAINER-local paths since the MCP subprocess runs inside
@@ -220,10 +221,10 @@ class DockerCLIAdapter(Adapter):
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         await self._ensure_started()
         user_message = ctx.messages[-1]["content"] if ctx.messages else ""
-        if self.harness.name() == "hermes":
-            return await self._run_turn_hermes(user_message, ctx.system_prompt)
-        if self.harness.name() == "gemini-cli":
-            return await self._run_turn_gemini(user_message, ctx.system_prompt)
+        if self.harness.name() == "codex":
+            return await self._ensure_codex_session().run_turn(
+                user_message, ctx.system_prompt,
+            )
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
@@ -233,411 +234,28 @@ class DockerCLIAdapter(Adapter):
         fallback_user_message: str,
         ctx: TurnContext,
     ) -> TurnResult:
-        # claude-code only — hermes / gemini-cli always run one-shot
-        # without --resume, so a retry is just a normal turn against
-        # the fallback payload.
-        if self.harness.name() != "claude-code":
-            ctx_fallback = TurnContext(
-                system_prompt=ctx.system_prompt,
-                messages=[{"role": "user", "content": fallback_user_message}],
-                workspace_dir=ctx.workspace_dir,
-                claude_dir=ctx.claude_dir,
-                memory_dir=ctx.memory_dir,
-                on_progress=ctx.on_progress,
-            )
-            return await self.run_turn(ctx_fallback)
         await self._ensure_started()
+        if self.harness.name() == "codex":
+            return await self._ensure_codex_session().run_turn(
+                fallback_user_message, ctx.system_prompt,
+            )
         session = self._ensure_session()
         return await session.run_retry_turn(
             kick_text, fallback_user_message, ctx.system_prompt,
         )
 
-    async def _run_turn_hermes(self, user_message: str, system_prompt: str) -> TurnResult:
-        """One-shot hermes turn via ``hermes chat --provider anthropic
-        --quiet [--continue] -q <prompt>``.
-
-        Hermes has no stream-json line protocol; interactive mode
-        requires a TTY and treats piped EOF as "user quit". Cold
-        start per turn is ~3-7s.
-
-        Auth: hermes auto-discovers the bind-mounted
-        ``~/.claude/.credentials.json``; no hermes-side state.
-
-        Continuity: ``cli_session.json`` is a "have we done at least
-        one turn" sentinel. First turn inlines the system prompt (no
-        ``--system`` flag in hermes); subsequent turns pass
-        ``--continue``. Stale sentinel triggers a one-shot retry
-        without ``--continue``.
-        """
-        return await self._run_hermes_chat(user_message, system_prompt)
-
-    async def _ensure_hermes_mcp_registered(self) -> None:
-        """Register the puffo MCP server with the in-container hermes
-        config so chat turns can call puffo tools.
-
-        Hermes uses its own ``hermes mcp add`` registry at
-        ``/home/agent/.hermes/config.yaml``. Re-registered on every
-        adapter start so config-shape changes are picked up
-        automatically. ``hermes mcp add`` prompts "Enable all N tools?
-        [Y/n/select]" before writing config — we pipe ``y\\n`` to
-        accept. Failure logs but doesn't hard-fail the turn (chat
-        still works, just without tools).
-        """
-        if self._hermes_mcp_registered:
-            return
-        if self.puffo_core_mcp_env is None:
-            logger.warning(
-                "agent %s: hermes MCP registration skipped — puffo_core "
-                "is not configured. Populate `puffo_core:` in agent.yml "
-                "to enable tool calls under hermes.",
-                self.agent_id,
-            )
-            return
-
-        env = dict(self.puffo_core_mcp_env)
-        env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
-        # No PUFFO_CORE_DB_PATH — MCP routes data reads through the
-        # daemon's data service at PUFFO_DATA_SERVICE_URL.
-        env["PUFFO_WORKSPACE"] = "/workspace"
-        env["PUFFO_RUNTIME_KIND"] = "cli-docker"
-        env["PUFFO_HARNESS"] = "hermes"
-        env["PYTHONPATH"] = "/opt/puffoagent-pkg"
-        env_flags: list[str] = [f"{k}={v}" for k, v in env.items()]
-
-        # Remove any stale puffo registration first so the add below
-        # overwrites cleanly. rc!=0 is fine — means there wasn't one.
-        await _run_cmd(
-            [
-                "docker", "exec", self.container_name,
-                "hermes", "mcp", "remove", "puffo",
-            ],
-            check=False,
-        )
-
-        cmd = [
-            "docker", "exec", "-i", self.container_name,
-            "hermes", "mcp", "add", "puffo",
-            "--command", "python3",
-            "--args", "-m", "puffo_agent.mcp.puffo_core_server",
-            "--env", *env_flags,
-        ]
-        try:
-            from ..._proc import no_window_kwargs
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **no_window_kwargs(),
-            )
-            stdout, stderr = await proc.communicate(b"y\n")
-        except Exception as exc:
-            logger.warning(
-                "agent %s: couldn't register puffo MCP with hermes: %s "
-                "(chat will work, tool calls won't)",
-                self.agent_id, exc,
-            )
-            return
-        if proc.returncode != 0:
-            logger.warning(
-                "agent %s: hermes mcp add puffo rc=%d | stdout: %s | stderr: %s "
-                "(chat will work, tool calls won't)",
-                self.agent_id, proc.returncode,
-                stdout.decode("utf-8", errors="replace").strip()[-400:],
-                stderr.decode("utf-8", errors="replace").strip()[-400:],
-            )
-            return
-        logger.info(
-            "agent %s: registered puffo MCP server with hermes "
-            "(18 tools available via hermes chat)",
-            self.agent_id,
-        )
-        self._hermes_mcp_registered = True
-
-    async def _run_hermes_chat(
-        self, user_message: str, system_prompt: str, *, _retried: bool = False,
-    ) -> TurnResult:
-        # Hermes doesn't actually auto-discover Claude Code's
-        # credentials despite upstream docs claiming it does. We read
-        # the access token from the bind-mounted credentials file and
-        # pass it via ``ANTHROPIC_API_KEY`` on the ``docker exec``
-        # command. ``sk-ant-oat01-*`` tokens are API-compatible with
-        # regular ``sk-ant-api03-*`` keys; billing routes to
-        # Anthropic's ``extra_usage`` pool, not the Claude
-        # subscription.
-        token = _read_claude_access_token()
-        if not token:
-            logger.error(
-                "agent %s: cannot read Claude Code access token from "
-                "%s — hermes turn would fail with no credentials. "
-                "run `claude login` on the host to refresh.",
-                self.agent_id, _HOST_CLAUDE_CREDENTIALS_PATH,
-            )
-            return TurnResult(reply="", metadata={
-                "error": "no Claude Code access token available on host",
-            })
-
-        # Idempotent — skipped after first success per adapter
-        # instance.
-        await self._ensure_hermes_mcp_registered()
-
-        has_prior_session = self.session_file.exists()
-        prompt = user_message if has_prior_session else stitch_hermes_prompt(
-            system_prompt, user_message,
-        )
-        cmd = [
-            "docker", "exec", "-i",
-            # Token in argv-space is acceptable for a single-user
-            # host; switch to --env-file + tmpfile if running on a
-            # shared host.
-            "-e", f"ANTHROPIC_API_KEY={token}",
-            self.container_name,
-            "hermes", "chat",
-            "--provider", "anthropic",
-            "--quiet",
-            "--source", f"puffoagent:{self.agent_id}",
-            "--model", hermes_model_id(self.model),
-        ]
-        if has_prior_session:
-            cmd.append("--continue")
-        cmd.extend(["-q", prompt])
-
-        started = time.time()
-        rc, stdout, stderr = await _run_cmd(cmd, check=False)
-        elapsed = time.time() - started
-        stdout_text = stdout.decode("utf-8", errors="replace")
-        stderr_text = stderr.decode("utf-8", errors="replace")
-
-        # Stale sentinel: hermes has no session matching ours.
-        # Clear + retry once without --continue.
-        if (
-            rc != 0
-            and HERMES_NO_RESUME_SIGNATURE in stdout_text
-            and not _retried
-        ):
-            logger.info(
-                "agent %s: hermes rejected --continue; clearing sentinel and retrying fresh",
-                self.agent_id,
-            )
-            try:
-                self.session_file.unlink()
-            except OSError:
-                pass
-            return await self._run_hermes_chat(
-                user_message, system_prompt, _retried=True,
-            )
-
-        if rc != 0:
-            logger.error(
-                "agent %s: hermes turn rc=%d in %.1fs | stdout: %r | stderr: %s",
-                self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
-            )
-            return TurnResult(reply="", metadata={
-                "error": f"hermes exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
-            })
-
-        reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
-        if tool_calls:
-            logger.info(
-                "agent %s: hermes turn invoked %d tool(s): %s",
-                self.agent_id, len(tool_calls), ", ".join(tool_calls),
-            )
-        if not reply:
-            logger.warning(
-                "agent %s: hermes rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
-            )
-
-        # First-ever success: write the sentinel so subsequent turns
-        # pass --continue. session_id is captured for debug.
-        if not has_prior_session:
-            try:
-                self.session_file.parent.mkdir(parents=True, exist_ok=True)
-                self.session_file.write_text(
-                    json.dumps({
-                        "harness": "hermes",
-                        "session_id": session_id,
-                        "first_turn_at": int(time.time()),
-                    }) + "\n",
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                logger.warning(
-                    "agent %s: couldn't write hermes session_file: %s "
-                    "(next turn will start a fresh session)",
-                    self.agent_id, exc,
-                )
-
-        logger.info(
-            "agent %s: hermes turn rc=0 in %.1fs, %d reply chars, "
-            "session=%s, resume=%s",
-            self.agent_id, elapsed, len(reply), session_id or "?",
-            has_prior_session,
-        )
-        # Always silent — see ``_run_hermes_turn`` in local_cli.py.
-        return TurnResult(
-            reply="",
-            tool_calls=len(tool_calls),
-            metadata={
-                "harness": "hermes",
-                "session_id": session_id,
-                "tools_invoked": tool_calls,
-                "send_message_targets": [{"channel": "", "root_id": ""}],
-                "hermes_assistant_text": reply,
-            },
-        )
-
-    # ── Gemini harness ────────────────────────────────────────────
-
-    async def _run_turn_gemini(
-        self, user_message: str, system_prompt: str,
-    ) -> TurnResult:
-        """One-shot gemini-cli turn via ``gemini -p <prompt>
-        --output-format json [-r latest]``.
-
-        Auth: ``GEMINI_API_KEY`` from daemon.yml passed via
-        ``docker exec -e``.
-
-        Continuity: ``cli_session.json`` sentinel gates ``-r latest``;
-        stale sentinel falls back to a fresh session.
-
-        Persona + memory: ``<agent_home>/.gemini/GEMINI.md`` is
-        rewritten on every start; gemini auto-discovers it.
-
-        MCP tools: registered in PROJECT-scope ``<workspace>/.gemini/
-        settings.json`` (gemini's MCP resolver defaults to cwd, not
-        $HOME). Same file merges in host user-level MCPs.
-        """
-        return await self._run_gemini_chat(user_message, system_prompt)
-
-    async def _run_gemini_chat(
-        self, user_message: str, system_prompt: str, *, _retried: bool = False,
-    ) -> TurnResult:
-        if not self.google_api_key:
-            logger.error(
-                "agent %s: gemini-cli turn requires a google api_key "
-                "(passed as GEMINI_API_KEY into the container). Pass "
-                "--api-key on `agent create`, set GEMINI_API_KEY in "
-                "the environment, or run `puffo-agent config`.",
-                self.agent_id,
-            )
-            return TurnResult(reply="", metadata={
-                "error": "no google api_key configured",
-            })
-
-        # Persona + memory + MCP entries are written upfront by
-        # ``_ensure_started``, so just send the user message.
-        has_prior_session = self.session_file.exists()
-        cmd = _build_gemini_argv(
-            container_name=self.container_name,
-            api_key=self.google_api_key,
-            model=self.model,
-            has_prior_session=has_prior_session,
-            user_message=user_message,
-        )
-
-        # Log the redacted argv so a failed turn is reproducible
-        # from the daemon log.
-        redacted = [
-            "GEMINI_API_KEY=***" if a.startswith("GEMINI_API_KEY=") else a
-            for a in cmd
-        ]
-        logger.info("agent %s: gemini argv: %s", self.agent_id, " ".join(redacted))
-
-        started = time.time()
-        rc, stdout, stderr = await _run_cmd(cmd, check=False)
-        elapsed = time.time() - started
-        stdout_text = stdout.decode("utf-8", errors="replace")
-        stderr_text = stderr.decode("utf-8", errors="replace")
-
-        # Stale sentinel recovery — any error with ``-r`` in play
-        # triggers one retry from a fresh session. Permissive because
-        # upstream doesn't pin an error string to match against.
-        if rc != 0 and has_prior_session and not _retried:
-            logger.info(
-                "agent %s: gemini -r latest rc=%d; clearing sentinel "
-                "and retrying with a fresh session. stderr: %s",
-                self.agent_id, rc, stderr_text.strip()[-200:] or "(empty)",
-            )
-            try:
-                self.session_file.unlink()
-            except OSError:
-                pass
-            return await self._run_gemini_chat(
-                user_message, system_prompt, _retried=True,
-            )
-
-        if rc != 0:
-            logger.error(
-                "agent %s: gemini turn rc=%d in %.1fs | stdout: %r | stderr: %s",
-                self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
-            )
-            return TurnResult(reply="", metadata={
-                "error": f"gemini exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
-            })
-
-        reply, session_id, err = _parse_gemini_reply(stdout_text)
-        if err:
-            logger.warning(
-                "agent %s: gemini rc=0 but returned JSON error: %s",
-                self.agent_id, err,
-            )
-        if not reply:
-            logger.warning(
-                "agent %s: gemini rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
-            )
-
-        if not has_prior_session:
-            try:
-                self.session_file.parent.mkdir(parents=True, exist_ok=True)
-                self.session_file.write_text(
-                    json.dumps({
-                        "harness": "gemini-cli",
-                        "session_id": session_id,
-                        "first_turn_at": int(time.time()),
-                    }) + "\n",
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                logger.warning(
-                    "agent %s: couldn't write gemini session_file: %s "
-                    "(next turn will start a fresh session)",
-                    self.agent_id, exc,
-                )
-
-        logger.info(
-            "agent %s: gemini turn rc=0 in %.1fs, %d reply chars, "
-            "session=%s, resume=%s%s",
-            self.agent_id, elapsed, len(reply), session_id or "?",
-            has_prior_session,
-            f", err={err!r}" if err else "",
-        )
-        metadata: dict = {
-            "harness": "gemini-cli",
-            "session_id": session_id,
-        }
-        if err:
-            metadata["error"] = err
-        return TurnResult(reply=reply, metadata=metadata)
-
     async def warm(self, system_prompt: str) -> None:
-        """Start the container eagerly; spawn the claude subprocess
-        only when this agent has a persisted session (fresh agents
-        wait for their first message). Container always starts so
-        ``docker logs`` tailing is useful even when idle.
-        """
+        """Start the container and resume a persisted harness session."""
         await self._ensure_started()
-        if self.harness.name() == "hermes":
-            # Hermes is one-shot per turn — no persistent subprocess.
+        if self.harness.name() == "codex":
+            session = self._ensure_codex_session()
+            if not session.has_persisted_session():
+                logger.info(
+                    "agent %s: no persisted codex conversation; deferring "
+                    "spawn until first message", self.agent_id,
+                )
+                return
+            await session.warm(system_prompt)
             return
         session = self._ensure_session()
         if not session.has_persisted_session():
@@ -651,27 +269,38 @@ class DockerCLIAdapter(Adapter):
     async def reload(
         self, new_system_prompt: str, *, with_session: bool = False,
     ) -> None:
-        """Close the in-container claude subprocess so the next turn
-        re-reads CLAUDE.md; container stays up. No-op for hermes.
-        ``with_session=True`` also unlinks ``cli_session.json``."""
+        """Close the harness process so the next turn reloads config."""
+        codex_session_file = (
+            self._codex_session.session_file
+            if self._codex_session is not None else self.codex_home / "codex_session.json"
+        )
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if self._codex_session is not None:
+            await self._codex_session.aclose()
+            self._codex_session = None
+        if self.harness.name() == "codex" and self._started:
+            self._prepare_codex_config(Path.home())
         if with_session:
-            try:
-                self.session_file.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                logger.warning(
-                    "agent %s: couldn't unlink session file %s: %s",
-                    self.agent_id, self.session_file, exc,
-                )
+            for path in (self.session_file, codex_session_file):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        "agent %s: couldn't unlink session file %s: %s",
+                        self.agent_id, path, exc,
+                    )
 
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if self._codex_session is not None:
+            await self._codex_session.aclose()
+            self._codex_session = None
         if not self._started:
             return
         # ``docker stop`` (not ``rm -f``) preserves the container's
@@ -680,9 +309,46 @@ class DockerCLIAdapter(Adapter):
         # ``-t 5`` shortens docker's 10s SIGTERM grace; stays within
         # Worker.stop's 30s asyncio.wait_for even on slow Windows.
         await _run_cmd(
-            ["docker", "stop", "-t", "5", self.container_name], check=False,
+            [self._docker_bin, "stop", "-t", "5", self.container_name],
+            check=False,
         )
         self._started = False
+
+    async def health_probe(self) -> bool:
+        if self._codex_session is not None:
+            return await self._codex_session.health_probe()
+        return True
+
+    @property
+    def codex_home(self) -> Path:
+        return self.agent_home_dir / ".codex"
+
+    def _ensure_codex_session(self) -> CodexSession:
+        if self._codex_session is not None:
+            return self._codex_session
+        argv = [self._docker_bin, "exec", "-i"]
+        for name in self._codex_bearer_env_names:
+            argv.extend(["-e", name])
+        argv.extend([
+            "-e", "CODEX_HOME=/home/agent/.codex",
+            self.container_name, "codex", "app-server",
+        ])
+        self._codex_session = CodexSession(
+            agent_id=self.agent_id,
+            session_file=self.codex_home / "codex_session.json",
+            argv=argv,
+            cwd=None,
+            thread_cwd="/workspace",
+            permission_mode=self.permission_mode,
+            sandbox=self.sandbox,
+            model=self.model,
+            task_timeout_seconds=self.task_timeout_seconds,
+            audit=AuditLog(
+                Path(self.workspace_dir) / ".puffo-agent" / "audit.log",
+                self.agent_id,
+            ),
+        )
+        return self._codex_session
 
     def _ensure_session(self) -> ClaudeSession:
         if self._session is not None:
@@ -711,9 +377,12 @@ class DockerCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
-        cmd: list[str] = ["docker", "exec", "-i"]
+        cmd: list[str] = [getattr(self, "_docker_bin", "docker"), "exec", "-i"]
         # ``env_overrides`` flows in before the container name so
         # docker treats each ``-e KEY=VALUE`` as an exec flag.
+        # SECURITY: values are visible in the process list and in command
+        # errors. Never pass secrets here; use Docker's name-only ``-e NAME``
+        # passthrough, as the Codex bearer-token path does.
         for key, value in (env_overrides or {}).items():
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([
@@ -744,15 +413,8 @@ class DockerCLIAdapter(Adapter):
 
         # Path values must be CONTAINER-local — override whatever the
         # worker put in the env dict from the host side.
-        if self.puffo_core_mcp_env is not None:
-            env = dict(self.puffo_core_mcp_env)
-            env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
-            # No PUFFO_CORE_DB_PATH — SQLite reads route via the
-            # daemon's data service.
-            env["PUFFO_WORKSPACE"] = "/workspace"
-            env["PUFFO_RUNTIME_KIND"] = "cli-docker"
-            env["PUFFO_HARNESS"] = self.harness.name()
-            env["PYTHONPATH"] = "/opt/puffoagent-pkg"
+        env = self._container_puffo_mcp_env()
+        if env is not None:
             write_cli_mcp_config(
                 config_host,
                 command="python3",
@@ -770,7 +432,7 @@ class DockerCLIAdapter(Adapter):
         )
         return []
 
-    async def _puffo_pkg_mount_is_current(self) -> bool:
+    async def _puffo_pkg_mount_is_current(self) -> bool | None:
         """``True`` iff the existing container's
         ``/opt/puffoagent-pkg`` bind mount still resolves to a
         directory containing the ``puffo_agent`` package.
@@ -788,64 +450,149 @@ class DockerCLIAdapter(Adapter):
         """
         rc, _, _ = await _run_cmd(
             [
-                "docker", "exec", self.container_name,
-                "test", "-f",
-                "/opt/puffoagent-pkg/puffo_agent/__init__.py",
+                self._docker_bin, "exec", self.container_name,
+                "sh", "-c",
+                "test -f /opt/puffoagent-pkg/puffo_agent/__init__.py "
+                f"&& exit 0 || exit {_PROBE_FALSE_EXIT}",
             ],
             check=False,
         )
-        return rc == 0
+        return _probe_result(rc)
 
-    async def _container_state(self) -> str:
+    async def _container_harness_is_current(self) -> bool | None:
+        harness = self.harness.name()
+        command = "claude" if harness == "claude-code" else "codex"
+        checks = [f"command -v {command} >/dev/null"]
+        if harness == "codex":
+            checks.append("test -f /home/agent/.codex/config.toml")
+        rc, _, _ = await _run_cmd(
+            [
+                self._docker_bin, "exec", self.container_name,
+                "sh", "-c",
+                f"if {' && '.join(checks)}; then exit 0; "
+                f"else exit {_PROBE_FALSE_EXIT}; fi",
+            ],
+            check=False,
+        )
+        return _probe_result(rc)
+
+    async def _container_state(self) -> str | None:
         """Docker-reported container State.Status (``running``,
-        ``exited``, ``paused``, ``created``, ``dead``), or ``""``
-        when the container doesn't exist.
+        ``exited``, ``paused``, ``created``, ``dead``), ``""`` when
+        the container doesn't exist, or ``None`` when Docker could not
+        answer the probe.
         """
         rc, out, _ = await _run_cmd(
             [
-                "docker", "inspect",
-                "-f", "{{.State.Status}}",
-                self.container_name,
+                self._docker_bin, "container", "ls", "--all",
+                "--filter", f"name=^/{self.container_name}$",
+                "--format", "{{.State}}",
             ],
             check=False,
         )
         if rc != 0:
-            return ""
+            return None
         return out.decode("utf-8", errors="replace").strip()
 
-    async def _install_desired_skills(self) -> None:
-        """Install desired skills into .claude/skills/, once per
-        instance. MCPs are gated out upstream, so skills only."""
-        if self._desired_installed or not self.desired_skills:
+    async def _install_desired(self) -> None:
+        if self._desired_installed:
+            return
+        if not self.desired_skills and not self.desired_mcps:
+            self._desired_installed = True
             return
         self._desired_installed = True
         from .desired_install import run_spawn_install
-        await run_spawn_install(
+        codex_extras = await run_spawn_install(
             agent_id=self.agent_id,
             agent_home=self.agent_home_dir,
             workspace_dir=Path(self.workspace_dir),
             harness_name=self.harness.name(),
             desired_skills=self.desired_skills,
-            desired_mcps=[],
+            desired_mcps=self.desired_mcps,
             server_url=self.puffo_core_server_url,
             slug=self.puffo_core_slug,
             keys_dir=self.puffo_core_keys_dir,
+            containerized=True,
+        )
+        if codex_extras:
+            self._desired_codex_extras = codex_extras
+
+    def _container_puffo_mcp_env(self) -> dict[str, str] | None:
+        if self.puffo_core_mcp_env is None:
+            return None
+        env = dict(self.puffo_core_mcp_env)
+        env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
+        env["PUFFO_WORKSPACE"] = "/workspace"
+        env["PUFFO_RUNTIME_KIND"] = "cli-docker"
+        env["PUFFO_HARNESS"] = self.harness.name()
+        env["PYTHONPATH"] = "/opt/puffoagent-pkg"
+        if self.harness.name() == "codex":
+            env["CODEX_HOME"] = "/home/agent/.codex"
+        return env
+
+    def _prepare_codex_config(self, host_home: Path) -> None:
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        agents_md = self.codex_home / "AGENTS.md"
+        if not agents_md.exists():
+            agents_md.write_text("", encoding="utf-8")
+
+        auth_mode = sync_host_codex_auth_view(host_home, self.codex_home)
+        if auth_mode == "no-host-file":
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: codex needs auth; run `codex login` "
+                "on the host so ~/.codex/auth.json exists"
+            )
+
+        host_mcps, unreachable = filter_container_mcp_servers(
+            read_host_codex_mcp_servers(host_home),
+        )
+        for name, command in unreachable:
+            logger.warning(
+                "agent %s: skipping host Codex MCP %r because %r does not "
+                "resolve inside the container", self.agent_id, name, command,
+            )
+        extras = dict(self._desired_codex_extras)
+        extras.update(host_mcps)
+        bearer_env_names = {
+            str(spec.get("bearer_token_env_var"))
+            for spec in extras.values()
+            if isinstance(spec, dict) and spec.get("bearer_token_env_var")
+        }
+        self._codex_bearer_env_names = tuple(sorted(
+            name for name in bearer_env_names if os.environ.get(name)
+        ))
+        for name in sorted(bearer_env_names - set(self._codex_bearer_env_names)):
+            logger.warning(
+                "agent %s: host Codex MCP bearer env %r is not set; "
+                "the MCP will start without authentication",
+                self.agent_id, name,
+            )
+        env = self._container_puffo_mcp_env()
+        write_codex_mcp_config(
+            self.codex_home / "config.toml",
+            command="python3" if env is not None else None,
+            args=["-m", "puffo_agent.mcp.puffo_core_server"] if env is not None else None,
+            env=env,
+            extra_servers=extras,
+            inference_level=self.inference_level,
         )
 
     async def _ensure_started(self) -> None:
         async with self._started_lock:
             if self._started:
                 return
-            if shutil.which("docker") is None:
+            docker_bin = resolve_docker_bin()
+            if docker_bin is None:
                 raise RuntimeError(
-                    "docker binary not found on PATH. install Docker Desktop "
+                    "docker binary not found. Tried $PUFFO_DOCKER_BIN, "
+                    "$PATH, the persistent user PATH, and known Docker "
+                    "Desktop install locations. Install Docker Desktop "
                     "(Windows/macOS) or docker-ce (Linux) to use runtime "
                     "kind 'cli-docker'."
                 )
-            # Seed the per-agent virtual $HOME from the operator's
-            # real $HOME on first use (settings, .claude.json).
-            # .credentials.json is also seeded but the docker mount
-            # overlays it with the host file so refreshes propagate.
+            self._docker_bin = docker_bin
+            # Keep both harness homes ready so switching harnesses does not
+            # require rebuilding the container.
             host_home = Path.home()
             seeded = seed_claude_home(host_home, self.agent_home_dir)
             if seeded:
@@ -853,18 +600,27 @@ class DockerCLIAdapter(Adapter):
                     "agent %s: seeded per-agent virtual $HOME at %s from %s",
                     self.agent_id, self.agent_home_dir, host_home,
                 )
+            claude_auth_mode = sync_host_claude_code_auth_view(
+                host_home, self.agent_home_dir,
+            )
+            logger.info(
+                "agent %s: wrote host Claude credential view (%s)",
+                self.agent_id, claude_auth_mode,
+            )
             # One-way sync of host skills + MCP registrations into
             # the per-agent home. Runs every start so host edits
             # propagate without daemon restart.
-            skill_count = sync_host_skills(host_home, self.agent_home_dir)
+            if self.harness.name() == "codex":
+                skill_count = sync_host_codex_skills(host_home, self.codex_home)
+                skills_dir = self.codex_home / "skills"
+            else:
+                skill_count = sync_host_skills(host_home, self.agent_home_dir)
+                skills_dir = self.agent_home_dir / ".claude" / "skills"
             if skill_count:
                 logger.info(
                     "agent %s: synced %d host skill(s) into %s",
-                    self.agent_id, skill_count,
-                    self.agent_home_dir / ".claude" / "skills",
+                    self.agent_id, skill_count, skills_dir,
                 )
-            # After host-sync so host skills win on collision.
-            await self._install_desired_skills()
             merged_mcp, unreachable = sync_host_mcp_servers(
                 host_home, self.agent_home_dir,
             )
@@ -881,6 +637,9 @@ class DockerCLIAdapter(Adapter):
                     "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
+            await self._install_desired()
+            if self.harness.name() == "codex":
+                self._prepare_codex_config(host_home)
             # Plugins: the actual plugin tree is bind-mounted read-
             # only into the container by ``_start_container``
             # (see the ``-v {host_plugins}:/home/agent/.claude/plugins:ro``
@@ -900,51 +659,16 @@ class DockerCLIAdapter(Adapter):
                     "from host settings.json", self.agent_id, enabled_count,
                 )
 
-            # Gemini host sync — always runs (cheap when there's no
-            # ~/.gemini/) so harness swap doesn't require a rebuild.
-            # Target is PROJECT-SCOPE (<workspace>/.gemini/), not
-            # user-scope: gemini's MCP resolver from cwd ignores
-            # $HOME/.gemini/settings.json.
-            gemini_project_dir = Path(self.workspace_dir)
-            gemini_skill_count = sync_host_gemini_skills(
-                host_home, gemini_project_dir,
-            )
-            if gemini_skill_count:
-                logger.info(
-                    "agent %s: synced %d host gemini skill(s) into %s",
-                    self.agent_id, gemini_skill_count,
-                    gemini_project_dir / ".gemini" / "skills",
-                )
-            # Inject the puffo MCP entry in the same write — no
-            # separate ``gemini mcp add`` subprocess to race.
-            puffo_entry = _puffo_gemini_mcp_entry(
-                puffo_core_mcp_env=self.puffo_core_mcp_env,
-            )
-            merged_gemini_mcp, gemini_unreachable = sync_host_gemini_mcp_servers(
-                host_home, gemini_project_dir,
-                extra_servers={"puffo": puffo_entry} if puffo_entry else None,
-            )
-            if merged_gemini_mcp:
-                logger.info(
-                    "agent %s: merged %d host gemini MCP server "
-                    "registration(s) into .gemini/settings.json",
-                    self.agent_id, merged_gemini_mcp,
-                )
-            for name, cmd in gemini_unreachable:
+            if (
+                self.harness.name() == "claude-code"
+                and not (self.agent_home_dir / ".claude" / ".credentials.json").exists()
+            ):
                 logger.warning(
-                    "agent %s: host gemini MCP %r has host-local path %r "
-                    "that won't resolve inside the container — SKIPPED. "
-                    "Install the binary in the image or bind-mount it, then "
-                    "re-sync, to make this MCP available.",
-                    self.agent_id, name, cmd,
-                )
-
-            if not (host_home / ".claude" / ".credentials.json").exists():
-                logger.warning(
-                    "agent %s: host has no %s — run `claude login` on the "
+                    "agent %s: agent has no %s — run `claude login` on the "
                     "host, then restart the agent. First turn will fail "
                     "with an auth error otherwise.",
-                    self.agent_id, host_home / ".claude" / ".credentials.json",
+                    self.agent_id,
+                    self.agent_home_dir / ".claude" / ".credentials.json",
                 )
             # Reuse the container left behind by a prior daemon run
             # (``aclose`` does ``docker stop``, not ``rm``) so
@@ -952,6 +676,11 @@ class DockerCLIAdapter(Adapter):
             # next turn instead of paying container boot + image
             # pull every restart.
             state = await self._container_state()
+            if state is None:
+                raise RuntimeError(
+                    f"could not inspect Docker container {self.container_name!r}; "
+                    "refusing to create or replace it while Docker is unavailable"
+                )
             existed = state != ""
             if state == "running":
                 logger.info(
@@ -963,52 +692,72 @@ class DockerCLIAdapter(Adapter):
                     "agent %s: starting existing container %r (was %s)",
                     self.agent_id, self.container_name, state,
                 )
-                await _run_cmd(["docker", "start", self.container_name])
+                await _run_cmd([self._docker_bin, "start", self.container_name])
             elif state == "paused":
                 logger.info(
                     "agent %s: unpausing container %r",
                     self.agent_id, self.container_name,
                 )
-                await _run_cmd(["docker", "unpause", self.container_name])
-            else:
-                # state == "" — no container with this name.
+                await _run_cmd([self._docker_bin, "unpause", self.container_name])
+            elif state == "":
                 await self._ensure_image()
                 await self._start_container()
+            else:
+                raise RuntimeError(
+                    f"Docker container {self.container_name!r} is in transient "
+                    f"state {state!r}; refusing to replace it"
+                )
 
-            # Validate the puffo_agent bind mount on REUSED
-            # containers. The /opt/puffoagent-pkg bind mount source
-            # is baked in at ``docker run`` time and immutable until
-            # the container is recreated. If the operator pip-
-            # reinstalled puffo-agent from a different host path
-            # (e.g. uninstalled the editable install from
-            # puffo-core-han-group/agent and re-installed from
-            # puffo-ai/puffo-agent), the container is still bound to
-            # the old — now non-existent — path. ``python3 -m
-            # puffo_agent.mcp.puffo_core_server`` inside the
-            # container then fails with ModuleNotFoundError, and
-            # claude-code reports every puffo MCP tool as
-            # "No such tool available". Detect that case here and
-            # recreate.
-            if existed and not await self._puffo_pkg_mount_is_current():
+            layout_marker = self.agent_home_dir / ".docker-layout"
+            try:
+                layout_current = (
+                    layout_marker.read_text(encoding="utf-8").strip()
+                    == CONTAINER_LAYOUT_VERSION
+                )
+            except OSError:
+                layout_current = False
+            package_current = (
+                await self._puffo_pkg_mount_is_current() if existed else True
+            )
+            harness_current = (
+                await self._container_harness_is_current() if existed else True
+            )
+            if package_current is None or harness_current is None:
+                raise RuntimeError(
+                    f"could not validate existing Docker container "
+                    f"{self.container_name!r}; refusing to remove it after a "
+                    "failed probe"
+                )
+            if existed and not (layout_current and package_current and harness_current):
                 logger.warning(
-                    "agent %s: container %r has a stale "
-                    "/opt/puffoagent-pkg bind mount (the host path it "
-                    "was created with no longer contains puffo_agent). "
-                    "Recreating so claude-code's MCP subprocess can "
-                    "import the package again — typical cause is a "
-                    "pip reinstall from a different path.",
+                    "agent %s: recreating stale container %r "
+                    "(layout=%s package=%s harness=%s)",
                     self.agent_id, self.container_name,
+                    layout_current, package_current, harness_current,
                 )
                 await _run_cmd(
-                    ["docker", "rm", "-f", self.container_name],
-                    check=False,
+                    [self._docker_bin, "rm", "-f", self.container_name],
                 )
                 await self._ensure_image()
                 await self._start_container()
+            final_harness_probe = await self._container_harness_is_current()
+            if final_harness_probe is None:
+                raise RuntimeError(
+                    f"could not verify harness {self.harness.name()!r} in "
+                    f"Docker container {self.container_name!r}"
+                )
+            if not final_harness_probe:
+                raise RuntimeError(
+                    f"docker image {self.image!r} does not provide a working "
+                    f"{self.harness.name()} harness"
+                )
+            layout_marker.write_text(
+                CONTAINER_LAYOUT_VERSION + "\n", encoding="utf-8",
+            )
             self._started = True
 
     async def _ensure_image(self) -> None:
-        if await _image_exists_locally(self.image):
+        if await _image_exists_locally(self._docker_bin, self.image):
             return
         if self.image != DEFAULT_IMAGE:
             raise RuntimeError(
@@ -1020,7 +769,7 @@ class DockerCLIAdapter(Adapter):
         # races in BuildKit's exporter and the loser crashes with
         # "image already exists". First wins; others wait and re-check.
         async with _BUILD_LOCK:
-            if await _image_exists_locally(self.image):
+            if await _image_exists_locally(self._docker_bin, self.image):
                 logger.info(
                     "agent %s: image %s was built by another worker "
                     "during our wait — skipping rebuild",
@@ -1036,13 +785,18 @@ class DockerCLIAdapter(Adapter):
     async def _build_image(self) -> None:
         from ..._proc import no_window_kwargs
         proc = await asyncio.create_subprocess_exec(
-            "docker", "build", "-t", self.image, "-",
+            self._docker_bin, "build", "-t", self.image, "-",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             **no_window_kwargs(),
         )
-        stdout, _ = await proc.communicate(DOCKERFILE.encode())
+        stdout, _ = await _communicate_with_timeout(
+            proc,
+            input_data=DOCKERFILE.encode(),
+            timeout_seconds=DOCKER_BUILD_TIMEOUT_SECONDS,
+            operation="docker build",
+        )
         if proc.returncode != 0:
             tail = stdout.decode("utf-8", errors="replace")[-1500:]
             raise RuntimeError(f"docker build failed:\n{tail}")
@@ -1055,42 +809,31 @@ class DockerCLIAdapter(Adapter):
         # non-root container user can't write to.
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
-        host_credentials = Path.home() / ".claude" / ".credentials.json"
-        if not host_credentials.exists():
-            host_credentials.parent.mkdir(parents=True, exist_ok=True)
-            host_credentials.touch()
+        self.codex_home.mkdir(parents=True, exist_ok=True)
         # .claude.json is a FILE (not a dir) — touch so the
         # bind-mount target is a file, not a dir.
         agent_claude_json = self.agent_home_dir / ".claude.json"
         agent_claude_json.touch(exist_ok=True)
-        (self.agent_home_dir / ".gemini").mkdir(parents=True, exist_ok=True)
         self.shared_fs_dir.mkdir(parents=True, exist_ok=True)
 
         # Bind-mounts per agent:
         #   1. workspace            — project root + cwd
         #   2. .claude dir          — per-agent identity
-        #   3. .credentials.json    — SHARED single-file overlay
-        #   4. .claude.json         — per-agent CLI config
-        #   5. .gemini dir          — per-agent gemini identity
-        #   6. shared_fs            — cross-agent cooperation
-        #   7. puffoagent pkg       — host package for in-container imports
-        #   8. .puffo-agent-state   — keystore + message DB
+        #   3. .codex dir           — per-agent Codex identity/config
+        #   4. .claude.json         — per-agent Claude CLI config
+        #   5. shared_fs            — cross-agent cooperation
+        #   6. puffoagent pkg       — host package for in-container imports
+        #   7. .puffo-agent-state   — keystore + message DB
         cmd = [
-            "docker", "run", "-d",
+            self._docker_bin, "run", "-d",
             "--name", self.container_name,
             "-e", f"PUFFO_AGENT_ID={self.agent_id}",
             "-v", f"{self.workspace_dir}:/workspace",
             "-v", f"{self.claude_home_src}:/home/agent/.claude",
-            # .credentials.json mount MUST come after the .claude dir
-            # mount for Docker to treat it as a file overlay rather
-            # than a no-op.
-            "-v", f"{host_credentials}:/home/agent/.claude/.credentials.json",
+            "-v", f"{self.codex_home}:/home/agent/.codex",
             # Sibling .claude.json — without this it lands on the
             # container's ephemeral fs and is lost on restart.
             "-v", f"{agent_claude_json}:/home/agent/.claude.json",
-            # Always mounted (regardless of harness) so swapping to
-            # gemini-cli doesn't need a rebuild.
-            "-v", f"{self.agent_home_dir / '.gemini'}:/home/agent/.gemini",
             "-v", f"{self.shared_fs_dir}:/workspace/.shared",
             "-v", f"{_puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
             # RW because subkey rotation rewrites <slug>.session.json.
@@ -1143,128 +886,65 @@ class DockerCLIAdapter(Adapter):
 _BUILD_LOCK = asyncio.Lock()
 
 
-async def _image_exists_locally(tag: str) -> bool:
+def _probe_result(returncode: int) -> bool | None:
+    if returncode == 0:
+        return True
+    if returncode == _PROBE_FALSE_EXIT:
+        return False
+    return None
+
+
+async def _communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    *,
+    input_data: bytes | None = None,
+    timeout_seconds: float,
+    operation: str,
+) -> tuple[bytes, bytes]:
+    communicate_task = asyncio.create_task(proc.communicate(input_data))
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(communicate_task), timeout=timeout_seconds,
+        )
+    except TimeoutError as exc:
+        await _kill_and_reap(proc, communicate_task)
+        raise RuntimeError(
+            f"{operation} timed out after {timeout_seconds:g}s; "
+            "the child process was terminated"
+        ) from exc
+    except asyncio.CancelledError:
+        await _kill_and_reap(proc, communicate_task)
+        raise
+
+
+async def _kill_and_reap(
+    proc: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await communicate_task
+    except (BrokenPipeError, ConnectionResetError):
+        await proc.wait()
+
+
+async def _image_exists_locally(docker_bin: str, tag: str) -> bool:
     rc, _, _ = await _run_cmd(
-        ["docker", "image", "inspect", tag], check=False,
+        [docker_bin, "image", "inspect", tag], check=False,
     )
     return rc == 0
 
 
-# Host-side Claude Code credentials path. Read on every hermes turn
-# because hermes' own auto-discovery is unreliable inside the
-# container even with the credentials file bind-mounted in.
-_HOST_CLAUDE_CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
-
-
-def _read_claude_access_token() -> str:
-    """Current Claude Code OAuth access token from the host's
-    credentials file. Empty string on any failure (missing file,
-    malformed JSON, missing key) — caller logs and surfaces a turn-
-    level error rather than crashing the worker.
-    """
-    try:
-        data = json.loads(
-            _HOST_CLAUDE_CREDENTIALS_PATH.read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        return ""
-    return ((data.get("claudeAiOauth") or {}).get("accessToken") or "").strip()
-
-
-def _puffo_gemini_mcp_entry(
+async def _run_cmd(
+    cmd: list[str],
+    check: bool = True,
     *,
-    puffo_core_mcp_env: dict[str, str] | None,
-) -> dict | None:
-    """Build gemini's ``mcpServers`` entry (command + args + env)
-    for the puffo MCP server. ``None`` when puffo_core isn't
-    configured.
-    """
-    if puffo_core_mcp_env is None:
-        return None
-    env = dict(puffo_core_mcp_env)
-    env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
-    # No PUFFO_CORE_DB_PATH — see mcp/data_client.py.
-    env["PUFFO_WORKSPACE"] = "/workspace"
-    env["PUFFO_RUNTIME_KIND"] = "cli-docker"
-    env["PUFFO_HARNESS"] = "gemini-cli"
-    env["PYTHONPATH"] = "/opt/puffoagent-pkg"
-    return {
-        "command": "python3",
-        "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
-        "env": env,
-    }
-
-
-def _build_gemini_argv(
-    *,
-    container_name: str,
-    api_key: str,
-    model: str,
-    has_prior_session: bool,
-    user_message: str,
-) -> list[str]:
-    """Assemble the ``docker exec ... gemini ...`` argv for one turn.
-
-    Uses ``--prompt=<value>`` (not ``-p <value>``) so yargs reads
-    the whole prompt as a single token even when it starts with
-    ``-`` (e.g. markdown list syntax in preambles).
-    """
-    cmd = [
-        "docker", "exec", "-i",
-        "-e", f"GEMINI_API_KEY={api_key}",
-        container_name,
-        "gemini",
-    ]
-    if model:
-        cmd.extend(["--model", _gemini_model_id(model)])
-    if has_prior_session:
-        cmd.extend(["-r", "latest"])
-    cmd.extend([
-        "--output-format", "json",
-        f"--prompt={user_message}",
-    ])
-    return cmd
-
-
-def _gemini_model_id(model: str) -> str:
-    """Translate ``runtime.model`` into the form ``gemini --model``
-    expects. Strips Claude-style ``[1m]`` suffixes; empty → default.
-    """
-    base = (model or "").split("[", 1)[0].strip()
-    if not base:
-        return "gemini-2.5-pro"
-    return base
-
-
-def _parse_gemini_reply(stdout_text: str) -> tuple[str, str, str]:
-    """Pull (reply, session_id, error) from ``gemini -p ...
-    --output-format json`` stdout. Falls back to raw text when JSON
-    parse fails (some upstream failure modes ignore the format
-    flag). Returns an explicit error when stdout is gemini's --help
-    banner instead of a reply (signals malformed argv).
-    """
-    stdout_text = stdout_text.strip()
-    if not stdout_text:
-        return "", "", ""
-    try:
-        obj = json.loads(stdout_text)
-    except (json.JSONDecodeError, ValueError):
-        if stdout_text.startswith("Usage: gemini"):
-            return "", "", "gemini printed its --help banner instead of a reply; argv likely malformed"
-        return stdout_text, "", ""
-    if not isinstance(obj, dict):
-        return stdout_text, "", ""
-    reply = str(obj.get("response", "") or "")
-    session_id = str(obj.get("session_id", "") or "")
-    err_raw = obj.get("error")
-    if isinstance(err_raw, dict):
-        err = str(err_raw.get("message", "") or err_raw.get("type", "") or "unknown error")
-    else:
-        err = str(err_raw or "")
-    return reply.strip(), session_id, err
-
-
-async def _run_cmd(cmd: list[str], check: bool = True) -> tuple[int, bytes, bytes]:
+    timeout_seconds: float = DOCKER_COMMAND_TIMEOUT_SECONDS,
+) -> tuple[int, bytes, bytes]:
     from ..._proc import no_window_kwargs
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -1272,7 +952,11 @@ async def _run_cmd(cmd: list[str], check: bool = True) -> tuple[int, bytes, byte
         stderr=asyncio.subprocess.PIPE,
         **no_window_kwargs(),
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(
+        proc,
+        timeout_seconds=timeout_seconds,
+        operation=" ".join(cmd[:2]),
+    )
     if check and proc.returncode != 0:
         raise RuntimeError(
             f"command failed ({proc.returncode}): {' '.join(cmd)}\n"

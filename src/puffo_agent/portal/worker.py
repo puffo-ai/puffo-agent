@@ -133,34 +133,14 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             )
         return adapter
 
-    # CLI adapters authenticate via the host's
-    # ~/.claude/.credentials.json (set up by `claude login`); no
-    # api_key is threaded through. Model overrides still flow.
     if kind == "cli-docker":
-        # desired_skills install below; desired_mcps can't (their
-        # launch commands don't resolve in-container) — reject loudly.
-        if agent_cfg.desired_mcps:
-            raise RuntimeError(
-                f"agent {agent_cfg.id!r}: desired_mcps are not supported "
-                "on the cli-docker runtime yet (the MCP launch command "
-                "won't resolve inside the container). Clear them from "
-                "agent.yml or switch runtime.kind to cli-local."
-            )
         from ..agent.adapters.docker_cli import DockerCLIAdapter
         from ..agent.harness import build_harness
         harness = build_harness(agent_cfg.runtime.harness)
-        # gemini-cli needs GEMINI_API_KEY per docker exec; claude-code
-        # and hermes use the bind-mounted credentials file.
-        google_key = ""
-        if harness.name() == "gemini-cli":
-            google_key = daemon_cfg.google.api_key
-            if not google_key:
-                raise RuntimeError(
-                    f"agent {agent_cfg.id!r}: harness=gemini-cli requires a "
-                    "google.api_key — pass --api-key on `agent create`, set "
-                    "GEMINI_API_KEY in the environment, or run "
-                    "`puffo-agent config` to save a daemon-wide default."
-                )
+        if harness.name() == "codex":
+            model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
+        else:
+            model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or ""
         # Per-agent overrides win; empty falls through to daemon
         # defaults, then to "no cap".
         memory_limit = (
@@ -173,20 +153,23 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
         )
         adapter = DockerCLIAdapter(
             agent_id=agent_cfg.id,
-            model=agent_cfg.runtime.model or daemon_cfg.anthropic.model or "",
+            model=model,
             image=agent_cfg.runtime.docker_image,
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             claude_dir=str(agent_cfg.resolve_claude_dir()),
             session_file=str(cli_session_json_path(agent_cfg.id)),
             agent_home_dir=str(agent_home_dir(agent_cfg.id)),
             shared_fs_dir=str(shared_fs_dir()),
+            permission_mode=agent_cfg.runtime.permission_mode,
+            sandbox=agent_cfg.runtime.sandbox,
             inference_level=agent_cfg.runtime.inference_level,
+            task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
             harness=harness,
-            google_api_key=google_key,
             memory_limit=memory_limit,
             memory_reservation=memory_reservation,
             desired_skills=agent_cfg.desired_skills,
             env_overrides=agent_cfg.env_overrides,
+            desired_mcps=agent_cfg.desired_mcps,
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
@@ -1589,19 +1572,28 @@ async def _process_refresh_flags(
 
     if host_sync_seen:
         try:
-            from .state import (
-                agent_home_dir,
-                sync_host_mcp_servers,
-                sync_host_skills,
-            )
-            host_home = Path.home()
-            ah = agent_home_dir(agent_id)
-            skill_count = sync_host_skills(host_home, ah)
-            merged_mcp, _unreach = sync_host_mcp_servers(host_home, ah)
-            logger.info(
-                "agent %s: refresh_host_sync (skills=%d mcp=%d)",
-                agent_id, skill_count, merged_mcp,
-            )
+            if harness_name == "codex":
+                # TODO: Implement Codex host sync for both cli-local and
+                # cli-docker instead of requiring a worker restart.
+                logger.info(
+                    "agent %s: refresh_host_sync for Codex is deferred until "
+                    "the worker restarts",
+                    agent_id,
+                )
+            else:
+                from .state import (
+                    agent_home_dir,
+                    sync_host_mcp_servers,
+                    sync_host_skills,
+                )
+                host_home = Path.home()
+                ah = agent_home_dir(agent_id)
+                skill_count = sync_host_skills(host_home, ah)
+                merged_mcp, _unreach = sync_host_mcp_servers(host_home, ah)
+                logger.info(
+                    "agent %s: refresh_host_sync (skills=%d mcp=%d)",
+                    agent_id, skill_count, merged_mcp,
+                )
         except Exception as exc:
             logger.warning(
                 "agent %s: refresh_host_sync failed: %s", agent_id, exc,

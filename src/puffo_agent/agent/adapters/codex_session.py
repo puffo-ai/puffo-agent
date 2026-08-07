@@ -219,6 +219,7 @@ class CodexSession:
         argv: list[str],
         *,
         cwd: Optional[str] = None,
+        thread_cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
@@ -230,6 +231,8 @@ class CodexSession:
         self.session_file = session_file
         self.argv = argv
         self.cwd = cwd
+        self.thread_cwd = thread_cwd
+        self._effective_thread_cwd = thread_cwd or cwd
         self.env = env
         # ``bypassPermissions`` auto-approves every approval request.
         # The plan's v1 stance — other modes are deferred until the
@@ -262,6 +265,17 @@ class CodexSession:
                     self.agent_id, persisted_sandbox, self.sandbox,
                 )
                 self._conversation_id = ""
+            elif self._effective_thread_cwd is not None:
+                persisted_thread_cwd = self._load_persisted_thread_cwd()
+                if persisted_thread_cwd != self._effective_thread_cwd:
+                    logger.info(
+                        "agent %s: codex thread cwd changed (%s → %s); "
+                        "starting a fresh thread",
+                        self.agent_id,
+                        persisted_thread_cwd or "<unset>",
+                        self._effective_thread_cwd,
+                    )
+                    self._conversation_id = ""
         # Latest system prompt; lets reload detect no-ops and respawn re-issue
         # thread/start with current instructions.
         self.current_instructions: str = ""
@@ -597,11 +611,22 @@ class CodexSession:
             return "danger-full-access"
         return str(data.get("sandbox") or "danger-full-access")
 
+    def _load_persisted_thread_cwd(self) -> str:
+        try:
+            data = json.loads(self.session_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(data.get("thread_cwd") or "")
+
     def _save_conversation_id(self, cid: str) -> None:
         try:
             self.session_file.parent.mkdir(parents=True, exist_ok=True)
             self.session_file.write_text(
-                json.dumps({"conversation_id": cid, "sandbox": self.sandbox}),
+                json.dumps({
+                    "conversation_id": cid,
+                    "sandbox": self.sandbox,
+                    "thread_cwd": self._effective_thread_cwd,
+                }),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -733,7 +758,7 @@ class CodexSession:
         # verified live). Sandbox default stays open: cli-local runs as the
         # operator's UID, the real boundary is cli-docker's container.
         new_conv_params: dict[str, Any] = {
-            "cwd": self.cwd or os.getcwd(),
+            "cwd": self._effective_thread_cwd or os.getcwd(),
             "approvalPolicy": (
                 "never" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),

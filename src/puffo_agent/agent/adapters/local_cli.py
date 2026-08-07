@@ -198,15 +198,12 @@ class LocalCLIAdapter(Adapter):
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
-        # cli-local supports claude-code (default), codex (alpha),
-        # and hermes (alpha — one-shot CLI per turn, no long-lived
-        # session). gemini-cli remains cli-docker-only.
+        # cli-local supports claude-code, codex, and hermes.
         if harness.name() == "gemini-cli":
             raise RuntimeError(
                 f"agent {agent_id!r}: runtime.harness={harness.name()!r} is "
-                "not supported with runtime.kind=cli-local yet. Use "
-                "runtime.kind=cli-docker, or switch runtime.harness "
-                "back to claude-code."
+                "not supported. Switch runtime.harness to claude-code "
+                "or codex."
             )
         self.harness = harness
         self.puffo_core_mcp_env: dict[str, str] | None = None

@@ -284,6 +284,8 @@ class Daemon:
             try:
                 agent_cfg = self._load_agent_cfg_cached(agent_id)
             except Exception as exc:
+                # TODO: Cache invalid configs by mtime, stop any stale worker,
+                # publish an errored RuntimeState, and support lenient CLI repair.
                 logger.warning("agent %s: failed to load agent.yml: %s", agent_id, exc)
                 continue
 
@@ -690,7 +692,7 @@ def _mcp_fingerprint_path() -> Path:
 
 
 def _respawn_codex_on_mcp_change_at_startup() -> None:
-    """Drop cli-local codex sessions when the MCP tool surface changed so
+    """Drop CLI Codex sessions when the MCP tool surface changed so
     they reload tools — codex caches MCP once (openai/codex#7767). First
     run just records the fingerprint."""
     import json
@@ -713,7 +715,7 @@ def _respawn_codex_on_mcp_change_at_startup() -> None:
             except Exception:  # noqa: BLE001
                 continue
             rt = cfg.runtime
-            if rt.kind != "cli-local" or rt.harness != "codex":
+            if rt.kind not in {"cli-local", "cli-docker"} or rt.harness != "codex":
                 continue
             try:
                 flag = refresh_session_flag_path(cfg.resolve_workspace_dir())

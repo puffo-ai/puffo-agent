@@ -238,7 +238,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         cfg.openai = ProviderConfig(api_key=oai_key, model=cfg.openai.model or "gpt-4o")
 
     goog_key = cfg.google.api_key or env_google
-    goog_key = prompt("Default Google API key (blank to skip; needed for cli-docker + gemini-cli)", goog_key)
+    goog_key = prompt("Default Google API key (blank to skip; used by Google chat runtimes)", goog_key)
     if goog_key:
         cfg.google = ProviderConfig(api_key=goog_key, model=cfg.google.model or "gemini-2.5-pro")
 
@@ -250,7 +250,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print("  chat-local   conversational LLM, no tools (default, uses the keys above)")
     print("  sdk-local    in-process agent SDK w/ tools  [pip install puffo-agent[sdk]]")
     print("  cli-local    claude CLI on the host, permission-proxy DMs operator [run `claude login` first]")
-    print("  cli-docker   claude CLI inside a per-agent container  [Docker + `claude login` on host]")
+    print("  cli-docker   Claude Code or Codex in a per-agent container  [Docker + host CLI login]")
     print()
     print("defaults saved — `puffo-agent agent create` will use these unless overridden.")
     return 0
@@ -465,6 +465,14 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
 
     runtime_kind = args.runtime or "chat-local"
     provider = args.provider or "anthropic"
+    from .runtime_matrix import resolve_effective_harness, validate_triple
+    harness = resolve_effective_harness(
+        runtime_kind, provider, getattr(args, "harness", None) or "",
+    ) or "claude-code"
+    result = validate_triple(runtime_kind, provider, harness)
+    if not result.ok:
+        print(f"error: {result.error}", file=sys.stderr)
+        return 2
     api_key = _resolve_api_key_for_create(
         provider=provider,
         flag_value=args.api_key or "",
@@ -507,6 +515,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             provider=args.provider or "",
             api_key=api_key,
             model=args.model or "",
+            harness=harness,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -1685,7 +1694,15 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--provider",
         choices=["anthropic", "openai", "google"],
-        help="Model provider (default: anthropic; ignored for cli-local/cli-docker)",
+        help="Model provider (default: anthropic)",
+    )
+    create.add_argument(
+        "--harness",
+        choices=["claude-code", "hermes", "codex"],
+        help=(
+            "CLI harness. Defaults by provider/runtime; cli-docker supports "
+            "claude-code and codex"
+        ),
     )
     create.add_argument(
         "--api-key",
@@ -1771,9 +1788,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         choices=["anthropic", "openai", "google"],
         help=(
-            "Model provider. anthropic (default) pairs with claude-code; "
-            "openai pairs with hermes; google reserved for gemini-cli. "
-            "Must match harness if harness is claude-code / gemini-cli."
+            "Model provider. anthropic pairs with claude-code; openai "
+            "pairs with codex, or hermes on cli-local."
         ),
     )
     runtime.add_argument("--model", help="Model override (empty string clears)")
@@ -1797,7 +1813,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox",
         choices=["read-only", "workspace-write", "danger-full-access"],
         help=(
-            "codex (cli-local): file-system policy. Note "
+            "codex: file-system policy. Note "
             "``workspace-write`` is silently downgraded to read-only "
             "on Windows; use ``danger-full-access`` there."
         ),
@@ -1813,17 +1829,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     runtime.add_argument(
         "--harness",
-        choices=["claude-code", "hermes", "gemini-cli", "codex"],
+        choices=["claude-code", "hermes", "codex"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
             "runtime. 'claude-code' (default, anthropic only) spawns the "
-            "claude CLI with our stream-json session protocol. 'hermes' "
-            "(anthropic + openai) spawns `hermes chat` one-shot per turn. "
-            "'gemini-cli' (google, reserved — not yet implemented) targets "
-            "Google's gemini CLI. 'codex' (openai, cli-local alpha — opt-"
-            "in, not the default for openai) spawns `codex app-server` as "
-            "a long-lived JSON-RPC subprocess; auth via runtime.api_key or "
-            "operator-side `codex login`. Hermes OAuth routes to "
+            "claude CLI with our stream-json session protocol. 'codex' "
+            "(openai, cli-local or cli-docker) spawns `codex app-server` "
+            "as a long-lived JSON-RPC subprocess using operator-side "
+            "`codex login`. 'hermes' is cli-local only and routes OAuth to "
             "Anthropic's extra_usage pool, NOT your Claude subscription — "
             "see NousResearch/hermes-agent#12905."
         ),
@@ -1956,7 +1969,10 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument(
         "--host-sync",
         action="store_true",
-        help="also re-sync ~/.claude/skills + host MCP registrations",
+        help=(
+            "also re-sync host skills, MCP registrations, and portable "
+            "credentials"
+        ),
     )
     refresh.add_argument(
         "--session",

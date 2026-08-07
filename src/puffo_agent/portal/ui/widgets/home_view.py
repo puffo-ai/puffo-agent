@@ -70,7 +70,6 @@ class _CliCard(QFrame):
         self.setObjectName("card")
         self._resolver = resolver
         self._cred_check = cred_check
-        self._coming_soon = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -118,20 +117,7 @@ class _CliCard(QFrame):
         self._path_label.setVisible(False)
         layout.addWidget(self._path_label)
 
-    def mark_coming_soon(self) -> None:
-        self._coming_soon = True
-
     def refresh(self) -> None:
-        if self._coming_soon:
-            self._dot.setStyleSheet("font-size: 14pt; color: #d8b834;")
-            self._status_label.setText("coming soon")
-            self._status_label.setStyleSheet(
-                "color: #9ca3af; font-size: 9pt; font-style: italic;"
-            )
-            self._path_label.setText("Hermes integration ships in a future release.")
-            self._toggle.setEnabled(False)
-            self._toggle.setVisible(False)
-            return
         try:
             path = self._resolver()
         except Exception:
@@ -224,10 +210,12 @@ class HomeView(QWidget):
             codex_has_credentials,
             resolve_claude_bin,
             resolve_codex_bin,
+            resolve_docker_bin,
         )
         cli_specs: list[tuple[str, Callable[[], Optional[str]], Optional[Callable[[], bool]]]] = [
             ("Claude Code", resolve_claude_bin, claude_has_credentials),
             ("Codex",       resolve_codex_bin,  codex_has_credentials),
+            ("Docker",      resolve_docker_bin, None),
         ]
         cli_grid = QHBoxLayout()
         cli_grid.setSpacing(12)
@@ -236,10 +224,6 @@ class HomeView(QWidget):
             card = _CliCard(label, resolver, cred_check)
             self._cli_cards.append(card)
             cli_grid.addWidget(card, stretch=1)
-        hermes_card = _CliCard("Hermes", lambda: None)
-        hermes_card.mark_coming_soon()
-        self._cli_cards.append(hermes_card)
-        cli_grid.addWidget(hermes_card, stretch=1)
         outer.addLayout(cli_grid)
 
         # Agent count card

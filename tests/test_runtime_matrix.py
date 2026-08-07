@@ -15,6 +15,7 @@ from puffo_agent.portal.runtime_matrix import (
     DEFAULT_HARNESS_FOR_PROVIDER,
     DEFAULT_PROVIDER_FOR_RUNTIME,
     HARNESS_CLAUDE_CODE,
+    HARNESS_CODEX,
     HARNESS_GEMINI_CLI,
     HARNESS_HERMES,
     HARNESS_PROVIDERS,
@@ -92,9 +93,8 @@ def test_migrate_unknown_kind_passes_through_for_validator_to_reject():
     (RUNTIME_CLI_LOCAL,  PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
     (RUNTIME_CLI_LOCAL,  PROVIDER_ANTHROPIC, HARNESS_HERMES),
     (RUNTIME_CLI_LOCAL,  PROVIDER_OPENAI,    HARNESS_HERMES),
-    (RUNTIME_CLI_LOCAL,  PROVIDER_GOOGLE,    HARNESS_GEMINI_CLI),
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
-    (RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE,    HARNESS_GEMINI_CLI),
+    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI,    HARNESS_CODEX),
 
     # Empty harness on CLI kinds falls back to the runtime default.
     (RUNTIME_CLI_LOCAL,  PROVIDER_ANTHROPIC, ""),
@@ -148,7 +148,16 @@ def test_validate_triple_rejects_gemini_cli_with_anthropic():
     result = validate_triple(RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_GEMINI_CLI)
     assert not result.ok
     assert "gemini-cli" in result.error
-    assert "anthropic" in result.error
+    assert "cli-docker" in result.error
+
+
+def test_validate_triple_rejects_gemini_cli_with_google():
+    result = validate_triple(
+        RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, HARNESS_GEMINI_CLI,
+    )
+    assert not result.ok
+    assert "gemini-cli" in result.error
+    assert "cli-docker" in result.error
 
 
 def test_validate_triple_rejects_hermes_with_google():
@@ -156,6 +165,15 @@ def test_validate_triple_rejects_hermes_with_google():
     result = validate_triple(RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, HARNESS_HERMES)
     assert not result.ok
     assert "hermes" in result.error
+
+
+def test_validate_triple_rejects_hermes_on_cli_docker():
+    result = validate_triple(
+        RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_HERMES,
+    )
+    assert not result.ok
+    assert "hermes" in result.error
+    assert "cli-docker" in result.error
 
 
 def test_validate_triple_ignores_harness_for_non_cli_runtimes():
@@ -222,19 +240,19 @@ def test_resolve_effective_harness_empty_for_non_cli_runtimes():
 
 def test_resolve_effective_harness_fills_cli_default():
     """Empty harness on a CLI runtime picks the provider-natural
-    default (anthropic -> claude-code, google -> gemini-cli)."""
+    default (anthropic -> claude-code, openai -> codex in Docker)."""
     assert resolve_effective_harness(
         RUNTIME_CLI_LOCAL, PROVIDER_ANTHROPIC, "",
     ) == HARNESS_CLAUDE_CODE
     assert resolve_effective_harness(
-        RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, "",
-    ) == HARNESS_GEMINI_CLI
+        RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, "",
+    ) == HARNESS_CODEX
 
 
 def test_resolve_effective_harness_preserves_explicit_value():
     assert resolve_effective_harness(
-        RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_HERMES,
-    ) == HARNESS_HERMES
+        RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, HARNESS_CODEX,
+    ) == HARNESS_CODEX
 
 
 # ── Matrix invariants ────────────────────────────────────────────────────────

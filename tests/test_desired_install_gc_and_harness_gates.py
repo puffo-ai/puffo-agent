@@ -1,4 +1,4 @@
-"""PUF-273: spawn-time provenance GC + cli-docker reject + hermes
+"""Spawn-time desired-content provenance, Docker wiring, and Hermes
 early-return.
 
 Covers the three follow-up items deferred from PUF-268:
@@ -267,14 +267,16 @@ def _make_agent_cfg(
     desired_skills: list[str] | None = None,
     desired_mcps: list[str] | None = None,
 ):
-    """Minimal stub: only the fields the cli-docker reject gate reads."""
+    """Minimal config accepted by the cli-docker worker branch."""
     from types import SimpleNamespace
     runtime = SimpleNamespace(
         kind=runtime_kind,
         harness="claude-code",
         model="",
         permission_mode="bypassPermissions",
+        sandbox="danger-full-access",
         inference_level="",
+        task_timeout_seconds=1800.0,
         docker_image="",
         docker_memory_limit="",
         docker_memory_reservation="",
@@ -341,16 +343,23 @@ def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
     assert "puffo_core_keys_dir" in captured
 
 
-def test_build_adapter_cli_docker_rejects_non_empty_desired_mcps():
+def test_build_adapter_cli_docker_accepts_non_empty_desired_mcps(monkeypatch):
     from puffo_agent.portal.worker import build_adapter
+    from puffo_agent.agent.adapters import docker_cli as dc
+
+    captured: dict = {}
+
+    class _Stub:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(dc, "DockerCLIAdapter", _Stub)
 
     agent_cfg = _make_agent_cfg(
         runtime_kind="cli-docker", desired_mcps=["m1"],
     )
-    with pytest.raises(RuntimeError) as ei:
-        build_adapter(_make_daemon_cfg(), agent_cfg)
-    assert "cli-docker" in str(ei.value)
-    assert "desired_mcps" in str(ei.value)
+    build_adapter(_make_daemon_cfg(), agent_cfg)
+    assert captured["desired_mcps"] == ["m1"]
 
 
 def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
@@ -383,7 +392,7 @@ def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_docker_install_desired_skills_passes_skills_only(
+async def test_docker_install_desired_passes_skills_and_mcps(
     monkeypatch, tmp_path,
 ):
     """The docker adapter installs skills but never MCPs — MCPs are
@@ -410,16 +419,18 @@ async def test_docker_install_desired_skills_passes_skills_only(
         agent_home_dir=str(tmp_path),
         shared_fs_dir=str(tmp_path),
         desired_skills=["s1"],
+        desired_mcps=["m1"],
         puffo_core_server_url="u",
         puffo_core_slug="sl",
         puffo_core_keys_dir=str(tmp_path / "keys"),
     )
-    await adapter._install_desired_skills()
+    await adapter._install_desired()
     assert calls["desired_skills"] == ["s1"]
-    assert calls["desired_mcps"] == []
+    assert calls["desired_mcps"] == ["m1"]
+    assert calls["containerized"] is True
     # idempotent — a second call is a no-op
     calls.clear()
-    await adapter._install_desired_skills()
+    await adapter._install_desired()
     assert calls == {}
 
 

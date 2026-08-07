@@ -139,6 +139,7 @@ def write_codex_mcp_config(
         "# Regenerated on every worker start; manual edits are lost.",
         "",
         'cli_auth_credentials_store = "file"',
+        'mcp_oauth_credentials_store = "file"',
     ]
     # top-level key must precede [mcp_servers.*] tables
     if inference_level:
