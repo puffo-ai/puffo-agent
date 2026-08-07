@@ -347,6 +347,10 @@ async def list_agents(request: web.Request) -> web.Response:
             "runtime_model": cfg.runtime.model,
             "runtime_status": rs_status,
             "runtime_health": rs.health if rs else "unknown",
+            "runtime_max_context": rs.max_context if rs else 0,
+            "runtime_auto_compact_threshold_pct": (
+                rs.auto_compact_threshold_pct if rs else None
+            ),
             "msg_count": rs.msg_count if rs else 0,
             "owned": is_owner(aid, paired_root),
             # Operator slug who created the agent. Empty string for
@@ -840,6 +844,8 @@ def _runtime_state_dict(rs: RuntimeState | None) -> dict | None:
         "last_event_at": rs.last_event_at,
         "error": rs.error,
         "health": rs.health,
+        "max_context": rs.max_context,
+        "auto_compact_threshold_pct": rs.auto_compact_threshold_pct,
     }
 
 

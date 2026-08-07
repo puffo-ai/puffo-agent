@@ -322,28 +322,19 @@ class PuffoAgent:
         )
         result = await self.adapter.run_turn(ctx)
 
+        turn_complete_payload = {
+            "tokens": {"input": result.input_tokens, "output": result.output_tokens}
+        }
+        context_tokens = result.metadata.get("context_tokens")
+        if isinstance(context_tokens, int) and context_tokens > 0:
+            turn_complete_payload["current_context"] = context_tokens
         asyncio.ensure_future(
             get_reporter().emit(
                 self.agent_id,
                 "turn_complete",
-                {"tokens": {"input": result.input_tokens, "output": result.output_tokens}},
+                turn_complete_payload,
             )
         )
-
-        # Only adapters reporting a positive context size emit telemetry.
-        context_tokens = result.metadata.get("context_tokens")
-        if isinstance(context_tokens, int) and context_tokens > 0:
-            from ..portal.control.context_telemetry import build_context_telemetry
-
-            telemetry = build_context_telemetry(
-                model=getattr(self.adapter, "model", "") or "",
-                current_context_tokens=context_tokens,
-                env_overrides=getattr(self.adapter, "env_overrides", None),
-                env=getattr(self.adapter, "context_telemetry_env", None),
-            )
-            asyncio.ensure_future(
-                get_reporter().emit(self.agent_id, "context_telemetry", telemetry)
-            )
 
         # Reply routing:
         #   a. send_message called → return None (MCP already posted).

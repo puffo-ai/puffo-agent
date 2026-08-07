@@ -229,6 +229,11 @@ class LocalCLIAdapter(Adapter):
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
 
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._session is None:
+            return None, None
+        return self._session.context_limits()
+
     async def run_retry_turn(
         self,
         kick_text: str,

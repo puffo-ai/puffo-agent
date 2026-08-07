@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from _bridge_support import write_test_agent
-from puffo_agent.portal.state import AgentConfig
+from puffo_agent.portal.state import AgentConfig, RuntimeState
 from puffo_agent.portal.ui.widgets import agent_detail
 
 
@@ -37,10 +37,45 @@ def test_threshold_control_uses_honest_default_label(qapp, agent_home):
     view = agent_detail.AgentDetail()
     view.bind("threshold-ui")
 
-    assert view._autocompact.itemText(0) == "Default (95%)"
+    assert view._autocompact.itemText(0) == "Default"
     assert view._autocompact.currentData() == "50"
-    assert "estimated compact point" in view._context_usage.text()
-    assert "1000K window" in view._context_usage.text()
+    assert "Estimated 1000K window" in view._context_usage.text()
+    assert "~500K (50%)" in view._context_usage.text()
+    assert view._autocompact.isEnabled()
+
+
+def test_preview_is_inert_before_an_agent_is_bound(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view._update_autocompact_preview()
+    assert view._context_usage.text() == "—"
+
+
+def test_threshold_control_uses_claude_reported_default(qapp, agent_home):
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.env_overrides = {}
+    cfg.save()
+    RuntimeState(
+        max_context=200_000,
+        auto_compact_threshold_pct=83.5,
+    ).save("threshold-ui")
+
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    assert view._autocompact.itemText(0) == "Default (83.5%)"
+    assert view._autocompact.currentData() == ""
+    assert "200K window" in view._context_usage.text()
+    assert "~167K (83.5%) (default)" in view._context_usage.text()
+    assert "Estimated" not in view._context_usage.text()
+
+
+def test_threshold_control_applies_to_cli_docker_claude(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    view._runtime_kind.setCurrentText("cli-docker")
+    qapp.processEvents()
+
     assert view._autocompact.isEnabled()
 
 
@@ -73,7 +108,42 @@ def test_threshold_selection_participates_in_dirty_state(qapp, agent_home):
     assert view._save_btn.isEnabled()
 
 
+def test_threshold_selection_updates_the_preview_immediately(qapp, agent_home):
+    RuntimeState(
+        max_context=200_000,
+        auto_compact_threshold_pct=50,
+    ).save("threshold-ui")
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    view._autocompact.setCurrentIndex(view._autocompact.findData("30"))
+    qapp.processEvents()
+
+    assert "200K window" in view._context_usage.text()
+    assert "~60K (30%)" in view._context_usage.text()
+
+
+def test_switching_from_override_to_default_does_not_reuse_stale_pct(
+    qapp, agent_home
+):
+    RuntimeState(
+        max_context=200_000,
+        auto_compact_threshold_pct=50,
+    ).save("threshold-ui")
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    view._autocompact.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert "compact point unavailable" in view._context_usage.text()
+
+
 def test_save_persists_selected_threshold(qapp, agent_home):
+    RuntimeState(
+        max_context=200_000,
+        auto_compact_threshold_pct=50,
+    ).save("threshold-ui")
     view = agent_detail.AgentDetail()
     view.bind("threshold-ui")
     view._autocompact.setCurrentIndex(view._autocompact.findData("75"))
@@ -83,6 +153,27 @@ def test_save_persists_selected_threshold(qapp, agent_home):
     assert AgentConfig.load("threshold-ui").env_overrides == {
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
     }
+    state = RuntimeState.load("threshold-ui")
+    assert state is not None
+    assert state.max_context == 0
+    assert state.auto_compact_threshold_pct is None
+
+
+def test_non_context_save_keeps_runtime_limits(qapp, agent_home):
+    RuntimeState(
+        max_context=200_000,
+        auto_compact_threshold_pct=50,
+    ).save("threshold-ui")
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    view._display_name.setText("Renamed")
+
+    view._on_save()
+
+    state = RuntimeState.load("threshold-ui")
+    assert state is not None
+    assert state.max_context == 200_000
+    assert state.auto_compact_threshold_pct == 50
 
 
 def test_save_default_clears_existing_threshold(qapp, agent_home):

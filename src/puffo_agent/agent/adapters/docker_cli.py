@@ -198,8 +198,6 @@ class DockerCLIAdapter(Adapter):
         self.harness = harness
         self.desired_skills = list(desired_skills or [])
         self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
-        # Docker exec does not inherit the daemon's host environment.
-        self.context_telemetry_env = self.env_overrides
         self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
@@ -227,6 +225,11 @@ class DockerCLIAdapter(Adapter):
             )
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._session is None:
+            return None, None
+        return self._session.context_limits()
 
     async def run_retry_turn(
         self,

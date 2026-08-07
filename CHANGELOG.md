@@ -9,10 +9,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Per-agent Claude Code auto-compaction controls and context telemetry.**
-  Operators can select the default 95%, 75%, 50%, or 30% threshold from the
-  desktop or web edit path. Changes restart only the affected worker, apply to
-  local and Docker CLI sessions, and report estimated context usage without
-  blocking turns.
+  Operators can select Claude's session-reported default or an earlier 75%,
+  50%, or 30% threshold for local and Docker CLI agents. The desktop and web
+  interfaces show the session's actual context window and compact point, while
+  completed turns report live usage without persisting it as runtime config.
 
 - **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
   runs `codex app-server` in its own container while reusing the

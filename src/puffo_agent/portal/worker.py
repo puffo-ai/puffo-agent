@@ -955,18 +955,41 @@ class Worker:
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
-    def _runtime_info(self) -> dict[str, str]:
+    def _runtime_info(self) -> dict[str, object]:
         """Heartbeat payload: the agent's runtime, so the operator's portal can
         show + pre-select the live model. An edit restarts the worker, so the
         next instance reports the updated values."""
         rt = self.agent_cfg.runtime
-        return {
+        info: dict[str, object] = {
             "kind": rt.kind,
             "provider": rt.provider,
             "harness": rt.harness,
             "model": rt.model,
             "inference_level": rt.inference_level,
         }
+        if rt.harness == "claude-code":
+            from .control.context_telemetry import build_context_runtime
+
+            adapter = getattr(self, "_adapter", None)
+            limits = adapter.context_limits() if adapter is not None else (None, None)
+            info.update(
+                build_context_runtime(
+                    model=getattr(adapter, "model", "") or rt.model,
+                    max_context=limits[0],
+                    auto_compact_threshold=limits[1],
+                    env_overrides=self.agent_cfg.env_overrides,
+                )
+            )
+            max_context = int(info["max_context"])
+            threshold_pct = info["auto_compact_threshold_pct"]
+            if (
+                self.runtime.max_context != max_context
+                or self.runtime.auto_compact_threshold_pct != threshold_pct
+            ):
+                self.runtime.max_context = max_context
+                self.runtime.auto_compact_threshold_pct = threshold_pct
+                self.runtime.save(self.agent_cfg.id)
+        return info
 
     async def _run_ws_local(self) -> None:
         """ws-local agents run no harness consumer. Build the client,

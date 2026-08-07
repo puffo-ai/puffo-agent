@@ -166,6 +166,7 @@ INIT_TIMEOUT_SECONDS = 10.0
 # the turn. 16 MiB bounds memory per agent while comfortably covering
 # every event size seen in practice.
 STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
+CONTEXT_USAGE_TIMEOUT_SECONDS = 3.0
 
 # Read loop has no turn-correlation — collects until ``result`` — so any
 # pre-turn ``assistant`` chatter (Claude Code's internal cron ticks) leaks
@@ -244,6 +245,9 @@ class ClaudeSession:
         # fallback needs to be sent because claude-code has no
         # transcript to resume.
         self._last_spawn_resumed: bool = False
+        self._context_usage: dict[str, object] | None = None
+        self._context_usage_supported: bool | None = None
+        self._control_request_counter = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -409,6 +413,15 @@ class ClaudeSession:
         """
         async with self._lock:
             await self._ensure_running(system_prompt)
+            await self._refresh_context_usage()
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._context_usage is None:
+            return None, None
+        return (
+            _positive_int(self._context_usage.get("rawMaxTokens")),
+            _positive_int(self._context_usage.get("autoCompactThreshold")),
+        )
 
     def has_persisted_session(self) -> bool:
         """True when a previous run left a session id on disk — i.e.
@@ -500,6 +513,8 @@ class ClaudeSession:
         # --verbose is required with --output-format stream-json +
         # --print / streaming input; the CLI rejects the combo
         # otherwise.
+        self._context_usage = None
+        self._context_usage_supported = None
         args = [
             "--input-format", "stream-json",
             "--output-format", "stream-json",
@@ -514,8 +529,6 @@ class ClaudeSession:
         if self._session_id:
             args.extend(["--resume", self._session_id])
 
-        # Keep this upstream whitelist narrow: a prior NODE_OPTIONS memory cap
-        # increased RSS on constrained Docker Desktop VMs.
         env_overrides: dict[str, str] = dict(self.env_overrides)
         cmd = self.build_command(args, env_overrides)
         logger.info(
@@ -651,6 +664,8 @@ class ClaudeSession:
             return
         proc = self._proc
         self._proc = None
+        self._context_usage = None
+        self._context_usage_supported = None
         # Cancel the stderr drain before the subprocess goes away —
         # without this the drain awaits readline() forever on Windows
         # and blocks ``asyncio.run`` from exiting cleanly on shutdown.
@@ -687,6 +702,75 @@ class ClaudeSession:
             pass
 
     # ── One turn ──────────────────────────────────────────────────────────────
+
+    async def _refresh_context_usage(self) -> dict[str, object] | None:
+        if self._context_usage_supported is False or self._proc is None:
+            return None
+        proc = self._proc
+        assert proc.stdin is not None and proc.stdout is not None
+        self._control_request_counter += 1
+        request_id = f"ctx_{self._control_request_counter}"
+        frame = {
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "get_context_usage"},
+        }
+        try:
+            proc.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            usage = await asyncio.wait_for(
+                self._read_context_usage_response(proc, request_id),
+                timeout=CONTEXT_USAGE_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError) as exc:
+            self._context_usage_supported = False
+            logger.debug(
+                "agent %s: Claude context usage unavailable: %s",
+                self.agent_id,
+                exc,
+            )
+            return None
+        self._context_usage_supported = True
+        self._context_usage = {
+            "totalTokens": _positive_int(usage.get("totalTokens")),
+            "rawMaxTokens": _positive_int(usage.get("rawMaxTokens")),
+            "autoCompactThreshold": _positive_int(
+                usage.get("autoCompactThreshold")
+            ),
+        }
+        return self._context_usage
+
+    async def _read_context_usage_response(
+        self,
+        proc: asyncio.subprocess.Process,
+        request_id: str,
+    ) -> dict[str, object]:
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                raise ConnectionError("Claude stream closed during context query")
+            event = _parse_event(line)
+            if event is None:
+                continue
+            if event.get("type") == "system":
+                sid = (event.get("session_id") or "").strip()
+                if sid and sid != self._session_id:
+                    self._save_session_id(sid)
+                continue
+            if event.get("type") != "control_response":
+                continue
+            response = event.get("response") or {}
+            if not isinstance(response, dict):
+                raise RuntimeError("context query returned an invalid envelope")
+            if response.get("request_id") != request_id:
+                continue
+            if response.get("subtype") == "error":
+                raise RuntimeError(response.get("error") or "context query failed")
+            usage = response.get("response")
+            if not isinstance(usage, dict):
+                raise RuntimeError("context query returned an invalid response")
+            return usage
 
     async def _drain_stale_stdout(self) -> int:
         """Consume stdout events buffered before this turn's frame is
@@ -884,6 +968,12 @@ class ClaudeSession:
                     reply_parts.append(result_text)
                 break
 
+        context_usage = await self._refresh_context_usage()
+        if context_usage is not None:
+            reported_context = _positive_int(context_usage.get("totalTokens"))
+            if reported_context is not None:
+                context_tokens = reported_context
+
         reply = "".join(reply_parts).strip()
 
         # Poisoned-session recovery. If the API rejected the whole
@@ -937,3 +1027,9 @@ def _parse_event(line: bytes) -> dict | None:
         return json.loads(line.decode("utf-8").strip())
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value

@@ -180,6 +180,30 @@ async def test_list_returned_normally_when_paired_operator_is_unlinked():
     assert "free-op-bot" in ids
 
 
+async def test_list_includes_persisted_context_limits():
+    from puffo_agent.portal.state import RuntimeState
+
+    user = make_user()
+    home = isolated_home()
+    user_root_pk = base64url_encode(user.root_key.public_key_bytes())
+    write_test_agent(home, "context-bot", owner_root_pubkey=user_root_pk)
+    RuntimeState(
+        status="running",
+        max_context=200_000,
+        auto_compact_threshold_pct=83.5,
+    ).save("context-bot")
+
+    app = build_app(DaemonConfig().bridge)
+    async with TestClient(TestServer(app)) as c:
+        await _pair(c, user)
+        h = signed_headers(user, "GET", "/v1/agents"); h.update(_HOST)
+        response = await c.get("/v1/agents", headers=h)
+        agents = {agent["id"]: agent for agent in (await response.json())["agents"]}
+
+    assert agents["context-bot"]["runtime_max_context"] == 200_000
+    assert agents["context-bot"]["runtime_auto_compact_threshold_pct"] == 83.5
+
+
 async def test_list_marks_owned_correctly(client):
     user = make_user()
     home = isolated_home()  # fresh home so we control which agents exist

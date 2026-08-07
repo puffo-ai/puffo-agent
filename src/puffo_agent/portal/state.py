@@ -1298,6 +1298,8 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
+    max_context: int = 0
+    auto_compact_threshold_pct: float | None = None
     # Worker-side health, independent of ``status``:
     #   "ok"                  - clean turn / cleared red
     #   "in_progress"         - turn mid-flight; overrides sticky reds
@@ -1329,6 +1331,12 @@ class RuntimeState:
             msg_count=int(raw.get("msg_count", 0)),
             last_event_at=int(raw.get("last_event_at", 0)),
             error=raw.get("error", ""),
+            max_context=int(raw.get("max_context", 0) or 0),
+            auto_compact_threshold_pct=(
+                float(raw["auto_compact_threshold_pct"])
+                if raw.get("auto_compact_threshold_pct") is not None
+                else None
+            ),
             health=raw.get("health", "unknown"),
         )
 
