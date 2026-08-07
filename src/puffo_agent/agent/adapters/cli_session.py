@@ -723,7 +723,8 @@ class ClaudeSession:
                 timeout=CONTEXT_USAGE_TIMEOUT_SECONDS,
             )
         except (asyncio.TimeoutError, ConnectionError, RuntimeError) as exc:
-            self._context_usage_supported = False
+            if isinstance(exc, RuntimeError):
+                self._context_usage_supported = False
             logger.debug(
                 "agent %s: Claude context usage unavailable: %s",
                 self.agent_id,
@@ -747,6 +748,9 @@ class ClaudeSession:
     ) -> dict[str, object]:
         assert proc.stdout is not None
         while True:
+            # Queries run only while the turn lock is held and stdout should be
+            # quiet. System status and unrelated control responses are safe to
+            # consume; all other events indicate unexpected stream interleaving.
             line = await proc.stdout.readline()
             if not line:
                 raise ConnectionError("Claude stream closed during context query")
@@ -759,6 +763,11 @@ class ClaudeSession:
                     self._save_session_id(sid)
                 continue
             if event.get("type") != "control_response":
+                logger.warning(
+                    "agent %s: ignoring unexpected %s event during context query",
+                    self.agent_id,
+                    event.get("type"),
+                )
                 continue
             response = event.get("response") or {}
             if not isinstance(response, dict):

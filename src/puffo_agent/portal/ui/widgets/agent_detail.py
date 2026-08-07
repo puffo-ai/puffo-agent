@@ -798,6 +798,12 @@ class AgentDetail(QWidget):
             and state.auto_compact_threshold_pct is not None
         ):
             pct = state.auto_compact_threshold_pct
+        if window is None:
+            self._context_usage.setText(
+                "Context limits unavailable. Live usage shows in the web app; "
+                "saving restarts the agent."
+            )
+            return
         threshold = estimate_compact_threshold_tokens(
             window, pct
         )

@@ -28,6 +28,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Claude context telemetry now treats session-reported limits as authoritative.**
+  Configured compact thresholds are used only until Claude reports the active
+  value, unknown models no longer fall back to an invented 200K window, and a
+  transient context query timeout remains retryable on later turns.
+
 - **Codex host MCP sync now includes portable OAuth credentials.** Codex
   agents use the file-backed MCP OAuth store, and `sync_host_mcp()` copies
   the selected credential into the isolated agent home for both

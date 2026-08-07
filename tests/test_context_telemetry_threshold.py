@@ -59,8 +59,14 @@ def test_in_range_pct_parses(raw, expected):
     assert parse_threshold_pct(raw) == expected
 
 
-def test_window_defaults_to_200k():
+def test_haiku_window_resolves_to_200k():
     assert resolve_context_window("claude-haiku-4-5", env={}) == 200_000
+
+
+def test_unknown_model_window_is_not_invented(caplog):
+    with caplog.at_level("WARNING"):
+        assert resolve_context_window("claude-future-model", env={}) is None
+    assert "context window is unknown" in caplog.text
 
 
 def test_window_env_override_wins():
@@ -126,14 +132,33 @@ def test_runtime_reports_active_override():
     assert out["auto_compact_threshold_pct"] == 50.0
 
 
-def test_runtime_override_wins_over_session_default():
-    out = build_context_runtime(
-        max_context=200_000,
-        auto_compact_threshold=167_000,
-        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
-        env={},
-    )
+def test_runtime_session_threshold_wins_over_configured_override(caplog):
+    with caplog.at_level("WARNING"):
+        out = build_context_runtime(
+            max_context=200_000,
+            auto_compact_threshold=167_000,
+            env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
+            env={},
+            agent_id="ctx-bot",
+        )
+    assert out["auto_compact_threshold_pct"] == 83.5
+    assert "differs from configured override" in caplog.text
+    record = caplog.records[-1]
+    assert record.agent_id == "ctx-bot"
+    assert record.configured_threshold_pct == 30.0
+    assert record.session_threshold_pct == 83.5
+
+
+def test_runtime_matching_session_threshold_does_not_warn(caplog):
+    with caplog.at_level("WARNING"):
+        out = build_context_runtime(
+            max_context=200_000,
+            auto_compact_threshold=60_000,
+            env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
+            env={},
+        )
     assert out["auto_compact_threshold_pct"] == 30.0
+    assert "differs from configured override" not in caplog.text
 
 
 def test_runtime_prefers_session_reported_max_context():
@@ -143,6 +168,14 @@ def test_runtime_prefers_session_reported_max_context():
         env={},
     )
     assert out["max_context"] == 1_000_000
+
+
+def test_runtime_unknown_model_reports_unknown_window():
+    out = build_context_runtime(model="claude-future-model", env={})
+    assert out == {
+        "max_context": None,
+        "auto_compact_threshold_pct": None,
+    }
 
 
 def test_runtime_preserves_valid_100_pct_config():
@@ -211,6 +244,29 @@ def test_runtime_info_prefers_adapter_context_window(monkeypatch):
 
     assert worker._runtime_info()["max_context"] == 1_000_000
     assert worker._runtime_info()["auto_compact_threshold_pct"] == 96.7
+
+
+def test_runtime_info_preserves_unknown_model_window():
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.agent_cfg = SimpleNamespace(
+        id="ctx-bot",
+        runtime=SimpleNamespace(
+            kind="cli-local",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-future-model",
+            inference_level="",
+        ),
+        env_overrides={},
+    )
+    worker.runtime = RuntimeState()
+
+    assert worker._runtime_info()["max_context"] is None
+    assert worker.runtime.max_context == 0
 
 
 def test_codex_runtime_info_omits_claude_context_config():
@@ -337,9 +393,12 @@ def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
         session_file=os.path.join(home, "s.json"),
         mcp_config_file=os.path.join(home, "mcp.json"),
         agent_home_dir=os.path.join(home, "agent-home"),
-        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"},
+        env_overrides={
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+            "HOME": "/tmp/untrusted-home",
+            "USERPROFILE": "/tmp/untrusted-profile",
+        },
     )
-    assert adapter.env_overrides == {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}
     assert adapter.context_limits() == (None, None)
     session = adapter._ensure_session()
     session._context_usage = {
@@ -348,13 +407,10 @@ def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
     }
     assert adapter.context_limits() == (200_000, 167_000)
 
-    env = {
-        **os.environ,
-        **adapter.env_overrides,
-        "HOME": str(adapter.agent_home_dir),
-    }
+    env = session.env
     assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "50"
     assert env["HOME"] == str(adapter.agent_home_dir)
+    assert env["USERPROFILE"] == str(adapter.agent_home_dir)
 
 
 def test_default_band_clears_the_override():
@@ -405,7 +461,7 @@ def test_docker_session_receives_overrides(tmp_path, monkeypatch):
         env_overrides=adapter.env_overrides,
         env={},
     )
-    assert runtime["max_context"] == 200_000
+    assert runtime["max_context"] is None
     assert session.build_command([], session.env_overrides)[:6] == [
         "docker",
         "exec",

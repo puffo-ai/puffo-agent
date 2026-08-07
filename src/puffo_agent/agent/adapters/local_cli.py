@@ -792,13 +792,16 @@ class LocalCLIAdapter(Adapter):
         # Both HOME (POSIX) and USERPROFILE (Node on Windows) are
         # needed: Claude Code uses Node's os.homedir(). PUFFO_* are
         # consumed by the per-tool-call hook subprocess.
-        env = {
-            **os.environ,
-            **self.env_overrides,
+        adapter_owned_env = {
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
             **self._macos_credential_env(),
+        }
+        env = {
+            **os.environ,
+            **self.env_overrides,
+            **adapter_owned_env,
         }
         self._session = ClaudeSession(
             agent_id=self.agent_id,

@@ -298,6 +298,55 @@ def test_context_usage_error_keeps_result_fallback_and_disables_retry(tmp_path):
     assert [frame["type"] for frame in frames] == ["user", "control_request"]
 
 
+def test_context_usage_timeout_remains_retryable(tmp_path, monkeypatch):
+    session = _make_session(tmp_path, audit=False)
+
+    async def timeout(*_args):
+        raise asyncio.TimeoutError
+
+    async def drive():
+        session._proc = _ContextUsageProc({})
+        monkeypatch.setattr(session, "_read_context_usage_response", timeout)
+        assert await session._refresh_context_usage() is None
+        assert await session._refresh_context_usage() is None
+
+    asyncio.run(drive())
+    assert session._context_usage_supported is not False
+
+
+def test_turn_ignores_late_context_control_response(tmp_path, monkeypatch):
+    late_response = {
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": "ctx_timed_out",
+            "response": {"totalTokens": 42},
+        },
+    }
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "result": "still works",
+        "usage": {},
+    }
+    lines = [
+        (json.dumps(late_response) + "\n").encode(),
+        (json.dumps(result) + "\n").encode(),
+    ]
+    session = _make_session(tmp_path, audit=False)
+
+    async def no_refresh():
+        return None
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=lines)
+        monkeypatch.setattr(session, "_refresh_context_usage", no_refresh)
+        return await session._one_turn("hi")
+
+    assert asyncio.run(drive()).reply == "still works"
+
+
 def test_context_usage_reader_ignores_unrelated_events(tmp_path):
     session = _make_session(tmp_path, audit=False)
 

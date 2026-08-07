@@ -50,6 +50,18 @@ def test_preview_is_inert_before_an_agent_is_bound(qapp, agent_home):
     assert view._context_usage.text() == "—"
 
 
+def test_unknown_model_does_not_show_an_invented_window(qapp, agent_home):
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.model = "claude-future-model"
+    cfg.save()
+    RuntimeState(max_context=0).save("threshold-ui")
+
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    assert view._context_usage.text().startswith("Context limits unavailable.")
+
+
 def test_threshold_control_uses_claude_reported_default(qapp, agent_home):
     cfg = AgentConfig.load("threshold-ui")
     cfg.env_overrides = {}
