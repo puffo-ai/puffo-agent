@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from _bridge_support import isolated_home, write_test_agent  # noqa: E402
 
 from puffo_agent.portal.control.context_telemetry import (  # noqa: E402
+    _warn_threshold_mismatch,
     build_context_runtime,
     compact_threshold_pct,
     estimate_compact_threshold_tokens,
@@ -133,6 +134,7 @@ def test_runtime_reports_active_override():
 
 
 def test_runtime_session_threshold_wins_over_configured_override(caplog):
+    _warn_threshold_mismatch.cache_clear()
     with caplog.at_level("WARNING"):
         out = build_context_runtime(
             max_context=200_000,
@@ -141,9 +143,22 @@ def test_runtime_session_threshold_wins_over_configured_override(caplog):
             env={},
             agent_id="ctx-bot",
         )
+        build_context_runtime(
+            max_context=200_000,
+            auto_compact_threshold=167_000,
+            env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
+            env={},
+            agent_id="ctx-bot",
+        )
     assert out["auto_compact_threshold_pct"] == 83.5
     assert "differs from configured override" in caplog.text
-    record = caplog.records[-1]
+    records = [
+        record
+        for record in caplog.records
+        if "differs from configured override" in record.message
+    ]
+    assert len(records) == 1
+    record = records[0]
     assert record.agent_id == "ctx-bot"
     assert record.configured_threshold_pct == 30.0
     assert record.session_threshold_pct == 83.5

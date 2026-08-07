@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
 import math
 import os
@@ -25,6 +26,24 @@ _MODEL_WINDOWS: tuple[tuple[str, int], ...] = (
     ("mythos-5", 1_000_000),
     ("haiku-4-5", 200_000),
 )
+
+
+@lru_cache(maxsize=256)
+def _warn_threshold_mismatch(
+    agent_id: str, configured_pct: float, reported_pct: float
+) -> None:
+    logger.warning(
+        "agent %s: Claude session compact threshold %g%% differs from "
+        "configured override %g%%",
+        agent_id or "<unknown>",
+        reported_pct,
+        configured_pct,
+        extra={
+            "agent_id": agent_id,
+            "configured_threshold_pct": configured_pct,
+            "session_threshold_pct": reported_pct,
+        },
+    )
 
 
 def resolve_context_window(
@@ -116,18 +135,7 @@ def build_context_runtime(
         and reported_pct is not None
         and not math.isclose(configured_pct, reported_pct, abs_tol=0.001)
     ):
-        logger.warning(
-            "agent %s: Claude session compact threshold %g%% differs from "
-            "configured override %g%%",
-            agent_id or "<unknown>",
-            reported_pct,
-            configured_pct,
-            extra={
-                "agent_id": agent_id,
-                "configured_threshold_pct": configured_pct,
-                "session_threshold_pct": reported_pct,
-            },
-        )
+        _warn_threshold_mismatch(agent_id, configured_pct, reported_pct)
     return {
         "max_context": window,
         "auto_compact_threshold_pct": (
