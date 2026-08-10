@@ -1,4 +1,4 @@
-"""Harness interface.
+"""Declarative engine metadata used only by the Docker runtime.
 
 A harness exposes:
   - ``name()`` — identifier for status output and MCP tool gating.
@@ -6,35 +6,18 @@ A harness exposes:
     ``refresh`` / etc., which assume Claude Code's skills layout.
   - ``supported_providers()`` — for runtime-matrix validation.
 
-The turn protocol lives on the adapter side; the harness owns its
-own session model (claude-code = persistent stream-json subprocess;
-hermes = one-shot per turn) but both look the same to the adapter.
-Runtime adapters still own credential linking, HOME overrides, and
-docker-exec vs host subprocess — the harness is agnostic.
+Interactive host-local engines implement :class:`driver.Driver` instead.
+The Docker adapter owns process/session behavior; these objects only declare
+the selected engine's name, provider compatibility, and tool-layout traits.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 
 
-@dataclass
-class HarnessTurn:
-    """Per-turn input to a harness. Decoupled from ``TurnContext`` so
-    harnesses don't depend on adapter internals.
-    """
-    user_message: str
-    system_prompt: str
-    # Absolute workspace path; cwd + project-level .claude/ root for
-    # claude-code, cwd for ``hermes chat -q``.
-    workspace_dir: str
-    # Model id (empty = harness default). Forwarded via ``--model``.
-    model: str
-
-
-class Harness(ABC):
-    """Agent engine abstraction. See module docstring."""
+class DockerHarness(ABC):
+    """Metadata for an engine launched by :class:`DockerCLIAdapter`."""
 
     @abstractmethod
     def name(self) -> str:

@@ -16,7 +16,6 @@ import shutil
 import signal
 import threading
 import time
-from typing import Optional
 
 from pathlib import Path
 
@@ -75,7 +74,7 @@ class Daemon:
         self._warm_serialise_timeout = 120.0
         # agent.yml mtime cache; reconcile tick skips yaml.safe_load
         # when (mtime_ns, size) is unchanged.
-        self._agent_cfg_cache: dict[str, tuple[int, int, "AgentConfig"]] = {}
+        self._agent_cfg_cache: dict[str, tuple[int, int, AgentConfig]] = {}
         # PUF-221: daemon owns Claude OAuth refresh — single writer to
         # the canonical credential store so Anthropic's single-use
         # refresh-token rotation can't be raced by N agent workers.
@@ -112,6 +111,7 @@ class Daemon:
         # Foreground start has no other trigger for the fetch=True
         # path, so capability reports fall back to the static list.
         from ..agent.model_catalog import prefetch as _prefetch_model_catalog
+
         _prefetch_model_catalog()
         # Retry any archived-dir pending revokes from a previous run.
         asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup())
@@ -125,7 +125,8 @@ class Daemon:
         # Start auxiliary HTTP services. Both are non-fatal on bind
         # failure — the daemon's primary job is still running agents.
         api_runner = await start_api_server(
-            self.daemon_cfg.bridge, ws_local_hub=self.ws_local_hub,
+            self.daemon_cfg.bridge,
+            ws_local_hub=self.ws_local_hub,
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_rpc_resolver(self._resolve_host_mcp_context)
@@ -134,15 +135,14 @@ class Daemon:
         # bridge; data starts after rpc so its fallback can route
         # past rpc's resolved port.
         rpc_runner = await start_rpc_service(
-            self.daemon_cfg.rpc_service, fallback_start=63388,
+            self.daemon_cfg.rpc_service,
+            fallback_start=63388,
         )
         data_runner = await start_data_service(
             self.daemon_cfg.data_service,
             fallback_start=max(63388, self.daemon_cfg.rpc_service.port + 1),
         )
-        refresher_task = asyncio.ensure_future(
-            self.refresher.run_loop(self._stop)
-        )
+        refresher_task = asyncio.ensure_future(self.refresher.run_loop(self._stop))
         codex_refresher_task = asyncio.ensure_future(
             self.codex_refresher.run_loop(self._stop)
         )
@@ -201,7 +201,7 @@ class Daemon:
     def request_stop(self) -> None:
         self._stop.set()
 
-    def _load_agent_cfg_cached(self, agent_id: str) -> "AgentConfig":
+    def _load_agent_cfg_cached(self, agent_id: str) -> AgentConfig:
         """Reuses a cached parse when (mtime_ns, size) is unchanged.
         Same exceptions as ``AgentConfig.load`` on parse failure."""
         path = agent_yml_path(agent_id)
@@ -216,52 +216,8 @@ class Daemon:
 
     async def _reconcile_once(self) -> None:
         on_disk = set(discover_agents())
-        running = set(self.workers.keys())
-
-        # Drop cached parses for ids that vanished — guards against a
-        # re-created id serving a stale config.
-        for stale_id in list(self._agent_cfg_cache.keys() - on_disk):
-            self._agent_cfg_cache.pop(stale_id, None)
-
-        # Agents that disappeared from disk → stop.
-        for agent_id in running - on_disk:
-            logger.info("agent %s: directory removed, stopping worker", agent_id)
-            await self._stop_worker(agent_id)
-
-        # archive.flag → stop worker + move dir to archived/.
-        archived_this_tick: set[str] = set()
-        for agent_id in sorted(on_disk):
-            if archive_flag_path(agent_id).exists():
-                await self._archive_on_flag(agent_id)
-                archived_this_tick.add(agent_id)
-        on_disk -= archived_this_tick
-
-        # delete.flag → stop worker + remove dir (no archived/ copy).
-        deleted_this_tick: set[str] = set()
-        for agent_id in sorted(on_disk):
-            if delete_flag_path(agent_id).exists():
-                await self._delete_on_flag(agent_id)
-                deleted_this_tick.add(agent_id)
-        on_disk -= deleted_this_tick
-
-        # restart.flag → stop worker; the same tick's start path
-        # respawns it, producing a visible cycle.
-        for agent_id in sorted(on_disk):
-            if restart_flag_path(agent_id).exists():
-                logger.info(
-                    "agent %s: restart.flag detected, stopping worker for re-spawn",
-                    agent_id,
-                )
-                await self._stop_worker(agent_id)
-                try:
-                    restart_flag_path(agent_id).unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    logger.warning(
-                        "agent %s: couldn't remove restart.flag: %s",
-                        agent_id, exc,
-                    )
+        await self._stop_removed_agents(on_disk)
+        on_disk = await self._consume_agent_lifecycle_flags(on_disk)
 
         # refresh_model / refresh_runtime mutate agent.yml; the
         # config-changed check below picks up the respawn.
@@ -298,8 +254,18 @@ class Daemon:
                     # parallel warms can OOM the host. Awaiting one at
                     # a time keeps peak RSS bounded.
                     await worker.wait_warm(timeout=self._warm_serialise_timeout)
-                elif _worker_needs_restart(worker.agent_cfg, agent_cfg):
-                    logger.info("agent %s: config changed, restarting worker", agent_id)
+                elif (
+                    worker.restart_required
+                    or _worker_needs_restart(worker.agent_cfg, agent_cfg)
+                ):
+                    reason = (
+                        "fatal runtime exit"
+                        if worker.restart_required
+                        else "config changed"
+                    )
+                    logger.info(
+                        "agent %s: %s, restarting worker", agent_id, reason
+                    )
                     await self._stop_worker(agent_id)
                     worker = Worker(
                         self.daemon_cfg,
@@ -330,6 +296,44 @@ class Daemon:
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
 
+    async def _stop_removed_agents(self, on_disk: set[str]) -> None:
+        for stale_id in list(self._agent_cfg_cache.keys() - on_disk):
+            self._agent_cfg_cache.pop(stale_id, None)
+        for agent_id in set(self.workers) - on_disk:
+            logger.info("agent %s: directory removed, stopping worker", agent_id)
+            await self._stop_worker(agent_id)
+
+    async def _consume_agent_lifecycle_flags(self, on_disk: set[str]) -> set[str]:
+        archived: set[str] = set()
+        for agent_id in sorted(on_disk):
+            if archive_flag_path(agent_id).exists():
+                await self._archive_on_flag(agent_id)
+                archived.add(agent_id)
+        on_disk -= archived
+        deleted: set[str] = set()
+        for agent_id in sorted(on_disk):
+            if delete_flag_path(agent_id).exists():
+                await self._delete_on_flag(agent_id)
+                deleted.add(agent_id)
+        on_disk -= deleted
+        for agent_id in sorted(on_disk):
+            if restart_flag_path(agent_id).exists():
+                await self._consume_restart_flag(agent_id)
+        return on_disk
+
+    async def _consume_restart_flag(self, agent_id: str) -> None:
+        logger.info(
+            "agent %s: restart.flag detected, stopping worker for re-spawn",
+            agent_id,
+        )
+        await self._stop_worker(agent_id)
+        try:
+            restart_flag_path(agent_id).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("agent %s: couldn't remove restart.flag: %s", agent_id, exc)
+
     def _refresher_for(self, agent_cfg: AgentConfig) -> CredentialRefresher:
         """Pick the right refresher for an agent's harness. Codex
         agents only need their own auth.json refresh; claude-code +
@@ -339,7 +343,9 @@ class Daemon:
         return self.refresher
 
     def _register_with_refresher(
-        self, agent_cfg: AgentConfig, worker: Worker,
+        self,
+        agent_cfg: AgentConfig,
+        worker: Worker,
     ) -> None:
         # Gateway/VK mode: nothing to refresh (static VK via LiteLLM). Skip
         # registration so the periodic refresh loop never probes the provider
@@ -355,7 +361,9 @@ class Daemon:
         def on_refresh_success() -> None:
             was_auth_failed = worker.runtime.health == "auth_failed"
             Worker._clear_auth_failed_if_recoverable(
-                worker.runtime, agent_id, logger,
+                worker.runtime,
+                agent_id,
+                logger,
             )
             # Re-arm the auth_failed DM dedup so a re-expiry this
             # session re-notifies the operator.
@@ -370,12 +378,14 @@ class Daemon:
                     flag.write_text("")
                     logger.info(
                         "agent %s: credential recovered — requesting restart "
-                        "to pick up the new credential", agent_id,
+                        "to pick up the new credential",
+                        agent_id,
                     )
                 except OSError as exc:
                     logger.warning(
                         "agent %s: could not write restart flag: %s",
-                        agent_id, exc,
+                        agent_id,
+                        exc,
                     )
 
         refresher.register_on_refresh_success(on_refresh_success)
@@ -397,7 +407,11 @@ class Daemon:
         return self._refresher_for(agent_cfg).ensure_fresh
 
     def _set_worker_profile_cache(
-        self, agent_id: str, slug: str, display_name: str, avatar_url: str,
+        self,
+        agent_id: str,
+        slug: str,
+        display_name: str,
+        avatar_url: str,
     ) -> None:
         """Data-service shim — find the worker for ``agent_id`` and
         inject fresh profile values into its in-memory cache. Called
@@ -410,7 +424,7 @@ class Daemon:
             return
         worker.set_profile_cache(slug, display_name, avatar_url)
 
-    def _resolve_host_mcp_context(self, agent_id: str) -> "HostMcpContext | None":
+    def _resolve_host_mcp_context(self, agent_id: str) -> HostMcpContext | None:
         """Rpc-service shim. Returns None when the worker isn't warm yet."""
         worker = self.workers.get(agent_id)
         if worker is None:
@@ -433,7 +447,9 @@ class Daemon:
 
     async def _stop_all_workers(self) -> None:
         ids = list(self.workers.keys())
-        await asyncio.gather(*(self._stop_worker(i) for i in ids), return_exceptions=True)
+        await asyncio.gather(
+            *(self._stop_worker(i) for i in ids), return_exceptions=True
+        )
 
     async def _archive_on_flag(self, agent_id: str) -> None:
         logger.warning(
@@ -445,6 +461,7 @@ class Daemon:
             revoke_archived_device,
             write_archived_pending_revoke,
         )
+
         cfg_for_revoke = None
         try:
             cfg_for_revoke = AgentConfig.load(agent_id)
@@ -468,7 +485,8 @@ class Daemon:
             logger.error(
                 "agent %s: archive move failed after retries: %s "
                 "(flag still present — will retry next tick)",
-                agent_id, move_err,
+                agent_id,
+                move_err,
             )
             return
         logger.info("agent %s: archived to %s", agent_id, dest)
@@ -484,10 +502,13 @@ class Daemon:
             logger.warning(
                 "agent %s: revoke failed (%s); pending marker will be "
                 "left in %s for the next startup sweep",
-                agent_id, reason, dest,
+                agent_id,
+                reason,
+                dest,
             )
             try:
                 from ..crypto.keystore import KeyStore
+
                 identity = KeyStore(dest / "keys").load_identity(pc.slug)
                 write_archived_pending_revoke(
                     dest,
@@ -499,7 +520,8 @@ class Daemon:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "agent %s: failed to write pending_revoke marker: %s",
-                    agent_id, exc,
+                    agent_id,
+                    exc,
                 )
 
     async def _delete_on_flag(self, agent_id: str) -> None:
@@ -512,6 +534,7 @@ class Daemon:
             revoke_archived_device,
             write_archived_pending_revoke,
         )
+
         cfg_for_revoke = None
         try:
             cfg_for_revoke = AgentConfig.load(agent_id)
@@ -529,7 +552,8 @@ class Daemon:
             logger.error(
                 "agent %s: delete move failed after retries: %s "
                 "(flag still present — will retry next tick)",
-                agent_id, move_err,
+                agent_id,
+                move_err,
             )
             return
         if cfg_for_revoke is None or not cfg_for_revoke.puffo_core.is_configured():
@@ -539,7 +563,9 @@ class Daemon:
             except OSError as exc:
                 logger.warning(
                     "agent %s: delete rmtree failed: %s (leftover at %s)",
-                    agent_id, exc, dest,
+                    agent_id,
+                    exc,
+                    dest,
                 )
             return
         pc = cfg_for_revoke.puffo_core
@@ -551,10 +577,12 @@ class Daemon:
             logger.warning(
                 "agent %s: revoke failed (%s); keeping as archive + "
                 "pending marker for the next sweep",
-                agent_id, reason,
+                agent_id,
+                reason,
             )
             try:
                 from ..crypto.keystore import KeyStore
+
                 identity = KeyStore(dest / "keys").load_identity(pc.slug)
                 write_archived_pending_revoke(
                     dest,
@@ -566,7 +594,8 @@ class Daemon:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "agent %s: failed to write pending_revoke marker: %s",
-                    agent_id, exc,
+                    agent_id,
+                    exc,
                 )
             return
         try:
@@ -574,9 +603,10 @@ class Daemon:
             logger.info("agent %s: deleted", agent_id)
         except OSError as exc:
             logger.warning(
-                "agent %s: delete rmtree failed after revoke: %s "
-                "(leftover at %s)",
-                agent_id, exc, dest,
+                "agent %s: delete rmtree failed after revoke: %s (leftover at %s)",
+                agent_id,
+                exc,
+                dest,
             )
 
 
@@ -608,17 +638,25 @@ async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
         if 400 <= exc.status < 500:
             logger.warning(
                 "agent %s: lifecycle report %r rejected (HTTP %s); giving up: %s",
-                agent_cfg.id, status, exc.status, exc.body,
+                agent_cfg.id,
+                status,
+                exc.status,
+                exc.body,
             )
             return True
         logger.warning(
             "agent %s: lifecycle report %r failed (HTTP %s); will retry",
-            agent_cfg.id, status, exc.status,
+            agent_cfg.id,
+            status,
+            exc.status,
         )
         return False
     except Exception as exc:  # noqa: BLE001 — transient (network); retry next tick
         logger.warning(
-            "agent %s: lifecycle report %r failed; will retry: %s", agent_cfg.id, status, exc
+            "agent %s: lifecycle report %r failed; will retry: %s",
+            agent_cfg.id,
+            status,
+            exc,
         )
         return False
     finally:
@@ -674,11 +712,13 @@ async def _drain_codex_tmp(src: Path) -> None:
 
 async def _sweep_archived_pending_revokes_at_startup() -> None:
     from .import_agents import sweep_archived_pending_revokes
+
     try:
         n = await sweep_archived_pending_revokes()
         if n:
             logger.info(
-                "archived pending revokes: retried %d marker(s)", n,
+                "archived pending revokes: retried %d marker(s)",
+                n,
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("archived pending revoke sweep errored: %s", exc)
@@ -696,12 +736,14 @@ async def _migrate_linked_agents_at_startup() -> None:
             if n:
                 logger.info(
                     "startup: stamped machine_id on %d agent(s) for operator %s",
-                    n, pairing.operator_slug,
+                    n,
+                    pairing.operator_slug,
                 )
         except Exception as exc:  # noqa: BLE001 — best-effort, per-operator
             logger.warning(
                 "startup machine_id migration failed for %s: %s",
-                pairing.operator_slug, exc,
+                pairing.operator_slug,
+                exc,
             )
 
 
@@ -732,7 +774,8 @@ async def _full_sync_all_owned_agents_at_startup() -> None:
     if not ids:
         return
     results = await asyncio.gather(
-        *(_sync_one(aid) for aid in ids), return_exceptions=False,
+        *(_sync_one(aid) for aid in ids),
+        return_exceptions=False,
     )
     failures = [r for r in results if r]
     ok = len(ids) - len(failures)
@@ -752,6 +795,7 @@ async def _log_outdated_version_warning() -> None:
         is_source_install,
         upgrade_command_for_install_mode,
     )
+
     if is_source_install():
         # Editable installs are often ahead of the latest tag.
         return
@@ -767,11 +811,15 @@ async def _log_outdated_version_warning() -> None:
             "puffo-agent %s is behind the latest release (%s). "
             "this daemon may be missing features or fixes documented "
             "on github. to upgrade: %s",
-            local, remote, upgrade_command_for_install_mode(),
+            local,
+            remote,
+            upgrade_command_for_install_mode(),
         )
     else:
         logger.info(
-            "puffo-agent %s (latest release: %s)", local, remote,
+            "puffo-agent %s (latest release: %s)",
+            local,
+            remote,
         )
 
 
@@ -796,6 +844,7 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
             f"{list(_DAEMON_REFRESH_HARNESSES)})"
         )
     from ..agent.cli_bin import resolve_claude_bin, resolve_codex_bin
+
     resolver = {
         "claude-code": resolve_claude_bin,
         "codex": resolve_codex_bin,
@@ -803,6 +852,7 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
     from ..agent.model_catalog import provider_models
+
     supported = [m.id for m in provider_models(harness) if m.id]
     if model not in supported:
         raise ValueError(
@@ -815,6 +865,7 @@ def _mark_flag_broken(flag_path: Path, reason: str) -> None:
     """Rename a refresh_*.flag to ``<name>.broken`` for operator
     inspection; agent.yml is untouched."""
     import json
+
     broken = flag_path.with_suffix(flag_path.suffix + ".broken")
     try:
         original = flag_path.read_text(encoding="utf-8")
@@ -825,7 +876,9 @@ def _mark_flag_broken(flag_path: Path, reason: str) -> None:
         broken.write_text(body, encoding="utf-8")
     except OSError as exc:
         logger.warning(
-            "couldn't write %s: %s", broken, exc,
+            "couldn't write %s: %s",
+            broken,
+            exc,
         )
     try:
         flag_path.unlink()
@@ -835,104 +888,218 @@ def _mark_flag_broken(flag_path: Path, reason: str) -> None:
 
 def _process_daemon_refresh_flags(agent_id: str) -> None:
     """Consume ``refresh_model.flag`` + ``refresh_runtime.flag``:
-    validate payload, mutate agent.yml, ``.broken``-rename on
-    failure. Respawn is left to the config-changed check."""
-    import json
+    validate model, harness, provider, and inference-level agreement;
+    mutate agent.yml; ``.broken``-rename invalid requests. Respawn is
+    left to the config-changed check."""
     try:
         agent_cfg = AgentConfig.load(agent_id)
     except Exception as exc:
         logger.warning(
             "agent %s: couldn't load agent.yml for refresh flags: %s",
-            agent_id, exc,
+            agent_id,
+            exc,
         )
         return
     workspace = agent_cfg.resolve_workspace_dir()
+    _process_model_refresh_flag(agent_id, agent_cfg, refresh_model_flag_path(workspace))
+    _process_runtime_refresh_flag(
+        agent_id, agent_cfg, refresh_runtime_flag_path(workspace)
+    )
 
-    model_flag = refresh_model_flag_path(workspace)
-    if model_flag.exists():
-        try:
-            payload = json.loads(model_flag.read_text(encoding="utf-8") or "{}")
-            harness = str(payload.get("harness") or "")
-            model = str(payload.get("model") or "")
+
+def _process_model_refresh_flag(
+    agent_id: str, agent_cfg: AgentConfig, model_flag: Path
+) -> None:
+    import json
+
+    if not model_flag.exists():
+        return
+    try:
+        payload = json.loads(model_flag.read_text(encoding="utf-8") or "{}")
+        harness = str(payload.get("harness") or "")
+        model = str(payload.get("model") or "")
+        has_model_swap = bool(harness or model)
+        if bool(harness) != bool(model):
+            raise ValueError("harness and model must be provided together")
+        has_inference_level = "inference_level" in payload
+        inference_level = payload.get("inference_level")
+        if not has_model_swap and not has_inference_level:
+            raise ValueError("refresh_model.flag contains no requested change")
+        if has_model_swap:
             _validate_daemon_refresh_model(harness, model)
-        except Exception as exc:
-            logger.warning(
-                "agent %s: refresh_model.flag invalid (%s); marking broken",
-                agent_id, exc,
-            )
-            _mark_flag_broken(model_flag, str(exc))
-        else:
-            agent_cfg.runtime.harness = harness
-            agent_cfg.runtime.model = model
-            try:
-                agent_cfg.save()
-                logger.info(
-                    "agent %s: refresh_model applied (harness=%r model=%r)",
-                    agent_id, harness, model,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: couldn't save agent.yml on refresh_model: %s",
-                    agent_id, exc,
-                )
-            try:
-                model_flag.unlink()
-            except OSError:
-                pass
+        effective_harness = harness if has_model_swap else agent_cfg.runtime.harness
+        if has_inference_level:
+            _validate_refresh_inference_level(inference_level, effective_harness)
+    except Exception as exc:
+        logger.warning(
+            "agent %s: refresh_model.flag invalid (%s); marking broken",
+            agent_id,
+            exc,
+        )
+        _mark_flag_broken(model_flag, str(exc))
+        return
+    _apply_model_refresh(
+        agent_id=agent_id,
+        agent_cfg=agent_cfg,
+        model_flag=model_flag,
+        harness=harness,
+        model=model,
+        inference_level=inference_level,
+        has_model_swap=has_model_swap,
+        has_inference_level=has_inference_level,
+    )
 
-    runtime_flag = refresh_runtime_flag_path(workspace)
-    if runtime_flag.exists():
-        try:
-            payload = json.loads(runtime_flag.read_text(encoding="utf-8") or "{}")
-            kind = str(payload.get("kind") or "")
-            new_harness = payload.get("harness")
-            new_model = payload.get("model")
-            new_provider = payload.get("provider")
-            from .runtime_matrix import validate_triple
-            candidate_harness = (
-                str(new_harness) if new_harness is not None
-                else agent_cfg.runtime.harness
+
+def _validate_refresh_inference_level(value: object, harness: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError("inference_level must be a non-empty string")
+    from ..mcp.config import supported_inference_levels
+
+    levels = supported_inference_levels(harness)
+    if value not in levels:
+        raise ValueError(
+            f"inference_level={value!r} not supported by harness={harness!r}; "
+            f"expected one of {list(levels)}"
+        )
+
+
+def _apply_model_refresh(
+    *,
+    agent_id: str,
+    agent_cfg: AgentConfig,
+    model_flag: Path,
+    harness: str,
+    model: str,
+    inference_level: object,
+    has_model_swap: bool,
+    has_inference_level: bool,
+) -> None:
+    if has_model_swap:
+        agent_cfg.runtime.harness = harness
+        agent_cfg.runtime.model = model
+        from .runtime_matrix import HARNESS_PROVIDERS
+
+        providers = HARNESS_PROVIDERS.get(harness, frozenset())
+        if len(providers) != 1:
+            raise RuntimeError(
+                f"refresh cannot infer a unique provider for harness={harness!r}"
             )
-            candidate_provider = (
-                str(new_provider) if new_provider is not None
-                else agent_cfg.runtime.provider
-            )
-            result = validate_triple(kind, candidate_provider, candidate_harness)
-            if not result.ok:
-                raise ValueError(result.error)
-            if new_model is not None and candidate_harness in _DAEMON_REFRESH_HARNESSES:
-                _validate_daemon_refresh_model(
-                    candidate_harness, str(new_model),
-                )
-        except Exception as exc:
-            logger.warning(
-                "agent %s: refresh_runtime.flag invalid (%s); marking broken",
-                agent_id, exc,
-            )
-            _mark_flag_broken(runtime_flag, str(exc))
-        else:
-            agent_cfg.runtime.kind = kind
-            if new_harness is not None:
-                agent_cfg.runtime.harness = str(new_harness)
-            if new_provider is not None:
-                agent_cfg.runtime.provider = str(new_provider)
-            if new_model is not None:
-                agent_cfg.runtime.model = str(new_model)
-            try:
-                agent_cfg.save()
-                logger.info(
-                    "agent %s: refresh_runtime applied (kind=%r)",
-                    agent_id, kind,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: couldn't save agent.yml on refresh_runtime: %s",
-                    agent_id, exc,
-                )
-            try:
-                runtime_flag.unlink()
-            except OSError:
-                pass
+        agent_cfg.runtime.provider = next(iter(providers))
+    if has_inference_level:
+        # Explicit input; already validated against the effective harness.
+        agent_cfg.runtime.inference_level = inference_level
+    elif has_model_swap:
+        from .runtime_matrix import normalize_inference_level
+
+        agent_cfg.runtime.inference_level = normalize_inference_level(
+            agent_cfg.runtime.kind,
+            agent_cfg.runtime.provider,
+            agent_cfg.runtime.harness,
+            agent_cfg.runtime.inference_level,
+        )
+    try:
+        agent_cfg.save()
+        logger.info(
+            "agent %s: refresh_model applied (provider=%r harness=%r "
+            "model=%r inference_level=%r)",
+            agent_id,
+            agent_cfg.runtime.provider,
+            agent_cfg.runtime.harness,
+            agent_cfg.runtime.model,
+            agent_cfg.runtime.inference_level,
+        )
+    except Exception as exc:
+        logger.warning(
+            "agent %s: couldn't save agent.yml on refresh_model: %s", agent_id, exc
+        )
+    try:
+        model_flag.unlink()
+    except OSError:
+        pass
+
+
+def _process_runtime_refresh_flag(
+    agent_id: str, agent_cfg: AgentConfig, runtime_flag: Path
+) -> None:
+    import json
+
+    if not runtime_flag.exists():
+        return
+    try:
+        payload = json.loads(runtime_flag.read_text(encoding="utf-8") or "{}")
+        kind = str(payload.get("kind") or "")
+        new_harness = payload.get("harness")
+        new_model = payload.get("model")
+        new_provider = payload.get("provider")
+        from .runtime_matrix import validate_triple
+
+        candidate_harness = (
+            str(new_harness) if new_harness is not None else agent_cfg.runtime.harness
+        )
+        candidate_provider = (
+            str(new_provider)
+            if new_provider is not None
+            else agent_cfg.runtime.provider
+        )
+        result = validate_triple(kind, candidate_provider, candidate_harness)
+        if not result.ok:
+            raise ValueError(result.error)
+        if new_model is not None and candidate_harness in _DAEMON_REFRESH_HARNESSES:
+            _validate_daemon_refresh_model(candidate_harness, str(new_model))
+    except Exception as exc:
+        logger.warning(
+            "agent %s: refresh_runtime.flag invalid (%s); marking broken",
+            agent_id,
+            exc,
+        )
+        _mark_flag_broken(runtime_flag, str(exc))
+        return
+    _apply_runtime_refresh(
+        agent_id,
+        agent_cfg,
+        runtime_flag,
+        kind,
+        new_harness,
+        new_provider,
+        new_model,
+    )
+
+
+def _apply_runtime_refresh(
+    agent_id: str,
+    agent_cfg: AgentConfig,
+    runtime_flag: Path,
+    kind: str,
+    new_harness: object,
+    new_provider: object,
+    new_model: object,
+) -> None:
+    agent_cfg.runtime.kind = kind
+    if new_harness is not None:
+        agent_cfg.runtime.harness = str(new_harness)
+    if new_provider is not None:
+        agent_cfg.runtime.provider = str(new_provider)
+    if new_model is not None:
+        agent_cfg.runtime.model = str(new_model)
+    from .runtime_matrix import normalize_inference_level
+
+    agent_cfg.runtime.inference_level = normalize_inference_level(
+        agent_cfg.runtime.kind,
+        agent_cfg.runtime.provider,
+        agent_cfg.runtime.harness,
+        agent_cfg.runtime.inference_level,
+    )
+    try:
+        agent_cfg.save()
+        logger.info("agent %s: refresh_runtime applied (kind=%r)", agent_id, kind)
+    except Exception as exc:
+        logger.warning(
+            "agent %s: couldn't save agent.yml on refresh_runtime: %s", agent_id, exc
+        )
+    try:
+        runtime_flag.unlink()
+    except OSError:
+        pass
 
 
 def _install_posix_stop_handlers(loop, handle_signal) -> bool:
@@ -975,6 +1142,7 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
     agents_dir().mkdir(parents=True, exist_ok=True)
 
     from .import_agents import cleanup_staging_dir
+
     cleanup_staging_dir()
 
     daemon_cfg = DaemonConfig.load()
@@ -996,8 +1164,10 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
     # back onto the loop via call_soon_threadsafe. Without this the
     # only graceful-stop path on Windows is the file sentinel.
     if not posix_handlers_installed:
+
         def _windows_sigint(*_args) -> None:
             loop.call_soon_threadsafe(daemon.request_stop)
+
         try:
             signal.signal(signal.SIGINT, _windows_sigint)
         except (ValueError, OSError):
@@ -1008,10 +1178,7 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
 
     # Cancel surviving tasks; otherwise asyncio.run can hang on
     # Windows when a subprocess transport is still alive.
-    survivors = [
-        t for t in asyncio.all_tasks(loop)
-        if t is not asyncio.current_task()
-    ]
+    survivors = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
     for t in survivors:
         t.cancel()
     if survivors:

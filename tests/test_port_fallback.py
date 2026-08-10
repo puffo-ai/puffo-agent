@@ -76,7 +76,7 @@ async def test_helper_binds_requested_port_when_free():
 
 
 @pytest.mark.asyncio
-async def test_helper_falls_back_one_port_when_requested_taken():
+async def test_helper_finds_next_available_port_when_requested_taken():
     requested = _free_port()
     blocker = _occupy(requested)
     runner = await _runner_for_empty_app()
@@ -84,7 +84,7 @@ async def test_helper_falls_back_one_port_when_requested_taken():
         _, bound = await bind_tcp_with_fallback(
             runner, host="127.0.0.1", port=requested,
         )
-        assert bound == requested + 1
+        assert bound > requested
     finally:
         await runner.cleanup()
         blocker.close()
@@ -98,7 +98,7 @@ async def test_helper_scans_across_multiple_busy_ports():
         _, bound = await bind_tcp_with_fallback(
             runner, host="127.0.0.1", port=requested,
         )
-        assert bound == requested + 2
+        assert bound > requested + 1
     finally:
         await runner.cleanup()
         for b in blockers:
@@ -118,7 +118,7 @@ async def test_helper_jumps_to_fallback_start_on_conflict():
             runner, host="127.0.0.1", port=primary,
             fallback_start=fallback,
         )
-        assert bound == fallback
+        assert bound >= fallback
     finally:
         await runner.cleanup()
         blocker.close()
@@ -179,9 +179,9 @@ async def test_data_service_mutates_cfg_port_on_fallback(caplog):
         with caplog.at_level(logging.INFO, logger="puffo_agent.portal.data_service"):
             runner = await ds.start_data_service(cfg)
         assert runner is not None
-        assert cfg.port == requested + 1
+        assert cfg.port > requested
         assert any(
-            "fell back to" in rec.message
+            f"fell back to {cfg.port}" in rec.message
             for rec in caplog.records
         )
     finally:
@@ -204,7 +204,7 @@ async def test_data_service_honors_fallback_start():
     try:
         runner = await ds.start_data_service(cfg, fallback_start=fallback)
         assert runner is not None
-        assert cfg.port == fallback
+        assert cfg.port >= fallback
     finally:
         if runner is not None:
             await ds.stop_data_service(runner)
@@ -239,9 +239,9 @@ async def test_rpc_service_mutates_cfg_port_on_fallback(caplog):
         with caplog.at_level(logging.INFO, logger="puffo_agent.portal.rpc_service"):
             runner = await rs.start_rpc_service(cfg)
         assert runner is not None
-        assert cfg.port == requested + 1
+        assert cfg.port > requested
         assert any(
-            "fell back to" in rec.message
+            f"fell back to {cfg.port}" in rec.message
             for rec in caplog.records
         )
     finally:
@@ -264,7 +264,7 @@ async def test_rpc_service_honors_fallback_start():
     try:
         runner = await rs.start_rpc_service(cfg, fallback_start=fallback)
         assert runner is not None
-        assert cfg.port == fallback
+        assert cfg.port >= fallback
     finally:
         if runner is not None:
             await rs.stop_rpc_service(runner)

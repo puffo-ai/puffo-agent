@@ -7,11 +7,11 @@ single-WS slot, hand back the live agent context, then run the tool
 attached — the session frame-loop and the message consumer together —
 until either ends, and always free the slot on the way out.
 
-The daemon supplies the collaborators: ``make_session`` builds the
-session wired to the ``bridge``; ``start_consumer`` runs the agent's
-``PuffoCoreMessageClient.listen`` with the bridge's dispatch callback;
-``agent_context`` reads the live role + profile.md. Attaching a tool is
-what brings the agent online (point 4) — no tool, no consumer.
+The daemon supplies the collaborators: ``make_session`` builds the session
+wired to the bridge and its ``GlobalInboxRuntime``;
+``start_consumer`` runs the durable message listener and scheduler;
+``agent_context`` reads the live role + profile.md. Attaching a tool is what
+brings the agent online — no tool, no consumer.
 """
 
 from __future__ import annotations
@@ -37,7 +37,10 @@ async def serve_connection(
     is_servable: Callable[[str], bool],
     agent_context: Callable[[str], Awaitable[dict]],
     registry: SessionRegistry[WsLocalSession],
-    make_session: Callable[[AuthedAgent, str, Transport, WsLocalBridge], WsLocalSession],
+    make_session: Callable[
+        [AuthedAgent, str, Transport, WsLocalBridge, tuple[str, ...]],
+        WsLocalSession,
+    ],
     start_consumer: Callable[[AuthedAgent, Callable], Awaitable[None]],
     new_session_id: Callable[[], str],
     base64_decode: Callable[[str], bytes],
@@ -71,14 +74,20 @@ async def serve_connection(
 
     session_id = new_session_id()
     bridge = WsLocalBridge()
-    session = make_session(authed, session_id, transport, bridge)
+    session = make_session(
+        authed, session_id, transport, bridge, frame.capabilities
+    )
     if not registry.acquire(authed.slug, session):
         await _reject(transport, f"{authed.slug!r} already has an active connection")
         return
 
     try:
         context = await agent_context(authed.slug)
-        await transport.send(encode(Connected(session_id, context)))
+        await transport.send(encode(Connected(
+            session_id,
+            context,
+            capabilities=("multi-target-v2", "explicit-admission-v2"),
+        )))
         await _run_attached(authed, session, bridge, start_consumer)
     except Exception as exc:  # noqa: BLE001
         logger.exception("ws-local %s: serve failed: %s", authed.slug, exc)

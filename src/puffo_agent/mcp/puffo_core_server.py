@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +33,7 @@ from .host_tools import (
 )
 from .memory_tools import MemoryToolsConfig, register_memory_tools
 from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
+from ..portal.local_service_auth import read_local_service_token
 
 logger = logging.getLogger(__name__)
 
@@ -66,35 +66,84 @@ def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
         )
 
 
-def _register_local_tools(
-    mcp: FastMCP,
-    workspace: str,
-    runtime_kind: str = "",
-    harness: str = "",
-) -> None:
-    """Register system/local tools that don't depend on the messaging API."""
+def _validate_refresh_inference_level(harness: str, level: str) -> None:
+    from .config import supported_inference_levels
+    levels = supported_inference_levels(harness)
+    if level not in levels:
+        raise RuntimeError(
+            f"inference_level={level!r} not supported by "
+            f"harness={harness or '(unknown)'!r}; choose one of: {list(levels)}"
+        )
 
-    def _require_claude_code(tool: str) -> None:
-        if harness and harness != "claude-code":
-            raise RuntimeError(
-                f"{tool} is only supported under the claude-code "
-                f"harness (this agent is using {harness!r})."
-            )
 
+def mcp_tool_fingerprint() -> str:
+    """Hash of the puffo MCP tool surface — tool names + their params."""
+    import hashlib
+    import inspect
+    import json
+    import types
+
+    from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
+
+    captured: dict[str, list[str]] = {}
+
+    class _Capture:
+        def tool(self, *a, **k):
+            def deco(fn):
+                captured[fn.__name__] = list(inspect.signature(fn).parameters)
+                return fn
+            return deco
+
+        def resource(self, *a, **k):
+            return lambda fn: fn
+
+        def prompt(self, *a, **k):
+            return lambda fn: fn
+
+    dummy = PuffoCoreToolsConfig(
+        slug="", device_id="",
+        keystore=types.SimpleNamespace(),
+        http_client=types.SimpleNamespace(),
+        data_client=types.SimpleNamespace(),
+    )
+    cap = _Capture()
+    register_core_tools(cap, dummy)
+    _register_local_tools(cap, "", "", "")
+    payload = json.dumps(
+        {name: captured[name] for name in sorted(captured)}, sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _require_claude_code(harness: str, tool: str) -> None:
+    if harness and harness != "claude-code":
+        raise RuntimeError(
+            f"{tool} is only supported under the claude-code "
+            f"harness (this agent is using {harness!r})."
+        )
+
+
+def _register_refresh_tool(mcp: FastMCP, workspace: str, runtime_kind: str, harness: str) -> None:
+    agent_current_harness = harness
     @mcp.tool()
     async def refresh(
         harness: Optional[str] = None,
         model: Optional[str] = None,
         host_sync: bool = False,
         session: bool = False,
+        inference_level: Optional[str] = None,
     ) -> str:
-        """Refresh your agent state. Four orthogonal axes:
+        """Refresh your agent state. Five orthogonal axes:
 
         * no args — rebuild CLAUDE.md + re-sync puffo default skills.
         * ``host_sync=True`` — also re-sync operator's host skills + MCP.
         * ``session=True`` — drop CLI session so next spawn is fresh.
         * ``harness`` + ``model`` (both required together) — swap
           harness/model, persist to agent.yml, full worker respawn.
+        * ``inference_level`` — set reasoning effort (persist to
+          agent.yml + respawn). Standalone or alongside a harness+model
+          swap. Valid values are per-harness (codex: minimal/low/medium/
+          high; claude-code: low/medium/high/xhigh).
 
         Requires ``cli-local`` / ``cli-docker`` runtime. On cli-docker,
         ``host_sync=True`` requires ``session=True`` (or harness+model).
@@ -111,7 +160,14 @@ def _register_local_tools(
             )
         if harness is not None:
             _validate_refresh_model(harness, model)
-        if host_sync and runtime_kind == "cli-docker" and not session and harness is None:
+        if inference_level is not None:
+            effective_harness = (
+                harness if harness is not None else (agent_current_harness or "")
+            )
+            _validate_refresh_inference_level(effective_harness, inference_level)
+        # A pending respawn already restarts the worker, subsuming host_sync.
+        respawns = harness is not None or inference_level is not None
+        if host_sync and runtime_kind == "cli-docker" and not session and not respawns:
             raise RuntimeError(
                 "refresh(host_sync=True) on cli-docker requires "
                 "session=True (the container has to restart to pick "
@@ -119,9 +175,19 @@ def _register_local_tools(
             )
         ws = Path(workspace)
         touched: list[str] = []
-        if harness is not None:
-            _write_refresh_model_flag(ws, harness=harness, model=model or "")
-            touched.append(f"refresh_model (harness={harness!r} model={model!r})")
+        if respawns:
+            _write_refresh_model_flag(
+                ws,
+                harness=harness or "",
+                model=model or "",
+                inference_level=inference_level,
+            )
+            parts: list[str] = []
+            if harness is not None:
+                parts.append(f"harness={harness!r} model={model!r}")
+            if inference_level is not None:
+                parts.append(f"inference_level={inference_level!r}")
+            touched.append("refresh_model (" + ", ".join(parts) + ")")
         else:
             _touch_refresh_flag(ws, "refresh_agent")
             touched.append("refresh_agent")
@@ -133,26 +199,25 @@ def _register_local_tools(
                 touched.append("refresh_session")
         return "refresh requested: " + ", ".join(touched)
 
+def _register_skill_tools(mcp: FastMCP, workspace: str, harness: str) -> None:
     @mcp.tool()
     async def install_skill(name: str, content: str) -> str:
         """Install a new skill at project scope."""
-        _require_claude_code("install_skill")
+        _require_claude_code(harness, "install_skill")
         dst = _install_skill(Path(workspace), name, content)
         return (
             f"installed skill {name!r} at project scope ({dst}). "
             "Call refresh() so your next turn picks it up."
         )
-
     @mcp.tool()
     async def uninstall_skill(name: str) -> str:
         """Remove a skill you previously installed."""
-        _require_claude_code("uninstall_skill")
+        _require_claude_code(harness, "uninstall_skill")
         _uninstall_skill(Path(workspace), name)
         return (
             f"uninstalled skill {name!r}. Call refresh() so your next "
             "turn stops seeing it."
         )
-
     @mcp.tool()
     async def list_skills() -> str:
         """List every skill available to you, tagged by scope."""
@@ -164,6 +229,7 @@ def _register_local_tools(
             for scope, name in entries
         )
 
+def _register_mcp_tools(mcp: FastMCP, workspace: str, runtime_kind: str, harness: str) -> None:
     @mcp.tool()
     async def install_mcp_server(
         name: str,
@@ -172,7 +238,7 @@ def _register_local_tools(
         env: Optional[dict[str, str]] = None,
     ) -> str:
         """Register a new stdio MCP server at project scope."""
-        _require_claude_code("install_mcp_server")
+        _require_claude_code(harness, "install_mcp_server")
         check_host_local = runtime_kind != "cli-local"
         path = _install_mcp_server(
             Path(workspace), name, command, args, env,
@@ -182,17 +248,15 @@ def _register_local_tools(
             f"registered MCP server {name!r} at project scope ({path}). "
             "Call refresh() so the claude subprocess respawns."
         )
-
     @mcp.tool()
     async def uninstall_mcp_server(name: str) -> str:
         """Remove an MCP server you previously registered."""
-        _require_claude_code("uninstall_mcp_server")
+        _require_claude_code(harness, "uninstall_mcp_server")
         _uninstall_mcp_server(Path(workspace), name)
         return (
             f"removed MCP server {name!r}. Call refresh() so the claude "
             "subprocess respawns without it."
         )
-
     @mcp.tool()
     async def list_mcp_servers() -> str:
         """List every MCP server available to you, tagged by scope.
@@ -221,6 +285,19 @@ def _register_local_tools(
                 lines.append(f"{tag} {name}")
         return "\n".join(lines)
 
+def _register_local_tools(
+    mcp: FastMCP,
+    workspace: str,
+    runtime_kind: str = "",
+    harness: str = "",
+) -> None:
+    """Register system/local tools that do not depend on messaging."""
+    _register_refresh_tool(mcp, workspace, runtime_kind, harness)
+    _register_skill_tools(mcp, workspace, harness)
+    _register_mcp_tools(mcp, workspace, runtime_kind, harness)
+
+
+
 
 class _BridgeNoKeysStore(KeyStore):
     """Bridge transport (T23): the agent holds no local keys. Tools
@@ -247,6 +324,7 @@ def build_server(
     harness: str = "",
     memory_dir: str = "",
     transport: str = "",
+    local_service_token: str = "",
 ) -> FastMCP:
     ks = (
         _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
@@ -260,17 +338,18 @@ def build_server(
     http = PuffoCoreHttpClient(
         server_url, ks, slug, keyless=(transport == "bridge"),
     )
-    data = DataClient(data_service_url, agent_id)
+    data = DataClient(data_service_url, agent_id, local_service_token)
 
     # None when PUFFO_RPC_URL is unset; tools surface a clear error
     # instead of crashing the whole MCP at startup.
     rpc_url = os.environ.get("PUFFO_RPC_URL", "")
     rpc_client = (
-        PuffoRpcClient(rpc_url, agent_id) if rpc_url else None
+        PuffoRpcClient(rpc_url, agent_id, local_service_token) if rpc_url else None
     )
 
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
+        agent_id=agent_id,
         device_id=device_id,
         keystore=ks,
         http_client=http,
@@ -333,6 +412,7 @@ def _cfg_from_env() -> dict[str, str]:
         "harness": os.environ.get("PUFFO_HARNESS", ""),
         "memory_dir": os.environ.get("PUFFO_MEMORY_DIR", ""),
         "transport": os.environ.get("PUFFO_CORE_TRANSPORT", ""),
+        "local_service_token": read_local_service_token(),
     }
 
 

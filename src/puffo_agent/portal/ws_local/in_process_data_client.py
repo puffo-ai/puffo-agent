@@ -23,7 +23,7 @@ class InProcessDataClient:
     the existing tool implementations don't notice the swap.
     """
 
-    def __init__(self, store: "MessageStore", client: "PuffoCoreMessageClient") -> None:
+    def __init__(self, store: MessageStore, client: PuffoCoreMessageClient) -> None:
         self._store = store
         self._client = client
 
@@ -40,7 +40,7 @@ class InProcessDataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
-    ) -> list["ChannelRoot"]:
+    ) -> list[ChannelRoot]:
         return await self._store.get_channel_roots(
             channel_id=channel_id,
             limit=limit,
@@ -51,7 +51,7 @@ class InProcessDataClient:
 
     async def get_dm_history(
         self, peer_slug: str, limit: int = 20, before: int | None = None,
-    ) -> list["StoredMessage"]:
+    ) -> list[StoredMessage]:
         return await self._store.get_dm_history(peer_slug, limit, before)
 
     async def get_thread_messages(
@@ -61,7 +61,7 @@ class InProcessDataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
-    ) -> list["StoredMessage"]:
+    ) -> list[StoredMessage]:
         return await self._store.get_thread_messages(
             root_id=root_id,
             limit=limit,
@@ -71,7 +71,28 @@ class InProcessDataClient:
         )
 
     async def get_message_by_envelope(self, envelope_id: str) -> Any:
-        return await self._store.get_message_by_envelope(envelope_id)
+        # Model-visible lane (get_post / get_post_segment): a foreign DM
+        # held for operator approval stays withheld, matching the HTTP
+        # data service and the DM/thread reads.
+        return await self._store.get_visible_message_by_envelope(envelope_id)
+
+    async def get_send_encryption(
+        self, slug: str, thread_root_id: str | None,
+    ) -> bool:
+        """Daemon-level send-mode decision, in-process.
+
+        Mirrors ``portal/data_service.py``'s HTTP endpoint so the ws-local
+        lane consults the same policy as the MCP subprocess lane. Without
+        this method ``_send_encryption_required`` fails safe to ``True``,
+        which turned every ws-local plaintext send into a hard failure.
+        """
+        from ...agent import send_mode
+
+        return bool(
+            await send_mode.encryption_required(
+                slug or "", self._store, thread_root_id or None,
+            )
+        )
 
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,

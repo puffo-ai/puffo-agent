@@ -46,6 +46,7 @@ from ...api.handlers import (
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
     harness_applies,
+    normalize_inference_level,
     validate_triple,
 )
 from ...state import AgentConfig
@@ -186,7 +187,7 @@ class AgentDetail(QWidget):
         bar.addWidget(self._pause_resume_btn)
         self._refresh_btn = QPushButton("Refresh session")
         self._refresh_btn.setToolTip(
-            "Drop cli_session.json + restart the worker for a fresh LLM context."
+            "Retire the provider session and restart with a fresh LLM context."
         )
         self._refresh_btn.clicked.connect(self._on_refresh_session)
         bar.addWidget(self._refresh_btn)
@@ -458,7 +459,7 @@ class AgentDetail(QWidget):
             "ws-local agents have no harness session to refresh — the attach "
             "client is the agent's session."
             if is_ws_local
-            else "Drop cli_session.json + restart the worker for a fresh LLM context."
+            else "Retire the provider session and restart with a fresh LLM context."
         )
         self._archive_btn.setEnabled(has)
         self._export_btn.setEnabled(has and state == "paused")
@@ -488,8 +489,8 @@ class AgentDetail(QWidget):
         )
         if confirm != QMessageBox.Yes:
             return
-        # refresh(session=True): worker unlinks cli_session.json via
-        # adapter.reload(with_session=True) on its next turn.
+        # refresh(session=True): the worker retires the provider session via
+        # adapter.reload(with_session=True) on its next safe boundary.
         import json
         import time
         workspace = self._cfg.resolve_workspace_dir()
@@ -737,6 +738,9 @@ class AgentDetail(QWidget):
         cfg.runtime.provider = provider
         cfg.runtime.harness = harness
         cfg.runtime.model = model
+        cfg.runtime.inference_level = normalize_inference_level(
+            runtime_kind, provider, harness, cfg.runtime.inference_level,
+        )
         try:
             cfg.save()
             _update_profile_summary(cfg, soul)

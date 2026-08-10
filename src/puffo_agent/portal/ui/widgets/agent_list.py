@@ -55,7 +55,7 @@ class AgentSummary:
     avatar_url: str
 
     @classmethod
-    def for_id(cls, agent_id: str) -> "AgentSummary":
+    def for_id(cls, agent_id: str) -> AgentSummary:
         display_name = agent_id
         role_short = ""
         harness = ""
@@ -294,7 +294,7 @@ class AgentList(QWidget):
 
         def worker() -> None:
             try:
-                from ...import_agents import import_bundle, ImportError as _ImportError
+                from ...import_agents import import_bundle
                 report = asyncio.run(import_bundle(blob, password))
                 msg = "\n".join(
                     f"{r.agent_id}: {r.status}" + (f" — {r.detail}" if r.detail else "")

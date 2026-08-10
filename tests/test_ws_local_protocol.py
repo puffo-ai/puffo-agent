@@ -13,6 +13,7 @@ import pytest
 
 from puffo_agent.portal.ws_local.protocol import (
     Ack,
+    Admitted,
     Connect,
     Connected,
     End,
@@ -26,6 +27,37 @@ from puffo_agent.portal.ws_local.protocol import (
     decode_inbound,
     encode,
 )
+
+
+def test_v2_admitted_is_distinct_from_status_ack():
+    admitted = decode_inbound(json.dumps({
+        "type": "admitted", "version": 2,
+        "bundle_id": "bdl", "turn_id": "turn",
+    }))
+    assert admitted == Admitted("bdl", "turn")
+    assert admitted != Ack("bdl")
+
+
+def test_v2_admitted_carries_held_continuation_correlation_key():
+    admitted = decode_inbound(json.dumps({
+        "type": "admitted",
+        "version": 2,
+        "bundle_id": "bdl",
+        "turn_id": "turn",
+        "correlation_key": "continuation-1",
+    }))
+    assert admitted == Admitted("bdl", "turn", "continuation-1")
+
+
+def test_multi_target_bundle_omits_ambiguous_compatibility_fields():
+    raw = json.loads(encode(SendBundle(
+        bundle_id="bdl", turn_id="turn",
+        targets=[["channel", "sp", "a"], ["dm", "bob"]],
+        routes=[{"envelope_id": "a"}, {"envelope_id": "b"}],
+        messages=[{"envelope_id": "a"}, {"envelope_id": "b"}],
+    )))
+    assert raw["version"] == 2
+    assert "root_id" not in raw and "channel_meta" not in raw
 
 
 # ── encode ───────────────────────────────────────────────────────────────────

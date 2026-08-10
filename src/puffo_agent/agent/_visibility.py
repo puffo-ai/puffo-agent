@@ -8,7 +8,7 @@ import logging
 import urllib.parse
 from typing import Any
 
-from .puffo_core_client import _MENTION_RE
+from .message_context import MENTION_RE
 
 
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ async def _detect_human_signal(
     signal" (preserves caller intent)."""
     if channel_ref.startswith("@"):
         return True, "dm"
-    mentioned = sorted({m.lower() for m in _MENTION_RE.findall(text or "")})
+    mentioned = sorted({m.lower() for m in MENTION_RE.findall(text or "")})
     if not mentioned:
         return False, ""
     try:

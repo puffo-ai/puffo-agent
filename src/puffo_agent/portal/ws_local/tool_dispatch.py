@@ -23,6 +23,11 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "send_message",
     "send_message_with_attachments",
     # read / navigation
+    "read_inbox",
+    # durable Agent-local reminders
+    "create_reminder",
+    "list_reminders",
+    "cancel_reminder",
     "get_user_info",
     "whoami",
     "get_post",

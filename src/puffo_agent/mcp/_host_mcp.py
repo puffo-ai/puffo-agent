@@ -10,6 +10,8 @@ from typing import Any, Optional
 
 import aiohttp
 
+from ..portal.local_service_auth import local_service_headers
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,14 +19,20 @@ class PuffoRpcClient:
     """Async client for the daemon's loopback RPC service.
     Transport failures + non-2xx responses raise ``RuntimeError``."""
 
-    def __init__(self, base_url: str, agent_id: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        agent_id: str,
+        local_service_token: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.agent_id = agent_id
+        self._headers = local_service_headers(local_service_token)
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(headers=self._headers)
             # Match the bare-address repr aiohttp gc-emits on a leak.
             logger.info(
                 "aiohttp ClientSession created (class=PuffoRpcClient "
@@ -77,6 +85,229 @@ class PuffoRpcClient:
             raise RuntimeError(
                 f"rpc {route} transport error: {exc}"
             ) from exc
+
+    async def _post_structured(
+        self, route: str, body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST an RPC whose successful response is a structured object.
+
+        This is intentionally separate from ``_post`` so the established
+        install/sync/leave/permission ``{"message": str}`` contract cannot
+        accidentally change.
+        """
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            f"{route.lstrip('/')}"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        f"rpc {route} returned non-JSON body "
+                        f"(status {resp.status}): {raw[:500]}"
+                    )
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(error or f"rpc {route} failed with status {resp.status}")
+                    )
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"rpc {route} returned a non-object result")
+                if data.get("state") not in ("sent", "held", "failed"):
+                    raise RuntimeError(f"rpc {route} returned an invalid send state")
+                if data.get("attempted") is not True:
+                    raise RuntimeError(f"rpc {route} omitted attempted=true")
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
+
+    async def _post_object(
+        self, route: str, body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST a strict object result without inheriting send semantics."""
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            f"{route.lstrip('/')}"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"rpc {route} returned non-JSON (status {resp.status})"
+                    ) from exc
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(error or f"rpc {route} failed ({resp.status})")
+                    )
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"rpc {route} returned a non-object")
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
+
+    async def send_message(
+        self,
+        *,
+        channel: str,
+        text: str = "",
+        paths: Optional[list[str]] = None,
+        caption: str = "",
+        root_id: str = "",
+        visibility_level: str = "default",
+        send_anyway: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "channel": channel,
+            "root_id": root_id,
+            "visibility_level": visibility_level,
+            "send_anyway": send_anyway,
+        }
+        if paths:
+            body.update(paths=paths, caption=caption)
+        else:
+            body["text"] = text
+        return await self._post_structured("send-message", body)
+
+    async def stage_model_visible_read(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+        through_seq: int,
+        through_envelope_id: str,
+        tool_name: str,
+        tool_arguments: dict[str, object],
+        visible_message_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        body = {
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "through_seq": through_seq,
+            "through_envelope_id": through_envelope_id,
+            "tool_name": tool_name,
+            "tool_arguments": tool_arguments,
+        }
+        if visible_message_ids is not None:
+            body["visible_message_ids"] = visible_message_ids
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            "model-visible-read"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        "rpc model-visible-read returned non-JSON body "
+                        f"(status {resp.status}): {raw[:500]}"
+                    )
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(
+                            error
+                            or "rpc model-visible-read failed with "
+                            f"status {resp.status}"
+                        )
+                    )
+                if not isinstance(data, dict) or data.get("state") != "staged":
+                    raise RuntimeError(
+                        "rpc model-visible-read returned an invalid result"
+                    )
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(
+                f"rpc model-visible-read transport error: {exc}"
+            ) from exc
+
+    async def read_inbox(
+        self, *, target: str = "", cursor: str = "", limit: int = 50
+    ) -> dict[str, Any]:
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/read-inbox"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(
+                f"{self.base_url}{path}",
+                json={"target": target, "cursor": cursor, "limit": limit},
+            ) as resp:
+                try:
+                    data = await resp.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"rpc read-inbox returned non-JSON (status {resp.status})"
+                    ) from exc
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        str(data.get("error") or f"rpc read-inbox failed ({resp.status})")
+                    )
+                if not isinstance(data, dict):
+                    raise RuntimeError("rpc read-inbox returned a non-object")
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"rpc read-inbox transport error: {exc}") from exc
+
+    @staticmethod
+    def _validate_reminder_object(data: dict[str, Any]) -> dict[str, Any]:
+        required = {
+            "reminder_id", "occurrence_id", "state", "target", "content",
+            "intended_at", "actual_fire_at", "created_at", "cancelled_at",
+            "delivered_at",
+        }
+        if set(data) != required or data.get("state") not in {
+            "scheduled", "claimed", "cancelled", "delivered",
+        } or not all(
+            isinstance(data.get(key), str)
+            for key in (
+                "reminder_id", "occurrence_id", "state", "target", "content",
+                "intended_at", "created_at",
+            )
+        ):
+            raise RuntimeError("rpc reminder returned an invalid structured result")
+        return data
+
+    async def create_reminder(
+        self, *, content: str, target: str, intended_at: str,
+    ) -> dict[str, Any]:
+        return self._validate_reminder_object(await self._post_object(
+            "create-reminder",
+            {"content": content, "target": target, "intended_at": intended_at},
+        ))
+
+    async def list_reminders(
+        self, *, state: str = "", limit: int = 50,
+    ) -> dict[str, Any]:
+        data = await self._post_object(
+            "list-reminders", {"state": state, "limit": limit},
+        )
+        reminders = data.get("reminders")
+        if set(data) != {"reminders"} or not isinstance(reminders, list):
+            raise RuntimeError("rpc list reminders returned an invalid structured result")
+        validated: list[dict[str, Any]] = []
+        for item in reminders:
+            if not isinstance(item, dict):
+                raise RuntimeError("rpc list reminders returned an invalid item")
+            validated.append(self._validate_reminder_object(item))
+        return {
+            "reminders": validated,
+        }
+
+    async def cancel_reminder(self, *, reminder_id: str) -> dict[str, Any]:
+        return self._validate_reminder_object(await self._post_object(
+            "cancel-reminder", {"reminder_id": reminder_id},
+        ))
 
     async def install_mcp(
         self,

@@ -35,22 +35,26 @@ def test_runtime_info_reports_effective_codex_defaults():
     }
 
 
-def test_runtime_info_uses_chat_provider_and_model_defaults():
+def test_runtime_info_reports_explicit_codex_driver_and_model():
     daemon = DaemonConfig(
         default_provider="openai",
         openai=ProviderConfig(model="gpt-4.1"),
     )
     agent = AgentConfig(
         id="cloud-agent",
-        runtime=RuntimeConfig(kind="chat-local"),
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="codex",
+        ),
     )
 
     worker = Worker(daemon, agent)
 
     assert worker._runtime_info() == {
-        "kind": "chat-local",
+        "kind": "cli-local",
         "provider": "openai",
-        "harness": "",
+        "harness": "codex",
         "model": "gpt-4.1",
     }
 

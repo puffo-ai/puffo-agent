@@ -6,16 +6,13 @@ import tempfile
 import time
 from unittest.mock import patch
 
-import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 from aiohttp_socks import ProxyConnector
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.crypto.certs import SUBKEY_TTL_HOURS
-from puffo_agent.crypto.encoding import base64url_decode, base64url_encode
-from puffo_agent.crypto.http_auth import sign_request
+from puffo_agent.crypto.encoding import base64url_decode
 from puffo_agent.crypto.http_client import HttpError, PuffoCoreHttpClient
 from puffo_agent.crypto.http_session import create_remote_http_session
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
@@ -131,7 +128,11 @@ class TestHttpClientSigning(AioHTTPTestCase):
         app.router.add_route("GET", "/health", self._handle)
         app.router.add_route("POST", "/messages", self._handle)
         app.router.add_route("PUT", "/update", self._handle)
+        app.router.add_route(
+            "PUT", "/v2/agent-runtime/reminder-occurrences/{occurrence_id}", self._handle,
+        )
         app.router.add_route("DELETE", "/remove", self._handle)
+        app.router.add_route("DELETE", "/blocklists", self._handle)
         return app
 
     async def _handle(self, request: web.Request):
@@ -171,6 +172,22 @@ class TestHttpClientSigning(AioHTTPTestCase):
             await client.close()
 
     @unittest_run_loop
+    async def test_reminder_put_is_signed(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.put(
+                "/v2/agent-runtime/reminder-occurrences/occurrence-a",
+                {"revision": 1, "opaque_payload": "AQ"},
+            )
+            headers = {key.lower(): value for key, value in self.captured_headers.items()}
+            assert "x-puffo-signature" in headers
+            assert "x-sandbox-token" not in headers
+            assert json.loads(self.captured_body)["opaque_payload"] == "AQ"
+        finally:
+            await client.close()
+
+    @unittest_run_loop
     async def test_signature_is_verifiable(self):
         url = f"http://localhost:{self.server.port}"
         client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
@@ -196,6 +213,33 @@ class TestHttpClientSigning(AioHTTPTestCase):
             assert result == {"ok": True}
             result = await client.delete("/remove")
             assert result == {"ok": True}
+            assert self.captured_body == b""
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_delete_with_body_sends_and_signs_the_same_bytes(self):
+        """``DELETE /blocklists`` identifies its target only by a JSON
+        body, and the server verifies the subkey signature over the raw
+        body bytes. A DELETE that signed an empty body while sending a
+        populated one — or dropped the body entirely — would fail auth
+        on every unblock, so this pins body transmission and signature
+        coverage together."""
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.delete("/blocklists", body={"id": "mallory-0009"})
+            assert json.loads(self.captured_body) == {"id": "mallory-0009"}
+            h = {k.lower(): v for k, v in self.captured_headers.items()}
+            expected_msg = (
+                f"DELETE\n/blocklists\n{h['x-puffo-timestamp']}\n"
+                f"{h['x-puffo-nonce']}\n"
+            ).encode() + self.captured_body
+            assert ed25519_verify(
+                self.subkey.public_key_bytes(),
+                expected_msg,
+                base64url_decode(h["x-puffo-signature"]),
+            )
         finally:
             await client.close()
 
@@ -215,6 +259,7 @@ class TestHttpClientErrors(AioHTTPTestCase):
         app.router.add_route("GET", "/server-error", self._handle_500)
         app.router.add_route("GET", "/html-ok", self._handle_html_ok)
         app.router.add_route("GET", "/empty-ok", self._handle_empty_ok)
+        app.router.add_route("GET", "/large-stream", self._handle_large_stream)
         return app
 
     async def _handle_404(self, request):
@@ -236,6 +281,14 @@ class TestHttpClientErrors(AioHTTPTestCase):
     async def _handle_empty_ok(self, request):
         # A legitimately empty 2xx (204 No Content) — must NOT raise.
         return web.Response(status=204)
+
+    async def _handle_large_stream(self, request):
+        response = web.StreamResponse(status=200)
+        await response.prepare(request)
+        await response.write(b"a" * 700)
+        await response.write(b"b" * 700)
+        await response.write_eof()
+        return response
 
     @unittest_run_loop
     async def test_404_raises_http_error(self):
@@ -286,6 +339,19 @@ class TestHttpClientErrors(AioHTTPTestCase):
         try:
             result = await client.get("/empty-ok")
             assert not result, f"expected falsy empty result, got {result!r}"
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_get_bytes_enforces_chunked_response_limit(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.get_bytes("/large-stream", max_bytes=1024)
+            assert False, "should have rejected the oversized stream"
+        except HttpError as exc:
+            assert exc.status == 413
+            assert "1024 bytes" in exc.body
         finally:
             await client.close()
 
@@ -440,6 +506,10 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
         app = web.Application()
         app.router.add_route("POST", "/v2/cloud-agents/blobs/upload", self._echo)
         app.router.add_route("POST", "/v2/cloud-agents/messages", self._echo)
+        app.router.add_route(
+            "PUT", "/v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}",
+            self._echo,
+        )
         app.router.add_route("GET", "/v2/cloud-agents/spaces", self._echo)
         # Signed routes — used to prove the shim never touches them.
         app.router.add_route("GET", "/health", self._echo)
@@ -469,6 +539,23 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
             )
             assert "x-puffo-signature" not in self.captured_headers
             assert "x-sandbox-token" not in self.captured_headers
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_put_unsigned_reminder_uses_egress_token_without_signature(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {"PUFFO_LOCAL_SANDBOX_TOKEN": "tok-reminder"}):
+                result = await client.put_unsigned(
+                    "/v2/cloud-agents/agent-runtime/reminder-occurrences/occurrence-a",
+                    {"revision": 1, "opaque_payload": "AQ"},
+                )
+            assert result["ok"] is True
+            assert self.captured_headers.get("x-sandbox-token") == "tok-reminder"
+            assert "x-puffo-signature" not in self.captured_headers
+            assert json.loads(self.captured_body)["opaque_payload"] == "AQ"
         finally:
             await client.close()
 

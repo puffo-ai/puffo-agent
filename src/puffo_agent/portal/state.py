@@ -3,7 +3,7 @@
 Home defaults to ``~/.puffo-agent/`` (override with ``PUFFO_AGENT_HOME``)::
 
     ~/.puffo-agent/
-      daemon.yml          # ai provider keys, defaults
+      daemon.yml          # model defaults, reserved provider settings, daemon settings
       daemon.pid          # daemon pid
       agents/
         <agent_id>/
@@ -21,16 +21,21 @@ the tree. No IPC port, no auth — the filesystem is the contract.
 
 from __future__ import annotations
 
-import json
+import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 import psutil
 import yaml
+
+from ..limits import DEFAULT_CATCHUP_STALE_HOURS
+
+
+logger = logging.getLogger(__name__)
 
 
 # Where daemon.yml, agents/, etc. live.
@@ -89,596 +94,59 @@ def agent_codex_user_dir(agent_id: str) -> Path:
 def shared_fs_dir() -> Path:
     """Shared dir for cross-agent cooperation. Bind-mounted to
     ``/workspace/.shared`` for cli-docker; referenced by absolute path
-    for cli-local / sdk agents."""
+    for cli-local agents."""
     return home_dir() / "shared"
 
 
-# Files copied from the operator's $HOME into a per-agent virtual
-# $HOME on first use. Lift OAuth-essential files only.
-# Note: ``.claude.json`` is a sibling of the ``.claude/`` dir; Claude
-# CLI reads it from ``$HOME/.claude.json`` so we mirror that layout.
-# ``.credentials.json`` is intentionally excluded — set up separately
-# via ``sync_host_claude_code_auth_view`` so every agent tracks live OAuth
-# state (matches cli-docker's bind-mount model).
-_CLAUDE_HOME_SEED_PATHS = (
-    ".claude/settings.json",
-    ".claude.json",
-)
+# Host integration lives separately from persistent state models. Keep this
+# module's public surface stable for existing daemon and third-party callers.
+from . import host_assets as _host_assets
 
-
-def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
-    """Seed a per-agent virtual ``$HOME`` from the operator's real
-    ``$HOME``. Idempotent — never overwrites an existing file.
-
-    ``.credentials.json`` is set up separately via
-    ``sync_host_claude_code_auth_view``. Returns True if any file was copied.
-    """
-    import shutil
-    agent_home.mkdir(parents=True, exist_ok=True)
-    copied = False
-    for rel in _CLAUDE_HOME_SEED_PATHS:
-        src = host_home / rel
-        dst = agent_home / rel
-        if dst.exists() or not src.exists():
-            continue
-        try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            copied = True
-        except OSError:
-            continue
-    return copied
+_CLAUDE_HOME_SEED_PATHS = _host_assets._CLAUDE_HOME_SEED_PATHS
+HOST_SYNCED_MARKER = _host_assets.HOST_SYNCED_MARKER
+AGENT_INSTALLED_MARKER = _host_assets.AGENT_INSTALLED_MARKER
+seed_claude_home = _host_assets.seed_claude_home
+sanitize_claude_code_auth_blob = _host_assets.sanitize_claude_code_auth_blob
+sanitize_codex_auth_blob = _host_assets.sanitize_codex_auth_blob
+read_host_codex_mcp_servers = _host_assets.read_host_codex_mcp_servers
+_sync_host_skills_dir = _host_assets._sync_host_skills_dir
+sync_host_skills = _host_assets.sync_host_skills
+sync_host_gemini_skills = _host_assets.sync_host_gemini_skills
+_looks_host_local_command = _host_assets._looks_host_local_command
+sync_host_mcp_servers = _host_assets.sync_host_mcp_servers
+sync_host_plugins = _host_assets.sync_host_plugins
+sync_host_enabled_plugins = _host_assets.sync_host_enabled_plugins
+sync_host_gemini_mcp_servers = _host_assets.sync_host_gemini_mcp_servers
 
 
 def _sync_credentials_from_keychain(host_home: Path) -> bool:
-    """On macOS, materialise ``~/.claude/.credentials.json`` from the
-    Claude Code Keychain entry when missing or stale.
-
-    Claude Code stores OAuth in Keychain instead of the file on macOS;
-    this bridges to the shared-file path used by every other agent.
-    Called on every ``sync_host_claude_code_auth_view`` invocation so
-    refreshed tokens propagate. Returns True if the file was written.
-    """
-    import platform
-    if platform.system() != "Darwin":
-        return False
-    try:
-        from ..macos.keychain import read_keychain_blob
-        keychain = read_keychain_blob(timeout=5)
-        if not keychain.ok or not keychain.blob:
-            return False
-        keychain_raw = keychain.blob
-        # Validate JSON before touching the file.
-        keychain_data = json.loads(keychain_raw)
-    except Exception:
-        return False
-
-    host_creds = host_home / ".claude" / ".credentials.json"
-
-    # Skip write when the access token already matches; avoids mtime
-    # churn that would trigger copy-mode re-syncs.
-    if host_creds.exists():
-        try:
-            existing = json.loads(host_creds.read_text(encoding="utf-8"))
-            kc_token = (keychain_data.get("claudeAiOauth") or {}).get("accessToken")
-            ex_token = (existing.get("claudeAiOauth") or {}).get("accessToken")
-            if kc_token and kc_token == ex_token:
-                return False
-        except Exception:
-            pass  # Corrupted file — overwrite below.
-
-    try:
-        host_creds.parent.mkdir(parents=True, exist_ok=True)
-        host_creds.write_text(keychain_raw, encoding="utf-8")
-        return True
-    except OSError:
-        return False
+    return _host_assets._sync_credentials_from_keychain(host_home)
 
 
-def sanitize_claude_code_auth_blob(blob: str) -> str | None:
-    """Strip ``claudeAiOauth.refreshToken`` from the host blob for the
-    agent view. ``None`` on unparseable JSON — never ship a blob we
-    can't vet. Claude Code tolerates the missing field: uses the
-    access token, 401s cleanly rather than attempting a refresh."""
-    try:
-        data = json.loads(blob)
-    except ValueError:
-        return None
-    oauth = data.get("claudeAiOauth")
-    if isinstance(oauth, dict):
-        oauth.pop("refreshToken", None)
-    return json.dumps(data)
-
-
-def sanitize_codex_auth_blob(blob: str) -> str | None:
-    """Blank (not remove) ``tokens.refresh_token`` for the agent view.
-    ``None`` on unparseable JSON. Codex serde is non-optional on this
-    field — dropping it crashes; empty string parses, ``codex login
-    status`` reports logged-in, and a refresh attempt fails server-side
-    without consuming the real (single-use) token."""
-    try:
-        data = json.loads(blob)
-    except ValueError:
-        return None
-    tokens = data.get("tokens")
-    if isinstance(tokens, dict):
-        tokens["refresh_token"] = ""
-    return json.dumps(data)
+def _is_current_user_home(path: Path) -> bool:
+    return _host_assets._is_current_user_home(path)
 
 
 def _write_credential_view(target: Path, blob: str) -> None:
-    """Atomic tmp+rename write at ``target``, mode 0600. ``os.replace``
-    swaps the path entry, so a legacy symlink at ``target`` is replaced,
-    not followed — the host file it pointed at stays untouched."""
-    import stat
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
-    tmp.write_text(blob, encoding="utf-8")
-    try:
-        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    os.replace(tmp, target)
+    _host_assets._write_credential_view(target, blob)
 
 
 def sync_host_claude_code_auth_view(host_home: Path, agent_home: Path) -> str:
-    """Write a refresh-token-free view of the host's
-    ``.credentials.json`` into the agent's virtual ``$HOME`` — only
-    the daemon holds the rotating RT, so agents can't race a refresh
-    into a token-family revocation. Idempotent + self-healing;
-    legacy symlinks migrated in place. Returns ``"view"``,
-    ``"view (fresh)"``, ``"view (migrated-from-symlink)"``,
-    ``"unparseable-host-file"``, ``"write-failed"``, or ``"no-host-file"``.
-    """
-    host_creds = host_home / ".claude" / ".credentials.json"
-    agent_creds = agent_home / ".claude" / ".credentials.json"
-    _sync_credentials_from_keychain(host_home)
-    try:
-        host_blob = host_creds.read_text(encoding="utf-8")
-    except OSError:
-        return "no-host-file"
-    view_blob = sanitize_claude_code_auth_blob(host_blob)
-    if view_blob is None:
-        return "unparseable-host-file"
-
-    migrated = agent_creds.is_symlink()
-    if not migrated:
-        try:
-            if agent_creds.read_text(encoding="utf-8") == view_blob:
-                return "view (fresh)"
-        except OSError:
-            pass
-    try:
-        _write_credential_view(agent_creds, view_blob)
-    except OSError:
-        return "write-failed"
-    return "view (migrated-from-symlink)" if migrated else "view"
+    return _host_assets.sync_host_claude_code_auth_view(
+        host_home,
+        agent_home,
+        write_view=_write_credential_view,
+        sync_credentials=_sync_credentials_from_keychain,
+        is_current_home=_is_current_user_home,
+    )
 
 
 def sync_host_codex_auth_view(host_home: Path, agent_codex_home: Path) -> str:
-    """Codex counterpart of ``sync_host_claude_code_auth_view``; RT
-    blanked, not removed (see ``sanitize_codex_auth_blob``). Same
-    return taxonomy."""
-    host_auth = host_home / ".codex" / "auth.json"
-    agent_auth = agent_codex_home / "auth.json"
-    try:
-        host_blob = host_auth.read_text(encoding="utf-8")
-    except OSError:
-        return "no-host-file"
-    view_blob = sanitize_codex_auth_blob(host_blob)
-    if view_blob is None:
-        return "unparseable-host-file"
-
-    migrated = agent_auth.is_symlink()
-    if not migrated:
-        try:
-            if agent_auth.read_text(encoding="utf-8") == view_blob:
-                return "view (fresh)"
-        except OSError:
-            pass
-    try:
-        _write_credential_view(agent_auth, view_blob)
-    except OSError:
-        return "write-failed"
-    return "view (migrated-from-symlink)" if migrated else "view"
-
-
-def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:
-    """Return host codex ``[mcp_servers.*]`` as a per-name spec dict.
-    Honours ``$CODEX_HOME``; ``{}`` on missing / unreadable / malformed.
-    Drops entries that match neither stdio nor http/sse shape."""
-    import tomllib
-    codex_home_env = os.environ.get("CODEX_HOME")
-    codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
-    host_config = codex_home / "config.toml"
-    if not host_config.exists():
-        return {}
-    try:
-        with host_config.open("rb") as f:
-            data = tomllib.load(f)
-    except (OSError, ValueError):
-        return {}
-    raw = data.get("mcp_servers")
-    if not isinstance(raw, dict):
-        return {}
-    out: dict[str, dict] = {}
-    for name, spec in raw.items():
-        if not isinstance(spec, dict):
-            continue
-        raw_env = spec.get("env")
-        env = dict(raw_env) if isinstance(raw_env, dict) else {}
-        url = spec.get("url")
-        if isinstance(url, str) and url:
-            entry: dict = {"url": url, "env": env}
-            bearer = spec.get("bearer_token_env_var")
-            if isinstance(bearer, str) and bearer:
-                entry["bearer_token_env_var"] = bearer
-            headers = spec.get("http_headers")
-            if isinstance(headers, dict) and headers:
-                entry["http_headers"] = {
-                    str(k): str(v) for k, v in headers.items()
-                }
-            out[name] = entry
-            continue
-        cmd = spec.get("command")
-        if not isinstance(cmd, str) or not cmd:
-            continue
-        raw_args = spec.get("args")
-        args = list(raw_args) if isinstance(raw_args, list) else []
-        out[name] = {"command": cmd, "args": args, "env": env}
-    return out
-
-
-# Provenance markers dropped in skill dirs. Claude Code only loads
-# SKILL.md as a skill's entrypoint, so these siblings are inert.
-HOST_SYNCED_MARKER = "host-synced.md"
-AGENT_INSTALLED_MARKER = "agent-installed.md"
-
-_HOST_SYNCED_MARKER_BODY = (
-    "This skill is synced from the operator's ~/.claude/skills/ on "
-    "every worker start. Do not edit; changes will be overwritten.\n"
-)
-_AGENT_INSTALLED_MARKER_BODY = (
-    "This skill was installed by the agent via the install_skill "
-    "MCP tool. It lives at project scope and survives host syncs.\n"
-)
-
-
-def _sync_host_skills_dir(
-    src: Path, dst_root: Path, marker_body: str,
-) -> int:
-    """Copy skill directories from ``src`` into ``dst_root``.
-
-    Host is source of truth; agent-installed skills are preserved on
-    name collision; stale host-synced skills are pruned. Returns the
-    number of dirs copied.
-    """
-    import shutil
-    host_names: set[str] = set()
-    if src.is_dir():
-        host_names = {p.name for p in src.iterdir() if p.is_dir()}
-
-    copied = 0
-    if host_names:
-        dst_root.mkdir(parents=True, exist_ok=True)
-        for name in sorted(host_names):
-            src_dir = src / name
-            dst_dir = dst_root / name
-            if (dst_dir / AGENT_INSTALLED_MARKER).exists():
-                continue
-            try:
-                if dst_dir.exists():
-                    shutil.rmtree(dst_dir)
-                shutil.copytree(src_dir, dst_dir)
-                (dst_dir / HOST_SYNCED_MARKER).write_text(
-                    marker_body, encoding="utf-8",
-                )
-                copied += 1
-            except OSError:
-                continue
-
-    if dst_root.is_dir():
-        for entry in dst_root.iterdir():
-            if not entry.is_dir() or entry.name in host_names:
-                continue
-            if (entry / HOST_SYNCED_MARKER).exists() and not (
-                entry / AGENT_INSTALLED_MARKER
-            ).exists():
-                try:
-                    shutil.rmtree(entry)
-                except OSError:
-                    pass
-
-    return copied
-
-
-def sync_host_skills(host_home: Path, agent_home: Path) -> int:
-    """Sync host ``~/.claude/skills/`` into the agent's user-scope
-    skills dir. Whole-tree copy; flat ``.md`` files are ignored
-    because they aren't valid Claude Code skills."""
-    return _sync_host_skills_dir(
-        src=host_home / ".claude" / "skills",
-        dst_root=agent_home / ".claude" / "skills",
-        marker_body=_HOST_SYNCED_MARKER_BODY,
+    return _host_assets.sync_host_codex_auth_view(
+        host_home,
+        agent_codex_home,
+        write_view=_write_credential_view,
     )
-
-
-_HOST_SYNCED_GEMINI_MARKER_BODY = (
-    "This skill is synced from the operator's ~/.gemini/skills/ on "
-    "every worker start. Do not edit; changes will be overwritten.\n"
-)
-
-
-def sync_host_gemini_skills(host_home: Path, project_dir: Path) -> int:
-    """Sync host ``~/.gemini/skills/`` into project-scope
-    ``<project_dir>/.gemini/skills/``.
-
-    Project scope is required: gemini-cli's resolver defaults to
-    project scope, so user-scope settings.json entries are silently
-    ignored. Same provenance + pruning semantics as
-    ``sync_host_skills``.
-    """
-    return _sync_host_skills_dir(
-        src=host_home / ".gemini" / "skills",
-        dst_root=project_dir / ".gemini" / "skills",
-        marker_body=_HOST_SYNCED_GEMINI_MARKER_BODY,
-    )
-
-
-# Path prefixes that won't resolve inside the runtime container.
-# ``/home/agent/`` is handled separately because it IS valid inside.
-_HOST_LOCAL_COMMAND_PREFIXES = ("/Users/", "/tmp/", "/var/folders/")
-
-
-def _looks_host_local_command(command: str) -> bool:
-    """True when ``command`` points at a host-only path. Conservative:
-    bare program names (``npx``, ``python3``) pass through."""
-    if not command:
-        return False
-    # Windows drive-letter / backslash paths can't resolve in a Linux container.
-    if re.match(r"^[A-Za-z]:[\\/]", command) or "\\" in command:
-        return True
-    # /home/* on the host (but the container's own /home/agent/ is fine).
-    if command.startswith("/home/") and not command.startswith("/home/agent/"):
-        return True
-    return any(command.startswith(p) for p in _HOST_LOCAL_COMMAND_PREFIXES)
-
-
-def sync_host_mcp_servers(
-    host_home: Path, agent_home: Path,
-) -> tuple[int, list[tuple[str, str]]]:
-    """Merge host ``~/.claude.json`` MCP registrations into the
-    per-agent ``.claude.json``.
-
-    Host wins on name collision; agent-only names are preserved;
-    every other key is left untouched. Returns
-    ``(merged_count, unreachable)`` — ``unreachable`` lists
-    ``(name, command)`` pairs whose command looks host-local.
-    """
-    host_path = host_home / ".claude.json"
-    if not host_path.exists():
-        return 0, []
-    try:
-        host_data = json.loads(host_path.read_text(encoding="utf-8") or "{}")
-    except (OSError, ValueError):
-        return 0, []
-    host_servers = host_data.get("mcpServers") or {}
-    if not host_servers:
-        return 0, []
-
-    agent_path = agent_home / ".claude.json"
-    agent_data: dict[str, Any] = {}
-    if agent_path.exists():
-        try:
-            raw = agent_path.read_text(encoding="utf-8")
-            if raw.strip():
-                agent_data = json.loads(raw)
-        except (OSError, ValueError):
-            agent_data = {}
-
-    agent_servers = dict(agent_data.get("mcpServers") or {})
-    unreachable: list[tuple[str, str]] = []
-    for name, cfg in host_servers.items():
-        agent_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
-    agent_data["mcpServers"] = agent_servers
-
-    try:
-        agent_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = agent_path.with_suffix(agent_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
-        os.replace(tmp, agent_path)
-    except OSError:
-        return 0, []
-    return len(host_servers), unreachable
-
-
-def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
-    """Mirror host ``~/.claude/plugins/`` into per-agent
-    ``.claude/plugins/`` so the agent's spawned Claude session can
-    resolve plugin names listed in ``settings.json#enabledPlugins``.
-
-    Without this, ``settings.json`` carries enabledPlugins via
-    ``seed_claude_home`` but Claude can't find the plugin code under
-    ``<agent_home>/.claude/plugins/`` and silently drops every plugin
-    — including any MCP servers they would register. cli-local
-    repro: operator runs ``claude /plugin install
-    chrome-devtools-mcp@claude-plugins-official``, then spawns an
-    agent → the agent sees ``(no MCP servers registered)`` for the
-    plugin-provided MCPs.
-
-    Prefers symlink (free read-through; new host plugin installs /
-    marketplace pulls show up automatically on next worker start
-    without re-copy). Falls back to ``copytree`` on Windows-without-
-    Developer-Mode. The plugin tree can be GB-scale (each marketplace
-    is a git clone with history); on copy fallback we don't refresh
-    an existing copy — operators can ``rm -rf <agent>/.claude/plugins``
-    to force a fresh re-sync.
-
-    Idempotent. Returns ``"symlink"``, ``"symlink (already)"``,
-    ``"copy"``, ``"copy (fresh)"``, or ``"no-host-dir"``.
-    """
-    import shutil
-    host_plugins = host_home / ".claude" / "plugins"
-    agent_plugins = agent_home / ".claude" / "plugins"
-    if not host_plugins.is_dir():
-        return "no-host-dir"
-    agent_plugins.parent.mkdir(parents=True, exist_ok=True)
-
-    # Fast path: existing symlink already points at host_plugins.
-    if agent_plugins.is_symlink():
-        try:
-            current = os.readlink(agent_plugins)
-            if Path(current) == host_plugins or current == str(host_plugins):
-                return "symlink (already)"
-        except OSError:
-            pass
-
-    # Fast path: copy-mode dir already in place. We deliberately
-    # don't recopy — see the docstring for the GB-scale rationale.
-    if agent_plugins.is_dir() and not agent_plugins.is_symlink():
-        return "copy (fresh)"
-
-    # Tear down whatever's there (stale symlink, regular file) before
-    # creating a fresh one. Unlink can fail on Windows races; the
-    # next call retries naturally.
-    try:
-        if agent_plugins.is_symlink() or agent_plugins.exists():
-            agent_plugins.unlink()
-    except OSError:
-        pass
-
-    try:
-        os.symlink(host_plugins, agent_plugins, target_is_directory=True)
-        return "symlink"
-    except (OSError, NotImplementedError):
-        pass
-
-    try:
-        shutil.copytree(host_plugins, agent_plugins)
-        return "copy"
-    except OSError:
-        return "no-host-dir"
-
-
-def sync_host_enabled_plugins(host_home: Path, agent_home: Path) -> int:
-    """Mirror host ``~/.claude/settings.json#enabledPlugins`` into the
-    per-agent ``settings.json``. ``enabledPlugins`` is the complete
-    enumeration of which ``<plugin>@<marketplace>`` names the operator
-    has flipped on; host wins and overwrites the agent's value.
-
-    ``seed_claude_home`` already copies ``settings.json`` once on
-    first start, but it's idempotent — when the operator enables a
-    new plugin later, the agent's copy stays stale. This helper
-    rewrites just ``enabledPlugins`` on every worker start while
-    leaving other settings keys (theme, model preferences, etc.)
-    untouched. The actual plugin code is wired up by the sibling
-    ``sync_host_plugins``.
-
-    Returns the count of enabledPlugins entries propagated. Returns
-    0 when host has no settings.json, no enabledPlugins key, or the
-    value isn't a dict/list.
-    """
-    host_settings = host_home / ".claude" / "settings.json"
-    if not host_settings.is_file():
-        return 0
-    try:
-        host_data = json.loads(host_settings.read_text(encoding="utf-8") or "{}")
-    except (OSError, ValueError):
-        return 0
-    enabled = host_data.get("enabledPlugins")
-    # Claude Code has used both shapes historically — dict
-    # (``{name: true}``) on newer versions, list (``[name, ...]``)
-    # on older. Pass either through unchanged so we don't reshape
-    # something Claude is about to read.
-    if not isinstance(enabled, (list, dict)) or not enabled:
-        return 0
-
-    agent_settings = agent_home / ".claude" / "settings.json"
-    agent_data: dict[str, Any] = {}
-    if agent_settings.exists():
-        try:
-            raw = agent_settings.read_text(encoding="utf-8")
-            if raw.strip():
-                agent_data = json.loads(raw)
-        except (OSError, ValueError):
-            agent_data = {}
-
-    agent_data["enabledPlugins"] = enabled
-
-    try:
-        agent_settings.parent.mkdir(parents=True, exist_ok=True)
-        tmp = agent_settings.with_suffix(agent_settings.suffix + ".tmp")
-        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
-        os.replace(tmp, agent_settings)
-    except OSError:
-        return 0
-    return len(enabled)
-
-
-def sync_host_gemini_mcp_servers(
-    host_home: Path, project_dir: Path, *, extra_servers: dict | None = None,
-) -> tuple[int, list[tuple[str, str]]]:
-    """Merge host ``~/.gemini/settings.json`` MCP registrations into
-    project-scope ``<project_dir>/.gemini/settings.json``.
-
-    Project scope is required: gemini-cli's resolver defaults to
-    project scope and silently ignores user-scope mcpServers entries.
-    Other keys on the per-agent settings.json are preserved; only
-    ``mcpServers`` is overwritten.
-
-    ``extra_servers`` lets the caller inject adapter-managed entries
-    (e.g. the puffo MCP stdio server) in the same write; these
-    override same-named host entries. Returns
-    ``(merged_count, unreachable)``; merged_count counts host entries
-    only.
-    """
-    host_path = host_home / ".gemini" / "settings.json"
-    host_servers: dict = {}
-    if host_path.exists():
-        try:
-            raw = host_path.read_text(encoding="utf-8")
-            if raw.strip():
-                host_servers = (json.loads(raw).get("mcpServers") or {})
-        except (OSError, ValueError):
-            host_servers = {}
-
-    agent_path = project_dir / ".gemini" / "settings.json"
-    agent_data: dict[str, Any] = {}
-    if agent_path.exists():
-        try:
-            raw = agent_path.read_text(encoding="utf-8")
-            if raw.strip():
-                agent_data = json.loads(raw)
-        except (OSError, ValueError):
-            agent_data = {}
-
-    merged_servers = dict(agent_data.get("mcpServers") or {})
-    unreachable: list[tuple[str, str]] = []
-    for name, cfg in host_servers.items():
-        merged_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
-
-    if extra_servers:
-        for name, cfg in extra_servers.items():
-            merged_servers[name] = cfg
-
-    agent_data["mcpServers"] = merged_servers
-
-    try:
-        agent_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = agent_path.with_suffix(agent_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
-        os.replace(tmp, agent_path)
-    except OSError:
-        return 0, []
-    return len(host_servers), unreachable
 
 
 def daemon_yml_path() -> Path:
@@ -777,6 +245,7 @@ class ProviderConfig:
 class DataServiceConfig:
     """Loopback HTTP service MCP subprocesses use to read each
     agent's ``messages.db``. See ``portal/data_service.py``."""
+
     enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63386
@@ -786,6 +255,7 @@ class DataServiceConfig:
 class RpcServiceConfig:
     """Loopback RPC the MCP calls for daemon-mediated ops (install/sync host MCP).
     See ``portal/rpc_service.py``."""
+
     enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63385
@@ -802,14 +272,17 @@ class BridgeConfig:
     per-run with ``start --with-local-bridge`` (or ``bridge.enabled`` in
     daemon.yml). The MCP-facing data + rpc services stay on regardless.
     """
+
     enabled: bool = False
     bind_host: str = "127.0.0.1"
     port: int = 63387
-    allowed_origins: list[str] = field(default_factory=lambda: [
-        "https://chat.puffo.ai",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ])
+    allowed_origins: list[str] = field(
+        default_factory=lambda: [
+            "https://chat.puffo.ai",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+    )
 
 
 @dataclass
@@ -817,13 +290,13 @@ class DaemonConfig:
     """Contents of ~/.puffo-agent/daemon.yml.
 
     Per-agent identity lives in each agent's ``agent.yml``; the
-    daemon holds only provider keys + reconcile knobs.
+    daemon holds model hints, reserved provider settings, and reconcile knobs.
     """
+
     default_provider: str = "anthropic"
     anthropic: ProviderConfig = field(default_factory=ProviderConfig)
     openai: ProviderConfig = field(default_factory=ProviderConfig)
-    # Required for cli-docker + harness=gemini-cli agents; passed
-    # through as GEMINI_API_KEY to the containerised gemini CLI.
+    # Reserved for future Google/Gemini support; no supported runtime reads it.
     google: ProviderConfig = field(default_factory=ProviderConfig)
     skills_dir: str = ""  # absolute path; empty = no shared skills
     reconcile_interval_seconds: float = 2.0
@@ -848,16 +321,18 @@ class DaemonConfig:
     # with a verbose primer.
     max_inline_message_chars: int = 4000
     segment_chars: int = 2000
+    # Catch-up older than this is stored but skips the LLM; <= 0 disables.
+    catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
-    data_service: "DataServiceConfig" = field(
+    data_service: DataServiceConfig = field(
         default_factory=lambda: DataServiceConfig(),
     )
-    rpc_service: "RpcServiceConfig" = field(
+    rpc_service: RpcServiceConfig = field(
         default_factory=lambda: RpcServiceConfig(),
     )
 
     @classmethod
-    def load(cls) -> "DaemonConfig":
+    def load(cls) -> DaemonConfig:
         path = daemon_yml_path()
         if not path.exists():
             return cls()
@@ -868,19 +343,28 @@ class DaemonConfig:
         cfg = cls(
             default_provider=raw.get("default_provider", "anthropic"),
             skills_dir=raw.get("skills_dir", ""),
-            reconcile_interval_seconds=float(raw.get("reconcile_interval_seconds", 2.0)),
+            reconcile_interval_seconds=float(
+                raw.get("reconcile_interval_seconds", 2.0)
+            ),
             runtime_heartbeat_seconds=float(raw.get("runtime_heartbeat_seconds", 5.0)),
             docker_memory_limit=raw.get("docker_memory_limit", "1.5g"),
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
             max_inline_message_chars=int(raw.get("max_inline_message_chars", 4000)),
             segment_chars=int(raw.get("segment_chars", 2000)),
+            catchup_stale_hours=float(
+                raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
+            ),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
-            setattr(cfg, name, ProviderConfig(
-                api_key=p.get("api_key", ""),
-                model=p.get("model", ""),
-            ))
+            setattr(
+                cfg,
+                name,
+                ProviderConfig(
+                    api_key=p.get("api_key", ""),
+                    model=p.get("model", ""),
+                ),
+            )
         # Older daemon.yml files may omit ``bridge:``.
         b = raw.get("bridge") or {}
         defaults = BridgeConfig()
@@ -918,6 +402,7 @@ class DaemonConfig:
             "docker_memory_reservation": self.docker_memory_reservation,
             "max_inline_message_chars": self.max_inline_message_chars,
             "segment_chars": self.segment_chars,
+            "catchup_stale_hours": self.catchup_stale_hours,
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),
@@ -951,6 +436,7 @@ VALID_TRANSPORTS = ("native", "bridge")
 @dataclass
 class PuffoCoreConfig:
     """puffo-core signed API config — the agent's only chat backend."""
+
     server_url: str = DEFAULT_PUFFO_SERVER_URL
     slug: str = ""
     device_id: str = ""
@@ -978,24 +464,30 @@ class PuffoCoreConfig:
 class RuntimeConfig:
     """Contents of the ``runtime:`` block in agent.yml.
 
-    Three orthogonal knobs (see ``portal/runtime_matrix.py``):
+    Four orthogonal knobs (see ``portal/runtime_matrix.py``):
     ``kind`` (where), ``provider`` (who), ``harness`` (what engine,
-    CLI kinds only). Empty strings on ``provider`` / ``model`` /
-    ``api_key`` mean "inherit from daemon defaults".
+    CLI kinds only), and ``inference_level`` (provider reasoning effort).
+    Empty strings on ``provider`` / ``model`` / ``inference_level`` /
+    ``api_key`` mean "inherit from the harness or daemon defaults".
     """
-    kind: str = "chat-local"      # chat-local | sdk-local | cli-local | cli-docker
-    provider: str = ""            # empty = default for kind
+
+    kind: str = "cli-local"  # cli-local | cli-docker | ws-local
+    provider: str = ""  # empty = default for kind
     model: str = ""
+    # Per-agent reasoning effort. Empty means harness default; when set,
+    # adapters pin the generated provider config instead of inheriting an
+    # operator-wide value that may be invalid for this agent's model.
+    inference_level: str = ""
     api_key: str = ""
     # OpenAI/Anthropic-compatible base URL for the LLM plane. Set this
     # to route model calls through a proxy — e.g. Shan's LiteLLM virtual
     # key endpoint for cloud agents — instead of the vendor default.
-    # Consumed by chat-local (Anthropic + OpenAI providers), sdk-local
-    # and cli-local/claude-code (as ANTHROPIC_BASE_URL). Empty = vendor
-    # endpoint (today's behavior, byte-for-byte unchanged). The matching
-    # secret rides on ``api_key`` (the VK), so no new field is needed.
+    # Consumed by cli-local Drivers. Claude receives ANTHROPIC_BASE_URL;
+    # Codex receives a generated model-provider entry. Empty keeps the
+    # harness's normal OAuth endpoint. The matching gateway secret rides on
+    # ``api_key`` (the VK), so no separate field is needed.
     llm_base_url: str = ""
-    # Tool allowlist patterns (sdk | cli-local | cli-docker). Each
+    # Tool allowlist patterns (cli-local | cli-docker). Each
     # entry is a bare tool name ("Read") or tool-name-plus-arg glob
     # ("Bash(git *)", "Read(**/*.py)"). Empty = no tools allowed.
     allowed_tools: list[str] = field(default_factory=list)
@@ -1006,25 +498,21 @@ class RuntimeConfig:
     docker_memory_limit: str = ""
     docker_memory_reservation: str = ""
     # cli-local Claude Code permission mode. Only ``bypassPermissions``
-    # is supported today; see LocalCLIAdapter._sanitise_permission_mode.
+    # is supported by the local Driver runtime today.
     permission_mode: str = "bypassPermissions"
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Agent engine (CLI kinds only):
-    #   - ``claude-code``: ``claude`` CLI with our stream-json session
-    #     protocol, --resume, --model, and the puffo MCP tool suite.
-    #   - ``hermes``: ``hermes chat -q`` one-shot per turn against
-    #     Anthropic, using Claude Code's credential store.
-    #   - ``gemini-cli``: declared, not yet implemented.
-    # Hermes + anthropic billing note: third-party OAuth clients route
-    # to Anthropic's ``extra_usage`` pool, NOT a Claude subscription.
-    # Same token, different ledger.
-    harness: str = "claude-code"  # claude-code | hermes
-    # sdk only: cap on agentic-loop iterations per turn. 10 is fine
-    # for short Q&A; multi-step work often needs 30-50. CLI kinds
-    # delegate turn-bounding to the claude CLI itself.
+    # Agent engine (CLI kinds only). cli-local supports the long-lived
+    # ``claude-code`` and ``codex`` Drivers; cli-docker additionally keeps
+    # the declarative ``hermes`` and ``gemini-cli`` harnesses.
+    harness: str = "claude-code"
+    # Retained only so older agent.yml files round-trip without losing data.
+    # Driver runtimes use the wall-time limit below instead.
     max_turns: int = 10
+    # cli-local: maximum wall time for one provider turn. The Runtime
+    # Manager interrupts and retires a driver that does not terminate.
+    task_timeout_seconds: float = 600.0
 
 
 @dataclass
@@ -1034,6 +522,7 @@ class AgentConfig:
     The ``state`` field is the pause/resume knob; the daemon picks up
     changes on the next reconcile tick.
     """
+
     id: str = ""
     state: str = "running"  # running | paused
     display_name: str = ""
@@ -1050,8 +539,8 @@ class AgentConfig:
     role_short: str = ""
     puffo_core: PuffoCoreConfig = field(default_factory=PuffoCoreConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
-    profile: str = "profile.md"       # path relative to agent dir, or absolute
-    memory_dir: str = "memory"        # path relative to agent dir, or absolute
+    profile: str = "profile.md"  # path relative to agent dir, or absolute
+    memory_dir: str = "memory"  # path relative to agent dir, or absolute
     workspace_dir: str = "workspace"  # path relative to agent dir, or absolute
     # Per-agent .claude/ lives inside workspace_dir so Claude Code's
     # project-level convention (.claude/CLAUDE.md, .claude/skills/) is
@@ -1063,48 +552,35 @@ class AgentConfig:
     desired_mcps: list[str] = field(default_factory=list)
     created_at: int = 0
 
-    @classmethod
-    def load(cls, agent_id: str) -> "AgentConfig":
-        from .runtime_matrix import migrate_legacy_kind, validate_triple
+    def save(self) -> None:
+        _agent_config_save(self)
 
+    def resolve_profile_path(self) -> Path:
+        return _agent_config_resolve(self, self.profile)
+
+    def resolve_memory_dir(self) -> Path:
+        return _agent_config_resolve(self, self.memory_dir)
+
+    def resolve_workspace_dir(self) -> Path:
+        return _agent_config_resolve(self, self.workspace_dir)
+
+    def resolve_claude_dir(self) -> Path:
+        """Always ``<workspace>/.claude`` — adapter-owned."""
+        return self.resolve_workspace_dir() / ".claude"
+
+    def _resolve(self, rel_or_abs: str) -> Path:
+        return _agent_config_resolve(self, rel_or_abs)
+
+    @classmethod
+    def load(cls, agent_id: str) -> AgentConfig:
         path = agent_yml_path(agent_id)
         with path.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         pc = raw.get("puffo_core") or {}
         rt = raw.get("runtime") or {}
         triggers = raw.get("triggers") or {}
-
-        # Legacy kind names (chat-only, sdk) auto-migrate with a
-        # one-time WARNING; current spellings are written on next save.
-        kind = migrate_legacy_kind(
-            rt.get("kind", "chat-local"), agent_id=agent_id,
-        )
-        provider = rt.get("provider", "")
-        harness = rt.get("harness", "claude-code")
-
-        # Fail fast on invalid triples (e.g. gemini-cli + anthropic,
-        # or reserved kind=cli-sandbox).
-        result = validate_triple(kind, provider, harness)
-        if not result.ok:
-            raise RuntimeError(
-                f"agent {agent_id!r}: invalid runtime config — {result.error}"
-            )
-
-        # Transport validation (T23). Absent key ⇒ native ⇒ identical
-        # to pre-transport configs; bridge requires its credential pair.
-        transport = pc.get("transport", "native")
-        sandbox_token = pc.get("sandbox_token", "")
-        server_url = pc.get("server_url") or DEFAULT_PUFFO_SERVER_URL
-        if transport not in VALID_TRANSPORTS:
-            raise RuntimeError(
-                f"agent {agent_id!r}: invalid puffo_core.transport "
-                f"{transport!r} — valid transports: {list(VALID_TRANSPORTS)}"
-            )
-        if transport == "bridge" and not (sandbox_token and server_url):
-            raise RuntimeError(
-                f"agent {agent_id!r}: puffo_core.transport 'bridge' "
-                "requires both server_url and sandbox_token"
-            )
+        runtime = _load_runtime_config(agent_id, rt)
+        core = _load_puffo_core_config(agent_id, pc)
 
         return cls(
             id=raw.get("id", agent_id),
@@ -1113,33 +589,8 @@ class AgentConfig:
             avatar_url=raw.get("avatar_url", ""),
             role=raw.get("role", ""),
             role_short=raw.get("role_short", ""),
-            puffo_core=PuffoCoreConfig(
-                server_url=server_url,
-                slug=pc.get("slug", ""),
-                device_id=pc.get("device_id", ""),
-                space_id=pc.get("space_id", ""),
-                operator_slug=pc.get("operator_slug", ""),
-                auto_accept_space_invitations=bool(
-                    pc.get("auto_accept_space_invitations", False)
-                ),
-                transport=transport,
-                sandbox_token=sandbox_token,
-            ),
-            runtime=RuntimeConfig(
-                kind=kind,
-                provider=provider,
-                model=rt.get("model", ""),
-                api_key=rt.get("api_key", ""),
-                llm_base_url=rt.get("llm_base_url", ""),
-                allowed_tools=list(rt.get("allowed_tools") or []),
-                docker_image=rt.get("docker_image", ""),
-                docker_memory_limit=rt.get("docker_memory_limit", ""),
-                docker_memory_reservation=rt.get("docker_memory_reservation", ""),
-                permission_mode=rt.get("permission_mode", "bypassPermissions"),
-                sandbox=rt.get("sandbox", "danger-full-access"),
-                harness=harness,
-                max_turns=int(rt.get("max_turns", 10)),
-            ),
+            puffo_core=core,
+            runtime=runtime,
             profile=raw.get("profile", "profile.md"),
             memory_dir=raw.get("memory_dir", "memory"),
             workspace_dir=raw.get("workspace_dir", "workspace"),
@@ -1152,16 +603,147 @@ class AgentConfig:
             created_at=int(raw.get("created_at", 0)),
         )
 
-    def save(self) -> None:
-        path = agent_yml_path(self.id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Native agents (the default) keep a byte-identical agent.yml:
-        # the transport keys are only written for bridge agents.
-        pc_dict = asdict(self.puffo_core)
-        if self.puffo_core.transport == "native":
-            pc_dict.pop("transport", None)
-            pc_dict.pop("sandbox_token", None)
-        data = {
+
+def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
+    from .runtime_matrix import (
+        RUNTIME_CLI_LOCAL,
+        migrate_legacy_kind,
+        normalize_inference_level,
+        resolve_effective_harness,
+        resolve_effective_provider,
+        validate_triple,
+    )
+
+    raw_kind, provider = raw.get("kind", RUNTIME_CLI_LOCAL), raw.get("provider", "")
+    kind = migrate_legacy_kind(raw_kind, agent_id=agent_id)
+    harness = raw.get("harness", "claude-code")
+    inference = raw.get("inference_level", "") or ""
+    if not isinstance(inference, str):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.inference_level must be a string"
+        )
+    if kind == RUNTIME_CLI_LOCAL:
+        migrated = _migrate_local_harness(
+            agent_id, provider, harness, kind_migrated=raw_kind != kind
+        )
+        if migrated != harness:
+            harness = migrated
+            inference = normalize_inference_level(kind, provider, harness, inference)
+    result = validate_triple(kind, provider, harness)
+    if not result.ok:
+        raise RuntimeError(
+            f"agent {agent_id!r}: invalid runtime config — {result.error}"
+        )
+    effective = resolve_effective_harness(
+        kind, resolve_effective_provider(kind, provider), harness
+    )
+    _validate_inference_level(agent_id, inference, effective)
+    return RuntimeConfig(
+        kind=kind,
+        provider=provider,
+        model=raw.get("model", ""),
+        inference_level=inference,
+        api_key=raw.get("api_key", ""),
+        llm_base_url=raw.get("llm_base_url", ""),
+        allowed_tools=list(raw.get("allowed_tools") or []),
+        docker_image=raw.get("docker_image", ""),
+        docker_memory_limit=raw.get("docker_memory_limit", ""),
+        docker_memory_reservation=raw.get("docker_memory_reservation", ""),
+        permission_mode=raw.get("permission_mode", "bypassPermissions"),
+        sandbox=raw.get("sandbox", "danger-full-access"),
+        harness=harness,
+        max_turns=int(raw.get("max_turns", 10)),
+        task_timeout_seconds=float(raw.get("task_timeout_seconds", 600.0)),
+    )
+
+
+def _migrate_local_harness(
+    agent_id: str, provider: str, harness: str, *, kind_migrated: bool
+) -> str:
+    """Return the harness a stale ``cli-local`` config should load as.
+
+    Configs written before the host-local Driver runtime landed name a
+    harness it never implements (``hermes``), and a legacy ``kind`` can leave
+    a harness that contradicts the stored provider. Rather than making those
+    agents unloadable, adopt the harness the provider resolves to — but only
+    when that yields a valid triple, so genuinely broken hand-edits still hit
+    the explicit error in ``_load_runtime_config``.
+    """
+    from .runtime_matrix import (
+        HARNESS_CLAUDE_CODE,
+        HARNESS_CODEX,
+        RUNTIME_CLI_LOCAL,
+        resolve_effective_harness,
+        validate_triple,
+    )
+
+    if validate_triple(RUNTIME_CLI_LOCAL, provider, harness).ok:
+        return harness
+    if not kind_migrated and harness in {HARNESS_CLAUDE_CODE, HARNESS_CODEX}:
+        # A Driver harness that fails for some other reason (e.g. an
+        # explicitly mismatched provider) is an operator error, not legacy.
+        return harness
+    resolved = resolve_effective_harness(RUNTIME_CLI_LOCAL, provider, "")
+    if resolved == harness or not validate_triple(
+        RUNTIME_CLI_LOCAL, provider, resolved
+    ).ok:
+        return harness
+    logger.warning(
+        "agent %s: runtime.harness %r is not implemented by the %r runtime, "
+        "auto-migrated to %r for this run; authenticate with `claude login` "
+        "or `codex login`, then update agent.yml.",
+        agent_id or "(?)", harness, RUNTIME_CLI_LOCAL, resolved,
+    )
+    return resolved
+
+
+def _validate_inference_level(agent_id: str, value: str, harness: str) -> None:
+    if not value:
+        return
+    from ..mcp.config import supported_inference_levels
+
+    levels = supported_inference_levels(harness)
+    if value not in levels:
+        raise RuntimeError(
+            f"agent {agent_id!r}: inference_level={value!r} is not supported by harness={harness!r}; expected one of {list(levels)}"
+        )
+
+
+def _load_puffo_core_config(agent_id: str, raw: dict) -> PuffoCoreConfig:
+    transport, token = raw.get("transport", "native"), raw.get("sandbox_token", "")
+    server_url = raw.get("server_url") or DEFAULT_PUFFO_SERVER_URL
+    if transport not in VALID_TRANSPORTS:
+        raise RuntimeError(
+            f"agent {agent_id!r}: invalid puffo_core.transport {transport!r} — valid transports: {list(VALID_TRANSPORTS)}"
+        )
+    if transport == "bridge" and not (token and server_url):
+        raise RuntimeError(
+            f"agent {agent_id!r}: puffo_core.transport 'bridge' requires both server_url and sandbox_token"
+        )
+    return PuffoCoreConfig(
+        server_url=server_url,
+        slug=raw.get("slug", ""),
+        device_id=raw.get("device_id", ""),
+        space_id=raw.get("space_id", ""),
+        operator_slug=raw.get("operator_slug", ""),
+        auto_accept_space_invitations=bool(
+            raw.get("auto_accept_space_invitations", False)
+        ),
+        transport=transport,
+        sandbox_token=token,
+    )
+
+
+def _agent_config_save(self: AgentConfig) -> None:
+    path = agent_yml_path(self.id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pc_dict = asdict(self.puffo_core)
+    if self.puffo_core.transport == "native":
+        pc_dict.pop("transport", None)
+        pc_dict.pop("sandbox_token", None)
+    _atomic_write_yaml(
+        path,
+        {
             "id": self.id,
             "state": self.state,
             "display_name": self.display_name,
@@ -1177,27 +759,13 @@ class AgentConfig:
             "triggers": asdict(self.triggers),
             "desired_skills": list(self.desired_skills),
             "desired_mcps": list(self.desired_mcps),
-        }
-        _atomic_write_yaml(path, data)
+        },
+    )
 
-    def resolve_profile_path(self) -> Path:
-        return self._resolve(self.profile)
 
-    def resolve_memory_dir(self) -> Path:
-        return self._resolve(self.memory_dir)
-
-    def resolve_workspace_dir(self) -> Path:
-        return self._resolve(self.workspace_dir)
-
-    def resolve_claude_dir(self) -> Path:
-        """Always ``<workspace>/.claude`` — adapter-owned."""
-        return self.resolve_workspace_dir() / ".claude"
-
-    def _resolve(self, rel_or_abs: str) -> Path:
-        p = Path(rel_or_abs)
-        if p.is_absolute():
-            return p
-        return agent_dir(self.id) / p
+def _agent_config_resolve(self: AgentConfig, rel_or_abs: str) -> Path:
+    path = Path(rel_or_abs)
+    return path if path.is_absolute() else agent_dir(self.id) / path
 
 
 @dataclass
@@ -1207,6 +775,7 @@ class RuntimeState:
     ``updated_at`` lets readers detect stale entries (daemon down or
     worker deadlocked).
     """
+
     status: str = "stopped"  # running | paused | error | stopped
     started_at: int = 0
     updated_at: int = 0
@@ -1245,13 +814,14 @@ class RuntimeState:
     health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod
-    def load(cls, agent_id: str) -> "RuntimeState | None":
+    def load(cls, agent_id: str) -> RuntimeState | None:
         path = runtime_json_path(agent_id)
         if not path.exists():
             return None
         try:
             with path.open("r", encoding="utf-8") as f:
                 import json
+
                 raw = json.load(f)
         except (OSError, ValueError):
             return None
@@ -1267,6 +837,7 @@ class RuntimeState:
 
     def save(self, agent_id: str) -> None:
         import json
+
         self.updated_at = int(time.time())
         path = runtime_json_path(agent_id)
         # CLI staleness gate is 30s; throttle pure-updated_at writes
@@ -1314,7 +885,8 @@ def discover_agents() -> list[str]:
     if not root.exists():
         return []
     return sorted(
-        entry.name for entry in root.iterdir()
+        entry.name
+        for entry in root.iterdir()
         if entry.is_dir() and (entry / "agent.yml").exists()
     )
 
@@ -1355,14 +927,13 @@ def _is_puffo_agent_process(pid: int) -> bool:
         tokens = [t or "" for t in proc.cmdline()]
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
         return False
+
     # Match by token name prefix to cover script-shim, .exe, and
     # ``python -m puffo_agent.portal.cli`` invocations.
     def _is_ours(token: str) -> bool:
         low = Path(token).name.lower()
-        return (
-            low.startswith("puffo-agent")
-            or low.startswith("puffo_agent")
-        )
+        return low.startswith("puffo-agent") or low.startswith("puffo_agent")
+
     has_exe = any(_is_ours(t) for t in tokens)
     has_start = any(t.lower() == "start" for t in tokens)
     return has_exe and has_start
@@ -1437,7 +1008,8 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         # allow_unicode keeps CJK/emoji/accented display_names readable.
         yaml.safe_dump(
-            data, f,
+            data,
+            f,
             sort_keys=False,
             default_flow_style=False,
             allow_unicode=True,

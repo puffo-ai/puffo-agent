@@ -21,7 +21,7 @@ The package is distributed as `puffo-agent`; the Python module is
 | Area | Main modules | Responsibility |
 | --- | --- | --- |
 | CLI and daemon | `portal/cli.py`, `portal/daemon.py`, `portal/state.py` | Start/stop/status commands, read and write on-disk config, reconcile desired agent state into running workers. |
-| Worker runtime | `portal/worker.py`, `agent/core.py`, `agent/adapters/*`, `agent/harness/*`, `agent/providers/*` | Run one agent loop, build system prompt, dispatch messages to the selected runtime, record runtime state. |
+| Worker runtime | `portal/worker.py`, `agent/core.py`, `agent/adapters/*`, `agent/harness/*` | Run one agent loop, build system prompt, dispatch messages to the selected runtime, record runtime state. |
 | Puffo protocol | `crypto/*`, `agent/message_store.py`, `agent/status_reporter.py` | Signed HTTP, WebSocket relay, HPKE/AEAD message encryption, local encrypted message history, status reporting. |
 | Local bridge | `portal/api/*` | Loopback HTTP API for local web clients to pair, manage agents, inspect files/logs, import/export, and attach WS-local tools. |
 | Remote control | `portal/control/*` | Machine linking, operator pairings, encrypted control WebSocket, remote create/edit/pause/resume/archive/refresh commands. |
@@ -38,10 +38,8 @@ The package is distributed as `puffo-agent`; the Python module is
    then repeatedly reconciles `~/.puffo-agent/agents/`.
 3. Each discovered `agent.yml` becomes a `portal.worker.Worker` unless the agent
    is paused, deleted, archived, or invalid.
-4. The worker builds an adapter from `runtime.kind`:
-   - `chat-local`: direct provider-backed chat adapter.
-   - `sdk-local`: Claude SDK adapter.
-   - `cli-local`: local CLI process with isolated per-agent home.
+4. The worker builds the execution boundary from `runtime.kind`:
+   - `cli-local`: Claude Code or Codex Driver with an isolated per-agent home.
    - `cli-docker`: Dockerized CLI process with mounted agent state.
    - `ws-local`: attached local WebSocket tool session.
 5. The worker owns the Puffo Core listen/send loop, persists `runtime.json`,
@@ -186,6 +184,33 @@ The repository has a broad pytest suite. Useful clusters:
   `test_ui_views.py`.
 
 ## Architectural Invariants
+
+## Model-facing conversation projection (current state)
+
+`agent.message_projection` is the common readable row owner for Inbox rows,
+channel/thread/DM history, and single-post reads. It groups rows under an
+explicit space/channel/thread or DM target and renders the daemon-owned
+`server_seq`, ISO time, sender type, deterministic author display, and body.
+Pagination/status and metadata-only wake notices remain tool-specific.
+
+On a coordinated held channel send the Server still returns only its strict
+metadata contract. `HeldRecoverySource` waits for WebSocket/signed catch-up,
+then `MessageStore` supplies a bounded decrypted local interval and proves the
+exact terminal pair. `SendCoordinator` returns the unchanged draft, exact
+target, pre-send visible basis, terminal watermark, and grouped
+`message_projection` rows only when that proof is complete. It never exposes
+the daemon's pending-ID list.
+
+Those recovered rows remain lifecycle-neutral until the original tool result
+crosses its provider boundary. Claude and Codex correlate the existing
+continuation receipt, tool name, arguments, provider session, and turn;
+WS-local admits at its explicit tool-return boundary. The callback admits only
+still-pending displayed rows to the same turn, adds all displayed rows to the
+active visible registry, and advances a channel only through the Store's
+safe-prefix proof. A later `send_anyway` remains an explicit model-owned
+choice, never an automatic retry. Server, E2EE ownership, public MCP
+arguments, RPC, and WS-local v2 bundles are unchanged. The older
+`PuffoAgent._format_user_block()` remains a legacy compatibility projection.
 
 - Agent lifecycle is file-driven and reconciled by the daemon.
 - Worker processes/tasks are per-agent; agent state is isolated on disk.

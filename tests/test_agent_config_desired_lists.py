@@ -6,7 +6,6 @@ adds on top of whatever the host already provides.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -57,7 +56,7 @@ def test_load_legacy_yml_without_desired_fields_defaults_to_empty(home, tmp_path
         "role_short: ''\n"
         "created_at: 0\n"
         "puffo_core: {server_url: 'https://api.puffo.ai', slug: '', device_id: '', space_id: '', operator_slug: ''}\n"
-        "runtime: {kind: chat-local, provider: '', model: '', api_key: '', "
+        "runtime: {kind: cli-local, provider: '', model: '', api_key: '', "
         "harness: claude-code, permission_mode: bypassPermissions, max_turns: 10, "
         "allowed_tools: [], docker_image: '', docker_memory_limit: '', "
         "docker_memory_reservation: ''}\n"
@@ -76,7 +75,7 @@ def test_save_persists_empty_lists_explicitly(home, tmp_path):
     # Defaults are []; on save, the YAML must include the keys
     # explicitly so a downstream reader can tell "no desired list"
     # from "field missing entirely."
-    from puffo_agent.portal.state import AgentConfig, agent_yml_path
+    from puffo_agent.portal.state import agent_yml_path
     cfg = _make_cfg("agent-explicit-empty")
     cfg.save()
     body = agent_yml_path("agent-explicit-empty").read_text(encoding="utf-8")

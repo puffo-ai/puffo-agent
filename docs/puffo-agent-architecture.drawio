@@ -28,10 +28,10 @@
         <mxCell id="agentcore" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#D5E8D4;strokeColor=#82B366;" value="Agent shell&#xa;agent/core.py&#xa;conversation log, memory, turn routing, fallback reply handling" vertex="1">
           <mxGeometry height="115" width="260" x="10" y="920" as="geometry" />
         </mxCell>
-        <mxCell id="adapters" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#E1D5E7;strokeColor=#9673A6;" value="Runtime adapters&#xa;agent/adapters/*&#xa;chat-local, sdk-local, cli-local, cli-docker, ws-local" vertex="1">
+        <mxCell id="adapters" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#E1D5E7;strokeColor=#9673A6;" value="Runtime execution&#xa;Driver: cli-local&#xa;Adapter: cli-docker, ws-local" vertex="1">
           <mxGeometry height="115" width="260" x="320" y="1120" as="geometry" />
         </mxCell>
-        <mxCell id="llm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F5F5F5;strokeColor=#666666;" value="LLM runtimes/providers&#xa;Claude SDK, Claude Code, Codex, Gemini, OpenAI/Anthropic/Google APIs, Docker" vertex="1">
+        <mxCell id="llm" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F5F5F5;strokeColor=#666666;" value="LLM engines&#xa;Claude Code, Codex&#xa;Docker: Claude, Hermes, Gemini" vertex="1">
           <mxGeometry height="115" width="260" x="890" y="1120" as="geometry" />
         </mxCell>
         <mxCell id="crypto" parent="1" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#FFE6CC;strokeColor=#D79B00;" value="Puffo protocol + crypto&#xa;crypto/*&#xa;signed HTTP, WS relay, HPKE/AEAD message envelopes, attachments, keystore" vertex="1">
@@ -79,7 +79,7 @@
         <mxCell id="e8" edge="1" parent="1" source="agentcore" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="adapters" value="TurnContext">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="e9" edge="1" parent="1" source="adapters" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="llm" value="subprocess / SDK / API">
+        <mxCell id="e9" edge="1" parent="1" source="adapters" style="endArrow=block;html=1;rounded=0;strokeColor=#9673A6;" target="llm" value="Driver / subprocess">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="e10" edge="1" parent="1" source="worker" style="endArrow=block;html=1;rounded=0;strokeColor=#D79B00;" target="crypto" value="signed/encrypted traffic">

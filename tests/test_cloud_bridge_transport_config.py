@@ -34,7 +34,7 @@ def _write_agent_yml(agent_id: str, puffo_core_extra: str = "") -> Path:
         "  space_id: 'sp-1'\n"
         "  operator_slug: 'op-5678'\n"
         f"{puffo_core_extra}"
-        "runtime: {kind: chat-local}\n"
+        "runtime: {kind: cli-local}\n"
         "triggers: {on_mention: true, on_dm: true}\n",
         encoding="utf-8",
     )

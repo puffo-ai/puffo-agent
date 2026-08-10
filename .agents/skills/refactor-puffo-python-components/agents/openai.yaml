@@ -1,0 +1,4 @@
+interface:
+  display_name: "Puffo Python Refactor"
+  short_description: "Refactor Puffo Python components without behavior drift"
+  default_prompt: "Use $refactor-puffo-python-components to split this Puffo Python component into cohesive, verifiable modules."

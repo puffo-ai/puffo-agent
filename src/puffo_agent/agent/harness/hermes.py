@@ -19,10 +19,10 @@ session systems.
 
 from __future__ import annotations
 
-from .base import Harness
+from .base import DockerHarness
 
 
-class HermesHarness(Harness):
+class HermesHarness(DockerHarness):
     def name(self) -> str:
         return "hermes"
 

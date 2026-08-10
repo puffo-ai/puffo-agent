@@ -9,15 +9,10 @@ and never DMed.
 
 from __future__ import annotations
 
-import asyncio
-import logging
-from typing import Any
-
 import pytest
 
 from puffo_agent.agent._auth_markers import looks_like_auth_error
 from puffo_agent.agent.core import AgentAPIError
-from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.portal.worker import Worker
 
 
@@ -111,95 +106,6 @@ async def test_core_tags_is_auth_on_raise(tmp_path):
         "Failed to authenticate. API Error: 401 Invalid authentication credentials"
     )
     assert auth_retry is not None and auth_retry.is_auth is True
-
-
-# ── consumer: auth skips kick-retries ──────────────────────────────
-
-
-@pytest.fixture(autouse=True)
-def _fast_sleep(monkeypatch):
-    real = asyncio.sleep
-
-    async def fast(_s):
-        await real(0)
-
-    monkeypatch.setattr(asyncio, "sleep", fast)
-
-
-def _make_client() -> PuffoCoreMessageClient:
-    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
-    client.slug = "tester-1234"
-    client._log = logging.getLogger("test-auth-class")
-    client.MAX_API_ERROR_RETRIES = 3  # type: ignore[attr-defined]
-
-    class _StubStore:
-        async def mark_thread_processed(self, *a, **k):
-            return None
-
-    client.store = _StubStore()  # type: ignore[assignment]
-    return client
-
-
-def _make_entry():
-    class _Entry:
-        def __init__(self):
-            self.dispatching_ids: set[str] = set()
-
-    return _Entry()
-
-
-@pytest.mark.asyncio
-async def test_auth_error_skips_kick_retries_without_overwriting_status():
-    client = _make_client()
-    retry_calls: list[int] = []
-    abandon: list[Any] = []
-
-    async def on_retry(root_id, batch, channel_meta):
-        retry_calls.append(1)
-
-    async def on_abandon(root_id, batch, channel_meta, attempts):
-        abandon.append(attempts)
-
-    await client._do_api_error_retries(  # type: ignore[arg-type]
-        root_id="r",
-        entry=_make_entry(),  # type: ignore[arg-type]
-        batch=[{"envelope_id": "e1"}],
-        channel_meta={},
-        on_api_error_retry=on_retry,
-        on_api_error_abandon=on_abandon,
-        last_envelope="e1",
-        is_auth=True,
-    )
-    assert retry_calls == []   # no pointless kick-retries
-    # The api-error-abandon callback must NOT fire — it would overwrite
-    # the worker's auth_failed status with api_error_abandoned.
-    assert abandon == []
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_still_kick_retries(monkeypatch):
-    """Sanity: a non-auth API error keeps the existing retry path."""
-    client = _make_client()
-    retry_calls: list[int] = []
-
-    async def on_retry(root_id, batch, channel_meta):
-        retry_calls.append(1)
-        raise AgentAPIError("still rate-limited")
-
-    async def on_abandon(*a):
-        return None
-
-    await client._do_api_error_retries(  # type: ignore[arg-type]
-        root_id="r",
-        entry=_make_entry(),  # type: ignore[arg-type]
-        batch=[{"envelope_id": "e1"}],
-        channel_meta={},
-        on_api_error_retry=on_retry,
-        on_api_error_abandon=on_abandon,
-        last_envelope="e1",
-        is_auth=False,
-    )
-    assert len(retry_calls) == 3   # MAX_API_ERROR_RETRIES kicks
 
 
 # ── worker: _enter_auth_failed edge ────────────────────────────────

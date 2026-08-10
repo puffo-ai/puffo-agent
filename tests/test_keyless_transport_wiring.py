@@ -4,14 +4,15 @@ The subprocess MCP server (``puffo_agent.mcp.puffo_core_server``) turns
 on its keyless / bridge path only when ``PUFFO_CORE_TRANSPORT == "bridge"``
 (``build_server`` does ``keyless=(transport == "bridge")``). That env var
 is produced by ``puffo_core_mcp_env`` and must be threaded from
-``agent.yml``'s ``puffo_core.transport`` at the two subprocess-MCP call
-sites in ``worker.build_adapter`` (cli-local and cli-docker).
+``agent.yml``'s ``puffo_core.transport`` through both execution builders:
+``LocalRuntimePreparer`` for cli-local and ``worker.build_docker_adapter``
+for cli-docker.
 
 These tests pin both halves of the seam:
 
   * the env builder emits ``PUFFO_CORE_TRANSPORT`` for ``bridge`` only,
     and for no other transport value (so keyless stays False elsewhere);
-  * ``build_adapter`` forwards ``pc.transport`` end-to-end, so a bridge
+  * ``build_docker_adapter`` forwards ``pc.transport`` end-to-end, so a bridge
     agent's adapter env carries the var while a native agent's does not
     (native stays byte-for-byte on the signed keystore path).
 """
@@ -32,7 +33,7 @@ from puffo_agent.portal.state import (
     PuffoCoreConfig,
     RuntimeConfig,
 )
-from puffo_agent.portal.worker import build_adapter
+from puffo_agent.portal.worker import build_docker_adapter
 
 
 @pytest.fixture(autouse=True)
@@ -105,9 +106,14 @@ def test_worker_forwards_bridge_transport(kind):
         runtime=RuntimeConfig(kind=kind),
         puffo_core=_bridge_puffo_core(),
     )
-    adapter = build_adapter(DaemonConfig(), cfg)
-    assert adapter.puffo_core_mcp_env is not None
-    assert adapter.puffo_core_mcp_env["PUFFO_CORE_TRANSPORT"] == "bridge"
+    if kind == "cli-local":
+        from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+
+        env = LocalRuntimePreparer(DaemonConfig(), cfg)._puffo_core_env
+    else:
+        env = build_docker_adapter(DaemonConfig(), cfg).puffo_core_mcp_env
+    assert env is not None
+    assert env["PUFFO_CORE_TRANSPORT"] == "bridge"
 
 
 @pytest.mark.parametrize("kind", ["cli-local", "cli-docker"])
@@ -117,6 +123,11 @@ def test_worker_native_agent_omits_transport(kind):
         runtime=RuntimeConfig(kind=kind),
         puffo_core=_native_puffo_core(),
     )
-    adapter = build_adapter(DaemonConfig(), cfg)
-    assert adapter.puffo_core_mcp_env is not None
-    assert "PUFFO_CORE_TRANSPORT" not in adapter.puffo_core_mcp_env
+    if kind == "cli-local":
+        from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+
+        env = LocalRuntimePreparer(DaemonConfig(), cfg)._puffo_core_env
+    else:
+        env = build_docker_adapter(DaemonConfig(), cfg).puffo_core_mcp_env
+    assert env is not None
+    assert "PUFFO_CORE_TRANSPORT" not in env

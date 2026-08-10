@@ -16,11 +16,19 @@ _SUMMARY_CAP = 200
 def _format_audit_extras(event: str, extras: dict) -> str:
     """Per-event-type formatter — keeps the row readable as plain text."""
     if event == "assistant.text":
+        summary = extras.get("text_summary")
+        if isinstance(summary, dict):
+            return f"content redacted length={summary.get('length', 0)}"
         text = extras.get("text", "")
         if isinstance(text, str):
             return text[:_SUMMARY_CAP] + ("…" if len(text) > _SUMMARY_CAP else "")
     if event == "tool":
         name = extras.get("name", "")
+        summary = extras.get("input_summary")
+        if isinstance(summary, dict):
+            return (
+                f"{name} input redacted fields={summary.get('fields', [])}"
+            ).strip()
         inp = extras.get("input", {})
         inp_str = json.dumps(inp, ensure_ascii=False) if isinstance(inp, (dict, list)) else str(inp)
         if len(inp_str) > _SUMMARY_CAP:
@@ -76,6 +84,7 @@ class PerAgentLogSource:
     def __init__(self, audit_path: Path) -> None:
         self._audit_path = audit_path
         self._seen_size = 0
+        self._seen_inode: int | None = None
         self._line_count = 0
 
     def snapshot(self) -> list[str]:
@@ -83,15 +92,28 @@ class PerAgentLogSource:
 
     def counter(self) -> int:
         try:
-            size = self._audit_path.stat().st_size
+            stat = self._audit_path.stat()
+            size = stat.st_size
         except OSError:
             return self._line_count
-        if size == self._seen_size:
+        inode = stat.st_ino
+        if inode == self._seen_inode and size == self._seen_size:
             return self._line_count
-        if size < self._seen_size:
-            # Rotated / truncated → recount from scratch.
+        if self._seen_inode is not None and inode != self._seen_inode:
+            rotated = self._audit_path.with_name(f"{self._audit_path.name}.1")
+            try:
+                rotated_stat = rotated.stat()
+                if rotated_stat.st_ino == self._seen_inode:
+                    with rotated.open("rb") as f:
+                        f.seek(min(self._seen_size, rotated_stat.st_size))
+                        self._line_count += f.read().count(b"\n")
+            except OSError:
+                pass
             self._seen_size = 0
-            self._line_count = 0
+        elif size < self._seen_size:
+            # In-place truncation cannot recover unread lines, but the
+            # cumulative count must never move backwards.
+            self._seen_size = 0
         try:
             with self._audit_path.open("rb") as f:
                 f.seek(self._seen_size)
@@ -100,4 +122,5 @@ class PerAgentLogSource:
             return self._line_count
         self._line_count += content.count(b"\n")
         self._seen_size = size
+        self._seen_inode = inode
         return self._line_count

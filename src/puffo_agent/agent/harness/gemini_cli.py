@@ -1,16 +1,15 @@
 """Gemini CLI harness.
 
-Wraps Google's ``gemini`` CLI. Runtime support is currently cli-
-docker only; cli-local rejects ``harness=gemini-cli`` at adapter
-construction.
+Wraps Google's ``gemini`` CLI. Runtime support is currently
+``cli-docker`` only; runtime validation rejects it for ``cli-local``.
 """
 
 from __future__ import annotations
 
-from .base import Harness
+from .base import DockerHarness
 
 
-class GeminiCLIHarness(Harness):
+class GeminiCLIHarness(DockerHarness):
     def name(self) -> str:
         return "gemini-cli"
 

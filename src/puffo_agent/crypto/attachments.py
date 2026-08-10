@@ -40,7 +40,7 @@ class AttachmentMeta:
         }
 
     @staticmethod
-    def from_dict(d: dict[str, Any]) -> "AttachmentMeta":
+    def from_dict(d: dict[str, Any]) -> AttachmentMeta:
         return AttachmentMeta(
             blob_id=str(d["blob_id"]),
             filename=str(d["filename"]),

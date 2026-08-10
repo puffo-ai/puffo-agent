@@ -148,13 +148,24 @@ class PuffoCoreHttpClient:
         _, data = await self._request("GET", path)
         return data
 
-    async def get_bytes(self, path: str) -> bytes:
+    async def get_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
         """Signed GET returning raw bytes (e.g. /blobs/{id})."""
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+            or max_bytes <= 0
+        ):
+            raise ValueError("max_bytes must be a positive integer")
         await self._ensure_subkey()
-        bytes_out = await self._do_request_bytes("GET", path)
+        bytes_out = await self._do_request_bytes("GET", path, max_bytes=max_bytes)
         return bytes_out
 
-    async def _do_request_bytes(self, method: str, path: str) -> bytes:
+    async def _do_request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
         signing_key, signer_id = self._load_signing_key()
         from .http_auth import sign_request
         auth = sign_request(signing_key, self.slug, signer_id, method, path, b"")
@@ -167,7 +178,16 @@ class PuffoCoreHttpClient:
                 raise HttpError(401, await resp.text())
             if resp.status >= 400:
                 raise HttpError(resp.status, await resp.text())
-            return await resp.read()
+            if max_bytes is None:
+                return await resp.read()
+            if resp.content_length is not None and resp.content_length > max_bytes:
+                raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+            return bytes(body)
 
     async def post(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""
@@ -190,8 +210,18 @@ class PuffoCoreHttpClient:
         _, data = await self._request("PATCH", path, raw)
         return data
 
-    async def delete(self, path: str) -> Any:
-        _, data = await self._request("DELETE", path)
+    async def delete(self, path: str, body: dict | None = None) -> Any:
+        """Signed DELETE, optionally carrying a JSON body.
+
+        Some routes identify their target in the body rather than the
+        path — ``DELETE /blocklists`` takes ``{"id": "<slug>"}``. The
+        body is serialized exactly as ``post()`` does and handed to
+        ``_request``, so ``sign_request`` covers the same bytes that go
+        on the wire (the server verifies the signature over the raw
+        body). Bodyless DELETEs are byte-for-byte unchanged.
+        """
+        raw = json.dumps(body).encode() if body else b""
+        _, data = await self._request("DELETE", path, raw)
         return data
 
     def _egress_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
@@ -216,6 +246,28 @@ class PuffoCoreHttpClient:
         raw = json.dumps(body).encode() if body else b""
         http = await self._get_session()
         async with http.post(
+            f"{self.server_url}{path}",
+            data=raw,
+            headers=self._egress_headers({"content-type": "application/json"}),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text
+
+    async def put_unsigned(self, path: str, body: dict | None = None) -> Any:
+        """Unsigned JSON PUT for the keyless cloud-Agent namespace.
+
+        Mirrors ``post_unsigned`` so provider-neutral callers retain the
+        existing egress-token boundary instead of opening a second aiohttp
+        request path in a scheduler or tool.
+        """
+        raw = json.dumps(body).encode() if body else b""
+        http = await self._get_session()
+        async with http.put(
             f"{self.server_url}{path}",
             data=raw,
             headers=self._egress_headers({"content-type": "application/json"}),

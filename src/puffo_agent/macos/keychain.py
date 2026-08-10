@@ -266,7 +266,7 @@ class CredentialCache:
     path: Path
 
     @classmethod
-    def at(cls, home: Path) -> "CredentialCache":
+    def at(cls, home: Path) -> CredentialCache:
         return cls(home / "run" / CACHE_FILENAME)
 
     def exists(self) -> bool:

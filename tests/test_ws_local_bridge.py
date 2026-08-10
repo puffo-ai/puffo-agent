@@ -160,3 +160,82 @@ async def test_reply_during_dispatch_relayed():
     assert replies == [("c", "r1", "hi")]
     t.feed_close()
     await run
+
+
+class _V1SessionStub:
+    """A capability-less peer: ``deliver_planned`` would raise for it."""
+
+    capabilities = frozenset()
+
+    def __init__(self, bridge) -> None:
+        self._bridge = bridge
+        self.batches: list = []
+
+    async def deliver_planned(self, _planned):
+        raise AssertionError("v1 peer must not be handed the v2 global bundle")
+
+    async def deliver_batch(self, root_id, messages, channel_meta):
+        self.batches.append((root_id, messages, channel_meta))
+        # v1 acks by ending the bundle; the real session does this from its
+        # frame loop, so resolve the bridge's waiter the same way.
+        await self._bridge.on_acked(None)
+
+
+class _RecordingAdapter:
+    def __init__(self) -> None:
+        self.admissions: list = []
+
+    async def emit_admission(self, *, turn_id, correlation_key, **_evidence):
+        self.admissions.append((turn_id, correlation_key))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_planned_maps_a_v1_peer_onto_single_root_batches():
+    from puffo_agent.agent.global_inbox_types import MessageRoute, PlannedTurn
+    from puffo_agent.agent.message_store_models import StoredMessage
+
+    def _item(envelope_id, root=None):
+        return StoredMessage(
+            envelope_id=envelope_id, envelope_kind="channel", sender_slug="alice",
+            channel_id="ch", space_id="sp", recipient_slug=None,
+            content_type="puffo/message+attachments/v1",
+            content={"text": f"body {envelope_id}", "sender_display_name": "Alice"},
+            sent_at=1, received_at=1, thread_root_id=root,
+        )
+
+    def _route(envelope_id, root=""):
+        return MessageRoute(
+            envelope_id=envelope_id, kind="thread" if root else "channel",
+            space_id="sp", channel_id="ch", thread_root_id=root,
+        )
+
+    planned = PlannedTurn(
+        turn_id="turn-v1", planning_cycle_key="cycle-v1",
+        message_ids=("root", "reply", "solo"),
+        items=(_item("root"), _item("reply", "root"), _item("solo")),
+        routes=(_route("root"), _route("reply", "root"), _route("solo")),
+        targets=(("channel", "sp", "ch"),), pending_targets=(),
+        target_summary="{}", formatted_blocks=(), provider_input="notice",
+        formatted_tokens=0, wrapper_overhead_tokens=0, formatted_bytes=0,
+        wrapper_overhead_bytes=0,
+    )
+    adapter = _RecordingAdapter()
+    runtime = type("Runtime", (), {"adapter": adapter})()
+    bridge = WsLocalBridge(runtime=runtime)
+    session = _V1SessionStub(bridge)
+
+    await bridge.dispatch_planned(session, planned)
+
+    assert [root_id for root_id, _batch, _meta in session.batches] == ["root", "solo"]
+    assert [
+        [message["envelope_id"] for message in batch]
+        for _root_id, batch, _meta in session.batches
+    ] == [["root", "reply"], ["solo"]]
+    assert session.batches[0][2] == {
+        "channel_id": "ch", "channel_name": "", "space_id": "sp",
+        "space_name": "", "is_dm": False,
+    }
+    assert session.batches[0][1][1]["root_id"] == "root"
+    assert session.batches[0][1][0]["text"] == "body root"
+    # Exactly one initial admission, correlated to the planning cycle.
+    assert adapter.admissions == [("turn-v1", "cycle-v1")]

@@ -26,12 +26,12 @@ import secrets
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 
-
 POLL_INTERVAL_SECONDS = 0.1
+V2_CAPABILITIES = ("multi-target-v2", "explicit-admission-v2")
 
 
 async def run_attach(
@@ -41,148 +41,220 @@ async def run_attach(
     bridge_url: str = "http://127.0.0.1:63387",
     session_dir: Optional[Path] = None,
 ) -> int:
+    prepared = _prepare_attach(bundle_path, bridge_url, session_dir)
+    if prepared is None:
+        return 2
+    bundle_b64, session_dir, events_path, commands_path, status_path, ws_url = prepared
+    print(f"SESSION_DIR={session_dir}", flush=True)
+    return await _run_attach_connection(
+        bundle_b64, passcode, events_path, commands_path, status_path, ws_url
+    )
+
+
+def _prepare_attach(
+    bundle_path: Path, bridge_url: str, session_dir: Path | None
+) -> tuple[str, Path, Path, Path, Path, str] | None:
     if not bundle_path.is_file():
         print(f"error: bundle not found: {bundle_path}", file=sys.stderr)
-        return 2
-
-    bundle_b64 = base64.b64encode(bundle_path.read_bytes()).decode("ascii")
-
+        return None
     if session_dir is None:
-        suffix = secrets.token_hex(4)
-        session_dir = Path(tempfile.gettempdir()) / f"puffo-attach-{suffix}"
+        session_dir = (
+            Path(tempfile.gettempdir()) / f"puffo-attach-{secrets.token_hex(4)}"
+        )
     session_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(session_dir, 0o700)
     except OSError:
         pass
-    events_path = session_dir / "events.ndjson"
-    commands_path = session_dir / "commands.ndjson"
-    status_path = session_dir / "status"
-    commands_path.touch()
+    events, commands, status = (
+        session_dir / "events.ndjson",
+        session_dir / "commands.ndjson",
+        session_dir / "status",
+    )
+    commands.touch()
+    url = (
+        bridge_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
+        + "/v1/ws-local"
+    )
+    return (
+        base64.b64encode(bundle_path.read_bytes()).decode("ascii"),
+        session_dir,
+        events,
+        commands,
+        status,
+        url,
+    )
 
-    # First stdout line so the wrapping AI can pick the path up.
-    print(f"SESSION_DIR={session_dir}", flush=True)
 
-    ws_url = bridge_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/v1/ws-local"
-
-    def emit_event(event: dict[str, Any]) -> None:
-        with events_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event) + "\n")
-
-    def write_status(state: dict[str, Any]) -> None:
-        tmp = status_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state), encoding="utf-8")
-        tmp.replace(status_path)
-
-    write_status({"state": "connecting", "ws_url": ws_url})
-
+async def _run_attach_connection(
+    bundle: str, passcode: str, events: Path, commands: Path, status: Path, url: str
+) -> int:
+    emit, write_status = _attach_file_writers(events, status)
+    write_status({"state": "connecting", "ws_url": url})
     async with aiohttp.ClientSession() as http:
         try:
-            ws = await http.ws_connect(ws_url, heartbeat=30.0)
+            ws = await http.ws_connect(url, heartbeat=30.0)
         except Exception as exc:
-            emit_event({"type": "error", "reason": f"connect failed: {exc}"})
+            emit({"type": "error", "reason": f"connect failed: {exc}"})
             write_status({"state": "error", "reason": str(exc)})
             return 1
-
-        await ws.send_str(json.dumps({
-            "type": "connect",
-            "bundle": bundle_b64,
-            "password": passcode,
-        }))
-
+        await ws.send_str(
+            json.dumps(
+                {
+                    "type": "connect",
+                    "bundle": bundle,
+                    "password": passcode,
+                    "capabilities": list(V2_CAPABILITIES),
+                }
+            )
+        )
         stop = asyncio.Event()
-
-        async def pump_ws() -> None:
-            try:
-                async for msg in ws:
-                    if stop.is_set():
-                        break
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        try:
-                            frame = json.loads(msg.data)
-                        except ValueError:
-                            emit_event({"type": "error", "reason": "non-JSON WS frame"})
-                            continue
-                        emit_event(frame)
-                        kind = frame.get("type")
-                        if kind == "connected":
-                            write_status({"state": "connected", "agent": frame.get("agent", {})})
-                        elif kind == "error":
-                            write_status({"state": "error", "reason": frame.get("reason", "")})
-                            stop.set()
-                        elif kind == "ping":
-                            await ws.send_str(json.dumps({"type": "pong"}))
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        emit_event({"type": "error", "reason": f"ws error: {ws.exception()}"})
-                        break
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        break
-            finally:
-                emit_event({"type": "disconnected"})
-                write_status({"state": "disconnected"})
-                stop.set()
-
-        async def pump_commands() -> None:
-            last_offset = 0
-            while not stop.is_set():
-                try:
-                    size = commands_path.stat().st_size
-                except FileNotFoundError:
-                    await asyncio.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-                if size > last_offset:
-                    with commands_path.open("rb") as fh:
-                        fh.seek(last_offset)
-                        chunk = fh.read(size - last_offset)
-                    last_offset = size
-                    for line in chunk.decode("utf-8-sig", errors="replace").splitlines():
-                        # ``utf-8-sig`` strips a leading BOM; lstrip catches
-                        # mid-file BOMs from per-line appenders (PowerShell
-                        # ``Add-Content -Encoding UTF8`` on Windows).
-                        line = line.lstrip("﻿").strip()
-                        if not line:
-                            continue
-                        try:
-                            cmd = json.loads(line)
-                        except ValueError:
-                            emit_event({"type": "error", "reason": f"bad command JSON: {line[:100]}"})
-                            continue
-                        ctype = cmd.get("type")
-                        if ctype == "ack":
-                            await ws.send_str(json.dumps({
-                                "type": "ack",
-                                "bundle_id": str(cmd.get("bundle_id", "")),
-                            }))
-                        elif ctype == "end":
-                            await ws.send_str(json.dumps({
-                                "type": "end",
-                                "bundle_id": str(cmd.get("bundle_id", "")),
-                            }))
-                        elif ctype == "tool_call":
-                            params = cmd.get("params") or {}
-                            if not isinstance(params, dict):
-                                emit_event({"type": "error",
-                                            "reason": "tool_call.params must be an object"})
-                                continue
-                            await ws.send_str(json.dumps({
-                                "type": "tool_call",
-                                "command_id": str(cmd.get("command_id", "")),
-                                "tool": str(cmd.get("tool", "")),
-                                "params": params,
-                            }))
-                        elif ctype == "detach":
-                            stop.set()
-                            await ws.close()
-                            return
-                        else:
-                            emit_event({"type": "error", "reason": f"unknown command type: {ctype!r}"})
-                await asyncio.sleep(POLL_INTERVAL_SECONDS)
-
         try:
-            await asyncio.gather(pump_ws(), pump_commands())
+            await asyncio.gather(
+                _pump_ws(ws, stop, emit, write_status),
+                _pump_commands(ws, stop, commands, emit),
+            )
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
         finally:
             if not ws.closed:
                 await ws.close()
     return 0
+
+
+def _attach_file_writers(
+    events: Path, status: Path
+) -> tuple[Callable[[dict[str, Any]], None], Callable[[dict[str, Any]], None]]:
+    def emit(event: dict[str, Any]) -> None:
+        with events.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event) + "\n")
+
+    def write_state(state: dict[str, Any]) -> None:
+        temporary = status.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state), encoding="utf-8")
+        temporary.replace(status)
+
+    return emit, write_state
+
+
+async def _pump_ws(
+    ws: aiohttp.ClientWebSocketResponse,
+    stop: asyncio.Event,
+    emit: Callable[[dict[str, Any]], None],
+    write_status: Callable[[dict[str, Any]], None],
+) -> None:
+    try:
+        async for message in ws:
+            if stop.is_set():
+                break
+            await _handle_ws_message(ws, message, stop, emit, write_status)
+    finally:
+        emit({"type": "disconnected"})
+        write_status({"state": "disconnected"})
+        stop.set()
+
+
+async def _handle_ws_message(
+    ws: aiohttp.ClientWebSocketResponse,
+    message: aiohttp.WSMessage,
+    stop: asyncio.Event,
+    emit: Callable[[dict[str, Any]], None],
+    write_status: Callable[[dict[str, Any]], None],
+) -> None:
+    if message.type == aiohttp.WSMsgType.TEXT:
+        try:
+            frame = json.loads(message.data)
+        except ValueError:
+            emit({"type": "error", "reason": "non-JSON WS frame"})
+            return
+        emit(frame)
+        kind = frame.get("type")
+        if kind == "connected":
+            write_status({"state": "connected", "agent": frame.get("agent", {})})
+        elif kind == "error":
+            write_status({"state": "error", "reason": frame.get("reason", "")})
+            stop.set()
+        elif kind == "ping":
+            await ws.send_str(json.dumps({"type": "pong"}))
+    elif message.type == aiohttp.WSMsgType.ERROR:
+        emit({"type": "error", "reason": f"ws error: {ws.exception()}"})
+
+
+async def _pump_commands(
+    ws: aiohttp.ClientWebSocketResponse,
+    stop: asyncio.Event,
+    commands: Path,
+    emit: Callable[[dict[str, Any]], None],
+) -> None:
+    offset = 0
+    while not stop.is_set():
+        try:
+            size = commands.stat().st_size
+        except FileNotFoundError:
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            continue
+        if size > offset:
+            with commands.open("rb") as fh:
+                fh.seek(offset)
+                chunk = fh.read(size - offset)
+            offset = size
+            for line in chunk.decode("utf-8-sig", errors="replace").splitlines():
+                if await _send_attach_command(ws, stop, line, emit):
+                    return
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+async def _send_attach_command(
+    ws: aiohttp.ClientWebSocketResponse,
+    stop: asyncio.Event,
+    line: str,
+    emit: Callable[[dict[str, Any]], None],
+) -> bool:
+    line = line.lstrip("﻿").strip()
+    if not line:
+        return False
+    try:
+        command = json.loads(line)
+    except ValueError:
+        emit({"type": "error", "reason": f"bad command JSON: {line[:100]}"})
+        return False
+    kind = command.get("type")
+    if kind in {"ack", "end"}:
+        await ws.send_str(
+            json.dumps({"type": kind, "bundle_id": str(command.get("bundle_id", ""))})
+        )
+        return False
+    if kind == "admitted":
+        admitted = {
+            "type": "admitted",
+            "version": 2,
+            "bundle_id": str(command.get("bundle_id", "")),
+            "turn_id": str(command.get("turn_id", "")),
+        }
+        correlation_key = command.get("correlation_key")
+        if correlation_key is not None:
+            admitted["correlation_key"] = str(correlation_key)
+        await ws.send_str(json.dumps(admitted))
+        return False
+    if kind == "tool_call":
+        params = command.get("params") or {}
+        if not isinstance(params, dict):
+            emit({"type": "error", "reason": "tool_call.params must be an object"})
+            return False
+        await ws.send_str(
+            json.dumps(
+                {
+                    "type": "tool_call",
+                    "command_id": str(command.get("command_id", "")),
+                    "tool": str(command.get("tool", "")),
+                    "params": params,
+                }
+            )
+        )
+        return False
+    if kind == "detach":
+        stop.set()
+        await ws.close()
+        return True
+    emit({"type": "error", "reason": f"unknown command type: {kind!r}"})
+    return False

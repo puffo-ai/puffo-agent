@@ -1,8 +1,8 @@
 """Tests for the harness abstraction layer.
 
 Covers:
-  1. ``build_harness`` resolves the runtime.harness string to a
-     concrete ``Harness`` (default + explicit values).
+  1. ``build_docker_harness`` resolves the runtime.harness string to a
+     concrete ``DockerHarness`` (default + explicit values).
   2. ``supports_claude_specific_tools()`` matches the MCP tool gating
      (claude-code -> True, hermes -> False).
   3. The MCP tool guard raises a clear error under non-claude harnesses
@@ -15,41 +15,42 @@ that needs a live hermes install and is covered in the smoke suite.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
 from puffo_agent.agent.harness import (
     ClaudeCodeHarness,
-    Harness,
+    DockerHarness,
     HermesHarness,
-    build_harness,
+    build_docker_harness,
 )
 
 
-# ── build_harness ────────────────────────────────────────────────────────────
+# ── build_docker_harness ────────────────────────────────────────────────────────────
 
 
 def test_build_harness_defaults_to_claude_code():
     """Backward-compat: agents with ``harness=""`` keep claude-code."""
-    h = build_harness("")
+    h = build_docker_harness("")
     assert isinstance(h, ClaudeCodeHarness)
     assert h.name() == "claude-code"
 
 
 def test_build_harness_explicit_claude_code():
-    h = build_harness("claude-code")
+    h = build_docker_harness("claude-code")
     assert isinstance(h, ClaudeCodeHarness)
 
 
 def test_build_harness_hermes():
-    h = build_harness("hermes")
+    h = build_docker_harness("hermes")
     assert isinstance(h, HermesHarness)
     assert h.name() == "hermes"
 
 
 def test_build_harness_unknown_raises():
     with pytest.raises(ValueError, match="unknown harness"):
-        build_harness("not-a-harness")
+        build_docker_harness("not-a-harness")
 
 
 # ── supports_claude_specific_tools ────────────────────────────────────────────
@@ -69,7 +70,7 @@ def test_base_harness_defaults_to_not_supporting():
     """New harness authors must opt IN to claude-specific tools, so a
     forgotten override can't silently enable write paths a harness
     doesn't understand."""
-    class MinimalHarness(Harness):
+    class MinimalHarness(DockerHarness):
         def name(self) -> str:
             return "minimal"
     assert MinimalHarness().supports_claude_specific_tools() is False
@@ -94,7 +95,7 @@ def test_gemini_cli_providers_google_only():
 def test_base_harness_declares_empty_provider_set():
     """Empty set forces concrete harnesses to opt in — the validation
     matrix rejects every provider, the safe fallback."""
-    class MinimalHarness(Harness):
+    class MinimalHarness(DockerHarness):
         def name(self) -> str:
             return "minimal"
     assert MinimalHarness().supported_providers() == frozenset()
@@ -102,7 +103,7 @@ def test_base_harness_declares_empty_provider_set():
 
 def test_build_harness_accepts_gemini_cli():
     from puffo_agent.agent.harness import GeminiCLIHarness
-    h = build_harness("gemini-cli")
+    h = build_docker_harness("gemini-cli")
     assert isinstance(h, GeminiCLIHarness)
     assert h.name() == "gemini-cli"
 
@@ -123,9 +124,6 @@ def _build_mcp_with_harness(harness: str, tmp_path=None):
     import os
     import tempfile
 
-    from puffo_agent.agent.message_store import MessageStore
-    from puffo_agent.crypto.http_client import PuffoCoreHttpClient
-    from puffo_agent.crypto.keystore import KeyStore
     from puffo_agent.mcp.puffo_core_server import build_server
 
     workspace = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp()
@@ -190,6 +188,20 @@ def test_refresh_default_writes_refresh_agent_flag(tmp_path):
     assert (
         Path(workspace) / ".puffo-agent" / "refresh_agent.flag"
     ).exists()
+
+
+def test_refresh_inference_level_writes_daemon_request(tmp_path):
+    server, workspace = _build_mcp_with_harness("codex", tmp_path=tmp_path)
+
+    out = _call_tool(server, "refresh", inference_level="medium")
+
+    assert "inference_level='medium'" in out
+    payload = json.loads(
+        (tmp_path / ".puffo-agent" / "refresh_model.flag").read_text()
+    )
+    assert payload["harness"] == ""
+    assert payload["model"] == ""
+    assert payload["inference_level"] == "medium"
 
 
 def test_install_mcp_server_blocked_under_hermes():
@@ -407,232 +419,6 @@ def test_stitch_hermes_prompt_no_system_passes_through():
     assert _stitch_hermes_prompt("", "hello") == "hello"
     assert _stitch_hermes_prompt(None, "hello") == "hello"  # type: ignore[arg-type]
 
-
-# ── cli-local accepts harness=hermes (binary check happens in _verify) ──────
-
-
-def test_local_cli_accepts_hermes_harness_at_construction():
-    """cli-local construction with hermes harness doesn't raise — the
-    binary + ``~/.hermes/config.yaml`` pre-flight is deferred to
-    ``_verify`` (first turn / warm), matching the codex path. This
-    keeps adapter registry construction cheap and lets the operator
-    see a clear error from ``_verify`` only when they actually try
-    to spawn the runtime.
-    """
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-    LocalCLIAdapter(
-        agent_id="t",
-        model="",
-        workspace_dir="/tmp/ws",
-        claude_dir="/tmp/ws/.claude",
-        session_file="/tmp/sess.json",
-        mcp_config_file="/tmp/mcp.json",
-        agent_home_dir="/tmp/agent",
-        harness=HermesHarness(),
-    )
-
-
-def test_local_cli_hermes_verify_raises_when_binary_missing(monkeypatch, tmp_path):
-    """``_verify`` is the lazy pre-flight — when the operator hasn't
-    installed hermes, surface a clear install message naming
-    ``$PUFFO_HERMES_BIN`` so they can fix it without grepping source.
-    """
-    from puffo_agent.agent.adapters import local_cli as local_cli_mod
-    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: None)
-    adapter = local_cli_mod.LocalCLIAdapter(
-        agent_id="t",
-        model="",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "sess.json"),
-        mcp_config_file=str(tmp_path / "mcp.json"),
-        agent_home_dir=str(tmp_path / "agent"),
-        harness=HermesHarness(),
-    )
-    with pytest.raises(RuntimeError, match="hermes binary not found"):
-        adapter._verify()
-
-
-def test_local_cli_hermes_verify_raises_when_host_config_missing(monkeypatch, tmp_path):
-    """If hermes is installed but the host HERMES_HOME's
-    ``config.yaml`` doesn't exist, the operator hasn't run
-    ``hermes setup`` yet. Surface that explicitly rather than
-    letting the first turn fail with a cryptic provider-not-
-    configured error from hermes itself.
-    """
-    from puffo_agent.agent.adapters import local_cli as local_cli_mod
-    fake_bin = tmp_path / "hermes"
-    fake_bin.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
-    # Point HERMES_HOME at a tmpdir with no config.yaml so the
-    # check fails the way it would for a fresh operator.
-    empty_home = tmp_path / "fake_hermes_home"
-    empty_home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(empty_home))
-    adapter = local_cli_mod.LocalCLIAdapter(
-        agent_id="t",
-        model="",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "sess.json"),
-        mcp_config_file=str(tmp_path / "mcp.json"),
-        agent_home_dir=str(tmp_path / "agent"),
-        harness=HermesHarness(),
-    )
-    with pytest.raises(RuntimeError, match="hermes installer"):
-        adapter._verify()
-
-
-def test_local_cli_hermes_verify_seeds_per_agent_home(monkeypatch, tmp_path):
-    """First successful ``_verify`` copies ``.env`` from the host
-    HERMES_HOME and seeds config.yaml; ``state.db`` deliberately
-    does NOT get copied — each agent gets a fresh session/memory
-    store. Model/provider get pinned from agent.yml — see
-    ``test_local_cli_hermes_pins_model_from_agent_yml``.
-    """
-    import yaml as _yaml
-    from puffo_agent.agent.adapters import local_cli as local_cli_mod
-    fake_bin = tmp_path / "hermes"
-    fake_bin.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
-
-    host_hermes = tmp_path / "host_hermes"
-    host_hermes.mkdir()
-    (host_hermes / "config.yaml").write_text(
-        "model:\n  default: gpt-5.5\n  provider: openai\n"
-    )
-    (host_hermes / ".env").write_text("ANTHROPIC_API_KEY=sk-test\n")
-    (host_hermes / "state.db").write_bytes(b"PERSONAL_DATA")
-    monkeypatch.setenv("HERMES_HOME", str(host_hermes))
-
-    agent_home = tmp_path / "agent"
-    adapter = local_cli_mod.LocalCLIAdapter(
-        agent_id="t",
-        model="claude-sonnet-4-6",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "sess.json"),
-        mcp_config_file=str(tmp_path / "mcp.json"),
-        agent_home_dir=str(agent_home),
-        harness=HermesHarness(),
-    )
-    adapter._verify()
-
-    per_agent = agent_home / ".hermes"
-    cfg = _yaml.safe_load((per_agent / "config.yaml").read_text())
-    # Model section was pinned from agent.yml's runtime.model — the
-    # host template's gpt-5.5/openai is overridden.
-    assert cfg["model"]["default"] == "claude-sonnet-4-6"
-    assert cfg["model"]["provider"] == "anthropic"
-    assert (per_agent / ".env").read_text() == "ANTHROPIC_API_KEY=sk-test\n"
-    # Operator's chat history must stay in the operator's HOME.
-    assert not (per_agent / "state.db").exists()
-
-
-def test_local_cli_hermes_pins_model_from_agent_yml(monkeypatch, tmp_path):
-    """``_pin_hermes_model`` rewrites the per-agent config.yaml's
-    ``model.default`` + ``model.provider`` on every verify, so
-    operators don't need ``hermes setup`` and each agent can carry
-    its own model/provider without polluting the host's choice.
-    """
-    import yaml as _yaml
-    from puffo_agent.agent.adapters import local_cli as local_cli_mod
-    fake_bin = tmp_path / "hermes"
-    fake_bin.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(local_cli_mod, "resolve_hermes_bin", lambda: str(fake_bin))
-
-    # Host config picks anthropic + claude-sonnet but agent.yml asks
-    # for a provider-prefixed openai model — pin should override.
-    host_hermes = tmp_path / "host_hermes"
-    host_hermes.mkdir()
-    (host_hermes / "config.yaml").write_text(
-        "model:\n  default: claude-sonnet-4-6\n  provider: anthropic\n"
-        "agent:\n  max_turns: 90\n"
-    )
-    monkeypatch.setenv("HERMES_HOME", str(host_hermes))
-
-    agent_home = tmp_path / "agent"
-    adapter = local_cli_mod.LocalCLIAdapter(
-        agent_id="t",
-        model="openai/gpt-4o",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "sess.json"),
-        mcp_config_file=str(tmp_path / "mcp.json"),
-        agent_home_dir=str(agent_home),
-        harness=HermesHarness(),
-    )
-    adapter._verify()
-
-    cfg = _yaml.safe_load((agent_home / ".hermes" / "config.yaml").read_text())
-    assert cfg["model"]["default"] == "gpt-4o"
-    assert cfg["model"]["provider"] == "openai"
-    # Other host-template sections survive the pin.
-    assert cfg["agent"]["max_turns"] == 90
-
-
-def test_host_hermes_home_respects_env_var(monkeypatch, tmp_path):
-    """``$HERMES_HOME`` always wins — multi-profile / non-default
-    Windows install layouts go through this."""
-    from puffo_agent.agent.adapters import local_cli as local_cli_mod
-    target = tmp_path / "custom_home"
-    monkeypatch.setenv("HERMES_HOME", str(target))
-    assert local_cli_mod._host_hermes_home() == target
-
-
-def test_host_hermes_home_falls_back_per_platform(monkeypatch, tmp_path):
-    """No ``$HERMES_HOME``: POSIX uses ``~/.hermes``; Windows uses
-    ``%LOCALAPPDATA%\\hermes`` (the PS1 installer's actual target).
-    """
-    from puffo_agent.agent.adapters import local_cli as local_cli_mod
-    monkeypatch.delenv("HERMES_HOME", raising=False)
-    # POSIX branch
-    monkeypatch.setattr(local_cli_mod.sys, "platform", "linux")
-    fake_home = tmp_path / "operator_home"
-    monkeypatch.setattr(
-        local_cli_mod.Path, "home", classmethod(lambda cls: fake_home),
-    )
-    assert local_cli_mod._host_hermes_home() == fake_home / ".hermes"
-    # Windows branch — LOCALAPPDATA wins over Path.home() because
-    # the installer writes there, not into the user profile root.
-    monkeypatch.setattr(local_cli_mod.sys, "platform", "win32")
-    fake_localappdata = tmp_path / "AppData" / "Local"
-    monkeypatch.setenv("LOCALAPPDATA", str(fake_localappdata))
-    assert local_cli_mod._host_hermes_home() == fake_localappdata / "hermes"
-
-
-def test_local_cli_accepts_claude_code_harness():
-    """Sanity: constructor's harness check doesn't false-positive on
-    the default case."""
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-    LocalCLIAdapter(
-        agent_id="t",
-        model="",
-        workspace_dir="/tmp/ws",
-        claude_dir="/tmp/ws/.claude",
-        session_file="/tmp/sess.json",
-        mcp_config_file="/tmp/mcp.json",
-        agent_home_dir="/tmp/agent",
-        harness=ClaudeCodeHarness(),
-    )
-
-
-def test_local_cli_rejects_gemini_cli_harness():
-    """gemini-cli has the same cli-local limitation as hermes (operator's
-    ``~/.gemini/`` may hold personal sessions). Same error shape."""
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-    from puffo_agent.agent.harness import GeminiCLIHarness
-    with pytest.raises(RuntimeError, match="not.+supported.+cli-local"):
-        LocalCLIAdapter(
-            agent_id="t",
-            model="",
-            workspace_dir="/tmp/ws",
-            claude_dir="/tmp/ws/.claude",
-            session_file="/tmp/sess.json",
-            mcp_config_file="/tmp/mcp.json",
-            agent_home_dir="/tmp/agent",
-            harness=GeminiCLIHarness(),
-        )
 
 
 # ── Gemini CLI helpers (model-id + stdout parser) ────────────────────────────

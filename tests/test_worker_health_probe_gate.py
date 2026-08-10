@@ -1,46 +1,11 @@
-"""Worker-side reassertion + adapter dispatch — the seams the round-trip
-probe test doesn't cover: ``LocalCli.health_probe`` delegates to a live
-``CodexSession`` (else True), and ``_reassert_auth_failed_after_failed_probe``
-only re-flips the eager-cleared ``ok`` state (no clobber of sticky-red)."""
+"""Worker-side health-gate reassertion and startup ordering."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 from types import SimpleNamespace
-
-
-# ── (1) LocalCli.health_probe dispatch ─────────────────────────────────────
-
-
-def test_local_cli_probe_delegates_to_codex_session(monkeypatch):
-    """With a CodexSession built, LocalCli delegates to its probe."""
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-
-    class _StubCodex:
-        async def health_probe(self):
-            return False
-
-    stub = SimpleNamespace.__new__(SimpleNamespace)
-    # __new__ to skip __init__ — the method only reads _codex_session.
-    adapter = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    adapter._session = None
-    adapter._codex_session = _StubCodex()
-
-    assert asyncio.run(adapter.health_probe()) is False
-
-
-def test_local_cli_probe_returns_true_without_codex_session():
-    """No _codex_session → inherit the True default (non-Codex agents
-    surface a real failure via the existing leak filter)."""
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-
-    adapter = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    adapter._session = None
-    adapter._codex_session = None
-
-    assert asyncio.run(adapter.health_probe()) is True
-
+from unittest.mock import AsyncMock, Mock, patch
 
 # ── (2) Worker._reassert_auth_failed_after_failed_probe ────────────────────
 
@@ -283,3 +248,49 @@ def test_reassert_does_not_fire_a_second_operator_dm():
         "reassert path must not fire a second operator DM; "
         f"got {sent!r}"
     )
+
+
+def test_prepared_runtime_retries_transient_warm_before_releasing_gate():
+    from puffo_agent.portal import worker_run
+
+    async def run():
+        adapter = Mock()
+        adapter.warm = AsyncMock(
+            side_effect=[
+                RuntimeError("provider startup race"),
+                RuntimeError("provider startup race"),
+                None,
+            ]
+        )
+        adapter.get_provider_session_id.return_value = "native-session"
+        outbox = Mock()
+        outbox.state.return_value = {}
+        prepared = Mock()
+        worker = SimpleNamespace(
+            _adapter=adapter,
+            _run_post_warm_gate=AsyncMock(),
+            _warm_done=asyncio.Event(),
+        )
+        context = SimpleNamespace(
+            paths=SimpleNamespace(agent_id="agent-a", system_prompt="system"),
+            runtime_event_outbox=outbox,
+            runtime_session_ref="logical-session",
+            prepared_local_runtime=prepared,
+        )
+        with patch.object(
+            worker_run,
+            "LOCAL_WARM_RETRY_DELAYS_SECONDS",
+            (0.0, 0.0),
+        ):
+            assert await worker_run.StandardWorkerRun(worker)._warm(context)
+        return adapter, outbox, prepared, worker
+
+    adapter, outbox, prepared, worker = asyncio.run(run())
+    assert adapter.warm.await_count == 3
+    outbox.set_active_turn.assert_called_once_with(
+        None,
+        session_ref="logical-session",
+        native_session_id="native-session",
+    )
+    prepared.finalize_legacy_session_migration.assert_called_once_with()
+    worker._run_post_warm_gate.assert_awaited_once_with("agent-a")

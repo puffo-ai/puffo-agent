@@ -6,25 +6,28 @@
 # runtime kind, triggers, etc. — don't duplicate those here.
 #
 # Most users don't need this file at all. The daemon starts with
-# built-in defaults; per-agent keys travel inside each agent's own
-# agent.yml. Use the keys below only if you want one provider key
-# shared across multiple agents — set them by running
-# `puffo-agent config`, which prompts and writes this file for you.
+# built-in defaults. Gateway keys travel inside each agent's own
+# agent.yml. The daemon-level Google key below is reserved and unused
+# today; `puffo-agent config` writes this file for you.
+#
+# Runtime Events v1 needs no daemon-wide switch. Supported cli-local
+# harnesses use a separate bounded per-agent SQLite outbox automatically;
+# legacy runtime/harness values retain their existing behavior.
 
-# Which provider the chat-local runtime uses by default. Agents can
-# still override this in their own agent.yml via runtime.provider.
+# Default provider and model hints for CLI Drivers. Agents can override
+# both in their own agent.yml. Claude Code and Codex normally reuse the
+# host CLI login; gateway credentials belong in runtime.api_key on the
+# individual agent, alongside runtime.llm_base_url.
 default_provider: "anthropic"  # "anthropic" | "openai" | "google"
 
 anthropic:
-  api_key: ""                    # https://console.anthropic.com/
   model:   "claude-sonnet-4-6"   # empty = provider default
 
 openai:
-  api_key: ""                    # https://platform.openai.com/ — used by chat-local + sdk-local only
-  model:   "gpt-4o"              # also used as the default model for cli-local + harness=codex
+  model:   "gpt-5"               # default model hint for cli-local + harness=codex
 
 google:
-  api_key: ""                    # required for cli-docker + harness=gemini-cli
+  api_key: ""                    # reserved; gemini-cli is design-only, no runtime reads it
   model:   "gemini-2.5-pro"
 
 # Optional: absolute path to a directory of shared Claude Code

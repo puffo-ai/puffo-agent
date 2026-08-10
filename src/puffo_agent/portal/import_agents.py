@@ -21,7 +21,6 @@ handled by the separate ``revoke_pending`` helper.
 
 from __future__ import annotations
 
-import asyncio
 import enum
 import json
 import logging
@@ -33,13 +32,12 @@ from pathlib import Path
 import aiohttp
 
 from ..crypto.certs import create_subkey_cert
-from ..crypto.encoding import base64url_decode, base64url_encode
+from ..crypto.encoding import base64url_encode
 from ..crypto.http_auth import sign_request
 from ..crypto.http_session import create_remote_http_session
 from ..crypto.keystore import KeyStore, StoredIdentity, decode_secret, encode_secret
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from .export import (
-    ImportPackError,
     UnpackedBundle,
     sanitize_staged_agent,
     unpack,
@@ -49,7 +47,6 @@ from .migration_certs import (
     build_root_key_envelope,
     create_device_cert,
     create_device_revocation,
-    create_slug_binding,
 )
 from .state import agent_dir, agent_yml_path, agents_dir
 

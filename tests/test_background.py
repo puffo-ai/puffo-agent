@@ -12,7 +12,6 @@ import argparse
 import subprocess
 import sys
 
-import pytest
 
 from puffo_agent.portal import background as bg
 

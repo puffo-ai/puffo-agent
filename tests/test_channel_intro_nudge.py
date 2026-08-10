@@ -15,7 +15,7 @@ wrapper on top — covered by manual smoke tests.
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import os
 import sys
 import tempfile
@@ -25,10 +25,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.message_store import MessageStore
-from puffo_agent.agent.puffo_core_client import (
-    PRIORITY_SYSTEM,
-    PuffoCoreMessageClient,
-)
+from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
 
 async def _make_store() -> MessageStore:
@@ -40,13 +37,20 @@ async def _make_store() -> MessageStore:
 
 def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     """Bare client with just enough state to exercise the intro path.
-    Mirrors ``test_thread_queue._make_client_for_queue`` and stubs the
-    HTTP-backed name resolvers so no network is touched."""
+    Stubs the HTTP-backed name resolvers so no network is touched."""
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.store = store
-    client._queue = asyncio.PriorityQueue()
-    client._queue_seq = 0
-    client._thread_state = {}
+    class RuntimeSpy:
+        work = 0
+        delivery = 0
+
+        def notify(self):
+            self.work += 1
+
+        def notify_delivery(self):
+            self.delivery += 1
+
+    client.global_runtime = RuntimeSpy()
     # ``_find_public_general_channel`` warms this cache from the
     # /channels response so the immediately-following
     # ``_resolve_channel_name`` inside the intro nudge becomes a hit.
@@ -56,6 +60,9 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._channel_space = {}
     # Written by ``_handle_event``'s ``invite_to_*`` branch.
     client._inviter_by_invitation_event_id = {}
+    # Empty → the auto-accept operator report short-circuits; the
+    # report itself is covered by its own test below.
+    client.operator_slug = ""
 
     async def _stub_space_name(space_id: str) -> str:
         return "Team" if space_id == "sp_1" else space_id
@@ -111,7 +118,7 @@ async def test_store_intro_helpers_idempotent():
 
 
 @pytest.mark.asyncio
-async def test_intro_nudge_admits_one_system_priority_envelope():
+async def test_intro_nudge_stores_one_durable_local_event():
     store = await _make_store()
     client = _make_client(store)
 
@@ -119,30 +126,17 @@ async def test_intro_nudge_admits_one_system_priority_envelope():
         space_id="sp_1", channel_id="ch_1",
     )
 
-    # Queue holds exactly one tuple with PRIORITY_SYSTEM.
-    assert client._queue.qsize() == 1
-    priority, _seq, root_id = await client._queue.get()
-    assert priority == PRIORITY_SYSTEM
-
-    # State has a single ThreadEntry keyed on the synthetic envelope_id
-    # (root_id == envelope_id since this is a top-level post).
-    assert root_id in client._thread_state
-    entry = client._thread_state[root_id]
-    assert len(entry.messages) == 1
-    msg = entry.messages[0]
-
-    assert msg["channel_id"] == "ch_1"
-    assert msg["channel_name"] == "general"
-    assert msg["space_id"] == "sp_1"
-    assert msg["space_name"] == "Team"
-    assert msg["is_dm"] is False
-    assert msg["attachments"] == []
-    assert msg["envelope_id"].startswith("intro-prompt-ch_1-")
-    assert msg["envelope_id"] == root_id
-    assert "[puffo-agent system message]" in msg["text"]
-    assert "ch_1" in msg["text"]
-    assert "general" in msg["text"]
-    assert "send_message" in msg["text"]
+    pending = await store.get_pending()
+    assert len(pending) == 1
+    msg = pending[0]
+    assert msg.channel_id == "ch_1"
+    assert msg.space_id == "sp_1"
+    assert msg.server_seq is None
+    assert msg.envelope_id == "intro-prompt-ch_1"
+    assert "[puffo-agent system message]" in msg.content
+    assert "ch_1" in msg.content
+    assert "general" in msg.content
+    assert "send_message" in msg.content
 
     assert await store.has_channel_intro_been_prompted("ch_1") is True
     await store.close()
@@ -167,7 +161,7 @@ async def test_intro_nudge_persists_envelope_to_messages_db():
     )
 
     # The envelope is queryable by its id.
-    _, _, root_id = await client._queue.get()
+    root_id = "intro-prompt-ch_1"
     envelope = await store.get_message_by_envelope(root_id)
     assert envelope is not None
     assert envelope.channel_id == "ch_1"
@@ -198,15 +192,14 @@ async def test_intro_nudge_skipped_when_already_prompted():
     await client._enqueue_channel_intro_nudge(
         space_id="sp_1", channel_id="ch_1",
     )
-    assert client._queue.qsize() == 1
+    assert len(await store.get_pending()) == 1
 
     # Second call (simulating a redelivered invite or restart-time
     # re-accept) must be a no-op — same channel, table already marked.
     await client._enqueue_channel_intro_nudge(
         space_id="sp_1", channel_id="ch_1",
     )
-    assert client._queue.qsize() == 1
-    assert len(client._thread_state) == 1
+    assert len(await store.get_pending()) == 1
     await store.close()
 
 
@@ -224,7 +217,7 @@ async def test_intro_nudge_distinct_channels_each_get_one():
         space_id="sp_1", channel_id="ch_2",
     )
 
-    assert client._queue.qsize() == 2
+    assert len(await store.get_pending()) == 2
     assert await store.has_channel_intro_been_prompted("ch_1") is True
     assert await store.has_channel_intro_been_prompted("ch_2") is True
     await store.close()
@@ -470,7 +463,7 @@ async def test_intro_nudge_survives_simulated_restart():
     await client_1._enqueue_channel_intro_nudge(
         space_id="sp_1", channel_id="ch_1",
     )
-    assert client_1._queue.qsize() == 1
+    assert len(await store_1.get_pending()) == 1
     await store_1.close()
 
     # Simulated restart — new MessageStore over the same file.
@@ -481,7 +474,7 @@ async def test_intro_nudge_survives_simulated_restart():
     await client_2._enqueue_channel_intro_nudge(
         space_id="sp_1", channel_id="ch_1",
     )
-    assert client_2._queue.qsize() == 0
+    assert len(await store_2.get_pending()) == 1
     await store_2.close()
 
 
@@ -562,8 +555,50 @@ async def test_handle_event_fires_intro_on_synthetic_auto_accept():
     )
     await client._handle_event(scope="sp_1", event=event)
 
-    assert client._queue.qsize() == 1
+    assert len(await store.get_pending()) == 1
     assert await store.has_channel_intro_been_prompted("ch_1") is True
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_synthetic_auto_accept_reports_to_operator():
+    """Auto-accepts DM the operator a report instead of joining silently."""
+    store = await _make_store()
+    client = _make_client(store)
+    client.slug = "agent-1"
+    client.operator_slug = "op-1"
+    client._log = logging.getLogger("nudge-test")
+
+    sent: list[dict] = []
+
+    async def _stub_send_dm(slug, text, root_id=""):
+        sent.append({"to": slug, "text": text, "root_id": root_id})
+        return {"envelope_id": "env_report_1"}
+
+    async def _stub_display_name(slug):
+        return "Alice"
+
+    client._send_dm = _stub_send_dm  # type: ignore[assignment]
+    client._fetch_display_name = _stub_display_name  # type: ignore[assignment]
+
+    event = _synthetic_accept_event(
+        agent_slug="agent-1", space_id="sp_1", channel_id="ch_1",
+    )
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert len(sent) == 1
+    report = sent[0]
+    assert report["to"] == "op-1"
+    assert report["root_id"] == ""
+    # Informational, not a /permission ask — nothing to decide.
+    assert not report["text"].startswith("/permission")
+    assert "Auto-accepted" in report["text"]
+    # Names only — raw ids are operator noise.
+    assert "**Alice**" in report["text"]
+    assert "**general**" in report["text"]
+    assert "**Team**" in report["text"]
+    assert "ch_1" not in report["text"]
+    assert "sp_1" not in report["text"]
     await store.close()
 
 
@@ -580,7 +615,7 @@ async def test_handle_event_ignores_accept_for_other_slug():
     )
     await client._handle_event(scope="sp_1", event=event)
 
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
     assert await store.has_channel_intro_been_prompted("ch_1") is False
     await store.close()
 
@@ -602,7 +637,7 @@ async def test_handle_event_ignores_operator_signed_accept():
     del event["payload"]["original_invite"]
     await client._handle_event(scope="sp_1", event=event)
 
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
     assert await store.has_channel_intro_been_prompted("ch_1") is False
     await store.close()
 
@@ -622,7 +657,7 @@ async def test_handle_event_synthetic_accept_is_idempotent():
     await client._handle_event(scope="sp_1", event=event)
     await client._handle_event(scope="sp_1", event=event)
 
-    assert client._queue.qsize() == 1
+    assert len(await store.get_pending()) == 1
     await store.close()
 
 
@@ -638,13 +673,13 @@ async def test_handle_event_synthetic_accept_missing_ids_is_safe():
         agent_slug="agent-1", space_id="", channel_id="ch_1",
     )
     await client._handle_event(scope="", event=event)
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
 
     event = _synthetic_accept_event(
         agent_slug="agent-1", space_id="sp_1", channel_id="",
     )
     await client._handle_event(scope="sp_1", event=event)
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
 
     await store.close()
 

@@ -80,6 +80,10 @@ class MessagePayload:
     # keys off ``content_type`` and never reads this field, so it stays
     # ``None`` on that path.
     attachments: Optional[list] = None
+    # Additive bridge identity fields. They intentionally never enter the
+    # signed native payload serialization below.
+    sender_owner_slug: Optional[str] = None
+    sender_type: Optional[str] = None
 
     def to_payload_dict(self) -> dict:
         """JSON shape matching the server's ``MessagePayload``.
@@ -129,17 +133,12 @@ def encrypt_message(
     return envelope
 
 
-def encrypt_message_with_content_key(
+def _build_signed_payload(
     inp: EncryptInput,
     signing_key: Ed25519KeyPair,
-    *,
-    now_ms: int | None = None,
-) -> tuple[dict, bytes]:
-    """Like ``encrypt_message`` but exposes ``content_key`` so the
-    caller can supplement later via ``build_supplementation_envelope``."""
-    if not inp.recipients:
-        raise ValueError("no recipients")
-
+    now_ms: int | None,
+) -> tuple[str, int, dict]:
+    """Build the payload shared by encrypted and plaintext messages."""
     # EnvelopeId MUST be ``msg_<UUID>`` — server's prefix validator
     # rejects anything else before crypto runs.
     envelope_id = f"msg_{uuid.uuid4()}"
@@ -175,6 +174,37 @@ def encrypt_message_with_content_key(
         "payload": payload_dict,
         "signature": base64url_encode(sig),
     }
+    return envelope_id, now_ms, signed
+
+
+def build_plaintext_message(
+    inp: EncryptInput,
+    signing_key: Ed25519KeyPair,
+    *,
+    now_ms: int | None = None,
+) -> dict:
+    """Build a signed message without recipient-specific encryption."""
+    envelope_id, _, signed = _build_signed_payload(inp, signing_key, now_ms)
+    return {
+        "type": "plaintext_message_envelope",
+        "version": 1,
+        "envelope_id": envelope_id,
+        "signed_payload": signed,
+    }
+
+
+def encrypt_message_with_content_key(
+    inp: EncryptInput,
+    signing_key: Ed25519KeyPair,
+    *,
+    now_ms: int | None = None,
+) -> tuple[dict, bytes]:
+    """Like ``encrypt_message`` but exposes ``content_key`` so the
+    caller can supplement later via ``build_supplementation_envelope``."""
+    if not inp.recipients:
+        raise ValueError("no recipients")
+
+    envelope_id, now_ms, signed = _build_signed_payload(inp, signing_key, now_ms)
     plaintext = json.dumps(signed, separators=(",", ":")).encode()
 
     content_key = generate_content_key()
@@ -311,6 +341,30 @@ def decrypt_message(
     if payload_dict.get("sender_slug") != envelope["sender_slug"]:
         raise ValueError("sender_slug mismatch")
 
+    return _message_payload_from_dict(payload_dict, envelope_id)
+
+
+def read_plaintext_message(
+    envelope: dict,
+    sender_public_key: bytes,
+) -> MessagePayload:
+    """Verify a plaintext message's signed payload."""
+    envelope_id = envelope["envelope_id"]
+    signed = envelope["signed_payload"]
+    payload_dict = signed["payload"]
+    sig_bytes = base64url_decode(signed["signature"])
+
+    canonical = canonicalize_for_signing(payload_dict)
+    if not ed25519_verify(sender_public_key, canonical, sig_bytes):
+        raise ValueError("signature verification failed")
+
+    return _message_payload_from_dict(payload_dict, envelope_id)
+
+
+def _message_payload_from_dict(
+    payload_dict: dict,
+    envelope_id: str,
+) -> MessagePayload:
     return MessagePayload(
         payload_type=payload_dict["type"],
         version=payload_dict["version"],

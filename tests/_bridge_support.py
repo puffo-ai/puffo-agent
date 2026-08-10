@@ -179,7 +179,7 @@ def write_test_agent(
             "space_id": "sp_test",
         },
         "runtime": {
-            "kind": "chat-local",
+            "kind": "cli-local",
             "provider": "anthropic",
             "model": "claude-sonnet-4-6",
             "api_key": "sk-ant-test-secret",

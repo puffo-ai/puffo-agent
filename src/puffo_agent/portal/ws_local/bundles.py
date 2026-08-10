@@ -34,6 +34,11 @@ class Bundle:
     # Arrival order of the bundle's first message; the send order and
     # the merge tie-breaker. Lower = older = sent first.
     order: int = 0
+    version: int = 2
+    turn_id: str = ""
+    targets: list[list[str]] = field(default_factory=list)
+    routes: list[dict[str, Any]] = field(default_factory=list)
+    notice: dict[str, Any] = field(default_factory=dict)
 
     def envelope_ids(self) -> list[str]:
         return [m.get("envelope_id", "") for m in self.messages]
@@ -75,6 +80,32 @@ class BundleQueue:
             return
         bundle.messages.append(message)
 
+    def enqueue_global(
+        self,
+        *,
+        turn_id: str,
+        messages: list[dict[str, Any]],
+        targets: list[list[str]],
+        routes: list[dict[str, Any]],
+        notice: dict[str, Any] | None = None,
+    ) -> Bundle:
+        """Freeze one global v2 batch; never collapse it by root."""
+        if self._inflight is not None or self._receiving:
+            raise RuntimeError("a ws-local batch is already pending")
+        bundle = Bundle(
+            bundle_id=self._make_id(),
+            root_id="",
+            channel_meta={},
+            messages=list(messages),
+            order=self._next_seq(),
+            turn_id=turn_id,
+            targets=[list(target) for target in targets],
+            routes=[dict(route) for route in routes],
+            notice=dict(notice or {}),
+        )
+        self._receiving[turn_id] = bundle
+        return bundle
+
     # ── delivery ─────────────────────────────────────────────────────────────
 
     def next_to_send(self) -> Bundle | None:
@@ -88,7 +119,10 @@ class BundleQueue:
                 candidate = bundle
         if candidate is None:
             return None
-        del self._receiving[candidate.root_id]
+        receiving_key = next(
+            key for key, value in self._receiving.items() if value is candidate
+        )
+        del self._receiving[receiving_key]
         self._inflight = candidate
         return candidate
 
@@ -111,20 +145,24 @@ class BundleQueue:
             return None
         stale = self._inflight
         self._inflight = None
-        successor = self._receiving.get(stale.root_id)
+        successor = self._receiving.get(stale.turn_id or stale.root_id)
         merged = Bundle(
             bundle_id=self._make_id(),
             root_id=stale.root_id,
             channel_meta=stale.channel_meta or (successor.channel_meta if successor else {}),
             messages=list(stale.messages),
             order=stale.order,
+            version=stale.version,
+            turn_id=stale.turn_id,
+            targets=list(stale.targets),
+            routes=list(stale.routes),
         )
         if successor is not None:
             seen = set(merged.envelope_ids())
             for msg in successor.messages:
                 if msg.get("envelope_id", "") not in seen:
                     merged.messages.append(msg)
-        self._receiving[stale.root_id] = merged
+        self._receiving[stale.turn_id or stale.root_id] = merged
         return merged
 
     # ── introspection (tests / metrics) ──────────────────────────────────────

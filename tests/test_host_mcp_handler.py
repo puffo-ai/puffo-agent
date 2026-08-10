@@ -60,6 +60,78 @@ def _write_host_claude_json(host_home: Path, servers: dict[str, Any]) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_send_message_structured_uses_context_coordinator(tmp_path):
+    ctx = _ctx(tmp_path)
+    requests = []
+
+    class Coordinator:
+        async def send(self, request):
+            requests.append(request)
+            return {"state": "sent", "attempted": True, "seq": 4}
+
+    ctx.send_coordinator = Coordinator()
+    result = await host_mcp_handler.send_message(
+        ctx, channel="ch_a", text="hello", send_anyway=True,
+    )
+    assert result == {"state": "sent", "attempted": True, "seq": 4}
+    assert requests[0].destination == "ch_a"
+    assert requests[0].send_anyway is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_stages_held_result_at_cli_rpc_boundary(tmp_path):
+    ctx = _ctx(tmp_path)
+
+    class Coordinator:
+        async def send(self, request):
+            return {
+                "state": "held",
+                "reconsideration": {"context_ready": True},
+            }
+
+    runtime = MagicMock()
+    runtime.stage_held_send_result = AsyncMock(return_value={
+        "state": "held",
+        "tool_result_admission": "[puffo:model-visible-read:receipt]",
+    })
+    ctx.send_coordinator = Coordinator()
+    ctx.message_client = MagicMock(global_runtime=runtime)
+
+    result = await host_mcp_handler.send_message(
+        ctx,
+        channel="ch_a",
+        text="hello",
+        root_id="root_a",
+        visibility_level="human",
+    )
+
+    assert result["tool_result_admission"].endswith("receipt]")
+    runtime.stage_held_send_result.assert_awaited_once_with(
+        {
+            "state": "held",
+            "reconsideration": {"context_ready": True},
+            "attempted": True,
+        },
+        tool_name="send_message",
+        tool_arguments={
+            "channel": "ch_a",
+            "text": "hello",
+            "root_id": "root_a",
+            "visibility_level": "human",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_message_unavailable_is_explicit_structured_failure(tmp_path):
+    result = await host_mcp_handler.send_message(
+        _ctx(tmp_path), channel="ch_a", text="hello",
+    )
+    assert result["state"] == "failed"
+    assert result["attempted"] is True
+
+
 # ── install ────────────────────────────────────────────────────────
 
 

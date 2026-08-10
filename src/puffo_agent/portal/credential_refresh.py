@@ -35,6 +35,7 @@ from typing import Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
+from ..agent._logging import diagnostic_category
 from .state import (
     sanitize_claude_code_auth_blob,
     sync_host_codex_auth_view,
@@ -143,20 +144,19 @@ def _classify_failed_refresh(
         logger.error(
             "%s auth failed rc=%d in %.1fs — refresh_token likely "
             "revoked (probable rotating-refresh-token silent-fail); "
-            "operator needs to `claude auth login` | "
-            "stdout: %s | stderr: %s",
-            log_prefix, rc, elapsed, out_tail, err_tail,
+            "operator needs to `claude auth login`; output_category=authentication",
+            log_prefix, rc, elapsed,
         )
         return RefreshOutcome.AUTH_FAILED
     if _looks_like_rate_limit(out_tail, err_tail):
         logger.warning(
-            "%s rate-limited rc=%d in %.1fs | stdout: %s | stderr: %s",
-            log_prefix, rc, elapsed, out_tail, err_tail,
+            "%s rate-limited rc=%d in %.1fs; output_category=rate_limit",
+            log_prefix, rc, elapsed,
         )
         return RefreshOutcome.RATE_LIMITED
     logger.warning(
-        "%s rc=%d in %.1fs | stdout: %s | stderr: %s",
-        log_prefix, rc, elapsed, out_tail, err_tail,
+        "%s rc=%d in %.1fs; output_category=provider_error",
+        log_prefix, rc, elapsed,
     )
     return RefreshOutcome.FAILED
 
@@ -330,14 +330,12 @@ class FileBackend:
                 log_prefix="credential refresh",
             )
         if before is not None and after is not None and after <= before:
-            err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
-            out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
             logger.error(
                 "credential refresh exit=0 but expiresAt didn't advance "
                 "(before=%ds, after=%ds) in %.1fs — claude may not be "
                 "rewriting credentials.json on this build; operator may "
-                "need `claude /login` to recover | stdout: %s | stderr: %s",
-                before, after, elapsed, out_tail, err_tail,
+                "need `claude /login` to recover; output_category=unchanged",
+                before, after, elapsed,
             )
             return RefreshOutcome.UNCHANGED
         logger.info(
@@ -455,10 +453,10 @@ class CodexFileBackend:
         if proc.returncode != 0:
             err_tail = stderr.decode("utf-8", errors="replace").strip()[-400:]
             out_tail = stdout.decode("utf-8", errors="replace").strip()[-400:]
+            category = diagnostic_category(f"{out_tail}\n{err_tail}")
             logger.warning(
-                "codex credential refresh rc=%d in %.1fs | "
-                "stdout: %s | stderr: %s",
-                proc.returncode, elapsed, out_tail, err_tail,
+                "codex credential refresh rc=%d in %.1fs; output_category=%s",
+                proc.returncode, elapsed, category,
             )
             return RefreshOutcome.FAILED
         if before is not None and after is not None and after <= before:
@@ -478,7 +476,7 @@ class CodexFileBackend:
     def sync_to_agent(self, agent_home: Path) -> None:
         agent_codex_home = agent_home / ".codex"
         # Only codex agents have a ``.codex`` subdir (created lazily by
-        # ``LocalCLIAdapter._ensure_codex_session``). Skip claude-only
+        # ``LocalRuntimePreparer._prepare_codex_spec``). Skip claude-only
         # agents to avoid cluttering them with a stray auth.json.
         if not agent_codex_home.exists():
             return

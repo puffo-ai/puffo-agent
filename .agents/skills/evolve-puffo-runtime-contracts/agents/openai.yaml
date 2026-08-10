@@ -1,0 +1,4 @@
+interface:
+  display_name: "Puffo Runtime Contracts"
+  short_description: "Evolve Driver, MCP, and runtime contracts"
+  default_prompt: "Use $evolve-puffo-runtime-contracts to change this Puffo runtime interface without adding accidental surface area."

@@ -43,8 +43,8 @@ Consequences for the cloud image:
   `ModuleNotFoundError` traceback. See `portal/cli.py cmd_start`.
 
 The cloud/E2B image should install the **base** package (no `[gui]`), which
-is what keeps the image slim and Qt-free. The `sdk` extra
-(`claude-agent-sdk`) is still required for `runtime.kind=sdk-local`.
+keeps the image slim and Qt-free. Cloud agents use `cli-local`; no provider
+Python SDK extra is installed.
 
 > `requirements.txt` is a stale partial list that never listed pyside6 —
 > `pyproject.toml` is the source of truth for dependencies.
@@ -63,7 +63,8 @@ embedded key** in the package.
 
 ```yaml
 runtime:
-  kind: chat-local            # or sdk-local / cli-local
+  kind: cli-local
+  harness: claude-code        # or codex for provider=openai
   llm_base_url: "<VK endpoint>"   # e.g. the LiteLLM proxy base URL
   api_key: "<VK>"                 # the virtual key (reuses the existing api_key field)
   # ...model / provider / etc. as usual
@@ -79,10 +80,8 @@ runtime:
 
 | `runtime.kind`            | `llm_base_url` routing                                                                 | VK secret (`api_key`)                          |
 | ------------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| `chat-local` (anthropic)  | `AnthropicProvider(base_url=…)` → `anthropic.Anthropic(base_url=…)`                    | `api_key` → client key                         |
-| `chat-local` (openai)     | `OpenAIProvider(base_url=…)` → `OpenAI(base_url=…)`                                    | `api_key` → client key                         |
-| `sdk-local`               | `SDKAdapter(base_url=…)` injects `ANTHROPIC_BASE_URL` into the SDK subprocess env      | `api_key` → `ANTHROPIC_API_KEY` (already wired) |
-| `cli-local` / claude-code | `LocalCLIAdapter(llm_base_url=…)` injects `ANTHROPIC_BASE_URL` into the claude spawn env | `api_key` → `ANTHROPIC_API_KEY` (VK), injected **only** when `llm_base_url` is also set |
+| `cli-local` / `claude-code` | `ClaudeCodeDriver` receives `ANTHROPIC_BASE_URL` in its process environment | `api_key` → `ANTHROPIC_API_KEY`, only when `llm_base_url` is set |
+| `cli-local` / `codex`       | `CodexDriver` receives a generated model-provider entry pointing at the gateway | `api_key` is written only to the isolated generated provider config |
 
 Notes:
 
@@ -92,16 +91,15 @@ Notes:
   add `ANTHROPIC_BASE_URL`, and only then (and when `api_key` is
   non-empty) do we add `ANTHROPIC_API_KEY=<VK>` so the CLI authenticates
   against the VK.
-- The env mapping is a single shared pure helper,
+- The Claude env mapping is a single shared pure helper,
   `puffo_agent.agent.adapters.base.anthropic_base_url_env(base_url)`,
-  reused by the SDK and CLI adapters so the behavior is DRY and unit-tested.
+  used by the local Driver preparer and unit-tested without importing a vendor
+  Python SDK.
 
 ### Follow-ups (out of scope for this change)
 
 - **`cli-docker`** base-URL routing — threading `ANTHROPIC_BASE_URL` (and
   the VK) into the per-agent container env is not wired yet.
-- **codex / OpenAI-CLI** — routing the VK into codex's `OPENAI_BASE_URL`
-  is not wired yet.
 - **Provisioning / rotating the VK** is Shan's; this change only threads
   the config-driven fields. No key is embedded, defaulted, or fetched by
   the package.
@@ -115,7 +113,6 @@ Notes:
   `puffo-agent --help` succeed. `pip install '.[gui]'` →
   `import puffo_agent.portal.ui.launcher` succeeds.
 - `tests/test_slim_packaging_headless.py` — headless import + GUI-hint guard.
-- `tests/test_llm_base_url_routing.py` — VK routing for chat-local
-  (Anthropic + OpenAI), cli-local spawn-env override, sdk-local wiring +
-  the shared env helper; and that an absent base URL leaves the vendor
-  endpoint unchanged.
+- `tests/test_llm_base_url_routing.py` — Claude and Codex Driver gateway
+  routing, config round-trip, the shared env helper, and the inert empty-base
+  case.

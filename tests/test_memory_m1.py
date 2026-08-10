@@ -154,6 +154,22 @@ def test_profile_briefing_minimal_default_with_empty_fields(tmp_path):
     assert "You are agent." in render_profile_briefing()
 
 
+def test_profile_briefing_identity_uses_authenticated_puffo_handle(tmp_path):
+    """An imported agent keeps its local directory ``agent_id`` while
+    pairing under a different ``puffo_core.slug``. The briefing is what
+    tells the model its own network identity, so showing the local id
+    there made it introduce itself and cite mentions under a handle no
+    peer could address. Storage keeps keying on ``agent_id``; only the
+    model-facing line follows the authenticated slug."""
+    root = tmp_path / "memory"
+    path = sync_profile_briefing(
+        root, agent_id="bot-42", puffo_handle="bot-42-x9f2",
+    )
+    text = path.read_text(encoding="utf-8")
+    assert "You are bot-42-x9f2 (agent `bot-42-x9f2`)." in text
+    assert "bot-42 (agent" not in text
+
+
 def test_profile_briefing_resync_preserves_user_text_outside_markers(tmp_path):
     root = tmp_path / "memory"
     path = sync_profile_briefing(

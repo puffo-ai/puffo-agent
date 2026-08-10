@@ -8,7 +8,6 @@ construction keeps the native signed path. ``build_server`` under
 from __future__ import annotations
 
 import asyncio
-import os
 import tempfile
 
 import pytest
@@ -70,7 +69,7 @@ class _RecordingWs:
     """PuffoCoreWsClient stand-in — records construction, run() is a
     no-op so listen() returns instead of blocking."""
 
-    instances: list["_RecordingWs"] = []
+    instances: list[_RecordingWs] = []
 
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs

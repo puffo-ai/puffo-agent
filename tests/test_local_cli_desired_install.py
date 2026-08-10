@@ -1,9 +1,8 @@
 """PUF-268 PR-B step 2: spawn-time install of desired_skills +
 desired_mcps from puffo-server catalog templates.
 
-Unit-level coverage of the ``desired_install`` module + the
-LocalCLIAdapter wiring that drives it. HTTP fetches are mocked
-via a fake PuffoCoreHttpClient — no real network.
+Unit-level coverage of the provider-neutral ``desired_install`` module.
+HTTP fetches are mocked via a fake PuffoCoreHttpClient — no real network.
 """
 from __future__ import annotations
 
@@ -12,15 +11,11 @@ import json
 import logging
 import os
 import sys
-import tomllib
-from pathlib import Path
 from typing import Any
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.adapters import desired_install
 from puffo_agent.agent.adapters.desired_install import (
     DESIRED_INSTALLED_MARKER,
     install_claude_mcp,
@@ -536,181 +531,3 @@ def test_install_desired_skill_404_and_mcp_500_both_log_and_keep_going(tmp_path,
     messages = [r.getMessage() for r in caplog.records]
     assert any("skill 'ghost'" in m and "404" in m for m in messages)
     assert any("mcp 'broken'" in m and "HTTP 500" in m for m in messages)
-
-
-# ── LocalCLIAdapter wiring ──────────────────────────────────────────────────
-
-
-def _make_local_adapter(tmp_path, monkeypatch, *, harness_name="claude-code",
-                       desired_skills=None, desired_mcps=None,
-                       with_puffo_core=True):
-    """Build a LocalCLIAdapter against tmp_path with claude binary
-    mocked so _verify() succeeds. Returns (adapter, agent_home)."""
-    host = tmp_path / "host"
-    host.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setenv("HOME", str(host))
-    monkeypatch.setenv("USERPROFILE", str(host))
-    from puffo_agent.agent.adapters import local_cli
-    monkeypatch.setattr(local_cli.shutil, "which", lambda _: "/fake/claude")
-    monkeypatch.setattr(
-        local_cli, "resolve_claude_bin", lambda: "/fake/claude",
-    )
-    from puffo_agent.agent.harness import build_harness
-    harness = build_harness(harness_name)
-    agent_home = tmp_path / "agent_home"
-    adapter = local_cli.LocalCLIAdapter(
-        agent_id="t-agent",
-        model="",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "sess.json"),
-        mcp_config_file=str(tmp_path / "mcp.json"),
-        agent_home_dir=str(agent_home),
-        harness=harness,
-        desired_skills=desired_skills or [],
-        desired_mcps=desired_mcps or [],
-        puffo_core_server_url="https://chat.test.invalid" if with_puffo_core else "",
-        puffo_core_slug="alice-0001" if with_puffo_core else "",
-        puffo_core_keys_dir=str(tmp_path / "keys") if with_puffo_core else "",
-    )
-    return adapter, agent_home
-
-
-def _patch_http(monkeypatch, fake: FakeHttp):
-    """Force ``PuffoCoreHttpClient(server_url, ks, slug)`` to return ``fake``."""
-    from puffo_agent.agent.adapters import local_cli as lc
-
-    class _Stub:
-        def __init__(self, *a, **kw):
-            self._fake = fake
-        async def get(self, path):
-            return await fake.get(path)
-        async def close(self):
-            await fake.close()
-
-    import puffo_agent.crypto.http_client as hc
-    monkeypatch.setattr(hc, "PuffoCoreHttpClient", _Stub)
-    # Also stub KeyStore to a no-op so we don't need a real identity file.
-    class _KS:
-        def __init__(self, *a, **kw):
-            pass
-    monkeypatch.setattr(hc, "KeyStore", _KS, raising=False)
-    import puffo_agent.crypto.keystore as ks_mod
-    monkeypatch.setattr(ks_mod, "KeyStore", _KS)
-
-
-def test_adapter_install_desired_runs_once(tmp_path, monkeypatch):
-    fake = FakeHttp({
-        "/v2/skill-templates/s1": {"id": "s1", "body": "BODY"},
-    })
-    _patch_http(monkeypatch, fake)
-    adapter, agent_home = _make_local_adapter(
-        tmp_path, monkeypatch, desired_skills=["s1"],
-    )
-    asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    assert (agent_home / ".claude" / "skills" / "s1" / "SKILL.md").exists()
-    # Second invocation is a no-op — verified by clearing responses
-    # and confirming no error / no extra fetch.
-    fake.calls.clear()
-    asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    assert fake.calls == []
-
-
-def test_adapter_install_desired_no_puffo_core_skips_with_warning(tmp_path, monkeypatch, caplog):
-    fake = FakeHttp({})
-    _patch_http(monkeypatch, fake)
-    adapter, _ = _make_local_adapter(
-        tmp_path, monkeypatch, desired_skills=["s1"], with_puffo_core=False,
-    )
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.local_cli"):
-        asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    assert fake.calls == []
-    assert any("puffo_core wiring is incomplete" in r.message for r in caplog.records)
-
-
-def test_adapter_install_desired_empty_lists_no_http(tmp_path, monkeypatch):
-    fake = FakeHttp({})
-    _patch_http(monkeypatch, fake)
-    adapter, _ = _make_local_adapter(tmp_path, monkeypatch)
-    asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    assert fake.calls == []
-
-
-def test_adapter_codex_extras_fold_into_config_toml(tmp_path, monkeypatch):
-    fake = FakeHttp({
-        "/v2/mcp-templates/fs": {
-            "id": "fs", "type": "stdio", "command": "npx",
-            "args": ["-y", "@x/fs"], "env": {"R": "/tmp"},
-        },
-    })
-    _patch_http(monkeypatch, fake)
-    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
-
-    adapter, _ = _make_local_adapter(
-        tmp_path, monkeypatch, harness_name="codex", desired_mcps=["fs"],
-    )
-    asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    assert adapter._desired_codex_extras == {
-        "fs": {"command": "npx", "args": ["-y", "@x/fs"], "env": {"R": "/tmp"}},
-    }
-    # Drive _ensure_codex_session to spawn-fail (no codex bin) but
-    # verify config.toml is still written with the desired MCP.
-    with pytest.raises(RuntimeError):
-        adapter._ensure_codex_session()
-    codex_home = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / adapter.agent_id / ".codex"
-    doc = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
-    assert "fs" in (doc.get("mcp_servers") or {})
-    assert doc["mcp_servers"]["fs"]["command"] == "npx"
-    assert doc["mcp_servers"]["fs"]["env"]["R"] == "/tmp"
-
-
-def test_adapter_codex_host_mcp_shadows_desired_on_collision(tmp_path, monkeypatch):
-    """Operator's local host config.toml beats catalog default.
-    Mirrors claude's host-sync semantics where host wins."""
-    fake = FakeHttp({
-        "/v2/mcp-templates/fs": {
-            "id": "fs", "type": "stdio", "command": "CATALOG",
-        },
-    })
-    _patch_http(monkeypatch, fake)
-    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
-    # Seed host codex config with same name "fs".
-    host = tmp_path / "host"
-    host.mkdir(parents=True, exist_ok=True)
-    (host / ".codex").mkdir(parents=True, exist_ok=True)
-    (host / ".codex" / "config.toml").write_text(
-        '[mcp_servers.fs]\ncommand = "HOST-WINS"\nargs = []\n',
-        encoding="utf-8",
-    )
-
-    adapter, _ = _make_local_adapter(
-        tmp_path, monkeypatch, harness_name="codex", desired_mcps=["fs"],
-    )
-    asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    with pytest.raises(RuntimeError):
-        adapter._ensure_codex_session()
-    codex_home = Path(os.environ["PUFFO_AGENT_HOME"]) / "agents" / adapter.agent_id / ".codex"
-    doc = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
-    assert doc["mcp_servers"]["fs"]["command"] == "HOST-WINS"
-
-
-def test_adapter_install_desired_crash_does_not_block(tmp_path, monkeypatch, caplog):
-    class CrashingHttp:
-        async def get(self, path):  # pragma: no cover - exercised below
-            raise RuntimeError("network down")
-        async def close(self):
-            pass
-
-    import puffo_agent.crypto.http_client as hc
-    monkeypatch.setattr(hc, "PuffoCoreHttpClient", lambda *a, **kw: CrashingHttp())
-    import puffo_agent.crypto.keystore as ks_mod
-    monkeypatch.setattr(ks_mod, "KeyStore", lambda *a, **kw: object())
-
-    adapter, _ = _make_local_adapter(
-        tmp_path, monkeypatch, desired_skills=["s1"],
-    )
-    # Per-template catch-all logs warning + continues; the outer
-    # try/except defends against any orchestrator-level crash too.
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.desired_install"):
-        asyncio.new_event_loop().run_until_complete(adapter._install_desired())
-    assert adapter._desired_installed is True

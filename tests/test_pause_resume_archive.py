@@ -7,7 +7,6 @@ agent, owner-check parity with the rest of the write endpoints.
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 import pytest_asyncio

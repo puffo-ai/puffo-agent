@@ -11,7 +11,6 @@ import os
 import sys
 import tempfile
 
-import pytest
 import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -40,7 +39,7 @@ def _agent_with_profile(home: str, profile_text: str, agent_id: str = "smoke") -
                 "device_id": "dev_test",
                 "space_id": "sp_test",
             },
-            "runtime": {"kind": "chat-local", "provider": "anthropic"},
+            "runtime": {"kind": "cli-local", "provider": "anthropic"},
             "profile": "profile.md",
             "memory_dir": "memory",
             "workspace_dir": "workspace",
@@ -157,7 +156,7 @@ def test_unreadable_profile_returns_empty(monkeypatch):
                     "device_id": "dev_test",
                     "space_id": "sp_test",
                 },
-                "runtime": {"kind": "chat-local", "provider": "anthropic"},
+                "runtime": {"kind": "cli-local", "provider": "anthropic"},
                 "profile": "profile.md",
                 "memory_dir": "memory",
                 "workspace_dir": "workspace",

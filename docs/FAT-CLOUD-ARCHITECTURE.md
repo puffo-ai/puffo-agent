@@ -71,10 +71,10 @@ Three sentences, three buckets:
 flowchart TB
     subgraph sandbox["E2B sandbox (single-tenant, holds NO keys) [BUILT: transport]"]
         core["Turn loop / PuffoAgent<br/>src/puffo_agent/agent/core.py"]
-        harness["Harness (claude-code CLI or chat-local)<br/>src/puffo_agent/portal/runtime_matrix.py<br/>[in-sandbox choice: open bake-off]"]
+        harness["CLI Driver (Claude Code or Codex)<br/>src/puffo_agent/agent/harness/driver.py<br/>[cloud default: cli-local]"]
         mcp["MCP tools (~17 core + host)<br/>src/puffo_agent/mcp/puffo_core_tools.py"]
         mem["MemoryManager<br/>src/puffo_agent/agent/memory.py"]
-        skills["Skills loader<br/>src/puffo_agent/agent/skills_loader.py"]
+        skills["Native skill projection<br/>portal/host_assets.py + adapters/desired_install.py"]
         portal["Portal daemon + worker<br/>src/puffo_agent/portal/daemon.py"]
         bridge["Keyless bridge client<br/>agent/bridge_client.py (phase 1, PR #127)"]
         core --> harness
@@ -120,14 +120,15 @@ All six nails are **[BUILT]** and cited into this worktree.
    never learns it is "in the cloud" — it just gets messages from a different
    transport.
 
-2. **Adapters / harness selection.** Which harness actually runs the model is
+2. **Drivers / harness selection.** Which harness actually runs the model is
    resolved by the `(runtime, provider, harness)` validity matrix
-   (`src/puffo_agent/portal/runtime_matrix.py`): `claude-code`, `hermes`,
-   `gemini-cli`, `codex`, keyed to providers, with a default per provider
+   (`src/puffo_agent/portal/runtime_matrix.py`): `claude-code` and `codex` are
+   admitted, `hermes` / `gemini-cli` are enumerated but design-only and
+   rejected there; harnesses are keyed to providers, with a default per provider
    (`DEFAULT_HARNESS_FOR_PROVIDER`, `src/puffo_agent/portal/runtime_matrix.py:105`).
-   In-sandbox this machinery is unchanged; *which* harness is preferred inside E2B
-   (the `claude-code` CLI vs. the `chat-local` in-process path) is an **open
-   bake-off** — see "The in-sandbox think-path".
+   In-sandbox this machinery is unchanged. E2B uses `cli-local`; Anthropic agents
+   run the Claude Code Driver and OpenAI agents run the Codex app-server Driver.
+   Direct in-process Chat/SDK runtimes are not part of the cloud image.
 
 3. **The MCP tool surface.** The ~17 puffo-core message tools are registered by
    `register_core_tools` (`src/puffo_agent/mcp/puffo_core_tools.py:368`, `@mcp.tool`
@@ -142,9 +143,10 @@ All six nails are **[BUILT]** and cited into this worktree.
    sibling branches `agent-memory-m1…m4`; they are **not** literal tiers in
    `memory.py` today, and this doc does not claim otherwise.)
 
-5. **Skills.** The skills loader (`src/puffo_agent/agent/skills_loader.py`) and the
-   repo `skills/` dir are unchanged; skills are baked into the E2B template alongside
-   the runtime.
+5. **Skills.** Host/template projection (`src/puffo_agent/portal/host_assets.py` and
+   `src/puffo_agent/agent/adapters/desired_install.py`) builds the per-agent native
+   skill directories. Claude Code and Codex discover those files themselves; cloud
+   templates can bake the same source skill set alongside the runtime.
 
 6. **Portal daemon/worker lifecycle.** The daemon
    (`src/puffo_agent/portal/daemon.py`), the per-agent worker
@@ -342,12 +344,10 @@ Inside the sandbox the agent thinks exactly as on desktop — same turn loop, sa
 harness machinery (`src/puffo_agent/portal/runtime_matrix.py`) — with two cloud-only
 substitutions on the **model** plane (not the message plane):
 
-1. **Harness choice is an open bake-off.** The runtime matrix supports both the
-   `claude-code` CLI harness and the in-process `chat-local` path. Which one runs
-   *inside E2B* is undecided; the desktop default resolution
-   (`DEFAULT_HARNESS_FOR_PROVIDER`, `runtime_matrix.py:105`) is the starting point,
-   but the sandbox trade-off (CLI process overhead vs. in-process simplicity) is
-   still being evaluated. **[DESIGNED]** for the cloud default.
+1. **The sandbox uses the same CLI Driver boundary as desktop.** Claude Code and
+   Codex keep their native session, streaming, cancellation, permission, and
+   compaction semantics behind the shared Driver protocol. The active E2B
+   bootstrap defaults to `cli-local`; no direct provider SDK is installed.
 2. **`ANTHROPIC_BASE_URL` → LiteLLM.** In the sandbox, model calls are pointed at a
    **LiteLLM** virtual-key endpoint via `ANTHROPIC_BASE_URL` env, which retires the
    old `/v1/llm/complete` server route. Crucially, this LLM plane is **Shan's
@@ -366,7 +366,7 @@ sequenceDiagram
     participant S as puffo-server bridge
     participant B as bridge_client.py (in sandbox)
     participant A as PuffoAgent turn loop (core.py)
-    participant H as Harness + LiteLLM (ANTHROPIC_BASE_URL)
+    participant H as CLI Driver + LiteLLM gateway
 
     Note over B,S: x-sandbox-token injected by E2B egress [BUILT]
     U->>S: send E2E message
@@ -514,7 +514,7 @@ surface" after the table. Disposition is one of `KEEP` / `KEEP-with-reconcile` /
 | Credential (OAuth) refresh | `portal/credential_refresh.py` + `macos/keychain.py` | **DROP-BY-DESIGN** — LiteLLM virtual-key replaces per-CLI OAuth (GAP #2); reverts to SWAP iff the in-sandbox `claude-code` harness still OAuths | — (drop-by-design) |
 | Model catalog / options | `agent/model_catalog.py:88` (`/v1/models`) | **KEEP-with-reconcile** — in-sandbox, but the concrete list must reconcile with the LiteLLM virtual-key's allowed model set (GAP #4) | [BUILT] |
 | Workspace file IO | `agent/file_browser.py:17` (`ALLOWED_ROOTS`) | **KEEP** (in-sandbox) — operator exposure is an E2B security-posture design call (GAP #5) | [BUILT] |
-| Direct providers + system-prompt assembly + events | `agent/providers/`, `agent/shared_content.py`, `agent/events.py` | **KEEP** — cognitive stack, unchanged in-sandbox (GAP #6) | [BUILT] |
+| Driver + system-prompt assembly + events | `agent/harness/driver.py`, `agent/shared_content.py`, `agent/events.py` | **KEEP** — cognitive stack, unchanged in-sandbox (GAP #6) | [BUILT] |
 | PreToolUse permission gate | `hooks/permission.py` | **KEEP** — same gate in-sandbox; candidate **DROP-BY-DESIGN** for a fully autonomous agent (operator-DM y/n gate is moot) (GAP #6) | [BUILT] |
 | Desktop-only surfaces | `portal/ws_local/`, `control/`, `api/`, `ui/`, `macos/` | **DROP-BY-DESIGN** — desktop UX/control planes with no cloud analogue | — (drop-by-design) |
 | Space/channel metadata edit/delete | `PATCH`/`DELETE /spaces…` | **drop-by-design** — out of an agent's lane | — (drop-by-design) |
@@ -533,12 +533,10 @@ disposition (this is the review's MISSING-GAP list, resolved):
    carries only `Heartbeat` liveness, so it needs an `AgentClientMsg::Status`/`Error`
    frame or a token-HTTP status route. Cross-ref `CLOUD-VS-DESKTOP-GAP.md` **P2**. (Full
    treatment in "Observability rides the deleted transport".)
-2. **Credential (OAuth) refresh** — `portal/credential_refresh.py`. **DROP-BY-DESIGN**:
-   the sandbox authenticates the model plane with a **LiteLLM virtual key**
-   (`ANTHROPIC_BASE_URL`), so per-CLI OAuth token refresh is not needed in the cloud
-   shape. **Caveat:** if the in-sandbox `claude-code` CLI harness still authenticates by
-   its own OAuth (the open harness bake-off), this reverts to **SWAP** — a real
-   credential path back into the sandbox is then required.
+2. **Credential (OAuth) refresh** — `portal/credential_refresh.py`. **SWAP in cloud**:
+   the CLI Driver is retained, but the sandbox points it at a LiteLLM virtual-key
+   endpoint. The desktop daemon's host OAuth refresh loop is therefore replaced by
+   provisioned gateway credentials rather than copied into E2B.
 3. **Local message store + history tools** — `agent/message_store.py:120` (`messages.db`);
    history tools `mcp/puffo_core_tools.py:531`/`:597`/`:628`. **KEEP**: the SQLite store
    runs in-sandbox unchanged. This corrects any "history = server round-trip" reading —
@@ -552,10 +550,10 @@ disposition (this is the review's MISSING-GAP list, resolved):
    (in-sandbox): file browsing stays local to the E2B filesystem. How much of that
    filesystem the operator may expose is an **E2B security-posture design call**
    (`CLOUD-VS-DESKTOP-GAP.md` P2: "interacts with E2B security posture — design call").
-6. **Direct providers + system-prompt assembly + events + permission gate** —
-   `agent/providers/{anthropic,openai}_provider.py`, `agent/shared_content.py`,
-   `agent/events.py`, `hooks/permission.py`. **KEEP**: this is the cognitive stack, byte
-   for byte in-sandbox. One nuance: the `PreToolUse` permission gate
+6. **Driver + system-prompt assembly + events + permission gate** —
+   `agent/harness/driver.py`, `agent/shared_content.py`, `agent/events.py`,
+   `hooks/permission.py`. **KEEP**: this is the cognitive stack, byte for byte
+   in-sandbox. One nuance: the `PreToolUse` permission gate
    (`hooks/permission.py`) is a candidate **DROP-BY-DESIGN** for a fully autonomous cloud
    agent, where an operator-DM y/n confirmation has no interactive surface to prompt.
 
@@ -572,11 +570,11 @@ The author ran this checklist against the finished doc:
       paths are cited and every one exists in this worktree (`crypto/http_client.py`,
       `crypto/ws_client.py`, `crypto/keystore.py`, `agent/puffo_core_client.py`,
       `mcp/puffo_core_tools.py`, `agent/core.py`, `portal/runtime_matrix.py`,
-      `agent/memory.py`, `agent/skills_loader.py`, `portal/daemon.py`,
+      `agent/memory.py`, `portal/host_assets.py`, `portal/daemon.py`,
       `portal/worker.py`, `portal/rpc_service.py`, `mcp/host_tools.py`,
       `mcp/puffo_core_server.py`, `mcp/_host_mcp.py`, `agent/status_reporter.py`,
       `agent/message_store.py`, `agent/model_catalog.py`, `agent/file_browser.py`,
-      `agent/shared_content.py`, `agent/events.py`, `agent/providers/`,
+      `agent/shared_content.py`, `agent/events.py`, `agent/harness/driver.py`,
       `hooks/permission.py`, `portal/credential_refresh.py`).
 - [x] **(iii) KEEP / SWAP / ADD + delta table scoped honestly.** All six KEEP nails,
       the full SWAP seam (`crypto/` deleted + `keys/` gone + `agent.yml`

@@ -5,7 +5,7 @@ Runs once per worker spawn, after host-sync. Both harnesses install:
   * codex  skills → ``<workspace>/.agents/skills/<id>/SKILL.md``
                     (body has ``mcp__puffo__`` prefix stripped)
   * claude MCPs   → ``<agent_home>/.claude.json#mcpServers[<id>]``
-  * codex  MCPs   → cached on the adapter so ``_ensure_codex_session``
+  * codex  MCPs   → returned to the runtime preparer for config.toml
                     folds them into ``[mcp_servers.*]`` config.toml.
 
 Catalog 404 / fetch error logs + continues — never blocks spawn."""
@@ -290,7 +290,8 @@ async def run_spawn_install(
 ) -> dict[str, dict[str, Any]]:
     """Build the puffo-core client from spawn wiring and run
     ``install_desired``, tolerating fetch / crash errors. Shared by the
-    cli-local and cli-docker adapters. Returns ``codex_extra_servers``.
+    cli-local runtime preparer and cli-docker adapter. Returns
+    ``codex_extra_servers``.
     """
     if not desired_skills and not desired_mcps:
         return {}

@@ -55,31 +55,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# --- chat-local LLM providers (cloud-slim) ------------------------------
-# The keyless cloud-agent boot chain (daemon + MCP + adapters + bridge)
-# never imports the vendor LLM SDKs: worker.py lazy-imports the providers
-# only when it builds a chat-local legacy provider, and the provider
-# modules import their vendor SDK at module top. So the base install (and
-# the cloud cli-local template) carries NEITHER anthropic NOR openai.
-# (Pillow is deliberately NOT slimmed out — see [project].dependencies.)
-#
-#   pip install puffo-agent[anthropic]   — chat-local provider=anthropic
-#   pip install puffo-agent[openai]      — chat-local provider=openai
-#   pip install puffo-agent[chat-local]  — both providers at once
-#
-# Building a chat-local provider without the matching extra fails with an
-# actionable "rebuild the template with 'pip install puffo-agent[...]'"
-# hint — not a raw ImportError. See worker._build_legacy_provider.
-anthropic = ["anthropic>=0.25"]
-openai = ["openai>=1.30"]
 # Back-compat alias: Pillow now ships in the base install (see above), so
 # this extra is a no-op for a base install. Kept so the historical
 # "pip install puffo-agent[attachments]" hint still resolves.
 attachments = ["pillow>=10.0"]
-# Convenience: everything a chat-local agent might need in one shot.
-# Self-references the component extras so version pins live in ONE place
-# and can't drift from the anthropic/openai/attachments extras above.
-chat-local = ["puffo-agent[anthropic,openai,attachments]"]
 # pip install puffo-agent[gui]  — the PySide6 desktop UI (window + tray).
 # Kept out of the base install so `pip install puffo-agent` stays Qt-free
 # for headless/cloud daemons; `start`/`run_daemon` never import PySide6.
@@ -87,8 +66,6 @@ chat-local = ["puffo-agent[anthropic,openai,attachments]"]
 # "install puffo-agent[gui]" hint (see portal/cli.py cmd_start) when the
 # extra is absent.
 gui = ["pyside6>=6.7"]
-# pip install puffo-agent[sdk]  — needed for agents with runtime.kind=sdk
-sdk = ["claude-agent-sdk>=0.1.61"]
 # cli-local / cli-docker adapters don't need extra Python deps; they
 # shell out to the `claude` binary (cli-local) or Docker (cli-docker).
 # pip install --editable ".[dev]"  — needed to run the test suite.
@@ -96,16 +73,25 @@ sdk = ["claude-agent-sdk>=0.1.61"]
 # test_ws_client, test_http_client) declare async test functions via
 # `@pytest.mark.asyncio`. Without it, those tests silently skip and
 # anything using async fixtures errors out.
-# chat-local pulls the anthropic + openai SDKs (pillow is already in the
-# base install): several pre-existing test modules import those SDKs at
-# module top (test_chat_local_tool_use, test_llm_base_url_routing, the
-# image-guard tests), so a clean CI box running `pip install -e .[dev]`
-# would otherwise error at collection now that the SDKs left the base deps.
-dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "puffo-agent[chat-local]"]
+dev = [
+    "pre-commit>=4.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.15",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F401", "F821", "UP037"]
 
 [project.urls]
 Homepage      = "https://github.com/puffo-ai/puffo-agent"

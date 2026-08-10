@@ -15,7 +15,14 @@ from typing import Any
 from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
-from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
+from ..agent import send_mode
+from ..agent.send_coordinator import SemanticSendRequest, failed_result
+from ..crypto.message import (
+    EncryptInput,
+    RecipientDevice,
+    build_plaintext_message,
+    encrypt_message,
+)
 from ..crypto.primitives import Ed25519KeyPair
 from ..mcp.config import _emit_codex_mcp_block
 
@@ -30,6 +37,7 @@ class HostMcpContext:
     """Per-agent dispatch context. ``harness`` routes to the correct
     operator config: ``claude-code`` → ``~/.claude.json``, ``codex``
     → ``~/.codex/config.toml``. Other harnesses raise."""
+
     agent_id: str
     slug: str
     operator_slug: str
@@ -41,6 +49,9 @@ class HostMcpContext:
     # The worker's live PuffoCoreMessageClient, for tools that drive
     # daemon-side state (leave requests). None until warm().
     message_client: Any = None
+    # The worker's single persistent semantic send coordinator. Package 4
+    # supplies it; optional preserves existing context constructors.
+    send_coordinator: Any = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -79,10 +90,7 @@ def _atomic_write_claude_json(path: Path, data: dict[str, Any]) -> None:
 def _codex_host_config_path(host_home: Path) -> Path:
     """Honours ``$CODEX_HOME`` so we land in the same file the operator's codex CLI reads."""
     codex_home_env = os.environ.get("CODEX_HOME")
-    codex_home = (
-        Path(codex_home_env) if codex_home_env
-        else host_home / ".codex"
-    )
+    codex_home = Path(codex_home_env) if codex_home_env else host_home / ".codex"
     return codex_home / "config.toml"
 
 
@@ -128,10 +136,7 @@ def _spec_from_template(template: dict[str, Any]) -> dict[str, Any] | None:
     args = template.get("args") or []
     env = template.get("env") or {}
     args_list = [str(a) for a in args] if isinstance(args, list) else []
-    env_map = (
-        {str(k): str(v) for k, v in env.items()}
-        if isinstance(env, dict) else {}
-    )
+    env_map = {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {}
     if transport == "stdio":
         command = template.get("command")
         if not isinstance(command, str) or not command:
@@ -173,8 +178,7 @@ def _validate_adhoc_spec(spec: dict[str, Any]) -> dict[str, Any]:
         command = spec.get("command")
         if not isinstance(command, str) or not command:
             raise RuntimeError(
-                "install_host_mcp: spec.command is required for stdio "
-                "transport"
+                "install_host_mcp: spec.command is required for stdio transport"
             )
         return {
             "type": "stdio",
@@ -194,17 +198,20 @@ def _validate_adhoc_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_operator_dm_body(
-    *, name: str, display_name: str, host_path: str = "~/.claude.json",
+    *,
+    name: str,
+    display_name: str,
+    host_path: str = "~/.claude.json",
 ) -> str:
     """One-line install confirmation. The agent sends docs/env hints separately."""
     return (
-        f"I just installed **{display_name}** into your host "
-        f"{host_path} as {name!r}."
+        f"I just installed **{display_name}** into your host {host_path} as {name!r}."
     )
 
 
 async def _fetch_device_keys(
-    http_client: PuffoCoreHttpClient, slugs: list[str],
+    http_client: PuffoCoreHttpClient,
+    slugs: list[str],
 ) -> list[RecipientDevice]:
     """Paginate ``/certs/sync?slugs=...`` and collect ``(device_id, kem_pk)`` per device_cert."""
     if not slugs:
@@ -214,25 +221,22 @@ async def _fetch_device_keys(
     seen_ids: set[str] = set()
     since = 0
     while True:
-        data = await http_client.get(
-            f"/certs/sync?slugs={slugs_param}&since={since}"
-        )
+        data = await http_client.get(f"/certs/sync?slugs={slugs_param}&since={since}")
         for entry in data.get("entries", []):
             if entry.get("kind") == "device_cert":
                 cert = entry.get("cert", {})
                 dev_id = cert.get("device_id", "")
                 keys_block = cert.get("keys") or {}
                 enc_block = keys_block.get("encryption") or {}
-                kem_b64 = (
-                    enc_block.get("public_key")
-                    or cert.get("kem_public_key", "")
-                )
+                kem_b64 = enc_block.get("public_key") or cert.get("kem_public_key", "")
                 if dev_id and kem_b64 and dev_id not in seen_ids:
                     try:
-                        devices.append(RecipientDevice(
-                            device_id=dev_id,
-                            kem_public_key=base64url_decode(kem_b64),
-                        ))
+                        devices.append(
+                            RecipientDevice(
+                                device_id=dev_id,
+                                kem_public_key=base64url_decode(kem_b64),
+                            )
+                        )
                         seen_ids.add(dev_id)
                     except Exception:
                         pass
@@ -243,7 +247,8 @@ async def _fetch_device_keys(
 
 
 async def _send_dm_to_operator(
-    ctx: HostMcpContext, text: str,
+    ctx: HostMcpContext,
+    text: str,
 ) -> str:
     """DM ``ctx.operator_slug`` from ``ctx.slug``. Returns the
     envelope_id on success. Raises on any failure."""
@@ -251,13 +256,18 @@ async def _send_dm_to_operator(
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(sess.subkey_secret_key)
     )
-    devices = await _fetch_device_keys(
-        ctx.http_client, [ctx.slug, ctx.operator_slug],
-    )
-    if not devices:
-        raise RuntimeError(
-            f"no recipient devices resolved for @{ctx.operator_slug}"
+    # Unthreaded DM — only the turn-bundle rule applies (no store here).
+    encrypt = await send_mode.encryption_required(ctx.slug, None, None)
+    devices: list[RecipientDevice] = []
+    if encrypt:
+        devices = await _fetch_device_keys(
+            ctx.http_client,
+            [ctx.slug, ctx.operator_slug],
         )
+        if not devices:
+            raise RuntimeError(
+                f"no recipient devices resolved for @{ctx.operator_slug}"
+            )
     inp = EncryptInput(
         envelope_kind="dm",
         sender_slug=ctx.slug,
@@ -271,8 +281,12 @@ async def _send_dm_to_operator(
         content=text,
         recipients=devices,
     )
-    envelope = encrypt_message(inp, signing_key)
-    await ctx.http_client.post("/messages", envelope)
+    if encrypt:
+        envelope = encrypt_message(inp, signing_key)
+        await ctx.http_client.post("/messages", envelope)
+    else:
+        envelope = build_plaintext_message(inp, signing_key)
+        await ctx.http_client.post("/v2/messages/plaintext", envelope)
     return str(envelope.get("envelope_id") or "?")
 
 
@@ -314,78 +328,17 @@ async def install(
             "config dict from the MCP's own docs)"
         )
 
-    display_name = name
-    if template_id:
-        try:
-            template = await ctx.http_client.get(
-                f"/v2/mcp-templates/{template_id}"
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"install_host_mcp: catalog fetch failed for "
-                f"{template_id!r}: {exc}"
-            ) from exc
-        if not isinstance(template, dict):
-            raise RuntimeError(
-                f"install_host_mcp: catalog returned a non-object body "
-                f"for {template_id!r}"
-            )
-        normalized = _spec_from_template(template)
-        if normalized is None:
-            raise RuntimeError(
-                f"install_host_mcp: catalog entry for {template_id!r} "
-                f"has an unsupported transport or is missing a "
-                f"required field"
-            )
-        spec_to_write = normalized
-        display_name = str(template.get("name") or name)
-    else:
-        spec_to_write = _validate_adhoc_spec(spec or {})
-
-    if ctx.harness == "codex":
-        host_path = _codex_host_config_path(ctx.host_home)
-        existing = _read_codex_mcp_servers(host_path)
-        if name in existing:
-            return (
-                f"{name!r} is already registered in the host's "
-                f"~/.codex/config.toml — left untouched. Call "
-                f"sync_host_mcp({name!r}) to pick up the operator's "
-                f"populated entry."
-            )
-        try:
-            _append_codex_mcp_block(host_path, name, spec_to_write)
-        except OSError as exc:
-            raise RuntimeError(
-                f"install_host_mcp: failed to write host's "
-                f"~/.codex/config.toml: {exc}"
-            ) from exc
-        host_path_label = "~/.codex/config.toml"
-    else:
-        host_path = ctx.host_home / ".claude.json"
-        data = _read_claude_json(host_path)
-        servers = data.get("mcpServers")
-        if not isinstance(servers, dict):
-            servers = {}
-        if name in servers:
-            return (
-                f"{name!r} is already registered in the host's "
-                f"~/.claude.json — left untouched. Call "
-                f"sync_host_mcp({name!r}) to pull the operator's "
-                f"populated entry into your own config."
-            )
-        servers[name] = spec_to_write
-        data["mcpServers"] = servers
-        try:
-            _atomic_write_claude_json(host_path, data)
-        except OSError as exc:
-            raise RuntimeError(
-                f"install_host_mcp: failed to write host's "
-                f"~/.claude.json: {exc}"
-            ) from exc
-        host_path_label = "~/.claude.json"
+    spec_to_write, display_name = await _resolve_install_spec(
+        ctx, name, template_id, spec
+    )
+    host_path_label, existing = _write_host_mcp(ctx, name, spec_to_write)
+    if existing:
+        return existing
 
     dm_body = _build_operator_dm_body(
-        name=name, display_name=display_name, host_path=host_path_label,
+        name=name,
+        display_name=display_name,
+        host_path=host_path_label,
     )
     try:
         envelope_id = await _send_dm_to_operator(ctx, dm_body)
@@ -405,6 +358,74 @@ async def install(
         f"{envelope_id}). They'll ping you when host setup is done; "
         f"call sync_host_mcp({name!r}) then refresh()."
     )
+
+
+async def _resolve_install_spec(
+    ctx: HostMcpContext, name: str, template_id: str, spec: dict[str, Any] | None
+) -> tuple[dict[str, Any], str]:
+    if not template_id:
+        return _validate_adhoc_spec(spec or {}), name
+    try:
+        template = await ctx.http_client.get(f"/v2/mcp-templates/{template_id}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"install_host_mcp: catalog fetch failed for {template_id!r}: {exc}"
+        ) from exc
+    if not isinstance(template, dict):
+        raise RuntimeError(
+            f"install_host_mcp: catalog returned a non-object body for {template_id!r}"
+        )
+    normalized = _spec_from_template(template)
+    if normalized is None:
+        raise RuntimeError(
+            f"install_host_mcp: catalog entry for {template_id!r} has an unsupported transport or is missing a required field"
+        )
+    return normalized, str(template.get("name") or name)
+
+
+def _write_host_mcp(
+    ctx: HostMcpContext, name: str, spec: dict[str, Any]
+) -> tuple[str, str | None]:
+    if ctx.harness == "codex":
+        path, label, existing = (
+            _codex_host_config_path(ctx.host_home),
+            "~/.codex/config.toml",
+            _read_codex_mcp_servers(_codex_host_config_path(ctx.host_home)),
+        )
+        if name in existing:
+            return (
+                label,
+                f"{name!r} is already registered in the host's {label} — left untouched. Call sync_host_mcp({name!r}) to pick up the operator's populated entry.",
+            )
+        try:
+            _append_codex_mcp_block(path, name, spec)
+        except OSError as exc:
+            raise RuntimeError(
+                f"install_host_mcp: failed to write host's {label}: {exc}"
+            ) from exc
+        return label, None
+    path, label, data = (
+        ctx.host_home / ".claude.json",
+        "~/.claude.json",
+        _read_claude_json(ctx.host_home / ".claude.json"),
+    )
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    if name in servers:
+        return (
+            label,
+            f"{name!r} is already registered in the host's {label} — left untouched. Call sync_host_mcp({name!r}) to pull the operator's populated entry into your own config.",
+        )
+    servers[name] = spec
+    data["mcpServers"] = servers
+    try:
+        _atomic_write_claude_json(path, data)
+    except OSError as exc:
+        raise RuntimeError(
+            f"install_host_mcp: failed to write host's {label}: {exc}"
+        ) from exc
+    return label, None
 
 
 async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
@@ -472,9 +493,7 @@ async def request_leave(
     only on approval. ``kind`` is ``leave_space`` / ``leave_channel``."""
     client = ctx.message_client
     if client is None:
-        raise RuntimeError(
-            "agent isn't fully warm yet — try again in a moment"
-        )
+        raise RuntimeError("agent isn't fully warm yet — try again in a moment")
     if kind not in ("leave_space", "leave_channel"):
         raise RuntimeError(f"unknown leave kind {kind!r}")
     if not space_id:
@@ -486,4 +505,171 @@ async def request_leave(
         space_id=space_id,
         channel_id=channel_id,
         reason=reason or "",
+    )
+
+
+async def send_message(
+    ctx: HostMcpContext,
+    *,
+    channel: str,
+    text: str = "",
+    paths: list[str] | None = None,
+    caption: str = "",
+    root_id: str = "",
+    visibility_level: str = "default",
+    send_anyway: bool = False,
+) -> dict[str, Any]:
+    """Dispatch a semantic model send through the worker-owned coordinator."""
+    coordinator = ctx.send_coordinator
+    if coordinator is None:
+        return failed_result(
+            "persistent send coordinator is unavailable",
+            kind="coordinator_unavailable",
+        )
+    request = SemanticSendRequest(
+        destination=str(channel or ""),
+        text=str(text or ""),
+        attachment_paths=tuple(paths or ()),
+        caption=str(caption or ""),
+        root_id=str(root_id or ""),
+        visibility_level=str(visibility_level or "default"),
+        send_anyway=send_anyway is True,
+    )
+    result = await coordinator.send(request)
+    if not isinstance(result, dict):
+        return failed_result(
+            "persistent send coordinator returned a malformed result",
+            kind="protocol",
+        )
+    result.setdefault("attempted", True)
+    if result.get("state") == "held":
+        runtime = getattr(ctx.message_client, "global_runtime", None)
+        if runtime is not None:
+            result = await runtime.stage_held_send_result(
+                result,
+                tool_name=(
+                    "send_message_with_attachments"
+                    if request.attachment_paths
+                    else "send_message"
+                ),
+                tool_arguments=request.to_tool_arguments(),
+            )
+    return result
+
+
+async def stage_model_visible_read(
+    ctx: HostMcpContext,
+    *,
+    space_id: str,
+    channel_id: str,
+    through_seq: int,
+    through_envelope_id: str,
+    tool_name: str,
+    tool_arguments: dict[str, object],
+    visible_message_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    """Correlate a local-history tool result with the live provider turn."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global message runtime is unavailable")
+    return await runtime.stage_model_visible_read(
+        space_id=space_id,
+        channel_id=channel_id,
+        through_seq=through_seq,
+        through_envelope_id=through_envelope_id,
+        tool_name=tool_name,
+        tool_arguments=tool_arguments,
+        visible_message_ids=visible_message_ids,
+    )
+
+
+async def read_inbox(
+    ctx: HostMcpContext,
+    *,
+    target: str = "",
+    cursor: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    arguments: dict[str, object] = {}
+    if target:
+        arguments["target"] = target
+    if cursor:
+        arguments["cursor"] = cursor
+    if limit != 50:
+        arguments["limit"] = limit
+    return await runtime.read_inbox(
+        target=target,
+        cursor=cursor,
+        limit=limit,
+        tool_arguments=arguments,
+    )
+
+
+async def create_reminder(
+    ctx: HostMcpContext,
+    *,
+    content: str,
+    target: str,
+    intended_at: str,
+) -> dict[str, object]:
+    """Resolve reminder creation against the warm worker's one Inbox runtime."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.create_reminder(
+        content=content,
+        target=target,
+        intended_at=intended_at,
+    )
+
+
+async def list_reminders(
+    ctx: HostMcpContext,
+    *,
+    state: str = "",
+    limit: int = 50,
+) -> dict[str, object]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.list_reminders(state=state, limit=limit)
+
+
+async def cancel_reminder(
+    ctx: HostMcpContext,
+    *,
+    reminder_id: str,
+) -> dict[str, object]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.cancel_reminder(reminder_id=reminder_id)
+
+
+async def request_command_permission(
+    ctx: HostMcpContext,
+    *,
+    tool_name: str,
+    summary: str,
+    timeout_s: object,
+) -> str:
+    """Hand a hook's permission ask to the message client; blocks
+    until y/n or timeout. Returns allow/deny/timeout."""
+    client = ctx.message_client
+    if client is None:
+        raise RuntimeError("agent isn't fully warm yet — try again in a moment")
+    if not tool_name:
+        raise RuntimeError("tool_name is required")
+    try:
+        timeout = int(timeout_s) if timeout_s is not None else 300
+    except (TypeError, ValueError):
+        timeout = 300
+    timeout = max(5, min(timeout, 3600))
+    return await client.request_command_permission(
+        tool_name=str(tool_name),
+        summary=str(summary or ""),
+        timeout_s=timeout,
     )

@@ -82,7 +82,10 @@ def _scrubbed_env() -> dict[str, str]:
 
 
 def _run_git(
-    memory_root: Path, args: list[str], *, pin_repo: bool = True,
+    memory_root: Path,
+    args: list[str],
+    *,
+    pin_repo: bool = True,
 ) -> subprocess.CompletedProcess | None:
     """Run one git command against the audit repo at ``memory_root``.
 
@@ -100,7 +103,8 @@ def _run_git(
         cmd += [
             f"--git-dir={root / '.git'}",
             f"--work-tree={root}",
-            "-c", f"safe.directory={root}",
+            "-c",
+            f"safe.directory={root}",
         ]
     cmd += args
     try:
@@ -129,8 +133,8 @@ def ensure_memory_git(memory_root: str | Path) -> bool:
         return True
     if not git_available():
         logger.warning(
-            "git is not installed; memory changes at %s will not be "
-            "audit-committed", memory_root,
+            "git is not installed; memory changes at %s will not be audit-committed",
+            memory_root,
         )
         return False
     # ``init`` runs before ``.git`` exists, so it can't pin --git-dir;
@@ -147,7 +151,9 @@ def ensure_memory_git(memory_root: str | Path) -> bool:
             detail = (proc.stderr or proc.stdout).strip() if proc else "launch failed"
             logger.warning(
                 "memory git init failed at %s (%s): %s",
-                memory_root, " ".join(step), detail,
+                memory_root,
+                " ".join(step),
+                detail,
             )
             return False
     return True
@@ -166,7 +172,9 @@ def format_commit_message(tool: str, paths: list[str], reason: str = "") -> str:
 
 
 def commit_memory_change(
-    memory_root: str | Path, paths: list[str], message: str,
+    memory_root: str | Path,
+    paths: list[str],
+    message: str,
 ) -> str | None:
     """Stage exactly ``paths`` (explicit pathspecs — stray files in the
     tree are never swept in) and commit with ``message``. Returns the
@@ -189,7 +197,9 @@ def commit_memory_change(
         detail = (add.stderr or add.stdout).strip() if add else "launch failed"
         logger.warning(
             "memory git add failed at %s for %s: %s",
-            memory_root, paths, detail,
+            memory_root,
+            paths,
+            detail,
         )
         return None
     commit = _run_git(memory_root, ["commit", "--quiet", "-m", message])
@@ -197,7 +207,9 @@ def commit_memory_change(
         detail = (commit.stderr or commit.stdout).strip() if commit else "launch failed"
         logger.warning(
             "memory git commit failed at %s for %s: %s",
-            memory_root, paths, detail,
+            memory_root,
+            paths,
+            detail,
         )
         return None
     head = _run_git(memory_root, ["rev-parse", "--short", "HEAD"])
@@ -244,13 +256,17 @@ def _history_read_failed(detail: str) -> MemoryHistoryError:
 
 def _history_invalid_query(detail: str, suggestion: str) -> MemoryHistoryError:
     return MemoryHistoryError(
-        "memory_invalid_history_query", message=detail, suggestion=suggestion,
+        "memory_invalid_history_query",
+        message=detail,
+        suggestion=suggestion,
     )
 
 
 def _history_too_large(detail: str, suggestion: str) -> MemoryHistoryError:
     return MemoryHistoryError(
-        "memory_history_query_too_large", message=detail, suggestion=suggestion,
+        "memory_history_query_too_large",
+        message=detail,
+        suggestion=suggestion,
     )
 
 
@@ -281,7 +297,8 @@ def _porcelain_paths(text: str) -> list[str]:
 
 
 def history_status(
-    memory_root: str | Path, path: str | None = None,
+    memory_root: str | Path,
+    path: str | None = None,
 ) -> dict:
     """Read-only health of the local audit repo: HEAD id, clean/dirty
     work tree, and — when ``path`` is given (a logical memory path,
@@ -293,7 +310,8 @@ def history_status(
     # HEAD short id — None (not an error) on an unborn/empty repo, where
     # ``--verify --quiet`` exits nonzero with empty output.
     head = _run_git(
-        root, ["rev-parse", "--verify", "--quiet", "--short", "HEAD"],
+        root,
+        ["rev-parse", "--verify", "--quiet", "--short", "HEAD"],
     )
     if head is None:
         raise _history_read_failed("git rev-parse failed to run")
@@ -310,7 +328,8 @@ def history_status(
     if status is None or status.returncode != 0:
         detail = (
             (status.stderr or status.stdout).strip()
-            if status else "git status failed to run"
+            if status
+            else "git status failed to run"
         )
         raise _history_read_failed(detail or "git status failed")
     uncommitted = _porcelain_paths(status.stdout)
@@ -327,35 +346,43 @@ def history_status(
         if head_id is None:
             # No commits yet: nothing is tracked (a bare `git log` on an
             # unborn HEAD would exit nonzero — treat as not-tracked).
-            result.update({
-                "path_tracked": False,
-                "last_changed_commit_id": None,
-                "last_changed_at": None,
-            })
+            result.update(
+                {
+                    "path_tracked": False,
+                    "last_changed_commit_id": None,
+                    "last_changed_at": None,
+                }
+            )
         else:
             log = _run_git(
-                root, ["log", "-1", "--format=%h%x1f%cI", "--", path],
+                root,
+                ["log", "-1", "--format=%h%x1f%cI", "--", path],
             )
             if log is None or log.returncode != 0:
                 detail = (
                     (log.stderr or log.stdout).strip()
-                    if log else "git log failed to run"
+                    if log
+                    else "git log failed to run"
                 )
                 raise _history_read_failed(detail or "git log failed")
             out = log.stdout.strip()
             if out:
                 short, _, iso = out.partition(_HISTORY_FIELD_SEP)
-                result.update({
-                    "path_tracked": True,
-                    "last_changed_commit_id": short or None,
-                    "last_changed_at": iso or None,
-                })
+                result.update(
+                    {
+                        "path_tracked": True,
+                        "last_changed_commit_id": short or None,
+                        "last_changed_at": iso or None,
+                    }
+                )
             else:
-                result.update({
-                    "path_tracked": False,
-                    "last_changed_commit_id": None,
-                    "last_changed_at": None,
-                })
+                result.update(
+                    {
+                        "path_tracked": False,
+                        "last_changed_commit_id": None,
+                        "last_changed_at": None,
+                    }
+                )
     return result
 
 
@@ -368,9 +395,9 @@ def _parse_commit_body(body: str) -> tuple[str | None, str | None]:
     for line in body.splitlines():
         stripped = line.strip()
         if operation is None and stripped.startswith("tool:"):
-            operation = stripped[len("tool:"):].strip() or None
+            operation = stripped[len("tool:") :].strip() or None
         elif reason is None and stripped.startswith("reason:"):
-            reason = stripped[len("reason:"):].strip() or None
+            reason = stripped[len("reason:") :].strip() or None
     return operation, reason
 
 
@@ -420,26 +447,30 @@ def _parse_history_records(output: str) -> list[dict]:
         full, short, iso, actor, subject, rest = fields
         body, changed, insertions, deletions = _split_body_numstat(rest)
         operation, reason = _parse_commit_body(body)
-        commits.append({
-            "_full": full,
-            "commit_id": short,
-            "time": iso,
-            "actor": actor,
-            "operation": operation,
-            "reason": reason,
-            "message": subject,
-            "changed_paths": changed,
-            "summary": {
-                "files_changed": len(changed),
-                "insertions": insertions,
-                "deletions": deletions,
-            },
-        })
+        commits.append(
+            {
+                "_full": full,
+                "commit_id": short,
+                "time": iso,
+                "actor": actor,
+                "operation": operation,
+                "reason": reason,
+                "message": subject,
+                "changed_paths": changed,
+                "summary": {
+                    "files_changed": len(changed),
+                    "insertions": insertions,
+                    "deletions": deletions,
+                },
+            }
+        )
     return commits
 
 
 def _history_diff(
-    root: Path, full_hash: str, pathspec: list[str],
+    root: Path,
+    full_hash: str,
+    pathspec: list[str],
 ) -> tuple[str, bool]:
     """Bounded diff excerpt for one commit, scoped to the same
     pathspec. ``full_hash`` is git-generated (%H), never user input.
@@ -447,8 +478,12 @@ def _history_diff(
     truncated)``. A diff we can't read degrades to an empty excerpt
     rather than failing the whole query."""
     args = [
-        "show", "--format=", f"--unified={_HISTORY_DIFF_CONTEXT}",
-        full_hash, "--", *pathspec,
+        "show",
+        "--format=",
+        f"--unified={_HISTORY_DIFF_CONTEXT}",
+        full_hash,
+        "--",
+        *pathspec,
     ]
     proc = _run_git(root, args)
     if proc is None or proc.returncode != 0:
@@ -495,8 +530,50 @@ def query_history(
     post-filters. Returns ``{entries, truncated}``; ``include_diff``
     attaches a byte-capped ``diff`` excerpt per entry."""
     root = _history_env_ok(memory_root)
+    filters, pathspec = _history_query_inputs(
+        path=path,
+        scopes=scopes,
+        since=since,
+        until=until,
+        actor=actor,
+        operation=operation,
+        query=query,
+        limit=limit,
+        include_diff=include_diff,
+    )
+    proc = _history_log(root, filters, pathspec)
+    if proc is None or proc.returncode != 0:
+        return _history_log_failure(proc)
+    entries, truncated = _filtered_history_entries(
+        proc.stdout,
+        filters["operation"],
+        filters["query"],
+        limit,
+    )
+    if include_diff:
+        for entry in entries:
+            entry["diff"], entry["diff_truncated"] = _history_diff(
+                root,
+                entry["_full"],
+                pathspec,
+            )
+    for entry in entries:
+        entry.pop("_full", None)
+    return {"entries": entries, "truncated": truncated}
 
-    # -- arg validation (memory_invalid_history_query) -----------------
+
+def _history_query_inputs(
+    *,
+    path: str | None,
+    scopes: list[str] | None,
+    since: str | None,
+    until: str | None,
+    actor: str | None,
+    operation: str | None,
+    query: str | None,
+    limit: int,
+    include_diff: bool,
+) -> tuple[dict[str, str | None], list[str]]:
     since = _normalize_history_filter(since, "since")
     until = _normalize_history_filter(until, "until")
     actor = _normalize_history_filter(actor, "actor")
@@ -526,7 +603,6 @@ def query_history(
             f"Use 1 <= limit <= {HISTORY_MAX_LIMIT}.",
         )
 
-    # -- size bounds (memory_history_query_too_large) ------------------
     if limit > HISTORY_MAX_LIMIT:
         raise _history_too_large(
             f"limit {limit} exceeds the maximum {HISTORY_MAX_LIMIT}.",
@@ -539,7 +615,6 @@ def query_history(
             "drop include_diff.",
         )
 
-    # -- pathspec: always after `--`, one entry per scope or the path --
     if path is not None:
         pathspec = [path]
     elif scopes:
@@ -547,63 +622,75 @@ def query_history(
     else:
         pathspec = []
 
-    # -- git log: glued options only; no ref/revision-range ever built.
-    # Over-fetch a bounded window so the Python post-filters can drop
-    # commits and still fill `limit` / detect truncation.
+    return {
+        "since": since,
+        "until": until,
+        "actor": actor,
+        "operation": operation,
+        "query": query,
+    }, pathspec
+
+
+def _history_log(root: Path, filters: dict[str, str | None], pathspec: list[str]):
     fetch = HISTORY_MAX_LIMIT + 1
     args = [
-        "log", f"--max-count={fetch}", f"--format={_HISTORY_LOG_FORMAT}",
+        "log",
+        f"--max-count={fetch}",
+        f"--format={_HISTORY_LOG_FORMAT}",
         "--numstat",
     ]
-    if since is not None:
-        args.append(f"--since={since}")
-    if until is not None:
-        args.append(f"--until={until}")
-    if actor is not None:
-        args.append(f"--author={actor}")
+    if filters["since"] is not None:
+        args.append(f"--since={filters['since']}")
+    if filters["until"] is not None:
+        args.append(f"--until={filters['until']}")
+    if filters["actor"] is not None:
+        args.append(f"--author={filters['actor']}")
     args.append("--")
     args.extend(pathspec)
 
-    proc = _run_git(root, args)
-    if proc is None or proc.returncode != 0:
-        # An unborn/empty repo makes `git log` exit nonzero with a
-        # "does not have any commits yet" message — that's simply no
-        # history, not a read failure.
-        stderr = (proc.stderr if proc else "") or ""
-        if proc is not None and "does not have any commits" in stderr:
-            return {"entries": [], "truncated": False}
-        detail = (
-            (proc.stderr or proc.stdout).strip()
-            if proc else "git log failed to run"
-        )
-        raise _history_read_failed(detail or "git log failed")
+    return _run_git(root, args)
 
-    commits = _parse_history_records(proc.stdout)
 
-    def _passes(c: dict) -> bool:
-        if operation is not None:
-            if operation.lower() not in (c["operation"] or "").lower():
-                return False
-        if query is not None:
-            haystack = " ".join([
-                c["message"] or "",
-                c["reason"] or "",
-                " ".join(c["changed_paths"]),
-            ]).lower()
-            if query.lower() not in haystack:
-                return False
+def _history_log_failure(proc) -> dict:
+    # An unborn/empty repo makes `git log` exit nonzero with a
+    # "does not have any commits yet" message — that's simply no
+    # history, not a read failure.
+    stderr = (proc.stderr if proc else "") or ""
+    if proc is not None and "does not have any commits" in stderr:
+        return {"entries": [], "truncated": False}
+    detail = (proc.stderr or proc.stdout).strip() if proc else "git log failed to run"
+    raise _history_read_failed(detail or "git log failed")
+
+
+def _filtered_history_entries(
+    output: str,
+    operation: str | None,
+    query: str | None,
+    limit: int,
+) -> tuple[list[dict], bool]:
+    entries = [
+        entry
+        for entry in _parse_history_records(output)
+        if _history_entry_matches(entry, operation, query)
+    ]
+    return entries[:limit], len(entries) > limit
+
+
+def _history_entry_matches(
+    entry: dict, operation: str | None, query: str | None
+) -> bool:
+    if (
+        operation is not None
+        and operation.lower() not in (entry["operation"] or "").lower()
+    ):
+        return False
+    if query is None:
         return True
-
-    filtered = [c for c in commits if _passes(c)]
-    truncated = len(filtered) > limit
-    entries = filtered[:limit]
-
-    if include_diff:
-        for entry in entries:
-            entry["diff"], entry["diff_truncated"] = _history_diff(
-                root, entry["_full"], pathspec,
-            )
-    for entry in entries:
-        entry.pop("_full", None)
-
-    return {"entries": entries, "truncated": truncated}
+    haystack = " ".join(
+        [
+            entry["message"] or "",
+            entry["reason"] or "",
+            " ".join(entry["changed_paths"]),
+        ]
+    ).lower()
+    return query.lower() in haystack

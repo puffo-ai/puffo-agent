@@ -313,7 +313,7 @@ def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
     """desired_skills no longer reject on cli-docker — they install into
     the bind-mounted .claude/skills/. The adapter must receive both the
     skills and the puffo_core install wiring."""
-    from puffo_agent.portal.worker import build_adapter
+    from puffo_agent.portal.worker import build_docker_adapter
     from puffo_agent.agent.adapters import docker_cli as dc
     from puffo_agent.agent import harness
 
@@ -329,24 +329,24 @@ def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
         def name(self) -> str:
             return "claude-code"
 
-    monkeypatch.setattr(harness, "build_harness", lambda _: _Harness())
+    monkeypatch.setattr(harness, "build_docker_harness", lambda _: _Harness())
 
     agent_cfg = _make_agent_cfg(
         runtime_kind="cli-docker", desired_skills=["s1", "s2"],
     )
-    build_adapter(_make_daemon_cfg(), agent_cfg)  # no RuntimeError
+    build_docker_adapter(_make_daemon_cfg(), agent_cfg)  # no RuntimeError
     assert captured.get("desired_skills") == ["s1", "s2"]
     assert "puffo_core_keys_dir" in captured
 
 
 def test_build_adapter_cli_docker_rejects_non_empty_desired_mcps():
-    from puffo_agent.portal.worker import build_adapter
+    from puffo_agent.portal.worker import build_docker_adapter
 
     agent_cfg = _make_agent_cfg(
         runtime_kind="cli-docker", desired_mcps=["m1"],
     )
     with pytest.raises(RuntimeError) as ei:
-        build_adapter(_make_daemon_cfg(), agent_cfg)
+        build_docker_adapter(_make_daemon_cfg(), agent_cfg)
     assert "cli-docker" in str(ei.value)
     assert "desired_mcps" in str(ei.value)
 
@@ -354,7 +354,7 @@ def test_build_adapter_cli_docker_rejects_non_empty_desired_mcps():
 def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
     """Reject gate must not fire when the lists are empty — that's the
     cli-docker happy path operators have today."""
-    from puffo_agent.portal.worker import build_adapter
+    from puffo_agent.portal.worker import build_docker_adapter
     from puffo_agent.agent.adapters import docker_cli as dc
     from puffo_agent.agent import harness
 
@@ -370,10 +370,10 @@ def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
         def name(self) -> str:
             return "claude-code"
 
-    monkeypatch.setattr(harness, "build_harness", lambda _: _Harness())
+    monkeypatch.setattr(harness, "build_docker_harness", lambda _: _Harness())
 
     agent_cfg = _make_agent_cfg(runtime_kind="cli-docker")
-    build_adapter(_make_daemon_cfg(), agent_cfg)
+    build_docker_adapter(_make_daemon_cfg(), agent_cfg)
     # Reaching here without RuntimeError is the assertion. Cheap
     # tail-check that the stub adapter actually saw the agent_id so
     # we know the code path executed past the reject gate.

@@ -236,16 +236,14 @@ there; their `space_id` is learned from inbound envelopes.
 
 ### 4b — `runtime:` block — pick a runtime
 
-The runtime decides *where* and *how* claude / gpt / gemini runs for
-this agent. Four options. **The starter `agent.yml` defaults to
-`chat-local`**, so if you want anything else, you must change `kind`.
+The runtime decides *where* and *how* the agent engine runs. The starter
+`agent.yml` defaults to `cli-local`.
 
 | `kind`        | What it runs                                  | When to pick it                                                 |
 |---------------|-----------------------------------------------|-----------------------------------------------------------------|
-| `chat-local`  | Direct API calls to the provider (no CLI)     | Cheapest / simplest. Bot has no tool use — chat replies only.   |
-| `sdk-local`   | Provider SDK in-process (Anthropic SDK, etc)  | Like chat-local but with structured tool use via the SDK.       |
-| `cli-local`   | A `claude` / `hermes` / `gemini` CLI subprocess on the host | Real agent loop with tool use; uses host's existing claude auth. |
+| `cli-local`   | A long-lived Claude Code or Codex Driver on the host | Default; full tool use and host CLI authentication.              |
 | `cli-docker`  | The same CLI, but in a per-agent Docker container | Same as cli-local but sandboxed; safer for risky tool use.       |
+| `ws-local`    | An external agent attaches over localhost WebSocket | Bring an existing external agent engine.                         |
 
 ### 4c — `provider:` and `harness:` — pick a model backend
 
@@ -255,16 +253,15 @@ non-default.
 
 | `provider`   | `harness`     | Models you can pick                                  | Runtime kinds                |
 |--------------|---------------|------------------------------------------------------|------------------------------|
-| `anthropic`  | `claude-code` | `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001` | all                          |
-| `anthropic`  | `hermes`      | Same as above (multi-provider harness)               | `cli-docker`, `cli-local` (alpha) |
-| `openai`     | `hermes`      | `gpt-4o`, `gpt-4-turbo`, etc.                        | `cli-docker`, `cli-local` (alpha) |
-| `openai`     | `codex`       | `gpt-5.5`, `gpt-5`, etc. (whatever your `codex` CLI supports) | **`cli-local` only** in 0.9.0 |
+| `anthropic`  | `claude-code` | Models supported by the installed Claude Code CLI    | `cli-local`, `cli-docker`    |
+| `anthropic`  | `hermes`      | Provider configured in the Hermes profile            | `cli-docker`                 |
+| `openai`     | `codex`       | Models supported by the installed Codex CLI          | `cli-local`                  |
 | `google`     | `gemini-cli`  | `gemini-2.5-pro`, `gemini-2.5-flash`                 | `cli-docker` only            |
 
 Defaults if you leave them blank: `anthropic` + `claude-code` (so a
 plain `kind: cli-local` agent runs Anthropic via Claude Code).
 
-> **Codex inside Docker is not yet supported** in 0.9.0. The bundled
+> **Codex inside Docker is not yet supported.** The bundled
 > Docker image installs `claude-code`, `gemini-cli`, and `hermes` but
 > not the codex npm package, and the cli-docker adapter has no codex
 > turn handler. Pick `kind: cli-local` for codex agents today.
@@ -273,25 +270,14 @@ plain `kind: cli-local` agent runs Anthropic via Claude Code).
 
 | Runtime       | Need an API key in `agent.yml`?                                                  |
 |---------------|----------------------------------------------------------------------------------|
-| `chat-local`  | **Yes** — the daemon talks to the provider directly. Set `runtime.api_key`.      |
-| `sdk-local`   | **Yes** — same reason as chat-local.                                             |
-| `cli-local`   | **No** for `claude-code` (uses host's saved auth — `claude login` once). **No** for `codex` either — codex agents share the host's `codex login` (ChatGPT-account OAuth); no `OPENAI_API_KEY` path on `cli-local`. **No** for `hermes` if you've run `hermes setup` on the host — keys live in `~/.hermes/.env`, which the daemon copies into each agent's `HERMES_HOME` on first verify. Set `PUFFO_HERMES_BIN` if `hermes` isn't on the daemon's `$PATH`. **Yes** for `gemini-cli` (cli-docker only). |
+| `cli-local`   | Normally no: reuse `claude login` or `codex login`. For a compatible gateway, set both `runtime.llm_base_url` and `runtime.api_key`. |
 | `cli-docker`  | **No** for `claude-code` (the per-agent container reuses the operator's host claude auth via a bind-mount). **Yes** for openai/google as above. |
+| `ws-local`    | No. The attached external engine owns its model authentication.                  |
 
-When set, `api_key` is the raw provider key (e.g. an Anthropic
-`sk-ant-…`).
+When set with `llm_base_url`, `api_key` is the credential accepted by that
+gateway (for example a LiteLLM virtual key).
 
 ### Examples
-
-**`chat-local` with Anthropic** (cheapest, chat-only):
-
-```yaml
-runtime:
-  kind: chat-local
-  provider: anthropic
-  model: claude-haiku-4-5-20251001
-  api_key: sk-ant-xxxxxxxxxxxxxxxxxxxx
-```
 
 **`cli-local` with Claude Code** (real agent loop, host-authenticated):
 

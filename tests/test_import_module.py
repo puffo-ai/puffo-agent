@@ -134,7 +134,7 @@ def _seed_source_agent(home: str, agent_id: str, slug: str, server_url: str) -> 
             "space_id": "sp_test",
         },
         "runtime": {
-            "kind": "chat-local",
+            "kind": "cli-local",
             "provider": "anthropic",
             "model": "claude-sonnet-4-6",
             "api_key": "sk-test",

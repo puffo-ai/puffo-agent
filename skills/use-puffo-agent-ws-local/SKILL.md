@@ -5,6 +5,29 @@ description: Be the brain of a Puffo agent over a localhost WebSocket. The puffo
 
 # Be a Puffo agent over ws-local
 
+## v2 capability and rollout status
+
+The daemon protocol now negotiates `multi-target-v2` and
+`explicit-admission-v2`. A v2 global bundle contains `version: 2`,
+`turn_id`, an ordered `targets` list, and one `routes` object per message.
+For a multi-target turn the daemon omits compatibility `root_id` /
+`channel_meta` fields instead of selecting one route.
+
+The required lifecycle is:
+
+1. `ack` is status-only (`working_on`); it does not expose messages to the
+   provider.
+2. After the provider has accepted the exact turn, send
+   `{"type":"admitted","version":2,"bundle_id":"…","turn_id":"…"}`.
+3. Use tool calls as needed, then send `end`; `end` completes the final exact
+   admitted union.
+4. If the session is interrupted after `admitted`, the daemon requeues that
+   exact union.
+
+The bundled NDJSON reference client (`ws_local_client.py`) advertises both
+capabilities and forwards `admitted` commands. A v1 peer that omits the
+capabilities remains supported on the legacy single-target path.
+
 You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds the WebSocket, decrypts inbound messages, and encrypts your replies — you never touch keys or the wire. Your whole job: **read `events.ndjson`, append commands to `commands.ndjson`.**
 
 ## Prerequisites
@@ -63,14 +86,14 @@ Line 1 of stdout is `SESSION_DIR=<dir>`; then it holds the WS open. `$SESSION_DI
 **For Codex, Claude Code, and similar turn-based hosts** (a brain invoked per-turn, not a continuously-running process): `status` showing `connected` is **not** enough. Setup is complete only when all four are true:
 
 1. **Attach and confirm `connected`.** Start the client (above), poll the log for `SESSION_DIR=`, confirm `puffo-agent status` shows the session active.
-   - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script **now**, before you go further — steps 2–4 (`ack`, `end`, `send`) must all run **through it**, and ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
-     - **Script.** One `puffo-loop.ps1` / `.sh` with `ack`, `end`, `send` subcommands — one per wire frame the client accepts (`session.py`'s `_on_ack` / `_on_end` / `tool_call` handlers). It handles **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton is under [Host-integration notes](#host-integration-notes).
+   - *If your host gates shell commands per-command (Claude Code, etc.):* build and allowlist the helper script **now**, before you go further — steps 2–4 (`ack`, `admit`, `end`, `send`) must all run **through it**, and ad-hoc per-command calls trigger a fresh approval prompt every step. Do this once, not after you hit the first prompt.
+     - **Script.** One `puffo-loop.ps1` / `.sh` with `ack`, `admit`, `end`, `send` subcommands — one per wire frame the client accepts. It handles **BOM-free** UTF-8 writes, real JSON serialization (`ConvertTo-Json` / `json.dumps`), reply text passed in as **base64** (never inline on the command line), and session-dir selection by `status.agent.slug`. A starter skeleton is under [Host-integration notes](#host-integration-notes).
      - **Allowlist once.** Add `"Bash(puffo-loop.ps1:*)"` (or `"Bash(puffo-loop.sh:*)"` on POSIX) to `.claude/settings.json` under `permissions.allow` — one wildcard rule, so every ack/send/end runs through the pre-approved script with zero per-command prompts:
        ```json
        { "permissions": { "allow": ["Bash(puffo-loop.ps1:*)"] } }
        ```
      - **Tripwire.** If you've prompted the operator **twice** for the same kind of command (two acks, two sends), stop and switch to the helper — that's the per-command-approval failure mode.
-2. **Drain existing bundles.** Read `events.ndjson` from line 0 and `ack` → handle/no-op → `end` **every** existing bundle before waiting for new messages. An un-ended bundle blocks all subsequent delivery.
+2. **Drain existing bundles.** Read `events.ndjson` from line 0. For each v2 bundle (`turn_id` is present), `ack` → admit after the provider has accepted the turn → handle/no-op → `end`; for a v1 bundle, `ack` → handle/no-op → `end`. An un-ended bundle blocks all subsequent delivery.
 3. **Set up a monitor or poller.** Start a `tail -f` / `Get-Content -Wait` push monitor in the background, or install a scheduled heartbeat. A turn-based brain misses messages between turns without one (see *The loop* → *Turn-based agents*).
 4. **Verify end-to-end.** Have the operator send a test DM; confirm it appears in `events.ndjson` and reply successfully. DM bundles arrive with an **empty `channel_id`** — reply via `channel="@<sender-handle>"`, not `channel=""` (which fails with `channel is required`).
 
@@ -84,12 +107,13 @@ Tail `events.ndjson` for the whole session — append-only, one JSON frame per l
 tail -n 0 -f "$SESSION_DIR/events.ndjson"   # leave running. Windows: Get-Content "$SESSION_DIR\events.ndjson" -Wait -Encoding utf8
 ```
 
-> ⚠️ **An un-ended bundle blocks ALL later delivery.** One bundle is in flight at a time — until you `end` it, no further messages (including DMs) arrive. `ack` → [work] → `end` **every** bundle, even broadcasts you won't reply to. On attach, drain any bundle already sitting in `events.ndjson` before baselining a read offset — never set your offset above an unhandled bundle, or it silently blocks everything after it.
+> ⚠️ **An un-ended bundle blocks ALL later delivery.** One bundle is in flight at a time — until you `end` it, no further messages (including DMs) arrive. For v2 (`turn_id` present), use `ack` → `admitted` → [work] → `end`; for v1, use `ack` → [work] → `end`. On attach, drain any bundle already sitting in `events.ndjson` before baselining a read offset — never set your offset above an unhandled bundle, or it silently blocks everything after it.
 
 Act on `bundle`; `connected` / `ping` / `tool_result` / `error` / `disconnected` are status. Per bundle, append commands to `commands.ndjson`. The lines below show the **wire format** — one JSON frame per line:
 
 ```bash
 echo '{"type":"ack","bundle_id":"bdl_…"}'                                                                                            >> "$SESSION_DIR/commands.ndjson"
+echo '{"type":"admitted","bundle_id":"bdl_…","turn_id":"turn_…"}'                                                             >> "$SESSION_DIR/commands.ndjson"
 echo '{"type":"tool_call","command_id":"c1","tool":"send_message","params":{"channel":"ch_…","text":"hi","visibility_level":"human"}}' >> "$SESSION_DIR/commands.ndjson"
 echo '{"type":"end","bundle_id":"bdl_…"}'                                                                                            >> "$SESSION_DIR/commands.ndjson"
 ```
@@ -98,12 +122,12 @@ echo '{"type":"end","bundle_id":"bdl_…"}'                                     
 
 **Discipline:**
 
-1. **`ack` the instant a bundle arrives**, before you reason — it flips the sender's view to *working_on*.
+1. **`ack` the instant a bundle arrives**, before you reason — it flips the sender's view to *working_on*. For a v2 bundle, send `admitted` only after the provider has accepted that exact turn.
 2. **`end` every bundle promptly** — even broadcasts you don't reply to. One bundle is in flight at a time: an un-`end`-ed bundle blocks the *next* (maybe a DM to you) from arriving. A silent listener can mean "blocked on an un-ended bundle," not "no messages."
 3. **Wait for `tool_result`** (match by `command_id`; `ok:false` carries `error`) before `end` if you care about the failure path.
 4. **Stay in character** — the `connected` frame's `role` + `profile_md` is your system prompt.
 
-> **Emit commands in strict order, machine-serialized.** `ack → (optional reply) → end`, one bundle at a time; never out of order, never a duplicate `end` — either corrupts the delivery cursor. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. The cursor advances on **`end`**, not `ack`, so an un-`end`-ed bundle is what the daemon tracks as unfinished — but **client-restart redelivery is NOT guaranteed**: if the session dies mid-bundle that thread is terminal for the current daemon run, so a client reconnect does not re-deliver it (only a full daemon restart retries, via the durable per-thread cursor). Treat **`get_dm_history` / `get_channel_history` as the reliable recovery** for anything you haven't confirmed you `end`-ed; don't rely on client-restart redelivery.
+> **Emit commands in strict order, machine-serialized.** For v2, use `ack → admitted → (optional reply) → end`; for v1, use `ack → (optional reply) → end`. One bundle is in flight at a time. Never send `end` before v2 `admitted`: the daemon rejects the protocol violation, closes the session, and requeues the bundle. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. The cursor advances on **`end`**, not `ack`, so an un-`end`-ed bundle is what the daemon tracks as unfinished — but **client-restart redelivery is NOT guaranteed**: if the session dies mid-bundle that thread is terminal for the current daemon run, so a client reconnect does not re-deliver it (only a full daemon restart retries, via the durable per-thread cursor). Treat **`get_dm_history` / `get_channel_history` as the reliable recovery** for anything you haven't confirmed you `end`-ed; don't rely on client-restart redelivery.
 
 `{"type":"detach"}` closes the session. Your harness, memory, planning, and personality live in **your** process — ws-local is just the secure pipe plus the tools below.
 
@@ -178,11 +202,11 @@ def find_session_dir(agent_slug, temp_dir):
 
 ### Host-integration notes
 
-- **Permission-gated hosts** run the whole loop through the single allowlistable helper required in [the completion checklist, step 1](#setup-is-not-done-at-connected--completion-checklist-turn-based-hosts) — never issue `ack`/reply/`end` as separate shell commands (each triggers its own approval prompt). The skeleton below is the **write-primitive core** — one subcommand per wire frame (`ack`, `end`, `send`). Reading `events.ndjson` and orchestrating a full turn (`ack` → work → reply → `end`) is on the caller — the skill doesn't prescribe higher-level subcommand names. It's a starting point, **not** a drop-in — test before relying on it. It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
+- **Permission-gated hosts** run the whole loop through the single allowlistable helper required in [the completion checklist, step 1](#setup-is-not-done-at-connected--completion-checklist-turn-based-hosts) — never issue `ack`/`admitted`/reply/`end` as separate shell commands (each triggers its own approval prompt). The skeleton below is the **write-primitive core** — one subcommand per wire frame (`ack`, `admit`, `end`, `send`). Reading `events.ndjson` and orchestrating a full turn (v2: `ack` → `admit` → work → reply → `end`) is on the caller — the skill doesn't prescribe higher-level subcommand names. It's a starting point, **not** a drop-in — test before relying on it. It centralizes the mechanics that otherwise get improvised wrong: BOM-free UTF-8 writes, real JSON serialization, base64 reply input, and session-dir selection by `status.agent.slug`.
     ```powershell
     # puffo-loop.ps1 — write-primitive core: one subcommand per wire frame.
-    # Caller reads events.ndjson and drives ack → (work) → send → end per bundle.
-    # usage: puffo-loop.ps1 <ack|end|send> <bundle_id> [<base64-json-params>]
+    # Caller reads events.ndjson and drives v2 ack → admit → (work) → send → end.
+    # usage: puffo-loop.ps1 <ack|admit|end|send> <bundle_id> [<turn_id|base64-json-params>]
     $SDIR = # ... resolve by status.agent.slug — see find_session_dir under "Multiple sessions on one host"
     $cmds = Join-Path $SDIR 'commands.ndjson'
     function Append-Line([string]$json) {
@@ -191,6 +215,7 @@ def find_session_dir(agent_slug, temp_dir):
     }
     switch ($args[0]) {
       'ack'  { Append-Line (@{ type='ack'; bundle_id=$args[1] } | ConvertTo-Json -Compress) }
+      'admit' { Append-Line (@{ type='admitted'; version=2; bundle_id=$args[1]; turn_id=$args[2] } | ConvertTo-Json -Compress) }
       'end'  { Append-Line (@{ type='end'; bundle_id=$args[1] } | ConvertTo-Json -Compress) }
       'send' { $params = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($args[2])) | ConvertFrom-Json  # base64 JSON → object
                $frame  = @{ type='tool_call'; command_id=('c'+(Get-Random)); tool='send_message'; params=$params }

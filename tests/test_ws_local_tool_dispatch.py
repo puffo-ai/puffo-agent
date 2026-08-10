@@ -8,6 +8,7 @@ Pins that ``build_dispatch`` returns exactly the
 
 from __future__ import annotations
 
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
@@ -25,6 +26,11 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "send_message",
         "send_message_with_attachments",
         # read / navigation
+        "read_inbox",
+        # durable Agent-local reminders
+        "create_reminder",
+        "list_reminders",
+        "cancel_reminder",
         "get_user_info",
         "whoami",
         "get_post",
@@ -91,6 +97,122 @@ def test_capture_stub_resource_decorator_is_passthrough():
 async def test_build_dispatch_subset_filter_drops_unknown_names():
     dispatch = build_dispatch(MagicMock(), allowed=frozenset({"send_message", "nonsense"}))
     assert set(dispatch.keys()) == {"send_message"}
+
+
+def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
+    dispatch = build_dispatch(MagicMock())
+    expected = {
+        "read_inbox": {"target", "cursor", "limit"},
+        "create_reminder": {"content", "target", "intended_at"},
+        "list_reminders": {"state", "limit"},
+        "cancel_reminder": {"reminder_id"},
+        "send_message": {
+            "channel", "text", "root_id", "visibility_level", "send_anyway",
+        },
+        "send_message_with_attachments": {
+            "paths", "channel", "caption", "root_id",
+            "visibility_level", "send_anyway",
+        },
+    }
+    forbidden = {
+        "freshness", "freshness_mode", "mode", "context_baseline_seq",
+        "seen_seq", "synchronized", "transport", "provider_session_id",
+        "session_ref", "turn_id", "turn_ref", "sequence", "seq",
+        "through_seq", "latest_seq", "latest_envelope_id", "held_pair",
+        "client_ref", "admission_receipt", "correlation_receipt",
+        "tool_name", "tool_arguments",
+    }
+    for name, property_set in expected.items():
+        parameters = set(inspect.signature(dispatch[name]).parameters)
+        assert parameters == property_set
+        assert parameters.isdisjoint(forbidden)
+
+
+@pytest.mark.asyncio
+async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation():
+    from puffo_agent.mcp.puffo_core_tools import PuffoCoreToolsConfig
+
+    calls = []
+
+    class Runtime:
+        async def read_inbox(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "messages": ["whole"],
+                "next_cursor": "",
+                "has_more": False,
+                "remaining_count": 0,
+                "snapshot_generation": 3,
+                "correlation_receipt": "receipt-3",
+            }
+
+    cfg = PuffoCoreToolsConfig(
+        slug="agent-1",
+        device_id="dev-1",
+        keystore=MagicMock(),
+        http_client=MagicMock(),
+        data_client=MagicMock(),
+        inbox_runtime=Runtime(),
+    )
+    dispatch = build_dispatch(cfg)
+    result = await dispatch["read_inbox"](
+        target="channel:sp:ch", cursor="", limit=7
+    )
+    assert result == {
+        "messages": ["whole"],
+        "next_cursor": "",
+        "has_more": False,
+        "remaining_count": 0,
+        "snapshot_generation": 3,
+        "admission_receipt": "[puffo:model-visible-read:receipt-3]",
+    }
+    assert calls == [{
+        "target": "channel:sp:ch",
+        "cursor": "",
+        "limit": 7,
+        "tool_arguments": {"target": "channel:sp:ch", "limit": 7},
+    }]
+
+
+@pytest.mark.asyncio
+async def test_ws_local_reminder_tools_use_the_live_runtime():
+    from puffo_agent.mcp.puffo_core_tools import PuffoCoreToolsConfig
+
+    calls = []
+
+    class Runtime:
+        async def create_reminder(self, **kwargs):
+            calls.append(("create", kwargs))
+            return {"reminder_id": "r", "occurrence_id": "o", "state": "scheduled"}
+
+        async def list_reminders(self, **kwargs):
+            calls.append(("list", kwargs))
+            return {"reminders": []}
+
+        async def cancel_reminder(self, **kwargs):
+            calls.append(("cancel", kwargs))
+            return {"reminder_id": "r", "occurrence_id": "o", "state": "cancelled"}
+
+    cfg = PuffoCoreToolsConfig(
+        slug="agent-1", device_id="dev-1", keystore=MagicMock(),
+        http_client=MagicMock(), data_client=MagicMock(), inbox_runtime=Runtime(),
+    )
+    dispatch = build_dispatch(cfg)
+    assert await dispatch["create_reminder"](
+        content="x", target="channel:sp:ch", intended_at="2026-08-02T12:00:00Z"
+    ) == {"reminder_id": "r", "occurrence_id": "o", "state": "scheduled"}
+    assert await dispatch["list_reminders"](state="scheduled", limit=7) == {"reminders": []}
+    assert await dispatch["cancel_reminder"](reminder_id="r") == {
+        "reminder_id": "r", "occurrence_id": "o", "state": "cancelled",
+    }
+    assert calls == [
+        ("create", {
+            "content": "x", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00Z",
+        }),
+        ("list", {"state": "scheduled", "limit": 7}),
+        ("cancel", {"reminder_id": "r"}),
+    ]
 
 
 @pytest.mark.asyncio

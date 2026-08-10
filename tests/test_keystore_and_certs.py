@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import tempfile
@@ -8,7 +7,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.crypto.canonical import canonicalize, canonicalize_for_signing
 from puffo_agent.crypto.certs import (
-    SUBKEY_TTL_HOURS,
     create_subkey_cert,
     is_subkey_expired,
     needs_rotation,

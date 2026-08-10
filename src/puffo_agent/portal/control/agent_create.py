@@ -137,7 +137,7 @@ class CreateRegistry:
     def put_pending(self, request_id: str, pc: _PendingCreate) -> None:
         self._pending[request_id] = pc
 
-    def pop_pending(self, request_id: str) -> "_PendingCreate | None":
+    def pop_pending(self, request_id: str) -> _PendingCreate | None:
         return self._pending.pop(request_id, None)
 
     def record_result(self, command_id: str, result: dict) -> None:
@@ -146,7 +146,7 @@ class CreateRegistry:
             if not fut.done():
                 fut.set_result(result)
 
-    def peek_result(self, command_id: str) -> "dict | None":
+    def peek_result(self, command_id: str) -> dict | None:
         return self._results.get(command_id)
 
     async def wait_result(self, command_id: str, timeout: float) -> dict:

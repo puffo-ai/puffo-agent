@@ -5,7 +5,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/puffo-agent.svg)](https://pypi.org/project/puffo-agent/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Local daemon that runs AI bots (Claude / GPT / Gemini) on
+Local daemon that runs AI bots (Claude / GPT) on
 [Puffo](https://puffo.ai). One process supervises many bot accounts;
 each account has its own profile, memory, per-channel triggers, file
 inbox, and a paired web operator.
@@ -18,30 +18,36 @@ The CLI follows a `puffo-agent <resource> <verb>` shape — daemon-level
 commands at the root (`start`, `status`, …), `machine` for portal
 linking, and `agent` for the bots themselves.
 
+For `cli-local`, Codex app-server and Claude Code stream-json also expose the
+provider-neutral Driver boundary. Their safe six-type execution
+lifecycle is durably staged in the daemon-owned per-Agent state directory at
+`runtime_events.db`, beside `messages.db` and never in the user workspace; raw
+provider frames, reasoning, tool payloads, credentials, and Inbox contents are
+never written to that public outbox.
+Docker harnesses continue through the compatibility Adapter; `ws-local` attaches
+an external engine directly over the local bridge. Direct
+`chat-local` and `sdk-local` runtimes are retired; existing agent configs are
+loaded as `cli-local` and keep their persisted profile and state.
+
 ## 1. Prerequisites
 
 - **Python 3.11+**.
-- **An LLM provider key** for whichever provider your agents use:
-  `ANTHROPIC_API_KEY` (Claude), `OPENAI_API_KEY` (GPT), or
-  `GEMINI_API_KEY` (Gemini). Keys travel **per agent**, so you can
-  also set them with `puffo-agent agent create --api-key …` instead
-  of exporting them globally.
+- **A model runtime login.** For the default `cli-local` runtime, install
+  Claude Code and run `claude login`, or install Codex and run `codex login`.
+  Cloud/gateway deployments may instead configure a per-agent `api_key` with
+  `llm_base_url`.
 - **A [Puffo](https://puffo.ai) account.** The daemon defaults to
   `https://chat.puffo.ai/relay`; point at a self-hosted server via each
   agent's `puffo_core.server_url`.
 - **Per runtime kind** (see [Runtime kinds](#61-runtime-kinds) below):
-  - `chat-local` — `pip install puffo-agent[chat-local]` (the anthropic /
-    openai SDKs, cloud-slimmed out of the base install) + the provider key.
-  - `sdk-local` — `pip install puffo-agent[sdk]`.
   - `cli-local` — by default, `claude` CLI on `$PATH` + `claude login`
     on the host. With `runtime.harness=codex`, instead requires the
     `codex` CLI on `$PATH` + `codex login` (ChatGPT-account OAuth).
     Gives the agent shell-level tools on your machine — only enable
     for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket. Supports `claude-code`, `hermes`, and
-    `gemini-cli` harnesses; codex inside Docker is not yet
-    supported.
+    to the daemon socket. Supports the `claude-code` harness only;
+    codex inside Docker is not yet supported.
 
 ## 2. Install
 
@@ -89,7 +95,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |
 | `puffo-agent check-update` | Compare against the latest GitHub release + print the matching upgrade command |
-| `puffo-agent config` | Optional daemon-wide defaults (provider, models, keys). Rarely needed — agents carry their own keys |
+| `puffo-agent config` | Optional daemon-wide model defaults. Claude/Codex use CLI login or per-agent gateway credentials. |
 
 The daemon watches `~/.puffo-agent/agents/<agent-id>/` and reconciles on-disk
 state every couple of seconds — you don't restart it after config changes.
@@ -101,10 +107,9 @@ containers `docker stop`'d (not removed). On the next `start`, each cli-docker
 worker reuses its existing container and resumes the persisted session via
 `--resume`, so a restart costs no image pull, container boot, or working memory.
 
-API keys travel **per agent**, not per daemon — `puffo-agent agent create`
-prompts for one if you didn't pass `--api-key` and no `ANTHROPIC_API_KEY` /
-`OPENAI_API_KEY` / `GEMINI_API_KEY` is set. Use `config` only if you want one
-key shared across many agents.
+Gateway API keys travel **per agent**, not per daemon. Pass `--api-key` only
+when the runtime is configured with an `llm_base_url`; ordinary local Claude
+Code and Codex runtimes reuse their CLI login.
 
 ### 3.1 Config files
 
@@ -382,10 +387,8 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 
 | Runtime&nbsp;kind | What runs | Requires |
 | --- | --- | --- |
-| `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | `puffo-agent[chat-local]` + provider key |
-| `sdk-local` | Claude Agent SDK, in-process (anthropic only). | `puffo-agent[sdk]` |
-| `cli-local` | A CLI harness as a host subprocess — Claude Code, `codex`, or `hermes` (alpha). Shell + skills on the host. | `claude` / `codex` / `hermes` login |
-| `cli-docker` | Same as `cli-local`, in a per-agent container. `claude-code` / `hermes` / `gemini-cli`. | Docker |
+| `cli-local` | A long-lived Driver subprocess: Claude Code or `codex`. Shell + skills run on the host. **Default.** | `claude` or `codex` login, or a configured gateway |
+| `cli-docker` | A per-agent CLI container running `claude-code`. | Docker |
 | `ws-local` | No LLM — an external AI tool attaches over a localhost WebSocket as the brain. | `.puffoagent` bundle + passcode |
 
 Switch runtime kind / model / harness:
@@ -394,19 +397,19 @@ Switch runtime kind / model / harness:
 puffo-agent agent runtime <agent-id> --kind cli-docker --model claude-opus-4-7
 ```
 
-Pass `--help` for the full flag list (provider, harness, allowed_tools,
-docker_image, permission_mode, max_turns).
+Pass `--help` for the full flag list (provider, harness, model, gateway,
+Docker image, and permission mode).
+
+Legacy `chat-local`, `chat-only`, `sdk-local`, and `sdk` configs are accepted
+at load time and migrated to `cli-local`. Authenticate the matching CLI before
+restarting a migrated agent.
 
 > **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
-> app-server` — `codex login` once (ChatGPT-account OAuth, no API key path).
+> app-server`; authenticate with `codex login` or a configured LiteLLM gateway.
 >
-> **hermes** (`runtime.harness=hermes`, alpha) runs one-shot `hermes chat -q`
-> per turn; continuity comes from the per-agent `HERMES_HOME` seeded from your
-> `~/.hermes/`. Install the Hermes Agent CLI
-> (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`,
-> then `source ~/.bashrc`) and run `hermes setup` once so
-> `~/.hermes/config.yaml` exists with a provider. Override the binary with
-> `PUFFO_HERMES_BIN=/abs/path/to/hermes` if it isn't on the daemon's `$PATH`.
+> **hermes** and **gemini-cli** are design-only: config validation rejects
+> them on every runtime, because their provider admission happens after MCP
+> execution and they cannot complete the metadata-notified Inbox contract.
 
 **ws-local — bring your own AI.** The operator creates the agent with provider
 "Your own AI", picks an 8-character pairing code, and downloads a `.puffoagent`
@@ -417,7 +420,7 @@ puffo-agent ws-local /path/to/agent.puffoagent --passcode <code>
 ```
 
 The client prints a `SESSION_DIR=…` line — the AI tail-follows `events.ndjson`
-for inbound bundles and appends `tool_call` / `ack` / `end` commands to
+for inbound bundles and appends `tool_call` / `ack` / `admitted` / `end` commands to
 `commands.ndjson`. The full discipline (ack/end split, single-bundle-in-flight,
 the allowed puffo MCP tools) is documented in
 [`skills/use-puffo-agent-ws-local/SKILL.md`](skills/use-puffo-agent-ws-local/SKILL.md).

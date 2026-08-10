@@ -76,16 +76,21 @@ def request_prompt_refresh(workspace_dir: str | Path, reason: str) -> bool:
     try:
         flag_path.parent.mkdir(parents=True, exist_ok=True)
         flag_path.write_text(
-            json.dumps({
-                "version": 1,
-                "requested_at": int(time.time()),
-                "reason": reason,
-            }) + "\n",
+            json.dumps(
+                {
+                    "version": 1,
+                    "requested_at": int(time.time()),
+                    "reason": reason,
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
     except OSError as exc:
         logger.warning(
-            "refresh_agent.flag write failed (%s): %s", reason, exc,
+            "refresh_agent.flag write failed (%s): %s",
+            reason,
+            exc,
         )
         return False
     return True
@@ -133,7 +138,9 @@ def _is_briefing_topic(path: Path) -> bool:
 
 
 def _read_briefing_entries(
-    memory_root: Path, *, enforce_per_file: bool = True,
+    memory_root: Path,
+    *,
+    enforce_per_file: bool = True,
 ) -> tuple[str, list[tuple[str, str]]]:
     """``(profile_body, [(stem, body), ...])`` in compile order:
     profile first, remaining topics by sorted filename. Empty bodies
@@ -156,8 +163,8 @@ def _read_briefing_entries(
         # symlinked ancestor dir (e.g. a symlinked briefing/).
         if not _resolves_within_root(path, memory_root):
             logger.warning(
-                "memory briefing: skipping %s — resolves outside the "
-                "memory root", path,
+                "memory briefing: skipping %s — resolves outside the memory root",
+                path,
             )
             continue
         body = path.read_text(encoding="utf-8")
@@ -235,99 +242,101 @@ def migrate_flat_memory(memory_root: Path) -> list[str]:
     if not memory_root.is_dir():
         return []
     ensure_memory_tree(memory_root)
-    flat = []
-    for p in sorted(memory_root.glob("*.md")):
-        if not p.is_file() or p.name == "README.md" or p.name.startswith("."):
-            continue
-        # A symlinked flat file (or one resolving outside the root)
-        # must never be read or moved into the tree — that would fold
-        # arbitrary host content into the agent's memory.
-        if p.is_symlink() or not _resolves_within_root(p, memory_root):
-            logger.warning(
-                "memory migrate: skipping %s — symlink or resolves "
-                "outside the memory root", p,
-            )
-            continue
-        flat.append(p)
+    flat = _flat_memory_files(memory_root)
     if not flat:
         return []
+    return _migrate_flat_files(memory_root, flat)
+
+
+def _flat_memory_files(memory_root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in sorted(memory_root.glob("*.md")):
+        if not path.is_file() or path.name == "README.md" or path.name.startswith("."):
+            continue
+        if path.is_symlink() or not _resolves_within_root(path, memory_root):
+            logger.warning(
+                "memory migrate: skipping %s — symlink or resolves outside the memory root",
+                path,
+            )
+            continue
+        files.append(path)
+    return files
+
+
+def _migrate_flat_files(memory_root: Path, flat: list[Path]) -> list[str]:
+    from .memory_store import MemoryStore
 
     briefing_dir = memory_root / BRIEFING_DIR
     notes_dir = memory_root / NOTES_DIR
     pointer_path = briefing_dir / f"{MIGRATED_NOTES_TOPIC}.md"
-
-    from .memory_store import MemoryStore
-
+    profile_body, entries = _read_briefing_entries(memory_root, enforce_per_file=False)
+    entry_map = dict(entries)
     store = MemoryStore(memory_root)
-
-    # Live simulation state: recomposing from these on every candidate
-    # keeps the fit check exact (section headers + join separators
-    # count toward the total, and so do appended pointer lines).
-    profile_body, entries = _read_briefing_entries(
-        memory_root, enforce_per_file=False,
-    )
-    entry_map: dict[str, str] = dict(entries)
-
-    def compiled_size_with(stem: str, body: str) -> int:
-        candidate = dict(entry_map)
-        candidate[stem] = body.strip()
-        composed = _compose_briefing(
-            profile_body, sorted(candidate.items()),
-        )
-        return _byte_size(composed)
-
     moved: list[str] = []
     for path in flat:
         body = path.read_text(encoding="utf-8")
-        fits_briefing = (
-            _byte_size(body) <= PER_FILE_LIMIT
-            and path.name != PROFILE_BRIEFING_NAME
-            and not (briefing_dir / path.name).exists()
-            and compiled_size_with(path.stem, body) <= TOTAL_LIMIT
-        )
-        if fits_briefing:
+        if _fits_briefing(path, body, briefing_dir, profile_body, entry_map):
             dest = briefing_dir / path.name
             path.rename(dest)
             entry_map[path.stem] = body.strip()
             moved.append(f"{BRIEFING_DIR}/{dest.name}")
             continue
-        dest = notes_dir / path.name
-        if dest.exists():
-            dest = notes_dir / f"{path.stem}-migrated.md"
-            n = 2
-            while dest.exists():
-                dest = notes_dir / f"{path.stem}-migrated-{n}.md"
-                n += 1
+        dest = _migrate_note_path(notes_dir, path)
         path.rename(dest)
         moved.append(f"{NOTES_DIR}/{dest.name}")
-        pointer_line = (
-            f"- {NOTES_DIR}/{dest.name} — migrated from flat memory\n"
-        )
-        existing = ""
-        if pointer_path.exists():
-            existing = pointer_path.read_text(encoding="utf-8")
-        elif not entry_map.get(MIGRATED_NOTES_TOPIC):
-            existing = "# Migrated notes\n\n"
-        new_body = existing + pointer_line
-        try:
-            # Route the pointer through the store: same atomic write and
-            # per-file/total budget validation as any briefing topic, so
-            # a migration can never leave a briefing that fails the next
-            # compile.
-            store.put_memory_file(
-                f"{BRIEFING_DIR}/{MIGRATED_NOTES_TOPIC}.md", new_body,
-            )
-        except BriefingCompileError as exc:
-            # The note itself already migrated to notes/; only its
-            # pointer line is dropped so the briefing stays compilable.
-            logger.warning(
-                "memory migrate: pointer to %s skipped (%s) — the note "
-                "migrated but the briefing budget is full",
-                dest.name, exc.code,
-            )
-            continue
-        entry_map[MIGRATED_NOTES_TOPIC] = new_body.strip()
+        _write_migration_pointer(store, pointer_path, entry_map, dest)
     return moved
+
+
+def _fits_briefing(
+    path: Path,
+    body: str,
+    briefing_dir: Path,
+    profile_body: str,
+    entry_map: dict[str, str],
+) -> bool:
+    candidate = dict(entry_map)
+    candidate[path.stem] = body.strip()
+    return (
+        _byte_size(body) <= PER_FILE_LIMIT
+        and path.name != PROFILE_BRIEFING_NAME
+        and not (briefing_dir / path.name).exists()
+        and _byte_size(_compose_briefing(profile_body, sorted(candidate.items())))
+        <= TOTAL_LIMIT
+    )
+
+
+def _migrate_note_path(notes_dir: Path, path: Path) -> Path:
+    dest = notes_dir / path.name
+    if not dest.exists():
+        return dest
+    dest = notes_dir / f"{path.stem}-migrated.md"
+    index = 2
+    while dest.exists():
+        dest = notes_dir / f"{path.stem}-migrated-{index}.md"
+        index += 1
+    return dest
+
+
+def _write_migration_pointer(
+    store, pointer_path: Path, entry_map: dict[str, str], dest: Path
+) -> None:
+    existing = (
+        pointer_path.read_text(encoding="utf-8")
+        if pointer_path.exists()
+        else ("" if entry_map.get(MIGRATED_NOTES_TOPIC) else "# Migrated notes\n\n")
+    )
+    new_body = existing + f"- {NOTES_DIR}/{dest.name} — migrated from flat memory\n"
+    try:
+        store.put_memory_file(f"{BRIEFING_DIR}/{MIGRATED_NOTES_TOPIC}.md", new_body)
+    except BriefingCompileError as exc:
+        logger.warning(
+            "memory migrate: pointer to %s skipped (%s) — the note migrated but the briefing budget is full",
+            dest.name,
+            exc.code,
+        )
+        return
+    entry_map[MIGRATED_NOTES_TOPIC] = new_body.strip()
 
 
 def render_profile_briefing(
@@ -337,16 +346,25 @@ def render_profile_briefing(
     role: str = "",
     role_short: str = "",
     soul: str = "",
+    puffo_handle: str = "",
 ) -> str:
     """Identity framing for ``briefing/profile.md``: display name,
     role lines, soul body. Deliberately NO ``## Instructions`` and no
     runtime-behavior sections — those live in the agent-root
     profile.md / primer. Missing fields degrade to a minimal identity
-    line derived from agent id + display name."""
-    name = display_name or agent_id or "agent"
+    line derived from agent id + display name.
+
+    ``puffo_handle`` is the agent's authenticated ``puffo_core.slug`` —
+    its unique identity on the network, and what peers actually address.
+    An imported agent can keep a local directory ``agent_id`` that
+    differs from it, so the handle wins for the model-facing line while
+    ``agent_id`` keeps naming local storage.
+    """
+    handle = puffo_handle or agent_id
+    name = display_name or handle or "agent"
     identity = f"You are {name}"
-    if agent_id:
-        identity += f" (agent `{agent_id}`)"
+    if handle:
+        identity += f" (agent `{handle}`)"
     identity += "."
     lines = [f"# {name}", "", identity]
     if role:
@@ -366,12 +384,15 @@ def sync_profile_briefing(
     role: str = "",
     role_short: str = "",
     soul: str = "",
+    puffo_handle: str = "",
 ) -> Path:
     """(Re)write the managed block of ``briefing/profile.md`` from the
     native profile surfaces (agent.yml identity fields + the ``# Soul``
     body of agent-root profile.md). Content between the
     ``puffo:managed-profile`` markers is regenerated on every managed
-    rebuild; user-authored text outside the markers is preserved."""
+    rebuild; user-authored text outside the markers is preserved — which
+    is also how an imported agent picks up its authenticated
+    ``puffo_handle`` with no migration step."""
     memory_root = Path(memory_root)
     ensure_memory_tree(memory_root)
     path = memory_root / BRIEFING_DIR / PROFILE_BRIEFING_NAME
@@ -381,13 +402,16 @@ def sync_profile_briefing(
         role=role,
         role_short=role_short,
         soul=soul,
+        puffo_handle=puffo_handle,
     )
     block = f"{PROFILE_MANAGED_BEGIN}\n{rendered}{PROFILE_MANAGED_END}\n"
     if path.exists():
         text = path.read_text(encoding="utf-8")
         if _MANAGED_BLOCK_RE.search(text):
             new_text = _MANAGED_BLOCK_RE.sub(
-                lambda _m: block.rstrip("\n"), text, count=1,
+                lambda _m: block.rstrip("\n"),
+                text,
+                count=1,
             )
         else:
             # Pre-existing user file without markers: identity framing
@@ -398,7 +422,8 @@ def sync_profile_briefing(
     from .memory_store import MemoryStore
 
     MemoryStore(memory_root).put_memory_file(
-        f"{BRIEFING_DIR}/{PROFILE_BRIEFING_NAME}", new_text,
+        f"{BRIEFING_DIR}/{PROFILE_BRIEFING_NAME}",
+        new_text,
     )
     return path
 
@@ -423,7 +448,12 @@ class MemoryManager:
         safe_topic = topic.replace(" ", "_").replace("/", "-")
         # Aware-UTC with ``Z`` suffix (``datetime.utcnow`` is
         # deprecated in 3.12+).
-        updated = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        updated = (
+            datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
         body = f"---\ntopic: {topic}\nupdated: {updated}\n---\n\n{content}\n"
         # The store validates sizes (per-file + would-be compiled
         # total, raising BriefingCompileError) before any write, so an
@@ -431,7 +461,8 @@ class MemoryManager:
         # refresh flag stays owned by save() — the store gets no
         # workspace_dir — so its reason keeps the M1 shape.
         MemoryStore(self.memory_dir).put_memory_file(
-            f"{BRIEFING_DIR}/{safe_topic}.md", body,
+            f"{BRIEFING_DIR}/{safe_topic}.md",
+            body,
         )
         self._request_refresh(topic)
 

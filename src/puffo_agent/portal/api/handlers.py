@@ -15,19 +15,16 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from aiohttp import web
 
-from ...crypto.http_auth import VerifyError, is_timestamp_fresh, verify_request
-from ...crypto.encoding import base64url_decode
 from ...agent.shared_content import rewrite_profile_name
+from ...crypto.encoding import base64url_decode
 from ..state import (
     AgentConfig,
     PuffoCoreConfig,
-    RuntimeConfig,
     RuntimeState,
     TriggerRules,
     agent_claude_user_dir,
@@ -40,11 +37,31 @@ from ..state import (
     refresh_agent_flag_path,
     restart_flag_path,
 )
-from .certs import (
-    CertError, verify_device_cert, verify_identity_cert, verify_slug_binding,
-)
+from .audit_log import parse_log_query, read_audit_log
 from .ownership import is_owner
-from .pairing import Pairing, clear_pairing, load_pairing, now_ms, save_pairing
+from .pair_endpoint import pair as pair
+from .pairing import clear_pairing, load_pairing, now_ms
+from .profile_content import (
+    MAX_PROFILE_SUMMARY_BYTES,
+    MAX_ROLE_LEN,
+    MAX_ROLE_SHORT_LEN,
+)
+from .profile_content import (
+    derive_role_short as _derive_role_short,
+)
+from .profile_content import (
+    profile_summary as _profile_summary,
+)
+from .profile_content import (
+    update_profile_summary as _update_profile_summary,
+)
+from .provision_validation import (
+    ProvisionError,
+)
+from .provision_validation import (
+    verify_agent_bundle as _verify_agent_bundle,
+)
+from .runtime_patch import apply_runtime_patch, runtime_response
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +105,7 @@ async def info(_request: web.Request) -> web.Response:
     pairing = load_pairing()
     try:
         from importlib.metadata import version
+
         daemon_version = version("puffo-agent")
     except Exception:
         daemon_version = "unknown"
@@ -98,24 +116,29 @@ async def info(_request: web.Request) -> web.Response:
         resolve_codex_bin,
     )
     from ..control.store import current_machine_id
-    return web.json_response({
-        "service": "puffo-agent-bridge",
-        "version": "v1",
-        "runtime": "puffo-agent",
-        "daemon_version": daemon_version,
-        "pid": os.getpid(),
-        # Lets a web client that sees both the remote-linked machine and this
-        # local bridge recognise they're the same host and drop the dup UI.
-        "machine_id": current_machine_id(),
-        "agent_count": len(discover_agents()),
-        "paired": pairing is not None,
-        "paired_slug": pairing.slug if pairing else None,
-        "paired_device_id": pairing.device_id if pairing else None,
-        "cli_tools": {
-            "claude-code": _cli_tool_status(resolve_claude_bin, claude_has_credentials),
-            "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
-        },
-    })
+
+    return web.json_response(
+        {
+            "service": "puffo-agent-bridge",
+            "version": "v1",
+            "runtime": "puffo-agent",
+            "daemon_version": daemon_version,
+            "pid": os.getpid(),
+            # Lets a web client that sees both the remote-linked machine and this
+            # local bridge recognise they're the same host and drop the dup UI.
+            "machine_id": current_machine_id(),
+            "agent_count": len(discover_agents()),
+            "paired": pairing is not None,
+            "paired_slug": pairing.slug if pairing else None,
+            "paired_device_id": pairing.device_id if pairing else None,
+            "cli_tools": {
+                "claude-code": _cli_tool_status(
+                    resolve_claude_bin, claude_has_credentials
+                ),
+                "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
+            },
+        }
+    )
 
 
 async def list_providers(_request: web.Request) -> web.Response:
@@ -145,153 +168,6 @@ async def list_providers(_request: web.Request) -> web.Response:
 # ────────────────────────────────────────────────────────────────────
 
 
-def _pair_reject(reason: str, **fields) -> web.Response:
-    """Log + return a 400 with structured detail so operators can see
-    which check failed in the daemon log."""
-    extra = " ".join(f"{k}={v!r}" for k, v in fields.items())
-    logger.warning("bridge: pair rejected: %s%s", reason, f" {extra}" if extra else "")
-    return _bad(reason)
-
-
-async def pair(request: web.Request) -> web.Response:
-    """Pair this daemon to a (slug, device_id).
-
-    Body: ``{ identity_cert, device_cert, slug_binding }``. Headers
-    carry the standard ``x-puffo-*`` set; signature is over the body
-    using ``device_cert.keys.signing.public_key``. Verification
-    order:
-
-      1. Both certs self-verify against ``root_public_key``.
-      2. ``slug_binding.slug`` == ``x-puffo-slug``.
-      3. ``identity_cert.identity_type`` == ``human`` (agents can't
-         pair to drive themselves).
-      4. ``device_cert.device_id`` == ``x-puffo-signer-id``.
-      5. Request signature verifies against the device signing key.
-
-    A successful POST overwrites any existing pairing — equivalent
-    to ``puffo-agent pairing unpair`` followed by re-pair. Letting
-    both paths win means the web client can take over a daemon
-    without dropping the operator to a terminal.
-    """
-    body = await request.read()
-    try:
-        payload = await request.json()
-    except Exception:
-        return _pair_reject("body must be JSON")
-    identity_cert = payload.get("identity_cert")
-    device_cert = payload.get("device_cert")
-    slug_binding = payload.get("slug_binding")
-    if (
-        not isinstance(identity_cert, dict)
-        or not isinstance(device_cert, dict)
-        or not isinstance(slug_binding, dict)
-    ):
-        return _pair_reject(
-            "identity_cert, device_cert, and slug_binding all required",
-            identity_cert_type=type(identity_cert).__name__,
-            device_cert_type=type(device_cert).__name__,
-            slug_binding_type=type(slug_binding).__name__,
-        )
-
-    try:
-        root_pk = verify_identity_cert(identity_cert)
-    except CertError as exc:
-        return _pair_reject(
-            f"identity_cert: {exc}",
-            cert_keys=sorted(identity_cert.keys()) if isinstance(identity_cert, dict) else None,
-        )
-    try:
-        device_signing_pk = verify_device_cert(device_cert, root_pk)
-    except CertError as exc:
-        return _pair_reject(
-            f"device_cert: {exc}",
-            cert_keys=sorted(device_cert.keys()) if isinstance(device_cert, dict) else None,
-        )
-    try:
-        # Returns the disambiguated slug ("alice-a62c") — the form
-        # used by the chat protocol, not the bare username.
-        cert_slug = verify_slug_binding(slug_binding, root_pk)
-    except CertError as exc:
-        return _pair_reject(
-            f"slug_binding: {exc}",
-            binding_keys=sorted(slug_binding.keys()) if isinstance(slug_binding, dict) else None,
-        )
-
-    if identity_cert.get("identity_type") != "human":
-        return _pair_reject(
-            "identity_type must be 'human'",
-            got=identity_cert.get("identity_type"),
-        )
-
-    cert_device_id = device_cert.get("device_id")
-    hdr_slug = request.headers.get("x-puffo-slug", "")
-    hdr_signer_id = request.headers.get("x-puffo-signer-id", "")
-    hdr_ts = request.headers.get("x-puffo-timestamp", "")
-    hdr_nonce = request.headers.get("x-puffo-nonce", "")
-    hdr_sig = request.headers.get("x-puffo-signature", "")
-
-    if cert_slug != hdr_slug:
-        return _pair_reject(
-            "slug_binding.slug does not match x-puffo-slug",
-            cert_slug=cert_slug, hdr_slug=hdr_slug,
-        )
-    if cert_device_id != hdr_signer_id:
-        return _pair_reject(
-            "device_cert.device_id does not match x-puffo-signer-id",
-            cert_device_id=cert_device_id, hdr_signer_id=hdr_signer_id,
-        )
-    if not is_timestamp_fresh(hdr_ts):
-        return _pair_reject("stale x-puffo-timestamp", ts=hdr_ts)
-    if not hdr_nonce or not hdr_sig:
-        return _pair_reject("missing x-puffo-nonce or x-puffo-signature")
-
-    try:
-        verify_request(
-            public_key=device_signing_pk,
-            method=request.method,
-            path=request.path_qs,
-            timestamp=hdr_ts,
-            nonce=hdr_nonce,
-            body=body,
-            signature_b64=hdr_sig,
-        )
-    except VerifyError as exc:
-        return _pair_reject(
-            f"signature: {exc}",
-            method=request.method, path=request.path_qs,
-        )
-
-    existing = load_pairing()
-    replaced_existing = (
-        existing is not None
-        and (existing.slug != cert_slug or existing.device_id != cert_device_id)
-    )
-
-    from ...crypto.encoding import base64url_encode
-    pairing = Pairing(
-        slug=cert_slug,
-        device_id=cert_device_id,
-        root_public_key=base64url_encode(root_pk),
-        device_signing_public_key=base64url_encode(device_signing_pk),
-        identity_cert=identity_cert,
-        device_cert=device_cert,
-        paired_at=now_ms(),
-    )
-    save_pairing(pairing)
-    if replaced_existing:
-        logger.info(
-            "bridge: replaced pairing prev_slug=%s prev_device_id=%s -> slug=%s device_id=%s",
-            existing.slug, existing.device_id, cert_slug, cert_device_id,
-        )
-    else:
-        logger.info("bridge: paired with slug=%s device_id=%s", cert_slug, cert_device_id)
-    return web.json_response({
-        "paired_slug": pairing.slug,
-        "paired_device_id": pairing.device_id,
-        "paired_at": pairing.paired_at,
-    })
-
-
 # ────────────────────────────────────────────────────────────────────
 # /v1/agents and friends
 # ────────────────────────────────────────────────────────────────────
@@ -302,9 +178,9 @@ def _operator_has_active_link(paired_root_pubkey: str) -> bool:
     if not paired_root_pubkey:
         return False
     from ..control.store import load_pairings
+
     return any(
-        p.operator_root_pubkey == paired_root_pubkey
-        for p in load_pairings().values()
+        p.operator_root_pubkey == paired_root_pubkey for p in load_pairings().values()
     )
 
 
@@ -332,42 +208,32 @@ async def list_agents(request: web.Request) -> web.Response:
             refresh_agent_flag_path(workspace).exists()
             or restart_flag_path(aid).exists()
         )
-        rs_status = "restarting" if restart_pending else (rs.status if rs else "unknown")
-        items.append({
-            "id": aid,
-            "display_name": cfg.display_name,
-            "avatar_url": cfg.avatar_url,
-            "puffo_core_slug": cfg.puffo_core.slug,
-            "space_id": cfg.puffo_core.space_id,
-            "profile_summary": _profile_summary(cfg),
-            "state": cfg.state,
-            "runtime_kind": cfg.runtime.kind,
-            "runtime_harness": cfg.runtime.harness,
-            "runtime_model": cfg.runtime.model,
-            "runtime_status": rs_status,
-            "runtime_health": rs.health if rs else "unknown",
-            "msg_count": rs.msg_count if rs else 0,
-            "owned": is_owner(aid, paired_root),
-            # Operator slug who created the agent. Empty string for
-            # agent.yml files written before this field existed; UI
-            # degrades to the ``owned`` boolean alone.
-            "operator_slug": cfg.puffo_core.operator_slug or "",
-        })
+        rs_status = (
+            "restarting" if restart_pending else (rs.status if rs else "unknown")
+        )
+        items.append(
+            {
+                "id": aid,
+                "display_name": cfg.display_name,
+                "avatar_url": cfg.avatar_url,
+                "puffo_core_slug": cfg.puffo_core.slug,
+                "space_id": cfg.puffo_core.space_id,
+                "profile_summary": _profile_summary(cfg),
+                "state": cfg.state,
+                "runtime_kind": cfg.runtime.kind,
+                "runtime_harness": cfg.runtime.harness,
+                "runtime_model": cfg.runtime.model,
+                "runtime_status": rs_status,
+                "runtime_health": rs.health if rs else "unknown",
+                "msg_count": rs.msg_count if rs else 0,
+                "owned": is_owner(aid, paired_root),
+                # Operator slug who created the agent. Empty string for
+                # agent.yml files written before this field existed; UI
+                # degrades to the ``owned`` boolean alone.
+                "operator_slug": cfg.puffo_core.operator_slug or "",
+            }
+        )
     return web.json_response({"agents": items})
-
-
-from ..profile_sync import _soul_section_span  # noqa: E402  re-export shim
-
-
-def _profile_summary(cfg: AgentConfig) -> str:
-    """Read profile.md and return its soul-section body. Empty on
-    read failure / no soul heading."""
-    from ..profile_sync import extract_soul_body
-    try:
-        text = cfg.resolve_profile_path().read_text(encoding="utf-8")
-    except Exception:
-        return ""
-    return extract_soul_body(text)
 
 
 async def get_agent(request: web.Request) -> web.Response:
@@ -384,45 +250,45 @@ async def get_agent(request: web.Request) -> web.Response:
         "model": cfg.runtime.model,
         "harness": cfg.runtime.harness,
         "permission_mode": cfg.runtime.permission_mode,
-        "max_turns": cfg.runtime.max_turns,
-        "allowed_tools": list(cfg.runtime.allowed_tools),
         "docker_image": cfg.runtime.docker_image,
         # Only owners see the actual key. Non-owners get a boolean
         # so the UI can still render "(set)" / "(inherit)".
         "api_key": cfg.runtime.api_key if owned else None,
         "api_key_set": bool(cfg.runtime.api_key),
     }
-    return web.json_response({
-        "id": cfg.id,
-        "display_name": cfg.display_name,
-        "avatar_url": cfg.avatar_url,
-        "state": cfg.state,
-        "owned": owned,
-        "puffo_core": {
-            "server_url": cfg.puffo_core.server_url,
-            "slug": cfg.puffo_core.slug,
-            "device_id": cfg.puffo_core.device_id,
-            "space_id": cfg.puffo_core.space_id,
-        },
-        "runtime": runtime_dict,
-        "triggers": {
-            "on_mention": cfg.triggers.on_mention,
-            "on_dm": cfg.triggers.on_dm,
-        },
-        "profile_path": str(cfg.resolve_profile_path()),
-        "memory_dir": str(cfg.resolve_memory_dir()),
-        "workspace_dir": str(cfg.resolve_workspace_dir()),
-        "created_at": cfg.created_at,
-        "runtime_state": _runtime_state_dict(rs),
-    })
+    return web.json_response(
+        {
+            "id": cfg.id,
+            "display_name": cfg.display_name,
+            "avatar_url": cfg.avatar_url,
+            "state": cfg.state,
+            "owned": owned,
+            "puffo_core": {
+                "server_url": cfg.puffo_core.server_url,
+                "slug": cfg.puffo_core.slug,
+                "device_id": cfg.puffo_core.device_id,
+                "space_id": cfg.puffo_core.space_id,
+            },
+            "runtime": runtime_dict,
+            "triggers": {
+                "on_mention": cfg.triggers.on_mention,
+                "on_dm": cfg.triggers.on_dm,
+            },
+            "profile_path": str(cfg.resolve_profile_path()),
+            "memory_dir": str(cfg.resolve_memory_dir()),
+            "workspace_dir": str(cfg.resolve_workspace_dir()),
+            "created_at": cfg.created_at,
+            "runtime_state": _runtime_state_dict(rs),
+        }
+    )
 
 
 async def update_runtime(request: web.Request) -> web.Response:
     """Patch the agent's runtime block. Owner-only.
 
     Accepts any subset of: ``kind``, ``provider``, ``model``,
-    ``harness``, ``api_key``, ``permission_mode``, ``sandbox``,
-    ``allowed_tools``, ``docker_image``, ``max_turns``. Missing fields
+    ``harness``, ``api_key``, ``permission_mode``, ``sandbox``, and
+    ``docker_image``. Missing fields
     are untouched. ``harness`` editing requires the corresponding CLI
     to already be installed + authenticated on the host
     (`claude login` / `codex login` / ...) — the worker will hit
@@ -453,79 +319,25 @@ async def update_runtime(request: web.Request) -> web.Response:
     cfg = AgentConfig.load(agent_id)
     rt = cfg.runtime
 
-    if "kind" in payload:
-        rt.kind = str(payload["kind"])
-    if "provider" in payload:
-        rt.provider = str(payload["provider"])
-    if "harness" in payload:
-        rt.harness = str(payload["harness"])
-    if "model" in payload:
-        rt.model = str(payload["model"])
-    if "api_key" in payload:
-        rt.api_key = str(payload["api_key"])
-    if "permission_mode" in payload:
-        rt.permission_mode = str(payload["permission_mode"])
-    if "sandbox" in payload:
-        sandbox = str(payload["sandbox"])
-        if sandbox not in ("read-only", "workspace-write", "danger-full-access"):
-            return _bad(
-                "sandbox must be one of: read-only, workspace-write, "
-                "danger-full-access"
-            )
-        rt.sandbox = sandbox
-    if "allowed_tools" in payload:
-        tools = payload["allowed_tools"]
-        if not isinstance(tools, list):
-            return _bad("allowed_tools must be a list of strings")
-        rt.allowed_tools = [str(t) for t in tools]
-    if "docker_image" in payload:
-        rt.docker_image = str(payload["docker_image"])
-    if "max_turns" in payload:
-        try:
-            rt.max_turns = int(payload["max_turns"])
-        except (TypeError, ValueError):
-            return _bad("max_turns must be an integer")
-
-    # Catch invalid combos here so the worker doesn't crash on the
-    # next reconcile tick.
-    from ..runtime_matrix import validate_triple
-    result = validate_triple(rt.kind, rt.provider, rt.harness)
-    if not result.ok:
-        return _bad(f"runtime: {result.error}")
+    error = apply_runtime_patch(rt, payload)
+    if error is not None:
+        return _bad(error)
 
     cfg.save()
     logger.info(
         "bridge: updated runtime for agent=%s kind=%s provider=%s model=%s",
-        agent_id, rt.kind, rt.provider, rt.model or "(default)",
+        agent_id,
+        rt.kind,
+        rt.provider,
+        rt.model or "(default)",
     )
-    return web.json_response({
-        "agent_id": agent_id,
-        "runtime": {
-            "kind": rt.kind,
-            "provider": rt.provider,
-            "model": rt.model,
-            "api_key_set": bool(rt.api_key),
-            "permission_mode": rt.permission_mode,
-            "sandbox": rt.sandbox,
-            "harness": rt.harness,
-            "allowed_tools": list(rt.allowed_tools),
-            "docker_image": rt.docker_image,
-            "max_turns": rt.max_turns,
-        },
-        "note": "daemon will restart this agent on the next reconcile tick (~2s)",
-    })
-
-
-MAX_ROLE_LEN = 140
-MAX_ROLE_SHORT_LEN = 32
-
-# PUF-208 v2: server-side cap on soul / profile_summary content.
-# Web UI types up to 6000 + supports a .md upload up to 10000; this
-# is the load-bearing storage cap that any caller (web, CLI, future
-# automation) must respect. UTF-8 byte count rather than codepoints
-# so the cap matches what gets written to profile.md and read back
-# off disk — CJK-heavy souls fit about 3000-3300 characters.
-MAX_PROFILE_SUMMARY_BYTES = 10000
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "runtime": runtime_response(rt),
+            "note": "daemon will restart this agent on the next reconcile tick (~2s)",
+        }
+    )
 
 
 async def update_profile(request: web.Request) -> web.Response:
@@ -552,142 +364,177 @@ async def update_profile(request: web.Request) -> web.Response:
     is a 400 — the server enforces the same rule but it's cheaper to
     catch it before the round-trip.
     """
-    import base64
+    context = await _profile_edit_context(request)
+    if isinstance(context, web.Response):
+        return context
+    agent_id, cfg, payload = context
+    error, avatar_bytes, summary = _validate_profile_edit(payload)
+    if error:
+        return _bad(error)
+    patch, avatar_url, warning = await _prepare_profile_patch(
+        agent_id, cfg, payload, avatar_bytes
+    )
+    old_display_name = cfg.display_name
+    renamed = _persist_profile_edit(cfg, payload, avatar_url, summary)
+    if summary is not None:
+        patch["soul"] = summary
+    _post_persist_profile_edit(cfg, old_display_name, renamed, payload, summary)
+    warning = await _sync_profile_patch(cfg, patch, warning)
+    return web.json_response(_profile_edit_response(agent_id, cfg, warning))
 
+
+async def _profile_edit_context(
+    request: web.Request,
+) -> tuple[str, AgentConfig, dict] | web.Response:
     agent_id = request.match_info["id"]
     if not agent_yml_path(agent_id).exists():
         return _not_found("agent not found")
-
-    paired_root = request["paired_root_pubkey"]
-    if not is_owner(agent_id, paired_root):
+    if not is_owner(agent_id, request["paired_root_pubkey"]):
         return web.json_response(
-            {"error": "only the agent's operator can edit profile"},
-            status=403,
+            {"error": "only the agent's operator can edit profile"}, status=403
         )
-
     try:
         payload = await request.json()
     except Exception:
         return _bad("body must be JSON")
     if not isinstance(payload, dict):
         return _bad("body must be a JSON object")
+    return agent_id, AgentConfig.load(agent_id), payload
 
-    cfg = AgentConfig.load(agent_id)
-    # Snapshot pre-edit display_name to detect a rename post-save.
-    old_display_name = cfg.display_name
-    new_display_name = payload.get("display_name")
+
+def _validate_profile_edit(
+    payload: dict,
+) -> tuple[str | None, bytes | None, str | None]:
+    import base64
+
+    role, role_short = payload.get("role"), payload.get("role_short")
+    if role is None and role_short is not None:
+        return "role_short cannot be set without role", None, None
+    if isinstance(role, str) and len(role) > MAX_ROLE_LEN:
+        return f"role must be at most {MAX_ROLE_LEN} characters", None, None
+    if isinstance(role_short, str) and len(role_short) > MAX_ROLE_SHORT_LEN:
+        return f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters", None, None
     avatar_b64 = payload.get("avatar_bytes_b64")
-    new_role = payload.get("role")
-    new_role_short = payload.get("role_short")
-
-    # Mirror the server-side INVALID_ROLE_SHORT 400 — keeps clients
-    # from sending an inconsistent patch that the server would reject.
-    if new_role is None and new_role_short is not None:
-        return _bad("role_short cannot be set without role")
-    if isinstance(new_role, str) and len(new_role) > MAX_ROLE_LEN:
-        return _bad(f"role must be at most {MAX_ROLE_LEN} characters")
-    if isinstance(new_role_short, str) and len(new_role_short) > MAX_ROLE_SHORT_LEN:
-        return _bad(
-            f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters",
-        )
-
-    avatar_bytes: bytes | None = None
-    if avatar_b64 is not None:
-        if not isinstance(avatar_b64, str):
-            return _bad("avatar_bytes_b64 must be a base64 string")
-        try:
-            avatar_bytes = base64.b64decode(avatar_b64)
-        except Exception as exc:
-            return _bad(f"avatar_bytes_b64 decode: {exc}")
-        if len(avatar_bytes) > MAX_AVATAR_BYTES:
-            return _bad(f"avatar exceeds {MAX_AVATAR_LABEL} cap")
-
-    new_avatar_url: str | None = None
-    sync_warning: str | None = None
-    profile_patch: dict[str, Any] = {}
-    if isinstance(new_display_name, str):
-        profile_patch["display_name"] = new_display_name.strip()
-    if avatar_bytes is not None:
-        try:
-            new_avatar_url = await _upload_avatar_via_agent_keystore(
-                cfg, avatar_bytes,
+    if avatar_b64 is not None and not isinstance(avatar_b64, str):
+        return "avatar_bytes_b64 must be a base64 string", None, None
+    try:
+        avatar = base64.b64decode(avatar_b64) if avatar_b64 is not None else None
+    except Exception as exc:
+        return f"avatar_bytes_b64 decode: {exc}", None, None
+    if avatar is not None and len(avatar) > MAX_AVATAR_BYTES:
+        return f"avatar exceeds {MAX_AVATAR_LABEL} cap", None, None
+    summary = payload.get("profile_summary")
+    if isinstance(summary, str):
+        summary = summary.strip()
+        size = len(summary.encode("utf-8"))
+        if size > MAX_PROFILE_SUMMARY_BYTES:
+            return (
+                f"profile_summary is {size} bytes; cap is {MAX_PROFILE_SUMMARY_BYTES}",
+                None,
+                None,
             )
-            profile_patch["avatar_url"] = new_avatar_url
+    return None, avatar, summary if isinstance(summary, str) else None
+
+
+async def _prepare_profile_patch(
+    agent_id: str,
+    cfg: AgentConfig,
+    payload: dict,
+    avatar: bytes | None,
+) -> tuple[dict[str, Any], str | None, str | None]:
+    patch: dict[str, Any] = {}
+    name, role, role_short = (
+        payload.get("display_name"),
+        payload.get("role"),
+        payload.get("role_short"),
+    )
+    if isinstance(name, str):
+        patch["display_name"] = name.strip()
+    if isinstance(role, str):
+        patch["role"] = role
+    if isinstance(role_short, str):
+        patch["role_short"] = role_short
+    if avatar is not None:
+        try:
+            url = await _upload_avatar_via_agent_keystore(cfg, avatar)
+            patch["avatar_url"] = url
+            return patch, url, None
         except Exception as exc:
-            # Recoverable: surface but don't block the local write.
-            sync_warning = f"avatar upload failed: {exc}"
             logger.warning(
-                "bridge: avatar upload failed for agent=%s: %s", agent_id, exc,
+                "bridge: avatar upload failed for agent=%s: %s", agent_id, exc
             )
-    elif "avatar_url" in payload and isinstance(payload["avatar_url"], str):
-        # Direct override (e.g. clearing). Synced to server too.
-        new_avatar_url = payload["avatar_url"].strip()
-        profile_patch["avatar_url"] = new_avatar_url
-    if isinstance(new_role, str):
-        profile_patch["role"] = new_role
-    if isinstance(new_role_short, str):
-        profile_patch["role_short"] = new_role_short
+            return patch, None, f"avatar upload failed: {exc}"
+    if isinstance(payload.get("avatar_url"), str):
+        url = payload["avatar_url"].strip()
+        patch["avatar_url"] = url
+        return patch, url, None
+    return patch, None, None
 
-    new_profile_summary = payload.get("profile_summary")
-    stripped_summary: str | None = None
-    if isinstance(new_profile_summary, str):
-        stripped_summary = new_profile_summary.strip()
-        summary_bytes = len(stripped_summary.encode("utf-8"))
-        if summary_bytes > MAX_PROFILE_SUMMARY_BYTES:
-            return _bad(
-                f"profile_summary is {summary_bytes} bytes; cap is "
-                f"{MAX_PROFILE_SUMMARY_BYTES}"
-            )
 
-    # Disk-first so a sync failure can't drop the operator's edit.
-    if isinstance(new_display_name, str):
-        cfg.display_name = new_display_name.strip() or cfg.display_name
-    if new_avatar_url is not None:
-        cfg.avatar_url = new_avatar_url
-    if isinstance(new_role, str):
-        cfg.role = new_role
-        if not isinstance(new_role_short, str):
-            cfg.role_short = _derive_role_short(new_role)
-    if isinstance(new_role_short, str):
-        cfg.role_short = new_role_short
+def _persist_profile_edit(
+    cfg: AgentConfig, payload: dict, avatar_url: str | None, summary: str | None
+) -> bool:
+    old_name, name, role, role_short = (
+        cfg.display_name,
+        payload.get("display_name"),
+        payload.get("role"),
+        payload.get("role_short"),
+    )
+    if isinstance(name, str):
+        cfg.display_name = name.strip() or cfg.display_name
+    if avatar_url is not None:
+        cfg.avatar_url = avatar_url
+    if isinstance(role, str):
+        cfg.role = role
+        if not isinstance(role_short, str):
+            cfg.role_short = _derive_role_short(role)
+    if isinstance(role_short, str):
+        cfg.role_short = role_short
     cfg.save()
-    if stripped_summary is not None:
-        _update_profile_summary(cfg, stripped_summary)
-        profile_patch["soul"] = stripped_summary
-    renamed = (
-        isinstance(new_display_name, str)
-        and cfg.display_name != old_display_name
-        and old_display_name
+    if summary is not None:
+        _update_profile_summary(cfg, summary)
+    return bool(
+        isinstance(name, str)
+        and cfg.display_name != old_name
+        and old_name
         and cfg.display_name
     )
+
+
+def _post_persist_profile_edit(
+    cfg: AgentConfig, old_name: str, renamed: bool, payload: dict, summary: str | None
+) -> None:
     if renamed:
-        rewrite_profile_name(
-            cfg.resolve_profile_path(), old_display_name, cfg.display_name,
-        )
+        rewrite_profile_name(cfg.resolve_profile_path(), old_name, cfg.display_name)
     logger.info(
         "bridge: updated profile for agent=%s display_name=%r avatar=%s role_short=%r",
-        agent_id, cfg.display_name,
+        cfg.id,
+        cfg.display_name,
         "(set)" if cfg.avatar_url else "(empty)",
         cfg.role_short,
     )
-
-    # refresh_agent.flag is lazy + session-preserving; right primitive
-    # for any prompt-affecting change.
-    if renamed or stripped_summary is not None or isinstance(new_role, str):
+    if renamed or summary is not None or isinstance(payload.get("role"), str):
         from ..profile_sync import write_refresh_agent_flag
+
         write_refresh_agent_flag(cfg, reason="bridge profile edit")
 
-    # Server sync LAST so a failure can't drop the local edit.
-    if profile_patch:
-        try:
-            await _sync_agent_profile(cfg, profile_patch)
-        except Exception as exc:
-            sync_warning = (
-                sync_warning or f"profile sync failed: {exc}"
-            )
-            logger.warning(
-                "bridge: profile sync failed for agent=%s: %s", agent_id, exc,
-            )
+
+async def _sync_profile_patch(
+    cfg: AgentConfig, patch: dict[str, Any], warning: str | None
+) -> str | None:
+    if not patch:
+        return warning
+    try:
+        await _sync_agent_profile(cfg, patch)
+    except Exception as exc:
+        logger.warning("bridge: profile sync failed for agent=%s: %s", cfg.id, exc)
+        return warning or f"profile sync failed: {exc}"
+    return warning
+
+
+def _profile_edit_response(
+    agent_id: str, cfg: AgentConfig, warning: str | None
+) -> dict[str, Any]:
     body: dict[str, Any] = {
         "agent_id": agent_id,
         "display_name": cfg.display_name,
@@ -696,76 +543,19 @@ async def update_profile(request: web.Request) -> web.Response:
         "role_short": cfg.role_short,
         "profile_summary": _profile_summary(cfg),
     }
-    if sync_warning:
-        body["warning"] = sync_warning
-    return web.json_response(body)
-
-
-def _derive_role_short(role: str) -> str:
-    """Local mirror of puffo-server's ``derive_role_short``: pull a
-    short chip label out of a ``<short>: <description>``-shaped role
-    string. Returns ``""`` for any shape the server would also
-    reject (no colon, empty prefix, whitespace in prefix, empty
-    suffix, prefix > ``MAX_ROLE_SHORT_LEN``). Kept in sync with
-    ``profiles::derive_role_short`` in puffo-server."""
-    if ":" not in role:
-        return ""
-    colon_pos = role.index(":")
-    candidate = role[:colon_pos].strip()
-    rest = role[colon_pos + 1:].strip()
-    if not candidate or not rest:
-        return ""
-    if len(candidate) > MAX_ROLE_SHORT_LEN:
-        return ""
-    if any(ch.isspace() for ch in candidate):
-        return ""
-    return candidate
-
-
-def _update_profile_summary(cfg: AgentConfig, new_summary: str) -> None:
-    """Rewrite the description section of profile.md with
-    ``new_summary``. Replaces the whole body of the ``# Soul`` (or
-    description / about / summary) section — its bounds come from
-    ``_soul_section_span``, the same logic the read path uses, so an
-    update round-trips faithfully and never appends a duplicate.
-    Appends a fresh ``# Soul`` section when no such heading exists.
-    """
-    try:
-        path = cfg.resolve_profile_path()
-        text = path.read_text(encoding="utf-8")
-        lines = text.splitlines(keepends=True)
-
-        # Span is computed on newline-stripped copies so the indices
-        # line up 1:1 with ``lines`` (splitlines(keepends=True) yields
-        # the same element count, just with the line endings kept).
-        span = _soul_section_span([raw.rstrip("\r\n") for raw in lines])
-        if span is not None:
-            _, body_start, body_end = span
-            new_lines = (
-                lines[:body_start]
-                + ["\n", new_summary + "\n"]
-                + lines[body_end:]
-            )
-        else:
-            # No matching heading — append a fresh Soul section.
-            new_lines = list(lines)
-            if new_lines and not new_lines[-1].endswith("\n"):
-                new_lines.append("\n")
-            new_lines.extend(["\n# Soul\n", new_summary + "\n"])
-
-        path.write_text("".join(new_lines), encoding="utf-8")
-    except Exception as exc:
-        logger.warning("bridge: failed to update profile summary for agent=%s: %s", cfg, exc)
+    if warning:
+        body["warning"] = warning
+    return body
 
 
 async def _upload_avatar_via_agent_keystore(
-    cfg: AgentConfig, avatar_bytes: bytes,
+    cfg: AgentConfig,
+    avatar_bytes: bytes,
 ) -> str:
     """Upload bytes to ``/blobs/upload`` signed by the agent's
     subkey; returns the resulting blob URL."""
     from ...crypto.http_client import PuffoCoreHttpClient
     from ...crypto.keystore import KeyStore
-    from ...crypto.encoding import base64url_encode
 
     pc = cfg.puffo_core
     ks = KeyStore.for_agent(cfg.id)
@@ -775,9 +565,14 @@ async def _upload_avatar_via_agent_keystore(
         await http._ensure_subkey()  # noqa: SLF001 — same intra-package use
         signing_key, signer_id = http._load_signing_key()  # noqa: SLF001
         from ...crypto.http_auth import sign_request
+
         auth = sign_request(
-            signing_key, pc.slug, signer_id,
-            "POST", "/blobs/upload", avatar_bytes,
+            signing_key,
+            pc.slug,
+            signer_id,
+            "POST",
+            "/blobs/upload",
+            avatar_bytes,
         )
         headers = auth.to_dict()
         headers["content-type"] = "application/octet-stream"
@@ -801,6 +596,7 @@ async def _sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
     Thin wrapper around ``portal.profile_sync.sync_agent_profile`` so
     the bridge and CLI share the same wire shape."""
     from ..profile_sync import sync_agent_profile
+
     await sync_agent_profile(cfg, patch)
 
 
@@ -845,7 +641,8 @@ async def restart_agent(request: web.Request) -> web.Response:
         cfg = AgentConfig.load(agent_id)
     except Exception as exc:  # noqa: BLE001
         return web.json_response(
-            {"error": f"could not load agent config: {exc}"}, status=500,
+            {"error": f"could not load agent config: {exc}"},
+            status=500,
         )
     flag = refresh_agent_flag_path(cfg.resolve_workspace_dir())
     try:
@@ -860,11 +657,13 @@ async def restart_agent(request: web.Request) -> web.Response:
             status=500,
         )
     logger.info("bridge: restart (refresh_agent) requested for agent=%s", agent_id)
-    return web.json_response({
-        "agent_id": agent_id,
-        "ok": True,
-        "note": "worker will rebuild CLAUDE.md + reload on its next turn",
-    })
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "ok": True,
+            "note": "worker will rebuild CLAUDE.md + reload on its next turn",
+        }
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -896,11 +695,13 @@ async def delete_agent(request: web.Request) -> web.Response:
             status=500,
         )
     logger.info("bridge: delete requested for agent=%s", agent_id)
-    return web.json_response({
-        "agent_id": agent_id,
-        "ok": True,
-        "note": "daemon will stop the worker + remove the agent dir on the next reconcile tick (~2s)",
-    })
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "ok": True,
+            "note": "daemon will stop the worker + remove the agent dir on the next reconcile tick (~2s)",
+        }
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -913,7 +714,10 @@ async def delete_agent(request: web.Request) -> web.Response:
 
 
 async def _flip_agent_state(
-    request: web.Request, *, target_state: str, action_label: str,
+    request: web.Request,
+    *,
+    target_state: str,
+    action_label: str,
 ) -> web.Response:
     agent_id = request.match_info["id"]
     if not is_valid_agent_id(agent_id):
@@ -932,38 +736,47 @@ async def _flip_agent_state(
         # state. The CLI prints "already {state}"; the bridge just
         # returns 200 with the resolved state so the web client can
         # refresh agent list without special-casing.
-        return web.json_response({
-            "agent_id": agent_id,
-            "state": cfg.state,
-            "ok": True,
-            "note": f"already {target_state}",
-        })
+        return web.json_response(
+            {
+                "agent_id": agent_id,
+                "state": cfg.state,
+                "ok": True,
+                "note": f"already {target_state}",
+            }
+        )
     cfg.state = target_state
     cfg.save()
     logger.info(
         "bridge: %s requested for agent=%s (state -> %s)",
-        action_label, agent_id, target_state,
+        action_label,
+        agent_id,
+        target_state,
     )
-    return web.json_response({
-        "agent_id": agent_id,
-        "state": cfg.state,
-        "ok": True,
-        "note": (
-            "daemon will apply the state change on the next reconcile "
-            "tick (~2s)"
-        ),
-    })
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "state": cfg.state,
+            "ok": True,
+            "note": (
+                "daemon will apply the state change on the next reconcile tick (~2s)"
+            ),
+        }
+    )
 
 
 async def pause_agent(request: web.Request) -> web.Response:
     return await _flip_agent_state(
-        request, target_state="paused", action_label="pause",
+        request,
+        target_state="paused",
+        action_label="pause",
     )
 
 
 async def resume_agent(request: web.Request) -> web.Response:
     return await _flip_agent_state(
-        request, target_state="running", action_label="resume",
+        request,
+        target_state="running",
+        action_label="resume",
     )
 
 
@@ -1006,14 +819,16 @@ async def archive_agent(request: web.Request) -> web.Response:
             status=500,
         )
     logger.info("bridge: archive requested for agent=%s", agent_id)
-    return web.json_response({
-        "agent_id": agent_id,
-        "ok": True,
-        "note": (
-            "daemon will pause the worker + move the agent dir to "
-            "~/.puffo-agent/archived/ on the next reconcile tick (~2s)"
-        ),
-    })
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "ok": True,
+            "note": (
+                "daemon will pause the worker + move the agent dir to "
+                "~/.puffo-agent/archived/ on the next reconcile tick (~2s)"
+            ),
+        }
+    )
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -1021,212 +836,24 @@ async def archive_agent(request: web.Request) -> web.Response:
 # ────────────────────────────────────────────────────────────────────
 
 
-# Default number of trailing lines returned when no ``tail`` query
-# param is supplied. The web UI's Logs tab caps total displayed text
-# at ~1000 chars (no scroll history), so 30 lines at ~80 chars each
-# is the right initial-paint budget. Operators investigating an
-# incident can still request up to ``_LOG_MAX_TAIL`` explicitly.
-_LOG_DEFAULT_TAIL = 30
-# Hard cap on ``tail`` — protects against accidental huge fetches
-# from a chatty agent. 2000 lines * ~300 bytes / line ≈ 600 KB.
-_LOG_MAX_TAIL = 2000
-# Cap on bytes returned in delta mode. Prevents a busy agent + slow
-# poller combination from delivering a multi-MB response in one
-# tick. When the delta exceeds this, we serve a partial window +
-# advance ``next_cursor`` to the partial offset so the client picks
-# up the rest on the next poll.
-_LOG_MAX_DELTA_BYTES = 256 * 1024
-# Reverse-seek chunk size — read this many bytes per pass off the
-# end of the file when building a tail response. Keeps memory
-# bounded for unbounded ``audit.log`` files until rotation lands
-# at the writer side.
-_LOG_TAIL_CHUNK_BYTES = 64 * 1024
-# Marker event used when a line in audit.log can't be parsed as
-# JSON. Surfaces the raw text so the operator can still see what
-# the agent emitted instead of dropping the line silently.
-_LOG_MALFORMED_EVENT = "_raw"
-
-
-def _parse_log_line(raw: str) -> dict[str, Any]:
-    """Decode one NDJSON line from audit.log. Falls back to a
-    ``_raw`` event wrapper if the line isn't valid JSON so the
-    client can still display the bytes. Synthesizes ``ts`` at the
-    ingestion moment so future sort-by-ts in the UI doesn't bunch
-    every ``_raw`` event at top-of-list because of an empty
-    timestamp."""
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "event": _LOG_MALFORMED_EVENT,
-            "msg": raw[:1024],
-        }
-
-
-def _read_tail_bytes(path: Path, file_size: int, target_lines: int) -> bytes:
-    """Reverse-seek the last ``target_lines + 1`` newlines off the
-    end of ``path``. Reads in ``_LOG_TAIL_CHUNK_BYTES`` chunks until
-    enough newlines are visible (or BOF is reached) so memory stays
-    bounded on a multi-MB audit.log. Returns the suffix bytes
-    starting at the byte after the (target_lines+1)-th-from-last
-    newline — enough to capture ``target_lines`` full lines (the
-    +1 ensures we don't accidentally start mid-line)."""
-    if file_size == 0:
-        return b""
-    with path.open("rb") as f:
-        # ``newlines_needed`` is the number of ``\n`` markers that
-        # delimit ``target_lines`` full lines from the back of the
-        # file. We need one more newline than lines to land on the
-        # start of a line cleanly; absent that extra newline (file
-        # starts with a partial line at BOF) we just return from the
-        # earliest read offset.
-        newlines_needed = target_lines + 1
-        offset = file_size
-        buf = b""
-        while offset > 0:
-            chunk_size = min(_LOG_TAIL_CHUNK_BYTES, offset)
-            offset -= chunk_size
-            f.seek(offset)
-            buf = f.read(chunk_size) + buf
-            if buf.count(b"\n") >= newlines_needed:
-                break
-        # Slice off everything before the (newlines_needed)-th-from-
-        # last newline so the result starts at a clean line boundary.
-        # If we didn't accumulate that many newlines (whole file
-        # smaller than tail window), return what we have.
-        if buf.count(b"\n") >= newlines_needed:
-            # ``rfind`` newline_needed times from the end.
-            pos = len(buf)
-            for _ in range(newlines_needed):
-                pos = buf.rfind(b"\n", 0, pos)
-                if pos == -1:
-                    break
-            if pos != -1:
-                buf = buf[pos + 1:]
-        return buf
-
-
 async def get_log(request: web.Request) -> web.Response:
-    """Return the agent's per-agent audit.log entries.
-
-    Query params:
-      * ``tail`` (default 200, max 2000) — last N lines. Mutually
-        exclusive with ``since``; passing both is a 400.
-      * ``since`` (optional, int byte-offset) — return lines written
-        after this point for delta polling, capped at
-        ``_LOG_MAX_DELTA_BYTES`` per response (the cursor advances
-        partially so the client picks up the rest on the next poll).
-        When the file has shrunk below ``since`` (rotation / archive)
-        the cursor resets to 0.
-
-    Response: ``{agent_id, lines, next_cursor, note?, state?}``.
-    ``state`` is populated when ``lines`` is empty so the client
-    can distinguish "never wrote" vs "caught up via delta":
-    ``"never_written"`` (audit.log doesn't exist yet) or
-    ``"up_to_date"`` (delta returned nothing). ``note`` carries the
-    matching human-readable explanation.
-    """
+    """Return a bounded tail or byte-cursor delta from the agent audit log."""
     agent_id = request.match_info["id"]
     if not agent_yml_path(agent_id).exists():
         return _not_found("agent not found")
 
+    try:
+        tail, since = parse_log_query(
+            request.query.get("tail"),
+            request.query.get("since"),
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
     cfg = AgentConfig.load(agent_id)
     log_path = cfg.resolve_workspace_dir() / ".puffo-agent" / "audit.log"
-
-    raw_tail = request.query.get("tail")
-    raw_since = request.query.get("since")
-    if raw_tail is not None and raw_since is not None:
-        # 400 instead of silently picking one — silent precedence
-        # masks confused callers and the surface is small enough
-        # that explicit-is-better-than-implicit wins.
-        return web.json_response(
-            {"error": "tail and since are mutually exclusive"},
-            status=400,
-        )
-
-    try:
-        tail = int(raw_tail) if raw_tail is not None else _LOG_DEFAULT_TAIL
-    except ValueError:
-        tail = _LOG_DEFAULT_TAIL
-    tail = max(1, min(_LOG_MAX_TAIL, tail))
-
-    since: int | None
-    if raw_since is None:
-        since = None
-    else:
-        try:
-            since = max(0, int(raw_since))
-        except ValueError:
-            since = None
-
-    if not log_path.exists():
-        return web.json_response({
-            "agent_id": agent_id,
-            "lines": [],
-            "next_cursor": 0,
-            "state": "never_written",
-            "note": "audit log not yet created",
-        })
-
-    file_size = log_path.stat().st_size
-
-    lines: list[dict[str, Any]] = []
-    if since is not None:
-        # Delta mode — read from the caller's last cursor. A file
-        # that's shrunk (rotated / archived) below the cursor
-        # resets to 0 so the next response carries the full window.
-        # Cap the per-response byte count so a slow-poller + busy-
-        # agent combination can't trigger multi-MB allocations.
-        offset = since if since <= file_size else 0
-        with log_path.open("rb") as f:
-            f.seek(offset)
-            content = f.read(_LOG_MAX_DELTA_BYTES)
-        # Defensive trim: if the cap landed mid-line, drop the
-        # partial trailing chunk so the client doesn't see a
-        # truncated JSON record. The dropped bytes are still
-        # before ``next_cursor`` (advancement is based on slice
-        # length); a future patch could try a smarter mid-line
-        # backtrack, but truncate-at-newline is the cheap-correct
-        # default.
-        if len(content) == _LOG_MAX_DELTA_BYTES:
-            last_nl = content.rfind(b"\n")
-            if last_nl > 0:
-                content = content[: last_nl + 1]
-        next_cursor = offset + len(content)
-        for raw in content.decode("utf-8", errors="replace").splitlines():
-            if raw.strip():
-                lines.append(_parse_log_line(raw))
-    else:
-        # Tail mode — reverse-seek off the end of the file rather
-        # than loading the whole thing. ``audit.log`` has no
-        # rotation today (``cli_session.AuditLog.write`` just
-        # appends), so unbounded growth is realistic and a
-        # full-file ``read_bytes()`` would scale badly for a
-        # long-lived agent.
-        suffix = _read_tail_bytes(log_path, file_size, tail)
-        decoded = suffix.decode("utf-8", errors="replace")
-        all_lines = [line for line in decoded.splitlines() if line.strip()]
-        for raw in all_lines[-tail:]:
-            lines.append(_parse_log_line(raw))
-        next_cursor = file_size
-
-    body: dict[str, Any] = {
-        "agent_id": agent_id,
-        "lines": lines,
-        "next_cursor": next_cursor,
-    }
-    if not lines:
-        # Distinct empty-state signals — the client uses ``state`` to
-        # pick the right copy + the matching ``note`` is the
-        # human-readable form. Missing-file is handled above before
-        # we reach this branch.
-        if since is not None:
-            body["state"] = "up_to_date"
-            body["note"] = "no new entries since cursor"
-        else:
-            body["state"] = "empty"
-            body["note"] = "audit log is empty"
+    body = {"agent_id": agent_id}
+    body.update(read_audit_log(log_path, tail, since))
     return web.json_response(body)
 
 
@@ -1251,25 +878,31 @@ async def list_files(request: web.Request) -> web.Response:
         return _bad("path is not a directory; use /files/raw to read a file")
     entries: list[dict] = []
     try:
-        for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        for child in sorted(
+            target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
+        ):
             try:
                 st = child.stat()
             except OSError:
                 continue
-            entries.append({
-                "name": child.name,
-                "kind": "dir" if child.is_dir() else "file",
-                "size": int(st.st_size) if child.is_file() else 0,
-                "mtime": int(st.st_mtime),
-            })
+            entries.append(
+                {
+                    "name": child.name,
+                    "kind": "dir" if child.is_dir() else "file",
+                    "size": int(st.st_size) if child.is_file() else 0,
+                    "mtime": int(st.st_mtime),
+                }
+            )
     except OSError as exc:
         return _bad(f"readdir failed: {exc}")
-    return web.json_response({
-        "agent_id": agent_id,
-        "workspace": str(workspace),
-        "path": rel,
-        "entries": entries,
-    })
+    return web.json_response(
+        {
+            "agent_id": agent_id,
+            "workspace": str(workspace),
+            "path": rel,
+            "entries": entries,
+        }
+    )
 
 
 async def read_file(request: web.Request) -> web.Response:
@@ -1337,212 +970,10 @@ async def disconnect(request: web.Request) -> web.Response:
 
 def _create_reject(reason: str, **fields) -> web.Response:
     extra = " ".join(f"{k}={v!r}" for k, v in fields.items())
-    logger.warning("bridge: create-agent rejected: %s%s", reason, f" {extra}" if extra else "")
+    logger.warning(
+        "bridge: create-agent rejected: %s%s", reason, f" {extra}" if extra else ""
+    )
     return _bad(reason)
-
-
-def _verify_attestation(att: dict, agent_root_pk: bytes, paired_root_pk: bytes) -> None:
-    """Verify operator_attestation: signature valid (signed by the
-    operator root key) and both pubkeys match the bound expectations.
-    Raises ``CertError`` on mismatch.
-    """
-    from ...crypto.canonical import canonicalize_for_signing
-    from ...crypto.primitives import ed25519_verify
-
-    if not isinstance(att, dict):
-        raise CertError("operator_attestation must be an object")
-    if att.get("type") != "operator_attestation":
-        raise CertError(f"unexpected attestation type {att.get('type')!r}")
-    op_pk_b64 = att.get("operator_root_public_key")
-    agent_pk_b64 = att.get("agent_root_public_key")
-    sig_b64 = att.get("signature")
-    if not isinstance(op_pk_b64, str) or not isinstance(agent_pk_b64, str) or not isinstance(sig_b64, str):
-        raise CertError("operator_attestation missing required fields")
-
-    try:
-        op_pk = base64url_decode(op_pk_b64)
-        agent_pk = base64url_decode(agent_pk_b64)
-        sig = base64url_decode(sig_b64)
-    except Exception as exc:
-        raise CertError(f"attestation field decode: {exc}") from exc
-    if op_pk != paired_root_pk:
-        raise CertError("attestation.operator_root_public_key != paired user")
-    if agent_pk != agent_root_pk:
-        raise CertError("attestation.agent_root_public_key != agent identity_cert")
-    canonical = canonicalize_for_signing({k: v for k, v in att.items() if k != "signature"})
-    if not ed25519_verify(op_pk, canonical, sig):
-        raise CertError("attestation signature verification failed")
-
-
-class ProvisionError(Exception):
-    """A create-agent bundle was inconsistent or could not be written.
-    ``fields`` carry structured context for the HTTP handler's log line."""
-
-    def __init__(self, reason: str, **fields: Any) -> None:
-        super().__init__(reason)
-        self.reason = reason
-        self.fields = fields
-
-
-def _verify_agent_bundle(payload: dict, paired_root_pubkey_b64: str) -> dict:
-    """Verify a create-agent bundle (certs, attestation, puffo_core, runtime)
-    against the paired operator. Returns a context dict the writer consumes.
-    No disk writes, no network. Raises ``ProvisionError`` on any mismatch."""
-    try:
-        paired_root_pk = base64url_decode(paired_root_pubkey_b64)
-    except Exception as exc:
-        raise ProvisionError(f"paired root pubkey decode: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ProvisionError("body must be a JSON object")
-
-    bundle = payload.get("identity_bundle")
-    pc = payload.get("puffo_core")
-    rt = payload.get("runtime")
-    if not isinstance(bundle, dict) or not isinstance(pc, dict) or not isinstance(rt, dict):
-        raise ProvisionError(
-            "identity_bundle, puffo_core, and runtime are required",
-            bundle_type=type(bundle).__name__,
-            pc_type=type(pc).__name__,
-            rt_type=type(rt).__name__,
-        )
-
-    identity_cert = bundle.get("identity_cert")
-    device_cert = bundle.get("device_cert")
-    attestation = bundle.get("operator_attestation")
-    slug_binding = bundle.get("slug_binding")
-    if not (
-        isinstance(identity_cert, dict)
-        and isinstance(device_cert, dict)
-        and isinstance(attestation, dict)
-        and isinstance(slug_binding, dict)
-    ):
-        raise ProvisionError("identity_bundle missing one of identity_cert/device_cert/operator_attestation/slug_binding")
-
-    # Cert errors surface verbatim so the web client can show the
-    # specific cryptographic mismatch.
-    try:
-        agent_root_pk = verify_identity_cert(identity_cert)
-    except CertError as exc:
-        raise ProvisionError(f"identity_cert: {exc}") from exc
-    if identity_cert.get("identity_type") != "agent":
-        raise ProvisionError(
-            "identity_cert.identity_type must be 'agent'",
-            got=identity_cert.get("identity_type"),
-        )
-
-    declared_op_pk_b64 = identity_cert.get("declared_operator_public_key")
-    if not isinstance(declared_op_pk_b64, str) or not declared_op_pk_b64:
-        raise ProvisionError("identity_cert.declared_operator_public_key required for agent identity")
-    if declared_op_pk_b64 != paired_root_pubkey_b64:
-        raise ProvisionError(
-            "identity_cert.declared_operator_public_key does not match paired operator",
-            cert=declared_op_pk_b64, paired=paired_root_pubkey_b64,
-        )
-
-    try:
-        verify_device_cert(device_cert, agent_root_pk)
-    except CertError as exc:
-        raise ProvisionError(f"device_cert: {exc}") from exc
-    try:
-        slug_from_binding = verify_slug_binding(slug_binding, agent_root_pk)
-    except CertError as exc:
-        raise ProvisionError(f"slug_binding: {exc}") from exc
-    try:
-        _verify_attestation(attestation, agent_root_pk, paired_root_pk)
-    except CertError as exc:
-        raise ProvisionError(f"operator_attestation: {exc}") from exc
-
-    # The slug + device_id must match the cert bundle. A mismatch means
-    # a doctored payload (or a rare provisioning race).
-    server_url = (pc.get("server_url") or "").strip()
-    pc_slug = (pc.get("slug") or "").strip()
-    pc_device_id = (pc.get("device_id") or "").strip()
-    space_id = (pc.get("space_id") or "").strip()
-    # Optional on the wire. Without it the worker can't DM the operator
-    # about non-auto-acceptable invites (falls back to logging).
-    operator_slug = (pc.get("operator_slug") or "").strip()
-    if not (server_url and pc_slug and pc_device_id and space_id):
-        raise ProvisionError(
-            "puffo_core block must include server_url, slug, device_id, space_id",
-            keys_present=sorted(pc.keys()),
-        )
-    if pc_slug != slug_from_binding:
-        raise ProvisionError(
-            "puffo_core.slug != slug_binding.slug",
-            puffo_core=pc_slug, slug_binding=slug_from_binding,
-        )
-    if pc_device_id != device_cert.get("device_id"):
-        raise ProvisionError(
-            "puffo_core.device_id != device_cert.device_id",
-            puffo_core=pc_device_id, device_cert=device_cert.get("device_id"),
-        )
-
-    agent_id = pc_slug
-    if not is_valid_agent_id(agent_id):
-        raise ProvisionError(f"slug {agent_id!r} is not a valid agent id")
-
-    # Defaults match the CLI's `agent create` behaviour.
-    display_name = (payload.get("display_name") or agent_id).strip() or agent_id
-    avatar_url = (payload.get("avatar_url") or "").strip()
-    role = (payload.get("role") or "").strip()
-    role_short_raw = payload.get("role_short")
-    if role_short_raw is not None and not isinstance(role_short_raw, str):
-        raise ProvisionError("role_short must be a string")
-    if role and len(role) > MAX_ROLE_LEN:
-        raise ProvisionError(f"role must be at most {MAX_ROLE_LEN} characters")
-    if isinstance(role_short_raw, str) and len(role_short_raw) > MAX_ROLE_SHORT_LEN:
-        raise ProvisionError(f"role_short must be at most {MAX_ROLE_SHORT_LEN} characters")
-    if not role and role_short_raw:
-        raise ProvisionError("role_short cannot be set without role")
-    role_short = (
-        role_short_raw.strip() if isinstance(role_short_raw, str)
-        else _derive_role_short(role) if role
-        else ""
-    )
-    profile_text = payload.get("profile")
-    if not isinstance(profile_text, str) or not profile_text.strip():
-        raise ProvisionError("profile (markdown body) is required")
-
-    # Reject invalid runtime triples up front instead of letting the
-    # worker crash on the next reconcile tick.
-    runtime = RuntimeConfig(
-        kind=str(rt.get("kind", "chat-local")),
-        provider=str(rt.get("provider", "")),
-        model=str(rt.get("model", "")),
-        api_key=str(rt.get("api_key", "")),
-        harness=str(rt.get("harness", "claude-code")),
-        permission_mode=str(rt.get("permission_mode", "bypassPermissions")),
-        max_turns=int(rt.get("max_turns", 10)),
-    )
-    from ..runtime_matrix import validate_triple
-    validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
-    if not validation.ok:
-        raise ProvisionError(f"runtime: {validation.error}")
-
-    desired_skills = payload.get("desired_skills") or []
-    desired_mcps = payload.get("desired_mcps") or []
-    if not isinstance(desired_skills, list) or not all(isinstance(s, str) and s for s in desired_skills):
-        raise ProvisionError("desired_skills must be a list of non-empty template-id strings")
-    if not isinstance(desired_mcps, list) or not all(isinstance(s, str) and s for s in desired_mcps):
-        raise ProvisionError("desired_mcps must be a list of non-empty template-id strings")
-
-    return {
-        "agent_id": agent_id,
-        "display_name": display_name,
-        "avatar_url": avatar_url,
-        "role": role,
-        "role_short": role_short,
-        "profile_text": profile_text,
-        "server_url": server_url,
-        "slug": pc_slug,
-        "device_id": pc_device_id,
-        "space_id": space_id,
-        "operator_slug": operator_slug,
-        "runtime": runtime,
-        "desired_skills": list(desired_skills),
-        "desired_mcps": list(desired_mcps),
-        "bundle": bundle,
-    }
 
 
 def _write_agent_from_context(ctx: dict) -> dict:
@@ -1582,20 +1013,26 @@ def _write_agent_from_context(ctx: dict) -> dict:
         cfg.save()
         (target / "memory").mkdir(exist_ok=True)
         (target / "profile.md").write_text(ctx["profile_text"], encoding="utf-8")
-        _write_keystore(agent_id, ctx["slug"], ctx["server_url"], ctx["bundle"], ctx["device_id"])
+        _write_keystore(
+            agent_id, ctx["slug"], ctx["server_url"], ctx["bundle"], ctx["device_id"]
+        )
     except ProvisionError:
         raise
     except Exception:
         # Best-effort cleanup so the reconcile loop doesn't keep
         # retrying a half-provisioned agent.
         import shutil
+
         shutil.rmtree(target, ignore_errors=True)
         raise
     return {"agent_id": agent_id, "agent_dir": str(target)}
 
 
 async def provision_agent_from_bundle(
-    payload: dict, paired_root_pubkey_b64: str, *, materialize=None,
+    payload: dict,
+    paired_root_pubkey_b64: str,
+    *,
+    materialize=None,
 ) -> dict:
     """Verify a web-signed create-agent bundle, optionally run an async
     ``materialize`` hook (Agent Portal remote create: finalize the pending
@@ -1656,7 +1093,9 @@ async def create_agent(request: web.Request) -> web.Response:
     agent_id = result["agent_id"]
     logger.info(
         "bridge: created agent slug=%s device_id=%s by operator=%s",
-        agent_id, result["device_id"], request["paired_slug"],
+        agent_id,
+        result["device_id"],
+        request["paired_slug"],
     )
 
     # role has no signup pathway, so sync it to the server profile post-create
@@ -1668,7 +1107,9 @@ async def create_agent(request: web.Request) -> web.Response:
                 patch["role_short"] = result["role_short"]
             await _sync_agent_profile(AgentConfig.load(agent_id), patch)
         except Exception as exc:
-            logger.warning("bridge: post-create role sync failed for agent=%s: %s", agent_id, exc)
+            logger.warning(
+                "bridge: post-create role sync failed for agent=%s: %s", agent_id, exc
+            )
 
     response_body: dict[str, Any] = {
         "agent_id": agent_id,
@@ -1678,28 +1119,40 @@ async def create_agent(request: web.Request) -> web.Response:
     # ws-local: passcode doubles as the ``.puffoagent`` export password so the
     # web can round-trip create + export in one call.
     from ..runtime_matrix import RUNTIME_WS_LOCAL
+
     passcode = (payload.get("passcode") or "").strip()
     if result["runtime"].kind == RUNTIME_WS_LOCAL and passcode:
         try:
             from .. import export as exp
+
             bundle_bytes = exp.pack(
-                [agent_id], passcode,
+                [agent_id],
+                passcode,
                 exported_by_slug=request.get("paired_slug", ""),
             )
-            response_body["bundle_base64"] = base64.b64encode(bundle_bytes).decode("ascii")
+            response_body["bundle_base64"] = base64.b64encode(bundle_bytes).decode(
+                "ascii"
+            )
         except Exception as exc:
-            logger.warning("bridge: ws-local bundle pack failed for agent=%s: %s", agent_id, exc)
+            logger.warning(
+                "bridge: ws-local bundle pack failed for agent=%s: %s", agent_id, exc
+            )
             response_body["bundle_error"] = str(exc)
 
     return web.json_response(response_body, status=201)
 
 
 def _write_keystore(
-    agent_id: str, slug: str, server_url: str, bundle: dict, device_id: str,
+    agent_id: str,
+    slug: str,
+    server_url: str,
+    bundle: dict,
+    device_id: str,
 ) -> None:
     """Write the agent's StoredIdentity to ``keys/<slug>.json``;
     shape mirrors what ``puffo-cli agent register`` produces."""
     import json
+
     keys_dir = agent_dir(agent_id) / "keys"
     keys_dir.mkdir(parents=True, exist_ok=True)
     stored = {
@@ -1716,6 +1169,7 @@ def _write_keystore(
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(stored, indent=2), encoding="utf-8")
     import os
+
     os.replace(tmp, path)
 
 
@@ -1805,7 +1259,11 @@ async def agents_export(request: web.Request) -> web.Response:
         return _bad("body must be a JSON object")
 
     raw_ids = payload.get("agent_ids")
-    if not isinstance(raw_ids, list) or not raw_ids or not all(isinstance(a, str) for a in raw_ids):
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or not all(isinstance(a, str) for a in raw_ids)
+    ):
         return _bad("agent_ids must be a non-empty list of strings")
     password = payload.get("password")
     if not isinstance(password, str) or not password:
@@ -1822,12 +1280,12 @@ async def agents_export(request: web.Request) -> web.Response:
         except FileNotFoundError:
             return _not_found(f"agent not found: {aid}")
         if cfg.state != "paused":
-            return _conflict(
-                f"agent {aid} is {cfg.state!r}; pause it before exporting"
-            )
+            return _conflict(f"agent {aid} is {cfg.state!r}; pause it before exporting")
 
     try:
-        blob = exp.pack(raw_ids, password, exported_by_slug=request.get("paired_slug", ""))
+        blob = exp.pack(
+            raw_ids, password, exported_by_slug=request.get("paired_slug", "")
+        )
     except exp.ExportError as exc:
         return _bad(str(exc))
 
@@ -1886,7 +1344,11 @@ async def agents_import(request: web.Request) -> web.Response:
     }
     logger.info(
         "bridge: import done total=%d imported=%d skipped=%d failed=%d pending_revokes=%d",
-        report.total, report.imported, report.skipped, report.failed, report.pending_revokes,
+        report.total,
+        report.imported,
+        report.skipped,
+        report.failed,
+        report.pending_revokes,
     )
     return web.json_response(body)
 

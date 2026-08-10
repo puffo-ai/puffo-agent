@@ -20,7 +20,6 @@ import asyncio
 import pytest
 
 from puffo_agent.portal.state import RuntimeState
-from puffo_agent.portal import worker as worker_module
 from puffo_agent.portal.worker import (
     _handle_suppressed_reply,
     _looks_like_auth_error,

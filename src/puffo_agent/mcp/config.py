@@ -1,7 +1,7 @@
 """MCP config builders for the puffo-core agent runtime.
 
-Every adapter (cli-local, cli-docker, sdk-local) spawns the same
-puffo_core MCP server through slightly different transports. This
+Every managed runtime spawns the same puffo_core MCP server through its
+native CLI transport. This
 module centralises env-var names, the MCP subprocess command line,
 and the JSON config shape claude-code expects.
 
@@ -13,13 +13,32 @@ that form.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import site
+import os
 import sys
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
+_PACKAGE_IMPORT_ROOT = Path(__file__).resolve().parents[2]
+
+# Claude Code reasoning-effort values.
+INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
+
+# codex model_reasoning_effort values.
+REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def supported_inference_levels(harness: str) -> tuple[str, ...]:
+    """Reasoning-effort values implemented by a specific harness."""
+    if harness == "codex":
+        return REASONING_EFFORTS
+    if harness == "claude-code":
+        return INFERENCE_LEVELS
+    return ()
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -48,11 +67,12 @@ PUFFO_CORE_TOOL_NAMES = (
     "sync_host_mcp",
     "leave_space",
     "leave_channel",
+    "get_dm_allowlists",
+    "get_dm_blocklists",
+    "add_dm_allowlist",
+    "update_dm_blocklist",
     "refresh",
-    # M3 memory tools (registered by mcp.memory_tools). Kept in the
-    # core allowlist so the sdk adapter's gate auto-allows them like
-    # every other mcp__puffo__ tool — otherwise they register but are
-    # denied at call time on sdk-local.
+    # M3 memory tools (registered by mcp.memory_tools).
     "create_note",
     "patch_note",
     "append_note",
@@ -64,9 +84,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "search_memory",
     "search_imports",
     # M4 memory status / recall / history tools (read-only; registered
-    # by mcp.memory_tools). Same reason as the M3 block — the sdk gate
-    # auto-allows every mcp__puffo__ tool in this list, so leaving them
-    # out would register them but deny them at call time on sdk-local.
+    # by mcp.memory_tools).
     "get_memory_status",
     "get_memory_file_status",
     "list_memory_files",
@@ -119,6 +137,7 @@ def write_codex_mcp_config(
     args: list[str] | None = None,
     env: dict[str, str] | None = None,
     extra_servers: dict[str, dict] | None = None,
+    inference_level: str | None = None,
     provider: dict | None = None,
 ) -> Path:
     """Serialise the per-agent codex config.toml.
@@ -141,6 +160,16 @@ def write_codex_mcp_config(
         "",
         'cli_auth_credentials_store = "file"',
     ]
+    # top-level key must precede [mcp_servers.*] tables
+    if inference_level:
+        if inference_level in REASONING_EFFORTS:
+            lines.append(f'model_reasoning_effort = "{inference_level}"')
+        else:
+            logger.warning(
+                "dropping inference_level %r for codex (no matching "
+                "model_reasoning_effort; expected one of %s)",
+                inference_level, ", ".join(REASONING_EFFORTS),
+            )
     # LiteLLM (or any OpenAI-compatible gateway) custom provider. When present,
     # codex talks to ``base_url`` via the Responses API using the bearer key in
     # ``env_key`` (the agent's virtual key) instead of its native ChatGPT OAuth.
@@ -272,6 +301,23 @@ def _python_user_base_env(runtime_kind: str) -> dict[str, str]:
     return {"PYTHONUSERBASE": _REAL_USER_BASE}
 
 
+def _mcp_pythonpath(runtime_kind: str) -> str:
+    """Pin the MCP subprocess to the package tree loaded by the daemon."""
+    if "docker" in runtime_kind:
+        return ""
+
+    entries = [str(_PACKAGE_IMPORT_ROOT)]
+    inherited = os.environ.get("PYTHONPATH")
+    if inherited:
+        daemon_cwd = Path.cwd()
+        for raw_entry in inherited.split(os.pathsep):
+            entry = Path(raw_entry or ".").expanduser()
+            if not entry.is_absolute():
+                entry = daemon_cwd / entry
+            entries.append(str(entry.resolve()))
+    return os.pathsep.join(dict.fromkeys(entries))
+
+
 # ── puffo-core config builders ────────────────────────────────────
 
 
@@ -297,6 +343,12 @@ def puffo_core_mcp_env(
     ``host.docker.internal``. ``memory_dir`` (optional) pins the
     memory root for the M3 memory tools; when empty the server falls
     back to the workspace-sibling ``memory/`` dir."""
+    from ..portal.local_service_auth import (
+        LOCAL_SERVICE_TOKEN_ENV,
+        issue_local_service_token,
+    )
+
+    effective_agent_id = agent_id or slug
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -305,8 +357,15 @@ def puffo_core_mcp_env(
         "PUFFO_WORKSPACE": workspace,
         "PUFFO_DATA_SERVICE_URL": data_service_url,
         "PUFFO_RPC_URL": rpc_url,
+        LOCAL_SERVICE_TOKEN_ENV: issue_local_service_token(effective_agent_id),
         **_python_user_base_env(runtime_kind),
     }
+    # The MCP starts with the agent workspace as cwd. A relative PYTHONPATH
+    # would therefore resolve against the wrong directory and can silently
+    # load a different editable checkout than the daemon.
+    pythonpath = _mcp_pythonpath(runtime_kind)
+    if pythonpath:
+        env["PYTHONPATH"] = pythonpath
     if agent_id:
         env["PUFFO_AGENT_ID"] = agent_id
     if space_id:
@@ -343,36 +402,3 @@ def puffo_core_mcp_env(
         from pathlib import Path as _Path
         env["CODEX_HOME"] = str(_Path(workspace).parent / ".codex")
     return env
-
-
-def puffo_core_stdio_sdk_config(
-    *,
-    python: str,
-    slug: str,
-    device_id: str,
-    server_url: str,
-    space_id: str = "",
-    keystore_dir: str,
-    workspace: str,
-    agent_id: str,
-    memory_dir: str = "",
-) -> dict:
-    """Return the ``mcp_servers`` config dict for the SDK adapter."""
-    return {
-        MCP_SERVER_NAME: {
-            "type": "stdio",
-            "command": python,
-            "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
-            "env": puffo_core_mcp_env(
-                slug=slug,
-                device_id=device_id,
-                server_url=server_url,
-                space_id=space_id,
-                keystore_dir=keystore_dir,
-                workspace=workspace,
-                agent_id=agent_id,
-                runtime_kind="sdk-local",
-                memory_dir=memory_dir,
-            ),
-        }
-    }

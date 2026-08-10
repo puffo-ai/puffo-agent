@@ -15,7 +15,11 @@ from pathlib import Path
 import pytest
 from aiohttp import WSMsgType, web
 
-from puffo_agent.portal.ws_local.ws_local_client import run_attach
+from puffo_agent.portal.ws_local.ws_local_client import (
+    V2_CAPABILITIES,
+    _send_attach_command,
+    run_attach,
+)
 
 
 async def _start_fake_daemon(
@@ -105,6 +109,7 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
 
         assert received[0]["type"] == "connect"
         assert received[0]["password"] == "abc12345"
+        assert received[0]["capabilities"] == list(V2_CAPABILITIES)
         assert received[1]["type"] == "ack"
         assert received[1]["bundle_id"] == "b1"
 
@@ -112,6 +117,44 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
         assert status["state"] in ("disconnected", "connected")
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_admitted_command_is_forwarded_as_v2_frame():
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.frames: list[dict] = []
+
+        async def send_str(self, raw: str) -> None:
+            self.frames.append(json.loads(raw))
+
+    ws = FakeWebSocket()
+    stop = asyncio.Event()
+    emitted: list[dict] = []
+
+    assert not await _send_attach_command(
+        ws,
+        stop,
+        json.dumps(
+            {
+                "type": "admitted",
+                "bundle_id": "bdl_1",
+                "turn_id": "turn_1",
+                "correlation_key": "read_1",
+            }
+        ),
+        emitted.append,
+    )
+    assert ws.frames == [
+        {
+            "type": "admitted",
+            "version": 2,
+            "bundle_id": "bdl_1",
+            "turn_id": "turn_1",
+            "correlation_key": "read_1",
+        }
+    ]
+    assert emitted == []
 
 
 @pytest.mark.asyncio

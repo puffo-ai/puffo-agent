@@ -361,15 +361,21 @@ def _touch_refresh_flag(workspace: Path, name: str) -> Path:
 
 
 def _write_refresh_model_flag(
-    workspace: Path, *, harness: str, model: str,
+    workspace: Path,
+    *,
+    harness: str,
+    model: str,
+    inference_level: Optional[str] = None,
 ) -> Path:
-    """Drop ``refresh_model.flag`` with ``{harness, model, requested_at}``."""
+    """Drop the daemon-owned model/inference refresh request."""
     flag_path = workspace / ".puffo-agent" / "refresh_model.flag"
     payload = {
         "harness": harness,
         "model": model,
         "requested_at": int(time.time()),
     }
+    if inference_level is not None:
+        payload["inference_level"] = inference_level
     try:
         flag_path.parent.mkdir(parents=True, exist_ok=True)
         flag_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")

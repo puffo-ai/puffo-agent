@@ -100,7 +100,7 @@ def test_agent_config_yaml_roundtrip_preserves_role(monkeypatch):
                     "operator_slug": "alice-0001",
                 },
                 "runtime": {
-                    "kind": "chat-local",
+                    "kind": "cli-local",
                     "provider": "anthropic",
                     "model": "claude-sonnet-4-6",
                     "api_key": "sk-ant-test",
@@ -147,7 +147,7 @@ def test_agent_config_load_defaults_role_to_empty(monkeypatch):
                     "space_id": "sp_legacy",
                 },
                 "runtime": {
-                    "kind": "chat-local",
+                    "kind": "cli-local",
                     "provider": "anthropic",
                 },
                 "profile": "profile.md",

@@ -102,7 +102,7 @@ def _seed_agent(
             "device_id": old_device_id, "space_id": "sp_test",
         },
         "runtime": {
-            "kind": "chat-local", "provider": "anthropic",
+            "kind": "cli-local", "provider": "anthropic",
             "model": "claude-sonnet-4-6", "api_key": "sk-test",
             "harness": "claude-code", "permission_mode": "bypassPermissions",
         },

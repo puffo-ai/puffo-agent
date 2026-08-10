@@ -20,9 +20,10 @@ from puffo_agent.mcp.config import (
     PUFFO_CORE_TOOL_NAMES,
     PUFFO_CORE_TOOL_FQNS,
     puffo_core_mcp_env,
-    puffo_core_stdio_sdk_config,
 )
+from puffo_agent.mcp import config as mcp_config
 from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig
+from puffo_agent.portal.local_service_auth import LOCAL_SERVICE_TOKEN_ENV
 
 
 def _now_ms():
@@ -90,7 +91,6 @@ def test_agent_config_default_puffo_core():
     cfg = AgentConfig(id="test-agent")
     assert not cfg.puffo_core.is_configured()
 
-
 # ── Config builder tests ───────────────────────────────────────────
 
 
@@ -129,6 +129,7 @@ def test_puffo_core_mcp_env():
     assert env["PUFFO_WORKSPACE"] == "/workspace"
     assert env["PUFFO_RUNTIME_KIND"] == "cli-local"
     assert env["PUFFO_HARNESS"] == "claude-code"
+    assert env[LOCAL_SERVICE_TOKEN_ENV]
 
 
 def test_puffo_core_mcp_env_optional_fields():
@@ -162,6 +163,30 @@ def test_puffo_core_mcp_env_pins_python_user_base():
     assert env["PYTHONUSERBASE"] == site.getuserbase()
 
 
+def test_puffo_core_mcp_env_pins_daemon_package_tree(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(("relative-src", str(tmp_path / "extra-src"))),
+    )
+
+    env = puffo_core_mcp_env(
+        slug="bot-0001",
+        device_id="dev_1",
+        server_url="http://localhost:3000",
+        keystore_dir="/tmp/keys",
+        workspace="/workspace",
+        runtime_kind="cli-local",
+    )
+
+    entries = env["PYTHONPATH"].split(os.pathsep)
+    assert entries[0] == str(mcp_config._PACKAGE_IMPORT_ROOT)
+    assert entries[1:] == [
+        str((tmp_path / "relative-src").resolve()),
+        str((tmp_path / "extra-src").resolve()),
+    ]
+
+
 def test_puffo_core_mcp_env_skips_python_user_base_for_docker():
     """The container has its own Python install with baked-in deps,
     so the host's user-base path is meaningless inside it. We
@@ -178,34 +203,13 @@ def test_puffo_core_mcp_env_skips_python_user_base_for_docker():
     assert "PYTHONUSERBASE" not in env
 
 
-def test_puffo_core_stdio_sdk_config():
-    cfg = puffo_core_stdio_sdk_config(
-        python="/usr/bin/python3",
-        slug="bot-0001",
-        device_id="dev_1",
-        server_url="http://localhost:3000",
-        space_id="sp_test",
-        keystore_dir="/tmp/keys",
-        workspace="/workspace",
-        agent_id="bot-0001",
-    )
-    assert "puffo" in cfg
-    server = cfg["puffo"]
-    assert server["type"] == "stdio"
-    assert server["command"] == "/usr/bin/python3"
-    assert server["args"] == ["-m", "puffo_agent.mcp.puffo_core_server"]
-    assert server["env"]["PUFFO_CORE_SLUG"] == "bot-0001"
-    assert server["env"]["PUFFO_AGENT_ID"] == "bot-0001"
-
-
 # ── MCP server build test ─────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_puffo_core_server_builds():
-    """The puffo-core MCP server should register both API and local tools."""
-    ks, ks_dir, d, _ = _make_keystore()
-    db_path = os.path.join(d, "messages.db")
+async def test_puffo_core_server_surface_and_identity():
+    """The MCP boundary exposes its tools and bound agent identity."""
+    _ks, ks_dir, d, _ = _make_keystore()
 
     from puffo_agent.mcp.puffo_core_server import build_server
 
@@ -220,40 +224,19 @@ async def test_puffo_core_server_builds():
         # Test never makes a real call; value just needs to parse.
         data_service_url="http://127.0.0.1:0",
     )
-    tool_names = {t.name for t in await mcp.list_tools()}
-    assert "whoami" in tool_names
-    assert "send_message" in tool_names
-    assert "get_channel_history" in tool_names
-    assert "refresh" in tool_names
-    assert "reload_system_prompt" not in tool_names
-    assert "install_skill" in tool_names
-    assert "list_skills" in tool_names
-    assert "install_mcp_server" in tool_names
-    assert "list_mcp_servers" in tool_names
+    async with mcp._mcp_server.lifespan(mcp._mcp_server):
+        tool_names = {t.name for t in await mcp.list_tools()}
+        assert {
+            "whoami", "send_message", "get_channel_history", "refresh",
+            "install_skill", "list_skills", "install_mcp_server",
+            "list_mcp_servers",
+        } <= tool_names
+        assert "reload_system_prompt" not in tool_names
 
-
-@pytest.mark.asyncio
-async def test_puffo_core_server_whoami():
-    ks, ks_dir, d, _ = _make_keystore()
-    db_path = os.path.join(d, "messages.db")
-
-    from puffo_agent.mcp.puffo_core_server import build_server
-
-    mcp = build_server(
-        slug="bot-0001",
-        device_id="dev_test",
-        server_url="http://localhost:3000",
-        space_id="sp_test",
-        keystore_dir=ks_dir,
-        workspace=d,
-        agent_id="bot-0001",
-        # Test never makes a real call; value just needs to parse.
-        data_service_url="http://127.0.0.1:0",
-    )
-    result = await mcp.call_tool("whoami", {})
-    text = "".join(getattr(item, "text", str(item)) for item in result)
-    assert "bot-0001" in text
-    assert "dev_test" in text
+        result = await mcp.call_tool("whoami", {})
+        text = "".join(getattr(item, "text", str(item)) for item in result)
+        assert "bot-0001" in text
+        assert "dev_test" in text
 
 
 # ── MessageStore WAL test ──────────────────────────────────────────
@@ -347,32 +330,23 @@ async def test_puffo_core_client_send_fallback_message_encrypts():
     # cache from inbound envelopes + membership events; the smoke
     # test seeds it directly.
     client._channel_space["ch_abc"] = "sp_test"
-    await client.send_fallback_message("ch_abc", "hello world", root_id="")
+    class Delegate:
+        def __init__(self):
+            self.requests = []
 
-    # Channel resolution: members endpoint -> /certs/sync.
-    assert any(
-        m == "GET" and p == "/spaces/sp_test/channels/ch_abc/members"
-        for m, p in http.calls
+        async def send(self, request):
+            self.requests.append(request)
+            return {"state": "sent", "attempted": True, "envelope_id": "coordinated"}
+
+    delegate = Delegate()
+    client.send_delegate = delegate
+    result = await client.send_fallback_message(
+        "ch_abc", "hello world", root_id=""
     )
-    assert any(m == "GET" and p.startswith("/certs/sync") for m, p in http.calls)
-    assert any(("POST", "/messages") == (m, p) for m, p in http.calls)
-
-    assert len(http.post_bodies) == 1
-    # Body IS the envelope; no ``{"envelope": ...}`` wrapper.
-    envelope = http.post_bodies[0]
-    assert envelope["type"] == "message_envelope"
-    assert envelope["version"] == 1
-    assert envelope["envelope_kind"] == "channel"
-    assert envelope["sender_slug"] == "bot-0001"
-    assert envelope["channel_id"] == "ch_abc"
-    assert envelope["space_id"] == "sp_test"
-    assert "content_ciphertext" in envelope
-    assert "content_nonce" in envelope
-    assert len(envelope["recipients"]) == 1
-    r = envelope["recipients"][0]
-    assert r["device_id"] == "dev_recipient"
-    assert "hpke_enc" in r
-    assert "wrapped_content_key" in r
+    assert result["state"] == "sent"
+    assert delegate.requests[0].destination == "ch_abc"
+    assert delegate.requests[0].text == "hello world"
+    assert http.calls == []
     await ms.close()
 
 
@@ -430,3 +404,100 @@ async def test_send_fallback_message_drops_when_channel_space_unknown():
     # No HTTP at all — the FakeHttp ``raise`` ensures it.
     assert http.calls == []
     await ms.close()
+
+
+def test_worker_build_and_listener_use_global_runtime_contract():
+    import inspect
+
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    constructor_params = inspect.signature(PuffoCoreMessageClient).parameters
+    listener_params = inspect.signature(PuffoCoreMessageClient.listen).parameters
+
+    assert tuple(listener_params) == ("self", "on_message")
+    assert tuple(constructor_params) == (
+        "slug",
+        "device_id",
+        "space_id",
+        "keystore",
+        "http_client",
+        "message_store",
+        "operator_slug",
+        "auto_accept_space_invitations",
+        "auto_accept_dm",
+        "workspace",
+        "max_inline_chars",
+        "segment_chars",
+        "agent_created_at",
+        "image_edge_px",
+        "catchup_stale_hours",
+        "agent_id",
+        "bridge_client",
+    )
+
+
+@pytest.mark.asyncio
+async def test_reminder_sync_reconnect_callbacks_and_shutdown_close_resources(tmp_path):
+    """Both transport flavors expose the same signal-only reconnect seam."""
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    ks, _ks_dir, _directory, _kem = _make_keystore()
+
+    class Http:
+        keyless = False
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+
+    native_http = Http()
+    native = PuffoCoreMessageClient(
+        slug="bot-0001", device_id="dev_test", space_id="sp_test",
+        keystore=ks, http_client=native_http,
+        message_store=MessageStore(tmp_path / "native.db"),
+    )
+    native_calls: list[str] = []
+
+    async def native_signal():
+        native_calls.append("native")
+
+    native.add_connected_callback(native_signal)
+    await native._notify_connected_callbacks()
+    assert native_calls == ["native"]
+    await native.stop()
+    assert native_http.close_calls == 1
+
+    class Bridge:
+        def __init__(self):
+            self.callbacks = []
+            self.close_calls = 0
+
+        def add_connected_callback(self, callback):
+            self.callbacks.append(callback)
+
+        async def close(self):
+            self.close_calls += 1
+
+    bridge = Bridge()
+    bridge_http = Http()
+    bridge_http.keyless = True
+    bridge_client = PuffoCoreMessageClient(
+        slug="bot-0001", device_id="dev_test", space_id="sp_test",
+        keystore=ks, http_client=bridge_http,
+        message_store=MessageStore(tmp_path / "bridge.db"),
+        bridge_client=bridge,
+    )
+    bridge_calls: list[str] = []
+
+    async def bridge_signal():
+        bridge_calls.append("bridge")
+
+    bridge_client.add_connected_callback(bridge_signal)
+    assert len(bridge.callbacks) == 1
+    await bridge.callbacks[0]()
+    assert bridge_calls == ["bridge"]
+    await bridge_client.stop()
+    assert bridge.close_calls == 1
+    assert bridge_http.close_calls == 1

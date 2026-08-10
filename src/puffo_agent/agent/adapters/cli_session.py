@@ -27,20 +27,79 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
+import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
+from .._logging import safe_diagnostic_summary, safe_value_summary
+from ..context_controller import (
+    AdmissionCallback,
+    CompactionResult,
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    RolloverResult,
+    ToolResultAdmission,
+    normalize_context_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Cap any single audit field so one huge user message or tool input
-# doesn't bloat the log / the docker-logs stream.
-AUDIT_FIELD_MAX = 2000
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_BACKUP_COUNT = 3
+_AUDIT_PAYLOAD_FIELDS = frozenset(
+    {
+        "content",
+        "text",
+        "input",
+        "reply",
+        "raw_reply",
+        "raw_event",
+        "stdout",
+        "stderr",
+        "result",
+        "tool_result",
+    }
+)
+_AUDIT_DIAGNOSTIC_FIELDS = frozenset({"error", "diagnostic"})
+_AUDIT_METADATA_FIELDS = frozenset(
+    {
+        "action",
+        "attempt",
+        "attempts",
+        "cap",
+        "duration_ms",
+        "event_type",
+        "event_types",
+        "id",
+        "input_tokens",
+        "name",
+        "of",
+        "output_tokens",
+        "phase",
+        "reply_len",
+        "resume",
+        "session_id",
+        "tool_calls",
+        "user_message_bytes",
+        "error_type",
+    }
+)
+
+
+def _is_audit_payload_field(key: str) -> bool:
+    return (
+        key in _AUDIT_PAYLOAD_FIELDS
+        or key.startswith(("stdout", "stderr", "raw_"))
+        or key.endswith(("_input", "_result"))
+    )
 
 
 # 180KB leaves ~20KB headroom under Anthropic's ~200KB request cap
@@ -85,6 +144,18 @@ _POISONED_SESSION_MARKERS = (
 )
 
 
+@dataclass
+class _ClaudeTurnState:
+    started_at: float
+    reply_parts: list[str] = field(default_factory=list)
+    tool_calls: int = 0
+    tool_names_used: list[str] = field(default_factory=list)
+    send_message_targets: list[dict[str, str]] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    event_types_seen: list[str] = field(default_factory=list)
+
+
 # Shared with ``core`` (which tags ``AgentAPIError.is_auth``) so the
 # two detections can't drift.
 from .._auth_markers import looks_like_auth_error as _looks_like_auth_error  # noqa: E402
@@ -111,45 +182,95 @@ class AuditLog:
     ``tail -F`` PID 1 and ``docker logs``.
     """
 
-    def __init__(self, path: Path, agent_id: str):
+    def __init__(
+        self,
+        path: Path,
+        agent_id: str,
+        *,
+        max_bytes: int = AUDIT_MAX_BYTES,
+        backup_count: int = AUDIT_BACKUP_COUNT,
+    ):
         self.path = path
         self.agent_id = agent_id
+        self.max_bytes = max(1, max_bytes)
+        self.backup_count = max(0, backup_count)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # Touch so the container's tail starts cleanly even if no
             # turn has happened yet.
             self.path.touch(exist_ok=True)
         except OSError as exc:
-            logger.warning(
-                "agent %s: cannot prepare audit log at %s: %s",
-                agent_id, path, exc,
-            )
+            self._warn("cannot prepare audit log", exc)
 
     def write(self, event: str, **fields) -> None:
-        rec = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "agent": self.agent_id,
-            "event": event,
-            **{k: _truncate(v) for k, v in fields.items()},
-        }
         try:
+            safe_fields = {}
+            for key, value in fields.items():
+                if _is_audit_payload_field(key):
+                    safe_fields[f"{key}_summary"] = safe_value_summary(value)
+                elif key in _AUDIT_DIAGNOSTIC_FIELDS:
+                    safe_fields[f"{key}_summary"] = safe_diagnostic_summary(value)
+                elif key in _AUDIT_METADATA_FIELDS:
+                    safe_fields[key] = _bounded_metadata(value)
+                else:
+                    safe_fields[f"{key}_summary"] = safe_value_summary(value)
+            rec = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "agent": self.agent_id,
+                "event": event,
+                **safe_fields,
+            }
+            encoded = json.dumps(rec, ensure_ascii=False)
+            self._rotate_if_needed()
             with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError as exc:
-            # Audit failure must not kill the turn.
+                f.write(encoded + "\n")
+        except Exception as exc:
+            self._warn("audit log write failed", exc)
+
+    def _warn(self, message: str, exc: BaseException) -> None:
+        try:
             logger.warning(
-                "agent %s: audit log write failed: %s",
-                self.agent_id, exc,
+                "agent %s: %s: %s",
+                self.agent_id,
+                message,
+                type(exc).__name__,
             )
+        except Exception:
+            pass
+
+    def _rotate_if_needed(self) -> None:
+        try:
+            if self.path.stat().st_size < self.max_bytes:
+                return
+            if self.backup_count == 0:
+                self.path.write_text("", encoding="utf-8")
+                return
+            oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+            try:
+                oldest.unlink()
+            except FileNotFoundError:
+                pass
+            for index in range(self.backup_count - 1, 0, -1):
+                source = self.path.with_name(f"{self.path.name}.{index}")
+                if source.exists():
+                    os.replace(
+                        source,
+                        self.path.with_name(f"{self.path.name}.{index + 1}"),
+                    )
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+            self.path.touch()
+        except Exception as exc:
+            self._warn("audit log rotation failed", exc)
 
 
-def _truncate(v):
-    if isinstance(v, str) and len(v) > AUDIT_FIELD_MAX:
-        return v[:AUDIT_FIELD_MAX] + "... (truncated)"
+def _bounded_metadata(v):
+    """Bound non-payload metadata while retaining IDs and counters."""
+    if isinstance(v, str) and len(v) > 256:
+        return safe_value_summary(v)
     if isinstance(v, dict):
-        return {k: _truncate(x) for k, x in v.items()}
+        return {str(k): _bounded_metadata(x) for k, x in list(v.items())[:64]}
     if isinstance(v, list):
-        return [_truncate(x) for x in v]
+        return [_bounded_metadata(x) for x in v[:64]]
     return v
 
 
@@ -190,7 +311,7 @@ class ClaudeSession:
         build_command: Callable[[list[str], dict[str, str]], list[str]],
         cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
-        audit: Optional["AuditLog"] = None,
+        audit: Optional[AuditLog] = None,
         extra_args: Optional[list[str]] = None,
         model: str = "",
     ):
@@ -238,6 +359,13 @@ class ClaudeSession:
         # fallback needs to be sent because claude-code has no
         # transcript to resume.
         self._last_spawn_resumed: bool = False
+        self._context_used_tokens: int = 0
+        self._context_measured_at: datetime | None = None
+        self._admission_callback: AdmissionCallback | None = None
+        self._admission_planning_cycle_key: str = ""
+        self._continuation_admissions: list[ToolResultAdmission] = []
+        self._active_puffo_tool_calls: dict[str, tuple[str, dict[str, object]]] = {}
+        self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -246,12 +374,14 @@ class ClaudeSession:
             return result
         logger.warning(
             "agent %s: claude reply matched Prompt-is-too-long pattern; "
-            "rewriting to friendly error (raw: %s)",
-            self.agent_id, result.reply[:200],
+            "rewriting to friendly error (%s)",
+            self.agent_id,
+            safe_diagnostic_summary(result.reply),
         )
         if self.audit is not None:
             self.audit.write(
-                "turn.request_too_large_reactive", raw_reply=result.reply,
+                "turn.request_too_large_reactive",
+                raw_reply=result.reply,
             )
         new_md = dict(result.metadata or {})
         new_md["request_too_large"] = "reactive"
@@ -265,7 +395,9 @@ class ClaudeSession:
         )
 
     async def _one_turn_with_poison_recovery(
-        self, user_message: str, system_prompt: str,
+        self,
+        user_message: str,
+        system_prompt: str,
     ) -> TurnResult:
         """``_one_turn`` plus a single fresh-session retry when the
         turn comes back poisoned.
@@ -304,9 +436,11 @@ class ClaudeSession:
                 if attempt > 0:
                     delay = AUTH_RETRY_BACKOFFS_SECONDS[attempt - 1]
                     logger.warning(
-                        "agent %s: auth-error reply on attempt %d/%d; "
-                        "retrying in %ds",
-                        self.agent_id, attempt, attempts, delay,
+                        "agent %s: auth-error reply on attempt %d/%d; retrying in %ds",
+                        self.agent_id,
+                        attempt,
+                        attempts,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                     # Re-ensure running — subprocess may have died
@@ -314,7 +448,8 @@ class ClaudeSession:
                     # credentials file.
                     await self._ensure_running(system_prompt)
                 result = await self._one_turn_with_poison_recovery(
-                    user_message, system_prompt,
+                    user_message,
+                    system_prompt,
                 )
                 if not _looks_like_auth_error(result.reply):
                     return self._rewrite_if_request_too_large(result)
@@ -332,9 +467,10 @@ class ClaudeSession:
             # metadata.
             logger.error(
                 "agent %s: auth error persisted across %d attempts; "
-                "suppressing reply. last reply: %s",
-                self.agent_id, attempts,
-                (last_result.reply if last_result else "")[:500],
+                "suppressing reply. last_reply=%s",
+                self.agent_id,
+                attempts,
+                safe_diagnostic_summary(last_result.reply if last_result else ""),
             )
             if self.audit is not None:
                 self.audit.write(
@@ -393,7 +529,8 @@ class ClaudeSession:
                 )
                 user_message = fallback_user_message
             return await self._one_turn_with_poison_recovery(
-                user_message, system_prompt,
+                user_message,
+                system_prompt,
             )
 
     async def warm(self, system_prompt: str) -> None:
@@ -413,6 +550,188 @@ class ClaudeSession:
     async def aclose(self) -> None:
         async with self._lock:
             await self._kill_proc()
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=self._context_used_tokens,
+            measured_at=self._context_measured_at,
+            estimated_source="claude_usage_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            native_measurement=bool(self._context_measured_at),
+            rollover=True,
+            diagnostic="Claude reports usage; native compaction unsupported",
+        )
+
+    async def compact_context(self) -> CompactionResult:
+        return CompactionResult(
+            completed=False,
+            provider_session_id=self.get_provider_session_id(),
+            diagnostic="native Claude compaction unsupported; no text frame sent",
+        )
+
+    async def rollover_context(self) -> RolloverResult:
+        previous = self.get_provider_session_id()
+        async with self._lock:
+            self._clear_session_id()
+            await self._kill_proc()
+            self._context_used_tokens = 0
+            self._context_measured_at = None
+        return RolloverResult(
+            completed=True,
+            previous_provider_session_id=previous,
+            diagnostic="Claude session and cached occupancy cleared",
+        )
+
+    def get_provider_session_id(self) -> str | None:
+        return self._session_id or None
+
+    def register_admission_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+    ) -> None:
+        self._admission_callback = callback
+        self._admission_planning_cycle_key = planning_cycle_key
+        if callback is None:
+            self._continuation_admissions.clear()
+
+    register_provider_admission_callback = register_admission_callback
+
+    def register_continuation_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
+    ) -> None:
+        if callback is None:
+            self._continuation_admissions.clear()
+            return
+        provider_turn_id = self._active_provider_turn_id
+        if provider_turn_id is None:
+            if tool_names or tool_arguments is not None or correlation_receipt:
+                raise RuntimeError(
+                    "no active Claude provider turn for tool-result admission"
+                )
+            self.register_admission_callback(callback, planning_cycle_key)
+            return
+        self._continuation_admissions.append(
+            ToolResultAdmission.build(
+                callback,
+                planning_cycle_key,
+                provider_turn_id,
+                channel_id=channel_id,
+                tool_names=tool_names
+                or (
+                    "send_message",
+                    "send_message_with_attachments",
+                ),
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
+            )
+        )
+
+    async def _fire_admission(self, provider_turn_id: str) -> None:
+        callback = self._admission_callback
+        key = self._admission_planning_cycle_key
+        self._admission_callback = None
+        self._admission_planning_cycle_key = ""
+        if callback is not None:
+            await callback(
+                ProviderAdmissionEvent(
+                    planning_cycle_key=key,
+                    provider_session_id=self.get_provider_session_id(),
+                    provider_turn_id=provider_turn_id,
+                    admitted_at=datetime.now(timezone.utc),
+                )
+            )
+
+    async def _fire_matching_continuations(
+        self,
+        event: dict,
+        provider_turn_id: str,
+    ) -> None:
+        if event.get("type") != "user" or not self._continuation_admissions:
+            return
+        content = (event.get("message") or {}).get("content") or []
+        selected: list[int] = []
+        selected_tool_ids: dict[int, str] = {}
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            tool_call = self._active_puffo_tool_calls.get(tool_use_id)
+            if block.get("is_error") is True:
+                self._active_puffo_tool_calls.pop(tool_use_id, None)
+                continue
+            serialized = json.dumps(block, sort_keys=True, default=str)
+            tool_name = tool_call[0] if tool_call is not None else ""
+            tool_arguments = tool_call[1] if tool_call is not None else {}
+            exact = next(
+                (
+                    index
+                    for index, admission in enumerate(self._continuation_admissions)
+                    if index not in selected
+                    and admission.provider_turn_id == provider_turn_id
+                    and admission.receipt_marker
+                    and admission.receipt_marker in serialized
+                    and tool_call is not None
+                    # A receipt proves that the model saw this result, but it
+                    # does not by itself prove which semantic call produced
+                    # it.  Keep the same tool/argument contract as every
+                    # other provider boundary before admitting held rows.
+                    and admission.matches(tool_name, tool_arguments)
+                ),
+                None,
+            )
+            if exact is not None:
+                selected.append(exact)
+                selected_tool_ids[exact] = tool_use_id
+                continue
+            if tool_call is None:
+                continue
+            candidates = [
+                index
+                for index, admission in enumerate(self._continuation_admissions)
+                if index not in selected
+                and admission.provider_turn_id == provider_turn_id
+                and not admission.correlation_receipt
+                and admission.matches(tool_name, tool_arguments)
+            ]
+            if candidates:
+                selected_index = max(
+                    candidates,
+                    key=lambda index: (
+                        self._continuation_admissions[index].match_specificity,
+                        -index,
+                    ),
+                )
+                selected.append(selected_index)
+                selected_tool_ids[selected_index] = tool_use_id
+            self._active_puffo_tool_calls.pop(tool_use_id, None)
+
+        admissions = [
+            (self._continuation_admissions[index], selected_tool_ids[index])
+            for index in selected
+        ]
+        for index in sorted(selected, reverse=True):
+            self._continuation_admissions.pop(index)
+        for admission, selected_tool_id in admissions:
+            await admission.callback(
+                ProviderAdmissionEvent(
+                    planning_cycle_key=admission.planning_cycle_key,
+                    provider_session_id=self.get_provider_session_id(),
+                    provider_turn_id=provider_turn_id,
+                    tool_call_id=selected_tool_id,
+                    admitted_at=datetime.now(timezone.utc),
+                )
+            )
 
     # ── Session id persistence ────────────────────────────────────────────────
 
@@ -467,7 +786,8 @@ class ClaudeSession:
         if self._proc is not None:
             logger.warning(
                 "agent %s: claude subprocess exited (rc=%s); re-spawning",
-                self.agent_id, self._proc.returncode,
+                self.agent_id,
+                self._proc.returncode,
             )
             self._proc = None
 
@@ -484,9 +804,12 @@ class ClaudeSession:
         except _ResumeFailed as exc:
             logger.warning(
                 "agent %s: --resume failed (%s); starting a fresh session",
-                self.agent_id, exc,
+                self.agent_id,
+                exc,
             )
             self._clear_session_id()
+            self._context_used_tokens = 0
+            self._context_measured_at = None
             await self._spawn(system_prompt)
             self._last_spawn_resumed = False
 
@@ -495,8 +818,10 @@ class ClaudeSession:
         # --print / streaming input; the CLI rejects the combo
         # otherwise.
         args = [
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
             "--verbose",
         ]
         args.extend(self.extra_args)
@@ -519,9 +844,11 @@ class ClaudeSession:
         cmd = self.build_command(args, env_overrides)
         logger.info(
             "agent %s: spawning claude session (resume=%s)",
-            self.agent_id, bool(self._session_id),
+            self.agent_id,
+            bool(self._session_id),
         )
         from ..._proc import no_window_kwargs
+
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -544,14 +871,18 @@ class ClaudeSession:
         # for diagnostics.
         try:
             sid = await asyncio.wait_for(
-                self._read_init(self._proc), timeout=INIT_TIMEOUT_SECONDS,
+                self._read_init(self._proc),
+                timeout=INIT_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
             logger.debug(
                 "agent %s: no init event within %.1fs; will capture session_id from first result",
-                self.agent_id, INIT_TIMEOUT_SECONDS,
+                self.agent_id,
+                INIT_TIMEOUT_SECONDS,
             )
-            self._stderr_drain_task = asyncio.ensure_future(self._drain_stderr(self._proc))
+            self._stderr_drain_task = asyncio.ensure_future(
+                self._drain_stderr(self._proc)
+            )
             return
         if sid and sid != self._session_id:
             self._save_session_id(sid)
@@ -567,15 +898,21 @@ class ClaudeSession:
                 if proc.stderr is not None:
                     try:
                         buf = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
-                        stderr_tail = buf.decode("utf-8", errors="replace").strip()[-800:]
+                        stderr_tail = buf.decode("utf-8", errors="replace").strip()[
+                            -800:
+                        ]
                     except asyncio.TimeoutError:
                         pass
                 raise _ResumeFailed(
                     f"claude exited rc={rc} before init event"
-                    + (f"; stderr: {stderr_tail}" if stderr_tail else "")
+                    + (
+                        f"; stderr_summary: {safe_diagnostic_summary(stderr_tail)}"
+                        if stderr_tail
+                        else ""
+                    )
                 )
             event = _parse_event(line)
-            if event is None:
+            if not isinstance(event, dict):
                 continue
             if event.get("type") == "system" and event.get("subtype") == "init":
                 return (event.get("session_id") or "").strip()
@@ -595,7 +932,8 @@ class ClaudeSession:
                 # complaint worth seeing.
                 logger.warning(
                     "agent %s claude stderr: %s",
-                    self.agent_id, text,
+                    self.agent_id,
+                    safe_diagnostic_summary(text),
                 )
         except Exception:
             return
@@ -611,7 +949,10 @@ class ClaudeSession:
         logger.error(
             "agent %s: claude stream failure in %s (%s: %s) — "
             "killing subprocess; next turn will respawn",
-            self.agent_id, phase, err_type, err_str,
+            self.agent_id,
+            phase,
+            err_type,
+            safe_diagnostic_summary(err_str),
         )
         if self.audit is not None:
             self.audit.write(
@@ -633,8 +974,9 @@ class ClaudeSession:
         logger.error(
             "agent %s: claude session poisoned (API rejects the whole "
             "conversation) — clearing session id, respawning fresh. "
-            "reply: %s",
-            self.agent_id, reply[:300],
+            "reply_summary: %s",
+            self.agent_id,
+            safe_diagnostic_summary(reply),
         )
         if self.audit is not None:
             self.audit.write(
@@ -644,6 +986,8 @@ class ClaudeSession:
             )
         self._clear_session_id()
         await self._kill_proc()
+        self._context_used_tokens = 0
+        self._context_measured_at = None
 
     async def _kill_proc(self) -> None:
         if self._proc is None:
@@ -701,8 +1045,12 @@ class ClaudeSession:
                 )
             except asyncio.TimeoutError:
                 break
-            except (asyncio.LimitOverrunError, ValueError,
-                    ConnectionResetError, BrokenPipeError):
+            except (
+                asyncio.LimitOverrunError,
+                ValueError,
+                ConnectionResetError,
+                BrokenPipeError,
+            ):
                 # Best-effort — main read loop handles recovery.
                 break
             if not line:
@@ -721,36 +1069,81 @@ class ClaudeSession:
         if drained:
             logger.info(
                 "agent %s: drained %d stale pre-turn stdout event(s)",
-                self.agent_id, drained,
+                self.agent_id,
+                drained,
             )
         return drained
 
     async def _one_turn(self, user_message: str) -> TurnResult:
+        provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
+        self._active_provider_turn_id = provider_turn_id
+        self._active_puffo_tool_calls.clear()
+        try:
+            return await self._one_turn_inner(user_message, provider_turn_id)
+        finally:
+            if self._active_provider_turn_id == provider_turn_id:
+                self._active_provider_turn_id = None
+            self._continuation_admissions = [
+                admission
+                for admission in self._continuation_admissions
+                if admission.provider_turn_id != provider_turn_id
+            ]
+            self._active_puffo_tool_calls.clear()
+
+    async def _one_turn_inner(
+        self,
+        user_message: str,
+        provider_turn_id: str,
+    ) -> TurnResult:
         assert self._proc is not None and self._proc.stdin is not None
-        ums_bytes = len(user_message.encode("utf-8"))
-        if ums_bytes > MAX_USER_MESSAGE_BYTES:
-            logger.warning(
-                "agent %s: user_message=%d bytes > cap %d; short-circuiting "
-                "with friendly reply (no claude turn spawned)",
-                self.agent_id, ums_bytes, MAX_USER_MESSAGE_BYTES,
-            )
-            if self.audit is not None:
-                self.audit.write(
-                    "turn.request_too_large_pre_send",
-                    user_message_bytes=ums_bytes,
-                    cap=MAX_USER_MESSAGE_BYTES,
-                )
-            return TurnResult(
-                reply=REQUEST_TOO_LARGE_FRIENDLY,
-                metadata={
-                    "request_too_large": "pre_send",
-                    "user_message_bytes": ums_bytes,
-                    "cap_bytes": MAX_USER_MESSAGE_BYTES,
-                },
-            )
+        oversized = self._oversized_turn_result(user_message)
+        if oversized is not None:
+            return oversized
         if self.audit is not None:
             self.audit.write("turn.input", content=user_message)
-        turn_started_at = time.time()
+        state = _ClaudeTurnState(started_at=time.time())
+        stream_error = await self._write_turn_frame(user_message)
+        if stream_error is not None:
+            return stream_error
+        from ...portal.control.reporter import get_reporter
+
+        stream_error = await self._collect_turn_events(
+            provider_turn_id,
+            get_reporter(),
+            state,
+        )
+        if stream_error is not None:
+            return stream_error
+        return await self._finish_turn(state)
+
+    def _oversized_turn_result(self, user_message: str) -> TurnResult | None:
+        size = len(user_message.encode("utf-8"))
+        if size <= MAX_USER_MESSAGE_BYTES:
+            return None
+        logger.warning(
+            "agent %s: user_message=%d bytes > cap %d; short-circuiting "
+            "with friendly reply (no claude turn spawned)",
+            self.agent_id,
+            size,
+            MAX_USER_MESSAGE_BYTES,
+        )
+        if self.audit is not None:
+            self.audit.write(
+                "turn.request_too_large_pre_send",
+                user_message_bytes=size,
+                cap=MAX_USER_MESSAGE_BYTES,
+            )
+        return TurnResult(
+            reply=REQUEST_TOO_LARGE_FRIENDLY,
+            metadata={
+                "request_too_large": "pre_send",
+                "user_message_bytes": size,
+                "cap_bytes": MAX_USER_MESSAGE_BYTES,
+            },
+        )
+
+    async def _write_turn_frame(self, user_message: str) -> TurnResult | None:
+        assert self._proc is not None and self._proc.stdin is not None
         frame = {
             "type": "user",
             "message": {"role": "user", "content": user_message},
@@ -762,165 +1155,198 @@ class ClaudeSession:
         try:
             await self._proc.stdin.drain()
         except (ConnectionResetError, BrokenPipeError) as exc:
-            # Subprocess died before we could hand it the turn. Treat
-            # the same as a mid-read failure: kill, audit, silent
-            # empty reply. Next turn respawns.
             await self._handle_stream_failure("stdin_drain", exc)
             return TurnResult(reply="", metadata={"stream_error": "stdin_drain"})
+        return None
 
-        reply_parts: list[str] = []
-        tool_calls = 0
-        # Names of every tool invoked this turn (debug / audit).
-        tool_names_used: list[str] = []
-        # ``(channel, root_id)`` of every ``mcp__puffo__send_message``
-        # call. The shell uses this to decide whether to suppress its
-        # auto-reply (otherwise narration around the MCP call posts as
-        # a duplicate). Empty ``root_id`` = top-level post.
-        send_message_targets: list[dict] = []
-        input_tokens = 0
-        output_tokens = 0
-        event_types_seen: list[str] = []
-
-        from ...portal.control.reporter import get_reporter
-
-        reporter = get_reporter()
-
+    async def _collect_turn_events(
+        self,
+        provider_turn_id: str,
+        reporter: Any,
+        state: _ClaudeTurnState,
+    ) -> TurnResult | None:
         while True:
-            try:
-                line = await self._proc.stdout.readline()
-            except (asyncio.LimitOverrunError, ValueError) as exc:
-                # asyncio wraps LimitOverrunError in ValueError when
-                # raising out of readline(); catch both. Recover
-                # rather than wedge if a single event exceeds the
-                # 16 MiB StreamReader buffer set at spawn time.
-                await self._handle_stream_failure("readline_limit", exc)
-                return TurnResult(reply="", metadata={"stream_error": "readline_limit"})
-            except (ConnectionResetError, BrokenPipeError) as exc:
-                await self._handle_stream_failure("readline_pipe", exc)
-                return TurnResult(reply="", metadata={"stream_error": "readline_pipe"})
-            if not line:
-                rc = await self._proc.wait()
-                # Subprocess died mid-turn. Audit, respawn on next
-                # turn, return empty reply so the channel doesn't see
-                # a traceback-flavoured bot message.
-                await self._handle_stream_failure("eof_mid_turn", f"rc={rc}")
-                return TurnResult(reply="", metadata={"stream_error": "eof_mid_turn"})
-            event = _parse_event(line)
+            event, stream_error = await self._read_turn_event()
+            if stream_error is not None:
+                return stream_error
             if event is None:
                 continue
-            event_types_seen.append(
-                f"{event.get('type')}/{event.get('subtype', '-')}"
+            await self._observe_turn_event(event, provider_turn_id, state)
+            if await self._project_turn_event(event, reporter, state):
+                return None
+
+    async def _read_turn_event(self) -> tuple[dict[str, Any] | None, TurnResult | None]:
+        assert self._proc is not None and self._proc.stdout is not None
+        try:
+            line = await self._proc.stdout.readline()
+        except (asyncio.LimitOverrunError, ValueError) as exc:
+            await self._handle_stream_failure("readline_limit", exc)
+            return None, TurnResult(
+                reply="", metadata={"stream_error": "readline_limit"}
             )
-            logger.debug("agent %s stream event: %s", self.agent_id, event)
+        except (ConnectionResetError, BrokenPipeError) as exc:
+            await self._handle_stream_failure("readline_pipe", exc)
+            return None, TurnResult(
+                reply="", metadata={"stream_error": "readline_pipe"}
+            )
+        if not line:
+            rc = await self._proc.wait()
+            await self._handle_stream_failure("eof_mid_turn", f"rc={rc}")
+            return None, TurnResult(reply="", metadata={"stream_error": "eof_mid_turn"})
+        event = _parse_event(line)
+        return (event if isinstance(event, dict) else None), None
 
-            t = event.get("type")
-            if t == "assistant":
-                msg = event.get("message") or {}
-                for block in msg.get("content") or []:
-                    if not isinstance(block, dict):
-                        continue
-                    bt = block.get("type")
-                    if bt == "text":
-                        text = block.get("text", "") or ""
-                        reply_parts.append(text)
-                        # The silent marker is a control signal, not content;
-                        # a fallback auto-post is reported separately by core.py.
-                        if text and not is_silent(text):
-                            asyncio.ensure_future(
-                                reporter.emit(self.agent_id, "assistant_text", {"text": text})
-                            )
-                        if self.audit is not None and text:
-                            self.audit.write("assistant.text", text=text)
-                    elif bt == "tool_use":
-                        tool_calls += 1
-                        name = block.get("name", "")
-                        tool_input = block.get("input") or {}
-                        tool_names_used.append(name)
-                        tool_event = {"tool": name}
-                        if "send_message" in name:
-                            body = tool_input.get("text")
-                            if isinstance(body, str):
-                                tool_event["content"] = body[:STATUS_PREVIEW_CHARS]
-                        asyncio.ensure_future(
-                            reporter.emit(self.agent_id, "tool_use", tool_event)
-                        )
-                        if name == "mcp__puffo__send_message":
-                            send_message_targets.append({
-                                "channel": str(tool_input.get("channel", "")),
-                                "root_id": str(tool_input.get("root_id", "")),
-                            })
-                        if self.audit is not None:
-                            self.audit.write(
-                                "tool",
-                                name=name,
-                                input=tool_input,
-                                id=block.get("id", ""),
-                            )
-            elif t == "system":
-                sid = (event.get("session_id") or "").strip()
-                if sid and sid != self._session_id:
-                    self._save_session_id(sid)
-            elif t == "result":
-                sid = (event.get("session_id") or "").strip()
-                if sid and sid != self._session_id:
-                    self._save_session_id(sid)
-                usage = event.get("usage") or {}
-                # input_tokens is just the uncached delta; add newly-cached input
-                # for the real non-cache-read figure (matches codex).
-                input_tokens = int(usage.get("input_tokens", 0) or 0) + int(
-                    usage.get("cache_creation_input_tokens", 0) or 0
+    async def _observe_turn_event(
+        self,
+        event: dict[str, Any],
+        provider_turn_id: str,
+        state: _ClaudeTurnState,
+    ) -> None:
+        session_id = str(event.get("session_id") or "").strip()
+        if session_id and session_id != self._session_id:
+            self._save_session_id(session_id)
+        if self._admission_callback is not None:
+            await self._fire_admission(provider_turn_id)
+        await self._fire_matching_continuations(event, provider_turn_id)
+        state.event_types_seen.append(
+            f"{event.get('type')}/{event.get('subtype', '-')}"
+        )
+        logger.debug(
+            "agent %s stream event: type=%s subtype=%s session_present=%s",
+            self.agent_id,
+            event.get("type"),
+            event.get("subtype"),
+            bool(event.get("session_id")),
+        )
+
+    async def _project_turn_event(
+        self,
+        event: dict[str, Any],
+        reporter: Any,
+        state: _ClaudeTurnState,
+    ) -> bool:
+        event_type = event.get("type")
+        if event_type == "assistant":
+            for block in (event.get("message") or {}).get("content") or []:
+                if isinstance(block, dict):
+                    await self._project_assistant_block(block, reporter, state)
+        elif event_type == "system":
+            self._update_session_from_event(event)
+        elif event_type == "result":
+            self._update_session_from_event(event)
+            self._project_result_event(event, state)
+            return True
+        return False
+
+    async def _project_assistant_block(
+        self,
+        block: dict[str, Any],
+        reporter: Any,
+        state: _ClaudeTurnState,
+    ) -> None:
+        if block.get("type") == "text":
+            text = block.get("text", "") or ""
+            state.reply_parts.append(text)
+            if text and not is_silent(text):
+                asyncio.ensure_future(
+                    reporter.emit(self.agent_id, "assistant_text", {"text": text})
                 )
-                output_tokens = int(usage.get("output_tokens", 0) or 0)
-                # Fallback for CLI versions where the assembled text
-                # reply only appears on ``result.result``.
-                result_text = event.get("result") or ""
-                if not reply_parts and result_text:
-                    reply_parts.append(result_text)
-                break
+            if self.audit is not None and text:
+                self.audit.write("assistant.text", text=text)
+        elif block.get("type") == "tool_use":
+            self._project_tool_use(block, reporter, state)
 
-        reply = "".join(reply_parts).strip()
+    def _project_tool_use(
+        self,
+        block: dict[str, Any],
+        reporter: Any,
+        state: _ClaudeTurnState,
+    ) -> None:
+        state.tool_calls += 1
+        name = block.get("name", "")
+        tool_input = block.get("input") or {}
+        state.tool_names_used.append(name)
+        tool_event = {"tool": name}
+        if "send_message" in name and isinstance(tool_input.get("text"), str):
+            tool_event["content"] = tool_input["text"][:STATUS_PREVIEW_CHARS]
+        asyncio.ensure_future(reporter.emit(self.agent_id, "tool_use", tool_event))
+        if name == "mcp__puffo__send_message":
+            state.send_message_targets.append(
+                {
+                    "channel": str(tool_input.get("channel", "")),
+                    "root_id": str(tool_input.get("root_id", "")),
+                }
+            )
+        self._track_puffo_tool(block, name, tool_input)
+        if self.audit is not None:
+            self.audit.write(
+                "tool", name=name, input=tool_input, id=block.get("id", "")
+            )
 
-        # Poisoned-session recovery. If the API rejected the whole
-        # conversation (oversized image in the transcript, etc),
-        # ``--resume`` would just reload the same poison — clear the
-        # session id + kill the subprocess so the next turn starts
-        # fresh. Empty reply (mirrors the stream-error contract) so
-        # the shell suppresses the post; the metadata flag lets the
-        # worker surface the reset.
+    def _track_puffo_tool(
+        self, block: dict[str, Any], name: str, tool_input: dict
+    ) -> None:
+        if not name.startswith("mcp__puffo__"):
+            return
+        tool_use_id = str(block.get("id") or "")
+        if tool_use_id:
+            self._active_puffo_tool_calls[tool_use_id] = (
+                name.removeprefix("mcp__puffo__"),
+                {str(key): value for key, value in tool_input.items()},
+            )
+
+    def _update_session_from_event(self, event: dict[str, Any]) -> None:
+        session_id = (event.get("session_id") or "").strip()
+        if session_id and session_id != self._session_id:
+            self._save_session_id(session_id)
+
+    def _project_result_event(
+        self, event: dict[str, Any], state: _ClaudeTurnState
+    ) -> None:
+        usage = event.get("usage") or {}
+        state.input_tokens = int(usage.get("input_tokens", 0) or 0) + int(
+            usage.get("cache_creation_input_tokens", 0) or 0
+        )
+        self._context_used_tokens = state.input_tokens + int(
+            usage.get("cache_read_input_tokens", 0) or 0
+        )
+        self._context_measured_at = datetime.now(timezone.utc)
+        state.output_tokens = int(usage.get("output_tokens", 0) or 0)
+        result_text = event.get("result") or ""
+        if not state.reply_parts and result_text:
+            state.reply_parts.append(result_text)
+
+    async def _finish_turn(self, state: _ClaudeTurnState) -> TurnResult:
+        reply = "".join(state.reply_parts).strip()
         if _looks_like_poisoned_session(reply):
             await self._handle_poisoned_session(reply)
             return TurnResult(reply="", metadata={"poisoned_session": True})
-
         if not reply:
             logger.warning(
                 "agent %s: claude turn produced no text reply. events seen: %s",
-                self.agent_id, event_types_seen,
+                self.agent_id,
+                state.event_types_seen,
             )
-        # Auth-error detection + rewriting lives in run_turn; this
-        # method only reports what happened.
         if self.audit is not None:
             self.audit.write(
                 "turn.end",
                 reply_len=len(reply),
-                tool_calls=tool_calls,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                duration_ms=int((time.time() - turn_started_at) * 1000),
-                event_types=event_types_seen,
+                tool_calls=state.tool_calls,
+                input_tokens=state.input_tokens,
+                output_tokens=state.output_tokens,
+                duration_ms=int((time.time() - state.started_at) * 1000),
+                event_types=state.event_types_seen,
             )
         return TurnResult(
             reply=reply,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            tool_calls=tool_calls,
+            input_tokens=state.input_tokens,
+            output_tokens=state.output_tokens,
+            tool_calls=state.tool_calls,
             metadata={
                 "session_id": self._session_id,
-                "tool_names": tool_names_used,
-                "send_message_targets": send_message_targets,
-                # Per-frame assistant text — used by the shell to
-                # build a bulleted fallback when the agent neither
-                # called send_message nor said [SILENT].
-                "assistant_text_parts": list(reply_parts),
+                "tool_names": state.tool_names_used,
+                "send_message_targets": state.send_message_targets,
+                "assistant_text_parts": list(state.reply_parts),
             },
         )
 

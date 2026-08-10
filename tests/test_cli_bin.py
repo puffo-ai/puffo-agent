@@ -228,7 +228,6 @@ def test_claude_has_credentials_false_when_file_missing(tmp_path, monkeypatch):
 def test_claude_has_credentials_macos_falls_back_to_keychain(tmp_path, monkeypatch):
     """When the file is missing on macOS, the Keychain probe (``security
     find-generic-password``) decides. rc=0 → True, rc!=0 → False."""
-    import subprocess as _sp
 
     monkeypatch.setattr("puffo_agent.agent.cli_bin.sys.platform", "darwin")
 

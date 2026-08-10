@@ -204,3 +204,16 @@ def test_default_id_factory_used_when_not_injected():
     q = BundleQueue()
     q.enqueue("r1", _msg("a"))
     assert q.next_to_send().bundle_id.startswith("bdl_")
+
+
+def test_global_bundle_is_one_frozen_turn_with_routes():
+    q = BundleQueue(make_id=lambda: "bdl-global")
+    bundle = q.enqueue_global(
+        turn_id="turn",
+        messages=[_msg("a"), _msg("b")],
+        targets=[["channel", "sp", "ch"], ["dm", "bob"]],
+        routes=[{"envelope_id": "a"}, {"envelope_id": "b"}],
+    )
+    assert q.next_to_send() is bundle
+    assert bundle.turn_id == "turn"
+    assert bundle.envelope_ids() == ["a", "b"]
