@@ -62,7 +62,7 @@ Python:
 ```bash
 uv tool install puffo-agent
 # pin to a specific version:
-uv tool install puffo-agent==1.3.0
+uv tool install puffo-agent==1.2.0
 ```
 
 Otherwise use pip:
@@ -70,8 +70,13 @@ Otherwise use pip:
 ```bash
 pip install puffo-agent
 # pin to a specific version:
-pip install puffo-agent==1.3.0
+pip install puffo-agent==1.2.0
 ```
+
+The Agent Foundation `1.3.0a1` candidate is for staging validation and is
+published to TestPyPI only. See
+[`docs/RELEASE-CANDIDATE-1.3.0a1.md`](docs/RELEASE-CANDIDATE-1.3.0a1.md) for
+the install command, test scope, and stable-release TODOs.
 
 Both paths install the `puffo-agent` console script. The CLI's
 `check-update` command detects which way you installed and prints
