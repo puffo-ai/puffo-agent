@@ -67,7 +67,7 @@ def _metadata_only_event(value: Any) -> RuntimeEvent | None:
         }
     elif event_type == "turn.finished":
         outcome = payload.get("outcome")
-        if outcome not in TURN_OUTCOMES:
+        if not isinstance(outcome, str) or outcome not in TURN_OUTCOMES:
             return None
         legacy_error = payload.get("error")
         payload = {"outcome": outcome}

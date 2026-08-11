@@ -255,6 +255,13 @@ def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
                 },
             },
         },
+        {
+            "version": 1, "event_id": "malformed-terminal", "agent_id": "agent",
+            "session_ref": "session", "turn_ref": "turn",
+            "scope": {"kind": "operator"}, "type": "turn.finished",
+            "occurred_at": "2026-07-30T12:00:02Z",
+            "payload": {"outcome": ["failed"]},
+        },
     ]
     for value in legacy_rows:
         encoded = json.dumps(value, separators=(",", ":")).encode()
