@@ -418,6 +418,12 @@ migrate to the provider's supported Driver; other unsupported Hermes/Gemini
 combinations fail validation. Authenticate the matching CLI before restarting
 a migrated agent.
 
+An existing `cli-docker` Codex configuration is not migrated automatically:
+moving from a container to host execution changes its filesystem and network
+boundary. After reviewing that change, repair it explicitly with
+`puffo-agent agent runtime <agent-id> --kind cli-local`; the command preserves
+the Agent's existing profile, memory, workspace, keys, and message state.
+
 > **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
 > app-server`; authenticate with `codex login` or a configured LiteLLM gateway.
 >

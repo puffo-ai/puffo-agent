@@ -274,7 +274,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-# Shown when a GUI entry point (``start --ui`` / ``start --tray``) is
+# Shown when a GUI entry point (``start --ui`` / ``start --background``) is
 # invoked but the desktop UI's ``[gui]`` extra (PySide6) isn't installed.
 # The base ``pip install puffo-agent`` is deliberately Qt-free so headless
 # / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.

@@ -66,7 +66,7 @@ attachments = ["pillow>=10.0"]
 # pip install puffo-agent[gui]  — the PySide6 desktop UI (window + tray).
 # Kept out of the base install so `pip install puffo-agent` stays Qt-free
 # for headless/cloud daemons; `start`/`run_daemon` never import PySide6.
-# The `start --ui` / `start --tray` entry points fail with an actionable
+# The `start --ui` / `start --background` entry points fail with an actionable
 # "install puffo-agent[gui]" hint (see portal/cli.py cmd_start) when the
 # extra is absent.
 gui = ["pyside6>=6.7"]
