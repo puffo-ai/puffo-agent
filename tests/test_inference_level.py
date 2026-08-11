@@ -162,10 +162,10 @@ def test_create_bundle_parses_and_validates_level():
     runtime.inference_level and rejects out-of-set values."""
     import inspect
 
-    from puffo_agent.portal.api import handlers
+    from puffo_agent.portal.control import provision
 
-    src = inspect.getsource(handlers._verify_agent_bundle)
-    assert "inference_level=str(rt.get(\"inference_level\", \"\"))" in src
+    src = inspect.getsource(provision.verify_agent_bundle)
+    assert "inference_level=str(runtime_input.get(\"inference_level\", \"\"))" in src
     assert "INFERENCE_LEVELS" in src
 
 

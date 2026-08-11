@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 
@@ -11,20 +10,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
-
-from _bridge_support import (  # noqa: E402
+from _portal_support import (  # noqa: E402
     isolated_home,
-    make_user,
-    pair_request_body,
-    signed_headers,
     write_test_agent,
 )
-from puffo_agent.crypto.encoding import base64url_encode  # noqa: E402
-from puffo_agent.portal.api.server import build_app  # noqa: E402
-from puffo_agent.portal.state import DaemonConfig  # noqa: E402
-
-from puffo_agent.portal.api.handlers import _derive_role_short  # noqa: E402
 from puffo_agent.portal.cli import _derive_role_short_cli  # noqa: E402
 from puffo_agent.portal.control.client import execute_command  # noqa: E402
 from puffo_agent.portal.profile_sync import sync_full_profile  # noqa: E402
@@ -54,9 +43,7 @@ def test_derive_role_short_edge_cases():
     assert derive_role_short("a" * 32 + ": x") == "a" * 32
 
 
-def test_wrappers_delegate_to_canonical():
-    """The bridge + CLI helpers must be thin wrappers — identical output
-    to the one canonical implementation for every shape."""
+def test_cli_wrapper_delegates_to_canonical():
     cases = [
         "coder: main coder",
         "plain text no colon",
@@ -68,7 +55,6 @@ def test_wrappers_delegate_to_canonical():
         "",
     ]
     for c in cases:
-        assert _derive_role_short(c) == derive_role_short(c), c
         assert _derive_role_short_cli(c) == derive_role_short(c), c
 
 
@@ -90,7 +76,7 @@ async def test_control_edit_role_sets_derived_role_short(home, monkeypatch):
         posted.update(patch)
 
     monkeypatch.setattr(
-        "puffo_agent.portal.api.handlers._sync_agent_profile", _fake_sync
+        "puffo_agent.portal.profile_sync.sync_agent_profile", _fake_sync
     )
 
     res = await execute_command(
@@ -111,7 +97,7 @@ async def test_control_edit_role_sets_derived_role_short(home, monkeypatch):
 async def test_control_edit_role_without_colon_clears_chip(home, monkeypatch):
     write_test_agent(home, "scout")
     monkeypatch.setattr(
-        "puffo_agent.portal.api.handlers._sync_agent_profile",
+        "puffo_agent.portal.profile_sync.sync_agent_profile",
         _noop_sync,
     )
     res = await execute_command("edit", "scout", {"role": "researcher"})
@@ -246,59 +232,6 @@ async def test_startup_backfill_preserves_behavior_fields(monkeypatch):
     # soul section still in profile.md; synced body unchanged
     assert profile_path.read_text(encoding="utf-8").count("# Soul") == 1
     assert _FakeHttp.posted[-1]["soul"] == "I lead product."
-
-
-# ─── deprecated explicit-override → accept-but-warn ───────────────
-
-
-_HOST = {"Host": "127.0.0.1:63387"}
-
-
-@pytest.mark.asyncio
-async def test_bridge_update_profile_warns_on_explicit_role_short(
-    monkeypatch, caplog
-):
-    home = isolated_home()
-    user = make_user()
-    write_test_agent(
-        home,
-        "chip-bot",
-        owner_root_pubkey=base64url_encode(user.root_key.public_key_bytes()),
-    )
-
-    async def _noop_sync(cfg, patch):
-        return None
-
-    monkeypatch.setattr(
-        "puffo_agent.portal.api.handlers._sync_agent_profile", _noop_sync
-    )
-
-    app = build_app(DaemonConfig().bridge)
-    server = TestServer(app)
-    async with TestClient(server) as c:
-        body = pair_request_body(user)
-        h = signed_headers(user, "POST", "/v1/pair", body)
-        h.update(_HOST)
-        assert (await c.post("/v1/pair", data=body, headers=h)).status == 200
-
-        payload = json.dumps(
-            {"role": "coder: main puffo-core coder", "role_short": "BOGUS"}
-        ).encode("utf-8")
-        h = signed_headers(
-            user, "PATCH", "/v1/agents/chip-bot/profile", payload
-        )
-        h.update(_HOST)
-        h["content-type"] = "application/json"
-        with caplog.at_level("WARNING"):
-            r = await c.patch(
-                "/v1/agents/chip-bot/profile", data=payload, headers=h
-            )
-        assert r.status == 200, await r.text()
-        # derived value wins over the explicit override
-        assert (await r.json())["role_short"] == "coder"
-    # the drop is announced, not silent
-    assert "deprecated (PUF-401)" in caplog.text
-    assert "BOGUS" in caplog.text
 
 
 def test_cli_agent_profile_warns_on_explicit_role_short(

@@ -75,7 +75,7 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
         task = asyncio.create_task(run_attach(
             bundle_path,
             "abc12345",
-            bridge_url=base,
+            daemon_url=base,
             session_dir=session_dir,
         ))
 
@@ -148,7 +148,7 @@ async def test_tool_call_command_forwards_and_emits_result(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -203,7 +203,7 @@ async def test_tool_call_rejects_non_object_params(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -256,7 +256,7 @@ async def test_bom_prefixed_command_lines_are_accepted(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -303,7 +303,7 @@ async def test_end_command_is_forwarded(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -344,7 +344,7 @@ async def test_detach_command_closes_ws_and_exits(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
 
         commands_path = session_dir / "commands.ndjson"
@@ -365,5 +365,5 @@ async def test_detach_command_closes_ws_and_exits(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_missing_bundle_path_returns_error(tmp_path: Path):
     missing = tmp_path / "missing.puffoagent"
-    rc = await run_attach(missing, "abc12345", bridge_url="http://127.0.0.1:1")
+    rc = await run_attach(missing, "abc12345", daemon_url="http://127.0.0.1:1")
     assert rc == 2

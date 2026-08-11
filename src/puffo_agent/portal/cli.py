@@ -19,7 +19,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .api.pairing import clear_pairing, load_pairing
 from .daemon import run_daemon
 from .state import (
     AgentConfig,
@@ -204,12 +203,26 @@ def cmd_config(args: argparse.Namespace) -> int:
     home_dir().mkdir(parents=True, exist_ok=True)
     cfg = DaemonConfig.load()
 
+    anthropic_api_key = getattr(args, "anthropic_api_key", None)
+    anthropic_cli_use_api_key = getattr(
+        args, "anthropic_cli_use_api_key", None,
+    )
+    if anthropic_api_key is not None or anthropic_cli_use_api_key is not None:
+        if anthropic_api_key is not None:
+            cfg.anthropic.api_key = anthropic_api_key
+        if anthropic_cli_use_api_key is not None:
+            cfg.anthropic.cli_use_api_key = (
+                anthropic_cli_use_api_key == "true"
+            )
+        cfg.save()
+        print(f"wrote {daemon_yml_path()}")
+        return 0
+
     if daemon_yml_path().exists():
         print(f"updating daemon.yml at {daemon_yml_path()}")
     else:
         print("creating daemon.yml (optional — defaults only)")
 
-    env_anthropic = os.environ.get("ANTHROPIC_API_KEY", "")
     env_openai = os.environ.get("OPENAI_API_KEY", "")
     env_google = (
         os.environ.get("GEMINI_API_KEY")
@@ -227,10 +240,19 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     cfg.default_provider = prompt("Default AI provider (anthropic|openai|google)", cfg.default_provider or "anthropic")
 
-    anth_key = cfg.anthropic.api_key or env_anthropic
+    anth_key = cfg.anthropic.api_key
     anth_key = prompt("Default Anthropic API key (blank to skip)", anth_key)
     if anth_key:
-        cfg.anthropic = ProviderConfig(api_key=anth_key, model=cfg.anthropic.model or "claude-sonnet-4-6")
+        cfg.anthropic.api_key = anth_key
+        cfg.anthropic.model = cfg.anthropic.model or "claude-sonnet-4-6"
+    cli_use_api_key = prompt(
+        "Use the Anthropic API key for Claude Code (true|false)",
+        "true" if cfg.anthropic.cli_use_api_key else "false",
+    ).lower()
+    if cli_use_api_key not in {"true", "false"}:
+        print("error: Claude Code API-key mode must be true or false")
+        return 2
+    cfg.anthropic.cli_use_api_key = cli_use_api_key == "true"
 
     oai_key = cfg.openai.api_key or env_openai
     oai_key = prompt("Default OpenAI API key (blank to skip)", oai_key)
@@ -238,7 +260,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         cfg.openai = ProviderConfig(api_key=oai_key, model=cfg.openai.model or "gpt-4o")
 
     goog_key = cfg.google.api_key or env_google
-    goog_key = prompt("Default Google API key (blank to skip; needed for cli-docker + gemini-cli)", goog_key)
+    goog_key = prompt("Default Google API key (blank to skip; used by Google chat runtimes)", goog_key)
     if goog_key:
         cfg.google = ProviderConfig(api_key=goog_key, model=cfg.google.model or "gemini-2.5-pro")
 
@@ -250,7 +272,7 @@ def cmd_config(args: argparse.Namespace) -> int:
     print("  chat-local   conversational LLM, no tools (default, uses the keys above)")
     print("  sdk-local    in-process agent SDK w/ tools  [pip install puffo-agent[sdk]]")
     print("  cli-local    claude CLI on the host, permission-proxy DMs operator [run `claude login` first]")
-    print("  cli-docker   claude CLI inside a per-agent container  [Docker + `claude login` on host]")
+    print("  cli-docker   Claude Code or Codex in a per-agent container  [Docker + host CLI login]")
     print()
     print("defaults saved — `puffo-agent agent create` will use these unless overridden.")
     return 0
@@ -258,21 +280,20 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    with_local_bridge = getattr(args, "with_local_bridge", False)
     if getattr(args, "tray_runner", False):
         from .ui.tray import run_tray
-        return run_tray(with_local_bridge=with_local_bridge)
+        return run_tray()
     if getattr(args, "background", False):
         from .background import spawn_background
-        return spawn_background(with_local_bridge=with_local_bridge)
+        return spawn_background()
     if getattr(args, "ui", False):
         from .ui.launcher import launch
-        return launch(with_local_bridge=with_local_bridge)
+        return launch()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    return asyncio.run(run_daemon(with_local_bridge=with_local_bridge))
+    return asyncio.run(run_daemon())
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -344,7 +365,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     return asyncio.run(run_attach(
         Path(args.bundle),
         args.passcode,
-        bridge_url=args.bridge_url,
+        daemon_url=args.daemon_url,
         session_dir=session_dir,
     ))
 
@@ -465,6 +486,14 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
 
     runtime_kind = args.runtime or "chat-local"
     provider = args.provider or "anthropic"
+    from .runtime_matrix import resolve_effective_harness, validate_triple
+    harness = resolve_effective_harness(
+        runtime_kind, provider, getattr(args, "harness", None) or "",
+    ) or "claude-code"
+    result = validate_triple(runtime_kind, provider, harness)
+    if not result.ok:
+        print(f"error: {result.error}", file=sys.stderr)
+        return 2
     api_key = _resolve_api_key_for_create(
         provider=provider,
         flag_value=args.api_key or "",
@@ -507,6 +536,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             provider=args.provider or "",
             api_key=api_key,
             model=args.model or "",
+            harness=harness,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -539,84 +569,6 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     else:
         print("daemon will pick it up on the next reconcile tick (a few seconds).")
     return 0
-
-
-def _bridge_wait_until_command(base: str, command_id: str, timeout: float) -> int:
-    """GET the bridge's wait-until-command and print its result JSON to stdout."""
-    import json
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-
-    url = (
-        f"{base}/v1/machine/wait-until-command?"
-        f"id={urllib.parse.quote(command_id)}&timeout={int(timeout)}"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=timeout + 10) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code == 504:
-            print(f"pending: operator hasn't approved yet ({detail})", file=sys.stderr)
-        else:
-            print(f"error: wait failed (HTTP {exc.code}): {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: cannot reach the daemon bridge ({exc.reason})", file=sys.stderr)
-        return 1
-    print(json.dumps(result))
-    return 0
-
-
-def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
-    """Request a ws-local agent via operator approval. Non-blocking: prints the
-    ``request_id`` and returns. Poll completion with
-    ``machine wait-until-command --id <request_id>`` (or pass ``--wait`` to block
-    here). Requires the daemon running with the bridge."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    base = args.bridge_url.rstrip("/")
-    body = json.dumps(
-        {
-            "operator": args.operator,
-            "passcode": args.passcode,
-            "display_name": getattr(args, "display_name", "") or "",
-            "message": getattr(args, "message", "") or "",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base}/v1/agents/create-ws-local",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            started = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        print(f"error: request failed (HTTP {exc.code}): {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(
-            f"error: cannot reach the daemon bridge at {args.bridge_url} ({exc.reason}). "
-            "Is the daemon running with --with-local-bridge?",
-            file=sys.stderr,
-        )
-        return 1
-
-    if not getattr(args, "wait", False):
-        print(json.dumps(started))
-        return 0
-    return _bridge_wait_until_command(base, str(started.get("request_id") or ""), args.wait_timeout)
-
-
-def cmd_machine_wait_until_command(args: argparse.Namespace) -> int:
-    """Block until the command with ``--id`` has been processed, print its result."""
-    return _bridge_wait_until_command(args.bridge_url.rstrip("/"), args.id, args.timeout)
 
 
 def cmd_agent_list(args: argparse.Namespace) -> int:
@@ -906,11 +858,9 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     role_short) and best-effort sync them to puffo-server signed by
     the agent's own keystore.
 
-    Mirrors the bridge ``PATCH /v1/agents/{id}/profile`` endpoint
-    one-for-one — same validation, same wire shape, same server
-    update — so anything the operator can do from the local-bridge
-    UI is reachable from the CLI too. No flags ⇒ show current
-    values. With flags ⇒ update agent.yml, then sync to server."""
+    Uses the same server profile shape as remote management. No flags
+    show current values; update flags write agent.yml and then sync to
+    the server."""
     import asyncio
 
     from .profile_sync import sync_agent_profile
@@ -1060,7 +1010,12 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  allowed_tools:    {cfg.runtime.allowed_tools or '[]'}")
         print(f"  docker_image:     {cfg.runtime.docker_image or '(bundled default)'}")
         print(f"  permission_mode:  {cfg.runtime.permission_mode}  (cli-local only)")
-        print(f"  sandbox:          {cfg.runtime.sandbox}  (codex only)")
+        sandbox = (
+            "Docker container"
+            if cfg.runtime.kind == "cli-docker" and cfg.runtime.harness == "codex"
+            else cfg.runtime.sandbox
+        )
+        print(f"  sandbox:          {sandbox}  (codex only)")
         print(f"  max_turns:        {cfg.runtime.max_turns}  (sdk-local only)")
         return 0
 
@@ -1176,40 +1131,12 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pairing_show(args: argparse.Namespace) -> int:
-    """Print the current bridge pairing, or ``(not paired)``.
-    Reads ``pairing.json`` directly — works whether the daemon is
-    running or not."""
-    pairing = load_pairing()
-    if pairing is None:
-        print("bridge: not paired")
-        return 0
-    print(f"slug:        {pairing.slug}")
-    print(f"device_id:   {pairing.device_id}")
-    print(f"paired_at:   {_format_ts(int(pairing.paired_at / 1000))}")
-    print(f"root_pubkey: {pairing.root_public_key}")
-    return 0
-
-
-def cmd_pairing_unpair(args: argparse.Namespace) -> int:
-    """Remove the bridge pairing so a different identity can pair
-    next. The daemon re-reads ``pairing.json`` on every request — no
-    restart needed."""
-    pairing = load_pairing()
-    if pairing is None:
-        print("bridge: nothing to unpair (not paired)")
-        return 0
-    clear_pairing()
-    print(f"bridge: unpaired (was slug={pairing.slug} device_id={pairing.device_id})")
-    return 0
-
-
 def cmd_link(args: argparse.Namespace) -> int:
     """Link this machine to an operator via the online agent portal."""
     from .control.link import DEFAULT_SERVER_URL, friendly_device_name, run_link
 
     # The daemon holds the control WS that serves the operator's commands
-    # once approved — auto-start it (without the local bridge) if it isn't
+    # once approved — auto-start it if it isn't
     # running, so `link` is a one-step onboard.
     if not is_daemon_alive():
         from .background import spawn_background
@@ -1231,24 +1158,6 @@ def cmd_unlink(args: argparse.Namespace) -> int:
     from .control.link import run_unlink
 
     return asyncio.run(run_unlink(args.operator, expected_server_url=args.server_url))
-
-
-def cmd_api_status(args: argparse.Namespace) -> int:
-    """Print bridge configuration + pairing status."""
-    cfg = DaemonConfig.load()
-    b = cfg.bridge
-    pairing = load_pairing()
-    print(f"enabled:         {b.enabled}")
-    print(f"bind:            http://{b.bind_host}:{b.port}")
-    print(f"allowed_origins: {b.allowed_origins}")
-    if pairing is None:
-        print("paired:          (none)")
-    else:
-        print(f"paired:          slug={pairing.slug} device_id={pairing.device_id}")
-        print(f"paired_at:       {_format_ts(int(pairing.paired_at / 1000))}")
-    if not is_daemon_alive():
-        print("daemon:          not running (bridge is offline until you `puffo-agent start`)")
-    return 0
 
 
 def cmd_agent_export(args: argparse.Namespace) -> int:
@@ -1578,13 +1487,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser(
+    config = sub.add_parser(
         "config",
         help=(
             "Optional: set daemon-wide defaults (provider, models, API keys). "
             "The daemon runs fine without this — agents can carry their own keys."
         ),
-    ).set_defaults(func=cmd_config)
+    )
+    config.add_argument(
+        "--anthropic-api-key",
+        metavar="KEY",
+        help=(
+            "Set daemon.yml anthropic.api_key without reading "
+            "ANTHROPIC_API_KEY from the environment; pass an empty value "
+            "to clear it"
+        ),
+    )
+    config.add_argument(
+        "--anthropic-cli-use-api-key",
+        choices=("true", "false"),
+        help=(
+            "Enable or disable passing daemon.yml anthropic.api_key to "
+            "Claude Code"
+        ),
+    )
+    config.set_defaults(func=cmd_config)
     start = sub.add_parser(
         "start",
         help=(
@@ -1605,14 +1532,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Detach the daemon into the background with a status-bar (tray) "
             "icon; it survives the terminal closing. Quit from the icon or "
             "run `puffo-agent stop`."
-        ),
-    )
-    start.add_argument(
-        "--with-local-bridge",
-        action="store_true",
-        help=(
-            "Also serve the local bridge HTTP API (off by default; the MCP "
-            "data + rpc ports are always served)."
         ),
     )
     # Internal: the detached child that --background spawns to host the
@@ -1685,7 +1604,15 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--provider",
         choices=["anthropic", "openai", "google"],
-        help="Model provider (default: anthropic; ignored for cli-local/cli-docker)",
+        help="Model provider (default: anthropic)",
+    )
+    create.add_argument(
+        "--harness",
+        choices=["claude-code", "hermes", "codex"],
+        help=(
+            "CLI harness. Defaults by provider/runtime; cli-docker supports "
+            "claude-code and codex"
+        ),
     )
     create.add_argument(
         "--api-key",
@@ -1699,37 +1626,6 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--no-mention", action="store_true", help="Don't reply on @mention")
     create.add_argument("--no-dm", action="store_true", help="Don't reply on DM")
     create.set_defaults(func=cmd_agent_create)
-
-    create_wsl = agent_sub.add_parser(
-        "create-ws-local",
-        help="Create a ws-local agent via operator approval over the machine channel.",
-    )
-    create_wsl.add_argument(
-        "--operator", required=True, help="Linked operator slug to request approval from"
-    )
-    create_wsl.add_argument(
-        "--passcode", required=True, help="Passcode for the .puffoagent bundle + ws-local attach"
-    )
-    create_wsl.add_argument("--display-name", default="", help="Suggested name for the new agent")
-    create_wsl.add_argument(
-        "--message",
-        default="",
-        help="Free-text note shown to the operator for context (why this agent is needed).",
-    )
-    create_wsl.add_argument(
-        "--wait",
-        action="store_true",
-        help="Block until the operator approves and print the final result (slug/bundle/passcode).",
-    )
-    create_wsl.add_argument(
-        "--wait-timeout", type=float, default=600.0, help="Seconds to wait with --wait (default 600)."
-    )
-    create_wsl.add_argument(
-        "--bridge-url",
-        default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
-    )
-    create_wsl.set_defaults(func=cmd_agent_create_ws_local)
 
     lst = agent_sub.add_parser("list", help="List registered agents")
     lst.set_defaults(func=cmd_agent_list)
@@ -1771,9 +1667,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         choices=["anthropic", "openai", "google"],
         help=(
-            "Model provider. anthropic (default) pairs with claude-code; "
-            "openai pairs with hermes; google reserved for gemini-cli. "
-            "Must match harness if harness is claude-code / gemini-cli."
+            "Model provider. anthropic pairs with claude-code; openai "
+            "pairs with codex, or hermes on cli-local."
         ),
     )
     runtime.add_argument("--model", help="Model override (empty string clears)")
@@ -1797,7 +1692,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox",
         choices=["read-only", "workspace-write", "danger-full-access"],
         help=(
-            "codex (cli-local): file-system policy. Note "
+            "cli-local codex: file-system policy. cli-docker always uses "
+            "its container as the sandbox. Note "
             "``workspace-write`` is silently downgraded to read-only "
             "on Windows; use ``danger-full-access`` there."
         ),
@@ -1813,17 +1709,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     runtime.add_argument(
         "--harness",
-        choices=["claude-code", "hermes", "gemini-cli", "codex"],
+        choices=["claude-code", "hermes", "codex"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
             "runtime. 'claude-code' (default, anthropic only) spawns the "
-            "claude CLI with our stream-json session protocol. 'hermes' "
-            "(anthropic + openai) spawns `hermes chat` one-shot per turn. "
-            "'gemini-cli' (google, reserved — not yet implemented) targets "
-            "Google's gemini CLI. 'codex' (openai, cli-local alpha — opt-"
-            "in, not the default for openai) spawns `codex app-server` as "
-            "a long-lived JSON-RPC subprocess; auth via runtime.api_key or "
-            "operator-side `codex login`. Hermes OAuth routes to "
+            "claude CLI with our stream-json session protocol. 'codex' "
+            "(openai, cli-local or cli-docker) spawns `codex app-server` "
+            "as a long-lived JSON-RPC subprocess using operator-side "
+            "`codex login`. 'hermes' is cli-local only and routes OAuth to "
             "Anthropic's extra_usage pool, NOT your Claude subscription — "
             "see NousResearch/hermes-agent#12905."
         ),
@@ -1836,7 +1729,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Show or edit identity-profile fields (display_name, role, "
             "role_short). No flags ⇒ show. With flags ⇒ update "
             "agent.yml AND sync to puffo-server, signed by the agent's "
-            "own keystore. Mirrors the local-bridge PATCH endpoint."
+            "own keystore."
         ),
     )
     profile.add_argument("id")
@@ -1956,7 +1849,10 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument(
         "--host-sync",
         action="store_true",
-        help="also re-sync ~/.claude/skills + host MCP registrations",
+        help=(
+            "also re-sync host skills, MCP registrations, and portable "
+            "credentials"
+        ),
     )
     refresh.add_argument(
         "--session",
@@ -1975,21 +1871,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="swap runtime kind; CLI-only (MCP + web app cannot change this)",
     )
     refresh.set_defaults(func=cmd_agent_refresh)
-
-    # Bridge / local HTTP API admin.
-    pairing = sub.add_parser(
-        "pairing",
-        help="Inspect or reset the local bridge pairing (which user can drive this daemon)",
-    )
-    pairing_sub = pairing.add_subparsers(dest="pairing_cmd", required=True)
-    pairing_sub.add_parser(
-        "show",
-        help="Print the currently paired (slug, device_id), or '(not paired)'",
-    ).set_defaults(func=cmd_pairing_show)
-    pairing_sub.add_parser(
-        "unpair",
-        help="Delete pairing.json so a different identity can pair next",
-    ).set_defaults(func=cmd_pairing_unpair)
 
     machine = sub.add_parser(
         "machine",
@@ -2038,31 +1919,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     machine_unlink.set_defaults(func=cmd_unlink)
 
-    machine_wait = machine_sub.add_parser(
-        "wait-until-command",
-        help="Block until a machine command (by id) is processed; print its result.",
-    )
-    machine_wait.add_argument("--id", required=True, help="Command id to wait for (e.g. a create request_id).")
-    machine_wait.add_argument(
-        "--timeout", type=float, default=600.0, help="Seconds to wait (default 600)."
-    )
-    machine_wait.add_argument(
-        "--bridge-url",
-        default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
-    )
-    machine_wait.set_defaults(func=cmd_machine_wait_until_command)
-
-    api = sub.add_parser(
-        "api",
-        help="Inspect the local bridge HTTP API config",
-    )
-    api_sub = api.add_subparsers(dest="api_cmd", required=True)
-    api_sub.add_parser(
-        "status",
-        help="Print bind address, allowed origins, and pairing status",
-    ).set_defaults(func=cmd_api_status)
-
     attach = sub.add_parser(
         "ws-local",
         help=(
@@ -2078,9 +1934,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Passcode that decrypts the bundle (matches the create-agent UI).",
     )
     attach.add_argument(
-        "--bridge-url",
+        "--daemon-url",
+        dest="daemon_url",
         default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
+        help="Daemon ws-local base URL (default: %(default)s).",
     )
     attach.add_argument(
         "--session-dir",

@@ -120,6 +120,10 @@ class Adapter(ABC):
         only the Codex override does a real subprocess/thread probe."""
         return True
 
+    def context_limits(self) -> tuple[int | None, int | None]:
+        """Return runtime-reported window and compact threshold tokens."""
+        return None, None
+
 
 def format_history_as_prompt(messages: list[dict]) -> str:
     """Render shell conversation history as a single prompt string.

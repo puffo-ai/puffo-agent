@@ -2,7 +2,7 @@
 
 The Qt tray (``run_tray``) needs a display, so it isn't exercised here;
 these cover the detach command, the per-platform Popen flags, the
-already-running short-circuit, and that ``cmd_start`` routes the flags
+already-running short-circuit, and that ``cmd_start`` routes modes
 to the right entry point.
 """
 
@@ -108,14 +108,20 @@ def test_cmd_start_tray_runner_takes_priority_over_background(monkeypatch):
     assert cmd_start(_ns(tray_runner=True, background=True)) == 1
 
 
-def test_cmd_start_threads_with_local_bridge_flag(monkeypatch):
-    seen = {}
-    monkeypatch.setattr(bg, "spawn_background", lambda **kw: seen.update(kw) or 0)
+def test_cmd_start_routes_ui(monkeypatch):
+    import puffo_agent.portal.ui.launcher as launcher
+
+    monkeypatch.setattr(launcher, "launch", lambda: 4)
     from puffo_agent.portal.cli import cmd_start
-    cmd_start(_ns(background=True, with_local_bridge=True))
-    assert seen == {"with_local_bridge": True}
+
+    assert cmd_start(_ns(ui=True)) == 4
 
 
-def test_tray_runner_command_appends_bridge_flag():
-    assert "--with-local-bridge" not in bg.tray_runner_command(False)
-    assert bg.tray_runner_command(True)[-1] == "--with-local-bridge"
+def test_cmd_start_routes_foreground_daemon(monkeypatch):
+    from puffo_agent.portal import cli
+
+    async def fake_run_daemon():
+        return 3
+
+    monkeypatch.setattr(cli, "run_daemon", fake_run_daemon)
+    assert cli.cmd_start(_ns()) == 3

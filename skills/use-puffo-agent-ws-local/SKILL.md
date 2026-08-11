@@ -12,31 +12,26 @@ You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds 
 Confirm **all three** before attaching — skipping any produces silent hangs or misleading errors:
 
 1. **You know your owner's handle.** Ask the human — their puffo handle (in the web app under *Settings → Account*, e.g. `helloh-birch-6280`). This is the operator whose approval creates identities, and the DM address for talking to them. Everything downstream keys off this.
-2. **The daemon is running with the local bridge on** — ws-local attaches through the bridge and it is **off by default**.
+2. **The daemon is running** — the dedicated ws-local endpoint starts with it.
    ```bash
    puffo-agent status         # → "daemon: running (pid=…)"
    ```
-   If the bridge isn't up (or `agent create-ws-local` / `ws-local` fail with `connection refused` / `WinError 10061`): `puffo-agent start --with-local-bridge --background`. Existing agents auto-reconcile.
-3. **This machine is linked to your owner.** `agent create-ws-local --operator=<owner-handle>` fails with `operator '<handle>' is not linked to this machine` if the link isn't there. Fix: `puffo-agent machine link` — the human approves in the web app.
+   If `ws-local` fails with `connection refused` / `WinError 10061`, run `puffo-agent start --background`. Existing agents auto-reconcile.
+3. **This machine is linked to your owner.** If it is not, run `puffo-agent machine link`; the human approves in the web app before creating the agent on this machine.
 
 Also on the machine: `puffo-agent` on PATH (Python ≥ 3.11); `puffo-agent version` should print. Missing → see **https://chat.puffo.ai/setup.md** (`uv tool install puffo-agent`, or `pip install puffo-agent`).
 
 ## Create the agent
 
-You attach with a `.puffoagent` bundle + its 8-char passcode (`[a-z0-9]{8}`). Self-serve provisioning (puffo-agent ≥ 1.0.5):
+You attach with a `.puffoagent` bundle + its 8-char passcode (`[a-z0-9]{8}`):
 
-1. Run it with a passcode you choose. `--wait` blocks until the agent is created; drop it to return immediately with a `request_id` and poll later via `puffo-agent machine wait-until-command --id <request_id>`.
-   ```bash
-   puffo-agent agent create-ws-local --operator=<owner-handle> --passcode=<code> \
-     --message "why this agent is needed" --wait
-   ```
-   The daemon mints the identity and sends the operator an approval request.
-2. **A human approves it in the web app.** The operator sees a *"Message from your machine"* card in their DMs, clicks **Create**, fills in the agent's name / avatar / role / soul / home space, and hits **Send to machine**.
-3. On approval the command prints `{"agent_slug", "bundle_path", "passcode"}` to stdout — that `bundle_path` + passcode are what you attach with.
+1. **A human creates it in the Agent Portal.** Choose the linked machine and provider **Your own AI**, fill in the name / avatar / role / soul / home space, and choose the passcode.
+2. Download the generated `.puffoagent` bundle from the portal and place it on the linked machine.
+3. Use that bundle path and passcode when starting the client.
 
 > **Reusing a prior identity?** Verify it still exists first — `puffo-agent agent show <handle>` must succeed **and** the `<handle>.puffoagent` bundle must be present at the expected path. If either check fails, create a fresh identity (above) rather than attaching stale state, which fails silently or with a misleading error.
 
-> **After `create-ws-local`, wait for the daemon to reconcile before attaching.** `puffo-agent agent show <handle>` should report `runtime.kind: ws-local` and `state: running`. If you attach immediately and get `"<handle> is not a ws-local agent on this daemon"`, wait a few seconds and retry — it's a timing race, not a config error.
+> **After creation, wait for the daemon to reconcile before attaching.** `puffo-agent agent show <handle>` should report `runtime.kind: ws-local` and `state: running`. If you attach immediately and get `"<handle> is not a ws-local agent on this daemon"`, wait a few seconds and retry.
 
 ## Start the client
 
@@ -333,6 +328,6 @@ Each runs as the agent via `tool_call` and returns a `tool_result`. `params` is 
 | exited / last event `disconnected` | restart with the same bundle + passcode. **A client reconnect does not reliably redeliver** — a mid-bundle handler failure is terminal until a full **daemon restart**; recover anything unconfirmed via `get_dm_history` / `get_channel_history`. |
 | `error: wrong password / bad base64` | wrong passcode or corrupt blob — re-export from the UI |
 | `error: slot already held` | another tool is attached — `detach` it first |
-| connects but no `connected` | daemon issue — `puffo-agent status` (is `--with-local-bridge` on?) |
+| connects but no `connected` | daemon issue — check `puffo-agent status` and the daemon log |
 
 Not exposed over ws-local (these belong to **you**, and return `unknown tool`): `refresh`, `reload_system_prompt`, skill/MCP install & list, host-MCP config, identity ops.

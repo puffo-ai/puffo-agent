@@ -23,12 +23,11 @@ The package is distributed as `puffo-agent`; the Python module is
 | CLI and daemon | `portal/cli.py`, `portal/daemon.py`, `portal/state.py` | Start/stop/status commands, read and write on-disk config, reconcile desired agent state into running workers. |
 | Worker runtime | `portal/worker.py`, `agent/core.py`, `agent/adapters/*`, `agent/harness/*`, `agent/providers/*` | Run one agent loop, build system prompt, dispatch messages to the selected runtime, record runtime state. |
 | Puffo protocol | `crypto/*`, `agent/message_store.py`, `agent/status_reporter.py` | Signed HTTP, WebSocket relay, HPKE/AEAD message encryption, local encrypted message history, status reporting. |
-| Local bridge | `portal/api/*` | Loopback HTTP API for local web clients to pair, manage agents, inspect files/logs, import/export, and attach WS-local tools. |
 | Remote control | `portal/control/*` | Machine linking, operator pairings, encrypted control WebSocket, remote create/edit/pause/resume/archive/refresh commands. |
 | Local services | `portal/data_service.py`, `portal/rpc_service.py`, `portal/ws_local/*` | Loopback data/RPC APIs and WS-local attachment protocol used by MCP and external tools. |
 | MCP tools | `mcp/*` | Stdio MCP server exposing Puffo messaging tools plus host-side skill/MCP/refresh tools to CLI runtimes. |
 | Desktop UI | `portal/ui/*` | PySide6 desktop window, tray runner, agent/operator/log/workspace views. |
-| Tests | `tests/*` | Pytest suite covering crypto, bridge, control, worker/runtime, MCP, WS-local, UI helpers, and packaging behavior. |
+| Tests | `tests/*` | Pytest suite covering crypto, control, worker/runtime, MCP, WS-local, UI helpers, and packaging behavior. |
 
 ## Runtime Flow
 
@@ -85,21 +84,6 @@ Key conventions:
 - Per-agent virtual homes isolate `.claude`, `.codex`, sessions, credentials,
   and workspace-level prompt/config files.
 
-## Local Bridge
-
-`portal/api/server.py` builds an aiohttp app bound to loopback. It exposes:
-
-- Discovery and pairing: `/v1/info`, `/v1/providers`, `/v1/pair`,
-  `/v1/pairing`.
-- Agent management: list/create/get/delete, profile/runtime update,
-  pause/resume/restart/archive.
-- Operator support: logs, workspace file browse/read, import/export,
-  revoke-pending.
-- WS-local: `GET /v1/ws-local`.
-
-The bridge is intentionally not load-bearing for agent message delivery. If it
-cannot bind its port, the daemon can continue running workers.
-
 ## Remote Control Plane
 
 `portal/control` links a local machine to one or more remote operators:
@@ -111,10 +95,10 @@ cannot bind its port, the daemon can continue running workers.
 - `envelope.py` verifies and decrypts operator command envelopes.
 - `client.py` maintains the machine control WebSocket and executes commands.
 
-Remote control commands deliberately reuse the same local state model as the
-bridge. For example, pause/resume updates `agent.yml`, archive touches
-`archive.flag`, and refresh writes workspace refresh flags. This keeps one
-execution path: the daemon reconcile loop.
+Remote control commands mutate the daemon's local state model. For example,
+pause/resume updates `agent.yml`, archive touches `archive.flag`, and refresh
+writes workspace refresh flags. The daemon reconcile loop remains the single
+execution path.
 
 ## Puffo Core And Crypto
 
@@ -159,7 +143,8 @@ inside the daemon's normal adapter process:
 - `protocol.py` defines strict JSON frames such as `connect`, `bundle`,
   `ack`, `end`, `tool_call`, and `tool_result`.
 - `hub.py` tracks attach points.
-- `route.py` exposes the bridge WebSocket route.
+- `server.py` exposes only `GET /v1/ws-local` on loopback port 63387.
+- `route.py` handles the WebSocket attachment.
 - `session.py` runs a turn session over an abstract transport.
 - `tool_dispatch.py` exposes the allowed Puffo tools.
 - `ws_local_client.py` is the attach-side client entry path.
@@ -171,8 +156,6 @@ plaintext bundles and returns tool results or turn completion frames.
 
 The repository has a broad pytest suite. Useful clusters:
 
-- Bridge and local API: `test_bridge_*`, `test_log_endpoint.py`,
-  `test_pause_resume_archive.py`.
 - Remote control: `test_control_client.py`, `test_control_envelope.py`,
   `test_link_migrate_soul_sync.py`.
 - Worker/runtime/adapters: `test_worker_*`, `test_runtime_matrix.py`,
@@ -189,8 +172,7 @@ The repository has a broad pytest suite. Useful clusters:
 
 - Agent lifecycle is file-driven and reconciled by the daemon.
 - Worker processes/tasks are per-agent; agent state is isolated on disk.
-- The bridge and control plane mutate desired state, not running workers
-  directly.
+- The control plane mutates desired state, not running workers directly.
 - Puffo Core traffic is signed, encrypted where required, and uses per-agent
   keystore material.
 - CLI runtimes receive Puffo capabilities through generated MCP config and

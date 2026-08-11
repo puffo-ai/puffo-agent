@@ -38,7 +38,7 @@ async def run_attach(
     bundle_path: Path,
     passcode: str,
     *,
-    bridge_url: str = "http://127.0.0.1:63387",
+    daemon_url: str = "http://127.0.0.1:63387",
     session_dir: Optional[Path] = None,
 ) -> int:
     if not bundle_path.is_file():
@@ -63,7 +63,7 @@ async def run_attach(
     # First stdout line so the wrapping AI can pick the path up.
     print(f"SESSION_DIR={session_dir}", flush=True)
 
-    ws_url = bridge_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/v1/ws-local"
+    ws_url = daemon_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://") + "/v1/ws-local"
 
     def emit_event(event: dict[str, Any]) -> None:
         with events_path.open("a", encoding="utf-8") as fh:

@@ -3,7 +3,6 @@ lifecycle 4xx give-up, and /v1/info machine_id."""
 from __future__ import annotations
 
 import argparse
-import json
 import types
 
 import pytest
@@ -197,21 +196,6 @@ async def test_report_lifecycle_retries_on_5xx(monkeypatch):
 
     _stub_lifecycle_http(monkeypatch, HttpError(503, "upstream down"))
     assert await daemon._report_lifecycle(_fake_cfg(), "paused") is False
-
-
-# ── /v1/info machine_id ─────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_info_includes_machine_id(monkeypatch):
-    from puffo_agent.portal.api import handlers
-
-    monkeypatch.setattr("puffo_agent.portal.control.store.current_machine_id", lambda: "mac_INFO")
-    monkeypatch.setattr(handlers, "load_pairing", lambda: None)
-    monkeypatch.setattr(handlers, "discover_agents", lambda: [])
-
-    resp = await handlers.info(None)
-    data = json.loads(resp.body)
-    assert data["machine_id"] == "mac_INFO"
 
 
 # ── machine unlink CLI wiring ───────────────────────────────────────

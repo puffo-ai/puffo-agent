@@ -10,7 +10,7 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-# Allow test files to import sibling helpers like ``_bridge_support``.
+# Allow test files to import sibling helpers like ``_portal_support``.
 _TESTS = Path(__file__).resolve().parent
 if str(_TESTS) not in sys.path:
     sys.path.insert(0, str(_TESTS))

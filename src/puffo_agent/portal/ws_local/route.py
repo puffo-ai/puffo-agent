@@ -1,8 +1,7 @@
 """aiohttp WS route for ws-local tools: ``GET /v1/ws-local``.
 
-Loopback-only (the bridge binds loopback). Auth is the handshake's own
-``.puffoagent`` decryption — this path is exempt from the bridge's HTTP
-signature middleware. The handler wires the hub's per-agent attach point
+Loopback-only. Authentication is performed by decrypting the
+``.puffoagent`` bundle during the handshake. The handler wires the hub's per-agent attach point
 into ``serve_connection``: the session relays replies + judges liveness,
 the consumer (``client.listen``) feeds batches and advances the cursor
 on ack.
@@ -48,10 +47,11 @@ def _build_tool_dispatch(point: AttachPoint):
     return _build_dispatch(cfg)
 
 WS_LOCAL_PATH = "/v1/ws-local"
+WS_LOCAL_HUB_KEY = web.AppKey("ws_local_hub", WsLocalHub)
 
 
 async def handle_ws_local(request: web.Request) -> web.WebSocketResponse:
-    hub: WsLocalHub | None = request.app.get("ws_local_hub")
+    hub = request.app.get(WS_LOCAL_HUB_KEY)
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     transport = AiohttpTransport(ws)

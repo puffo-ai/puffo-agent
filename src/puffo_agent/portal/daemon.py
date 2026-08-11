@@ -21,8 +21,8 @@ from typing import Optional
 from pathlib import Path
 
 from ..macos.keychain import CredentialCache, is_macos
-from .api import start_api_server, stop_api_server
 from .ws_local.hub import WsLocalHub
+from .ws_local.server import start_ws_local_server, stop_ws_local_server
 from .credential_refresh import (
     CodexFileBackend,
     CredentialRefresher,
@@ -46,6 +46,7 @@ from .state import (
     agents_dir,
     archive_flag_path,
     archived_dir,
+    claude_cli_api_key,
     clear_daemon_pid,
     clear_refresh_token_request,
     clear_stop_request,
@@ -67,13 +68,21 @@ from .worker import Worker
 logger = logging.getLogger(__name__)
 
 
+def _uses_claude_api_key(daemon_cfg: DaemonConfig | None, agent_cfg: AgentConfig) -> bool:
+    return (
+        getattr(agent_cfg.runtime, "kind", "cli-local")
+        in {"cli-local", "cli-docker"}
+        and (agent_cfg.runtime.harness or "claude-code") == "claude-code"
+        and bool(claude_cli_api_key(daemon_cfg))
+    )
+
+
 class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
         self._paused_reported: set[str] = set()
-        # Shared attach registry: ws-local Workers register here; the
-        # bridge's /v1/ws-local route serves tools against it.
+        # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
         self._stop = asyncio.Event()
         # Cap on per-worker warm wait so a wedged warm can't pin the
@@ -128,18 +137,17 @@ class Daemon:
         # the operator hand-edited agent.yml / profile.md offline.
         asyncio.ensure_future(_full_sync_all_owned_agents_at_startup())
 
-        # Start auxiliary HTTP services. Both are non-fatal on bind
+        # Start auxiliary HTTP services. Each is non-fatal on bind
         # failure — the daemon's primary job is still running agents.
-        api_runner = await start_api_server(
-            self.daemon_cfg.bridge, ws_local_hub=self.ws_local_hub,
+        ws_local_runner = await start_ws_local_server(
+            self.daemon_cfg.ws_local_service, ws_local_hub=self.ws_local_hub,
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_client_resolver(self._resolve_message_client)
         set_rpc_resolver(self._resolve_host_mcp_context)
-        # Bridge pins 63387 (browser clients hard-code it). Both
-        # fallbacks scan from 63388 onward so neither collides with
-        # bridge; data starts after rpc so its fallback can route
-        # past rpc's resolved port.
+        # ws-local pins 63387. Both fallbacks scan from 63388 onward so
+        # neither collides with it; data starts after rpc so its fallback
+        # can route past rpc's resolved port.
         rpc_runner = await start_rpc_service(
             self.daemon_cfg.rpc_service, fallback_start=63388,
         )
@@ -199,7 +207,7 @@ class Daemon:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
-            await stop_api_server(api_runner)
+            await stop_ws_local_server(ws_local_runner)
             set_profile_setter(None)
             set_client_resolver(None)
             set_rpc_resolver(None)
@@ -284,6 +292,8 @@ class Daemon:
             try:
                 agent_cfg = self._load_agent_cfg_cached(agent_id)
             except Exception as exc:
+                # TODO: Cache invalid configs by mtime, stop any stale worker,
+                # publish an errored RuntimeState, and support lenient CLI repair.
                 logger.warning("agent %s: failed to load agent.yml: %s", agent_id, exc)
                 continue
 
@@ -349,9 +359,14 @@ class Daemon:
             return self.codex_refresher
         return self.refresher
 
+    def _uses_claude_api_key(self, agent_cfg: AgentConfig) -> bool:
+        return _uses_claude_api_key(self.daemon_cfg, agent_cfg)
+
     def _register_with_refresher(
         self, agent_cfg: AgentConfig, worker: Worker,
     ) -> None:
+        if _uses_claude_api_key(getattr(self, "daemon_cfg", None), agent_cfg):
+            return
         refresher = self._refresher_for(agent_cfg)
         refresher.register_agent(agent_home_dir(agent_cfg.id))
         agent_id = agent_cfg.id
@@ -387,9 +402,13 @@ class Daemon:
         worker._refresh_success_callback = on_refresh_success
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
+        if self._uses_claude_api_key(agent_cfg):
+            return None
         return self._refresher_for(agent_cfg).notify_refresh_needed
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
+        if self._uses_claude_api_key(agent_cfg):
+            return None
         return self._refresher_for(agent_cfg).ensure_fresh
 
     def _set_worker_profile_cache(
@@ -690,7 +709,7 @@ def _mcp_fingerprint_path() -> Path:
 
 
 def _respawn_codex_on_mcp_change_at_startup() -> None:
-    """Drop cli-local codex sessions when the MCP tool surface changed so
+    """Drop CLI Codex sessions when the MCP tool surface changed so
     they reload tools — codex caches MCP once (openai/codex#7767). First
     run just records the fingerprint."""
     import json
@@ -713,7 +732,7 @@ def _respawn_codex_on_mcp_change_at_startup() -> None:
             except Exception:  # noqa: BLE001
                 continue
             rt = cfg.runtime
-            if rt.kind != "cli-local" or rt.harness != "codex":
+            if rt.kind not in {"cli-local", "cli-docker"} or rt.harness != "codex":
                 continue
             try:
                 flag = refresh_session_flag_path(cfg.resolve_workspace_dir())
@@ -836,6 +855,7 @@ def _worker_needs_restart(old, new) -> bool:
         old.puffo_core != new.puffo_core
         or old.profile != new.profile
         or old.runtime != new.runtime
+        or old.env_overrides != new.env_overrides
     )
 
 
@@ -1031,7 +1051,7 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def run_daemon(with_local_bridge: bool = False) -> int:
+async def run_daemon() -> int:
     # Single-daemon enforcement. ``start`` against an already-running
     # daemon exits 0 (the user wanted a running daemon; one exists) —
     # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
@@ -1052,8 +1072,6 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
     cleanup_staging_dir()
 
     daemon_cfg = DaemonConfig.load()
-    if with_local_bridge:
-        daemon_cfg.bridge.enabled = True
     write_daemon_pid(os.getpid())
 
     daemon = Daemon(daemon_cfg)

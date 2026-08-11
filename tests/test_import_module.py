@@ -14,7 +14,7 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from _bridge_support import isolated_home
+from _portal_support import isolated_home
 
 from puffo_agent.crypto.canonical import canonicalize_for_signing
 from puffo_agent.crypto.certs import derive_public_key_id
@@ -327,7 +327,7 @@ async def test_revoke_pending_succeeds_on_retry(mock_server):
 
 async def test_revoke_pending_no_marker():
     from puffo_agent.portal import import_agents as imp
-    from _bridge_support import write_test_agent
+    from _portal_support import write_test_agent
 
     write_test_agent(os.environ["PUFFO_AGENT_HOME"], "alpha")
     result = await imp.revoke_pending("alpha")

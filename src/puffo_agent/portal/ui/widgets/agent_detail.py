@@ -35,21 +35,21 @@ from PySide6.QtWidgets import (
 from ....agent import disk_cache
 from ....agent.model_catalog import ModelOption, prefetch, provider_models
 from ... import export
-from ...api.handlers import (
+from ...profile_sync import (
     MAX_AVATAR_BYTES,
     MAX_PROFILE_SUMMARY_BYTES,
     MAX_ROLE_LEN,
     MAX_ROLE_SHORT_LEN,
-    _profile_summary,
-    _update_profile_summary,
-    _upload_avatar_via_agent_keystore,
+    profile_summary,
+    update_profile_summary,
+    upload_avatar,
 )
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
     harness_applies,
     validate_triple,
 )
-from ...state import AgentConfig, derive_role_short
+from ...state import AgentConfig, RuntimeState, derive_role_short, merge_env_overrides
 from ..names import resolve_display_name
 from .avatar import initial_pixmap
 
@@ -160,8 +160,12 @@ class AgentDetail(QWidget):
             (self._harness,      "currentTextChanged"),
             (self._model,        "currentTextChanged"),
             (self._effort,       "currentTextChanged"),
+            (self._autocompact,  "currentTextChanged"),
         ):
             getattr(w, sig).connect(self._check_dirty)
+        self._autocompact.currentTextChanged.connect(
+            self._update_autocompact_preview
+        )
         self._check_dirty()
 
     # Construction ──────────────────────────────────────────────────
@@ -283,6 +287,28 @@ class AgentDetail(QWidget):
         self._access.setWordWrap(True)
         layout.addRow("Access", self._access)
 
+        self._autocompact = QComboBox()
+        for label, value in (
+            ("Default", ""),
+            ("75%", "75"),
+            ("50%", "50"),
+            ("30%", "30"),
+        ):
+            self._autocompact.addItem(label, value)
+        self._autocompact.setToolTip(
+            "Compact the agent's context earlier to cut cold-read cost. "
+            "Saving restarts the agent."
+        )
+        layout.addRow("Auto-compact at", self._autocompact)
+
+        self._context_usage = QLabel("—")
+        self._context_usage.setStyleSheet("color: #6b7280;")
+        self._context_usage.setWordWrap(True)
+        layout.addRow("Context", self._context_usage)
+        self._runtime_kind.currentTextChanged.connect(
+            self._update_autocompact_enabled
+        )
+
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
@@ -390,12 +416,14 @@ class AgentDetail(QWidget):
         self._display_name.setText(cfg.display_name)
         self._role.setText(cfg.role)
         self._role_short.setText(cfg.role_short)
-        self._soul.setPlainText(_profile_summary(cfg))
+        self._soul.setPlainText(profile_summary(cfg))
         self._set_combo(self._runtime_kind, cfg.runtime.kind)
         self._set_combo(self._harness, cfg.runtime.harness)
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
         self._populate_effort_combo(cfg.runtime.harness, cfg.runtime.inference_level)
         self._access.setText(self._access_summary(cfg.runtime.harness, cfg))
+        self._populate_autocompact(cfg)
+        self._update_autocompact_enabled()
         self._populate_skills(cfg)
         self._populate_mcp(cfg)
         # ws-local agents bring their own brain — runtime / harness / model
@@ -441,6 +469,7 @@ class AgentDetail(QWidget):
             self._harness.currentText(),
             self._model.currentData() or "",
             self._effort.currentData() or "",
+            self._autocompact.currentData() or "",
         )
 
     def _check_dirty(self) -> None:
@@ -593,7 +622,7 @@ class AgentDetail(QWidget):
 
         def worker() -> None:
             try:
-                url = asyncio.run(_upload_avatar_via_agent_keystore(cfg, data))
+                url = asyncio.run(upload_avatar(cfg, data))
                 if not url:
                     self._avatar_uploaded.emit("", "upload returned empty url")
                     return
@@ -674,6 +703,22 @@ class AgentDetail(QWidget):
         self._populate_effort_combo(harness, self._effort.currentData() or "")
         if self._cfg is not None:
             self._access.setText(self._access_summary(harness, self._cfg))
+            self._populate_autocompact(self._cfg, harness=harness)
+        self._update_autocompact_enabled()
+
+    def _update_autocompact_enabled(self, *_args) -> None:
+        applies = (
+            self._runtime_kind.currentText() in {"cli-local", "cli-docker"}
+            and self._harness.currentText() in {"claude-code", "codex"}
+        )
+        self._autocompact.setEnabled(applies)
+        self._context_usage.setEnabled(applies)
+        reason = "" if applies else "Auto-compact thresholds require Claude Code or Codex."
+        self._autocompact.setToolTip(
+            "Compact the agent's context earlier; saving restarts the agent."
+            if applies else reason
+        )
+        self._context_usage.setToolTip(reason)
 
     def _populate_effort_combo(self, harness: str, current: str) -> None:
         from ....mcp.config import INFERENCE_LEVELS
@@ -692,6 +737,103 @@ class AgentDetail(QWidget):
         self._effort.setCurrentIndex(idx if idx >= 0 else 0)
         self._effort.blockSignals(False)
 
+    def _populate_autocompact(
+        self, cfg: AgentConfig, *, harness: str | None = None,
+    ) -> None:
+        from ...control.context_telemetry import compact_pct_key, parse_threshold_pct
+
+        active_harness = harness or cfg.runtime.harness
+        raw = cfg.env_overrides.get(compact_pct_key(active_harness), "")
+        configured_pct = parse_threshold_pct(raw)
+        wanted = (
+            ""
+            if configured_pct is None
+            else str(int(configured_pct))
+            if float(configured_pct).is_integer()
+            else str(configured_pct)
+        )
+        state = RuntimeState.load(cfg.id)
+        idx = self._autocompact.findData(wanted)
+        self._autocompact.blockSignals(True)
+        default_label = "Default"
+        if (
+            configured_pct is None
+            and state is not None
+            and state.auto_compact_threshold_pct is not None
+        ):
+            default_label = f"Default ({state.auto_compact_threshold_pct:g}%)"
+        self._autocompact.setItemText(0, default_label)
+        self._autocompact.setCurrentIndex(idx if idx >= 0 else 0)
+        self._autocompact.blockSignals(False)
+        self._update_autocompact_preview()
+
+    def _update_autocompact_preview(self, *_args) -> None:
+        if self._cfg is None:
+            return
+        from ...control.context_telemetry import (
+            build_context_runtime,
+            compact_pct_key,
+            estimate_compact_threshold_tokens,
+            parse_threshold_pct,
+        )
+
+        cfg = self._cfg
+        state = RuntimeState.load(cfg.id)
+        harness = self._harness.currentText()
+        same_harness = harness == cfg.runtime.harness
+        live_window = (
+            state.max_context
+            if same_harness and state and state.max_context > 0
+            else None
+        )
+        selected_pct = parse_threshold_pct(self._autocompact.currentData())
+        key = compact_pct_key(harness)
+        if harness == "codex":
+            window = live_window
+            pct = selected_pct
+        else:
+            runtime = build_context_runtime(
+                model=cfg.runtime.model,
+                max_context=live_window,
+                env_overrides={key: self._autocompact.currentData() or ""},
+                env={} if cfg.runtime.kind == "cli-docker" else None,
+            )
+            window = runtime["max_context"]
+            pct = runtime["auto_compact_threshold_pct"]
+        configured_pct = parse_threshold_pct(
+            cfg.env_overrides.get(key)
+        )
+        if (
+            pct is None
+            and configured_pct is None
+            and same_harness
+            and state is not None
+            and state.auto_compact_threshold_pct is not None
+        ):
+            pct = state.auto_compact_threshold_pct
+        if window is None:
+            self._context_usage.setText(
+                "Context limits unavailable. Live usage shows in the web app; "
+                "saving restarts the agent."
+            )
+            return
+        threshold = estimate_compact_threshold_tokens(
+            window, pct
+        )
+        window_k = window // 1000
+        prefix = "" if live_window is not None else "Estimated "
+        if threshold is None:
+            limits = f"{prefix}{window_k}K window · compact point unavailable"
+        else:
+            suffix = " (default)" if selected_pct is None else ""
+            limits = (
+                f"{prefix}{window_k}K window · compact point "
+                f"~{threshold // 1000}K ({pct:g}%){suffix}"
+            )
+        self._context_usage.setText(
+            f"{limits}. Live usage shows in the web app; saving restarts the agent."
+        )
+
     def _access_summary(self, harness: str, cfg) -> str:
         """Read-only access line: permission mode for claude-code,
         sandbox + approval policy for codex."""
@@ -702,6 +844,8 @@ class AgentDetail(QWidget):
                 "never" if cfg.runtime.permission_mode == "bypassPermissions"
                 else "untrusted"
             )
+            if cfg.runtime.kind == "cli-docker":
+                return f"sandbox: Docker container · approve: {policy}"
             return f"sandbox: {cfg.runtime.sandbox} · approve: {policy}"
         return f"permission: {cfg.runtime.permission_mode}"
 
@@ -727,6 +871,13 @@ class AgentDetail(QWidget):
         if not self._cfg or not self._agent_id:
             return
         cfg = self._cfg
+
+        previous_context_config = (
+            cfg.runtime.kind,
+            cfg.runtime.harness,
+            cfg.runtime.model,
+            tuple(sorted(cfg.env_overrides.items())),
+        )
 
         runtime_kind = self._runtime_kind.currentText()
         harness = self._harness.currentText() if harness_applies(runtime_kind) else cfg.runtime.harness
@@ -763,12 +914,35 @@ class AgentDetail(QWidget):
         cfg.runtime.harness = harness
         cfg.runtime.model = model
         cfg.runtime.inference_level = self._effort.currentData() or ""
+        pct = self._autocompact.currentData() or ""
+        from ...control.context_telemetry import compact_pct_key
+        compact_key = compact_pct_key(harness)
+        try:
+            cfg.env_overrides = merge_env_overrides(
+                cfg.env_overrides,
+                {compact_key: pct},
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Save", str(exc))
+            return
         try:
             cfg.save()
-            _update_profile_summary(cfg, soul)
+            update_profile_summary(cfg, soul)
         except Exception as exc:
             QMessageBox.warning(self, "Save", f"failed to persist: {exc}")
             return
+        current_context_config = (
+            cfg.runtime.kind,
+            cfg.runtime.harness,
+            cfg.runtime.model,
+            tuple(sorted(cfg.env_overrides.items())),
+        )
+        if current_context_config != previous_context_config:
+            state = RuntimeState.load(cfg.id)
+            if state is not None:
+                state.max_context = 0
+                state.auto_compact_threshold_pct = None
+                state.save(cfg.id)
         self._reload_from_disk()
         self.saved.emit(self._agent_id)
 

@@ -1231,11 +1231,19 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def sync_host_mcp(template_id: str) -> str:
-        """Copy the operator's ``~/.claude.json#mcpServers[<id>]``
-        entry into your own ``<agent>/.claude.json``. Pair with
+        """Copy the operator's host MCP registration and portable
+        credentials into your isolated runtime. Claude reads the entry
+        from ``~/.claude.json``; Codex reads ``~/.codex/config.toml``
+        plus its file-backed MCP OAuth store. Pair with
         ``install_host_mcp`` once the operator finishes OAuth on host,
-        then call ``refresh()`` so claude respawns and picks up the
-        new MCP.
+        then call ``refresh()`` so the CLI respawns and picks up the MCP.
+
+        Codex OAuth must be created on the host with
+        ``mcp_oauth_credentials_store="file"`` (for example,
+        ``codex -c 'mcp_oauth_credentials_store="file"' mcp login NAME``).
+        OS-keyring-encrypted Codex OAuth cannot be copied into an
+        isolated agent home; the returned result explains the one-time
+        host re-login required when that legacy storage is detected.
 
         If the host config doesn't have the entry yet, returns an
         error asking you to call ``install_host_mcp`` first (and

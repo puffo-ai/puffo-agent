@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from _bridge_support import isolated_home
+from _portal_support import isolated_home
 from puffo_agent.agent.permission_prompt import format_permission_prompt
 
 

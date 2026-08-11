@@ -41,9 +41,9 @@
   <text x="810" y="318" text-anchor="middle" font-size="13" font-weight="600" fill="#1b2417">MCP loopback</text>
   <text x="810" y="336" text-anchor="middle" font-size="10.5" fill="#5d6a55">data :63386 · rpc :63385</text>
 
-  <rect x="724" y="372" width="172" height="56" rx="8" fill="#f6f6f4" stroke="#b7b7b7" stroke-width="1.2" stroke-dasharray="4 3"/>
-  <text x="810" y="395" text-anchor="middle" font-size="12.5" font-weight="600" fill="#9aa0a6">Legacy bridge :63387</text>
-  <text x="810" y="412" text-anchor="middle" font-size="10.5" fill="#9aa0a6">off by default · --with-local-bridge</text>
+  <rect x="724" y="372" width="172" height="56" rx="8" fill="#ffffff" stroke="#c2d191" stroke-width="1.2"/>
+  <text x="810" y="395" text-anchor="middle" font-size="12.5" font-weight="600" fill="#1b2417">ws-local :63387</text>
+  <text x="810" y="412" text-anchor="middle" font-size="10.5" fill="#5d6a55">WebSocket messages only</text>
 
   <!-- forward arrows -->
   <line x1="230" y1="162" x2="372" y2="162" stroke="#5d6a55" stroke-width="1.6" marker-end="url(#arw)"/>

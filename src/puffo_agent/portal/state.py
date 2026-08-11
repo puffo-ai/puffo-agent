@@ -108,6 +108,35 @@ _CLAUDE_HOME_SEED_PATHS = (
 )
 
 
+def strip_claude_api_key_from_settings(path: Path) -> bool:
+    """Remove a persisted ``env.ANTHROPIC_API_KEY`` override.
+
+    Claude Code gives that setting precedence over subscription credentials.
+    Puffo's only API-key opt-in lives in ``daemon.yml``, so agent-scoped
+    settings must not select a separate billing credential.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    env = data.get("env")
+    if not isinstance(env, dict) or "ANTHROPIC_API_KEY" not in env:
+        return False
+    env = dict(env)
+    del env["ANTHROPIC_API_KEY"]
+    if env:
+        data["env"] = env
+    else:
+        data.pop("env", None)
+    try:
+        _atomic_write_json(path, data)
+    except OSError:
+        return False
+    return True
+
+
 def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     """Seed a per-agent virtual ``$HOME`` from the operator's real
     ``$HOME``. Idempotent — never overwrites an existing file.
@@ -340,6 +369,10 @@ _HOST_SYNCED_MARKER_BODY = (
     "This skill is synced from the operator's ~/.claude/skills/ on "
     "every worker start. Do not edit; changes will be overwritten.\n"
 )
+_HOST_SYNCED_CODEX_MARKER_BODY = (
+    "This skill is synced from the operator's ~/.codex/skills/ on "
+    "every worker start. Do not edit; changes will be overwritten.\n"
+)
 _AGENT_INSTALLED_MARKER_BODY = (
     "This skill was installed by the agent via the install_skill "
     "MCP tool. It lives at project scope and survives host syncs.\n"
@@ -402,6 +435,16 @@ def sync_host_skills(host_home: Path, agent_home: Path) -> int:
         src=host_home / ".claude" / "skills",
         dst_root=agent_home / ".claude" / "skills",
         marker_body=_HOST_SYNCED_MARKER_BODY,
+    )
+
+
+def sync_host_codex_skills(host_home: Path, agent_codex_home: Path) -> int:
+    """Sync host ``~/.codex/skills/`` into the agent's isolated
+    ``$CODEX_HOME/skills/`` with the standard provenance semantics."""
+    return _sync_host_skills_dir(
+        src=host_home / ".codex" / "skills",
+        dst_root=agent_codex_home / "skills",
+        marker_body=_HOST_SYNCED_CODEX_MARKER_BODY,
     )
 
 
@@ -474,6 +517,21 @@ def _host_local_token(cfg: dict) -> str | None:
         ):
             return arg
     return None
+
+
+def filter_container_mcp_servers(
+    servers: dict[str, dict],
+) -> tuple[dict[str, dict], list[tuple[str, str]]]:
+    """Drop MCP entries whose executable or args are host-only paths."""
+    reachable: dict[str, dict] = {}
+    unreachable: list[tuple[str, str]] = []
+    for name, cfg in servers.items():
+        token = _host_local_token(cfg)
+        if token is None:
+            reachable[name] = cfg
+        else:
+            unreachable.append((name, token))
+    return reachable, unreachable
 
 
 def sync_host_mcp_servers(
@@ -728,13 +786,6 @@ def background_log_path() -> Path:
     return home_dir() / "background.log"
 
 
-def pairing_path() -> Path:
-    """Single-pairing file holding (slug, device_id) + cached certs
-    for the operator currently authorised to drive this daemon.
-    Removed by ``puffo-agent pairing unpair``."""
-    return home_dir() / "pairing.json"
-
-
 def agent_dir(agent_id: str) -> Path:
     return agents_dir() / agent_id
 
@@ -807,6 +858,12 @@ class ProviderConfig:
 
 
 @dataclass
+class AnthropicProviderConfig(ProviderConfig):
+    # Claude Code uses subscription auth unless this explicit opt-in is true.
+    cli_use_api_key: bool = False
+
+
+@dataclass
 class DataServiceConfig:
     """Loopback HTTP service MCP subprocesses use to read each
     agent's ``messages.db``. See ``portal/data_service.py``."""
@@ -825,24 +882,12 @@ class RpcServiceConfig:
 
 
 @dataclass
-class BridgeConfig:
-    """Local HTTP API for the puffo web/desktop client. Loopback only;
-    auth uses the same ed25519 request-signing scheme as puffo-server.
+class WsLocalServiceConfig:
+    """Loopback WebSocket used by externally attached ws-local tools."""
 
-    ``allowed_origins`` is the CORS allowlist for PNA preflights.
-
-    Off by default — agents are managed remotely via the portal. Opt in
-    per-run with ``start --with-local-bridge`` (or ``bridge.enabled`` in
-    daemon.yml). The MCP-facing data + rpc services stay on regardless.
-    """
-    enabled: bool = False
+    enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63387
-    allowed_origins: list[str] = field(default_factory=lambda: [
-        "https://chat.puffo.ai",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ])
 
 
 @dataclass
@@ -853,10 +898,11 @@ class DaemonConfig:
     daemon holds only provider keys + reconcile knobs.
     """
     default_provider: str = "anthropic"
-    anthropic: ProviderConfig = field(default_factory=ProviderConfig)
+    anthropic: AnthropicProviderConfig = field(
+        default_factory=AnthropicProviderConfig,
+    )
     openai: ProviderConfig = field(default_factory=ProviderConfig)
-    # Required for cli-docker + harness=gemini-cli agents; passed
-    # through as GEMINI_API_KEY to the containerised gemini CLI.
+    # Google provider defaults for chat-local/sdk-local runtimes.
     google: ProviderConfig = field(default_factory=ProviderConfig)
     skills_dir: str = ""  # absolute path; empty = no shared skills
     reconcile_interval_seconds: float = 2.0
@@ -873,7 +919,9 @@ class DaemonConfig:
     segment_chars: int = MESSAGE_SEGMENT_CHARS
     # Catch-up older than this is stored but skips the LLM; <= 0 disables.
     catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
-    bridge: BridgeConfig = field(default_factory=BridgeConfig)
+    ws_local_service: "WsLocalServiceConfig" = field(
+        default_factory=lambda: WsLocalServiceConfig(),
+    )
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
     )
@@ -905,20 +953,24 @@ class DaemonConfig:
                 raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
             ),
         )
-        for name in ("anthropic", "openai", "google"):
+        p = raw.get("anthropic") or {}
+        cfg.anthropic = AnthropicProviderConfig(
+            api_key=p.get("api_key", ""),
+            model=p.get("model", ""),
+            cli_use_api_key=p.get("cli_use_api_key") is True,
+        )
+        for name in ("openai", "google"):
             p = raw.get(name) or {}
             setattr(cfg, name, ProviderConfig(
                 api_key=p.get("api_key", ""),
                 model=p.get("model", ""),
             ))
-        # Older daemon.yml files may omit ``bridge:``.
-        b = raw.get("bridge") or {}
-        defaults = BridgeConfig()
-        cfg.bridge = BridgeConfig(
-            enabled=bool(b.get("enabled", defaults.enabled)),
-            bind_host=str(b.get("bind_host", defaults.bind_host)),
-            port=int(b.get("port", defaults.port)),
-            allowed_origins=list(b.get("allowed_origins") or defaults.allowed_origins),
+        w = raw.get("ws_local_service") or {}
+        defaults = WsLocalServiceConfig()
+        cfg.ws_local_service = WsLocalServiceConfig(
+            enabled=bool(w.get("enabled", defaults.enabled)),
+            bind_host=str(w.get("bind_host", defaults.bind_host)),
+            port=int(w.get("port", defaults.port)),
         )
         d = raw.get("data_service") or {}
         ds_defaults = DataServiceConfig()
@@ -952,11 +1004,19 @@ class DaemonConfig:
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),
-            "bridge": asdict(self.bridge),
+            "ws_local_service": asdict(self.ws_local_service),
             "data_service": asdict(self.data_service),
             "rpc_service": asdict(self.rpc_service),
         }
         _atomic_write_yaml(path, data)
+
+
+def claude_cli_api_key(daemon_cfg: DaemonConfig | None) -> str:
+    """Return the daemon-owned Claude CLI key when explicitly enabled."""
+    anthropic = getattr(daemon_cfg, "anthropic", None)
+    if not getattr(anthropic, "cli_use_api_key", False):
+        return ""
+    return getattr(anthropic, "api_key", "")
 
 
 @dataclass
@@ -1019,19 +1079,17 @@ class RuntimeConfig:
     # cli-local Claude Code permission mode. Only ``bypassPermissions``
     # is supported today; see LocalCLIAdapter._sanitise_permission_mode.
     permission_mode: str = "bypassPermissions"
-    # codex (cli-local) sandbox policy: read-only | workspace-write |
+    # codex sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
     # "" = harness default; codex → config.toml, claude-code → --effort
     inference_level: str = ""
-    # codex (cli-local) per-turn wall-clock budget in seconds (default 30 min);
+    # codex per-turn wall-clock budget in seconds (default 30 min);
     # raise it for agents running even longer reasoning/complex tasks.
     task_timeout_seconds: float = 1800.0
-    # Agent engine (CLI kinds only): ``claude-code`` (stream-json + resume +
-    # puffo MCP), ``hermes`` (one-shot ``hermes chat -q``), ``gemini-cli``
-    # (declared, unimplemented). Hermes OAuth bills to Anthropic
-    # extra_usage, not a Claude subscription.
-    harness: str = "claude-code"  # claude-code | hermes
+    # Agent engine. cli-docker accepts claude-code/codex; cli-local also
+    # accepts hermes. Hermes OAuth bills to Anthropic extra_usage.
+    harness: str = "claude-code"
     # sdk only: cap on agentic-loop iterations per turn. 10 is fine
     # for short Q&A; multi-step work often needs 30-50. CLI kinds
     # delegate turn-bounding to the claude CLI itself.
@@ -1039,6 +1097,56 @@ class RuntimeConfig:
 
 
 MAX_ROLE_SHORT_LEN = 32
+
+# Prevent remote edits from rewriting process identity or credentials.
+ENV_OVERRIDE_WHITELIST = frozenset({
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CODEX_AUTOCOMPACT_PCT_OVERRIDE",
+})
+
+
+def validate_env_overrides(raw: object) -> dict[str, str]:
+    """Validate and normalize a partial ``env_overrides`` update."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("env_overrides must be an object")
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        key = str(key)
+        if key not in ENV_OVERRIDE_WHITELIST:
+            allowed = ", ".join(sorted(ENV_OVERRIDE_WHITELIST))
+            raise ValueError(
+                f"env_overrides key {key!r} is not allowed (allowed: {allowed})"
+            )
+        text = str(value).strip()
+        if not text:
+            out[key] = ""
+            continue
+        try:
+            pct = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{key} must be a number between 1 and 100; got {text!r}"
+            ) from None
+        if not (0 < pct <= 100):
+            raise ValueError(
+                f"{key} must be >0 and <=100; got {text!r}"
+            )
+        text = str(int(pct)) if pct.is_integer() else str(pct)
+        out[key] = text
+    return out
+
+
+def merge_env_overrides(current: object, updates: object) -> dict[str, str]:
+    """Apply a validated partial update; empty values remove keys."""
+    merged = dict(validate_env_overrides(current))
+    for key, value in validate_env_overrides(updates).items():
+        if value:
+            merged[key] = value
+        else:
+            merged.pop(key, None)
+    return merged
 
 
 def derive_role_short(role: str) -> str:
@@ -1089,6 +1197,8 @@ class AgentConfig:
     # de-duped against whatever host already provides.
     desired_skills: list[str] = field(default_factory=list)
     desired_mcps: list[str] = field(default_factory=list)
+    # Whitelisted per-agent subprocess environment.
+    env_overrides: dict[str, str] = field(default_factory=dict)
     created_at: int = 0
 
     @classmethod
@@ -1110,8 +1220,7 @@ class AgentConfig:
         provider = rt.get("provider", "")
         harness = rt.get("harness", "claude-code")
 
-        # Fail fast on invalid triples (e.g. gemini-cli + anthropic,
-        # or reserved kind=cli-sandbox).
+        # Fail fast on invalid runtime/provider/harness triples.
         result = validate_triple(kind, provider, harness)
         if not result.ok:
             raise RuntimeError(
@@ -1161,6 +1270,9 @@ class AgentConfig:
             ),
             desired_skills=list(raw.get("desired_skills") or []),
             desired_mcps=list(raw.get("desired_mcps") or []),
+            env_overrides={
+                str(k): str(v) for k, v in (raw.get("env_overrides") or {}).items()
+            },
             created_at=int(raw.get("created_at", 0)),
         )
 
@@ -1183,6 +1295,7 @@ class AgentConfig:
             "triggers": asdict(self.triggers),
             "desired_skills": list(self.desired_skills),
             "desired_mcps": list(self.desired_mcps),
+            "env_overrides": dict(self.env_overrides),
         }
         _atomic_write_yaml(path, data)
 
@@ -1219,6 +1332,8 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
+    max_context: int = 0
+    auto_compact_threshold_pct: float | None = None
     # Worker-side health, independent of ``status``:
     #   "ok"                  - clean turn / cleared red
     #   "in_progress"         - turn mid-flight; overrides sticky reds
@@ -1250,6 +1365,12 @@ class RuntimeState:
             msg_count=int(raw.get("msg_count", 0)),
             last_event_at=int(raw.get("last_event_at", 0)),
             error=raw.get("error", ""),
+            max_context=int(raw.get("max_context", 0) or 0),
+            auto_compact_threshold_pct=(
+                float(raw["auto_compact_threshold_pct"])
+                if raw.get("auto_compact_threshold_pct") is not None
+                else None
+            ),
             health=raw.get("health", "unknown"),
         )
 
@@ -1416,8 +1537,15 @@ def clear_refresh_token_request() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Atomic YAML write
+# Atomic config writes
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def _atomic_write_yaml(path: Path, data: Any) -> None:

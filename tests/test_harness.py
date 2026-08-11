@@ -154,6 +154,14 @@ def _call_tool(server, tool_name, **kwargs):
     return _run(tool.fn(**kwargs))
 
 
+def test_sync_host_mcp_description_explains_codex_file_oauth(tmp_path):
+    server, _ = _build_mcp_with_harness("codex", tmp_path=tmp_path)
+    description = server._tool_manager._tools["sync_host_mcp"].description
+
+    assert 'mcp_oauth_credentials_store="file"' in description
+    assert "OS-keyring-encrypted" in description
+
+
 def test_install_skill_blocked_under_hermes(tmp_path):
     server, _ = _build_mcp_with_harness("hermes")
     with pytest.raises(RuntimeError, match="only supported under the claude-code harness"):
@@ -618,11 +626,10 @@ def test_local_cli_accepts_claude_code_harness():
 
 
 def test_local_cli_rejects_gemini_cli_harness():
-    """gemini-cli has the same cli-local limitation as hermes (operator's
-    ``~/.gemini/`` may hold personal sessions). Same error shape."""
+    """Gemini CLI is not an active local or Docker harness."""
     from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
     from puffo_agent.agent.harness import GeminiCLIHarness
-    with pytest.raises(RuntimeError, match="not.+supported.+cli-local"):
+    with pytest.raises(RuntimeError, match="not supported"):
         LocalCLIAdapter(
             agent_id="t",
             model="",
@@ -633,213 +640,3 @@ def test_local_cli_rejects_gemini_cli_harness():
             agent_home_dir="/tmp/agent",
             harness=GeminiCLIHarness(),
         )
-
-
-# ── Gemini CLI helpers (model-id + stdout parser) ────────────────────────────
-#
-# Pure helpers; subprocess path is covered in the smoke suite.
-
-
-def test_gemini_model_id_default_when_empty():
-    from puffo_agent.agent.adapters.docker_cli import _gemini_model_id
-    assert _gemini_model_id("").startswith("gemini-")
-    assert _gemini_model_id(None).startswith("gemini-")  # type: ignore[arg-type]
-
-
-def test_gemini_model_id_passes_through_explicit_value():
-    from puffo_agent.agent.adapters.docker_cli import _gemini_model_id
-    assert _gemini_model_id("gemini-2.5-flash") == "gemini-2.5-flash"
-
-
-def test_gemini_model_id_strips_claude_style_context_suffix():
-    """Tolerate operators copy-pasting claude-style ids — strip the
-    ``[1m]`` 1M-context suffix instead of letting gemini reject it."""
-    from puffo_agent.agent.adapters.docker_cli import _gemini_model_id
-    assert _gemini_model_id("gemini-2.5-pro[1m]") == "gemini-2.5-pro"
-
-
-def test_parse_gemini_reply_happy_path():
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    stdout = '{"response": "hello from gemini", "stats": {"input_tokens": 5}}'
-    reply, session_id, err = _parse_gemini_reply(stdout)
-    assert reply == "hello from gemini"
-    assert session_id == ""
-    assert err == ""
-
-
-def test_parse_gemini_reply_captures_session_id_at_top_level():
-    """Gemini 0.38.2 puts ``session_id`` at the JSON top level, not
-    inside ``stats``."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    stdout = (
-        '{"session_id": "d21ddcdd-b12b-4579-9905-9dd0c26beb95", '
-        '"response": "OK", "stats": {"models": {}}}'
-    )
-    reply, session_id, err = _parse_gemini_reply(stdout)
-    assert reply == "OK"
-    assert session_id == "d21ddcdd-b12b-4579-9905-9dd0c26beb95"
-
-
-def test_parse_gemini_reply_extracts_message_from_error_object():
-    """Structured failures: parser surfaces the inner ``error.message``
-    string, not the stringified dict."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    stdout = (
-        '{"session_id": "abc", "error": {"type": "Error", '
-        '"message": "You have exhausted your daily quota on this model.", '
-        '"code": 1}}'
-    )
-    reply, session_id, err = _parse_gemini_reply(stdout)
-    assert reply == ""
-    assert session_id == "abc"
-    assert err == "You have exhausted your daily quota on this model."
-
-
-def test_parse_gemini_reply_flags_usage_banner_as_malformed_argv():
-    """If gemini prints its ``Usage:`` help banner instead of JSON,
-    argv was malformed. Surface as an error string, never as a reply.
-    """
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    stdout = (
-        "Usage: gemini [options] [command]\n\n"
-        "Gemini CLI - Defaults to interactive mode...\n"
-        "Commands:\n  gemini mcp    Manage MCP servers\n"
-    )
-    reply, session_id, err = _parse_gemini_reply(stdout)
-    assert reply == ""
-    assert session_id == ""
-    assert "argv" in err.lower() and "malformed" in err.lower()
-
-
-def test_parse_gemini_reply_falls_back_to_raw_on_json_error():
-    """Plain-text upstream failures (despite ``--output-format json``):
-    return raw stdout so callers still have something to log."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    stdout = "ERROR: invalid API key"
-    reply, session_id, err = _parse_gemini_reply(stdout)
-    assert reply == "ERROR: invalid API key"
-    assert session_id == ""
-    assert err == ""
-
-
-def test_parse_gemini_reply_empty_stdout_returns_empty():
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    assert _parse_gemini_reply("") == ("", "", "")
-    assert _parse_gemini_reply("   \n  ") == ("", "", "")
-
-
-def test_parse_gemini_reply_tolerates_missing_response_field():
-    """Well-formed JSON without ``response`` returns empty rather than
-    crashing."""
-    from puffo_agent.agent.adapters.docker_cli import _parse_gemini_reply
-    stdout = '{"stats": {"tokens": 10}}'
-    reply, session_id, err = _parse_gemini_reply(stdout)
-    assert reply == ""
-    assert err == ""
-
-
-# ── _build_gemini_argv — argv invariants ─────────────────────────────────────
-#
-# Preamble lines (built by PuffoAgent._append_user) start with ``- ``
-# markdown list syntax. Passed as a separate argv after ``-p`` yargs
-# treats it as another flag and gemini prints its --help banner.
-
-
-def test_build_gemini_argv_uses_prompt_equals_form_not_dash_p():
-    """Load-bearing: prompt goes in as one ``--prompt=<msg>`` token,
-    not two ``-p <msg>`` tokens. ``=``-joined form tells yargs
-    everything after ``=`` is the value, so a leading ``-`` in the
-    value doesn't get eaten as another flag."""
-    from puffo_agent.agent.adapters.docker_cli import _build_gemini_argv
-    argv = _build_gemini_argv(
-        container_name="puffo-abc",
-        api_key="sk-test",
-        model="gemini-2.5-flash",
-        has_prior_session=False,
-        user_message="- message: hello",
-    )
-    # Prompt must be ONE argv token, `=`-joined.
-    assert "--prompt=- message: hello" in argv
-    # Bare ``-p`` + separate value form must NOT appear.
-    assert "-p" not in argv
-    prompt_tokens = [a for a in argv if a.startswith("--prompt=")]
-    assert len(prompt_tokens) == 1
-    assert prompt_tokens[0] == "--prompt=- message: hello"
-
-
-def test_build_gemini_argv_preserves_multi_line_cjk_prompt():
-    """Multi-line CJK + markdown list preamble must survive untouched
-    as a single argv element."""
-    from puffo_agent.agent.adapters.docker_cli import _build_gemini_argv
-    msg = (
-        "- channel: @han.dev\n"
-        "- thread_root_id: k87yuaun7p8o8yis8jxuddojse\n"
-        "- message: 测试"
-    )
-    argv = _build_gemini_argv(
-        container_name="puffo-abc",
-        api_key="sk-test",
-        model="",
-        has_prior_session=False,
-        user_message=msg,
-    )
-    assert f"--prompt={msg}" in argv
-
-
-def test_build_gemini_argv_includes_resume_flag_when_session_exists():
-    from puffo_agent.agent.adapters.docker_cli import _build_gemini_argv
-    argv = _build_gemini_argv(
-        container_name="puffo-abc",
-        api_key="sk-test",
-        model="gemini-2.5-flash",
-        has_prior_session=True,
-        user_message="hi",
-    )
-    assert "-r" in argv
-    # ``latest`` must come right after ``-r``.
-    i = argv.index("-r")
-    assert argv[i + 1] == "latest"
-
-
-def test_build_gemini_argv_omits_resume_for_fresh_session():
-    from puffo_agent.agent.adapters.docker_cli import _build_gemini_argv
-    argv = _build_gemini_argv(
-        container_name="puffo-abc",
-        api_key="sk-test",
-        model="gemini-2.5-flash",
-        has_prior_session=False,
-        user_message="hi",
-    )
-    assert "-r" not in argv
-    assert "latest" not in argv
-
-
-def test_build_gemini_argv_skips_model_flag_when_empty():
-    """Empty model -> no ``--model`` flag, so gemini uses the
-    container default."""
-    from puffo_agent.agent.adapters.docker_cli import _build_gemini_argv
-    argv = _build_gemini_argv(
-        container_name="puffo-abc",
-        api_key="sk-test",
-        model="",
-        has_prior_session=False,
-        user_message="hi",
-    )
-    assert "--model" not in argv
-
-
-def test_build_gemini_argv_passes_api_key_via_docker_exec_e():
-    """GEMINI_API_KEY flows through ``docker exec -e`` (container env),
-    never through the host's environment — scopes the key to one
-    invocation."""
-    from puffo_agent.agent.adapters.docker_cli import _build_gemini_argv
-    argv = _build_gemini_argv(
-        container_name="puffo-abc",
-        api_key="sk-ant-xyz",
-        model="",
-        has_prior_session=False,
-        user_message="hi",
-    )
-    assert "docker" in argv and "exec" in argv
-    e_idx = argv.index("-e")
-    assert argv[e_idx + 1] == "GEMINI_API_KEY=sk-ant-xyz"

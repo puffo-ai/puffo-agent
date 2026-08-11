@@ -35,6 +35,7 @@ from ...portal.state import (
     home_dir,
     read_host_codex_mcp_servers,
     seed_claude_home,
+    strip_claude_api_key_from_settings,
     sync_host_codex_auth_view,
     sync_host_claude_code_auth_view,
     sync_host_enabled_plugins,
@@ -162,15 +163,20 @@ class LocalCLIAdapter(Adapter):
         permission_mode: str = "default",
         sandbox: str = "danger-full-access",
         inference_level: str = "",
+        auto_compact_threshold_pct: float | None = None,
         task_timeout_seconds: float = 1800.0,
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
+        claude_api_key: str = "",
     ):
         self.agent_id = agent_id
+        # Adapter-owned variables below take precedence over these overrides.
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.model = model
         self.workspace_dir = workspace_dir
         self.claude_dir = claude_dir
@@ -184,26 +190,25 @@ class LocalCLIAdapter(Adapter):
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
         self.sandbox = _sanitise_sandbox(sandbox, agent_id)
         self.inference_level = inference_level
+        self.auto_compact_threshold_pct = auto_compact_threshold_pct
         self.task_timeout_seconds = task_timeout_seconds
         self.desired_skills = list(desired_skills or [])
         self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
+        self.claude_api_key = claude_api_key
         self._desired_codex_extras: dict[str, dict] = {}
         self._desired_installed = False
         if harness is None:
             from ..harness import ClaudeCodeHarness
             harness = ClaudeCodeHarness()
-        # cli-local supports claude-code (default), codex (alpha),
-        # and hermes (alpha — one-shot CLI per turn, no long-lived
-        # session). gemini-cli remains cli-docker-only.
+        # cli-local supports claude-code, codex, and hermes.
         if harness.name() == "gemini-cli":
             raise RuntimeError(
                 f"agent {agent_id!r}: runtime.harness={harness.name()!r} is "
-                "not supported with runtime.kind=cli-local yet. Use "
-                "runtime.kind=cli-docker, or switch runtime.harness "
-                "back to claude-code."
+                "not supported. Switch runtime.harness to claude-code "
+                "or codex."
             )
         self.harness = harness
         self.puffo_core_mcp_env: dict[str, str] | None = None
@@ -228,6 +233,13 @@ class LocalCLIAdapter(Adapter):
             return await self._run_hermes_turn(user_message, ctx.system_prompt)
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._codex_session is not None:
+            return self._codex_session.context_limits()
+        if self._session is None:
+            return None, None
+        return self._session.context_limits()
 
     async def run_retry_turn(
         self,
@@ -461,6 +473,7 @@ class LocalCLIAdapter(Adapter):
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             model=self.model,
+            auto_compact_threshold_pct=self.auto_compact_threshold_pct,
             task_timeout_seconds=self.task_timeout_seconds,
             audit=codex_audit,
         )
@@ -780,6 +793,7 @@ class LocalCLIAdapter(Adapter):
         if self._session is not None:
             return self._session
         extra = self._prepare_mcp_args()
+        self._strip_claude_api_key_settings()
         # Register the PreToolUse permission hook before spawning;
         # settings.json is read fresh every spawn so this is
         # idempotent on every worker restart.
@@ -787,13 +801,25 @@ class LocalCLIAdapter(Adapter):
         # Both HOME (POSIX) and USERPROFILE (Node on Windows) are
         # needed: Claude Code uses Node's os.homedir(). PUFFO_* are
         # consumed by the per-tool-call hook subprocess.
-        env = {
-            **os.environ,
+        adapter_owned_env = {
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
             **self._macos_credential_env(),
         }
+        env = {
+            **os.environ,
+            **{
+                key: value
+                for key, value in self.env_overrides.items()
+                if key != "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+            },
+            **adapter_owned_env,
+        }
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
+        if self.claude_api_key:
+            env["ANTHROPIC_API_KEY"] = self.claude_api_key
         self._session = ClaudeSession(
             agent_id=self.agent_id,
             session_file=self.session_file,
@@ -806,8 +832,26 @@ class LocalCLIAdapter(Adapter):
             ),
             extra_args=extra,
             model=self.model,
+            env_overrides=self.env_overrides,
         )
         return self._session
+
+    def _strip_claude_api_key_settings(self) -> None:
+        paths: list[Path] = []
+        agent_home_dir = getattr(self, "agent_home_dir", None)
+        if agent_home_dir is not None:
+            paths.extend([
+                Path(agent_home_dir) / ".claude" / "settings.json",
+                Path(agent_home_dir) / ".claude" / "settings.local.json",
+            ])
+        claude_dir = getattr(self, "claude_dir", None)
+        if claude_dir is not None:
+            paths.extend([
+                Path(claude_dir) / "settings.json",
+                Path(claude_dir) / "settings.local.json",
+            ])
+        for settings_path in paths:
+            strip_claude_api_key_from_settings(settings_path)
 
     def _macos_credential_env(self) -> dict[str, str]:
         """macOS-only env hardening:
@@ -925,6 +969,7 @@ class LocalCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
+        self._strip_claude_api_key_settings()
         # ``env_overrides`` is merged into the subprocess env on the
         # host by ClaudeSession._spawn; the kwarg here is just for
         # symmetry with the docker adapter.
@@ -941,6 +986,14 @@ class LocalCLIAdapter(Adapter):
             cmd.extend(["--permission-mode", self.permission_mode])
         if self.model:
             cmd.extend(["--model", self.model])
+        from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+        threshold = claude_autocompact_tokens(
+            model=self.model,
+            pct=getattr(self, "auto_compact_threshold_pct", None),
+        )
+        if threshold is not None:
+            cmd.extend(["--autocompact", str(threshold)])
         # drops codex-only yaml values
         if self.inference_level:
             if self.inference_level in INFERENCE_LEVELS:

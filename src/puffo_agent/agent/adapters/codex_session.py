@@ -83,6 +83,11 @@ TURN_TIMEOUT_SECONDS = 1800.0
 # Reacts fast in a small fleet, absorbs single transient hiccups.
 CODEX_THREAD_WEDGED_THRESHOLD = 2
 
+# Codex reports the usable 95% window while its default compaction point is
+# 90% of the underlying model window.
+CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT = 95
+CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT = 90
+
 # Tuple shape so a future "thread is dead" surface adds one line.
 _CODEX_THREAD_LIMIT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"agent thread limit reached", re.IGNORECASE),
@@ -186,6 +191,7 @@ class _PendingTurn:
     # value standing when this turn's first request completed.
     input_tokens: int = 0
     output_tokens: int = 0
+    context_tokens: int = 0
     _in_base: int | None = None
     _out_base: int | None = None
     # ``turn/completed`` resolves this; ``turn/failed`` rejects it.
@@ -219,10 +225,12 @@ class CodexSession:
         argv: list[str],
         *,
         cwd: Optional[str] = None,
+        thread_cwd: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
         model: str = "",
+        auto_compact_threshold_pct: float | None = None,
         task_timeout_seconds: float = TURN_TIMEOUT_SECONDS,
         audit: Optional[AuditLog] = None,
     ):
@@ -230,6 +238,8 @@ class CodexSession:
         self.session_file = session_file
         self.argv = argv
         self.cwd = cwd
+        self.thread_cwd = thread_cwd
+        self._effective_thread_cwd = thread_cwd or cwd
         self.env = env
         # ``bypassPermissions`` auto-approves every approval request.
         # The plan's v1 stance — other modes are deferred until the
@@ -239,6 +249,7 @@ class CodexSession:
         # Codex's thread/start takes ``model`` as a required-ish
         # parameter; empty string means "let codex pick its default".
         self.model = model
+        self.auto_compact_threshold_pct = auto_compact_threshold_pct
         # Per-agent turn wall-clock budget; raised via agent.yml for long tasks.
         self.task_timeout_seconds = task_timeout_seconds
         self.audit = audit
@@ -251,23 +262,68 @@ class CodexSession:
         self._active_turn: _PendingTurn | None = None
         self._lock = asyncio.Lock()
         self._conversation_id: str = self._load_conversation_id()
-        # thread/start params aren't re-sent on resume; a sandbox change would
-        # silently keep the old policy. Drop the thread, next start re-applies.
+        self._model_context_window: int | None = self._load_model_context_window()
+        self._compact_config_pending = False
+        # A sandbox change must start a fresh thread. Although resume re-applies
+        # our current policy, retaining a thread created under a different
+        # policy would make the persisted session state misleading.
         if self._conversation_id:
             persisted_sandbox = self._load_persisted_sandbox()
-            if persisted_sandbox != self.sandbox:
+            persisted_model = self._load_persisted_model()
+            if persisted_model is not None and persisted_model != self.model:
+                logger.info(
+                    "agent %s: codex model changed (%s → %s); starting a "
+                    "fresh thread",
+                    self.agent_id, persisted_model or "<default>",
+                    self.model or "<default>",
+                )
+                self._conversation_id = ""
+                self._model_context_window = None
+            elif persisted_sandbox != self.sandbox:
                 logger.info(
                     "agent %s: codex sandbox changed (%s → %s); starting a "
                     "fresh thread so the new policy applies",
                     self.agent_id, persisted_sandbox, self.sandbox,
                 )
                 self._conversation_id = ""
+            elif self._effective_thread_cwd is not None:
+                persisted_thread_cwd = self._load_persisted_thread_cwd()
+                if persisted_thread_cwd != self._effective_thread_cwd:
+                    logger.info(
+                        "agent %s: codex thread cwd changed (%s → %s); "
+                        "starting a fresh thread",
+                        self.agent_id,
+                        persisted_thread_cwd or "<unset>",
+                        self._effective_thread_cwd,
+                    )
+                    self._conversation_id = ""
         # Latest system prompt; lets reload detect no-ops and respawn re-issue
         # thread/start with current instructions.
         self.current_instructions: str = ""
         # Resets on next success; hits THRESHOLD → rotate (drop the
         # persisted conversation id; next _ensure_running starts fresh).
         self._consecutive_thread_failures: int = 0
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        window = self._model_context_window
+        pct = self.auto_compact_threshold_pct
+        if window is None:
+            return None, None
+        if pct is not None:
+            return window, int(window * pct / 100)
+        threshold = (
+            window * CODEX_AUTO_COMPACT_CONTEXT_WINDOW_PERCENT
+            // CODEX_EFFECTIVE_CONTEXT_WINDOW_PERCENT
+        )
+        return window, threshold
+
+    def _thread_config(self) -> dict[str, int]:
+        if self.auto_compact_threshold_pct is None:
+            return {}
+        _, threshold = self.context_limits()
+        if threshold is None:
+            return {}
+        return {"model_auto_compact_token_limit": threshold}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -281,6 +337,8 @@ class CodexSession:
     async def run_turn(self, user_message: str, system_prompt: str) -> TurnResult:
         """Send one turn; wait for ``turn/completed``."""
         async with self._lock:
+            if self._compact_config_pending:
+                await self._teardown_locked()
             await self._ensure_running(system_prompt)
             # Defence-in-depth: a non-empty cid is ``_ensure_running``'s
             # contract; never send ``threadId=""`` (a silent wedge) if
@@ -425,6 +483,7 @@ class CodexSession:
                 "harness": "codex",
                 "conversation_id": self._conversation_id,
                 "send_message_targets": turn.send_message_targets,
+                "context_tokens": turn.context_tokens,
             },
         )
 
@@ -597,11 +656,45 @@ class CodexSession:
             return "danger-full-access"
         return str(data.get("sandbox") or "danger-full-access")
 
+    def _load_persisted_thread_cwd(self) -> str:
+        try:
+            data = json.loads(self.session_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(data.get("thread_cwd") or "")
+
+    def _load_persisted_model(self) -> str | None:
+        try:
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if "model" not in data:
+            return None
+        return str(data.get("model") or "")
+
+    def _load_model_context_window(self) -> int | None:
+        try:
+            data = json.loads(self.session_file.read_text(encoding="utf-8"))
+            if "model" in data and str(data.get("model") or "") != self.model:
+                return None
+            value = data.get("model_context_window")
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        except (OSError, ValueError):
+            pass
+        return None
+
     def _save_conversation_id(self, cid: str) -> None:
         try:
             self.session_file.parent.mkdir(parents=True, exist_ok=True)
             self.session_file.write_text(
-                json.dumps({"conversation_id": cid, "sandbox": self.sandbox}),
+                json.dumps({
+                    "conversation_id": cid,
+                    "sandbox": self.sandbox,
+                    "thread_cwd": self._effective_thread_cwd,
+                    "model": self.model,
+                    "model_context_window": self._model_context_window,
+                }),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -701,13 +794,29 @@ class CodexSession:
                 self.agent_id, exc,
             )
 
-        # 2. Start or resume the conversation/thread.
+        # 2. Start or resume the conversation/thread. App Server processes can
+        # be short-lived, so resume must re-apply these settings; otherwise a
+        # newly spawned server falls back to read-only / on-request defaults.
+        thread_settings: dict[str, Any] = {
+            "cwd": self._effective_thread_cwd or os.getcwd(),
+            "approvalPolicy": (
+                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
+            ),
+            "sandbox": self.sandbox,
+        }
         if self._conversation_id:
             try:
+                resume_params: dict[str, Any] = {
+                    "threadId": self._conversation_id,
+                    **thread_settings,
+                }
+                config = self._thread_config()
+                if config:
+                    resume_params["config"] = config
                 await self._send_raw_request(
                     self._reserve_id(),
                     METHOD_RESUME_CONVERSATION,
-                    {"threadId": self._conversation_id},
+                    resume_params,
                 )
                 logger.info(
                     "agent %s: resumed codex thread %s",
@@ -719,6 +828,8 @@ class CodexSession:
                         resume=True,
                         session_id=self._conversation_id,
                     )
+                if config:
+                    self._compact_config_pending = False
                 return
             except Exception as exc:
                 logger.warning(
@@ -732,15 +843,12 @@ class CodexSession:
         # ``approvalPolicy: "never"`` = auto-approve everything (confusing name;
         # verified live). Sandbox default stays open: cli-local runs as the
         # operator's UID, the real boundary is cli-docker's container.
-        new_conv_params: dict[str, Any] = {
-            "cwd": self.cwd or os.getcwd(),
-            "approvalPolicy": (
-                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
-            ),
-            "sandbox": self.sandbox,
-        }
+        new_conv_params = thread_settings
         if self.model:
             new_conv_params["model"] = self.model
+        config = self._thread_config()
+        if config:
+            new_conv_params["config"] = config
 
         result = await self._send_raw_request(
             self._reserve_id(),
@@ -765,7 +873,8 @@ class CodexSession:
                 resume=False,
                 session_id=self._conversation_id,
             )
-
+        if config:
+            self._compact_config_pending = False
 
     async def _teardown_locked(self) -> None:
         for pending in self._pending.values():
@@ -1069,12 +1178,32 @@ class CodexSession:
             get_reporter().record_codex_rate_limits((params or {}).get("rateLimits"))
             return
 
-        if m.startswith("thread/tokenusage/updated") and turn is not None:
+        if m.startswith("thread/tokenusage/updated"):
             # codex reports per-turn tokens here (not turn/completed); ``last``
             # refreshes during the turn, final value stands at turn/completed.
             tu = (params or {}).get("tokenUsage") or {}
+            model_context_window = tu.get("modelContextWindow")
+            if (
+                isinstance(model_context_window, int)
+                and not isinstance(model_context_window, bool)
+                and model_context_window > 0
+                and model_context_window != self._model_context_window
+            ):
+                self._model_context_window = model_context_window
+                self._save_conversation_id(self._conversation_id)
+                if self.auto_compact_threshold_pct is not None:
+                    self._compact_config_pending = True
+            if turn is None:
+                return
             last = tu.get("last") or {}
             total = tu.get("total") or {}
+            context_tokens = last.get("totalTokens")
+            if (
+                isinstance(context_tokens, int)
+                and not isinstance(context_tokens, bool)
+                and context_tokens > 0
+            ):
+                turn.context_tokens = context_tokens
             try:
                 # ``last`` is a single request; sum the whole turn via the
                 # thread total's delta. Input excludes the re-sent cached read.

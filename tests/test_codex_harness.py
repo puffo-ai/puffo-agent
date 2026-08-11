@@ -61,10 +61,6 @@ def test_validate_codex_with_openai_on_cli_local():
 
 
 def test_validate_codex_with_openai_on_cli_docker():
-    # No technical reason cli-docker shouldn't pass triple validation
-    # — even though the docker adapter doesn't dispatch codex yet, the
-    # matrix is "is this combo conceptually valid"; the adapter
-    # rejects gracefully if it can't actually run.
     r = validate_triple(RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, HARNESS_CODEX)
     assert r.ok, r.error
 

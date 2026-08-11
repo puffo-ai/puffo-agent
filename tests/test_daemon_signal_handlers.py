@@ -13,6 +13,7 @@ import asyncio
 import threading
 
 from puffo_agent.portal.daemon import _install_posix_stop_handlers
+from puffo_agent.portal.ui.daemon_thread import DaemonThread
 
 
 def test_posix_stop_handlers_skipped_off_main_thread():
@@ -34,3 +35,15 @@ def test_posix_stop_handlers_skipped_off_main_thread():
     # No RuntimeError from set_wakeup_fd, and nothing installed off-thread.
     assert "error" not in out, out.get("error")
     assert out["installed"] is False
+
+
+def test_daemon_thread_runs_daemon_without_bridge_flag(monkeypatch):
+    calls = []
+
+    async def fake_run_daemon():
+        calls.append("run")
+        return 0
+
+    monkeypatch.setattr("puffo_agent.portal.daemon.run_daemon", fake_run_daemon)
+    DaemonThread().run()
+    assert calls == ["run"]

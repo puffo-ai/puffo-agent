@@ -1,5 +1,5 @@
 """Codex snapshots MCP at session start; when the puffo tool surface
-changes, cli-local codex agents must drop their session on daemon boot
+changes, CLI Codex agents must drop their session on daemon boot
 so they reload the tools (openai/codex#7767)."""
 import pytest
 
@@ -56,7 +56,7 @@ def test_unchanged_fingerprint_no_respawn(tmp_path, monkeypatch):
     assert not _has_session_flag(c)
 
 
-def test_changed_fingerprint_respawns_only_cli_local_codex(tmp_path, monkeypatch):
+def test_changed_fingerprint_respawns_all_cli_codex(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     codex_local = _agent("codex-local", kind="cli-local", harness="codex")
     codex_docker = _agent("codex-docker", kind="cli-docker", harness="codex")
@@ -67,7 +67,7 @@ def test_changed_fingerprint_respawns_only_cli_local_codex(tmp_path, monkeypatch
     _respawn_codex_on_mcp_change_at_startup()
 
     assert _has_session_flag(codex_local)
-    assert not _has_session_flag(codex_docker)
+    assert _has_session_flag(codex_docker)
     assert not _has_session_flag(claude_local)
     assert not _has_session_flag(ws_agent)
     assert _mcp_fingerprint_path().read_text().strip() == mcp_tool_fingerprint()

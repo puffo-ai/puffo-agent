@@ -6,6 +6,7 @@ Contract:
     into ``<agent_home>/.claude/skills/``, drop a ``host-synced.md``
     marker for provenance, prune stale host-synced dirs the host
     removed, never clobber a dir tagged ``agent-installed.md``.
+    Codex mirrors ``~/.codex/skills`` into its isolated CODEX_HOME.
   * MCPs: merge host ``~/.claude.json`` ``mcpServers`` into the
     per-agent ``.claude.json``; host wins on collision; agent-only
     entries survive; other top-level keys are left untouched.
@@ -29,6 +30,7 @@ from puffo_agent.portal.state import (
     HOST_SYNCED_MARKER,
     _host_local_token,
     _looks_host_local_command,
+    sync_host_codex_skills,
     sync_host_enabled_plugins,
     sync_host_gemini_mcp_servers,
     sync_host_gemini_skills,
@@ -190,6 +192,19 @@ def test_sync_host_skills_missing_host_dir_is_noop(tmp_path):
     assert sync_host_skills(host, agent) == 0
     # Don't create an empty dst when there was nothing to copy.
     assert not (agent / ".claude" / "skills").exists()
+
+
+def test_sync_host_codex_skills_targets_isolated_codex_home(tmp_path):
+    host = tmp_path / "host"
+    _write_skill(host / ".codex" / "skills", "review", body="codex review")
+    agent_codex = tmp_path / "agent" / ".codex"
+
+    assert sync_host_codex_skills(host, agent_codex) == 1
+
+    installed = agent_codex / "skills" / "review"
+    assert (installed / "SKILL.md").read_text() == "codex review"
+    assert (installed / HOST_SYNCED_MARKER).exists()
+    assert not (tmp_path / "agent" / ".claude" / "skills").exists()
 
 
 # ── MCP registrations ────────────────────────────────────────────────────────

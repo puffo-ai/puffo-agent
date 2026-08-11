@@ -1,9 +1,8 @@
 """(runtime, provider, harness) validity matrix.
 
 Single source of truth for which combinations are supported, used
-both at agent-load time and at CLI flag-parse time. Some harnesses
-are bound to one provider (``claude-code`` → anthropic, ``gemini-cli``
-→ google); ``hermes`` is multi-provider.
+both at agent-load time and at CLI flag-parse time. Harness/provider
+compatibility and runtime-specific availability are validated together.
 """
 
 from __future__ import annotations
@@ -73,6 +72,18 @@ HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_CODEX:       frozenset({PROVIDER_OPENAI}),
 }
 
+HARNESSES_FOR_RUNTIME: dict[str, frozenset[str]] = {
+    RUNTIME_CLI_LOCAL: frozenset({
+        HARNESS_CLAUDE_CODE,
+        HARNESS_HERMES,
+        HARNESS_CODEX,
+    }),
+    RUNTIME_CLI_DOCKER: frozenset({
+        HARNESS_CLAUDE_CODE,
+        HARNESS_CODEX,
+    }),
+}
+
 
 # Runtimes where ``harness`` is meaningful. For chat-local and
 # sdk-local the agent engine is implicit and the field is ignored.
@@ -106,6 +117,11 @@ DEFAULT_HARNESS_FOR_PROVIDER: dict[str, str] = {
     PROVIDER_ANTHROPIC: HARNESS_CLAUDE_CODE,
     PROVIDER_OPENAI:    HARNESS_HERMES,
     PROVIDER_GOOGLE:    HARNESS_GEMINI_CLI,
+}
+
+DEFAULT_DOCKER_HARNESS_FOR_PROVIDER: dict[str, str] = {
+    PROVIDER_ANTHROPIC: HARNESS_CLAUDE_CODE,
+    PROVIDER_OPENAI: HARNESS_CODEX,
 }
 
 
@@ -182,6 +198,13 @@ def validate_triple(
             f"(valid: {', '.join(sorted(VALID_HARNESSES))})"
         ))
 
+    runtime_harnesses = HARNESSES_FOR_RUNTIME.get(runtime, frozenset())
+    if harness not in runtime_harnesses:
+        return ValidationResult(False, (
+            f"harness {harness!r} is not supported with runtime {runtime!r} "
+            f"(supported: {', '.join(sorted(runtime_harnesses)) or '(none)'})"
+        ))
+
     if provider:
         supported = HARNESS_PROVIDERS.get(harness, frozenset())
         if provider not in supported:
@@ -211,6 +234,10 @@ def resolve_effective_harness(runtime: str, provider: str, harness: str) -> str:
     if harness:
         return harness
     provider = resolve_effective_provider(runtime, provider)
+    if runtime == RUNTIME_CLI_DOCKER:
+        return DEFAULT_DOCKER_HARNESS_FOR_PROVIDER.get(
+            provider, HARNESS_CLAUDE_CODE,
+        )
     return DEFAULT_HARNESS_FOR_PROVIDER.get(provider, HARNESS_CLAUDE_CODE)
 
 
@@ -228,6 +255,7 @@ __all__ = [
     "VALID_RUNTIMES", "RESERVED_RUNTIMES",
     "VALID_PROVIDERS", "VALID_HARNESSES",
     "HARNESS_PROVIDERS",
+    "HARNESSES_FOR_RUNTIME",
     # helpers
     "harness_applies",
     "migrate_legacy_kind",

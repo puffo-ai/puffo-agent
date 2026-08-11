@@ -17,14 +17,15 @@ default_provider: "anthropic"  # "anthropic" | "openai" | "google"
 
 anthropic:
   api_key: ""                    # https://console.anthropic.com/
+  cli_use_api_key: false          # true = Claude Code uses this key instead of subscription auth
   model:   "claude-sonnet-4-6"   # empty = provider default
 
 openai:
   api_key: ""                    # https://platform.openai.com/ — used by chat-local + sdk-local only
-  model:   "gpt-4o"              # also used as the default model for cli-local + harness=codex
+  model:   "gpt-4o"              # default for cli-local/cli-docker + harness=codex
 
 google:
-  api_key: ""                    # required for cli-docker + harness=gemini-cli
+  api_key: ""
   model:   "gemini-2.5-pro"
 
 # Optional: absolute path to a directory of shared Claude Code
@@ -37,6 +38,13 @@ skills_dir: ""
 # agents.
 reconcile_interval_seconds: 2.0
 runtime_heartbeat_seconds:  5.0
+
+# Dedicated loopback WebSocket for ws-local attachments. Port 63387 exposes
+# only GET /v1/ws-local; it is not an agent-management API.
+ws_local_service:
+  enabled: true
+  bind_host: 127.0.0.1
+  port: 63387
 
 # cli-docker resource caps applied to every agent container at
 # `docker run` time. Defaults are ON: 1.5 GiB hard ceiling / 500 MiB

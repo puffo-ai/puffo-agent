@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from _bridge_support import isolated_home
+from _portal_support import isolated_home
 
 
 # ─────────────────────────────────────────────────────────────────────

@@ -322,11 +322,17 @@ class PuffoAgent:
         )
         result = await self.adapter.run_turn(ctx)
 
+        turn_complete_payload = {
+            "tokens": {"input": result.input_tokens, "output": result.output_tokens}
+        }
+        context_tokens = result.metadata.get("context_tokens")
+        if isinstance(context_tokens, int) and context_tokens > 0:
+            turn_complete_payload["current_context"] = context_tokens
         asyncio.ensure_future(
             get_reporter().emit(
                 self.agent_id,
                 "turn_complete",
-                {"tokens": {"input": result.input_tokens, "output": result.output_tokens}},
+                turn_complete_payload,
             )
         )
 

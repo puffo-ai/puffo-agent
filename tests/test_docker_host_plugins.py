@@ -178,13 +178,14 @@ def test_ensure_started_propagates_enabled_plugins(tmp_path):
     async def _run() -> None:
         with patch.object(docker_cli, "_run_cmd", new=_fake_run_cmd), \
              patch.object(docker_cli.Path, "home", staticmethod(lambda: host)), \
-             patch.object(docker_cli.shutil, "which", lambda _: "/fake/docker"), \
+             patch.object(docker_cli, "resolve_docker_bin", lambda: "/fake/docker"), \
              patch.object(adapter, "_ensure_image", side_effect=_noop_coro), \
              patch.object(adapter, "_start_container", side_effect=_noop_coro):
             await adapter._ensure_started()
 
     asyncio.run(_run())
 
+    assert adapter._docker_bin == "/fake/docker"
     settings = json.loads(
         (agent_home / ".claude" / "settings.json").read_text(encoding="utf-8"),
     )
