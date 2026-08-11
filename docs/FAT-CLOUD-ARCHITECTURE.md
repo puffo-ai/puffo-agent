@@ -196,9 +196,12 @@ must not create a second model behavior policy.
 
 ## 8. Known Limits
 
-1. Outbound-DM allowlisting is not complete in keyless mode. The native
-   self-echo path can write the signed allowlist route; the scoped bridge token
-   does not yet expose an equivalent write.
+1. DM trust management is not complete in keyless mode. The native self-echo
+   path can write the signed allowlist route, and the native foreign-DM flow can
+   prompt the operator and apply allowlist/blocklist decisions. The scoped
+   bridge token exposes none of those writes yet. With `auto_accept_dm=false`,
+   an untrusted inbound DM remains gated rather than being delivered without
+   approval.
 2. The sequence-less compatibility lane cannot participate in a Server
    freshness proof until a trusted sequence arrives. Current Server bridge
    frames avoid this limitation.

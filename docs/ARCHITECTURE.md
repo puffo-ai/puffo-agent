@@ -287,8 +287,10 @@ Three loopback services support local integration:
 
 - The frontend is outside this repository. Runtime events are exposed for Web
   and mobile clients, but this PR does not implement their UI.
-- Keyless outbound DM allowlisting is incomplete: the bridge Agent cannot yet
-  perform the signed allowlist write used by the native self-echo path.
+- Keyless DM trust management is incomplete. The bridge Agent cannot perform
+  the signed allowlist write used by native outbound self-echo, nor complete
+  the operator approval and allowlist/blocklist side effects for an untrusted
+  inbound DM. With `auto_accept_dm=false`, that inbound DM remains gated.
 - Reactions are not a Puffo message feature in this release.
 - Docker Codex, Hermes, Gemini, and `cli-sandbox` are not supported runtime
   combinations.

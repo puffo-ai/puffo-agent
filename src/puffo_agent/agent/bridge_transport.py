@@ -21,10 +21,11 @@ runs them in the native order (blocked → self echo → operator control →
 foreign DM → stale → eligible) and only maps each verdict onto the bridge's
 own storage lane.
 
-Known keyless gap: outbound-DM allowlisting on self-echo
-(``_maybe_allowlist_outbound_dm``) needs a signed ``POST /allowlists`` this
-transport cannot make, so a bridge agent that DMs a stranger first does not
-pre-allowlist them; their reply goes through the normal foreign-DM gate.
+Known keyless DM gaps: outbound allowlisting on self-echo needs a signed
+``POST /allowlists`` this transport cannot make, and the foreign-DM operator
+approval flow also depends on signed prompt/allowlist/blocklist operations.
+With ``auto_accept_dm=false`` and an operator configured, an untrusted inbound
+DM therefore remains safely gated until a keyless approval control plane exists.
 """
 
 from __future__ import annotations
@@ -71,7 +72,8 @@ async def listen_bridge(client) -> None:
 
     Deliberately does NOT start ``_invite_poll_loop`` /
     ``_warm_member_caches`` — they drive signed HTTP endpoints that
-    can't work keyless; names render as ids until those are rewired.
+    can't work keyless. Current Server message frames pre-seed sender identity;
+    other uncached directory entries degrade to their stable slugs.
     """
     bridge = client._bridge
     assert bridge is not None  # guarded by listen()
