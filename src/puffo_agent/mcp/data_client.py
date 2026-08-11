@@ -340,7 +340,6 @@ class DataClient:
             return None
 
     async def get_send_encryption(self, channel_id: str) -> bool:
-        """Return the cached channel policy; failures stay encrypted."""
         policy = await self._get_channel_encryption(channel_id)
         return True if policy is None else policy
 

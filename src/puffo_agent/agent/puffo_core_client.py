@@ -2698,12 +2698,7 @@ class PuffoCoreMessageClient:
         return self.channel_policy(channel_id)
 
     async def refresh_channel_policy(self, channel_id: str) -> bool:
-        """Re-read one channel's policy from the server.
-
-        The send path calls this after the server rejects a format, so it
-        deliberately skips ``rewarm_channel_caches``' 5s debounce — the
-        retry needs the value now, not on the next tick.
-        """
+        """Refresh policy without the normal cache-warm debounce."""
         space_id = self._channel_space.get(channel_id) or ""
         if not space_id:
             try:

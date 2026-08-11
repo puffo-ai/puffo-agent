@@ -1,20 +1,20 @@
-"""Plaintext envelope primitives and the encrypted DM send contract."""
-
 import logging
 import os
 import sys
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from puffo_agent.crypto.http_client import HttpError
+from puffo_agent.crypto.keystore import encode_secret
 from puffo_agent.crypto.message import (
     EncryptInput,
     build_plaintext_message,
     read_plaintext_message,
 )
 from puffo_agent.crypto.primitives import Ed25519KeyPair
-from puffo_agent.crypto.keystore import encode_secret
 
 
 def _inp(**over):
@@ -135,6 +135,15 @@ async def test_send_dm_stops_when_recipient_has_no_devices():
 
 
 @pytest.mark.asyncio
+async def test_send_dm_surfaces_http_failure():
+    client, _, _ = _make_client()
+    client.http.post = AsyncMock(side_effect=HttpError(500, "failed"))
+
+    with pytest.raises(HttpError):
+        await client._send_dm("op-1", "hi", "")
+
+
+@pytest.mark.asyncio
 async def test_in_process_data_client_reads_channel_policy():
     from puffo_agent.portal.ws_local.in_process_data_client import (
         InProcessDataClient,
@@ -148,3 +157,17 @@ async def test_in_process_data_client_reads_channel_policy():
     c._client = _Client()
     assert await c.get_send_encryption("ch_plaintext") is False
     assert await c.get_send_encryption("ch_encrypted") is True
+
+
+@pytest.mark.asyncio
+async def test_in_process_data_client_refreshes_channel_policy():
+    from puffo_agent.portal.ws_local.in_process_data_client import (
+        InProcessDataClient,
+    )
+
+    c = InProcessDataClient.__new__(InProcessDataClient)
+    c._client = MagicMock()
+    c._client.refresh_channel_policy = AsyncMock(return_value=False)
+
+    assert await c.refresh_channel_policy("ch_plaintext") is False
+    c._client.refresh_channel_policy.assert_awaited_once_with("ch_plaintext")

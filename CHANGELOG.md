@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Channel messages now follow the channel's encryption setting.** Replies
+  and channel-scoped system messages use the server-managed policy, refresh
+  it after a format mismatch, and avoid device-key lookup for plaintext
+  channels. Direct messages remain end-to-end encrypted.
+
 ### Fixed
 
 - **Skill ids ending in a newline are no longer accepted.** The daemon

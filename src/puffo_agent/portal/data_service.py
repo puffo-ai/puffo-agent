@@ -408,7 +408,6 @@ async def update_profile_cache(request: web.Request) -> web.Response:
 
 
 async def get_send_encryption(request: web.Request) -> web.Response:
-    """Return the cached channel policy, optionally refreshing it."""
     agent_id = request.match_info["agent_id"]
     channel_id = request.query.get("channel_id") or ""
     client = _client_for(agent_id)

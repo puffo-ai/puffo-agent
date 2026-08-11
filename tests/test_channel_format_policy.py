@@ -1,5 +1,3 @@
-"""PUF-411: channel format policy drives the send endpoint, and a policy
-flip mid-send is recovered from rather than surfaced as an error."""
 from __future__ import annotations
 
 import pytest
@@ -17,8 +15,6 @@ from puffo_agent.mcp import puffo_core_tools as pct
 
 FORMAT_MISMATCH = '{"error": "CHANNEL_FORMAT_MISMATCH", "message": "wrong"}'
 
-
-# ── cache: server value lands and round-trips ───────────────────────
 
 def _client() -> PuffoCoreMessageClient:
     c = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
@@ -77,11 +73,24 @@ async def test_cache_ignores_invalid_channel_and_store_failure(monkeypatch):
     ) == "ch_a"
     assert client.channel_policy("ch_a") is False
 
+    assert await client._cache_channel(
+        {"channel_id": "ch_without_name", "is_encrypted": False},
+        "sp_1",
+    ) == "ch_without_name"
+
+
+@pytest.mark.asyncio
+async def test_warm_ignores_malformed_channel_entries():
+    client = _client()
+    client.http.get = AsyncMock(return_value={"channels": [None]})
+
+    await client._warm_channels_for_space("sp_1")
+
+    assert client._channel_encrypted == {}
+
 
 @pytest.mark.asyncio
 async def test_policy_overwrites_rather_than_setdefault(monkeypatch):
-    """A flipped policy must land — a stale cached value is exactly what
-    the server guard rejects."""
     client = _client()
     client._channel_encrypted["ch_a"] = True
     client.http.get = AsyncMock(return_value={"channels": [
@@ -95,8 +104,6 @@ async def test_policy_overwrites_rather_than_setdefault(monkeypatch):
 
 
 def test_policy_round_trips_through_disk(tmp_path, monkeypatch):
-    """Survives a daemon restart: an empty in-memory cache falls back to
-    what was persisted."""
     monkeypatch.setattr(disk_cache, "_cache_root", lambda: tmp_path)
     disk_cache.persist_channel("ch_a", "general", "sp_1", False)
 
@@ -144,6 +151,7 @@ async def test_ensure_policy_uses_disk_then_warms_server(tmp_path, monkeypatch):
         {"channel_id": "ch_server", "name": "server", "is_encrypted": False},
     ]})
     assert await client.ensure_channel_policy("ch_server", "sp_1") is False
+    assert await client.ensure_channel_policy("ch_unknown", "") is True
 
 
 @pytest.mark.asyncio
@@ -159,6 +167,11 @@ async def test_refresh_policy_resolves_space_and_keeps_value_on_fetch_failure():
     client._channel_space.clear()
     client.store.lookup_channel_space.side_effect = RuntimeError("db down")
     assert await client.refresh_channel_policy("ch_a") is False
+
+    client._channel_space["ch_a"] = "sp_1"
+    client.store.lookup_channel_space.reset_mock()
+    assert await client.refresh_channel_policy("ch_a") is False
+    client.store.lookup_channel_space.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -178,15 +191,11 @@ async def test_general_lookup_ignores_malformed_channel(monkeypatch):
     assert await client._find_public_general_channel("sp_1") == ""
 
 
-# ── the 400 → reshape → resend recovery ─────────────────────────────
-
 def test_format_mismatch_reads_the_server_error_code():
     assert is_channel_format_mismatch(HttpError(400, FORMAT_MISMATCH)) is True
 
 
 def test_unrelated_errors_are_not_treated_as_format_mismatch():
-    """Retrying an unrelated 400 by flipping format would send the wrong
-    shape and mask the real error."""
     assert is_channel_format_mismatch(HttpError(400, '{"error": "bad nonce"}')) is False
     assert is_channel_format_mismatch(HttpError(403, FORMAT_MISMATCH)) is False
     assert is_channel_format_mismatch(HttpError(400, "not json")) is False
@@ -272,8 +281,6 @@ async def test_plaintext_send_to_flipped_encrypted_channel_recovers(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_no_retry_when_the_server_keeps_rejecting(monkeypatch):
-    """A second rejection of the shape the server itself asked for is a
-    server bug; looping would amplify it."""
     _patch_builders(monkeypatch)
     cfg = _Cfg(refreshed_policy=False)
     cfg.http_client.post = AsyncMock(side_effect=HttpError(400, FORMAT_MISMATCH))
@@ -369,6 +376,18 @@ async def test_encrypted_send_schedules_missing_device_supplement(monkeypatch):
     )
 
     assert len(scheduled) == 1
+
+
+@pytest.mark.asyncio
+async def test_encrypted_send_requires_recipient_devices(monkeypatch):
+    fetch = _patch_builders(monkeypatch)
+    fetch.return_value = []
+
+    with pytest.raises(RuntimeError, match="no recipient devices"):
+        await pct._post_respecting_channel_format(
+            _Cfg(), MagicMock(), MagicMock(), True,
+            ["alice-0001"], "ch_abc",
+        )
 
 
 @pytest.mark.asyncio

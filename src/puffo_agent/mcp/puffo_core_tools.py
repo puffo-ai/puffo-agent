@@ -43,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 
 async def _send_encryption_required(cfg, channel_id=None):
-    """Read the channel policy; DMs and lookup failures stay encrypted."""
     if not channel_id:
         return True
     getter = getattr(cfg.data_client, "get_send_encryption", None)
@@ -56,11 +55,7 @@ async def _post_respecting_channel_format(
     cfg, inp, signing_key, encrypt: bool,
     recipient_slugs: list, channel_id: Optional[str],
 ) -> dict:
-    """Send via the endpoint the channel's format policy demands.
-
-    A format mismatch invalidates the channel cache. Refresh it and retry
-    once only when the authoritative value changed.
-    """
+    """Post in the cached format, refreshing once on a mismatch."""
     for attempt in (0, 1):
         devices: list = []
         if encrypt:
@@ -96,7 +91,6 @@ async def _post_respecting_channel_format(
                 channel_id or "?", "e2ee" if wanted else "plaintext",
             )
             encrypt = wanted
-    raise RuntimeError("unreachable: send retry loop exhausted")
 
 
 async def _refresh_channel_policy(
