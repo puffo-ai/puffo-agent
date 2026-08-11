@@ -196,6 +196,23 @@ async def test_intro_nudge_persists_envelope_to_messages_db():
 
 
 @pytest.mark.asyncio
+async def test_plaintext_channel_intro_uses_cached_channel_policy():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_encrypted["ch_1"] = False
+
+    await client._enqueue_channel_intro_nudge(
+        space_id="sp_1", channel_id="ch_1",
+    )
+
+    _, _, root_id = await client._queue.get()
+    assert client._thread_state[root_id].messages[0]["is_encrypted"] is False
+    envelope = await store.get_message_by_envelope(root_id)
+    assert envelope is not None and envelope.is_encrypted is False
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_intro_nudge_skipped_when_already_prompted():
     store = await _make_store()
     client = _make_client(store)

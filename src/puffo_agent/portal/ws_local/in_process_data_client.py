@@ -30,18 +30,8 @@ class InProcessDataClient:
     async def close(self) -> None:
         return None
 
-    async def get_send_encryption(
-        self, slug: str, thread_root_id: str | None,
-        channel_id: str | None = None,
-    ) -> bool:
-        from ...agent import send_mode
-
-        policy = (
-            self._client.channel_policy(channel_id) if channel_id else None
-        )
-        return await send_mode.encryption_required(
-            slug, self._store, thread_root_id, policy,
-        )
+    async def get_send_encryption(self, channel_id: str) -> bool:
+        return self._client.channel_policy(channel_id)
 
     async def refresh_channel_policy(self, channel_id: str) -> bool | None:
         return await self._client.refresh_channel_policy(channel_id)

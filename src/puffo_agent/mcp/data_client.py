@@ -314,21 +314,14 @@ class DataClient:
             )
             return None
 
-    async def get_send_encryption(
-        self, slug: str, thread_root_id: str | None,
-        channel_id: str | None = None, refresh: bool = False,
-    ) -> bool:
-        """Ask the daemon whether the next send must be E2EE.
-        Fail-safe: any transport/decode problem answers encrypt."""
+    async def _get_channel_encryption(
+        self, channel_id: str, *, refresh: bool = False,
+    ) -> bool | None:
         path = (
             f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
             f"/send-encryption"
         )
-        params = {"slug": slug}
-        if thread_root_id:
-            params["thread_root_id"] = thread_root_id
-        if channel_id:
-            params["channel_id"] = channel_id
+        params = {"channel_id": channel_id}
         if refresh:
             params["refresh"] = "1"
         session = await self._get_session()
@@ -337,31 +330,22 @@ class DataClient:
                 f"{self.base_url}{path}", params=params,
             ) as resp:
                 if resp.status >= 400:
-                    return True
+                    return None
                 data = await resp.json()
                 return bool(data.get("encrypt", True))
         except aiohttp.ClientError as exc:
             logger.warning(
                 "data-service: get_send_encryption transport: %s", exc,
             )
-            return True
+            return None
 
-    async def refresh_channel_policy(self, channel_id: str) -> None:
-        """PUF-411: make the daemon re-read this channel's format policy.
+    async def get_send_encryption(self, channel_id: str) -> bool:
+        """Return the cached channel policy; failures stay encrypted."""
+        policy = await self._get_channel_encryption(channel_id)
+        return True if policy is None else policy
 
-        Best-effort and fire-and-forget — the send that triggered it has
-        already recovered from the server's error; this only stops the
-        next send paying for the same round trip.
-        """
-        try:
-            await self.get_send_encryption(
-                "", None, channel_id, refresh=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "data-service: refresh_channel_policy(%s): %s",
-                channel_id, exc,
-            )
+    async def refresh_channel_policy(self, channel_id: str) -> bool | None:
+        return await self._get_channel_encryption(channel_id, refresh=True)
 
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,

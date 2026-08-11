@@ -31,10 +31,10 @@ from ..crypto.message import (
     encrypt_message,
     read_plaintext_message,
 )
-from . import send_mode
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
 from . import disk_cache
+from .channel_format import is_channel_format_mismatch
 from ._invite_strings import format_invite_error, format_leave_error
 from .contact_cache import ContactCache
 from .core import AgentAPIError
@@ -602,10 +602,7 @@ class PuffoCoreMessageClient:
         # fallback when lookup fails so the LLM never sees a blank.
         self._space_name_cache: dict[str, str] = {}
         self._channel_name_cache: dict[str, str] = {}
-        # PUF-411: channel_id → format policy. True = E2EE-only, False =
-        # plaintext-only, None (or absent) = owner set no policy, so the
-        # send decision falls back to the source-based rules.
-        self._channel_encrypted: dict[str, Optional[bool]] = {}
+        self._channel_encrypted: dict[str, bool] = {}
 
         # Per-space member cache (slug → identity_type) for mention
         # scoping + bot-vs-human labelling. Lazy, session-lifetime.
@@ -1578,11 +1575,6 @@ class PuffoCoreMessageClient:
             except asyncio.CancelledError:
                 raise
 
-            # Missing key counts as encrypted — never downgrade on doubt.
-            send_mode.note_turn_bundle(
-                [getattr(self, "slug", "")],
-                any(m.get("is_encrypted", True) for m in batch),
-            )
             try:
                 await on_message_batch(root_id, batch, channel_meta)
             except AgentAPIError as exc:
@@ -1628,10 +1620,6 @@ class PuffoCoreMessageClient:
                 # the slot done in-memory so live arrivals keep
                 # flowing for other threads.
                 continue
-            finally:
-                # Between turns the default (plaintext) applies.
-                send_mode.clear_turn_bundle([getattr(self, "slug", "")])
-
             # Success: persist the cursor so a restart-then-redeliver
             # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
             # the high-water mark we just covered.
@@ -2661,47 +2649,55 @@ class PuffoCoreMessageClient:
         except Exception:
             return
         for ch in resp.get("channels", []) or []:
-            cid = ch.get("channel_id") or ""
-            name = (ch.get("name") or "").strip()
-            if not cid:
-                continue
-            # ``setdefault`` so a faster-arriving WS event that
-            # populated these isn't clobbered with potentially older
-            # data we just fetched.
-            self._channel_space.setdefault(cid, space_id)
-            # PUF-411: policy is authoritative from the server on every
-            # fetch, so it overwrites rather than setdefault — a stale
-            # cached value is exactly what the send guard would trip on.
-            policy = ch.get("is_encrypted")
-            self._channel_encrypted[cid] = (
-                bool(policy) if policy is not None else None
-            )
-            if name:
-                self._channel_name_cache.setdefault(cid, name)
-                disk_cache.persist_channel(
-                    cid, name, space_id, self._channel_encrypted[cid],
-                )
-            try:
-                await self.store.mark_channel_space(cid, space_id)
-            except Exception:
-                pass
+            if isinstance(ch, dict):
+                await self._cache_channel(ch, space_id)
 
-    def channel_policy(self, channel_id: str) -> Optional[bool]:
-        """PUF-411: cached format policy, falling back to disk.
-
-        None means "no policy" — either the owner never set one or we've
-        never seen the channel. Both cases must behave identically: leave
-        the send decision to the source-based rules.
-        """
+    async def _cache_channel(self, channel: dict, space_id: str) -> str:
+        channel_id = channel.get("channel_id") or ""
         if not channel_id:
-            return None
+            return ""
+        name = (channel.get("name") or "").strip()
+        self._channel_space.setdefault(channel_id, space_id)
+        self._channel_encrypted[channel_id] = (
+            channel.get("is_encrypted") is not False
+        )
+        if name:
+            self._channel_name_cache.setdefault(channel_id, name)
+            disk_cache.persist_channel(
+                channel_id,
+                name,
+                space_id,
+                self._channel_encrypted[channel_id],
+            )
+        try:
+            await self.store.mark_channel_space(channel_id, space_id)
+        except Exception:
+            pass
+        return channel_id
+
+    def channel_policy(self, channel_id: str) -> bool:
+        if not channel_id:
+            return True
         if channel_id in self._channel_encrypted:
             return self._channel_encrypted[channel_id]
         cached = disk_cache.load_channel(channel_id) or {}
-        policy = cached.get("is_encrypted")
-        return bool(policy) if policy is not None else None
+        return cached.get("is_encrypted") is not False
 
-    async def refresh_channel_policy(self, channel_id: str) -> Optional[bool]:
+    async def ensure_channel_policy(
+        self, channel_id: str, space_id: str,
+    ) -> bool:
+        if channel_id in self._channel_encrypted:
+            return self._channel_encrypted[channel_id]
+        cached = disk_cache.load_channel(channel_id) or {}
+        if isinstance(cached.get("is_encrypted"), bool):
+            policy = cached["is_encrypted"]
+            self._channel_encrypted[channel_id] = policy
+            return policy
+        if space_id:
+            await self._warm_channels_for_space(space_id)
+        return self.channel_policy(channel_id)
+
+    async def refresh_channel_policy(self, channel_id: str) -> bool:
         """Re-read one channel's policy from the server.
 
         The send path calls this after the server rejects a format, so it
@@ -2716,13 +2712,7 @@ class PuffoCoreMessageClient:
                 space_id = ""
         if not space_id:
             return self.channel_policy(channel_id)
-        try:
-            await self._warm_channels_for_space(space_id)
-        except Exception:
-            self._log.debug(
-                "refresh_channel_policy(%s) failed; keeping cached value",
-                channel_id,
-            )
+        await self._warm_channels_for_space(space_id)
         return self.channel_policy(channel_id)
 
     async def _bulk_fetch_profiles(self, slugs: list[str]) -> None:
@@ -2832,13 +2822,8 @@ class PuffoCoreMessageClient:
         try:
             ch_data = await self.http.get(f"/spaces/{space_id}/channels")
             for entry in ch_data.get("channels") or []:
-                cid = entry.get("channel_id")
-                if not cid or cid in self._channel_name_cache:
-                    continue
-                entry_name = (entry.get("name") or "").strip() or cid
-                self._channel_name_cache[cid] = entry_name
-                if entry_name != cid:
-                    disk_cache.persist_channel(cid, entry_name, space_id)
+                if isinstance(entry, dict):
+                    await self._cache_channel(entry, space_id)
             if channel_id in self._channel_name_cache:
                 return self._channel_name_cache[channel_id]
         except Exception:
@@ -3002,19 +2987,9 @@ class PuffoCoreMessageClient:
                 continue
             found_cid = ""
             for entry in data.get("channels") or []:
-                cid = entry.get("channel_id") or ""
-                name = (entry.get("name") or "").strip()
-                if cid and cid not in self._channel_name_cache:
-                    self._channel_name_cache[cid] = name or cid
-                # Persist the channel→space mapping so the MCP
-                # subprocess's send_message can resolve this channel
-                # BEFORE the first inbound message lands. Without
-                # this, lookup_channel_space falls through to the
-                # /messages table (empty) and then to agent.yml's
-                # space_id, which is the WRONG space when the agent
-                # has just joined a different one.
-                if cid:
-                    await self.store.mark_channel_space(cid, space_id)
+                if not isinstance(entry, dict):
+                    continue
+                cid = await self._cache_channel(entry, space_id)
                 if not found_cid and entry.get("is_public") and cid:
                     found_cid = cid
             return found_cid
@@ -3046,6 +3021,7 @@ class PuffoCoreMessageClient:
 
         now_ms = int(__import__("time").time() * 1000)
         envelope_id = f"intro-prompt-{channel_id}-{now_ms}"
+        is_encrypted = await self.ensure_channel_policy(channel_id, space_id)
         # The prefix is documented in the agent's CLAUDE.md primer as
         # a recognised control-message marker (see 0.7.3 notes); the
         # agent treats it as a directive rather than user chatter.
@@ -3076,7 +3052,7 @@ class PuffoCoreMessageClient:
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
-            "is_encrypted": True,
+            "is_encrypted": is_encrypted,
         }
         channel_meta = {
             "channel_id": channel_id,
@@ -3113,6 +3089,7 @@ class PuffoCoreMessageClient:
             "sent_at": now_ms,
             "thread_root_id": envelope_id,
             "reply_to_id": None,
+            "is_encrypted": is_encrypted,
         }
         try:
             await self.store.store(store_payload)
@@ -3230,13 +3207,10 @@ class PuffoCoreMessageClient:
         for c in channels:
             if not isinstance(c, dict):
                 continue
-            cid = (c.get("channel_id") or "").strip()
+            cid = await self._cache_channel(c, space_id)
             if not cid:
                 continue
-            self._channel_space[cid] = space_id
             name = (c.get("name") or "").strip()
-            if name:
-                self._channel_name_cache.setdefault(cid, name)
             if not first:
                 first = cid
             if not general and name.lower() == "general":
@@ -3396,6 +3370,7 @@ class PuffoCoreMessageClient:
         envelope_id = (
             f"membership-{action}-{channel_id}-{actor_slug}-{envelope_id_suffix}"
         )
+        is_encrypted = await self.ensure_channel_policy(channel_id, space_id)
         prompt_text = (
             f"[puffo-agent system message] Channel membership update: "
             f"{body} This is an announcement, for your context."
@@ -3417,7 +3392,7 @@ class PuffoCoreMessageClient:
             "mentions": [],
             "envelope_id": envelope_id,
             "sent_at": now_ms,
-            "is_encrypted": True,
+            "is_encrypted": is_encrypted,
         }
         channel_meta = {
             "channel_id": channel_id,
@@ -3438,6 +3413,7 @@ class PuffoCoreMessageClient:
             "sent_at": now_ms,
             "thread_root_id": envelope_id,
             "reply_to_id": None,
+            "is_encrypted": is_encrypted,
         }
         try:
             await self.store.store(store_payload)
@@ -4433,18 +4409,13 @@ class PuffoCoreMessageClient:
         signing_key = Ed25519KeyPair.from_secret_bytes(
             decode_secret(sess.subkey_secret_key)
         )
-        encrypt = await send_mode.encryption_required(
-            self.slug, self.store, root_id or None,
-        )
-        devices: list[RecipientDevice] = []
-        if encrypt:
-            devices = await self._fetch_device_keys([self.slug, recipient_slug])
-            if not devices:
-                self._log.warning(
-                    "no recipient devices for DM to %s — dropping",
-                    recipient_slug,
-                )
-                return None
+        devices = await self._fetch_device_keys([self.slug, recipient_slug])
+        if not devices:
+            self._log.warning(
+                "no recipient devices for DM to %s — dropping",
+                recipient_slug,
+            )
+            return None
         inp = EncryptInput(
             envelope_kind="dm",
             sender_slug=self.slug,
@@ -4457,14 +4428,9 @@ class PuffoCoreMessageClient:
             content=text,
             recipients=devices,
         )
-        if encrypt:
-            envelope = encrypt_message(inp, signing_key)
-            path = "/messages"
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            path = "/v2/messages/plaintext"
+        envelope = encrypt_message(inp, signing_key)
         try:
-            await self.http.post(path, envelope)
+            await self.http.post("/messages", envelope)
         except HttpError:
             self._log.exception("DM send to %s failed", recipient_slug)
             raise
@@ -4582,44 +4548,11 @@ class PuffoCoreMessageClient:
             send_space_id = None
             send_channel_id = None
 
-        encrypt = await send_mode.encryption_required(
-            self.slug, self.store, root_id or None,
+        encrypt = (
+            self.channel_policy(channel_id)
+            if envelope_kind == "channel"
+            else True
         )
-        devices: list[RecipientDevice] = []
-        if encrypt:
-            if envelope_kind == "channel":
-                members_resp = await self.http.get(
-                    f"/spaces/{send_space_id}/channels/{channel_id}/members"
-                )
-                member_slugs = [
-                    m.get("slug", "")
-                    for m in members_resp.get("members", [])
-                    if m.get("slug")
-                ]
-                if not member_slugs:
-                    self._log.warning(
-                        "channel %s has no members — dropping reply", channel_id,
-                    )
-                    return
-                devices = await self._fetch_device_keys(member_slugs)
-            else:
-                devices = await self._fetch_device_keys(
-                    [self.slug, recipient_slug or ""]
-                )
-            if not devices:
-                self._log.warning(
-                    "no recipient devices found (kind=%s target=%s) — dropping",
-                    envelope_kind, recipient_slug or channel_id,
-                )
-                return
-
-        self._log.info(
-            "send_fallback_message: kind=%s target=%s encrypt=%s devices=%d",
-            envelope_kind, recipient_slug or channel_id, encrypt, len(devices),
-        )
-
-        # Fallback shares the visibility_level="default" floor; the
-        # note is dropped (no MCP return channel).
         from ._visibility import resolve_visibility
         channel_ref = (
             f"@{recipient_slug}" if envelope_kind == "dm" else (channel_id or "")
@@ -4628,37 +4561,76 @@ class PuffoCoreMessageClient:
             "default", channel_ref, text, root_id or "", self.http,
         )
 
-        inp = EncryptInput(
-            envelope_kind=envelope_kind,
-            sender_slug=self.slug,
-            sender_subkey_id=sess.subkey_id,
-            is_visible_to_human=effective_visible,
-            space_id=send_space_id,
-            channel_id=send_channel_id,
-            recipient_slug=recipient_slug,
-            thread_root_id=root_id if root_id else None,
-            content_type="text/plain",
-            content=text,
-            recipients=devices,
-        )
-        if encrypt:
-            envelope = encrypt_message(inp, signing_key)
-            path = "/messages"
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            path = "/v2/messages/plaintext"
-        # POST takes the envelope at the top level, not wrapped in
-        # ``{"envelope": ...}``.
-        try:
-            resp = await self.http.post(path, envelope)
-            self._log.info(
-                "send_fallback_message sent: envelope_id=%s queued=%s",
-                envelope.get("envelope_id"),
-                (resp or {}).get("devices_queued"),
+        for attempt in (0, 1):
+            devices: list[RecipientDevice] = []
+            if encrypt:
+                if envelope_kind == "channel":
+                    members_resp = await self.http.get(
+                        f"/spaces/{send_space_id}/channels/{channel_id}/members"
+                    )
+                    member_slugs = [
+                        m.get("slug", "")
+                        for m in members_resp.get("members", [])
+                        if m.get("slug")
+                    ]
+                    if not member_slugs:
+                        self._log.warning(
+                            "channel %s has no members — dropping reply", channel_id,
+                        )
+                        return
+                    devices = await self._fetch_device_keys(member_slugs)
+                else:
+                    devices = await self._fetch_device_keys(
+                        [self.slug, recipient_slug or ""]
+                    )
+                if not devices:
+                    self._log.warning(
+                        "no recipient devices found (kind=%s target=%s) — dropping",
+                        envelope_kind, recipient_slug or channel_id,
+                    )
+                    return
+
+            inp = EncryptInput(
+                envelope_kind=envelope_kind,
+                sender_slug=self.slug,
+                sender_subkey_id=sess.subkey_id,
+                is_visible_to_human=effective_visible,
+                space_id=send_space_id,
+                channel_id=send_channel_id,
+                recipient_slug=recipient_slug,
+                thread_root_id=root_id if root_id else None,
+                content_type="text/plain",
+                content=text,
+                recipients=devices,
             )
-        except Exception:
-            self._log.exception("send_fallback_message: POST %s failed", path)
-            raise
+            if encrypt:
+                envelope = encrypt_message(inp, signing_key)
+                path = "/messages"
+            else:
+                envelope = build_plaintext_message(inp, signing_key)
+                path = "/v2/messages/plaintext"
+            try:
+                resp = await self.http.post(path, envelope)
+                self._log.info(
+                    "send_fallback_message sent: envelope_id=%s queued=%s",
+                    envelope.get("envelope_id"),
+                    (resp or {}).get("devices_queued"),
+                )
+                break
+            except Exception as exc:
+                if (
+                    envelope_kind != "channel"
+                    or attempt == 1
+                    or not is_channel_format_mismatch(exc)
+                ):
+                    self._log.exception(
+                        "send_fallback_message: POST %s failed", path,
+                    )
+                    raise
+                refreshed = await self.refresh_channel_policy(channel_id)
+                if refreshed == encrypt:
+                    raise
+                encrypt = refreshed
 
         # No mirror-write here anymore. The WS echo path now persists
         # self-envelopes through the same handler every other message

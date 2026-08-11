@@ -166,7 +166,7 @@ async def test_send_message_plaintext_when_daemon_says_unencrypted():
         "members": [{"slug": "alice-0001", "role": "owner"}],
     }
 
-    async def _no_encrypt(slug, root):
+    async def _no_encrypt(channel_id):
         return False
 
     ms.get_send_encryption = _no_encrypt
@@ -1117,7 +1117,7 @@ class _FakeDataClient:
         # tests flip this to False.
         self.send_encryption = True
 
-    async def get_send_encryption(self, slug, thread_root_id):
+    async def get_send_encryption(self, channel_id):
         return self.send_encryption
 
     def add(

@@ -20,6 +20,7 @@ from ..portal.state import home_dir
 
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 
 def _cache_root() -> Path:
@@ -83,21 +84,23 @@ def persist_channel(
     channel_id: str,
     name: str,
     space_id: str = "",
-    is_encrypted: Optional[bool] = None,
+    is_encrypted: bool | object = _UNSET,
 ) -> None:
-    # PUF-411. ``is_encrypted`` None = the channel owner set no format
-    # policy, which is every channel that predates PUF-410. Stored as null
-    # rather than omitted so a reader can tell "no policy" from "not cached".
     if not channel_id or not name:
         return
     try:
+        if is_encrypted is _UNSET:
+            existing = load_channel(channel_id) or {}
+            policy = existing.get("is_encrypted") is not False
+        else:
+            policy = bool(is_encrypted)
         _atomic_write_json(
             _cache_root() / "channels" / f"{_safe(channel_id)}.json",
             {
                 "channel_id": channel_id,
                 "name": name,
                 "space_id": space_id,
-                "is_encrypted": is_encrypted,
+                "is_encrypted": policy,
                 "fetched_at": int(time.time()),
             },
         )

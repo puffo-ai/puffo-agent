@@ -408,31 +408,16 @@ async def update_profile_cache(request: web.Request) -> web.Response:
 
 
 async def get_send_encryption(request: web.Request) -> web.Response:
-    """Daemon-level send-mode decision for out-of-process senders (the
-    MCP subprocess). Fail-safe: unknown agent/store answers encrypt."""
-    from ..agent import send_mode
-
+    """Return the cached channel policy, optionally refreshing it."""
     agent_id = request.match_info["agent_id"]
-    slug = request.query.get("slug", "")
-    root = request.query.get("thread_root_id") or None
     channel_id = request.query.get("channel_id") or ""
-    store = await _store_for(request.app, agent_id)
-    if store is None:
+    client = _client_for(agent_id)
+    if client is None or not channel_id:
         return web.json_response({"encrypt": True})
-    # PUF-411: the channel's own policy, when its owner set one, decides.
-    # ``refresh=1`` is the send path telling us the server rejected our
-    # format — re-read it rather than answer from the cache we know is stale.
-    policy = None
-    if channel_id:
-        client = _client_for(agent_id)
-        if client is not None:
-            if request.query.get("refresh") == "1":
-                policy = await client.refresh_channel_policy(channel_id)
-            else:
-                policy = client.channel_policy(channel_id)
-    encrypt = await send_mode.encryption_required(
-        slug or agent_id, store, root, policy,
-    )
+    if request.query.get("refresh") == "1":
+        encrypt = await client.refresh_channel_policy(channel_id)
+    else:
+        encrypt = client.channel_policy(channel_id)
     return web.json_response({"encrypt": bool(encrypt)})
 
 

@@ -13,6 +13,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -39,6 +40,9 @@ def _bare_client(http: _FakeHttp) -> PuffoCoreMessageClient:
     client._space_name_cache = {}
     client._channel_name_cache = {}
     client._channel_encrypted = {}
+    client._channel_space = {}
+    client.store = MagicMock()
+    client.store.mark_channel_space = AsyncMock()
     return client
 
 

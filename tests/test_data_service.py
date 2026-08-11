@@ -233,63 +233,49 @@ async def test_send_encryption_fail_safe_for_unknown_agent() -> None:
 
 @pytest.mark.asyncio
 async def test_send_encryption_decision_matrix_over_http() -> None:
-    from puffo_agent.agent import send_mode
+    class _Client:
+        def __init__(self):
+            self.policies = {"ch_plain": False, "ch_encrypted": True}
+            self.refreshes = []
 
-    home = _isolated_home()
-    agent_path = Path(home) / "agents" / "agent-enc-1"
-    agent_path.mkdir(parents=True, exist_ok=True)
-    store = MessageStore(agent_path / "messages.db")
-    await store.open()
-    await store.store({
-        "envelope_id": "msg_pt",
-        "envelope_kind": "channel",
-        "sender_slug": "alice",
-        "channel_id": "ch_1",
-        "space_id": "sp_1",
-        "content_type": "text/plain",
-        "content": "clear",
-        "sent_at": 1700000000_000,
-        "is_encrypted": False,
-    })
-    await store.store({
-        "envelope_id": "msg_enc",
-        "envelope_kind": "channel",
-        "sender_slug": "bob",
-        "channel_id": "ch_1",
-        "space_id": "sp_1",
-        "content_type": "text/plain",
-        "content": "sealed",
-        "sent_at": 1700000001_000,
-    })
-    await store.close()
+        def channel_policy(self, channel_id):
+            return self.policies.get(channel_id, True)
 
-    send_mode._turn_bundle_encrypted.clear()
+        async def refresh_channel_policy(self, channel_id):
+            self.refreshes.append(channel_id)
+            self.policies[channel_id] = False
+            return False
+
+    message_client = _Client()
+    ds.set_client_resolver(
+        lambda agent_id: message_client if agent_id == "agent-enc-1" else None
+    )
     app = ds.build_app(ds.DataServiceConfig())
     try:
         async with TestClient(TestServer(app)) as client:
-            base = "/v1/data/agent-enc-1/send-encryption?slug=bot-1"
+            base = "/v1/data/agent-enc-1/send-encryption"
 
             async def ask(url):
                 resp = await client.get(url)
                 assert resp.status == 200
                 return (await resp.json())["encrypt"]
 
-            assert await ask(base) is False  # default plaintext
-            assert await ask(base + "&thread_root_id=msg_pt") is False
-            assert await ask(base + "&thread_root_id=msg_enc") is True  # legacy row
-            assert await ask(base + "&thread_root_id=msg_gone") is True  # fail-safe
-            send_mode.note_turn_bundle(["bot-1"], True)
             assert await ask(base) is True
+            assert await ask(base + "?channel_id=ch_plain") is False
+            assert await ask(base + "?channel_id=ch_encrypted") is True
+            assert await ask(base + "?channel_id=ch_stale&refresh=1") is False
+            assert message_client.refreshes == ["ch_stale"]
 
-            # The MCP-side wrapper resolves the same answers over HTTP.
             from puffo_agent.mcp.data_client import DataClient
-            send_mode._turn_bundle_encrypted.clear()
             dc = DataClient(
                 str(client.server.make_url("")).rstrip("/"), "agent-enc-1",
             )
             try:
-                assert await dc.get_send_encryption("bot-1", "msg_pt") is False
-                assert await dc.get_send_encryption("bot-1", "msg_gone") is True
+                assert await dc.get_send_encryption("ch_plain") is False
+                assert await dc.get_send_encryption("ch_encrypted") is True
+                assert await dc.refresh_channel_policy("ch_stale") is False
+                await dc.update_profile_cache("", "", "")
+                await dc.update_profile_cache("alice", "Alice", "")
             finally:
                 await dc.close()
 
@@ -298,13 +284,13 @@ async def test_send_encryption_decision_matrix_over_http() -> None:
                 str(client.server.make_url("/bogus")).rstrip("/"), "agent-enc-1",
             )
             try:
-                assert await dc404.get_send_encryption("bot-1", None) is True
+                assert await dc404.get_send_encryption("ch_plain") is True
             finally:
                 await dc404.close()
             dc_dead = DataClient("http://127.0.0.1:1", "agent-enc-1")
             try:
-                assert await dc_dead.get_send_encryption("bot-1", None) is True
+                assert await dc_dead.get_send_encryption("ch_plain") is True
             finally:
                 await dc_dead.close()
     finally:
-        send_mode._turn_bundle_encrypted.clear()
+        ds.set_client_resolver(None)
