@@ -141,6 +141,47 @@ async def test_old_codex_agent_imports_session_with_matching_sandbox(
     assert not old_session.exists()
 
 
+@pytest.mark.asyncio
+async def test_durable_session_resumes_only_with_matching_fingerprint(
+    puffo_home, monkeypatch,
+):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_claude_bin", lambda: "/opt/bin/claude"
+    )
+    monkeypatch.setattr(
+        local_runtime,
+        "sync_host_claude_code_auth_view",
+        lambda *_args: "view",
+    )
+    config = AgentConfig(
+        id="fingerprinted-claude",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="anthropic",
+            harness="claude-code",
+        ),
+    )
+    preparer = LocalRuntimePreparer(DaemonConfig(), config)
+    baseline = await preparer.prepare(system_prompt="stable prompt")
+    resumed = await preparer.prepare(
+        system_prompt="stable prompt",
+        persisted_native_session_id="native-old",
+        persisted_session_fingerprint=baseline.session_fingerprint,
+    )
+    rotated = await preparer.prepare(
+        system_prompt="changed identity prompt",
+        persisted_native_session_id="native-old",
+        persisted_session_fingerprint=baseline.session_fingerprint,
+    )
+
+    assert resumed.native_session_id == "native-old"
+    assert not resumed.discarded_persisted_session
+    assert rotated.native_session_id == ""
+    assert rotated.discarded_persisted_session
+
+
 class _ResumeFallbackDriver(Driver):
     def __init__(self):
         self.open_calls: list[str | None] = []

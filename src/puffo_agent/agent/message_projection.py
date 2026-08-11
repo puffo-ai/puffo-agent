@@ -76,6 +76,22 @@ def _dm_peer(message: Any, current_agent_aliases: Sequence[str] = ()) -> str:
     return (sender or recipient or "unknown").lstrip("@")
 
 
+def canonical_target_parts(message: Any) -> tuple[str, ...]:
+    """Return the one durable routing projection used by every Inbox layer."""
+    if str(_value(message, "envelope_kind", "")) == "dm":
+        return (
+            "dm",
+            str(_value(message, "sender_slug", "") or "")
+            or str(_value(message, "recipient_slug", "") or ""),
+        )
+    space_id = str(_value(message, "space_id", "") or "")
+    channel_id = str(_value(message, "channel_id", "") or "")
+    root_id = _effective_thread_root(message)
+    if root_id:
+        return ("thread", space_id, channel_id, root_id)
+    return ("channel", space_id, channel_id)
+
+
 def target_label(
     message: Any,
     *,

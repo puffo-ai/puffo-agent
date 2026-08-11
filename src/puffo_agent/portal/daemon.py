@@ -20,15 +20,20 @@ import time
 from pathlib import Path
 
 from ..macos.keychain import CredentialCache, is_macos
-from .api import start_api_server, stop_api_server
 from .ws_local.hub import WsLocalHub
+from .ws_local.server import start_ws_local_server, stop_ws_local_server
 from .credential_refresh import (
     CodexFileBackend,
     CredentialRefresher,
     FileBackend,
     KeychainBackend,
 )
-from .data_service import set_profile_setter, start_data_service, stop_data_service
+from .data_service import (
+    set_client_resolver,
+    set_profile_setter,
+    start_data_service,
+    stop_data_service,
+)
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
 from .state import (
@@ -40,24 +45,43 @@ from .state import (
     agents_dir,
     archive_flag_path,
     archived_dir,
+    claude_cli_api_key,
     clear_daemon_pid,
+    clear_daemon_ready,
     clear_refresh_token_request,
     clear_stop_request,
     delete_flag_path,
     discover_agents,
     home_dir,
     is_daemon_alive,
+    is_daemon_ready,
+    is_pid_alive,
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_runtime_flag_path,
+    refresh_session_flag_path,
     refresh_token_request_path,
     restart_flag_path,
     stop_request_path,
+    stop_requested_for,
     write_daemon_pid,
+    write_daemon_ready,
 )
 from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+class _DaemonRuntime:
+    """Resources acquired incrementally during one daemon generation."""
+
+    def __init__(self) -> None:
+        self.startup_tasks: list[asyncio.Task] = []
+        self.runtime_tasks: list[asyncio.Task] = []
+        self.ws_local_runner = None
+        self.rpc_runner = None
+        self.data_runner = None
+        self.control_manager = None
 
 
 class Daemon:
@@ -65,8 +89,7 @@ class Daemon:
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
         self._paused_reported: set[str] = set()
-        # Shared attach registry: ws-local Workers register here; the
-        # bridge's /v1/ws-local route serves tools against it.
+        # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
         self._stop = asyncio.Event()
         # Cap on per-worker warm wait so a wedged warm can't pin the
@@ -102,101 +125,153 @@ class Daemon:
             backend=CodexFileBackend(host_home=Path.home()),
         )
 
-    async def run(self) -> None:
+    async def run(
+        self,
+        external_stop_requested: threading.Event | None = None,
+    ) -> None:
         logger.info("puffo-agent portal starting; home=%s", home_dir())
         interval = max(0.5, self.daemon_cfg.reconcile_interval_seconds)
+        pid = os.getpid()
+        runtime = _DaemonRuntime()
+        try:
+            await self._start_runtime(runtime)
+            if self._stop_was_requested(pid, external_stop_requested):
+                logger.info("stop requested during startup; shutting down")
+                self._stop.set()
+            else:
+                write_daemon_ready(pid)
+            await self._run_reconcile_loop(
+                pid,
+                interval,
+                external_stop_requested,
+            )
+        finally:
+            await self._shutdown_runtime(runtime, pid)
 
-        # One-shot version check at startup; non-blocking, best-effort.
-        asyncio.ensure_future(_log_outdated_version_warning())
-        # Foreground start has no other trigger for the fetch=True
-        # path, so capability reports fall back to the static list.
+    async def _start_runtime(self, runtime: _DaemonRuntime) -> None:
+        runtime.startup_tasks.append(
+            asyncio.ensure_future(_log_outdated_version_warning())
+        )
         from ..agent.model_catalog import prefetch as _prefetch_model_catalog
 
         _prefetch_model_catalog()
-        # Retry any archived-dir pending revokes from a previous run.
-        asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup())
-        # Re-assert machine_id for already-linked operators' agents so agents
-        # created/paused before linking show as remote without a re-link.
-        asyncio.ensure_future(_migrate_linked_agents_at_startup())
-        # Re-push every owned agent's profile to the server in case
-        # the operator hand-edited agent.yml / profile.md offline.
-        asyncio.ensure_future(_full_sync_all_owned_agents_at_startup())
-
-        # Start auxiliary HTTP services. Both are non-fatal on bind
-        # failure — the daemon's primary job is still running agents.
-        api_runner = await start_api_server(
-            self.daemon_cfg.bridge,
+        runtime.startup_tasks.extend(
+            (
+                asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup()),
+                asyncio.ensure_future(_migrate_linked_agents_at_startup()),
+                asyncio.ensure_future(_full_sync_all_owned_agents_at_startup()),
+            )
+        )
+        runtime.ws_local_runner = await start_ws_local_server(
+            self.daemon_cfg.ws_local_service,
             ws_local_hub=self.ws_local_hub,
         )
         set_profile_setter(self._set_worker_profile_cache)
+        set_client_resolver(self._resolve_message_client)
         set_rpc_resolver(self._resolve_host_mcp_context)
-        # Bridge pins 63387 (browser clients hard-code it). Both
-        # fallbacks scan from 63388 onward so neither collides with
-        # bridge; data starts after rpc so its fallback can route
-        # past rpc's resolved port.
-        rpc_runner = await start_rpc_service(
+        runtime.rpc_runner = await start_rpc_service(
             self.daemon_cfg.rpc_service,
             fallback_start=63388,
         )
-        data_runner = await start_data_service(
+        runtime.data_runner = await start_data_service(
             self.daemon_cfg.data_service,
             fallback_start=max(63388, self.daemon_cfg.rpc_service.port + 1),
         )
-        refresher_task = asyncio.ensure_future(self.refresher.run_loop(self._stop))
-        codex_refresher_task = asyncio.ensure_future(
-            self.codex_refresher.run_loop(self._stop)
+        runtime.runtime_tasks.extend(
+            (
+                asyncio.ensure_future(self.refresher.run_loop(self._stop)),
+                asyncio.ensure_future(self.codex_refresher.run_loop(self._stop)),
+            )
         )
         from .control.client import ControlManager
 
-        control_manager = ControlManager()
-        control_task = asyncio.ensure_future(control_manager.run())
+        runtime.control_manager = ControlManager()
+        runtime.runtime_tasks.append(
+            asyncio.ensure_future(runtime.control_manager.run())
+        )
+        _respawn_codex_on_mcp_change_at_startup()
 
+    def _stop_was_requested(
+        self,
+        pid: int,
+        external_stop_requested: threading.Event | None,
+    ) -> bool:
+        return (
+            self._stop.is_set()
+            or (
+                external_stop_requested is not None
+                and external_stop_requested.is_set()
+            )
+            or stop_requested_for(pid)
+        )
+
+    async def _run_reconcile_loop(
+        self,
+        pid: int,
+        interval: float,
+        external_stop_requested: threading.Event | None,
+    ) -> None:
+        while not self._stop.is_set():
+            if self._stop_was_requested(pid, external_stop_requested):
+                logger.info(
+                    "stop request detected at %s; shutting down",
+                    stop_request_path(),
+                )
+                self._stop.set()
+                break
+            try:
+                await self._reconcile_once()
+            except Exception as exc:
+                logger.error("reconcile tick crashed: %s", exc, exc_info=True)
+            if refresh_token_request_path().exists():
+                logger.info("refresh-token sentinel detected; notifying refreshers")
+                self.refresher.notify_refresh_needed()
+                self.codex_refresher.notify_refresh_needed()
+                clear_refresh_token_request()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _shutdown_runtime(self, runtime: _DaemonRuntime, pid: int) -> None:
+        self._stop.set()
         try:
-            while not self._stop.is_set():
-                try:
-                    await self._reconcile_once()
-                except Exception as exc:
-                    logger.error("reconcile tick crashed: %s", exc, exc_info=True)
-                # File-sentinel shutdown path. Required on Windows
-                # where ``loop.add_signal_handler`` is unsupported, so
-                # ``puffo-agent stop`` can't rely on SIGTERM.
-                if stop_request_path().exists():
-                    logger.info(
-                        "stop sentinel detected at %s; shutting down",
-                        stop_request_path(),
-                    )
-                    self._stop.set()
-                    break
-                # PUF-221: ``puffo-agent agent refresh-token`` flag —
-                # wake the credential refresher so the operator can
-                # force a refresh + fan-out without waiting for the
-                # 2-min poll.
-                if refresh_token_request_path().exists():
-                    logger.info("refresh-token sentinel detected; notifying refreshers")
-                    self.refresher.notify_refresh_needed()
-                    self.codex_refresher.notify_refresh_needed()
-                    clear_refresh_token_request()
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=interval)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
             await self._stop_all_workers()
-            control_manager.stop()
-            for t in (refresher_task, codex_refresher_task, control_task):
-                t.cancel()
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
-            await stop_api_server(api_runner)
-            set_profile_setter(None)
-            set_rpc_resolver(None)
-            await stop_data_service(data_runner)
-            await stop_rpc_service(rpc_runner)
-            clear_daemon_pid()
-            clear_stop_request()
-            logger.info("puffo-agent portal stopped")
+        except Exception:
+            logger.exception("shutdown: failed to stop all workers")
+        if runtime.control_manager is not None:
+            try:
+                runtime.control_manager.stop()
+            except Exception:
+                logger.exception("shutdown: failed to stop control manager")
+        owned_tasks = runtime.startup_tasks + runtime.runtime_tasks
+        for task in owned_tasks:
+            task.cancel()
+        if owned_tasks:
+            await asyncio.gather(*owned_tasks, return_exceptions=True)
+
+        for clear_resolver in (
+            lambda: set_profile_setter(None),
+            lambda: set_client_resolver(None),
+            lambda: set_rpc_resolver(None),
+        ):
+            try:
+                clear_resolver()
+            except Exception:
+                logger.exception("shutdown: failed to clear service resolver")
+        for name, stop_service, runner in (
+            ("ws-local", stop_ws_local_server, runtime.ws_local_runner),
+            ("data", stop_data_service, runtime.data_runner),
+            ("rpc", stop_rpc_service, runtime.rpc_runner),
+        ):
+            if runner is None:
+                continue
+            try:
+                await stop_service(runner)
+            except Exception:
+                logger.exception("shutdown: failed to stop %s service", name)
+        clear_daemon_ready(expected_pid=pid)
+        logger.info("puffo-agent portal stopped")
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -352,7 +427,10 @@ class Daemon:
         # (api.openai.com for codex) and flips refresh_broken.
         # getattr: a runtime without the field is simply not in gateway mode —
         # never let a missing optional field crash worker startup.
-        if (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip():
+        if (
+            (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip()
+            or Daemon._uses_claude_api_key(self, agent_cfg)
+        ):
             return
         refresher = self._refresher_for(agent_cfg)
         refresher.register_agent(agent_home_dir(agent_cfg.id))
@@ -393,6 +471,8 @@ class Daemon:
         worker._refresh_success_callback = on_refresh_success
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
+        if Daemon._uses_claude_api_key(self, agent_cfg):
+            return None
         return self._refresher_for(agent_cfg).notify_refresh_needed
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
@@ -402,9 +482,21 @@ class Daemon:
         # refresh gate, so a turn isn't blocked (and deferred ~40s) by a spurious
         # api.openai.com probe that 401s. Native-auth harnesses keep the refresh.
         # getattr: see _register_with_refresher — a missing field means OAuth mode.
-        if (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip():
+        if (
+            (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip()
+            or Daemon._uses_claude_api_key(self, agent_cfg)
+        ):
             return None
         return self._refresher_for(agent_cfg).ensure_fresh
+
+    def _uses_claude_api_key(self, agent_cfg: AgentConfig) -> bool:
+        runtime = agent_cfg.runtime
+        return (
+            getattr(runtime, "kind", "cli-local") in {"cli-local", "cli-docker"}
+            and (getattr(runtime, "harness", "") or "claude-code")
+            == "claude-code"
+            and bool(claude_cli_api_key(getattr(self, "daemon_cfg", None)))
+        )
 
     def _set_worker_profile_cache(
         self,
@@ -430,6 +522,11 @@ class Daemon:
         if worker is None:
             return None
         return worker.host_mcp_context()
+
+    def _resolve_message_client(self, agent_id: str):
+        """Data-service shim for on-miss channel-cache recovery."""
+        context = self._resolve_host_mcp_context(agent_id)
+        return context.message_client if context is not None else None
 
     async def _stop_worker(self, agent_id: str) -> None:
         worker = self.workers.pop(agent_id, None)
@@ -724,6 +821,56 @@ async def _sweep_archived_pending_revokes_at_startup() -> None:
         logger.warning("archived pending revoke sweep errored: %s", exc)
 
 
+def _mcp_fingerprint_path() -> Path:
+    return home_dir() / "mcp_tool_fingerprint"
+
+
+def _respawn_codex_on_mcp_change_at_startup() -> None:
+    """Rotate Codex sessions when their cached MCP surface changed."""
+    import json
+
+    from ..mcp.puffo_core_server import mcp_tool_fingerprint
+
+    try:
+        current = mcp_tool_fingerprint()
+    except Exception as exc:  # noqa: BLE001 - startup remains best-effort
+        logger.warning("startup: mcp fingerprint failed: %s", exc)
+        return
+    path = _mcp_fingerprint_path()
+    try:
+        previous = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        previous = ""
+    except OSError as exc:
+        logger.warning("startup: couldn't read mcp fingerprint: %s", exc)
+        previous = ""
+    if previous and previous != current:
+        for agent_id in discover_agents():
+            try:
+                cfg = AgentConfig.load(agent_id)
+            except Exception:  # noqa: BLE001 - one broken config is isolated
+                continue
+            if cfg.runtime.kind != "cli-local" or cfg.runtime.harness != "codex":
+                continue
+            try:
+                flag = refresh_session_flag_path(cfg.resolve_workspace_dir())
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text(
+                    json.dumps({"requested_at": int(time.time())}) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                logger.warning(
+                    "startup: couldn't rotate codex session for %s: %s",
+                    agent_id,
+                    exc,
+                )
+    try:
+        path.write_text(current + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("startup: couldn't persist mcp fingerprint: %s", exc)
+
+
 async def _migrate_linked_agents_at_startup() -> None:
     """For each already-linked operator, stamp machine_id on its owned agents
     so locals created/paused before the link become remote. Best-effort."""
@@ -831,6 +978,7 @@ def _worker_needs_restart(old, new) -> bool:
         old.puffo_core != new.puffo_core
         or old.profile != new.profile
         or old.runtime != new.runtime
+        or old.env_overrides != new.env_overrides
     )
 
 
@@ -859,6 +1007,11 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
             f"model={model!r} not supported by harness={harness!r}; "
             f"supported: {supported}"
         )
+
+
+def _validate_daemon_inference_level(harness: str, level: str) -> None:
+    """Validate the public daemon refresh contract."""
+    _validate_refresh_inference_level(level, harness)
 
 
 def _mark_flag_broken(flag_path: Path, reason: str) -> None:
@@ -1124,7 +1277,21 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def run_daemon(with_local_bridge: bool = False) -> int:
+async def _wait_for_existing_daemon_ready(pid: int, timeout: float = 10.0) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if is_daemon_ready(pid):
+            return True
+        if not is_pid_alive(pid):
+            return False
+        await asyncio.sleep(0.1)
+    return is_daemon_ready(pid)
+
+
+async def run_daemon(
+    external_stop_requested: threading.Event | None = None,
+) -> int:
     # Single-daemon enforcement. ``start`` against an already-running
     # daemon exits 0 (the user wanted a running daemon; one exists) —
     # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
@@ -1132,66 +1299,78 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
     # discriminated here; ``stop && start`` is the version-swap path.
     if is_daemon_alive():
         pid = read_daemon_pid()
-        # print + log: background / tray runners may not surface INFO.
-        msg = f"puffo-agent daemon already running (pid={pid})"
-        logger.info(msg)
+        if pid is not None and await _wait_for_existing_daemon_ready(pid):
+            # print + log: background / tray runners may not surface INFO.
+            msg = f"puffo-agent daemon already running (pid={pid})"
+            logger.info(msg)
+            print(msg)
+            return 0
+        msg = f"puffo-agent daemon failed to become ready (pid={pid})"
+        logger.error(msg)
         print(msg)
-        return 0
+        return 1
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)
+    clear_daemon_ready()
 
     from .import_agents import cleanup_staging_dir
 
     cleanup_staging_dir()
 
     daemon_cfg = DaemonConfig.load()
-    if with_local_bridge:
-        daemon_cfg.bridge.enabled = True
-    write_daemon_pid(os.getpid())
+    pid = os.getpid()
+    try:
+        write_daemon_pid(pid)
+        daemon = Daemon(daemon_cfg)
+        loop = asyncio.get_running_loop()
 
-    daemon = Daemon(daemon_cfg)
+        def handle_signal() -> None:
+            logger.info("received stop signal; shutting down")
+            daemon.request_stop()
 
-    loop = asyncio.get_running_loop()
+        posix_handlers_installed = _install_posix_stop_handlers(loop, handle_signal)
 
-    def handle_signal() -> None:
-        logger.info("received stop signal; shutting down")
-        daemon.request_stop()
+        # Windows fallback: synchronous C-runtime Ctrl+C handler dispatched
+        # back onto the loop via call_soon_threadsafe. Without this the
+        # only graceful-stop path on Windows is the file sentinel.
+        if not posix_handlers_installed:
 
-    posix_handlers_installed = _install_posix_stop_handlers(loop, handle_signal)
+            def _windows_sigint(*_args) -> None:
+                loop.call_soon_threadsafe(daemon.request_stop)
 
-    # Windows fallback: synchronous C-runtime Ctrl+C handler dispatched
-    # back onto the loop via call_soon_threadsafe. Without this the
-    # only graceful-stop path on Windows is the file sentinel.
-    if not posix_handlers_installed:
+            try:
+                signal.signal(signal.SIGINT, _windows_sigint)
+            except (ValueError, OSError):
+                # Not on the main thread, or already trapped.
+                pass
 
-        def _windows_sigint(*_args) -> None:
-            loop.call_soon_threadsafe(daemon.request_stop)
+        await daemon.run(external_stop_requested)
 
-        try:
-            signal.signal(signal.SIGINT, _windows_sigint)
-        except (ValueError, OSError):
-            # Not on the main thread, or already trapped.
-            pass
-
-    await daemon.run()
-
-    # Cancel surviving tasks; otherwise asyncio.run can hang on
-    # Windows when a subprocess transport is still alive.
-    survivors = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
-    for t in survivors:
-        t.cancel()
-    if survivors:
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*survivors, return_exceptions=True),
-                timeout=5.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "shutdown: %d tasks still running after 5s; exiting anyway",
-                sum(1 for t in survivors if not t.done()),
-            )
+        # Cancel surviving tasks; otherwise asyncio.run can hang on
+        # Windows when a subprocess transport is still alive.
+        survivors = [
+            task
+            for task in asyncio.all_tasks(loop)
+            if task is not asyncio.current_task()
+        ]
+        for task in survivors:
+            task.cancel()
+        if survivors:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*survivors, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "shutdown: %d tasks still running after 5s; exiting anyway",
+                    sum(1 for task in survivors if not task.done()),
+                )
+    finally:
+        clear_daemon_ready(expected_pid=pid)
+        clear_stop_request(expected_pid=pid)
+        clear_daemon_pid(expected_pid=pid)
 
     # Hard exit avoids loop.close() hangs on leftover subprocess
     # transports; workers + adapters are already torn down.

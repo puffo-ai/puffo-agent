@@ -26,6 +26,9 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import threading
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path, PurePosixPath
 
 from .memory import (
@@ -41,6 +44,7 @@ from .memory import (
     _read_briefing_entries,
     compile_briefing,
     request_prompt_refresh,
+    safe_memory_scope,
 )
 from .memory_errors import BriefingCompileError, MemoryStoreError
 
@@ -75,6 +79,15 @@ _PATH_SUGGESTION = (
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
 
 
+def _serialized_write(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self.write_transaction():
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class MemoryStore:
     """Validated file operations under one agent's memory root.
 
@@ -93,9 +106,61 @@ class MemoryStore:
         self.memory_root = Path(memory_root)
         self.workspace_dir = workspace_dir
         self.maintenance = maintenance
+        self._thread_write_lock = threading.RLock()
+        self._write_lock_depth = 0
+
+    @contextmanager
+    def write_transaction(self):
+        """Serialize one complete memory mutation across local processes."""
+
+        with self._thread_write_lock:
+            if self._write_lock_depth:
+                self._write_lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._write_lock_depth -= 1
+                return
+            self.memory_root.mkdir(parents=True, exist_ok=True)
+            resolved_root = self.memory_root.resolve()
+            lock_path = resolved_root.parent / (
+                f".{resolved_root.name}.puffo-memory.lock"
+            )
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            locked = False
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"0")
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+                self._write_lock_depth = 1
+                try:
+                    yield
+                finally:
+                    self._write_lock_depth = 0
+            finally:
+                if locked and os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                elif locked:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     # ── the seven primitives ─────────────────────────────────────────
 
+    @_serialized_write
     def create_memory_file(self, path: str, body: str) -> dict:
         """Create a new file. Fails with ``memory_file_exists`` if the
         target already exists — overwriting goes through patch/append."""
@@ -133,8 +198,9 @@ class MemoryStore:
                 ),
             )
         limit = _FILE_LIMITS[scope]
-        data = physical.read_bytes()
-        size = len(data)
+        size = physical.stat().st_size
+        with physical.open("rb") as handle:
+            data = handle.read(limit + 1)
         truncated = size > limit
         if truncated:
             # A byte cap can split a multi-byte sequence; drop the
@@ -190,6 +256,7 @@ class MemoryStore:
                 })
         return results
 
+    @_serialized_write
     def patch_memory_file(self, path: str, patches: list) -> dict:
         """Exact text replacement. Each ``{old_text, new_text}`` must
         match exactly once; the patch list is all-or-nothing — nothing
@@ -245,6 +312,7 @@ class MemoryStore:
             self._mark_briefing_dirty(scope, "patch", logical)
         return {"path": str(logical), "changed": changed, "size": size}
 
+    @_serialized_write
     def append_memory_file(self, path: str, text: str) -> dict:
         """Append to the end of an existing file (no separator magic,
         no prepend/insert mode)."""
@@ -265,6 +333,7 @@ class MemoryStore:
             self._mark_briefing_dirty(scope, "append", logical)
         return {"path": str(logical), "changed": changed, "size": size}
 
+    @_serialized_write
     def delete_memory_file(self, path: str) -> dict:
         """Delete a safe memory file: validated writable path, regular
         file, and never the managed ``briefing/profile.md``."""
@@ -323,11 +392,17 @@ class MemoryStore:
         Uses ``rglob('*')`` filtered to real files — ``briefing/`` is
         flat, ``recollection/`` is nested, ``imports/`` may hold
         non-``.md`` files."""
-        base = self.memory_root / scope
-        if not base.is_dir():
+        base = safe_memory_scope(self.memory_root, scope)
+        if base is None:
             return []
+        resolved_root = self.memory_root.resolve()
         out: list[tuple[str, Path]] = []
         for p in sorted(base.rglob("*")):
+            try:
+                if not p.resolve().is_relative_to(resolved_root):
+                    continue
+            except OSError:
+                continue
             rel = p.relative_to(self.memory_root).as_posix()
             if any(seg.startswith(".") for seg in rel.split("/")):
                 continue
@@ -421,6 +496,7 @@ class MemoryStore:
 
     # ── daemon-owned writer (not one of the public seven) ────────────
 
+    @_serialized_write
     def put_memory_file(self, path: str, body: str) -> dict:
         """Overwrite-allowed create, for the daemon-owned M1 writers
         (``MemoryManager.save`` / ``sync_profile_briefing`` /

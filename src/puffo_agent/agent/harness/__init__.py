@@ -1,15 +1,14 @@
 """Execution engines used by Puffo runtimes.
 
-Runtime answers WHERE the agent executes; harness answers WHAT.
-Docker retains three declarative ``DockerHarness`` metadata types.
-The host-local runtime uses the long-lived Driver implementations for
-``claude-code`` and ``codex`` only.
+Docker executes Claude Code only. Host-local execution uses the long-lived
+Claude Code and Codex Driver implementations.
 """
+
+from dataclasses import dataclass
+from typing import Any
 
 from .base import DockerHarness
 from .claude_code import ClaudeCodeHarness
-from .gemini_cli import GeminiCLIHarness
-from .hermes import HermesHarness
 from .driver import (
     Driver,
     RuntimeRef,
@@ -20,24 +19,18 @@ from .driver import (
 )
 from .codex_driver import CodexAppServerDriver, CodexDriver
 from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
-from dataclasses import dataclass
-from typing import Any
 
 
 def build_docker_harness(name: str) -> DockerHarness:
-    """Resolve Docker engine metadata from ``agent.yml``.
+    """Resolve the sole executable Docker harness from ``agent.yml``.
 
     Claude Code is the compatibility default for configs without a harness.
     """
     if not name or name == "claude-code":
         return ClaudeCodeHarness()
-    if name == "hermes":
-        return HermesHarness()
-    if name == "gemini-cli":
-        return GeminiCLIHarness()
     raise ValueError(
-        f"unknown harness {name!r}: expected one of "
-        "'claude-code', 'hermes', 'gemini-cli'"
+        f"Docker harness {name!r} is not executable; "
+        "the supported Docker harness is 'claude-code'"
     )
 
 
@@ -50,8 +43,7 @@ class UnsupportedDriver:
 def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
     """Construct only the two ratified Driver implementations.
 
-    This factory is deliberately separate from :func:`build_docker_harness`,
-    which is the declarative registry used by the Docker runtime.
+    This factory is deliberately separate from :func:`build_docker_harness`.
     """
     if name == "codex":
         return CodexAppServerDriver(**kwargs)
@@ -63,13 +55,17 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
 __all__ = [
     "DockerHarness",
     "ClaudeCodeHarness",
-    "GeminiCLIHarness",
-    "HermesHarness",
     "build_docker_harness",
     "Driver",
-    "RuntimeRef", "SessionRef", "TurnRef", "PermissionRef",
-    "UnsupportedCapability", "UnsupportedDriver",
-    "CodexAppServerDriver", "CodexDriver",
-    "ClaudeCodeCliDriver", "ClaudeDriver",
+    "RuntimeRef",
+    "SessionRef",
+    "TurnRef",
+    "PermissionRef",
+    "UnsupportedCapability",
+    "UnsupportedDriver",
+    "CodexAppServerDriver",
+    "CodexDriver",
+    "ClaudeCodeCliDriver",
+    "ClaudeDriver",
     "build_driver",
 ]

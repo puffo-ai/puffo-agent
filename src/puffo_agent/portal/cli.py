@@ -18,13 +18,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .api.pairing import clear_pairing, load_pairing
 from .cli_parser import build_parser as build_cli_parser
 from .daemon import run_daemon
 from .state import (
     AgentConfig,
     DaemonConfig,
-    ProviderConfig,
     RuntimeConfig,
     RuntimeState,
     TriggerRules,
@@ -39,9 +37,11 @@ from .state import (
     daemon_pid_path,
     daemon_yml_path,
     discover_agents,
+    derive_role_short,
     docker_shared_dir,
     home_dir,
     is_daemon_alive,
+    is_daemon_ready,
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
@@ -204,23 +204,33 @@ def upgrade_command_for_install_mode() -> str:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    """Set daemon-wide model defaults and the reserved Google key.
+    """Set the daemon-owned Claude API-key policy.
 
     Claude Code and Codex authenticate through their CLI login or a
-    per-agent gateway configuration. The Google key is reserved: no
-    supported runtime uses it while gemini-cli is design-only.
+    per-agent gateway configuration by default.
     """
     home_dir().mkdir(parents=True, exist_ok=True)
     cfg = DaemonConfig.load()
+
+    anthropic_api_key = getattr(args, "anthropic_api_key", None)
+    anthropic_cli_use_api_key = getattr(
+        args, "anthropic_cli_use_api_key", None
+    )
+    if anthropic_api_key is not None or anthropic_cli_use_api_key is not None:
+        if anthropic_api_key is not None:
+            cfg.anthropic.api_key = anthropic_api_key
+        if anthropic_cli_use_api_key is not None:
+            cfg.anthropic.cli_use_api_key = (
+                anthropic_cli_use_api_key == "true"
+            )
+        cfg.save()
+        print(f"wrote {daemon_yml_path()}")
+        return 0
 
     if daemon_yml_path().exists():
         print(f"updating daemon.yml at {daemon_yml_path()}")
     else:
         print("creating daemon.yml (optional — defaults only)")
-
-    env_google = (
-        os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
-    )
 
     def prompt(label: str, default: str = "") -> str:
         hint = f" [{default}]" if default else ""
@@ -230,21 +240,23 @@ def cmd_config(args: argparse.Namespace) -> int:
             val = ""
         return val or default
 
-    cfg.default_provider = prompt(
-        "Default AI provider (anthropic|openai|google)",
-        cfg.default_provider or "anthropic",
+    anth_key = prompt(
+        "Default Anthropic API key (blank to skip)",
+        cfg.anthropic.api_key,
     )
-
-    goog_key = cfg.google.api_key or env_google
-    goog_key = prompt(
-        "Default Google API key (blank to skip; reserved — gemini-cli is "
-        "design-only, so no supported runtime reads it today)",
-        goog_key,
-    )
-    if goog_key:
-        cfg.google = ProviderConfig(
-            api_key=goog_key, model=cfg.google.model or "gemini-2.5-pro"
+    if anth_key:
+        cfg.anthropic.api_key = anth_key
+        cfg.anthropic.model = (
+            cfg.anthropic.model or "claude-sonnet-4-6"
         )
+    cli_use_api_key = prompt(
+        "Use the Anthropic API key for Claude Code (true|false)",
+        "true" if cfg.anthropic.cli_use_api_key else "false",
+    ).lower()
+    if cli_use_api_key not in {"true", "false"}:
+        print("error: Claude Code API-key mode must be true or false")
+        return 2
+    cfg.anthropic.cli_use_api_key = cli_use_api_key == "true"
 
     cfg.save()
     print(f"wrote {daemon_yml_path()}")
@@ -258,9 +270,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         "  cli-docker   claude CLI inside a per-agent container  [Docker + `claude login` on host]"
     )
     print()
-    print(
-        "defaults saved — `puffo-agent agent create` will use these unless overridden."
-    )
+    print("daemon settings saved.")
     return 0
 
 
@@ -270,14 +280,15 @@ def cmd_config(args: argparse.Namespace) -> int:
 # / cloud daemons don't pull Qt; PySide6 lives in the ``gui`` extra.
 _GUI_EXTRA_HINT = (
     "the desktop UI requires the [gui] extra (PySide6), which is not "
-    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n\n"
+    "installed. install it with:\n\n    pip install 'puffo-agent[gui]'\n"
+    "or, for a uv tool install:\n"
+    "    uv tool install --force 'puffo-agent[gui]'\n\n"
     "(the headless daemon — `puffo-agent start` with no UI flag — runs "
     "without it.)"
 )
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    with_local_bridge = getattr(args, "with_local_bridge", False)
     # The PySide6 import inside run_tray/launch is deferred to call time,
     # so the ImportError surfaces from the call, not the ``from .ui...``
     # line — wrap both so a missing [gui] extra yields the actionable hint
@@ -286,19 +297,19 @@ def cmd_start(args: argparse.Namespace) -> int:
         try:
             from .ui.tray import run_tray
 
-            return run_tray(with_local_bridge=with_local_bridge)
+            return run_tray()
         except ImportError:
             print(_GUI_EXTRA_HINT, file=sys.stderr)
             return 1
     if getattr(args, "background", False):
         from .background import spawn_background
 
-        return spawn_background(with_local_bridge=with_local_bridge)
+        return spawn_background()
     if getattr(args, "ui", False):
         try:
             from .ui.launcher import launch
 
-            return launch(with_local_bridge=with_local_bridge)
+            return launch()
         except ImportError:
             print(_GUI_EXTRA_HINT, file=sys.stderr)
             return 1
@@ -306,7 +317,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    return asyncio.run(run_daemon(with_local_bridge=with_local_bridge))
+    return asyncio.run(run_daemon())
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -326,15 +337,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
         return 0
     if not is_pid_alive(pid):
         print(f"daemon: not running (stale pid file at {daemon_pid_path()})")
-        clear_daemon_pid()
+        clear_daemon_pid(expected_pid=pid)
+        clear_stop_request(expected_pid=pid)
         return 0
 
-    write_stop_request()
+    write_stop_request(pid)
     print(f"requested daemon shutdown (pid={pid}); waiting up to {args.timeout}s...")
     deadline = time.time() + max(1, args.timeout)
     while time.time() < deadline:
         if not is_pid_alive(pid):
-            clear_stop_request()
+            clear_stop_request(expected_pid=pid)
             # A new daemon may have taken the pid file mid-poll — say so,
             # rather than a bare "stopped".
             new_pid = read_daemon_pid()
@@ -380,7 +392,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
         run_attach(
             Path(args.bundle),
             args.passcode,
-            bridge_url=args.bridge_url,
+            daemon_url=args.daemon_url,
             session_dir=session_dir,
         )
     )
@@ -447,21 +459,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def _derive_role_short_cli(role: str) -> str:
-    """Local mirror of ``profiles::derive_role_short`` (server) +
-    ``_derive_role_short`` (bridge). Keeps the chip label in
-    agent.yml consistent with what the server stores when the
-    daemon syncs on first connect. See server-side validators for
-    the canonical contract."""
-    if ":" not in role:
-        return ""
-    head, tail = role.split(":", 1)
-    candidate = head.strip()
-    rest = tail.strip()
-    if not candidate or not rest or len(candidate) > 32:
-        return ""
-    if any(ch.isspace() for ch in candidate):
-        return ""
-    return candidate
+    """Compatibility wrapper around the shared server contract."""
+    return derive_role_short(role)
 
 
 def cmd_agent_create(args: argparse.Namespace) -> int:
@@ -502,7 +501,13 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     if role_short_raw and len(role_short_raw) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
-    role_short = role_short_raw or (_derive_role_short_cli(role) if role else "")
+    role_short = _derive_role_short_cli(role) if role else ""
+    if role_short_raw and role_short_raw != role_short:
+        print(
+            f"warning: --role-short is deprecated (PUF-401); ignoring "
+            f"{role_short_raw!r}, using role-derived {role_short!r}",
+            file=sys.stderr,
+        )
 
     target.mkdir(parents=True)
 
@@ -572,88 +577,6 @@ def _print_agent_create_result(agent_id: str, target: Path) -> None:
         print("daemon is not running — run `puffo-agent start` to activate.")
     else:
         print("daemon will pick it up on the next reconcile tick (a few seconds).")
-
-
-def _bridge_wait_until_command(base: str, command_id: str, timeout: float) -> int:
-    """GET the bridge's wait-until-command and print its result JSON to stdout."""
-    import json
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-
-    url = (
-        f"{base}/v1/machine/wait-until-command?"
-        f"id={urllib.parse.quote(command_id)}&timeout={int(timeout)}"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=timeout + 10) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code == 504:
-            print(f"pending: operator hasn't approved yet ({detail})", file=sys.stderr)
-        else:
-            print(f"error: wait failed (HTTP {exc.code}): {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: cannot reach the daemon bridge ({exc.reason})", file=sys.stderr)
-        return 1
-    print(json.dumps(result))
-    return 0
-
-
-def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
-    """Request a ws-local agent via operator approval. Non-blocking: prints the
-    ``request_id`` and returns. Poll completion with
-    ``machine wait-until-command --id <request_id>`` (or pass ``--wait`` to block
-    here). Requires the daemon running with the bridge."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    base = args.bridge_url.rstrip("/")
-    body = json.dumps(
-        {
-            "operator": args.operator,
-            "passcode": args.passcode,
-            "display_name": getattr(args, "display_name", "") or "",
-            "message": getattr(args, "message", "") or "",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base}/v1/agents/create-ws-local",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            started = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        print(f"error: request failed (HTTP {exc.code}): {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(
-            f"error: cannot reach the daemon bridge at {args.bridge_url} ({exc.reason}). "
-            "Is the daemon running with --with-local-bridge?",
-            file=sys.stderr,
-        )
-        return 1
-
-    if not getattr(args, "wait", False):
-        print(json.dumps(started))
-        return 0
-    return _bridge_wait_until_command(
-        base, str(started.get("request_id") or ""), args.wait_timeout
-    )
-
-
-def cmd_machine_wait_until_command(args: argparse.Namespace) -> int:
-    """Block until the command with ``--id`` has been processed, print its result."""
-    return _bridge_wait_until_command(
-        args.bridge_url.rstrip("/"), args.id, args.timeout
-    )
 
 
 def cmd_agent_list(args: argparse.Namespace) -> int:
@@ -994,7 +917,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         print(f"server_url:    {cfg.puffo_core.server_url}")
         return 0
 
-    # Validation mirrors handlers.update_profile so the CLI fails
+    # Validation mirrors the control provision contract so the CLI fails
     # locally before bothering the server.
     if role_short_arg is not None and role_arg is None and not cfg.role:
         print(
@@ -1021,14 +944,18 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if isinstance(role_arg, str):
         cfg.role = role_arg
         patch["role"] = role_arg
-        # Mirror the server-side derive locally so agent.yml stays
-        # in sync with what the server stores unless the caller
-        # explicitly overrides ``role_short`` below.
-        if not isinstance(role_short_arg, str):
-            cfg.role_short = _derive_role_short_cli(role_arg)
+        cfg.role_short = _derive_role_short_cli(role_arg)
+        patch["role_short"] = cfg.role_short
     if isinstance(role_short_arg, str):
-        cfg.role_short = role_short_arg
-        patch["role_short"] = role_short_arg
+        derived = _derive_role_short_cli(cfg.role)
+        if role_short_arg.strip() and role_short_arg.strip() != derived:
+            print(
+                f"warning: --role-short is deprecated (PUF-401); ignoring "
+                f"{role_short_arg!r}, using role-derived {derived!r}",
+                file=sys.stderr,
+            )
+        cfg.role_short = derived
+        patch["role_short"] = derived
 
     cfg.save()
 
@@ -1049,8 +976,6 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if "role" in patch:
         print(f"  role:         {cfg.role!r}")
     if "role_short" in patch:
-        print(f"  role_short:   {cfg.role_short!r}  (explicit)")
-    elif "role" in patch:
         print(f"  role_short:   {cfg.role_short!r}  (server-derived)")
     return 0
 
@@ -1276,50 +1201,31 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pairing_show(args: argparse.Namespace) -> int:
-    """Print the current bridge pairing, or ``(not paired)``.
-    Reads ``pairing.json`` directly — works whether the daemon is
-    running or not."""
-    pairing = load_pairing()
-    if pairing is None:
-        print("bridge: not paired")
-        return 0
-    print(f"slug:        {pairing.slug}")
-    print(f"device_id:   {pairing.device_id}")
-    print(f"paired_at:   {_format_ts(int(pairing.paired_at / 1000))}")
-    print(f"root_pubkey: {pairing.root_public_key}")
-    return 0
-
-
-def cmd_pairing_unpair(args: argparse.Namespace) -> int:
-    """Remove the bridge pairing so a different identity can pair
-    next. The daemon re-reads ``pairing.json`` on every request — no
-    restart needed."""
-    pairing = load_pairing()
-    if pairing is None:
-        print("bridge: nothing to unpair (not paired)")
-        return 0
-    clear_pairing()
-    print(f"bridge: unpaired (was slug={pairing.slug} device_id={pairing.device_id})")
-    return 0
-
-
 def cmd_link(args: argparse.Namespace) -> int:
     """Link this machine to an operator via the online agent portal."""
     from .control.link import DEFAULT_SERVER_URL, friendly_device_name, run_link
 
     # The daemon holds the control WS that serves the operator's commands
-    # once approved — auto-start it (without the local bridge) if it isn't
-    # running, so `link` is a one-step onboard.
-    if not is_daemon_alive():
-        from .background import spawn_background
+    # once approved — auto-start a detached headless daemon if it isn't
+    # running, so `link` stays a one-step onboard without requiring Qt.
+    if not is_daemon_ready():
+        from .background import spawn_headless_background
 
-        spawn_background()
+        startup_rc = spawn_headless_background()
+        if startup_rc != 0:
+            return startup_rc
 
     name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(run_link(server_url, name, open_browser=not args.not_open))
+        return asyncio.run(
+            run_link(
+                server_url,
+                name,
+                open_browser=not args.not_open,
+                code=getattr(args, "code", None),
+            )
+        )
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
@@ -1330,26 +1236,6 @@ def cmd_unlink(args: argparse.Namespace) -> int:
     from .control.link import run_unlink
 
     return asyncio.run(run_unlink(args.operator, expected_server_url=args.server_url))
-
-
-def cmd_api_status(args: argparse.Namespace) -> int:
-    """Print bridge configuration + pairing status."""
-    cfg = DaemonConfig.load()
-    b = cfg.bridge
-    pairing = load_pairing()
-    print(f"enabled:         {b.enabled}")
-    print(f"bind:            http://{b.bind_host}:{b.port}")
-    print(f"allowed_origins: {b.allowed_origins}")
-    if pairing is None:
-        print("paired:          (none)")
-    else:
-        print(f"paired:          slug={pairing.slug} device_id={pairing.device_id}")
-        print(f"paired_at:       {_format_ts(int(pairing.paired_at / 1000))}")
-    if not is_daemon_alive():
-        print(
-            "daemon:          not running (bridge is offline until you `puffo-agent start`)"
-        )
-    return 0
 
 
 def cmd_agent_export(args: argparse.Namespace) -> int:

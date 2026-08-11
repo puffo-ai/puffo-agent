@@ -32,6 +32,9 @@ def test_runtime_info_reports_effective_codex_defaults():
         "provider": "openai",
         "harness": "codex",
         "model": "gpt-5.4",
+        "inference_level": "",
+        "max_context": None,
+        "auto_compact_threshold_pct": None,
     }
 
 
@@ -56,6 +59,9 @@ def test_runtime_info_reports_explicit_codex_driver_and_model():
         "provider": "openai",
         "harness": "codex",
         "model": "gpt-4.1",
+        "inference_level": "",
+        "max_context": None,
+        "auto_compact_threshold_pct": None,
     }
 
 
@@ -73,6 +79,7 @@ def test_runtime_info_does_not_invent_ws_local_provider():
         "provider": "",
         "harness": "",
         "model": "",
+        "inference_level": "",
     }
 
 
@@ -118,6 +125,7 @@ async def test_worker_registers_reconnect_status_callback():
                 "provider": "openai",
                 "harness": "codex",
                 "model": "gpt-5.4",
+                "inference_level": "",
             },
         },
     )]

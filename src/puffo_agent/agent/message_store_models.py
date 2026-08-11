@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,23 +14,39 @@ from typing import Any, Optional
 # keep the durable lookup itself finite before formatting adds metadata.
 PRIOR_CONTEXT_MAX_ITEMS = 20
 PRIOR_CONTEXT_MAX_BYTES = 48_000
+MAX_REMINDER_ENVELOPE_BYTES = 32_768
 
 # Persisting an envelope is the write-ahead fence for remote delivery. Only an
 # entirely unprepared row can use the local-only path. A remotely coordinated
 # row additionally needs a freshly validated Server lease before delivery.
 _REMINDER_LOCAL_DELIVERY_SQL = """
 (
-    server_ack_revision = 0
+    snapshot_conflict = 0
+    AND server_ack_revision = 0
     AND payload_format IS NULL
     AND opaque_payload IS NULL
+    AND delivery_claim_id IS NULL
+    AND delivery_claim_acquired = 0
+    AND delivery_claim_expires_at_ms IS NULL
 )
 """
-_REMINDER_DELIVERY_CUSTODY_SQL = f"""
-(
-    delivery_claim_acquired = 1
-    OR {_REMINDER_LOCAL_DELIVERY_SQL}
-)
-"""
+
+
+def _reminder_delivery_custody_sql(now_parameter: str = "?") -> str:
+    return f"""
+    (
+        snapshot_conflict = 0
+        AND (
+            {_REMINDER_LOCAL_DELIVERY_SQL}
+            OR (
+                delivery_claim_acquired = 1
+                AND delivery_claim_id IS NOT NULL
+                AND delivery_claim_expires_at_ms IS NOT NULL
+                AND delivery_claim_expires_at_ms > {now_parameter}
+            )
+        )
+    )
+    """
 
 
 def _now_ms() -> int:
@@ -222,6 +239,21 @@ class ReminderSyncRecord:
     sync_permanent_code: str | None
     delivery_claim_id: str | None
     delivery_claim_acquired: bool
+    delivery_claim_expires_at_ms: int | None
+    snapshot_conflict: bool
+
+    @property
+    def is_unprepared_local_only(self) -> bool:
+        """Whether this row has no evidence of remote delivery custody."""
+        return (
+            not self.snapshot_conflict
+            and self.server_ack_revision == 0
+            and self.payload_format is None
+            and self.opaque_payload is None
+            and self.delivery_claim_id is None
+            and not self.delivery_claim_acquired
+            and self.delivery_claim_expires_at_ms is None
+        )
 
     @property
     def server_lifecycle(self) -> str:
@@ -249,6 +281,32 @@ class ReminderMaterializationResult:
 
 REMINDER_STATES = frozenset({"scheduled", "claimed", "cancelled", "delivered"})
 MAX_REMINDER_LIST_LIMIT = 100
+
+
+def reminder_plaintext_envelope_size(target: str, content: str) -> int:
+    """Return the exact byte size of the deterministic v1 envelope shape."""
+
+    plaintext = json.dumps(
+        {"content": content, "target": target},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    ciphertext_bytes = len(plaintext) + 16
+    encoded_bytes = ((ciphertext_bytes + 2) // 3) * 4
+    encoded_bytes -= (3 - ciphertext_bytes % 3) % 3
+    envelope = json.dumps(
+        {
+            "algorithm": "chacha20-poly1305",
+            "ciphertext": "A" * encoded_bytes,
+            "nonce": "A" * 16,
+            "version": 1,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return len(envelope)
 
 
 def reminder_time_to_rfc3339(value: int) -> str:

@@ -130,6 +130,32 @@ class TestKeyStore:
         loaded = store.load_session("alice-0001")
         assert loaded.subkey_id == "sk_test"
 
+    def test_identity_and_session_files_are_private(self):
+        if os.name == "nt":
+            return
+        store, _ = self._temp_store()
+        store.save_identity(self._sample_identity())
+        store.save_session(Session(
+            slug="alice-0001",
+            subkey_id="sk_test",
+            subkey_secret_key=encode_secret(bytes([5] * 32)),
+            expires_at=int(time.time() * 1000) + 3_600_000,
+        ))
+
+        assert store.base_dir.stat().st_mode & 0o777 == 0o700
+        assert store._identity_path("alice-0001").stat().st_mode & 0o777 == 0o600
+        assert store._session_path("alice-0001").stat().st_mode & 0o777 == 0o600
+
+        store.base_dir.chmod(0o755)
+        store._identity_path("alice-0001").chmod(0o644)
+        store._session_path("alice-0001").chmod(0o644)
+        store.load_identity("alice-0001")
+        store.load_session("alice-0001")
+
+        assert store.base_dir.stat().st_mode & 0o777 == 0o700
+        assert store._identity_path("alice-0001").stat().st_mode & 0o777 == 0o600
+        assert store._session_path("alice-0001").stat().st_mode & 0o777 == 0o600
+
     def test_expired_session_deleted(self):
         store, _ = self._temp_store()
         session = Session(

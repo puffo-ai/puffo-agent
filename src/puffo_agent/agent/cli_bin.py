@@ -1,5 +1,4 @@
-"""Resolve ``codex`` and ``claude`` binaries with broader-than-PATH
-search.
+"""Resolve host CLI binaries with broader-than-PATH search.
 
 A daemon started by a LaunchAgent (macOS) / Windows service / before a
 shell-profile refresh inherits a narrow, stale PATH that misses
@@ -7,14 +6,13 @@ npm-global / scoop / nvm / fnm / volta / homebrew installs. The
 resolver layers, in order:
 
 1. ``$PUFFO_<NAME>_BIN`` env var — explicit operator override.
-2. Caches — an in-memory one for this daemon's lifetime and a
-   ``resolved_clis.json`` file so a restart skips the (slow) PATH
-   reconstruction; both validated against the filesystem.
+2. An in-memory cache for this daemon's lifetime.
 3. ``shutil.which`` against the process PATH.
 4. ``shutil.which`` against the user's *real* PATH, reconstructed from
    the persistent Machine+User registry env (Windows) or a login shell
    (POSIX) — catches installs the narrow process PATH missed.
 5. OS-specific bundle paths (desktop-app installs).
+6. The validated ``resolved_clis.json`` disk cache as a last resort.
 
 Returns absolute path on hit, ``None`` on full miss. Callers
 distinguish "binary missing" (raise / report to status) from
@@ -29,11 +27,28 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 # Resolved-path caches: in-memory for this daemon's lifetime, plus a
-# JSON file so a restart skips the (slow) real-PATH reconstruction.
+# last-resort JSON fallback for installs that later disappear from PATH.
 _resolve_memcache: dict[str, str] = {}
 _real_path_cache: str | None = None
+
+
+def cli_tool_status(
+    resolver: Callable[[], str | None], credential_check: Callable[[], bool],
+) -> str:
+    """Return ``not_installed``, ``need_login``, or ``ready`` for a host CLI."""
+    try:
+        path = resolver()
+    except Exception:
+        path = None
+    if not path:
+        return "not_installed"
+    try:
+        return "ready" if credential_check() else "need_login"
+    except Exception:
+        return "need_login"
 
 
 def resolve_codex_bin() -> str | None:
@@ -44,6 +59,11 @@ def resolve_codex_bin() -> str | None:
 def resolve_claude_bin() -> str | None:
     """Return the absolute path of the ``claude`` binary, or ``None``."""
     return _resolve("claude", "PUFFO_CLAUDE_BIN", _claude_bundle_paths())
+
+
+def resolve_docker_bin() -> str | None:
+    """Return the absolute path of the ``docker`` binary, or ``None``."""
+    return _resolve("docker", "PUFFO_DOCKER_BIN", _docker_bundle_paths())
 
 
 def resolve_hermes_bin() -> str | None:
@@ -64,33 +84,38 @@ def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
     env_override = os.environ.get(env_var)
     if env_override:
         p = Path(env_override).expanduser()
-        if p.is_file():
+        if _is_executable_file(p):
             return str(p)
-    # 2. Caches (in-memory, then on-disk) — validated against the FS so
-    #    an uninstalled / moved binary falls through to a fresh lookup.
+    # 2. The daemon-lifetime cache avoids repeated path reconstruction.
     cached = _resolve_memcache.get(name)
-    if cached and Path(cached).is_file():
+    if cached and _is_executable_file(Path(cached)):
         return cached
-    saved = _read_path_cache().get(name)
-    if saved and Path(saved).is_file():
-        _resolve_memcache[name] = saved
-        return saved
-    # 3-5. Live lookup: process PATH → the user's real (reconstructed)
-    #      PATH → OS bundle paths. Persist whatever resolves.
+    # 3-5. Prefer live and known-install lookups over the user-writable
+    # disk cache, especially for privileged Docker invocations.
     resolved = shutil.which(name)
     if not resolved:
         resolved = shutil.which(name, path=_real_path())
     if not resolved:
-        resolved = _first_existing(bundle_paths)
+        resolved = _first_executable(bundle_paths)
+    # 6. Last-resort restart cache. Executability is revalidated so a
+    # stale or non-executable entry cannot shadow a working live lookup.
+    if not resolved:
+        saved = _read_path_cache().get(name)
+        if saved and _is_executable_file(Path(saved)):
+            resolved = saved
     if resolved:
         _resolve_memcache[name] = resolved
         _write_path_cache(name, resolved)
     return resolved
 
 
-def _first_existing(paths: list[Path]) -> str | None:
+def _is_executable_file(path: Path) -> bool:
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _first_executable(paths: list[Path]) -> str | None:
     for cand in paths:
-        if cand.is_file():
+        if _is_executable_file(cand):
             return str(cand)
     return None
 
@@ -196,7 +221,11 @@ def _write_path_cache(name: str, path: str) -> None:
 
 def _codex_bundle_paths() -> list[Path]:
     if sys.platform == "darwin":
+        # ChatGPT.app first — newer builds bundle codex there (moved out
+        # of Codex.app), so a leftover Codex.app copy is the stale one.
         return _expand(
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "~/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
             "~/Applications/Codex.app/Contents/Resources/codex",
         )
@@ -233,6 +262,27 @@ def _claude_bundle_paths() -> list[Path]:
         "/opt/Claude/claude",
         "/opt/claude/claude",
         "/usr/lib/claude/claude",
+    )
+
+
+def _docker_bundle_paths() -> list[Path]:
+    if sys.platform == "darwin":
+        return _expand(
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+            "~/Applications/Docker.app/Contents/Resources/bin/docker",
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+        )
+    if sys.platform == "win32":
+        return _expand(
+            r"%LOCALAPPDATA%\Programs\DockerDesktop\resources\bin\docker.exe",
+            r"%PROGRAMFILES%\Docker\Docker\resources\bin\docker.exe",
+            r"%PROGRAMDATA%\DockerDesktop\version-bin\docker.exe",
+        )
+    return _expand(
+        "/usr/bin/docker",
+        "/usr/local/bin/docker",
+        "/snap/bin/docker",
     )
 
 

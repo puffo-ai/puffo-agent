@@ -1,8 +1,8 @@
 """Serve one localhost WS connection end to end.
 
 Glue, but dependency-injected so the decision logic stays unit-testable:
-read the ``connect`` frame, authenticate by decrypting the export, gate
-on "agent is managed here and is a ws-local runtime", claim the
+read the ``connect`` frame, decrypt and identity-bind the export, gate on
+"agent is managed here and is a ws-local runtime", claim the
 single-WS slot, hand back the live agent context, then run the tool
 attached — the session frame-loop and the message consumer together —
 until either ends, and always free the slot on the way out.
@@ -34,7 +34,7 @@ async def serve_connection(
     transport: Transport,
     *,
     authenticate: Callable[[bytes, str], AuthedAgent],
-    is_servable: Callable[[str], bool],
+    is_servable: Callable[[AuthedAgent], bool],
     agent_context: Callable[[str], Awaitable[dict]],
     registry: SessionRegistry[WsLocalSession],
     make_session: Callable[
@@ -68,7 +68,7 @@ async def serve_connection(
         await _reject(transport, f"authentication failed: {exc}")
         return
 
-    if not is_servable(authed.slug):
+    if not is_servable(authed):
         await _reject(transport, f"{authed.slug!r} is not a ws-local agent on this daemon")
         return
 

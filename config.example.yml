@@ -6,33 +6,29 @@
 # runtime kind, triggers, etc. — don't duplicate those here.
 #
 # Most users don't need this file at all. The daemon starts with
-# built-in defaults. Gateway keys travel inside each agent's own
-# agent.yml. The daemon-level Google key below is reserved and unused
-# today; `puffo-agent config` writes this file for you.
+# built-in defaults. Gateway keys normally travel inside each agent's
+# own agent.yml. The Anthropic fields below are the explicit exception:
+# they can opt Claude Code into one daemon-owned API key.
 #
 # Runtime Events v1 needs no daemon-wide switch. Supported cli-local
 # harnesses use a separate bounded per-agent SQLite outbox automatically;
 # legacy runtime/harness values retain their existing behavior.
 
-# Default provider and model hints for CLI Drivers. Agents can override
-# both in their own agent.yml. Claude Code and Codex normally reuse the
-# host CLI login; gateway credentials belong in runtime.api_key on the
-# individual agent, alongside runtime.llm_base_url.
-default_provider: "anthropic"  # "anthropic" | "openai" | "google"
+# Compatibility-only field retained when older daemon configs are loaded.
+# New Agents select their provider from runtime.harness in agent.yml.
+default_provider: "anthropic"
 
 anthropic:
+  api_key: ""                    # used only when cli_use_api_key is true
+  cli_use_api_key: false         # false keeps Claude subscription/OAuth auth
   model:   "claude-sonnet-4-6"   # empty = provider default
 
 openai:
+  api_key: ""                    # reserved; local Codex uses its own CLI login
   model:   "gpt-5"               # default model hint for cli-local + harness=codex
 
-google:
-  api_key: ""                    # reserved; gemini-cli is design-only, no runtime reads it
-  model:   "gemini-2.5-pro"
-
-# Optional: absolute path to a directory of shared Claude Code
-# skills (*.md files or skill dirs) synced into every cli-local /
-# cli-docker agent on worker start. Leave empty to skip.
+# Compatibility-only path retained on config round-trips. No current runtime
+# synchronizes skills from this daemon-wide directory.
 skills_dir: ""
 
 # Reconciler tick intervals. Lower = more responsive to agent.yml
@@ -40,6 +36,29 @@ skills_dir: ""
 # agents.
 reconcile_interval_seconds: 2.0
 runtime_heartbeat_seconds:  5.0
+
+# Loopback-only daemon services. The MCP subprocess reads message/history data
+# and requests daemon-owned operations through data_service and rpc_service;
+# externally attached ws-local clients connect to ws_local_service.
+data_service:
+  enabled: true
+  bind_host: 127.0.0.1
+  port: 63386
+
+rpc_service:
+  enabled: true
+  bind_host: 127.0.0.1
+  port: 63385
+
+ws_local_service:
+  enabled: true
+  bind_host: 127.0.0.1
+  port: 63387
+
+# Prompt-budget and reconnect catch-up limits.
+max_inline_message_chars: 4000
+segment_chars: 2000
+catchup_stale_hours: 48.0       # <= 0 disables the stale-catchup gate
 
 # cli-docker resource caps applied to every agent container at
 # `docker run` time. Defaults are ON: 1.5 GiB hard ceiling / 500 MiB

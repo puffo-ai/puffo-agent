@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -101,11 +102,45 @@ def ensure_memory_tree(memory_root: Path) -> None:
     never touches existing content. All paths are built by joining
     fixed names under the root — nothing is written outside it."""
     memory_root = Path(memory_root)
+    memory_root.mkdir(parents=True, exist_ok=True)
+    resolved_root = memory_root.resolve()
     for sub in (BRIEFING_DIR, NOTES_DIR, RECOLLECTION_DIR, IMPORTS_DIR):
-        (memory_root / sub).mkdir(parents=True, exist_ok=True)
+        path = memory_root / sub
+        if path.exists() or path.is_symlink():
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                raise MemoryStoreError(
+                    "memory_invalid_path",
+                    path=sub,
+                    suggestion="Memory scope roots must be real directories.",
+                ) from exc
+            if not stat.S_ISDIR(mode) or path.resolve().parent != resolved_root:
+                raise MemoryStoreError(
+                    "memory_invalid_path",
+                    path=sub,
+                    suggestion="Memory scope roots must be real directories.",
+                )
+        else:
+            path.mkdir()
     index = memory_root / IMPORTS_DIR / "index.md"
     if not index.exists():
         index.write_text(_IMPORTS_INDEX_SEED, encoding="utf-8")
+
+
+def safe_memory_scope(memory_root: Path, scope: str) -> Path | None:
+    """Return a real contained scope directory, never a followed symlink."""
+
+    root = Path(memory_root).resolve()
+    path = Path(memory_root) / scope
+    try:
+        mode = path.lstat().st_mode
+        resolved = path.resolve()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(mode) or resolved.parent != root:
+        return None
+    return path
 
 
 def _byte_size(text: str) -> int:

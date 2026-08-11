@@ -23,6 +23,7 @@ from ..crypto.keystore import KeyStore
 from ..crypto.primitives import aead_decrypt, aead_encrypt
 from .message_store import (
     LifecycleConflict,
+    MAX_REMINDER_ENVELOPE_BYTES,
     MessageStore,
     ReminderSyncRecord,
     parse_reminder_target,
@@ -40,15 +41,19 @@ logger = logging.getLogger(__name__)
 REMINDER_PAYLOAD_FORMAT = "puffo-reminder-aead-v1"
 ENVELOPE_VERSION = 1
 ENVELOPE_ALGORITHM = "chacha20-poly1305"
-MAX_ENVELOPE_BYTES = 32_768
+MAX_ENVELOPE_BYTES = MAX_REMINDER_ENVELOPE_BYTES
 SNAPSHOT_PAGE_LIMIT = 100
 MAX_SNAPSHOT_PAGES = 10_000
 RETRY_BASE_MS = 1_000
 RETRY_CAP_MS = 60_000
 DELIVERY_CLAIM_RETRY_MS = 5_000
+MIN_DELIVERY_LEASE_REMAINING_MS = 5_000
+SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 10.0
+CLAIM_REQUEST_TIMEOUT_SECONDS = 10.0
 SYNC_IDLE_SECONDS = 30.0
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_SNAPSHOT_CURSOR_RE = re.compile(r"^[\x21-\x7e]{1,256}$")
 _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _RFC3339_OFFSET_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -94,6 +99,12 @@ def _base64url_decode(value: object) -> bytes:
 def _validate_id(value: object) -> str:
     if not isinstance(value, str) or not _ID_RE.fullmatch(value):
         raise ReminderContractError("invalid reminder metadata")
+    return value
+
+
+def _validate_snapshot_cursor(value: object) -> str:
+    if not isinstance(value, str) or not _SNAPSHOT_CURSOR_RE.fullmatch(value):
+        raise ReminderContractError("invalid reminder snapshot")
     return value
 
 
@@ -293,6 +304,8 @@ class ReminderSync:
         scheduler: ReminderScheduler,
         now_ms: Callable[[], int] | None = None,
         idle_seconds: float = SYNC_IDLE_SECONDS,
+        snapshot_request_timeout_seconds: float = SNAPSHOT_REQUEST_TIMEOUT_SECONDS,
+        claim_request_timeout_seconds: float = CLAIM_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.store = store
         self.owner_slug = _validate_owner(owner_slug)
@@ -300,12 +313,19 @@ class ReminderSync:
         self.scheduler = scheduler
         self._now_ms = now_ms or (lambda: int(datetime.now(timezone.utc).timestamp() * 1000))
         self._idle_seconds = max(0.1, float(idle_seconds))
+        self._snapshot_request_timeout_seconds = max(
+            0.01, float(snapshot_request_timeout_seconds)
+        )
+        self._claim_request_timeout_seconds = max(
+            0.01, float(claim_request_timeout_seconds)
+        )
         # This is the sole custody call.  Nothing in this object logs or
         # returns these bytes; only the AEAD helpers receive them.
         self._dek = keystore.load_or_create_message_backup_dek(self.owner_slug)
         self._wakeup = asyncio.Event()
         self._stopping = False
         self._snapshot_requested = False
+        self._local_only_delivery_released_since_connect = False
         # A remote-coordinated scheduler is fail-closed until an authenticated
         # complete current-state snapshot has reconciled this local database.
         self._delivery_ready = False
@@ -328,6 +348,7 @@ class ReminderSync:
     async def on_transport_connected(self) -> None:
         """Provider-neutral callback: signal only, never do HTTP in WS code."""
         self._delivery_ready = False
+        self._local_only_delivery_released_since_connect = False
         self.signal_snapshot()
 
     def stop(self) -> None:
@@ -379,6 +400,12 @@ class ReminderSync:
         )
 
     def _put_body(self, record: ReminderSyncRecord) -> dict[str, object]:
+        expected_revision = 1 if record.server_lifecycle == "scheduled" else 2
+        if (
+            record.server_lifecycle not in {"scheduled", "cancelled", "delivered"}
+            or record.revision != expected_revision
+        ):
+            raise ReminderContractError("invalid reminder lifecycle revision")
         if record.opaque_payload is None or record.payload_format != REMINDER_PAYLOAD_FORMAT:
             raise ReminderEnvelopeError("invalid opaque envelope")
         body: dict[str, object] = {
@@ -415,10 +442,9 @@ class ReminderSync:
             return await method(path, body)
         return await self.http_client.post(path, body)
 
-    @staticmethod
     def _validate_delivery_claim_response(
-        response: Any, record: ReminderSyncRecord,
-    ) -> str:
+        self, response: Any, record: ReminderSyncRecord,
+    ) -> tuple[str, int | None]:
         required = {
             "occurrence_id", "revision", "lifecycle", "status",
         }
@@ -436,91 +462,113 @@ class ReminderSync:
         status = response.get("status")
         if status not in {"acquired", "held", "terminal"}:
             raise ReminderContractError("invalid reminder delivery claim")
-        if "lease_expires_at" in response:
-            if status != "acquired":
+        lease_expires_at: int | None = None
+        if status == "acquired":
+            if "lease_expires_at" not in response:
                 raise ReminderContractError("invalid reminder delivery claim")
-            _parse_rfc3339_timestamp(response.get("lease_expires_at"))
-        if status == "terminal":
-            if lifecycle not in {"cancelled", "delivered"} or revision < record.revision:
+            lease_expires_at = int(
+                _parse_rfc3339_timestamp(
+                    response.get("lease_expires_at")
+                ).timestamp()
+                * 1000
+            )
+            if lease_expires_at - int(self._now_ms()) < MIN_DELIVERY_LEASE_REMAINING_MS:
                 raise ReminderContractError("invalid reminder delivery claim")
-        elif revision != record.revision or lifecycle != "scheduled":
+        elif "lease_expires_at" in response:
             raise ReminderContractError("invalid reminder delivery claim")
-        return status
+        if status == "terminal":
+            if lifecycle not in {"cancelled", "delivered"} or revision != 2:
+                raise ReminderContractError("invalid reminder delivery claim")
+        elif revision != 1 or record.revision != 1 or lifecycle != "scheduled":
+            raise ReminderContractError("invalid reminder delivery claim")
+        return status, lease_expires_at
 
     async def authorize_due_delivery(
         self, candidates: tuple[ReminderSyncRecord, ...],
     ) -> ReminderDeliveryAuthorization:
         """Authorize untouched local work or acquire Server delivery custody."""
-        retry_after = int(self._now_ms()) + DELIVERY_CLAIM_RETRY_MS
-        blocked = False
-        authorized: list[str] = []
-        for candidate in candidates:
-            # A row cannot have crossed the remote boundary until its
-            # immutable envelope exists.  That lets untouched local work fire
-            # while offline without treating a prepared unknown-ack row as
-            # safe to deliver locally.
-            if (
-                candidate.server_ack_revision == 0
-                and candidate.payload_format is None
-                and candidate.opaque_payload is None
-            ):
-                authorized.append(candidate.occurrence_id)
-                continue
-            if not self._delivery_ready:
-                blocked = True
-                continue
-            if candidate.state not in {"scheduled", "claimed"}:
-                blocked = True
-                continue
-            # Server claims are renewable leases. The persisted flag records a
-            # prior response but is never sufficient authorization after a
-            # restart or suspend; retrying the same claim ID renews and fences
-            # this concrete delivery attempt.
-            claim_id = candidate.delivery_claim_id or str(uuid.uuid4())
-            try:
-                persisted = await self.store.persist_reminder_delivery_claim_id(
-                    occurrence_id=candidate.occurrence_id,
-                    revision=candidate.revision,
-                    claim_id=claim_id,
-                )
-                if persisted is None:
-                    continue
-                claim_id = persisted.delivery_claim_id
-                if claim_id is None:
-                    continue
-                response = await self._post(
+        if not candidates:
+            return ReminderDeliveryAuthorization()
+        now = int(self._now_ms())
+        retry_after = now + DELIVERY_CLAIM_RETRY_MS
+        if not self._local_only_delivery_released_since_connect:
+            return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
+
+        local_occurrence_ids = tuple(
+            candidate.occurrence_id
+            for candidate in candidates
+            if candidate.is_unprepared_local_only
+        )
+        remote_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if not candidate.is_unprepared_local_only
+        )
+        if local_occurrence_ids:
+            return ReminderDeliveryAuthorization(
+                occurrence_ids=local_occurrence_ids,
+                retry_after_ms=now if remote_candidates else None,
+            )
+        if not remote_candidates:
+            return ReminderDeliveryAuthorization()
+        if not self._delivery_ready:
+            return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
+
+        # One authorization pass performs at most one remote claim. Local-only
+        # work has already committed on a prior pass, so claim I/O cannot hold
+        # it behind a slow or unavailable Server.
+        candidate = remote_candidates[0]
+        if candidate.state not in {"scheduled", "claimed"}:
+            return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
+        claim_id = candidate.delivery_claim_id or str(uuid.uuid4())
+        try:
+            persisted = await self.store.persist_reminder_delivery_claim_id(
+                occurrence_id=candidate.occurrence_id,
+                revision=candidate.revision,
+                claim_id=claim_id,
+            )
+            if persisted is None or persisted.delivery_claim_id is None:
+                return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
+            claim_id = persisted.delivery_claim_id
+            response = await asyncio.wait_for(
+                self._post(
                     f"{self.route_prefix}/{persisted.occurrence_id}/delivery-claim",
                     {"revision": persisted.revision, "claim_id": claim_id},
-                )
-                status = self._validate_delivery_claim_response(response, persisted)
+                ),
+                timeout=self._claim_request_timeout_seconds,
+            )
+            status, lease_expires_at_ms = self._validate_delivery_claim_response(
+                response, persisted
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
+
+        if status == "acquired":
+            assert lease_expires_at_ms is not None
+            acquired = await self.store.acquire_reminder_delivery_claim(
+                occurrence_id=persisted.occurrence_id,
+                revision=persisted.revision,
+                claim_id=claim_id,
+                lease_expires_at_ms=lease_expires_at_ms,
+            )
+            if not acquired:
+                return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
+            return ReminderDeliveryAuthorization(
+                occurrence_ids=(persisted.occurrence_id,),
+                retry_after_ms=now if len(remote_candidates) > 1 else None,
+            )
+        if status == "terminal":
+            self._delivery_ready = False
+            self.signal_snapshot()
+            try:
+                await self.reconcile_snapshot()
             except asyncio.CancelledError:
                 raise
             except Exception:
-                blocked = True
-                continue
-            if status == "acquired":
-                if await self.store.acquire_reminder_delivery_claim(
-                    occurrence_id=persisted.occurrence_id,
-                    revision=persisted.revision,
-                    claim_id=claim_id,
-                ):
-                    authorized.append(persisted.occurrence_id)
-            elif status == "terminal":
-                blocked = True
-                self._delivery_ready = False
-                self.signal_snapshot()
-                try:
-                    await self.reconcile_snapshot()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    pass
-            else:
-                blocked = True
-        return ReminderDeliveryAuthorization(
-            occurrence_ids=tuple(authorized),
-            retry_after_ms=retry_after if blocked else None,
-        )
+                pass
+        return ReminderDeliveryAuthorization(retry_after_ms=retry_after)
 
     def _validate_put_response(
         self, response: Any, record: ReminderSyncRecord, body: Mapping[str, object],
@@ -590,6 +638,7 @@ class ReminderSync:
         *,
         force: bool = False,
         retry_permanent: bool = False,
+        prepare_new_envelopes: bool = True,
     ) -> int:
         """Upload one bounded scan; local work survives every failure path."""
         uploaded = 0
@@ -599,6 +648,8 @@ class ReminderSync:
             retry_permanent=retry_permanent,
         )
         for original in records:
+            if not prepare_new_envelopes and original.is_unprepared_local_only:
+                continue
             try:
                 record = await self._ensure_envelope(original)
                 body = self._put_body(record)
@@ -665,7 +716,7 @@ class ReminderSync:
             isinstance(revision, bool)
             or not isinstance(revision, int)
             or revision <= 0
-            or (lifecycle == "scheduled" and revision != 1)
+            or revision != (1 if lifecycle == "scheduled" else 2)
         ):
             raise ReminderContractError("invalid reminder snapshot")
         payload_format = value.get("payload_format")
@@ -705,8 +756,27 @@ class ReminderSync:
         )
 
     async def reconcile_snapshot(self) -> int:
+        """Reconcile a complete snapshot before releasing remote delivery."""
+        changed = await self._reconcile_snapshot()
+        self._release_local_only_delivery()
+        return changed
+
+    def _release_local_only_delivery(self) -> None:
+        self._local_only_delivery_released_since_connect = True
+        self.scheduler.signal()
+
+    @staticmethod
+    def _is_retryable_snapshot_transport_error(exc: Exception) -> bool:
+        return (
+            isinstance(exc, (asyncio.TimeoutError, TimeoutError, OSError))
+            or isinstance(exc, HttpError)
+            and (exc.status == 429 or exc.status >= 500)
+        )
+
+    async def _reconcile_snapshot(self) -> int:
         """Exhaust the Server current-state snapshot and apply changed rows once."""
         after: str | None = None
+        last_occurrence_id: str | None = None
         pages = 0
         changed = 0
         seen_after: set[str] = set()
@@ -714,7 +784,17 @@ class ReminderSync:
             query: dict[str, object] = {"limit": SNAPSHOT_PAGE_LIMIT}
             if after is not None:
                 query["after"] = after
-            response = await self._get(f"{self.route_prefix}?{urlencode(query)}")
+            try:
+                response = await asyncio.wait_for(
+                    self._get(f"{self.route_prefix}?{urlencode(query)}"),
+                    timeout=self._snapshot_request_timeout_seconds,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if after is None and self._is_retryable_snapshot_transport_error(exc):
+                    self._release_local_only_delivery()
+                raise
             if not isinstance(response, Mapping) or set(response) != {
                 "occurrences", "next_after",
             }:
@@ -724,19 +804,20 @@ class ReminderSync:
             if not isinstance(occurrences, list) or len(occurrences) > 200:
                 raise ReminderContractError("invalid reminder snapshot")
             if next_after is not None:
-                next_after = _validate_id(next_after)
+                next_after = _validate_snapshot_cursor(next_after)
             remote_rows = [self._validate_snapshot_row(value) for value in occurrences]
             page_occurrence_ids = [remote.occurrence_id for remote in remote_rows]
             if (
                 page_occurrence_ids != sorted(page_occurrence_ids)
                 or len(set(page_occurrence_ids)) != len(page_occurrence_ids)
-                or (after is not None and page_occurrence_ids and page_occurrence_ids[0] <= after)
+                or (
+                    last_occurrence_id is not None
+                    and page_occurrence_ids
+                    and page_occurrence_ids[0] <= last_occurrence_id
+                )
             ):
                 raise ReminderContractError("invalid reminder snapshot")
-            if next_after is not None and (
-                not page_occurrence_ids
-                or next_after != page_occurrence_ids[-1]
-            ):
+            if after is not None and not page_occurrence_ids:
                 raise ReminderContractError("invalid reminder snapshot")
             for remote in remote_rows:
                 if remote.lifecycle == "scheduled":
@@ -770,6 +851,8 @@ class ReminderSync:
                     # A local immutable conflict is non-destructive.  Do not
                     # include IDs, payload, or decryption detail in logs.
                     logger.warning("reminder snapshot conflict")
+            if page_occurrence_ids:
+                last_occurrence_id = page_occurrence_ids[-1]
             if next_after is None:
                 break
             # The frozen snapshot contract is ordered by occurrence ID and
@@ -783,10 +866,6 @@ class ReminderSync:
             pages += 1
             if pages >= MAX_SNAPSHOT_PAGES:
                 raise ReminderContractError("invalid reminder snapshot")
-        if changed:
-            # One changed batch gives the existing scheduler a chance to
-            # process every overdue reconstruction through its normal path.
-            self.scheduler.signal()
         self._delivery_ready = True
         return changed
 
@@ -810,6 +889,7 @@ class ReminderSync:
             try:
                 await self.upload_pending_once(
                     retry_permanent=reconciliation_completed,
+                    prepare_new_envelopes=self._delivery_ready,
                 )
             except asyncio.CancelledError:
                 raise
@@ -859,14 +939,8 @@ async def prepare_reminder_sync(
     )
     register = register_connected or client.add_connected_callback
     register(reminder_sync.on_transport_connected)
-    try:
-        await reminder_sync.reconcile_snapshot()
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.warning(
-            "agent %s: startup reminder snapshot failed; delivery remains blocked",
-            agent_id,
-        )
-        reminder_sync.signal_snapshot()
+    # Startup must not block ordinary Inbox processing on remote reminder I/O.
+    # Remotely prepared reminders remain fail-closed until the background
+    # worker completes this requested snapshot.
+    reminder_sync.signal_snapshot()
     return reminder_sync

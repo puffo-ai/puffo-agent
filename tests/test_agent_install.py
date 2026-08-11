@@ -22,6 +22,7 @@ Contract:
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -159,6 +160,8 @@ def test_install_mcp_server_writes_project_scope_config(tmp_path):
         "args": ["-y", "@gh/mcp"],
         "env": {"GH_TOKEN": "x"},
     }
+    if os.name != "nt":
+        assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_install_mcp_server_merges_with_existing_entries(tmp_path):

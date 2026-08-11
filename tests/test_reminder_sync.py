@@ -55,6 +55,7 @@ class _RetryThenSnapshotTransport:
             "revision": body["revision"],
             "lifecycle": "scheduled",
             "status": "acquired",
+            "lease_expires_at": "2030-01-01T00:00:00Z",
         }
 
 
@@ -68,6 +69,7 @@ class _RecordingTransport:
         self.failure: Exception | None = None
         self.snapshot_failure: Exception | None = None
         self.claim_status = "acquired"
+        self.lease_expires_at = "2030-01-01T00:00:00.123456Z"
         self.claims: list[tuple[str, dict[str, object]]] = []
 
     @staticmethod
@@ -104,7 +106,7 @@ class _RecordingTransport:
             "status": self.claim_status,
         }
         if self.claim_status == "acquired":
-            response["lease_expires_at"] = "2030-01-01T00:00:00.123456Z"
+            response["lease_expires_at"] = self.lease_expires_at
         return response
 
     async def get(self, path: str) -> dict[str, object]:
@@ -125,13 +127,18 @@ class _RecordingTransport:
         ordered = sorted(self.rows, key=lambda row: str(row["occurrence_id"]))
         start = 0
         if after is not None:
+            _, occurrence_after = after.split(".", 1)
             start = next(
                 index + 1
                 for index, row in enumerate(ordered)
-                if row["occurrence_id"] == after
+                if row["occurrence_id"] == occurrence_after
             )
         page = ordered[start:start + 1]
-        next_after = page[-1]["occurrence_id"] if start + 1 < len(ordered) else None
+        next_after = (
+            f"{start + 1}.{page[-1]['occurrence_id']}"
+            if start + 1 < len(ordered)
+            else None
+        )
         return {"occurrences": copy.deepcopy(page), "next_after": next_after}
 
 
@@ -197,6 +204,8 @@ def _sync(
     now: list[int] | None = None,
     wakes: list[str] | None = None,
     idle_seconds: float = 30.0,
+    snapshot_request_timeout_seconds: float | None = None,
+    claim_request_timeout_seconds: float | None = None,
 ) -> tuple[ReminderSync, MessageStore, ReminderScheduler, KeyStore]:
     now = now if now is not None else [2_000]
     keys = keys or KeyStore(tmp_path / "agent-state" / "keys")
@@ -206,6 +215,13 @@ def _sync(
         notify=lambda: (wakes if wakes is not None else []).append("wake"),
         now_ms=lambda: now[0],
     )
+    sync_options: dict[str, float] = {}
+    if snapshot_request_timeout_seconds is not None:
+        sync_options["snapshot_request_timeout_seconds"] = (
+            snapshot_request_timeout_seconds
+        )
+    if claim_request_timeout_seconds is not None:
+        sync_options["claim_request_timeout_seconds"] = claim_request_timeout_seconds
     return (
         ReminderSync(
             store=store,
@@ -215,6 +231,7 @@ def _sync(
             scheduler=scheduler,
             now_ms=lambda: now[0],
             idle_seconds=idle_seconds,
+            **sync_options,
         ),
         store,
         scheduler,
@@ -229,6 +246,7 @@ async def test_lifecycle_commits_wake_a_sleeping_sync_outbox(tmp_path):
         tmp_path, transport, idle_seconds=3_600,
     )
     scheduler.set_lifecycle_committed_callback(sync.signal_lifecycle_committed)
+    assert await sync.reconcile_snapshot() == 0
     task = asyncio.create_task(sync.run(request_snapshot_on_start=False))
     await asyncio.sleep(0.05)
 
@@ -245,9 +263,14 @@ async def test_lifecycle_commits_wake_a_sleeping_sync_outbox(tmp_path):
     record = await store.get_reminder_sync_record(str(created["occurrence_id"]))
     assert record is not None and record.server_ack_revision == 1
 
-    await scheduler.cancel_reminder(reminder_id=str(created["reminder_id"]))
+    cancellable = await store.create_reminder(
+        content="cancel and sync",
+        target="dm:peer",
+        intended_at_ms=6_000,
+    )
+    await scheduler.cancel_reminder(reminder_id=cancellable.reminder_id)
     await asyncio.wait_for(wait_for_put_count(2), timeout=1)
-    record = await store.get_reminder_sync_record(str(created["occurrence_id"]))
+    record = await store.get_reminder_sync_record(cancellable.occurrence_id)
     assert record is not None
     assert (record.state, record.revision, record.server_ack_revision) == (
         "cancelled", 2, 2,
@@ -441,10 +464,49 @@ async def test_acquired_claim_delivers_and_terminal_put_carries_same_claim_id(tm
     record = await store.get_reminder_sync_record(reminder.occurrence_id)
     assert record is not None and record.delivery_claim_id == claim_id
     assert record.delivery_claim_acquired
+    assert record.delivery_claim_expires_at_ms == 1_893_456_000_123
     assert sync._wakeup.is_set()
     assert await sync.upload_pending_once() == 1
     delivered_put = transport.calls[-1][2]
     assert delivered_put is not None and delivered_put["delivery_claim_id"] == claim_id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_rolls_back_if_claim_expires_inside_inbox_transaction(
+    tmp_path, monkeypatch,
+):
+    transport = _RecordingTransport()
+    transport.lease_expires_at = "1970-01-01T00:00:07Z"
+    now = [1_000]
+    sync, store, scheduler, _keys = _sync(tmp_path, transport, now=now)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=500,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    original_insert = store._insert_local_event_in_transaction
+
+    async def expire_after_insert(*args, **kwargs):
+        await original_insert(*args, **kwargs)
+        now[0] = 7_000
+
+    monkeypatch.setattr(store, "_insert_local_event_in_transaction", expire_after_insert)
+    assert await scheduler.process_due_once() == ()
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    assert record.state == "claimed"
+    assert record.delivery_claim_expires_at_ms == 7_000
+    assert await store.get_message_by_envelope(
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    ) is None
+
+    monkeypatch.setattr(store, "_insert_local_event_in_transaction", original_insert)
+    transport.lease_expires_at = "1970-01-01T00:00:20Z"
+    assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
+        reminder.occurrence_id
+    ]
     await store.close()
 
 
@@ -541,6 +603,34 @@ async def test_acknowledged_persisted_delivery_claim_rejects_cancellation(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("custody", ["prepared", "acknowledged", "claimed"])
+async def test_prepared_acknowledged_or_claimed_work_rejects_cancellation(
+    tmp_path, custody,
+):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    if custody == "claimed":
+        await store.claim_due_reminders(now_ms=2_000)
+    elif custody == "prepared":
+        record = await store.get_reminder_sync_record(reminder.occurrence_id)
+        assert record is not None
+        await sync._ensure_envelope(record)
+    else:
+        assert await sync.upload_pending_once() == 1
+
+    with pytest.raises(LifecycleConflict):
+        await store.cancel_reminder(reminder.reminder_id)
+
+    retained = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert retained is not None
+    assert retained.state == ("claimed" if custody == "claimed" else "scheduled")
+    await store.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("claim_status", ["held", "acquired"])
 async def test_unknown_ack_persisted_delivery_claim_rejects_cancellation(
     tmp_path, monkeypatch, claim_status,
@@ -607,6 +697,39 @@ async def test_delivery_claim_id_survives_restart_before_claim_response(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_migration_invalidates_acquired_claim_without_persisted_expiry(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "legacy-claim.db"
+    store = MessageStore(path, now_ms=lambda: 2_000)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    await store.close()
+
+    claim_id = "50c0a35a-7f24-4a9d-879a-f87ec418b790"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        "UPDATE reminder_occurrences SET delivery_claim_id = ?, "
+        "delivery_claim_acquired = 1 WHERE occurrence_id = ?",
+        (claim_id, reminder.occurrence_id),
+    )
+    connection.execute(
+        "ALTER TABLE reminder_occurrences DROP COLUMN delivery_claim_expires_at_ms"
+    )
+    connection.commit()
+    connection.close()
+
+    reopened = MessageStore(path, now_ms=lambda: 2_000)
+    record = await reopened.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    assert record.delivery_claim_id == claim_id
+    assert not record.delivery_claim_acquired
+    assert record.delivery_claim_expires_at_ms is None
+    await reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_only_acquired_replica_delivers_shared_acknowledged_occurrence(tmp_path):
     transport = _RecordingTransport()
     first, first_store, first_scheduler, keys = _sync(tmp_path, transport, name="first.db")
@@ -635,6 +758,85 @@ async def test_only_acquired_replica_delivers_shared_acknowledged_occurrence(tmp
     assert await second_store.get_message_by_envelope("reminder-occurrence:occurrence-shared") is None
     await first_store.close()
     await second_store.close()
+
+
+@pytest.mark.asyncio
+async def test_local_only_due_rows_precede_one_remote_claim_without_backlog_delay(
+    tmp_path,
+):
+    transport = _RecordingTransport()
+    now = [2_000]
+    sync, store, scheduler, _keys = _sync(tmp_path, transport, now=now)
+    remote_ids: list[str] = []
+    for index, intended_at_ms in enumerate((500, 600), start=1):
+        remote = await store.create_reminder(
+            reminder_id=f"reminder-remote-{index}",
+            occurrence_id=f"occurrence-remote-{index}",
+            content=f"remote {index}",
+            target="dm:peer",
+            intended_at_ms=intended_at_ms,
+            created_at_ms=100,
+        )
+        remote_ids.append(remote.occurrence_id)
+    assert await sync.upload_pending_once() == 2
+    local = await store.create_reminder(
+        reminder_id="reminder-local-first",
+        occurrence_id="occurrence-local-first",
+        content="local first",
+        target="dm:peer",
+        intended_at_ms=700,
+        created_at_ms=100,
+    )
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+
+    first = await scheduler.process_due_once()
+    assert [item.occurrence_id for item in first] == [local.occurrence_id]
+    assert transport.claims == []
+    assert scheduler._authorization_retry_after_ms == now[0]
+
+    second = await scheduler.process_due_once()
+    assert [item.occurrence_id for item in second] == [remote_ids[0]]
+    assert len(transport.claims) == 1
+    assert scheduler._authorization_retry_after_ms == now[0]
+
+    third = await scheduler.process_due_once()
+    assert [item.occurrence_id for item in third] == [remote_ids[1]]
+    assert len(transport.claims) == 2
+    assert scheduler._authorization_retry_after_ms is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_claim_request_is_bounded(tmp_path):
+    class _HangingClaimTransport(_RecordingTransport):
+        async def post(
+            self, path: str, body: dict[str, object],
+        ) -> dict[str, object]:
+            self.claims.append((path, copy.deepcopy(body)))
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    transport = _HangingClaimTransport()
+    sync, store, scheduler, _keys = _sync(
+        tmp_path,
+        transport,
+        claim_request_timeout_seconds=0.01,
+    )
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+
+    assert await asyncio.wait_for(scheduler.process_due_once(), timeout=0.2) == ()
+    assert len(transport.claims) == 1
+    assert scheduler._authorization_retry_after_ms == 7_000
+    assert await store.get_message_by_envelope(
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    ) is None
+    await store.close()
 
 
 def test_dek_is_private_stable_and_scoped_to_agent_state(tmp_path, caplog):
@@ -832,6 +1034,42 @@ async def test_keyless_missing_unsigned_put_is_permanent_not_retryable(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_contract_failed_snapshot_run_does_not_prepare_untouched_work(tmp_path):
+    transport = _RecordingTransport()
+    transport.failure = OSError("offline")
+
+    def malformed_snapshot(_path: str) -> dict[str, object]:
+        return {"occurrences": "invalid", "next_after": None}
+
+    transport._snapshot = malformed_snapshot  # type: ignore[method-assign]
+    sync, store, _scheduler, _keys = _sync(
+        tmp_path, transport, idle_seconds=3_600,
+    )
+    reminder = await store.create_reminder(
+        content="untouched",
+        target="dm:peer",
+        intended_at_ms=3_000,
+    )
+
+    task = asyncio.create_task(sync.run())
+
+    async def wait_for_snapshot() -> None:
+        while not any(call[0] == "get" for call in transport.calls):
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_for_snapshot(), timeout=0.2)
+    await asyncio.sleep(0.02)
+    sync.stop()
+    await asyncio.wait_for(task, timeout=0.2)
+
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    assert record.payload_format is None and record.opaque_payload is None
+    assert not any(call[0] == "put" for call in transport.calls)
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_untouched_local_reminder_delivers_with_real_authorizer_while_offline(
     tmp_path,
 ):
@@ -851,6 +1089,7 @@ async def test_untouched_local_reminder_delivers_with_real_authorizer_while_offl
     transport.snapshot_failure = OSError("snapshot unavailable")
     with pytest.raises(OSError, match="snapshot unavailable"):
         await sync.reconcile_snapshot()
+    assert await sync.upload_pending_once(prepare_new_envelopes=False) == 0
     scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
     assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
         reminder.occurrence_id
@@ -901,7 +1140,7 @@ async def test_upload_claimed_maps_to_scheduled_and_initial_terminal_uploads(tmp
 
 
 @pytest.mark.asyncio
-async def test_upload_race_does_not_ack_newer_local_cancel(tmp_path):
+async def test_upload_envelope_fence_rejects_racing_local_cancel(tmp_path):
     now = [2_000]
 
     class _RaceTransport(_RecordingTransport):
@@ -931,8 +1170,12 @@ async def test_upload_race_does_not_ack_newer_local_cancel(tmp_path):
     record = await store.get_reminder_sync_record("occurrence-race")
     assert record is not None
     assert (record.state, record.revision, record.server_ack_revision) == (
-        "cancelled", 2, 0,
+        "scheduled", 1, 0,
     )
+    assert record.payload_format == REMINDER_PAYLOAD_FORMAT
+    assert record.opaque_payload is not None
+    with pytest.raises(LifecycleConflict):
+        await store.cancel_reminder("reminder-race", cancelled_at_ms=1_500)
     assert len(await store.pending_reminder_sync_records(now_ms=now[0], force=True)) == 1
     await store.close()
 
@@ -1108,7 +1351,14 @@ async def test_snapshot_reconstructs_every_page_and_signals_once(tmp_path):
 @pytest.mark.asyncio
 async def test_snapshot_rejects_invalid_cursor_before_materializing(tmp_path):
     transport = _RecordingTransport()
-    sync, store, _scheduler, keys = _sync(tmp_path, transport)
+    sync, store, scheduler, keys = _sync(tmp_path, transport)
+    local = await store.create_reminder(
+        reminder_id="reminder-local-contract-failure",
+        occurrence_id="occurrence-local-contract-failure",
+        content="must stay blocked",
+        target="dm:peer",
+        intended_at_ms=1_000,
+    )
     transport.rows = [
         _remote_row(
             keys, reminder_id="reminder-bad-page", occurrence_id="occurrence-bad-page",
@@ -1119,12 +1369,130 @@ async def test_snapshot_rejects_invalid_cursor_before_materializing(tmp_path):
 
     def malformed_snapshot(path: str):
         result = original_snapshot(path)
-        result["next_after"] = "different-cursor"
+        result["next_after"] = "invalid cursor"
         return result
 
     transport._snapshot = malformed_snapshot  # type: ignore[method-assign]
     with pytest.raises(ReminderContractError, match="invalid reminder snapshot"):
         await sync.reconcile_snapshot()
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    assert await scheduler.process_due_once() == ()
+    assert await sync.upload_pending_once(prepare_new_envelopes=False) == 0
+    record = await store.get_reminder_sync_record(local.occurrence_id)
+    assert record is not None
+    assert record.payload_format is None and record.opaque_payload is None
+    assert [item.occurrence_id for item in await store.list_reminders()] == [
+        local.occurrence_id
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_first_snapshot_page_timeout_is_bounded_and_releases_local_only_work(
+    tmp_path,
+):
+    class _HangingSnapshotTransport(_RecordingTransport):
+        async def get(self, path: str) -> dict[str, object]:
+            self.calls.append(("get", path, None))
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    transport = _HangingSnapshotTransport()
+    sync, store, scheduler, _keys = _sync(
+        tmp_path,
+        transport,
+        snapshot_request_timeout_seconds=0.01,
+    )
+    reminder = await store.create_reminder(
+        content="offline local", target="dm:peer", intended_at_ms=1_000,
+    )
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(sync.reconcile_snapshot(), timeout=0.2)
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
+        reminder.occurrence_id
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_snapshot_transport_failure_keeps_local_only_work_blocked(
+    tmp_path,
+):
+    class _PartialSnapshotTransport(_RecordingTransport):
+        async def get(self, path: str) -> dict[str, object]:
+            self.calls.append(("get", path, None))
+            if "after=" in path:
+                raise OSError("second page unavailable")
+            return self._snapshot(path)
+
+    transport = _PartialSnapshotTransport()
+    sync, store, scheduler, keys = _sync(tmp_path, transport)
+    local = await store.create_reminder(
+        content="local blocked", target="dm:peer", intended_at_ms=1_000,
+    )
+    transport.rows = [
+        _remote_row(
+            keys,
+            reminder_id=f"reminder-{suffix}",
+            occurrence_id=f"occurrence-{suffix}",
+        )
+        for suffix in ("a", "b")
+    ]
+
+    with pytest.raises(OSError, match="second page unavailable"):
+        await sync.reconcile_snapshot()
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    assert await scheduler.process_due_once() == ()
+    record = await store.get_reminder_sync_record(local.occurrence_id)
+    assert record is not None and record.state == "scheduled"
+    assert record.payload_format is None and record.opaque_payload is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_rejects_empty_continuation_page(tmp_path):
+    class _EmptyContinuationTransport(_RecordingTransport):
+        async def get(self, path: str) -> dict[str, object]:
+            self.calls.append(("get", path, None))
+            if "after=" in path:
+                return {"occurrences": [], "next_after": None}
+            return {
+                "occurrences": copy.deepcopy(self.rows),
+                "next_after": "continuation.1",
+            }
+
+    transport = _EmptyContinuationTransport()
+    sync, store, _scheduler, keys = _sync(tmp_path, transport)
+    transport.rows = [
+        _remote_row(
+            keys,
+            reminder_id="reminder-first-page",
+            occurrence_id="occurrence-first-page",
+        )
+    ]
+
+    with pytest.raises(ReminderContractError, match="invalid reminder snapshot"):
+        await sync.reconcile_snapshot()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_rejects_terminal_revision_one(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    transport.rows = [
+        _terminal_row(
+            reminder_id="reminder-bad-terminal",
+            occurrence_id="occurrence-bad-terminal",
+            revision=1,
+        )
+    ]
+
+    with pytest.raises(ReminderContractError, match="invalid reminder snapshot"):
+        await sync.reconcile_snapshot()
+
     assert await store.list_reminders() == ()
     await store.close()
 
@@ -1259,8 +1627,8 @@ async def test_snapshot_never_regresses_terminal_or_deletes_or_overwrites_confli
         intended_at_ms=3_000,
         created_at_ms=500,
     )
-    await sync.upload_pending_once()
     await store.cancel_reminder(local.reminder_id, cancelled_at_ms=1_500)
+    await sync.upload_pending_once()
     transport.rows = [
         _remote_row(
             keys,
@@ -1276,7 +1644,7 @@ async def test_snapshot_never_regresses_terminal_or_deletes_or_overwrites_confli
     assert await sync.reconcile_snapshot() == 0
     record = await store.get_reminder_sync_record(local.occurrence_id)
     assert record is not None
-    assert (record.state, record.revision, record.server_ack_revision) == ("cancelled", 2, 1)
+    assert (record.state, record.revision, record.server_ack_revision) == ("cancelled", 2, 2)
     transport.rows = []
     assert await sync.reconcile_snapshot() == 0
     assert (await store.get_reminder(local.reminder_id)).state == "cancelled"
@@ -1296,8 +1664,15 @@ async def test_snapshot_never_regresses_terminal_or_deletes_or_overwrites_confli
         content="local content", intended_at_ms=4_000,
         created_at_ms=500,
     )
-    assert await sync.reconcile_snapshot() == 0
+    assert await sync.reconcile_snapshot() == 1
     assert (await store.get_reminder("reminder-conflict")).content == "local content"
+    assert await store.due_reminder_delivery_candidates(now_ms=5_000) == ()
+    assert "occurrence-conflict" not in {
+        item.occurrence_id
+        for item in await store.pending_reminder_sync_records(force=True)
+    }
+    with pytest.raises(LifecycleConflict):
+        await store.cancel_reminder("reminder-conflict")
 
     claimed = await store.create_reminder(
         reminder_id="reminder-claimed-snapshot",

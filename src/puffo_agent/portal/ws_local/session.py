@@ -304,9 +304,10 @@ class WsLocalSession:
         begin_turn inline when ack was skipped so the turn record is
         complete either way."""
         inflight = self._queue.inflight
+        if inflight is None or inflight.bundle_id != bundle_id:
+            return
         if (
-            inflight is not None
-            and inflight.turn_id
+            inflight.turn_id
             and not self._inflight_admitted
         ):
             reason = "v2 bundle ended before explicit admission"

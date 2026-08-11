@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
@@ -28,6 +30,37 @@ _BLOCKING_HELD_RESPONSE_FIELDS = frozenset(
 _CURRENT_HELD_RESPONSE_FIELDS = (
     _LEGACY_HELD_RESPONSE_FIELDS | _BLOCKING_HELD_RESPONSE_FIELDS
 )
+
+
+def coordinator_config(coordinator: Any) -> SimpleNamespace:
+    """Project the routing fields expected by legacy send helpers."""
+    return SimpleNamespace(
+        slug=coordinator.slug,
+        keystore=coordinator.keystore,
+        http_client=coordinator.http_client,
+        data_client=coordinator.data_client,
+        workspace=coordinator.workspace,
+        keyless=bool(getattr(coordinator.http_client, "keyless", False)),
+    )
+
+
+def http_error_detail(body: str) -> str:
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return str(body)[:500] or "HTTP request failed"
+    if isinstance(parsed, Mapping):
+        return str(parsed.get("message") or parsed.get("error") or parsed)[:500]
+    return str(parsed)[:500]
+
+
+def optional_response_int(raw: Any, name: str, prefix: str) -> int | None:
+    value = raw.get(name) if isinstance(raw, Mapping) else None
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{prefix} has invalid {name}")
+    return value
 
 
 def validate_keyless_response(raw: Any, request_body: Mapping[str, Any]) -> SendResult:

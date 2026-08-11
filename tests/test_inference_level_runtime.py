@@ -116,12 +116,6 @@ def _save_agent(tmp_path, monkeypatch, start, level: str) -> AgentConfig:
     return cfg
 
 
-def _write_bridge_patch(cfg, payload) -> None:
-    from puffo_agent.portal.api.runtime_patch import apply_runtime_patch
-
-    assert apply_runtime_patch(cfg.runtime, payload) is None
-
-
 def _write_control_edit(cfg, payload) -> None:
     from puffo_agent.portal.control.client import _apply_edit_runtime
 
@@ -129,13 +123,10 @@ def _write_control_edit(cfg, payload) -> None:
 
 
 @pytest.mark.parametrize(("writer", "start", "level", "target", "expected"), [
-    # Every runtime writer clears a level the incoming harness cannot serve...
-    (_write_bridge_patch, _CLAUDE, "xhigh", _CODEX, ""),
-    (_write_bridge_patch, _CODEX, "minimal", _CLAUDE, ""),
+    # The active control writer clears a level the incoming harness cannot serve...
     (_write_control_edit, _CLAUDE, "xhigh", _CODEX, ""),
     (_write_control_edit, _CODEX, "minimal", _CLAUDE, ""),
     # ...and keeps one that the incoming harness still supports.
-    (_write_bridge_patch, _CLAUDE, "high", _CODEX, "high"),
     (_write_control_edit, _CLAUDE, "high", _CODEX, "high"),
 ])
 def test_runtime_writers_save_a_loadable_config_on_harness_swap(

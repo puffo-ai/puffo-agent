@@ -134,6 +134,32 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
     )
 
 
+def format_anthropic_api_key_rejected(
+    agent_id: str, agent_display_name: str = "",
+) -> str:
+    """Bilingual recovery copy for daemon-owned Anthropic API keys."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    return (
+        f"⚠️ {label} — my Anthropic API key was rejected, so I can't "
+        "answer until it is corrected.\n\n"
+        "**On the computer where puffo-agent is running:**\n"
+        "1. Update `anthropic.api_key` in `daemon.yml` (or run "
+        "`puffo-agent config --anthropic-api-key KEY`).\n"
+        "2. Keep `anthropic.cli_use_api_key: true`.\n"
+        "3. Restart puffo-agent, then send me another message.\n\n"
+        f"⚠️ {label} — 我的 Anthropic API key 被拒绝，需要修正后才能"
+        "继续回复。\n\n"
+        "**在运行 puffo-agent 的电脑上：**\n"
+        "1. 修改 `daemon.yml` 中的 `anthropic.api_key`（或运行 "
+        "`puffo-agent config --anthropic-api-key KEY`）。\n"
+        "2. 保持 `anthropic.cli_use_api_key: true`。\n"
+        "3. 重启 puffo-agent，然后再发一条消息。"
+    )
+
+
 def format_codex_oauth_expired(
     agent_id: str, agent_display_name: str = "",
 ) -> str:

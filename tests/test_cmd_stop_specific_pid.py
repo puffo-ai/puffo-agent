@@ -8,7 +8,7 @@ from __future__ import annotations
 import argparse
 from unittest.mock import patch
 
-from puffo_agent.portal import cli
+from puffo_agent.portal import cli, state
 
 
 def _args(timeout: int = 5) -> argparse.Namespace:
@@ -25,10 +25,12 @@ class TestCmdStopOriginalPid:
     def test_stale_pid_file_clears_and_reports(self, capsys):
         with patch("puffo_agent.portal.cli.read_daemon_pid", return_value=1234), \
              patch("puffo_agent.portal.cli.is_pid_alive", return_value=False), \
-             patch("puffo_agent.portal.cli.clear_daemon_pid") as clear:
+             patch("puffo_agent.portal.cli.clear_daemon_pid") as clear, \
+             patch("puffo_agent.portal.cli.clear_stop_request") as clear_stop:
             rc = cli.cmd_stop(_args())
         assert rc == 0
-        clear.assert_called_once()
+        clear.assert_called_once_with(expected_pid=1234)
+        clear_stop.assert_called_once_with(expected_pid=1234)
         assert "stale pid" in capsys.readouterr().out
 
     def test_daemon_stops_within_timeout(self, capsys):
@@ -40,11 +42,13 @@ class TestCmdStopOriginalPid:
                 "puffo_agent.portal.cli.is_pid_alive",
                 side_effect=lambda pid: next(alive_calls),
             ), \
-             patch("puffo_agent.portal.cli.write_stop_request"), \
-             patch("puffo_agent.portal.cli.clear_stop_request"), \
+             patch("puffo_agent.portal.cli.write_stop_request") as write_stop, \
+             patch("puffo_agent.portal.cli.clear_stop_request") as clear_stop, \
              patch("puffo_agent.portal.cli.time.sleep"):
             rc = cli.cmd_stop(_args(timeout=5))
         assert rc == 0
+        write_stop.assert_called_once_with(1234)
+        clear_stop.assert_called_once_with(expected_pid=1234)
         out = capsys.readouterr().out
         assert "daemon stopped" in out
         # No "new daemon" surface — same pid throughout.
@@ -141,3 +145,23 @@ class TestCmdStopOriginalPid:
         captured = capsys.readouterr()
         assert "warning" in captured.err.lower()
         assert "pid=1234" in captured.err
+
+
+def test_stop_request_is_scoped_to_target_pid(monkeypatch, tmp_path):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+
+    state.write_stop_request(1234)
+
+    assert state.stop_requested_for(1234) is True
+    assert state.stop_requested_for(9999) is False
+    assert state.clear_stop_request(expected_pid=9999) is False
+    assert state.stop_request_path().exists()
+    assert state.clear_stop_request(expected_pid=1234) is True
+
+
+def test_legacy_timestamp_stop_request_is_stale(monkeypatch, tmp_path):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    state.stop_request_path().write_text("1720000000", encoding="utf-8")
+
+    assert state.read_stop_request_pid() is None
+    assert state.stop_requested_for(1720000000) is False

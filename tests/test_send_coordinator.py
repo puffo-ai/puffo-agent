@@ -128,6 +128,27 @@ async def test_missing_baseline_defaults_to_zero_and_active_turn_advances_seen()
 
 
 @pytest.mark.asyncio
+async def test_committed_send_stays_sent_when_local_boundary_update_fails():
+    coordinator, _freshness, http = await coordinator_fixture(
+        baseline=5, active=5
+    )
+
+    async def fail_advance(*_args):
+        raise RuntimeError("local sqlite unavailable")
+
+    coordinator._advance = fail_advance
+    result = await coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="already committed")
+    )
+
+    assert result["state"] == "sent"
+    assert len([
+        call for call in http.calls
+        if call[0] == "POST" and call[1] == CHANNEL_SEND_PATH
+    ]) == 1
+
+
+@pytest.mark.asyncio
 async def test_boundary_multiple_shared_channel_and_independent_channels():
     coordinator, freshness, http = await coordinator_fixture(baseline=0)
     first = await coordinator.send(SemanticSendRequest(destination="ch_a", text="one"))

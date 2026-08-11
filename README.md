@@ -24,8 +24,8 @@ lifecycle is durably staged in the daemon-owned per-Agent state directory at
 `runtime_events.db`, beside `messages.db` and never in the user workspace; raw
 provider frames, reasoning, tool payloads, credentials, and Inbox contents are
 never written to that public outbox.
-Docker harnesses continue through the compatibility Adapter; `ws-local` attaches
-an external engine directly over the local bridge. Direct
+Docker Claude continues through the compatibility Adapter; `ws-local` attaches
+an external engine directly to the daemon's loopback WebSocket endpoint. Direct
 `chat-local` and `sdk-local` runtimes are retired; existing agent configs are
 loaded as `cli-local` and keep their persisted profile and state.
 
@@ -59,7 +59,7 @@ Python:
 ```bash
 uv tool install puffo-agent
 # pin to a specific version:
-uv tool install puffo-agent==0.12.4
+uv tool install puffo-agent==1.2.0
 ```
 
 Otherwise use pip:
@@ -67,12 +67,20 @@ Otherwise use pip:
 ```bash
 pip install puffo-agent
 # pin to a specific version:
-pip install puffo-agent==0.12.4
+pip install puffo-agent==1.2.0
 ```
 
 Both paths install the `puffo-agent` console script. The CLI's
 `check-update` command detects which way you installed and prints
 the matching upgrade command, so you don't have to remember.
+
+The base install runs the headless foreground daemon. Install the GUI extra
+before using the desktop window, tray, or detached background mode:
+
+```bash
+uv tool install --force 'puffo-agent[gui]'
+# or: pip install 'puffo-agent[gui]'
+```
 
 For contributors working from a source checkout:
 
@@ -90,7 +98,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent start` | Run the daemon (foreground). `--ui` adds the PySide6 desktop window, `--background` detaches with a tray icon, `--with-local-bridge` also serves the [legacy bridge](#63-legacy-local-bridge) |
+| `puffo-agent start` | Run the daemon (foreground). `--ui`, `--tray`, and `--background` require the `[gui]` extra; background mode detaches with a tray icon. |
 | `puffo-agent status` | Is it alive? which agents are running? |
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |
@@ -181,7 +189,7 @@ through the **Agent Portal**, without a direct connection to the machine.
 `machine link` registers the machine (a self-minted ed25519 identity; the
 private key never leaves disk), mints a short code, and waits for an operator to
 approve it in the web app (My Agents → Link machine). It **auto-starts the
-daemon** (without the local bridge) if it isn't already running, so it's a
+daemon** if it isn't already running, so it's a
 one-step onboard. The default server is `chat.puffo.ai/relay`.
 
 ### 4.1 Agent Portal architecture (v0.4)
@@ -202,17 +210,14 @@ to the first pairing's server; multiple operators on that server are all served.
 this machine's `machine_id` onto the operator's owned agents, so agents created
 locally before linking become remotely manageable without re-creating them.
 
-**MCP loopback services.** Two loopback HTTP services stay up regardless of the
-bridge:
+**Loopback services.** The daemon owns three loopback-only services:
 
 - `127.0.0.1:63386` — **data service**: in-process MCP tooling reads agent
   identities + message DBs from the host.
 - `127.0.0.1:63385` — **rpc service**: daemon-mediated MCP ops (host-MCP
   install / sync).
-
-The full **local bridge** (the legacy web-client HTTP API on `:63387`) is **off
-by default**; enable it with `puffo-agent start --with-local-bridge` (see
-[Legacy: local bridge](#63-legacy-local-bridge)).
+- `127.0.0.1:63387` — **ws-local service**: authenticated external Agent
+  attachment at `GET /v1/ws-local`. It exposes no browser management API.
 
 ## 5. Agent commands
 
@@ -401,8 +406,10 @@ Pass `--help` for the full flag list (provider, harness, model, gateway,
 Docker image, and permission mode).
 
 Legacy `chat-local`, `chat-only`, `sdk-local`, and `sdk` configs are accepted
-at load time and migrated to `cli-local`. Authenticate the matching CLI before
-restarting a migrated agent.
+at load time and migrated to `cli-local`. Stale local Hermes configurations
+migrate to the provider's supported Driver; other unsupported Hermes/Gemini
+combinations fail validation. Authenticate the matching CLI before restarting
+a migrated agent.
 
 > **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
 > app-server`; authenticate with `codex login` or a configured LiteLLM gateway.
@@ -433,8 +440,10 @@ tool follows the protocol without you re-explaining it each session.
 Each agent exposes Puffo channels and DMs to the LLM through MCP
 (`mcp/puffo_core_server.py`). Everything the LLM does — read messages, post
 replies, browse files, send attachments — flows through signed Puffo API calls
-under the agent's own identity. Skills (Markdown files in `daemon.yml`'s
-`skills_dir`) are synced into each `cli-*` agent on start.
+under the agent's own identity. Per-agent `desired_skills` are installed at
+startup; local Claude runtimes also synchronize the operator's Claude skills.
+The legacy `daemon.yml.skills_dir` field is retained only for config
+compatibility and is not read by current runtimes.
 
 | MCP tool | What it does |
 | --- | --- |
@@ -462,43 +471,14 @@ confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
 
-### 6.3 Legacy: local bridge
+### 6.3 WS-local service
 
-> Superseded by the [Agent Portal](#4-machine-commands). Before the portal, the
-> web client managed agents over a loopback HTTP API on the same machine, with a
-> single browser pairing. It's **off by default** now — enable it with
-> `puffo-agent start --with-local-bridge` only if you need the in-browser local
-> Agents pane.
-
-The bridge API listens on `127.0.0.1:63387` (signed request / response,
-single-pairing). The MCP-facing data (`:63386`) and rpc (`:63385`) services are
-**not** part of the bridge — they stay up regardless.
-
-The web app probes the bridge on boot and, if reachable, surfaces an **Agents**
-pane: list / inspect / DM / invite-to-channel / edit-runtime / provision a new
-agent. Auth is the same `x-puffo-*` signing scheme `puffo-cli` uses, but with the
-device root signing key. **Single-pairing**: the daemon stores one `(slug,
-device_id)` at `~/.puffo-agent/pairing.json`; each successful `POST /v1/pair`
-replaces it (most recent client wins).
-
-| Command | What it does |
-| --- | --- |
-| `puffo-agent api status` | Bind address, allowed origins, paired status |
-| `puffo-agent pairing show` | Who's currently paired (or `(none)`) |
-| `puffo-agent pairing unpair` | Release the pairing for a new client |
-
-Enable the bridge per-run with `puffo-agent start --with-local-bridge`, or
-persistently in `daemon.yml`:
-
-```yaml
-bridge:
-  enabled: true
-  bind_host: 127.0.0.1
-  port: 63387
-  allowed_origins:
-    - https://chat.puffo.ai
-    - http://localhost:5173
-```
+The daemon reserves `127.0.0.1:63387` for the loopback-only ws-local protocol.
+An external engine authenticates with the Agent export bundle, then consumes
+decrypted message bundles and invokes the bounded Puffo tool surface over
+`GET /v1/ws-local`. Browser-originated requests and non-loopback binds are
+rejected. See the ws-local section under [Runtime kinds](#61-runtime-kinds) for
+the reference client and protocol skill.
 
 ### 6.4 Diagnostics
 

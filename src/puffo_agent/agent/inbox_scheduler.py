@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable, Iterable
 
+from .message_projection import canonical_target_parts
 from .message_store import StoredMessage
 
 MAX_MESSAGES = 50
@@ -83,20 +84,7 @@ class InboxPlanner:
 
     @staticmethod
     def target_projection(item: StoredMessage) -> TargetProjection:
-        if item.envelope_kind == "dm":
-            return (
-                "dm",
-                item.sender_slug,
-                item.recipient_slug or "",
-            )
-        if item.thread_root_id:
-            return (
-                "thread",
-                item.space_id or "",
-                item.channel_id or "",
-                item.thread_root_id,
-            )
-        return ("channel", item.space_id or "", item.channel_id or "")
+        return canonical_target_parts(item)
 
     def plan(
         self,

@@ -25,6 +25,7 @@ from ..crypto.message import (
 )
 from ..crypto.primitives import Ed25519KeyPair
 from ..mcp.config import _emit_codex_mcp_block
+from .host_assets import _atomic_write_private, _ensure_private_directory
 
 logger = logging.getLogger(__name__)
 
@@ -77,11 +78,9 @@ def _read_claude_json(path: Path) -> dict[str, Any]:
 
 
 def _atomic_write_claude_json(path: Path, data: dict[str, Any]) -> None:
-    """Write ``data`` to ``path`` atomically: tmp file then replace."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    """Write private JSON atomically without a world-readable temp window."""
+    _ensure_private_directory(path.parent)
+    _atomic_write_private(path, json.dumps(data, indent=2))
 
 
 # ── codex config.toml helpers ──────────────────────────────────────
@@ -94,8 +93,77 @@ def _codex_host_config_path(host_home: Path) -> Path:
     return codex_home / "config.toml"
 
 
+def _codex_host_dir(host_home: Path) -> Path:
+    codex_home_env = os.environ.get("CODEX_HOME")
+    return Path(codex_home_env) if codex_home_env else host_home / ".codex"
+
+
 def _agent_codex_config_path(agent_home: Path) -> Path:
     return agent_home / ".codex" / "config.toml"
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sync_codex_file_oauth(
+    *,
+    host_home: Path,
+    agent_home: Path,
+    name: str,
+    url: str,
+) -> str:
+    """Copy only this server's portable OAuth entry into agent CODEX_HOME."""
+    host_codex = _codex_host_dir(host_home)
+    host_store = _read_json_object(host_codex / ".credentials.json")
+    matches = [
+        (key, entry)
+        for key, entry in host_store.items()
+        if isinstance(entry, dict)
+        and not entry.get("executor_owned", False)
+        and entry.get("server_url") == url
+        and entry.get("server_name") in {name, f"local:{name}"}
+    ]
+    if not matches:
+        encrypted = host_codex / "secrets" / "mcp_oauth.age"
+        return "encrypted-only" if encrypted.is_file() else "missing"
+
+    key, entry = next(
+        ((key, entry) for key, entry in matches if entry.get("server_name") == name),
+        matches[0],
+    )
+    agent_path = agent_home / ".codex" / ".credentials.json"
+    agent_store = _read_json_object(agent_path)
+    for old_key, old_entry in list(agent_store.items()):
+        if (
+            isinstance(old_entry, dict)
+            and not old_entry.get("executor_owned", False)
+            and old_entry.get("server_url") == url
+            and old_entry.get("server_name") in {name, f"local:{name}"}
+        ):
+            agent_store.pop(old_key, None)
+    agent_store[key] = entry
+    _atomic_write_claude_json(agent_path, agent_store)
+    if os.name != "nt":
+        agent_path.chmod(0o600)
+    return "copied"
+
+
+def _codex_file_oauth_login_command(name: str) -> str:
+    safe_name = (
+        name if all(char.isalnum() or char in "._-" for char in name)
+        else "<server-name>"
+    )
+    return (
+        "codex -c 'mcp_oauth_credentials_store=\"file\"' "
+        f"mcp login {safe_name}"
+    )
 
 
 def _read_codex_mcp_servers(path: Path) -> dict[str, dict]:
@@ -115,16 +183,16 @@ def _append_codex_mcp_block(path: Path, name: str, spec: dict[str, Any]) -> None
     """Append a single block to ``path``. Never regenerates the whole
     file — operator's other config (auth, models, comments) must
     round-trip intact. Caller guarantees the entry isn't already present."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(path.parent)
     block_lines = _emit_codex_mcp_block(name, spec)
     block_text = "\n".join(block_lines).rstrip("\n") + "\n"
     if path.exists():
         existing = path.read_text(encoding="utf-8")
         if existing and not existing.endswith("\n"):
             existing += "\n"
-        path.write_text(existing + block_text, encoding="utf-8")
+        _atomic_write_private(path, existing + block_text)
     else:
-        path.write_text(block_text, encoding="utf-8")
+        _atomic_write_private(path, block_text)
 
 
 # ── catalog + adhoc spec normalisation ─────────────────────────────
@@ -202,11 +270,19 @@ def _build_operator_dm_body(
     name: str,
     display_name: str,
     host_path: str = "~/.claude.json",
+    codex_http: bool = False,
 ) -> str:
     """One-line install confirmation. The agent sends docs/env hints separately."""
-    return (
+    body = (
         f"I just installed **{display_name}** into your host {host_path} as {name!r}."
     )
+    if codex_http:
+        body += (
+            " Complete OAuth on the host with "
+            f"`{_codex_file_oauth_login_command(name)}` so "
+            "sync_host_mcp can copy the credential."
+        )
+    return body
 
 
 async def _fetch_device_keys(
@@ -339,6 +415,7 @@ async def install(
         name=name,
         display_name=display_name,
         host_path=host_path_label,
+        codex_http=ctx.harness == "codex" and bool(spec_to_write.get("url")),
     )
     try:
         envelope_id = await _send_dm_to_operator(ctx, dm_body)
@@ -429,10 +506,7 @@ def _write_host_mcp(
 
 
 async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
-    """Mirror the operator's host MCP entry into the agent's config.
-    Codex skips the agent-side write — the worker re-merges host's
-    ``~/.codex/config.toml`` on every restart, so refresh() already
-    picks it up."""
+    """Mirror host MCP state and portable Codex OAuth into the agent."""
     _require_supported_harness(ctx, "sync_host_mcp")
     if not template_id or not isinstance(template_id, str):
         raise RuntimeError("sync_host_mcp: template_id is required")
@@ -447,11 +521,42 @@ async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
                 f"install_host_mcp({template_id!r}) first and DM the "
                 f"operator the setup steps."
             )
+        spec = host_servers[template_id]
+        url = spec.get("url") if isinstance(spec, dict) else None
+        oauth_status = "not-applicable"
+        if isinstance(url, str) and url:
+            oauth_status = _sync_codex_file_oauth(
+                host_home=ctx.host_home,
+                agent_home=ctx.agent_home,
+                name=template_id,
+                url=url,
+            )
+        if oauth_status == "encrypted-only":
+            login_command = _codex_file_oauth_login_command(template_id)
+            return (
+                f"Verified host MCP registration {template_id!r}, but its OAuth "
+                "is only in Codex's OS-keyring-encrypted store and cannot be "
+                "copied to the isolated agent. Re-authenticate once on the host "
+                f"with `{login_command}`, then call "
+                f"sync_host_mcp({template_id!r}) again."
+            )
+        if oauth_status == "missing":
+            login_command = _codex_file_oauth_login_command(template_id)
+            return (
+                f"Verified host MCP registration {template_id!r}, but no portable "
+                "OAuth credential was found. If the server requires OAuth, run "
+                f"`{login_command}` on the host, then call "
+                f"sync_host_mcp({template_id!r}) again."
+            )
+        oauth_note = (
+            " Copied its OAuth credential into the agent's isolated CODEX_HOME."
+            if oauth_status == "copied" else ""
+        )
         return (
-            f"Verified host's ~/.codex/config.toml has {template_id!r}. "
-            f"Call refresh() — your codex worker re-merges the host's "
-            f"mcp_servers into your own config on every restart, so "
-            f"the new entry will be live immediately."
+            f"Verified host's ~/.codex/config.toml has {template_id!r}."
+            f"{oauth_note} Call refresh() - your codex worker re-merges the "
+            "host's mcp_servers into your own config on every restart, so "
+            "the new entry will be live immediately."
         )
 
     host_claude_json = ctx.host_home / ".claude.json"

@@ -28,8 +28,9 @@ class ProtocolError(Exception):
 class Connect:
     """Handshake opener. The tool proves it holds the agent's
     ``.puffoagent`` export and its password by sending both; the daemon
-    authenticates by decrypting (``auth.authenticate_bundle``). ``bundle``
-    is the base64 export blob."""
+    decrypts the export and binds its root identity to the locally managed
+    attach point (``auth.authenticate_bundle``). ``bundle`` is the base64
+    export blob."""
 
     bundle: str
     password: str

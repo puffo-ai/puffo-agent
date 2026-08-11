@@ -77,9 +77,12 @@ def test_cache_write_is_atomic(tmp_path):
     cache.write(_BLOB)
     assert cache.path.exists()
     cache.write(_REFRESHED_BLOB)
-    siblings = list(cache.path.parent.glob(".claude-credentials.json.tmp.*"))
+    siblings = list(cache.path.parent.glob(".claude-credentials.json*.tmp*"))
     assert siblings == []
     assert cache.read() == _REFRESHED_BLOB
+    if os.name != "nt":
+        assert cache.path.parent.stat().st_mode & 0o777 == 0o700
+        assert cache.path.stat().st_mode & 0o777 == 0o600
 
 
 def test_cache_access_token_handles_malformed_blob(tmp_path):
@@ -436,6 +439,10 @@ def test_keychain_backend_sync_to_agent_writes_per_agent_file(tmp_path, monkeypa
     assert not agent_creds.is_symlink()
     assert agent_creds.read_text() == _view(_BLOB)
     assert "refreshToken" not in agent_creds.read_text()
+    if os.name != "nt":
+        assert agent_home.stat().st_mode & 0o777 == 0o700
+        assert agent_creds.parent.stat().st_mode & 0o777 == 0o700
+        assert agent_creds.stat().st_mode & 0o777 == 0o600
 
 
 def test_keychain_backend_sync_skips_when_cache_empty(tmp_path, monkeypatch):
@@ -881,6 +888,8 @@ def test_sync_to_agent_is_idempotent_when_target_matches(
     backend.sync_to_agent(agent_home)
     target = agent_home / ".claude" / ".credentials.json"
     assert target.read_text() == _view(_BLOB)
+    if os.name != "nt":
+        target.chmod(0o644)
 
     import os as _os
     replace_calls = 0
@@ -895,6 +904,8 @@ def test_sync_to_agent_is_idempotent_when_target_matches(
     # Second sync — target already matches → no write.
     backend.sync_to_agent(agent_home)
     assert replace_calls == 0
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o777 == 0o600
 
 
 def test_poll_external_rotation_detects_disk_rotation_when_keychain_dead(

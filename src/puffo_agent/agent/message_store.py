@@ -34,6 +34,8 @@ ReminderSyncRecord = _models.ReminderSyncRecord
 ReminderMaterializationResult = _models.ReminderMaterializationResult
 REMINDER_STATES = _models.REMINDER_STATES
 MAX_REMINDER_LIST_LIMIT = _models.MAX_REMINDER_LIST_LIMIT
+MAX_REMINDER_ENVELOPE_BYTES = _models.MAX_REMINDER_ENVELOPE_BYTES
+reminder_plaintext_envelope_size = _models.reminder_plaintext_envelope_size
 reminder_time_to_rfc3339 = _models.reminder_time_to_rfc3339
 parse_reminder_target = _models.parse_reminder_target
 LifecycleConflict = _models.LifecycleConflict
@@ -49,6 +51,7 @@ _SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
 # The row stays so envelope accounting and redelivery dedupe still work; the
 # plaintext the operator refused does not.
 DENIED_DM_PLACEHOLDER = "[message from a denied sender was discarded]"
+_CONTENT_JSON_PREFIX = "\x1ePUFFO_CONTENT_JSON_V1:"
 
 # A held foreign DM is withheld from the model on the push path, so every
 # pull-side read must withhold it too. Applied to the DM, thread, and
@@ -65,6 +68,45 @@ def _schema_init_lock(db_path: Path) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     locks = _SCHEMA_INIT_LOCKS.setdefault(loop, {})
     return locks.setdefault(str(db_path.resolve()), asyncio.Lock())
+
+
+def _encode_content(value: Any) -> str:
+    return _CONTENT_JSON_PREFIX + json.dumps(
+        value, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def _decode_content(
+    value: Any,
+    *,
+    content_type: str,
+    receipt_disposition: str | None,
+) -> Any:
+    raw = str(value or "")
+    if raw.startswith(_CONTENT_JSON_PREFIX):
+        try:
+            return json.loads(raw[len(_CONTENT_JSON_PREFIX):])
+        except (json.JSONDecodeError, ValueError):
+            return raw
+    # Before the explicit marker, structured local/eligible rows were stored
+    # as bare JSON. Terminal remote prose is deliberately excluded: a user
+    # message that happens to be valid JSON must remain text, not metadata.
+    legacy_structured = (
+        content_type.endswith("+json")
+        or content_type == "application/json"
+        or content_type == "puffo/message+attachments/v1"
+        or receipt_disposition
+        in {
+            ReceiptDisposition.ELIGIBLE.value,
+            ReceiptDisposition.LOCAL_RUNTIME.value,
+        }
+    )
+    if legacy_structured:
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return raw
 
 
 _BASE_SCHEMA = """
@@ -214,7 +256,9 @@ CREATE TABLE IF NOT EXISTS reminder_occurrences (
     sync_permanent_revision INTEGER,
     sync_permanent_code TEXT CHECK (sync_permanent_code IS NULL OR length(sync_permanent_code) <= 128),
     delivery_claim_id TEXT,
-    delivery_claim_acquired INTEGER NOT NULL DEFAULT 0
+    delivery_claim_acquired INTEGER NOT NULL DEFAULT 0,
+    snapshot_conflict INTEGER NOT NULL DEFAULT 0
+        CHECK (snapshot_conflict IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
     ON reminder_occurrences (state, intended_at_ms, occurrence_id);
@@ -324,9 +368,9 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                 delay = min(delay * 2, 0.25)
 
         await db.execute("PRAGMA busy_timeout=30000")
-        # synchronous=NORMAL is WAL-safe (crash may lose the last group
-        # commit, never corrupt) and halves write latency.
-        await db.execute("PRAGMA synchronous=NORMAL")
+        # A transport receipt is ACKed immediately after its commit. FULL is
+        # required so a power loss cannot erase an already-ACKed delivery.
+        await db.execute("PRAGMA synchronous=FULL")
         await db.execute("PRAGMA temp_store=MEMORY")
         await db.execute("PRAGMA cache_size=-20000")
         await db.execute("PRAGMA mmap_size=268435456")
@@ -386,7 +430,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             reply_to_id = getattr(payload, "reply_to_id", None)
             is_encrypted = getattr(payload, "is_encrypted", True)
 
-        content_str = json.dumps(content) if not isinstance(content, str) else content
+        content_str = _encode_content(content)
         if received_at is None:
             received_at = _now_ms()
 
@@ -423,7 +467,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
 
         envelope_id = value("envelope_id", "")
         content = value("content", "")
-        content_str = json.dumps(content) if not isinstance(content, str) else content
+        content_str = _encode_content(content)
         return (
             envelope_id,
             value("envelope_kind", "channel"),
@@ -1394,7 +1438,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                    WHERE envelope_kind = 'dm' AND sender_slug = ?
                      AND receipt_disposition = ?""",
                 (
-                    DENIED_DM_PLACEHOLDER,
+                    _encode_content(DENIED_DM_PLACEHOLDER),
                     ReceiptDisposition.TERMINAL.value,
                     "foreign dm denied by operator",
                     sender_slug,
@@ -1424,11 +1468,11 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             return count
 
     def _row_to_msg(self, row: aiosqlite.Row) -> StoredMessage:
-        content_raw = row["content"]
-        try:
-            content = json.loads(content_raw)
-        except (json.JSONDecodeError, ValueError):
-            content = content_raw
+        content = _decode_content(
+            row["content"],
+            content_type=str(row["content_type"] or ""),
+            receipt_disposition=row["receipt_disposition"],
+        )
 
         return StoredMessage(
             envelope_id=row["envelope_id"],

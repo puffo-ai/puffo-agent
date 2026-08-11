@@ -8,6 +8,7 @@ from typing import Any, Iterable
 
 import aiosqlite
 
+from .message_projection import canonical_target_parts
 from .message_store_models import (
     PRIOR_CONTEXT_MAX_BYTES,
     PRIOR_CONTEXT_MAX_ITEMS,
@@ -309,11 +310,12 @@ class InboxStoreMixin:
     @staticmethod
     def target_projection(item: StoredMessage) -> str:
         """Return the canonical Inbox projection for one durable row."""
-        if item.envelope_kind == "dm":
-            return f"dm:{item.sender_slug}"
-        base = f"channel:{item.space_id or ''}:{item.channel_id or ''}"
-        if item.thread_root_id:
-            return f"{base}:thread:{item.thread_root_id}"
+        target = canonical_target_parts(item)
+        if target[0] == "dm":
+            return f"dm:{target[1]}"
+        base = f"channel:{target[1]}:{target[2]}"
+        if target[0] == "thread":
+            return f"{base}:thread:{target[3]}"
         return base
 
     @staticmethod

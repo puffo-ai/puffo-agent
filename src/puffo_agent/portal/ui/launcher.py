@@ -4,11 +4,11 @@ from __future__ import annotations
 import logging
 import sys
 
-from .daemon_thread import DaemonThread
+from .daemon_thread import DaemonThread, install_daemon_watchdog
 from .log_buffer import install_log_buffer
 
 
-def launch(with_local_bridge: bool = False) -> int:
+def launch() -> int:
     # basicConfig must run before install_log_buffer attaches a handler,
     # otherwise root stays at WARNING and INFO records drop.
     logging.basicConfig(
@@ -23,16 +23,22 @@ def launch(with_local_bridge: bool = False) -> int:
     from .main_window import MainWindow
     from .style import APP_STYLESHEET
 
-    daemon_thread = DaemonThread(with_local_bridge=with_local_bridge)
-    daemon_thread.start()
-
     app = QApplication(sys.argv)
     app.setApplicationName("Puffo Agent")
     app.setWindowIcon(QIcon(str(logo_path())))
     app.setQuitOnLastWindowClosed(True)
     app.setStyleSheet(APP_STYLESHEET)
 
+    daemon_thread = DaemonThread()
+    daemon_thread.start()
+    daemon_watchdog = install_daemon_watchdog(app, daemon_thread)
+
     window = MainWindow(daemon_thread=daemon_thread, log_buffer=log_buffer)
     window.show()
 
-    return app.exec()
+    qt_exit_code = app.exec()
+    # Keep the timer strongly referenced through the event loop.
+    _ = daemon_watchdog
+    if daemon_thread.failed:
+        return daemon_thread.exit_code or 1
+    return qt_exit_code

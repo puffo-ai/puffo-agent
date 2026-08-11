@@ -186,6 +186,33 @@ async def test_validate_dm_envelope_skips_channel_check_but_keeps_cache_check():
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_validate_dm_parent_requires_same_authenticated_peer():
+    store = await _make_store()
+    await store.store({
+        "envelope_id": "other-dm-root",
+        "envelope_kind": "dm",
+        "sender_slug": "stranger-0003",
+        "recipient_slug": SELF_SLUG,
+        "content_type": "text/plain",
+        "content": "other conversation",
+        "sent_at": _now_ms(),
+    })
+    client = _bare_client(store)
+    client.slug = SELF_SLUG
+
+    out = await client._validate_incoming_parent_id(
+        "other-dm-root",
+        None,
+        None,
+        expected_envelope_kind="dm",
+        expected_dm_peer=FRIEND_SLUG,
+    )
+
+    assert out is None
+    await store.close()
+
+
 # ── lookup transport error ────────────────────────────────────────
 
 

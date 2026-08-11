@@ -122,6 +122,22 @@ async def test_scheduler_notifies_every_lifecycle_commit_once(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_create_rejects_content_that_cannot_enter_remote_envelope(tmp_path):
+    store = MessageStore(tmp_path / "oversized.db")
+    scheduler = ReminderScheduler(store=store, notify=lambda: None)
+
+    with pytest.raises(ValueError, match="remote envelope limit"):
+        await scheduler.create_reminder(
+            content="x" * 40_000,
+            target="dm:peer",
+            intended_at="2030-01-01T00:00:00Z",
+        )
+
+    assert await store.list_reminders() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_earlier_create_replans_wait_and_stop_has_no_leaked_task(tmp_path):
     now = [1_000]
     waits: list[float | None] = []

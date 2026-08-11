@@ -227,7 +227,8 @@ def test_claude_effective_capabilities():
     compact = claude_capabilities(True)
     assert baseline.session_resume is True
     assert baseline.inflight_turn_recovery is False
-    assert baseline.steer == baseline.cancel == baseline.context_status == "none"
+    assert baseline.steer == baseline.cancel == "none"
+    assert baseline.context_status == "pull"
     assert baseline.compact == "none"
     assert compact.compact == "session_command"
     assert baseline.permission_bridge is False
@@ -642,6 +643,19 @@ def _metadata_driver(provider, provider_inputs):
         return proc, CodexAppServerDriver(lambda _spec: proc)
 
     def replay_claude_frame(frame):
+        if frame.get("type") == "control_request":
+            proc.feed({
+                "type": "control_response",
+                "response": {
+                    "request_id": frame["request_id"],
+                    "subtype": "success",
+                    "response": {
+                        "totalTokens": 1,
+                        "rawMaxTokens": 200_000,
+                    },
+                },
+            })
+            return
         if frame.get("type") == "user":
             provider_inputs.append(frame["message"]["content"][0]["text"])
             proc.feed({**frame, "isReplay": True})
@@ -933,13 +947,25 @@ async def _assert_codex_protocol_completion(proc, driver, stream):
     decoded = [json.loads(value) for value in proc.stdin.writes]
     assert any(value.get("method") == "turn/steer" for value in decoded)
     assert any(value.get("method") == "turn/interrupt" for value in decoded)
-    assert any(value.get("id") == 900 and "result" in value for value in decoded)
+    assert any(
+        value.get("id") == 900
+        and value.get("result") == {"decision": "accept"}
+        for value in decoded
+    )
     assert (await driver.context_status()).used_tokens == 12
+    proc.feed({
+        "id": 901,
+        "method": "item/commandExecution/requestApproval",
+        "params": {"turnId": "native-1", "command": "pending"},
+    })
+    await _next_matching(stream, "turn.permission_requested")
+    assert driver._permission_requests
     proc.feed({
         "method": "turn/completed",
         "params": {"turn": {"status": "interrupted"}},
     })
     await _next_matching(stream, "turn.completed")
+    assert not driver._permission_requests
     compact = await driver.compact(CompactRequest())
     assert compact.operation_ref == "compact-1"
     await driver.close()
@@ -1233,6 +1259,26 @@ async def test_claude_driver_reopens_cleanly_after_closing_an_active_turn():
     await driver.close()
 
 
+async def _assert_claude_unsupported_calls_write_nothing(
+    driver, started, process,
+):
+    assert isinstance(
+        await driver.steer_turn(started.turn_ref, TurnInput("x")),
+        UnsupportedCapability,
+    )
+    assert isinstance(
+        await driver.cancel_turn(started.turn_ref), UnsupportedCapability
+    )
+    before = len(process.stdin.writes)
+    assert isinstance(
+        await driver.resolve_permission(
+            PermissionRef("p"), PermissionDecision.DENY
+        ),
+        UnsupportedCapability,
+    )
+    assert len(process.stdin.writes) == before
+
+
 @pytest.mark.asyncio
 async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_writes():
     captured_args = []
@@ -1243,6 +1289,19 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
 
         def on_frame(frame):
             proc = holder["proc"]
+            if frame.get("type") == "control_request":
+                proc.feed({
+                    "type": "control_response",
+                    "response": {
+                        "request_id": frame["request_id"],
+                        "subtype": "success",
+                        "response": {
+                            "totalTokens": 42,
+                            "rawMaxTokens": 200_000,
+                        },
+                    },
+                })
+                return
             if frame.get("uuid"):
                 proc.feed({
                     **frame, "isReplay": True,
@@ -1303,22 +1362,15 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     trailing = await _next_matching(stream, "session.updated")
     assert trailing.turn_ref is None
 
-    before = len(holder["proc"].stdin.writes)
-    assert isinstance(
-        await driver.steer_turn(started.turn_ref, TurnInput("x")),
-        UnsupportedCapability,
+    context = await driver.context_status()
+    assert (context.used_tokens, context.context_window, context.stale) == (
+        42,
+        200_000,
+        False,
     )
-    assert isinstance(
-        await driver.cancel_turn(started.turn_ref), UnsupportedCapability
+    await _assert_claude_unsupported_calls_write_nothing(
+        driver, started, holder["proc"]
     )
-    assert isinstance(await driver.context_status(), UnsupportedCapability)
-    assert isinstance(
-        await driver.resolve_permission(
-            PermissionRef("p"), PermissionDecision.DENY
-        ),
-        UnsupportedCapability,
-    )
-    assert len(holder["proc"].stdin.writes) == before
     assert (await driver.compact(CompactRequest("now"))).accepted
     await driver.close()
 

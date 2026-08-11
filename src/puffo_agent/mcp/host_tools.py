@@ -19,8 +19,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-
-_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+from ..portal.host_assets import _atomic_write_private
+from ..skill_ids import SKILL_ID_RE
 
 # Provenance markers dropped inside every skill directory. Claude
 # Code only executes ``SKILL.md``, so siblings are inert unless
@@ -162,14 +162,11 @@ def _read_json_or_empty(path: Path) -> dict[str, Any]:
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    _atomic_write_private(path, json.dumps(data, indent=2))
 
 
 def _install_skill(workspace: Path, name: str, content: str) -> Path:
-    if not _SKILL_NAME_RE.match(name or ""):
+    if not SKILL_ID_RE.match(name or ""):
         raise RuntimeError(
             f"invalid skill name {name!r}: must be lowercase letters, "
             "digits, and hyphens (max 64 chars, can't start with a hyphen)"
@@ -186,7 +183,7 @@ def _install_skill(workspace: Path, name: str, content: str) -> Path:
 
 
 def _uninstall_skill(workspace: Path, name: str) -> Path:
-    if not _SKILL_NAME_RE.match(name or ""):
+    if not SKILL_ID_RE.match(name or ""):
         raise RuntimeError(f"invalid skill name {name!r}")
     dst = _workspace_skills_dir(workspace) / name
     if not dst.is_dir():

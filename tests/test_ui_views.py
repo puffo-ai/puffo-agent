@@ -16,6 +16,7 @@ pytest.importorskip("PySide6")
 
 from PySide6.QtWidgets import QApplication
 
+from puffo_agent.portal.ui.widgets.home_view import HomeView
 from puffo_agent.portal.ui.widgets.log_view import LogView
 from puffo_agent.portal.ui.widgets.mcp_status import McpStatusView, _status_style
 
@@ -87,3 +88,21 @@ def test_mcp_status_groups_by_agent(qapp):
     alice = tree.topLevelItem(0)                   # sorted by name
     assert "Alice" in alice.text(0)
     assert alice.childCount() == 2                 # playwright + filesystem
+
+
+def test_home_view_replaces_hermes_placeholder_with_docker_path(
+    qapp, monkeypatch,
+):
+    from puffo_agent.agent import cli_bin
+
+    docker_path = r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"
+    monkeypatch.setattr(cli_bin, "resolve_docker_bin", lambda: docker_path)
+    view = HomeView()
+
+    assert [card._title.text() for card in view._cli_cards] == [
+        "Claude Code", "Codex", "Docker",
+    ]
+    docker_card = view._cli_cards[2]
+    docker_card.refresh()
+    assert docker_card._status_label.text() == "ready"
+    assert docker_card._path_label.text() == docker_path

@@ -115,7 +115,7 @@ def test_order_local_metadata_neutral_targets_and_defensive_deduplication():
     assert batch.target_projections == (
         ("channel", "sp", "ch"),
         ("thread", "sp", "ch", "root"),
-        ("dm", "d", "agent"),
+        ("dm", "d"),
     )
 
 
@@ -133,7 +133,7 @@ def test_pending_target_projections_only_describe_the_unselected_suffix():
     assert batch.target_projections == (("channel", "sp", "selected"),)
     assert batch.pending_target_projections == (
         ("thread", "sp", "later", "root"),
-        ("dm", "bob", "agent"),
+        ("dm", "bob"),
     )
 
 

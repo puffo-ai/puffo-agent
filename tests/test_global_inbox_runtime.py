@@ -814,10 +814,6 @@ async def test_local_event_has_no_fabricated_server_seq_and_global_order(tmp_pat
     await store.close()
 
 
-
-
-
-
 @pytest.mark.asyncio
 async def test_turn_send_mode_tracks_encrypted_bundle_and_clears(tmp_path):
     from puffo_agent.agent import send_mode
@@ -846,8 +842,6 @@ async def test_turn_send_mode_tracks_encrypted_bundle_and_clears(tmp_path):
     await store.close()
 
 
-
-
 @pytest.mark.asyncio
 async def test_turn_send_mode_plaintext_bundle_does_not_require_encryption(tmp_path):
     from puffo_agent.agent import send_mode
@@ -871,8 +865,6 @@ async def test_turn_send_mode_plaintext_bundle_does_not_require_encryption(tmp_p
     )
     assert await runtime.process_once()
     await store.close()
-
-
 
 
 @pytest.mark.asyncio
@@ -933,8 +925,6 @@ async def test_listener_guard_observes_simultaneous_listener_failure():
         match="runtime boom; listener also failed: listener boom",
     ):
         await guarded
-
-
 
 
 @pytest.mark.asyncio
@@ -1375,8 +1365,6 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
     await store.close()
 
 
-
-
 @pytest.mark.asyncio
 async def test_coordinator_exception_is_tracked_and_re_raised(caplog):
     caplog.set_level(
@@ -1479,10 +1467,6 @@ async def test_coordinator_worker_host_context_shares_failed_held_attachment_att
     assert attempts.states == ["failed", "held"]
 
 
-
-
-
-
 @pytest.mark.asyncio
 async def test_crash_join_mismatched_or_stateless_session_requeues(tmp_path):
     store = await make_store(tmp_path)
@@ -1582,20 +1566,6 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
     await store.close()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class ScriptedContext:
     def __init__(self, adapter, outcomes, on_replan=None):
         self.adapter = adapter
@@ -1625,10 +1595,6 @@ class ScriptedContext:
         )
 
 
-
-
-
-
 class RetryingRunner:
     def __init__(self, adapter, retry_effects):
         self.adapter = adapter
@@ -1647,10 +1613,6 @@ class RetryingRunner:
         if isinstance(effect, BaseException):
             raise effect
         return effect
-
-
-
-
 
 
 @pytest.mark.asyncio
@@ -1839,6 +1801,39 @@ async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_adm
     assert await ActiveBoundaryAdapter(
         store, runtime.active
     ).get_active_turn_through_seq("sp-1", "ch-1") == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_held_watermark_is_valid_sync_evidence(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "initial", 1)
+    await store.admit_messages(
+        ["initial"], turn_id="turn", provider_session_id="provider-1"
+    )
+    await receipt(
+        store,
+        "terminal-watermark",
+        2,
+        disposition=ReceiptDisposition.TERMINAL,
+    )
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn"
+    runtime.active.provider_session_id = "provider-1"
+
+    rows = await runtime.held_recovery_source.query_held_messages(
+        "sp-1", "ch-1", 2, "terminal-watermark", "provider-1"
+    )
+
+    assert [row["envelope_id"] for row in rows] == ["terminal-watermark"]
+    assert "content" not in rows[0]
+    assert runtime.held[("sp-1", "ch-1")].synchronized
+    assert runtime.held[("sp-1", "ch-1")].message_ids == ()
     await store.close()
 
 

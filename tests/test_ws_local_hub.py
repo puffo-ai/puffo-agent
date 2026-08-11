@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from puffo_agent.portal.ws_local.auth import AuthedAgent
 from puffo_agent.portal.ws_local.hub import AttachPoint, WsLocalHub
+
+ROOT_KEY = b"r" * 32
 
 
 def _point(slug: str) -> AttachPoint:
@@ -10,15 +13,22 @@ def _point(slug: str) -> AttachPoint:
         slug=slug, agent_id=f"{slug}-1", agent_cfg=object(),
         client=object(), reporter=object(),
         ack_timeout_s=180.0, ping_interval_s=30.0,
+        root_public_key=ROOT_KEY,
     )
+
+
+def _authed(slug: str, root_key: bytes = ROOT_KEY) -> AuthedAgent:
+    return AuthedAgent(f"{slug}-1", slug, slug, root_key)
 
 
 def test_register_makes_servable():
     hub = WsLocalHub()
-    assert hub.is_servable("alice") is False
+    assert hub.is_servable(_authed("alice")) is False
     p = _point("alice")
     hub.register(p)
-    assert hub.is_servable("alice") is True
+    assert hub.is_servable(_authed("alice")) is True
+    assert hub.is_servable(_authed("alice", b"x" * 32)) is False
+    assert hub.is_servable(AuthedAgent("other", "alice", "alice", ROOT_KEY)) is False
     assert hub.get("alice") is p
 
 
@@ -27,7 +37,7 @@ def test_unregister_removes():
     p = _point("alice")
     hub.register(p)
     hub.unregister(p)
-    assert hub.is_servable("alice") is False
+    assert hub.is_servable(_authed("alice")) is False
     assert hub.get("alice") is None
 
 

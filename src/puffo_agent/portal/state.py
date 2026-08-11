@@ -21,6 +21,7 @@ the tree. No IPC port, no auth — the filesystem is the contract.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -106,13 +107,19 @@ _CLAUDE_HOME_SEED_PATHS = _host_assets._CLAUDE_HOME_SEED_PATHS
 HOST_SYNCED_MARKER = _host_assets.HOST_SYNCED_MARKER
 AGENT_INSTALLED_MARKER = _host_assets.AGENT_INSTALLED_MARKER
 seed_claude_home = _host_assets.seed_claude_home
+strip_claude_api_key_from_settings = (
+    _host_assets.strip_claude_api_key_from_settings
+)
 sanitize_claude_code_auth_blob = _host_assets.sanitize_claude_code_auth_blob
 sanitize_codex_auth_blob = _host_assets.sanitize_codex_auth_blob
 read_host_codex_mcp_servers = _host_assets.read_host_codex_mcp_servers
 _sync_host_skills_dir = _host_assets._sync_host_skills_dir
 sync_host_skills = _host_assets.sync_host_skills
+sync_host_codex_skills = _host_assets.sync_host_codex_skills
 sync_host_gemini_skills = _host_assets.sync_host_gemini_skills
 _looks_host_local_command = _host_assets._looks_host_local_command
+_host_local_token = _host_assets._host_local_token
+filter_container_mcp_servers = _host_assets.filter_container_mcp_servers
 sync_host_mcp_servers = _host_assets.sync_host_mcp_servers
 sync_host_plugins = _host_assets.sync_host_plugins
 sync_host_enabled_plugins = _host_assets.sync_host_enabled_plugins
@@ -155,6 +162,10 @@ def daemon_yml_path() -> Path:
 
 def daemon_pid_path() -> Path:
     return home_dir() / "daemon.pid"
+
+
+def daemon_ready_path() -> Path:
+    return home_dir() / "daemon.ready"
 
 
 def background_log_path() -> Path:
@@ -242,6 +253,13 @@ class ProviderConfig:
 
 
 @dataclass
+class AnthropicProviderConfig(ProviderConfig):
+    """Claude Code keeps subscription auth unless explicitly opted in."""
+
+    cli_use_api_key: bool = False
+
+
+@dataclass
 class DataServiceConfig:
     """Loopback HTTP service MCP subprocesses use to read each
     agent's ``messages.db``. See ``portal/data_service.py``."""
@@ -262,27 +280,12 @@ class RpcServiceConfig:
 
 
 @dataclass
-class BridgeConfig:
-    """Local HTTP API for the puffo web/desktop client. Loopback only;
-    auth uses the same ed25519 request-signing scheme as puffo-server.
+class WsLocalServiceConfig:
+    """Loopback WebSocket used by externally attached ws-local tools."""
 
-    ``allowed_origins`` is the CORS allowlist for PNA preflights.
-
-    Off by default — agents are managed remotely via the portal. Opt in
-    per-run with ``start --with-local-bridge`` (or ``bridge.enabled`` in
-    daemon.yml). The MCP-facing data + rpc services stay on regardless.
-    """
-
-    enabled: bool = False
+    enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63387
-    allowed_origins: list[str] = field(
-        default_factory=lambda: [
-            "https://chat.puffo.ai",
-            "http://localhost:5173",
-            "http://127.0.0.1:5173",
-        ]
-    )
 
 
 @dataclass
@@ -294,7 +297,9 @@ class DaemonConfig:
     """
 
     default_provider: str = "anthropic"
-    anthropic: ProviderConfig = field(default_factory=ProviderConfig)
+    anthropic: AnthropicProviderConfig = field(
+        default_factory=AnthropicProviderConfig,
+    )
     openai: ProviderConfig = field(default_factory=ProviderConfig)
     # Reserved for future Google/Gemini support; no supported runtime reads it.
     google: ProviderConfig = field(default_factory=ProviderConfig)
@@ -323,7 +328,9 @@ class DaemonConfig:
     segment_chars: int = 2000
     # Catch-up older than this is stored but skips the LLM; <= 0 disables.
     catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
-    bridge: BridgeConfig = field(default_factory=BridgeConfig)
+    ws_local_service: WsLocalServiceConfig = field(
+        default_factory=WsLocalServiceConfig,
+    )
     data_service: DataServiceConfig = field(
         default_factory=lambda: DataServiceConfig(),
     )
@@ -336,6 +343,8 @@ class DaemonConfig:
         path = daemon_yml_path()
         if not path.exists():
             return cls()
+        _host_assets._ensure_private_directory(path.parent)
+        _host_assets._set_private_file_mode(path)
         with path.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         # Legacy ``server:`` blocks are silently ignored and dropped
@@ -355,7 +364,13 @@ class DaemonConfig:
                 raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
             ),
         )
-        for name in ("anthropic", "openai", "google"):
+        p = raw.get("anthropic") or {}
+        cfg.anthropic = AnthropicProviderConfig(
+            api_key=p.get("api_key", ""),
+            model=p.get("model", ""),
+            cli_use_api_key=p.get("cli_use_api_key") is True,
+        )
+        for name in ("openai", "google"):
             p = raw.get(name) or {}
             setattr(
                 cfg,
@@ -365,14 +380,12 @@ class DaemonConfig:
                     model=p.get("model", ""),
                 ),
             )
-        # Older daemon.yml files may omit ``bridge:``.
-        b = raw.get("bridge") or {}
-        defaults = BridgeConfig()
-        cfg.bridge = BridgeConfig(
-            enabled=bool(b.get("enabled", defaults.enabled)),
-            bind_host=str(b.get("bind_host", defaults.bind_host)),
-            port=int(b.get("port", defaults.port)),
-            allowed_origins=list(b.get("allowed_origins") or defaults.allowed_origins),
+        w = raw.get("ws_local_service") or {}
+        defaults = WsLocalServiceConfig()
+        cfg.ws_local_service = WsLocalServiceConfig(
+            enabled=bool(w.get("enabled", defaults.enabled)),
+            bind_host=str(w.get("bind_host", defaults.bind_host)),
+            port=int(w.get("port", defaults.port)),
         )
         d = raw.get("data_service") or {}
         ds_defaults = DataServiceConfig()
@@ -406,11 +419,19 @@ class DaemonConfig:
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),
-            "bridge": asdict(self.bridge),
+            "ws_local_service": asdict(self.ws_local_service),
             "data_service": asdict(self.data_service),
             "rpc_service": asdict(self.rpc_service),
         }
         _atomic_write_yaml(path, data)
+
+
+def claude_cli_api_key(daemon_cfg: DaemonConfig | None) -> str:
+    """Return the daemon-owned Claude CLI key when explicitly enabled."""
+    anthropic = getattr(daemon_cfg, "anthropic", None)
+    if not getattr(anthropic, "cli_use_api_key", False):
+        return ""
+    return getattr(anthropic, "api_key", "")
 
 
 @dataclass
@@ -448,6 +469,9 @@ class PuffoCoreConfig:
     # Hidden knob (no UI, agent.yml only): when true, space invites from
     # non-operators are auto-accepted, then the operator is DM'd a report.
     auto_accept_space_invitations: bool = False
+    # Hidden yaml-only flag: bypass the unknown-sender DM hold while
+    # preserving block and operator-notification behavior.
+    auto_accept_dm: bool = False
     # One of VALID_TRANSPORTS. ``bridge`` (experimental) talks plaintext
     # WS to ``server_url``'s /v2/cloud-agents/subscribe endpoint using
     # ``sandbox_token`` instead of local key files. Absent from saved
@@ -504,15 +528,81 @@ class RuntimeConfig:
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
     # Agent engine (CLI kinds only). cli-local supports the long-lived
-    # ``claude-code`` and ``codex`` Drivers; cli-docker additionally keeps
-    # the declarative ``hermes`` and ``gemini-cli`` harnesses.
+    # ``claude-code`` and ``codex`` Drivers; cli-docker supports Claude Code.
+    # ``hermes`` and ``gemini-cli`` remain named design-only values so stale
+    # configs receive an explicit migration diagnostic.
     harness: str = "claude-code"
     # Retained only so older agent.yml files round-trip without losing data.
     # Driver runtimes use the wall-time limit below instead.
     max_turns: int = 10
     # cli-local: maximum wall time for one provider turn. The Runtime
     # Manager interrupts and retires a driver that does not terminate.
-    task_timeout_seconds: float = 600.0
+    task_timeout_seconds: float = 1800.0
+
+
+MAX_ROLE_SHORT_LEN = 32
+
+ENV_OVERRIDE_WHITELIST = frozenset({
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CODEX_AUTOCOMPACT_PCT_OVERRIDE",
+})
+
+
+def validate_env_overrides(raw: object) -> dict[str, str]:
+    """Validate and normalize a partial per-agent environment update."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("env_overrides must be an object")
+    out: dict[str, str] = {}
+    for raw_key, value in raw.items():
+        key = str(raw_key)
+        if key not in ENV_OVERRIDE_WHITELIST:
+            allowed = ", ".join(sorted(ENV_OVERRIDE_WHITELIST))
+            raise ValueError(
+                f"env_overrides key {key!r} is not allowed (allowed: {allowed})"
+            )
+        text = str(value).strip()
+        if not text:
+            out[key] = ""
+            continue
+        try:
+            pct = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{key} must be a number between 1 and 100; got {text!r}"
+            ) from None
+        if not (0 < pct <= 100):
+            raise ValueError(f"{key} must be >0 and <=100; got {text!r}")
+        out[key] = str(int(pct)) if pct.is_integer() else str(pct)
+    return out
+
+
+def merge_env_overrides(current: object, updates: object) -> dict[str, str]:
+    """Apply a validated partial update; empty values remove keys."""
+    merged = dict(validate_env_overrides(current))
+    for key, value in validate_env_overrides(updates).items():
+        if value:
+            merged[key] = value
+        else:
+            merged.pop(key, None)
+    return merged
+
+
+def derive_role_short(role: str) -> str:
+    """Derive the server-compatible short label from ``short: detail``."""
+    if ":" not in role:
+        return ""
+    candidate, rest = role.split(":", 1)
+    candidate = candidate.strip()
+    if (
+        not candidate
+        or not rest.strip()
+        or len(candidate) > MAX_ROLE_SHORT_LEN
+        or any(ch.isspace() for ch in candidate)
+    ):
+        return ""
+    return candidate
 
 
 @dataclass
@@ -550,6 +640,7 @@ class AgentConfig:
     # de-duped against whatever host already provides.
     desired_skills: list[str] = field(default_factory=list)
     desired_mcps: list[str] = field(default_factory=list)
+    env_overrides: dict[str, str] = field(default_factory=dict)
     created_at: int = 0
 
     def save(self) -> None:
@@ -574,6 +665,8 @@ class AgentConfig:
     @classmethod
     def load(cls, agent_id: str) -> AgentConfig:
         path = agent_yml_path(agent_id)
+        _host_assets._ensure_private_directory(path.parent)
+        _host_assets._set_private_file_mode(path)
         with path.open("r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         pc = raw.get("puffo_core") or {}
@@ -600,6 +693,7 @@ class AgentConfig:
             ),
             desired_skills=list(raw.get("desired_skills") or []),
             desired_mcps=list(raw.get("desired_mcps") or []),
+            env_overrides=validate_env_overrides(raw.get("env_overrides") or {}),
             created_at=int(raw.get("created_at", 0)),
         )
 
@@ -653,7 +747,7 @@ def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
         sandbox=raw.get("sandbox", "danger-full-access"),
         harness=harness,
         max_turns=int(raw.get("max_turns", 10)),
-        task_timeout_seconds=float(raw.get("task_timeout_seconds", 600.0)),
+        task_timeout_seconds=float(raw.get("task_timeout_seconds", 1800.0)),
     )
 
 
@@ -729,6 +823,7 @@ def _load_puffo_core_config(agent_id: str, raw: dict) -> PuffoCoreConfig:
         auto_accept_space_invitations=bool(
             raw.get("auto_accept_space_invitations", False)
         ),
+        auto_accept_dm=bool(raw.get("auto_accept_dm", False)),
         transport=transport,
         sandbox_token=token,
     )
@@ -759,6 +854,7 @@ def _agent_config_save(self: AgentConfig) -> None:
             "triggers": asdict(self.triggers),
             "desired_skills": list(self.desired_skills),
             "desired_mcps": list(self.desired_mcps),
+            "env_overrides": dict(self.env_overrides),
         },
     )
 
@@ -782,6 +878,8 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
+    max_context: int = 0
+    auto_compact_threshold_pct: float | None = None
     # Worker-side health, independent of ``status``. Values:
     #   "ok"                  — refresh-ping passed, a turn cleared a
     #                           prior abandon, or a credential refresh
@@ -832,6 +930,12 @@ class RuntimeState:
             msg_count=int(raw.get("msg_count", 0)),
             last_event_at=int(raw.get("last_event_at", 0)),
             error=raw.get("error", ""),
+            max_context=int(raw.get("max_context", 0) or 0),
+            auto_compact_threshold_pct=(
+                float(raw["auto_compact_threshold_pct"])
+                if raw.get("auto_compact_threshold_pct") is not None
+                else None
+            ),
             health=raw.get("health", "unknown"),
         )
 
@@ -945,13 +1049,58 @@ def write_daemon_pid(pid: int) -> None:
     path.write_text(str(pid), encoding="utf-8")
 
 
-def clear_daemon_pid() -> None:
+def read_daemon_ready_pid() -> int | None:
+    path = daemon_ready_path()
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def is_daemon_ready(pid: int | None = None) -> bool:
+    """True when one live daemon owns both the PID and ready markers."""
+    target_pid = read_daemon_pid() if pid is None else pid
+    return (
+        target_pid is not None
+        and read_daemon_pid() == target_pid
+        and read_daemon_ready_pid() == target_pid
+        and is_pid_alive(target_pid)
+    )
+
+
+def write_daemon_ready(pid: int) -> None:
+    path = daemon_ready_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(str(pid), encoding="utf-8")
+    temporary.replace(path)
+
+
+def clear_daemon_ready(expected_pid: int | None = None) -> bool:
+    if expected_pid is not None and read_daemon_ready_pid() != expected_pid:
+        return False
+    try:
+        daemon_ready_path().unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def clear_daemon_pid(expected_pid: int | None = None) -> bool:
+    if expected_pid is not None and read_daemon_pid() != expected_pid:
+        return False
     path = daemon_pid_path()
-    if path.exists():
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 def stop_request_path() -> Path:
@@ -961,19 +1110,48 @@ def stop_request_path() -> Path:
     return home_dir() / ".stop_requested"
 
 
-def write_stop_request() -> None:
+def read_stop_request_pid() -> int | None:
+    path = stop_request_path()
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        pid = payload.get("pid") if isinstance(payload, dict) else None
+        return int(pid) if pid is not None else None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        # Timestamp-only sentinels from older versions are deliberately stale.
+        return None
+
+
+def stop_requested_for(pid: int) -> bool:
+    return read_stop_request_pid() == pid
+
+
+def write_stop_request(pid: int | None = None) -> None:
+    target_pid = read_daemon_pid() if pid is None else pid
+    if target_pid is None:
+        raise RuntimeError("cannot request stop without a daemon PID")
     path = stop_request_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(str(int(time.time())), encoding="utf-8")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps({"pid": target_pid, "created_at": int(time.time())}),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
-def clear_stop_request() -> None:
+def clear_stop_request(expected_pid: int | None = None) -> bool:
+    if expected_pid is not None and read_stop_request_pid() != expected_pid:
+        return False
     path = stop_request_path()
-    if path.exists():
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 def refresh_token_request_path() -> Path:
@@ -1004,14 +1182,12 @@ def clear_refresh_token_request() -> None:
 
 
 def _atomic_write_yaml(path: Path, data: Any) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        # allow_unicode keeps CJK/emoji/accented display_names readable.
-        yaml.safe_dump(
-            data,
-            f,
-            sort_keys=False,
-            default_flow_style=False,
-            allow_unicode=True,
-        )
-    os.replace(tmp, path)
+    # allow_unicode keeps CJK/emoji/accented display_names readable.
+    payload = yaml.safe_dump(
+        data,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+    )
+    _host_assets._ensure_private_directory(path.parent)
+    _host_assets._atomic_write_private(path, payload)

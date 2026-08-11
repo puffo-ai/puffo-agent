@@ -1,7 +1,7 @@
-"""``handlers._profile_summary`` returns the full body of the ``#
+"""``profile_summary`` returns the full body of the ``#
 Soul`` section in an agent's profile.md (or any description-like
 heading: description / about / summary). Symmetric with the write
-path in ``_update_profile_summary`` so the round-trip preserves the
+path in ``update_profile_summary`` so the round-trip preserves the
 operator's full text.
 """
 
@@ -15,9 +15,10 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.portal.api.handlers import (
-    _profile_summary,
-    _update_profile_summary,
+from puffo_agent.portal.profile_sync import (
+    profile_summary,
+    update_profile_summary,
+    update_profile_role,
 )
 from puffo_agent.portal.state import AgentConfig
 
@@ -74,7 +75,7 @@ def test_returns_full_soul_body_multi_paragraph(monkeypatch):
             "Also part of soul.\n"
         )
         cfg = _agent_with_profile(home, body)
-        out = _profile_summary(cfg)
+        out = profile_summary(cfg)
         # First-line + subsequent paragraphs.
         assert "First paragraph of soul." in out
         assert "Wrapped onto a second line." in out
@@ -105,7 +106,7 @@ def test_stops_on_same_level_heading_after_soul(monkeypatch):
             "Operator's private notes — not soul.\n"
         )
         cfg = _agent_with_profile(home, body)
-        out = _profile_summary(cfg)
+        out = profile_summary(cfg)
         assert "The actual soul." in out
         assert "## A subsection" in out
         assert "Still soul." in out
@@ -118,7 +119,7 @@ def test_returns_empty_when_no_soul_section(monkeypatch):
     with tempfile.TemporaryDirectory() as home:
         monkeypatch.setenv("PUFFO_AGENT_HOME", home)
         cfg = _agent_with_profile(home, "# Hello\n\nNot a soul section.\n")
-        assert _profile_summary(cfg) == ""
+        assert profile_summary(cfg) == ""
 
 
 def test_accepts_alternative_headings(monkeypatch):
@@ -132,7 +133,7 @@ def test_accepts_alternative_headings(monkeypatch):
             "# Description\n\nLegacy single-paragraph body.\n",
             agent_id="legacy",
         )
-        out = _profile_summary(cfg)
+        out = profile_summary(cfg)
         assert out == "Legacy single-paragraph body."
 
 
@@ -163,7 +164,7 @@ def test_unreadable_profile_returns_empty(monkeypatch):
                 "triggers": {"on_mention": True, "on_dm": True},
             }, f, sort_keys=False)
         cfg = AgentConfig.load("no-profile")
-        assert _profile_summary(cfg) == ""
+        assert profile_summary(cfg) == ""
 
 
 def test_trims_blank_lines_around_body(monkeypatch):
@@ -175,7 +176,7 @@ def test_trims_blank_lines_around_body(monkeypatch):
             home,
             "# Soul\n\n\n\nLine 1.\nLine 2.\n\n\n",
         )
-        out = _profile_summary(cfg)
+        out = profile_summary(cfg)
         assert out == "Line 1.\nLine 2."
 
 
@@ -199,7 +200,7 @@ def test_soul_body_may_open_with_its_own_heading(monkeypatch):
             "You are the household butler.\n"
         )
         cfg = _agent_with_profile(home, body)
-        out = _profile_summary(cfg)
+        out = profile_summary(cfg)
         assert "# d2d2-butler" in out
         assert "> Language rule: match the human." in out
         assert "## Identity" in out
@@ -220,8 +221,8 @@ def test_update_replaces_body_that_opens_with_a_heading(monkeypatch):
             "Old soul body.\n"
         )
         cfg = _agent_with_profile(home, body)
-        _update_profile_summary(cfg, "# new-title\n\nBrand new soul body.")
-        out = _profile_summary(cfg)
+        update_profile_summary(cfg, "# new-title\n\nBrand new soul body.")
+        out = profile_summary(cfg)
         assert "# new-title" in out
         assert "Brand new soul body." in out
         assert "old-title" not in out
@@ -240,7 +241,7 @@ def test_update_preserves_trailing_section(monkeypatch):
             "# Notes\n\nOperator's private notes.\n"
         )
         cfg = _agent_with_profile(home, body)
-        _update_profile_summary(cfg, "New soul.")
+        update_profile_summary(cfg, "New soul.")
         text = cfg.resolve_profile_path().read_text(encoding="utf-8")
         assert "New soul." in text
         assert "Old soul." not in text
@@ -254,6 +255,101 @@ def test_update_appends_soul_when_absent(monkeypatch):
     with tempfile.TemporaryDirectory() as home:
         monkeypatch.setenv("PUFFO_AGENT_HOME", home)
         cfg = _agent_with_profile(home, "# Identity\nd2d2\n")
-        _update_profile_summary(cfg, "Freshly added soul.")
-        out = _profile_summary(cfg)
+        update_profile_summary(cfg, "Freshly added soul.")
+        out = profile_summary(cfg)
         assert out == "Freshly added soul."
+
+
+# ── _update_profile_role ─────────────────────────────────────────────────────
+
+
+def test_update_profile_role_rewrites_role_line(monkeypatch):
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(
+            home,
+            "# Bot\n\n**Role:** helper: old description\n\n# Soul\n\nText.\n",
+        )
+        update_profile_role(cfg, "coder: writes production code")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert "**Role:** coder: writes production code\n" in text
+        assert "old description" not in text
+        assert "# Soul\n\nText.\n" in text
+
+
+def test_update_profile_role_no_role_line_is_noop(monkeypatch):
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        original = "# Custom layout\n\nNo role line here.\n"
+        cfg = _agent_with_profile(home, original)
+        update_profile_role(cfg, "coder: new role")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert text == original
+
+
+def test_update_profile_role_empty_role_is_noop(monkeypatch):
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        original = "# Bot\n\n**Role:** keeper: keep this\n"
+        cfg = _agent_with_profile(home, original)
+        update_profile_role(cfg, "   ")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert text == original
+
+
+def test_update_profile_role_only_first_line_rewritten(monkeypatch):
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(
+            home,
+            "**Role:** first\n\nBody quoting **Role:** second\n",
+        )
+        update_profile_role(cfg, "replaced")
+
+        text = open(
+            os.path.join(home, "agents", "smoke", "profile.md"), encoding="utf-8",
+        ).read()
+        assert text.startswith("**Role:** replaced\n")
+        assert "**Role:** second" in text
+
+
+def test_update_profile_role_swallows_read_errors(monkeypatch):
+
+    with tempfile.TemporaryDirectory() as home:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+        cfg = _agent_with_profile(home, "**Role:** x\n")
+        monkeypatch.setattr(
+            type(cfg), "resolve_profile_path",
+            lambda self: (_ for _ in ()).throw(OSError("boom")),
+        )
+        update_profile_role(cfg, "new role")  # must not raise
+
+
+def test_update_summary_appends_after_file_without_trailing_newline(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", tmp)
+        cfg = _agent_with_profile(tmp, "No heading and no newline")
+        update_profile_summary(cfg, "New summary")
+        assert profile_summary(cfg) == "New summary"
+
+
+def test_update_summary_swallows_write_errors(monkeypatch, caplog):
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setenv("PUFFO_AGENT_HOME", tmp)
+        cfg = _agent_with_profile(tmp, "Soul")
+        cfg.resolve_profile_path().unlink()
+        update_profile_summary(cfg, "New summary")
+        assert "profile summary update failed" in caplog.text

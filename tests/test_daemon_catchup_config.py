@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+from puffo_agent.crypto.keystore import KeyStore, StoredIdentity, encode_secret
 from puffo_agent.limits import DEFAULT_CATCHUP_STALE_HOURS
 from puffo_agent.portal import profile_sync
 from puffo_agent.portal.daemon import Daemon
@@ -86,6 +87,20 @@ def _configured_agent(agent_id: str) -> AgentConfig:
     )
 
 
+def _save_ws_local_identity(config: AgentConfig) -> None:
+    secret = encode_secret(b"w" * 32)
+    KeyStore.for_agent(config.id).save_identity(
+        StoredIdentity(
+            slug=config.puffo_core.slug,
+            device_id=config.puffo_core.device_id,
+            root_secret_key=secret,
+            device_signing_secret_key=secret,
+            kem_secret_key=secret,
+            server_url=config.puffo_core.server_url,
+        )
+    )
+
+
 async def _assert_real_worker_builder_threads_catchup_threshold(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -133,6 +148,7 @@ async def _assert_real_reconcile_initializes_multiple_ws_local_workers(
 
     agent_configs = [_configured_agent("alpha"), _configured_agent("bravo")]
     for agent_config in agent_configs:
+        _save_ws_local_identity(agent_config)
         agent_config.save()
 
     daemon_config = DaemonConfig(catchup_stale_hours=12.5)
@@ -175,6 +191,7 @@ async def _assert_reconcile_replaces_post_start_fatal_worker(
 
     monkeypatch.setattr(profile_sync, "sync_full_profile", no_profile_sync)
     config = _configured_agent("restart-agent")
+    _save_ws_local_identity(config)
     config.save()
     daemon = Daemon(DaemonConfig())
     try:

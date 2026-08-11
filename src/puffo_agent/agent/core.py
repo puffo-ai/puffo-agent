@@ -516,6 +516,7 @@ class PuffoAgent:
             sender_display_name=sender_display_name,
             is_visible_to_human=is_visible_to_human,
             sender_owner_slug=sender_owner_slug,
+            sender_type=sender_type,
             is_from_operator=is_from_operator,
             is_encrypted=is_encrypted,
         )
@@ -640,7 +641,11 @@ def _user_metadata_lines(
     projected = (
         sender_type
         if sender_type in {"human", "agent"}
-        else ("agent" if (sender_is_agent or sender_owner_slug) else "unknown")
+        else (
+            "agent"
+            if (sender_is_agent or sender_owner_slug)
+            else ("human" if is_from_operator else "unknown")
+        )
     )
     lines.append(f"- sender_type: {projected}")
     if sender_owner_slug:

@@ -106,6 +106,26 @@ def _counter_queue() -> BundleQueue:
     return BundleQueue(make_id=lambda: f"bdl_{next(seq)}")
 
 
+def _planned_turn() -> SimpleNamespace:
+    return SimpleNamespace(
+        turn_id="turn_1",
+        items=[SimpleNamespace(envelope_id="a", content="hello")],
+        targets=[("sp", "ch", "")],
+        routes=[
+            SimpleNamespace(
+                envelope_id="a",
+                kind="channel",
+                space_id="sp",
+                channel_id="ch",
+                thread_root_id="",
+                dm_peer="",
+            )
+        ],
+        notice_generation=0,
+        target_summary="{}",
+    )
+
+
 # ── happy path ───────────────────────────────────────────────────────────────
 
 
@@ -363,15 +383,23 @@ async def test_ack_after_end_is_noop():
 async def test_unknown_end_id_is_ignored():
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
     acked, replies = [], []
-    sess = _make_session(t, q, r, acked=acked, replies=replies)
+    sess = _make_session(
+        t,
+        q,
+        r,
+        acked=acked,
+        replies=replies,
+        capabilities=("multi-target-v2", "explicit-admission-v2"),
+    )
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
-    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
+    await sess.deliver_planned(_planned_turn())
     t.feed({"type": "end", "bundle_id": "bdl_nope"})
     t.feed_close()
     await task
     assert acked == []
     assert q.has_inflight is False  # rolled back on close, not advanced
+    assert not any(frame.get("type") == "error" for frame in t.sent)
 
 
 @pytest.mark.asyncio
@@ -388,25 +416,7 @@ async def test_v2_end_before_admission_requeues_and_closes_connection():
     )
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
-    await sess.deliver_planned(
-        SimpleNamespace(
-            turn_id="turn_1",
-            items=[SimpleNamespace(envelope_id="a", content="hello")],
-            targets=[("sp", "ch", "")],
-            routes=[
-                SimpleNamespace(
-                    envelope_id="a",
-                    kind="channel",
-                    space_id="sp",
-                    channel_id="ch",
-                    thread_root_id="",
-                    dm_peer="",
-                )
-            ],
-            notice_generation=0,
-            target_summary="{}",
-        )
-    )
+    await sess.deliver_planned(_planned_turn())
 
     t.feed({"type": "end", "bundle_id": "bdl_1"})
     await task

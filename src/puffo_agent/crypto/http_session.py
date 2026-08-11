@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from urllib.request import getproxies, proxy_bypass
 
 import aiohttp
+import certifi
 from aiohttp_socks import ProxyConnector
 
 
@@ -42,6 +43,7 @@ def create_remote_http_session(
     # the context here means a session recreated after a CA change picks the new
     # CA up — the same fix bridge_client applies at the WS.
     ssl_ctx = ssl.create_default_context()
+    ssl_ctx.load_verify_locations(cafile=certifi.where())
 
     proxy_url = _env_proxy_for_url(base_url)
     if proxy_url and _is_socks_proxy(proxy_url):

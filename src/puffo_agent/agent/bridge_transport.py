@@ -447,6 +447,11 @@ def _redelivery_ack(stored) -> bool:
 
 
 async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]:
+    dm_peer = (
+        payload.recipient_slug
+        if payload.sender_slug == client.slug
+        else payload.sender_slug
+    ) if payload.envelope_kind == "dm" else ""
     return {
         "envelope_id": payload.envelope_id,
         "envelope_kind": payload.envelope_kind,
@@ -461,11 +466,15 @@ async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]
             payload.thread_root_id,
             payload.channel_id,
             payload.space_id,
+            expected_envelope_kind=payload.envelope_kind,
+            expected_dm_peer=dm_peer,
         ),
         "reply_to_id": await client._validate_incoming_parent_id(
             payload.reply_to_id,
             payload.channel_id,
             payload.space_id,
+            expected_envelope_kind=payload.envelope_kind,
+            expected_dm_peer=dm_peer,
         ),
         "is_encrypted": False,
     }

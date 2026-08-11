@@ -82,9 +82,10 @@ def test_native_save_emits_no_transport_keys(home):
         "slug",
         "device_id",
         "space_id",
-        "operator_slug",
-        "auto_accept_space_invitations",
-    }
+            "operator_slug",
+            "auto_accept_space_invitations",
+            "auto_accept_dm",
+        }
 
 
 def test_bridge_fields_parse_and_round_trip(home):

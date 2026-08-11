@@ -90,21 +90,22 @@ async def _query_context_rows(
 def _bounded_page(
     store: Any, rows: list[aiosqlite.Row], *, limit: int, max_bytes: int
 ) -> PriorContextPage:
-    selected_rows: list[aiosqlite.Row] = []
+    selected: list[StoredMessage] = []
     used_bytes = 0
     has_more = False
     for row in rows:
-        if len(selected_rows) >= limit:
+        if len(selected) >= limit:
             has_more = True
             continue
-        body_bytes = len(str(row["content"]).encode("utf-8"))
+        message = store._row_to_msg(row)
+        body_bytes = len(str(message.content).encode("utf-8"))
         if used_bytes + body_bytes > max_bytes:
             has_more = True
             continue
-        selected_rows.append(row)
+        selected.append(message)
         used_bytes += body_bytes
     return PriorContextPage(
-        tuple(store._row_to_msg(row) for row in reversed(selected_rows)),
+        tuple(reversed(selected)),
         has_more,
     )
 

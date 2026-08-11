@@ -20,6 +20,8 @@ from puffo_agent.portal.ws_local.bundles import Bundle
 from puffo_agent.portal.ws_local.hub import AttachPoint, WsLocalHub
 from puffo_agent.portal.ws_local.route import serve_attached
 
+ROOT_KEY = b"r" * 32
+
 
 class FakeTransport:
     def __init__(self) -> None:
@@ -375,6 +377,7 @@ def _v1_hub(client, tmp_path, reporter):
     hub.register(AttachPoint(
         slug="puffotest", agent_id="puffotest-1", agent_cfg=V1Cfg(),
         client=client, reporter=reporter, ack_timeout_s=180.0, ping_interval_s=30.0,
+        root_public_key=ROOT_KEY,
     ))
     return hub
 
@@ -383,7 +386,9 @@ async def _attach_v1(monkeypatch, hub, client):
     """Handshake with no ``capabilities`` — the documented v1 connect."""
     monkeypatch.setattr(
         route_mod, "authenticate_bundle",
-        lambda _blob, _pw: AuthedAgent("puffotest-1", "puffotest", "Puffo Test"),
+        lambda _blob, _pw: AuthedAgent(
+            "puffotest-1", "puffotest", "Puffo Test", ROOT_KEY
+        ),
     )
     transport = FakeTransport()
     transport.feed({"type": "connect", "bundle": "Yg==", "password": "pw"})
@@ -570,7 +575,7 @@ async def test_unservable_slug_rejected(monkeypatch):
     hub = WsLocalHub()  # nothing registered
     monkeypatch.setattr(
         route_mod, "authenticate_bundle",
-        lambda blob, pw: AuthedAgent("ghost-1", "ghost", "Ghost"),
+        lambda blob, pw: AuthedAgent("ghost-1", "ghost", "Ghost", ROOT_KEY),
     )
     t = FakeTransport()
     t.feed({"type": "connect", "bundle": "Yg==", "password": "pw"})
@@ -656,12 +661,13 @@ async def _start_v2_attached(monkeypatch, tmp_path, store):
         reporter=reporter,
         ack_timeout_s=180,
         ping_interval_s=30,
+        root_public_key=ROOT_KEY,
     ))
     monkeypatch.setattr(
         route_mod,
         "authenticate_bundle",
         lambda _blob, _pw: AuthedAgent(
-            "puffotest-1", "puffotest", "Puffo Test",
+            "puffotest-1", "puffotest", "Puffo Test", ROOT_KEY,
         ),
     )
     transport = FakeTransport()
@@ -763,7 +769,9 @@ async def test_pre_attach_failure_leaves_the_client_untouched(monkeypatch, tmp_p
     hub = _v1_hub(client, tmp_path, reporter)
     monkeypatch.setattr(
         route_mod, "authenticate_bundle",
-        lambda _blob, _pw: AuthedAgent("puffotest-1", "puffotest", "Puffo Test"),
+        lambda _blob, _pw: AuthedAgent(
+            "puffotest-1", "puffotest", "Puffo Test", ROOT_KEY
+        ),
     )
     transport = _DropConnectedTransport()
     transport.feed({"type": "connect", "bundle": "Yg==", "password": "pw"})

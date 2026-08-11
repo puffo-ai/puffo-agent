@@ -1,8 +1,9 @@
 """PUF-268 PR-B step 2: spawn-time install of desired_skills +
 desired_mcps from puffo-server catalog templates.
 
-Unit-level coverage of the provider-neutral ``desired_install`` module.
-HTTP fetches are mocked via a fake PuffoCoreHttpClient — no real network.
+Unit-level coverage of the ``desired_install`` module + the
+LocalCLIAdapter wiring that drives it. HTTP fetches are mocked
+via a fake PuffoCoreHttpClient — no real network.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import os
 import sys
 from typing import Any
 
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -267,6 +269,68 @@ def test_install_desired_mcp_stdio_codex_path_returns_extras_no_disk_write(tmp_p
     assert extras == {"fs": {"command": "npx", "args": ["-y"], "env": {}}}
     # codex never touches .claude.json:
     assert not (tmp_path / ".claude.json").exists()
+
+
+@pytest.mark.parametrize("harness_name", ["claude-code", "codex"])
+def test_containerized_desired_mcp_skips_host_local_command(
+    tmp_path, caplog, harness_name,
+):
+    http = FakeHttp({
+        "/v2/mcp-templates/host-only": {
+            "id": "host-only",
+            "type": "stdio",
+            "command": "/Users/operator/bin/mcp-server",
+        },
+    })
+    with caplog.at_level(
+        logging.WARNING,
+        logger="puffo_agent.agent.adapters.desired_install",
+    ):
+        extras = _run(install_desired(
+            http=http,
+            agent_home=tmp_path,
+            workspace_dir=tmp_path,
+            agent_id="a1",
+            harness_name=harness_name,
+            desired_skills=[],
+            desired_mcps=["host-only"],
+            containerized=True,
+        ))
+
+    assert extras == {}
+    assert not (tmp_path / ".claude.json").exists()
+    assert any(
+        "cannot resolve inside the container" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("harness_name", ["claude-code", "codex"])
+def test_containerized_desired_mcp_keeps_portable_command(tmp_path, harness_name):
+    http = FakeHttp({
+        "/v2/mcp-templates/portable": {
+            "id": "portable",
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "portable-server"],
+        },
+    })
+    extras = _run(install_desired(
+        http=http,
+        agent_home=tmp_path,
+        workspace_dir=tmp_path,
+        agent_id="a1",
+        harness_name=harness_name,
+        desired_skills=[],
+        desired_mcps=["portable"],
+        containerized=True,
+    ))
+
+    if harness_name == "codex":
+        assert extras["portable"]["command"] == "npx"
+    else:
+        data = json.loads((tmp_path / ".claude.json").read_text(encoding="utf-8"))
+        assert data["mcpServers"]["portable"]["command"] == "npx"
 
 
 def test_install_desired_mcp_sse_claude_writes_url(tmp_path):
@@ -531,3 +595,42 @@ def test_install_desired_skill_404_and_mcp_500_both_log_and_keep_going(tmp_path,
     messages = [r.getMessage() for r in caplog.records]
     assert any("skill 'ghost'" in m and "404" in m for m in messages)
     assert any("mcp 'broken'" in m and "HTTP 500" in m for m in messages)
+
+
+# ── Driver runtime wiring ───────────────────────────────────────────────────
+
+
+def test_local_runtime_installs_once_and_retains_codex_extras(
+    tmp_path, monkeypatch,
+):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
+
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_install(**kwargs):
+        calls.append(kwargs)
+        return {"fs": {"command": "npx", "args": [], "env": {}}}
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(local_runtime, "run_spawn_install", _fake_install)
+    cfg = AgentConfig(
+        id="codex-assets",
+        runtime=RuntimeConfig(
+            kind="cli-local", provider="openai", harness="codex",
+        ),
+        desired_skills=["s1"],
+        desired_mcps=["fs"],
+    )
+    preparer = LocalRuntimePreparer(DaemonConfig(), cfg)
+
+    _run(preparer._install_desired_once())
+    _run(preparer._install_desired_once())
+
+    assert len(calls) == 1
+    assert calls[0]["desired_skills"] == ["s1"]
+    assert calls[0]["desired_mcps"] == ["fs"]
+    assert preparer._desired_codex_extras == {
+        "fs": {"command": "npx", "args": [], "env": {}},
+    }

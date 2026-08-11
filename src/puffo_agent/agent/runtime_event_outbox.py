@@ -350,32 +350,42 @@ class RuntimeEventOutbox:
     def set_active_turn(
         self, turn_ref: str | None, *, session_ref: str = "",
         native_session_id: str = "",
+        session_fingerprint: str | None = None,
     ) -> None:
         self._call(
             lambda: self._set_active_turn(
-                turn_ref, session_ref, native_session_id
+                turn_ref, session_ref, native_session_id,
+                session_fingerprint,
             )
         )
 
     async def aset_active_turn(
         self, turn_ref: str | None, *, session_ref: str = "",
         native_session_id: str = "",
+        session_fingerprint: str | None = None,
     ) -> None:
         """Commit the active turn without blocking the caller's event loop."""
         await self._acall(
             lambda: self._set_active_turn(
-                turn_ref, session_ref, native_session_id
+                turn_ref, session_ref, native_session_id,
+                session_fingerprint,
             )
         )
 
     def _set_active_turn(
-        self, turn_ref: str | None, session_ref: str, native_session_id: str
+        self,
+        turn_ref: str | None,
+        session_ref: str,
+        native_session_id: str,
+        session_fingerprint: str | None,
     ) -> None:
         values = {
             "active_turn_ref": turn_ref or "",
             "session_ref": session_ref,
             "native_session_id": native_session_id,
         }
+        if session_fingerprint is not None:
+            values["session_fingerprint"] = session_fingerprint
         with self._db:
             for key, value in values.items():
                 self._db.execute(

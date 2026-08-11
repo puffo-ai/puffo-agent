@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from puffo_agent.agent.message_store import (
+    LifecycleConflict,
     MessageStore,
     ProcessingState,
     ReceiptDisposition,
@@ -316,6 +317,7 @@ async def test_reminder_schema_migrates_additively_without_changing_existing_inb
         "revision", "server_ack_revision", "payload_format", "opaque_payload",
         "sync_retry_after_ms", "sync_retry_count", "sync_permanent_revision",
         "sync_permanent_code", "delivery_claim_id", "delivery_claim_acquired",
+        "delivery_claim_expires_at_ms", "snapshot_conflict",
     }
     async with db.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' "
@@ -420,10 +422,6 @@ async def test_reminder_sync_revisions_and_acknowledgments_are_transactional(tmp
     assert record is not None and (record.state, record.revision, record.server_ack_revision) == (
         "scheduled", 1, 0,
     )
-    await store.claim_due_reminders(now_ms=2_000)
-    record = await store.get_reminder_sync_record(created.occurrence_id)
-    assert record is not None and (record.state, record.revision) == ("claimed", 1)
-
     await store.schedule_reminder_sync_retry(
         occurrence_id=created.occurrence_id, revision=1, retry_after_ms=9_000,
     )
@@ -570,12 +568,15 @@ async def test_reminder_restart_boundaries_and_cancellation_are_atomic(tmp_path,
         content="claimed cancel", target="channel:sp:ch", intended_at_ms=1,
     )
     await reopened.claim_due_reminders(now_ms=3_500)
-    claimed_cancelled = await reopened.cancel_reminder(claimed_cancel.reminder_id)
-    assert claimed_cancelled.state == "cancelled"
-    assert not await reopened.deliver_due_reminders(now_ms=5_000)
+    with pytest.raises(LifecycleConflict):
+        await reopened.cancel_reminder(claimed_cancel.reminder_id)
+    assert [
+        item.reminder_id
+        for item in await reopened.deliver_due_reminders(now_ms=5_000)
+    ] == [claimed_cancel.reminder_id]
     assert await reopened.get_message_by_envelope(
         f"reminder-occurrence:{claimed_cancel.occurrence_id}"
-    ) is None
+    ) is not None
 
     delivered = await reopened.create_reminder(
         content="history stays", target="channel:sp:ch", intended_at_ms=1,
@@ -599,17 +600,16 @@ async def test_claimed_cancel_delivery_race_serializes_to_one_valid_terminal_sta
     cancel, delivered = await asyncio.gather(
         store.cancel_reminder(reminder.reminder_id, cancelled_at_ms=2),
         store.deliver_due_reminders(now_ms=2),
+        return_exceptions=True,
     )
     terminal = await store.get_reminder(reminder.reminder_id)
     assert terminal is not None
     event = await store.get_message_by_envelope(
         f"reminder-occurrence:{reminder.occurrence_id}"
     )
-    if terminal.state == "cancelled":
-        assert event is None and delivered == () and cancel.state == "cancelled"
-    else:
-        assert terminal.state == "delivered" and event is not None
-        assert cancel.state == "delivered"
+    assert terminal.state == "delivered" and event is not None
+    assert len(delivered) == 1
+    assert isinstance(cancel, LifecycleConflict) or cancel.state == "delivered"
     await store.close()
 
 

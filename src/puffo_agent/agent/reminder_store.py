@@ -9,9 +9,10 @@ from typing import Any
 import aiosqlite
 
 from .message_store_models import (
-    _REMINDER_DELIVERY_CUSTODY_SQL,
     _REMINDER_LOCAL_DELIVERY_SQL,
+    _reminder_delivery_custody_sql,
     MAX_REMINDER_LIST_LIMIT,
+    MAX_REMINDER_ENVELOPE_BYTES,
     REMINDER_STATES,
     LifecycleConflict,
     ReceiptDisposition,
@@ -19,6 +20,7 @@ from .message_store_models import (
     ReminderOccurrence,
     ReminderSyncRecord,
     parse_reminder_target,
+    reminder_plaintext_envelope_size,
     reminder_time_to_rfc3339,
 )
 
@@ -61,6 +63,10 @@ class ReminderStoreMixin:
                 "delivery_claim_acquired": (
                     "delivery_claim_acquired INTEGER NOT NULL DEFAULT 0"
                 ),
+                "delivery_claim_expires_at_ms": "delivery_claim_expires_at_ms INTEGER",
+                "snapshot_conflict": (
+                    "snapshot_conflict INTEGER NOT NULL DEFAULT 0"
+                ),
             }
             added_revision = "revision" not in columns
             for name, declaration in additions.items():
@@ -88,6 +94,12 @@ class ReminderStoreMixin:
             )
             await db.execute(
                 """UPDATE reminder_occurrences
+                   SET snapshot_conflict = 0
+                   WHERE snapshot_conflict IS NULL
+                      OR snapshot_conflict NOT IN (0, 1)"""
+            )
+            await db.execute(
+                """UPDATE reminder_occurrences
                    SET server_ack_revision = 0
                    WHERE server_ack_revision IS NULL OR server_ack_revision < 0"""
             )
@@ -95,7 +107,8 @@ class ReminderStoreMixin:
                 """UPDATE reminder_occurrences
                    SET delivery_claim_acquired = 0
                    WHERE delivery_claim_acquired IS NULL
-                      OR delivery_claim_acquired NOT IN (0, 1)"""
+                      OR delivery_claim_acquired NOT IN (0, 1)
+                      OR delivery_claim_expires_at_ms IS NULL"""
             )
             await db.execute(
                 """CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_sync_pending
@@ -190,6 +203,10 @@ class ReminderStoreMixin:
                 else None
             ),
             delivery_claim_acquired=bool(row["delivery_claim_acquired"]),
+            delivery_claim_expires_at_ms=optional_int(
+                "delivery_claim_expires_at_ms"
+            ),
+            snapshot_conflict=bool(row["snapshot_conflict"]),
         )
 
     @staticmethod
@@ -324,6 +341,11 @@ class ReminderStoreMixin:
         if not isinstance(content, str) or not content:
             raise ValueError("reminder content must be a non-empty string")
         parse_reminder_target(target)
+        if (
+            reminder_plaintext_envelope_size(target, content)
+            > MAX_REMINDER_ENVELOPE_BYTES
+        ):
+            raise ValueError("reminder content exceeds the remote envelope limit")
         if not self._valid_reminder_time(intended_at_ms):
             raise ValueError("intended_at_ms must be an integer epoch milliseconds")
         if created_at_ms is None:
@@ -500,6 +522,7 @@ class ReminderStoreMixin:
             async with db.execute(
                 """SELECT * FROM reminder_occurrences
                    WHERE server_ack_revision < revision
+                     AND snapshot_conflict = 0
                      AND (? = 1
                           OR sync_permanent_revision IS NULL
                           OR sync_permanent_revision != revision)
@@ -617,6 +640,88 @@ class ReminderStoreMixin:
                 await db.rollback()
                 raise
 
+    @staticmethod
+    def _scheduled_snapshot_matches(
+        record: ReminderSyncRecord,
+        *,
+        reminder_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+        payload_format: str,
+        opaque_payload: bytes,
+    ) -> bool:
+        return (
+            record.reminder_id == reminder_id
+            and record.target == target
+            and record.content == content
+            and record.intended_at_ms == intended_at_ms
+            and record.payload_format == payload_format
+            and record.opaque_payload == opaque_payload
+        )
+
+    @staticmethod
+    def _terminal_materialization_changes(
+        record: ReminderSyncRecord,
+        values: tuple[str, int | None, int | None, int | None, str | None, int, int],
+    ) -> bool:
+        (
+            next_state,
+            actual_fire_at_ms,
+            cancelled_at_ms,
+            delivered_at_ms,
+            delivered_event_id,
+            next_revision,
+            next_ack_revision,
+        ) = values
+        return (
+            record.state != next_state
+            or record.revision != next_revision
+            or record.server_ack_revision < next_ack_revision
+            or record.payload_format is None
+            or record.actual_fire_at_ms != actual_fire_at_ms
+            or record.cancelled_at_ms != cancelled_at_ms
+            or record.delivered_at_ms != delivered_at_ms
+            or record.delivered_event_id != delivered_event_id
+            or record.claimed_at_ms is not None
+            or record.sync_retry_after_ms is not None
+            or record.sync_retry_count != 0
+            or record.sync_permanent_revision is not None
+            or record.sync_permanent_code is not None
+            or record.snapshot_conflict
+        )
+
+    @staticmethod
+    async def _mark_occurrence_snapshot_conflict(
+        db: aiosqlite.Connection,
+        occurrence_id: str,
+    ) -> ReminderMaterializationResult:
+        cursor = await db.execute(
+            """UPDATE reminder_occurrences
+               SET snapshot_conflict = 1
+               WHERE occurrence_id = ? AND snapshot_conflict = 0""",
+            (occurrence_id,),
+        )
+        await db.commit()
+        return ReminderMaterializationResult(cursor.rowcount == 1, conflict=True)
+
+    @staticmethod
+    async def _mark_reminder_snapshot_conflict(
+        db: aiosqlite.Connection,
+        reminder_id: str,
+    ) -> ReminderMaterializationResult:
+        cursor = await db.execute(
+            """UPDATE reminder_occurrences
+               SET snapshot_conflict = 1
+               WHERE reminder_id = ? AND snapshot_conflict = 0""",
+            (reminder_id,),
+        )
+        if cursor.rowcount:
+            await db.commit()
+            return ReminderMaterializationResult(True, conflict=True)
+        await db.rollback()
+        return ReminderMaterializationResult(False)
+
     async def materialize_remote_scheduled_reminder(
         self,
         *,
@@ -651,34 +756,37 @@ class ReminderStoreMixin:
                     occurrence_id,
                 )
                 if record is not None:
-                    exact_immutable = (
-                        record.reminder_id == reminder_id
-                        and record.target == target
-                        and record.content == content
-                        and record.intended_at_ms == intended_at_ms
-                        and record.payload_format == payload_format
-                        and record.opaque_payload == opaque_payload
-                    )
-                    if not exact_immutable:
+                    # A locally durable terminal fact wins over a stale
+                    # scheduled snapshot. It is neither resurrected nor
+                    # fenced by independently encrypted stale payload bytes.
+                    if record.state not in {"scheduled", "claimed"}:
                         await db.rollback()
-                        return ReminderMaterializationResult(False, conflict=True)
-                    if record.state in {"scheduled", "claimed"}:
-                        ack = min(revision, record.revision)
-                        cursor = await db.execute(
-                            """UPDATE reminder_occurrences
-                               SET server_ack_revision = MAX(server_ack_revision, ?)
-                               WHERE occurrence_id = ?
-                                 AND server_ack_revision < ?""",
-                            (ack, occurrence_id, ack),
+                        return ReminderMaterializationResult(False)
+                    if not self._scheduled_snapshot_matches(
+                        record,
+                        reminder_id=reminder_id,
+                        target=target,
+                        content=content,
+                        intended_at_ms=intended_at_ms,
+                        payload_format=payload_format,
+                        opaque_payload=opaque_payload,
+                    ):
+                        return await self._mark_occurrence_snapshot_conflict(
+                            db, occurrence_id
                         )
-                        changed = cursor.rowcount == 1
-                        await db.commit()
-                        return ReminderMaterializationResult(changed)
-                    # Cancelled/delivered state is a locally durable fact.  A
-                    # stale scheduled snapshot may not acknowledge, overwrite,
-                    # or resurrect it; its newer terminal revision stays due.
-                    await db.rollback()
-                    return ReminderMaterializationResult(False)
+                    ack = min(revision, record.revision)
+                    cursor = await db.execute(
+                        """UPDATE reminder_occurrences
+                           SET server_ack_revision = MAX(server_ack_revision, ?),
+                               snapshot_conflict = 0
+                           WHERE occurrence_id = ?
+                             AND (server_ack_revision < ?
+                                  OR snapshot_conflict != 0)""",
+                        (ack, occurrence_id, ack),
+                    )
+                    changed = cursor.rowcount == 1
+                    await db.commit()
+                    return ReminderMaterializationResult(changed)
 
                 async with db.execute(
                     "SELECT occurrence_id FROM reminder_occurrences WHERE reminder_id = ?",
@@ -686,8 +794,9 @@ class ReminderStoreMixin:
                 ) as cursor:
                     same_reminder = await cursor.fetchone()
                 if same_reminder is not None:
-                    await db.rollback()
-                    return ReminderMaterializationResult(False, conflict=True)
+                    return await self._mark_reminder_snapshot_conflict(
+                        db, reminder_id
+                    )
                 await db.execute(
                     """INSERT INTO reminder_occurrences
                        (reminder_id, occurrence_id, target, content, intended_at_ms,
@@ -743,15 +852,17 @@ class ReminderStoreMixin:
                     occurrence_id,
                 )
                 if record is None:
-                    await db.rollback()
-                    return ReminderMaterializationResult(False)
+                    return await self._mark_reminder_snapshot_conflict(
+                        db, reminder_id
+                    )
                 if (
                     record.reminder_id != reminder_id
                     or record.intended_at_ms != intended_at_ms
                     or record.payload_format not in {None, payload_format}
                 ):
-                    await db.rollback()
-                    return ReminderMaterializationResult(False, conflict=True)
+                    return await self._mark_occurrence_snapshot_conflict(
+                        db, occurrence_id
+                    )
 
                 (
                     next_state,
@@ -767,22 +878,18 @@ class ReminderStoreMixin:
                     lifecycle_at_ms,
                     revision,
                 )
-                changed = (
-                    record.state != next_state
-                    or record.revision != next_revision
-                    or record.server_ack_revision < next_ack_revision
-                    or record.payload_format is None
-                    or record.actual_fire_at_ms != actual_fire_at_ms
-                    or record.cancelled_at_ms != cancelled_at_ms
-                    or record.delivered_at_ms != delivered_at_ms
-                    or record.delivered_event_id != delivered_event_id
-                    or record.claimed_at_ms is not None
-                    or record.sync_retry_after_ms is not None
-                    or record.sync_retry_count != 0
-                    or record.sync_permanent_revision is not None
-                    or record.sync_permanent_code is not None
-                )
-                if not changed:
+                if not self._terminal_materialization_changes(
+                    record,
+                    (
+                        next_state,
+                        actual_fire_at_ms,
+                        cancelled_at_ms,
+                        delivered_at_ms,
+                        delivered_event_id,
+                        next_revision,
+                        next_ack_revision,
+                    ),
+                ):
                     await db.rollback()
                     return ReminderMaterializationResult(False)
                 await db.execute(
@@ -794,7 +901,8 @@ class ReminderStoreMixin:
                            payload_format = COALESCE(payload_format, ?),
                            sync_retry_after_ms = NULL, sync_retry_count = 0,
                            sync_permanent_revision = NULL,
-                           sync_permanent_code = NULL
+                           sync_permanent_code = NULL,
+                           snapshot_conflict = 0
                        WHERE occurrence_id = ?""",
                     (
                         next_state,
@@ -873,6 +981,7 @@ class ReminderStoreMixin:
                 async with db.execute(
                     f"""SELECT 1 FROM reminder_occurrences
                         WHERE state = 'claimed'
+                          AND snapshot_conflict = 0
                           AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
                         LIMIT 1""",
                     (1 if local_only else 0,),
@@ -882,6 +991,7 @@ class ReminderStoreMixin:
             async with db.execute(
                 f"""SELECT intended_at_ms FROM reminder_occurrences
                     WHERE state = 'scheduled'
+                      AND snapshot_conflict = 0
                       AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
                       AND (? IS NULL OR intended_at_ms > ?)
                     ORDER BY intended_at_ms, occurrence_id LIMIT 1""",
@@ -915,8 +1025,9 @@ class ReminderStoreMixin:
             db = await self._ensure_db()
             async with db.execute(
                 """SELECT * FROM reminder_occurrences
-                   WHERE (state = 'scheduled' AND intended_at_ms <= ?)
-                      OR state = 'claimed'
+                   WHERE snapshot_conflict = 0
+                     AND ((state = 'scheduled' AND intended_at_ms <= ?)
+                          OR state = 'claimed')
                    ORDER BY intended_at_ms, occurrence_id""",
                 (now,),
             ) as cursor:
@@ -961,7 +1072,8 @@ class ReminderStoreMixin:
                 await db.execute(
                     """UPDATE reminder_occurrences SET delivery_claim_id = ?
                        WHERE occurrence_id = ? AND revision = ?
-                         AND delivery_claim_id IS NULL""",
+                         AND delivery_claim_id IS NULL
+                         AND snapshot_conflict = 0""",
                     (claim_id, occurrence_id, revision),
                 )
                 await db.commit()
@@ -978,18 +1090,24 @@ class ReminderStoreMixin:
         occurrence_id: str,
         revision: int,
         claim_id: str,
+        lease_expires_at_ms: int,
     ) -> bool:
         """Record Server-acquired delivery custody for one current revision."""
+        if not self._valid_reminder_time(lease_expires_at_ms):
+            raise ValueError("invalid reminder delivery claim expiry")
         async with self._inbox_lock:
             db = await self._ensure_db()
             await db.execute("BEGIN IMMEDIATE")
             try:
                 cursor = await db.execute(
-                    """UPDATE reminder_occurrences SET delivery_claim_acquired = 1
+                    """UPDATE reminder_occurrences
+                       SET delivery_claim_acquired = 1,
+                           delivery_claim_expires_at_ms = ?
                        WHERE occurrence_id = ? AND revision = ?
                          AND delivery_claim_id = ?
-                         AND state IN ('scheduled', 'claimed')""",
-                    (occurrence_id, revision, claim_id),
+                         AND state IN ('scheduled', 'claimed')
+                         AND snapshot_conflict = 0""",
+                    (lease_expires_at_ms, occurrence_id, revision, claim_id),
                 )
                 changed = cursor.rowcount == 1
                 await db.commit()
@@ -1012,21 +1130,23 @@ class ReminderStoreMixin:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 placeholders = ", ".join("?" for _ in occurrence_ids)
+                claim_custody_now_ms = int(self._now_ms())
                 await db.execute(
                     f"""UPDATE reminder_occurrences
                         SET state = 'claimed', claimed_at_ms = ?, actual_fire_at_ms = ?
                         WHERE occurrence_id IN ({placeholders})
                           AND state = 'scheduled'
-                          AND {_REMINDER_DELIVERY_CUSTODY_SQL}""",
-                    (now_ms, now_ms, *occurrence_ids),
+                          AND {_reminder_delivery_custody_sql()}""",
+                    (now_ms, now_ms, *occurrence_ids, claim_custody_now_ms),
                 )
+                select_custody_now_ms = int(self._now_ms())
                 async with db.execute(
                     f"""SELECT * FROM reminder_occurrences
                         WHERE occurrence_id IN ({placeholders})
                           AND state = 'claimed'
-                          AND {_REMINDER_DELIVERY_CUSTODY_SQL}
+                          AND {_reminder_delivery_custody_sql()}
                         ORDER BY intended_at_ms, occurrence_id""",
-                    occurrence_ids,
+                    (*occurrence_ids, select_custody_now_ms),
                 ) as cursor:
                     rows = await cursor.fetchall()
                 await db.commit()
@@ -1120,11 +1240,12 @@ class ReminderStoreMixin:
         db = await self._ensure_db()
         await db.execute("BEGIN IMMEDIATE")
         try:
+            select_custody_now_ms = int(self._now_ms())
             async with db.execute(
                 f"""SELECT * FROM reminder_occurrences
                     WHERE reminder_id = ? AND state = 'claimed'
-                      AND {_REMINDER_DELIVERY_CUSTODY_SQL}""",
-                (reminder_id,),
+                      AND {_reminder_delivery_custody_sql()}""",
+                (reminder_id, select_custody_now_ms),
             ) as cursor:
                 row = await cursor.fetchone()
             if row is None:
@@ -1163,6 +1284,7 @@ class ReminderStoreMixin:
                     raise LifecycleConflict(
                         "reminder delivery event identity belongs to another row"
                     )
+            final_custody_now_ms = int(self._now_ms())
             cursor = await db.execute(
                 f"""UPDATE reminder_occurrences
                    SET state = 'delivered', delivered_event_id = ?, delivered_at_ms = ?,
@@ -1172,11 +1294,12 @@ class ReminderStoreMixin:
                        sync_permanent_revision = NULL,
                        sync_permanent_code = NULL
                    WHERE reminder_id = ? AND state = 'claimed'
-                     AND {_REMINDER_DELIVERY_CUSTODY_SQL}""",
-                (event_id, now_ms, reminder_id),
+                     AND {_reminder_delivery_custody_sql()}""",
+                (event_id, now_ms, reminder_id, final_custody_now_ms),
             )
             if cursor.rowcount != 1:
-                raise LifecycleConflict("reminder delivery lost claimed ownership")
+                await db.rollback()
+                return None
             await db.commit()
         except Exception:
             await db.rollback()
@@ -1230,13 +1353,14 @@ class ReminderStoreMixin:
         async with self._inbox_lock:
             db = await self._ensure_db()
             placeholders = ", ".join("?" for _ in occurrence_ids)
+            custody_now_ms = int(self._now_ms())
             async with db.execute(
                 f"""SELECT reminder_id FROM reminder_occurrences
                     WHERE occurrence_id IN ({placeholders})
                       AND state = 'claimed'
-                      AND {_REMINDER_DELIVERY_CUSTODY_SQL}
+                      AND {_reminder_delivery_custody_sql()}
                     ORDER BY intended_at_ms, occurrence_id""",
-                occurrence_ids,
+                (*occurrence_ids, custody_now_ms),
             ) as cursor:
                 rows = await cursor.fetchall()
             delivered: list[ReminderOccurrence] = []
@@ -1275,12 +1399,12 @@ class ReminderStoreMixin:
                     reminder.occurrence_id,
                 )
                 assert record is not None
-                if record.delivery_claim_id is not None and reminder.state in {
-                    "scheduled",
-                    "claimed",
-                }:
+                if reminder.state == "claimed" or (
+                    reminder.state == "scheduled"
+                    and not record.is_unprepared_local_only
+                ):
                     raise LifecycleConflict(
-                        "reminder cancellation conflicts with delivery claim"
+                        "reminder cancellation conflicts with claimed or remote work"
                     )
                 if reminder.state in {"scheduled", "claimed"}:
                     cursor = await db.execute(
@@ -1289,6 +1413,7 @@ class ReminderStoreMixin:
                                revision = revision + 1,
                                delivery_claim_id = NULL,
                                delivery_claim_acquired = 0,
+                               delivery_claim_expires_at_ms = NULL,
                                sync_retry_after_ms = NULL,
                                sync_retry_count = 0,
                                sync_permanent_revision = NULL,

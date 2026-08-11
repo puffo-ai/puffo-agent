@@ -9,6 +9,7 @@ those responsibilities belong to :mod:`codex_driver`,
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from ...portal.state import (
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
+    claude_cli_api_key,
     cli_session_json_path,
     read_host_codex_mcp_servers,
     seed_claude_home,
@@ -40,6 +42,7 @@ from ...portal.state import (
     sync_host_mcp_servers,
     sync_host_plugins,
     sync_host_skills,
+    strip_claude_api_key_from_settings,
 )
 from ...portal.runtime_matrix import (
     resolve_effective_harness,
@@ -53,6 +56,7 @@ from ..runtime_event_outbox import (
     RuntimeEventProjectingSink,
 )
 from ..runtime_events import RuntimeEventProjector, TrustedScope
+from ..shared_content import MEMORY_SECTION_HEADER
 from . import UnsupportedDriver, build_driver
 from .driver import HarnessEvent, RuntimeSpec, SessionRef, TurnRef
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
@@ -164,6 +168,8 @@ class PreparedLocalRuntime:
     migration_source: str
     legacy_session_path: Path
     preparer: LocalRuntimePreparer
+    session_fingerprint: str
+    discarded_persisted_session: bool = False
 
     def finalize_legacy_session_migration(self) -> None:
         """Retire the pre-Driver session sentinel after durable adoption."""
@@ -229,11 +235,17 @@ class LocalRuntimePreparer:
         *,
         system_prompt: str,
         persisted_native_session_id: str = "",
+        persisted_session_fingerprint: str = "",
     ) -> PreparedLocalRuntime:
         spec = await self.refresh_spec(system_prompt)
+        session_fingerprint = self.session_fingerprint(spec)
         legacy_path = self._legacy_session_path()
         legacy_id = self._load_legacy_session_id(legacy_path)
-        if persisted_native_session_id:
+        discarded_persisted_session = bool(
+            persisted_native_session_id
+            and persisted_session_fingerprint != session_fingerprint
+        )
+        if persisted_native_session_id and not discarded_persisted_session:
             native_session_id = persisted_native_session_id
             source = "runtime_event_outbox"
         elif legacy_id:
@@ -241,7 +253,18 @@ class LocalRuntimePreparer:
             source = "legacy_session_file"
         else:
             native_session_id = ""
-            source = "fresh"
+            source = (
+                "fresh_incompatible_persisted_session"
+                if discarded_persisted_session
+                else "fresh"
+            )
+        if discarded_persisted_session:
+            logger.info(
+                "agent %s: starting a fresh %s session because the durable "
+                "session fingerprint is missing or incompatible",
+                self.agent_id,
+                self.harness_name,
+            )
         return PreparedLocalRuntime(
             harness_name=self.harness_name,
             spec=spec,
@@ -249,7 +272,34 @@ class LocalRuntimePreparer:
             migration_source=source,
             legacy_session_path=legacy_path,
             preparer=self,
+            session_fingerprint=session_fingerprint,
+            discarded_persisted_session=discarded_persisted_session,
         )
+
+    def session_fingerprint(self, spec: RuntimeSpec) -> str:
+        """Fingerprint only inputs that make a native session incompatible."""
+        prompt_core = spec.system_prompt.split(MEMORY_SECTION_HEADER, 1)[0]
+        payload = {
+            "version": 1,
+            "harness": self.harness_name,
+            "provider": resolve_effective_provider(
+                self.agent_cfg.runtime.kind or "cli-local",
+                self.agent_cfg.runtime.provider,
+            ),
+            "model": spec.model,
+            "workspace": str(Path(spec.workspace_dir).resolve()),
+            "sandbox": spec.sandbox,
+            "permission_mode": spec.permission_mode,
+            "inference_level": self.agent_cfg.runtime.inference_level,
+            "llm_base_url": self.agent_cfg.runtime.llm_base_url.rstrip("/"),
+            "prompt_core_sha256": hashlib.sha256(
+                prompt_core.encode("utf-8")
+            ).hexdigest(),
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return "v1:" + hashlib.sha256(encoded).hexdigest()
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -335,6 +385,19 @@ class LocalRuntimePreparer:
         sync_host_mcp_servers(host_home, self.agent_home)
         sync_host_plugins(host_home, self.agent_home)
         sync_host_enabled_plugins(host_home, self.agent_home)
+        self._strip_claude_api_key_settings()
+
+    def _strip_claude_api_key_settings(self) -> None:
+        roots = [self.agent_home / ".claude"]
+        claude_dir = getattr(self, "claude_dir", None)
+        if claude_dir is not None and claude_dir not in roots:
+            roots.append(claude_dir)
+        for settings_path in (
+            path
+            for root in roots
+            for path in (root / "settings.json", root / "settings.local.json")
+        ):
+            strip_claude_api_key_from_settings(settings_path)
 
     def _prepare_claude_spec(self, system_prompt: str) -> RuntimeSpec:
         executable = resolve_claude_bin()
@@ -344,6 +407,20 @@ class LocalRuntimePreparer:
                 "PUFFO_CLAUDE_BIN=/absolute/path/to/claude."
             )
         launch_args = ["--dangerously-skip-permissions"]
+        from ...portal.control.context_telemetry import (
+            claude_autocompact_tokens,
+            configured_compact_pct,
+        )
+
+        compact_pct = configured_compact_pct(
+            "claude-code", self.agent_cfg.env_overrides
+        )
+        compact_tokens = claude_autocompact_tokens(
+            model=self.model,
+            pct=compact_pct,
+        )
+        if compact_tokens is not None:
+            launch_args.extend(["--autocompact", str(compact_tokens)])
         inference = self.agent_cfg.runtime.inference_level
         if inference:
             if inference in INFERENCE_LEVELS:
@@ -370,17 +447,23 @@ class LocalRuntimePreparer:
                 self.agent_id,
             )
         _remove_legacy_permission_hook(self.claude_dir)
-        llm_env = anthropic_base_url_env(
-            self.agent_cfg.runtime.llm_base_url
-        )
-        if llm_env and self.agent_cfg.runtime.api_key:
-            llm_env["ANTHROPIC_API_KEY"] = self.agent_cfg.runtime.api_key
-        environment = {
-            **os.environ,
+        runtime = self.agent_cfg.runtime
+        llm_env = anthropic_base_url_env(runtime.llm_base_url)
+        environment = dict(os.environ)
+        environment.pop("ANTHROPIC_API_KEY", None)
+        environment.update(self.agent_cfg.env_overrides)
+        environment.pop("ANTHROPIC_API_KEY", None)
+        if llm_env and runtime.api_key:
+            llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
+        else:
+            configured_key = claude_cli_api_key(self.daemon_cfg)
+            if configured_key:
+                llm_env["ANTHROPIC_API_KEY"] = configured_key
+        environment.update({
             "HOME": str(self.agent_home),
             "USERPROFILE": str(self.agent_home),
             **llm_env,
-        }
+        })
         if is_macos():
             environment["CLAUDE_CONFIG_DIR"] = str(
                 agent_claude_user_dir(self.agent_id)
@@ -396,6 +479,8 @@ class LocalRuntimePreparer:
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+            auto_compact_threshold_pct=compact_pct,
+            auto_compact_threshold_tokens=compact_tokens,
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
@@ -422,7 +507,11 @@ class LocalRuntimePreparer:
             })
         write_codex_mcp_config(codex_home / "config.toml", **config_kwargs)
 
-        environment = {**os.environ, "CODEX_HOME": str(codex_home)}
+        environment = {
+            **os.environ,
+            **self.agent_cfg.env_overrides,
+            "CODEX_HOME": str(codex_home),
+        }
         if gateway:
             environment["OPENAI_API_KEY"] = self.agent_cfg.runtime.api_key
         else:
@@ -450,6 +539,11 @@ class LocalRuntimePreparer:
             executable,
         )
         self._log_host_access()
+        from ...portal.control.context_telemetry import configured_compact_pct
+
+        compact_pct = configured_compact_pct(
+            "codex", self.agent_cfg.env_overrides
+        )
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
@@ -459,6 +553,7 @@ class LocalRuntimePreparer:
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+            auto_compact_threshold_pct=compact_pct,
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
@@ -565,6 +660,7 @@ def build_local_runtime_adapter(
     )
     projecting_sink = RuntimeEventProjectingSink(outbox, projector)
     manager: RuntimeManager
+    session_fingerprint = [prepared.session_fingerprint]
 
     async def require_initial_capacity() -> None:
         sizing_projector = RuntimeEventProjector(
@@ -607,7 +703,13 @@ def build_local_runtime_adapter(
             active_turn,
             session_ref=logical_session,
             native_session_id=manager.native_session_id,
+            session_fingerprint=session_fingerprint[0],
         )
+
+    async def reload_spec(system_prompt: str) -> RuntimeSpec:
+        spec = await prepared.preparer.refresh_spec(system_prompt)
+        session_fingerprint[0] = prepared.preparer.session_fingerprint(spec)
+        return spec
 
     manager = RuntimeManager(
         driver,
@@ -621,7 +723,7 @@ def build_local_runtime_adapter(
     )
     return RuntimeManagerAdapter(
         manager,
-        spec_reloader=prepared.preparer.refresh_spec,
+        spec_reloader=reload_spec,
     )
 
 

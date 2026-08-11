@@ -26,6 +26,8 @@ from ..limits import (
     MESSAGE_SEGMENT_CHARS,
 )
 from ..agent.status_reporter import StatusReporter
+from ..crypto.keystore import decode_secret
+from ..crypto.primitives import Ed25519KeyPair
 from .runtime_matrix import (
     HARNESS_PROVIDERS,
     RUNTIME_CLI_DOCKER,
@@ -47,6 +49,7 @@ from .state import (
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
+    claude_cli_api_key,
     cli_session_json_path,
     docker_shared_dir as docker_shared_dir,
     shared_fs_dir,
@@ -109,6 +112,12 @@ logger = logging.getLogger(__name__)
 RECONNECT_BACKOFF_SECONDS = 5.0
 
 
+def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
+    if harness_name != "claude-code":
+        return ""
+    return claude_cli_api_key(daemon_cfg)
+
+
 def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     """Construct a non-Driver adapter for ``runtime.kind``.
 
@@ -118,15 +127,8 @@ def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Ad
     """
     kind = agent_cfg.runtime.kind or "cli-local"
     if kind == "cli-docker":
-        if agent_cfg.desired_mcps:
-            raise RuntimeError(
-                f"agent {agent_cfg.id!r}: desired_mcps are not supported "
-                "on the cli-docker runtime yet (the MCP launch command "
-                "won't resolve inside the container). Clear them from "
-                "agent.yml or switch runtime.kind to cli-local."
-            )
-        harness, google_key = _resolve_docker_harness(daemon_cfg, agent_cfg)
-        adapter = _new_docker_adapter(daemon_cfg, agent_cfg, harness, google_key)
+        harness = _resolve_docker_harness(agent_cfg)
+        adapter = _new_docker_adapter(daemon_cfg, agent_cfg, harness)
         _configure_docker_mcp(adapter, daemon_cfg, agent_cfg, harness.name())
         return adapter
 
@@ -142,7 +144,7 @@ def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Ad
     )
 
 
-def _resolve_docker_harness(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig):
+def _resolve_docker_harness(agent_cfg: AgentConfig):
     from ..agent.harness import build_docker_harness
 
     provider = resolve_effective_provider(
@@ -151,24 +153,20 @@ def _resolve_docker_harness(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig):
     name = resolve_effective_harness(
         "cli-docker", provider, getattr(agent_cfg.runtime, "harness", "")
     )
+    if name != "claude-code":
+        raise RuntimeError(
+            f"agent {agent_cfg.id!r}: Docker harness {name!r} is design-only; "
+            "the supported Docker runtime is claude-code"
+        )
     harness = build_docker_harness(name)
-    google_key = ""
-    if harness.name() == "gemini-cli":
-        google_key = agent_cfg.runtime.api_key or daemon_cfg.google.api_key
-        if not google_key:
-            raise RuntimeError(
-                f"agent {agent_cfg.id!r}: harness=gemini-cli requires a "
-                "google.api_key — pass --api-key on `agent create`, set "
-                "GEMINI_API_KEY in the environment, or run "
-                "`puffo-agent config` to save a daemon-wide default."
-            )
-    return harness, google_key
+    return harness
 
 
 def _new_docker_adapter(
-    daemon_cfg: DaemonConfig, agent_cfg: AgentConfig, harness, google_key: str
+    daemon_cfg: DaemonConfig, agent_cfg: AgentConfig, harness
 ) -> Adapter:
     from ..agent.adapters.docker_cli import DockerCLIAdapter
+    from .control.context_telemetry import configured_compact_pct
 
     return DockerCLIAdapter(
         agent_id=agent_cfg.id,
@@ -180,8 +178,10 @@ def _new_docker_adapter(
         agent_home_dir=str(agent_home_dir(agent_cfg.id)),
         shared_fs_dir=str(shared_fs_dir()),
         inference_level=getattr(agent_cfg.runtime, "inference_level", ""),
+        auto_compact_threshold_pct=configured_compact_pct(
+            harness.name(), agent_cfg.env_overrides
+        ),
         harness=harness,
-        google_api_key=google_key,
         memory_limit=(
             agent_cfg.runtime.docker_memory_limit or daemon_cfg.docker_memory_limit
         ),
@@ -190,9 +190,12 @@ def _new_docker_adapter(
             or daemon_cfg.docker_memory_reservation
         ),
         desired_skills=agent_cfg.desired_skills,
+        desired_mcps=agent_cfg.desired_mcps,
+        env_overrides=agent_cfg.env_overrides,
         puffo_core_server_url=agent_cfg.puffo_core.server_url,
         puffo_core_slug=agent_cfg.puffo_core.slug,
         puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+        claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
     )
 
 
@@ -473,6 +476,7 @@ def _handle_suppressed_reply(
     scope: str,
     on_auth_failure: Optional[Callable[[], None]] = None,
     on_auth_failed_enter: Optional[Callable[[], None]] = None,
+    auth_error_message: str | None = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
     ``(suppressed, backoff_seconds)``:
@@ -530,7 +534,7 @@ def _handle_suppressed_reply(
                 )
     if scope == "api-error-retry":
         if is_auth:
-            runtime.error = (
+            runtime.error = auth_error_message or (
                 "Claude Code sign-in expired. On the computer running "
                 "puffo-agent, open a terminal and run `claude auth "
                 "login`, then send this agent a message."
@@ -543,8 +547,12 @@ def _handle_suppressed_reply(
             )
     else:
         runtime.error = (
-            "Worker emitted an auth / rate-limit / quota error string "
-            "instead of a real reply. Check the puffo-agent daemon log."
+            auth_error_message
+            if is_auth and auth_error_message
+            else (
+                "Worker emitted an auth / rate-limit / quota error string "
+                "instead of a real reply. Check the puffo-agent daemon log."
+            )
         )
     runtime.save(agent_id)
     return True, backoff
@@ -639,6 +647,7 @@ class Worker:
                 self.runtime,
                 agent_id,
                 logger,
+                api_key_mode=getattr(self, "_claude_api_key_mode", False),
             )
         self._warm_done.set()
 
@@ -647,6 +656,8 @@ class Worker:
         runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
+        *,
+        api_key_mode: bool = False,
     ) -> None:
         """``on_refresh_success`` eagerly clears ``auth_failed`` before
         the respawn, so a still-broken provider warms up looking healthy.
@@ -656,11 +667,7 @@ class Worker:
         if runtime.health != "ok":
             return
         runtime.health = "auth_failed"
-        runtime.error = (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
-        )
+        runtime.error = Worker._auth_failed_error(api_key_mode)
         runtime.save(agent_id)
         log.warning(
             "agent %s: post-warm health probe failed; reasserted "
@@ -675,10 +682,8 @@ class Worker:
         rt = self.runtime
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
-        rt.error = (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
+        rt.error = Worker._auth_failed_error(
+            getattr(self, "_claude_api_key_mode", False)
         )
         rt.save(agent_id)
         if self._notify_refresh_needed is not None:
@@ -699,6 +704,8 @@ class Worker:
         on a failed send, so a later genuine failure re-notifies."""
         if self._auth_failed_notification_sent:
             return
+        if getattr(self, "_claude_api_key_mode", False):
+            self._api_key_auth_recovery_pending = True
         self._auth_failed_notification_sent = True
         try:
             asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
@@ -735,6 +742,7 @@ class Worker:
             )
             return
         from ..agent._invite_strings import (
+            format_anthropic_api_key_rejected,
             format_codex_oauth_expired,
             format_oauth_expired,
         )
@@ -745,7 +753,11 @@ class Worker:
         # the alert is broken. Harness is the cheapest signal we have.
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
-        if harness == "codex":
+        if getattr(self, "_claude_api_key_mode", False):
+            text = format_anthropic_api_key_rejected(
+                self.agent_cfg.id, display_name
+            )
+        elif harness == "codex":
             text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
         else:
             text = format_oauth_expired(self.agent_cfg.id, display_name)
@@ -762,9 +774,23 @@ class Worker:
             )
             return
         logger.info(
-            "agent %s: notified operator @%s of OAuth-expired",
+            "agent %s: notified operator @%s of auth failure",
             self.agent_cfg.id,
             operator_slug,
+        )
+
+    @staticmethod
+    def _auth_failed_error(api_key_mode: bool) -> str:
+        if api_key_mode:
+            return (
+                "Claude Code API key was rejected. Update anthropic.api_key "
+                "in daemon.yml, keep anthropic.cli_use_api_key enabled, "
+                "restart puffo-agent, then send this agent a message."
+            )
+        return (
+            "Claude Code sign-in expired. On the computer running "
+            "puffo-agent, open a terminal and run `claude auth "
+            "login`, then send this agent a message."
         )
 
     @staticmethod
@@ -786,14 +812,36 @@ class Worker:
         runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
+        *,
+        recover_auth_failed: bool = False,
     ) -> None:
         """Transition ``in_progress`` → ``ok``; skip any in-turn red."""
-        if runtime.health != "in_progress":
+        if runtime.health != "in_progress" and not (
+            recover_auth_failed and runtime.health == "auth_failed"
+        ):
             return
+        previous_health = runtime.health
         runtime.health = "ok"
         runtime.error = ""
         runtime.save(agent_id)
-        log.info("agent %s: runtime.health in_progress → ok", agent_id)
+        log.info(
+            "agent %s: runtime.health %s → ok", agent_id, previous_health
+        )
+
+    def _resolve_health_after_success(self, agent_id: str) -> None:
+        recovering_api_key = (
+            getattr(self, "_claude_api_key_mode", False)
+            and getattr(self, "_api_key_auth_recovery_pending", False)
+        )
+        self._resolve_health_on_success(
+            self.runtime,
+            agent_id,
+            logger,
+            recover_auth_failed=recovering_api_key,
+        )
+        if recovering_api_key:
+            self._api_key_auth_recovery_pending = False
+            self._auth_failed_notification_sent = False
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
@@ -840,6 +888,16 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        self._claude_api_key_mode = (
+            agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
+            and bool(
+                _claude_cli_api_key(
+                    daemon_cfg,
+                    agent_cfg.runtime.harness or "claude-code",
+                )
+            )
+        )
+        self._api_key_auth_recovery_pending = False
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),
@@ -1068,7 +1126,7 @@ class Worker:
             )
         self._client = None
 
-    def _runtime_info(self) -> dict[str, str]:
+    def _runtime_info(self) -> dict[str, object]:
         rt = self.agent_cfg.runtime
         kind = getattr(rt, "kind", "") or "cli-local"
         if kind == RUNTIME_WS_LOCAL:
@@ -1077,6 +1135,7 @@ class Worker:
                 "provider": "",
                 "harness": "",
                 "model": "",
+                "inference_level": "",
             }
         provider = getattr(rt, "provider", "")
         configured_harness = getattr(rt, "harness", "")
@@ -1090,14 +1149,63 @@ class Worker:
                 provider = next(iter(supported))
         provider = resolve_effective_provider(kind, provider)
         harness = resolve_effective_harness(kind, provider, configured_harness)
-        provider_cfg = getattr(self.daemon_cfg, provider, None)
+        daemon_cfg = getattr(self, "daemon_cfg", None)
+        provider_cfg = getattr(daemon_cfg, provider, None)
         model = getattr(rt, "model", "") or getattr(provider_cfg, "model", "")
-        return {
+        info: dict[str, object] = {
             "kind": kind,
             "provider": provider,
             "harness": harness,
             "model": model,
+            "inference_level": getattr(rt, "inference_level", ""),
         }
+        adapter = getattr(self, "_adapter", None)
+        context_limits = getattr(adapter, "context_limits", None)
+        limits = context_limits() if callable(context_limits) else (None, None)
+        env_overrides = getattr(self.agent_cfg, "env_overrides", {})
+        if harness == "claude-code":
+            from .control.context_telemetry import build_context_runtime
+
+            info.update(
+                build_context_runtime(
+                    model=getattr(adapter, "model", "") or model,
+                    max_context=limits[0],
+                    auto_compact_threshold=limits[1],
+                    env_overrides=env_overrides,
+                )
+            )
+        elif harness == "codex":
+            from .control.context_telemetry import (
+                compact_threshold_pct,
+                configured_compact_pct,
+            )
+
+            configured_pct = configured_compact_pct(
+                "codex", env_overrides
+            )
+            info.update({
+                "max_context": limits[0],
+                "auto_compact_threshold_pct": (
+                    configured_pct
+                    if configured_pct is not None
+                    else compact_threshold_pct(limits[0], limits[1])
+                ),
+            })
+        if harness in {"claude-code", "codex"}:
+            max_context = int(info.get("max_context") or 0)
+            threshold_pct = info.get("auto_compact_threshold_pct")
+            runtime_state = getattr(self, "runtime", None)
+            if (
+                runtime_state is not None
+                and (
+                    runtime_state.max_context != max_context
+                    or runtime_state.auto_compact_threshold_pct != threshold_pct
+                )
+            ):
+                runtime_state.max_context = max_context
+                runtime_state.auto_compact_threshold_pct = threshold_pct
+                runtime_state.save(self.agent_cfg.id)
+        return info
 
     def _build_status_reporter(self, client) -> StatusReporter:
         bridge = getattr(client, "_bridge", None)
@@ -1130,6 +1238,10 @@ class Worker:
             )
             self._client = client
             reporter = self._build_status_reporter(client)
+            identity = client.keystore.load_identity(client.slug)
+            root_public_key = Ed25519KeyPair.from_secret_bytes(
+                decode_secret(identity.root_secret_key)
+            ).public_key_bytes()
             point = AttachPoint(
                 slug=self.agent_cfg.puffo_core.slug,
                 agent_id=agent_id,
@@ -1138,6 +1250,7 @@ class Worker:
                 reporter=reporter,
                 ack_timeout_s=180.0,
                 ping_interval_s=30.0,
+                root_public_key=root_public_key,
             )
         except Exception as e:
             logger.error(

@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 # *same* env without colliding. CLI binary stays `puffo-agent`; home
 # dir stays `~/.puffo-agent/`.
 name = "puffo-agent"
-version = "1.0.7"
+version = "1.2.0"
 description = "Run AI bots on Puffo.ai — local daemon that supervises many bot accounts and handles their LLM loops."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -36,6 +36,8 @@ dependencies = [
     "aiohttp>=3.9",
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
+    # Relay TLS fallback for Python installs with an incomplete system store.
+    "certifi>=2024.2.2",
     "cryptography>=43.0",
     "mcp>=1.0,<2",  # mcp 2.x moved FastMCP out of `mcp.server.fastmcp` (now the standalone `fastmcp` pkg); our MCP servers import the 1.x path
     # Pillow stays in the BASE install (not an extra): the inbound-image
@@ -51,6 +53,8 @@ dependencies = [
     "psutil>=5.9",
     "python-socks>=2.4",
     "pyyaml>=6.0",
+    # Windows has no system IANA timezone database; usage reset parsing needs it.
+    "tzdata>=2024.1",
     "websockets>=12.0",
 ]
 
@@ -75,6 +79,8 @@ gui = ["pyside6>=6.7"]
 # anything using async fixtures errors out.
 dev = [
     "pre-commit>=4.0",
+    # CI executes the desktop UI tests under QT_QPA_PLATFORM=offscreen.
+    "pyside6>=6.7",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.15",

@@ -116,9 +116,22 @@ def _run_git(
             timeout=_GIT_TIMEOUT,
             env=_scrubbed_env(),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         logger.warning("memory git %s failed to run: %s", args[:1], exc)
         return None
+
+
+def _unstage_failed_commit(memory_root: Path, paths: list[str]) -> None:
+    """Restore the dedicated audit index after a failed add/commit."""
+
+    head = _run_git(memory_root, ["rev-parse", "--verify", "HEAD"])
+    if head is not None and head.returncode == 0:
+        _run_git(memory_root, ["reset", "--quiet", "HEAD", "--", *paths])
+        return
+    try:
+        (memory_root / ".git" / "index").unlink()
+    except FileNotFoundError:
+        pass
 
 
 def ensure_memory_git(memory_root: str | Path) -> bool:
@@ -201,6 +214,7 @@ def commit_memory_change(
             paths,
             detail,
         )
+        _unstage_failed_commit(memory_root, paths)
         return None
     commit = _run_git(memory_root, ["commit", "--quiet", "-m", message])
     if commit is None or commit.returncode != 0:
@@ -211,6 +225,7 @@ def commit_memory_change(
             paths,
             detail,
         )
+        _unstage_failed_commit(memory_root, paths)
         return None
     head = _run_git(memory_root, ["rev-parse", "--short", "HEAD"])
     if head is None or head.returncode != 0:

@@ -361,11 +361,16 @@ async def test_string_content_roundtrip():
     store = _temp_store()
     await store.open()
 
-    payload = _channel_payload("env_1", content="plain text")
+    payload = _channel_payload(
+        "env_1",
+        content='{"sender_type":"agent","text":"still plain text"}',
+    )
     await store.store(payload)
 
     msgs = await store.get_channel_history("ch_1")
-    assert msgs[0].content == "plain text"
+    assert msgs[0].content == (
+        '{"sender_type":"agent","text":"still plain text"}'
+    )
 
     await store.close()
 

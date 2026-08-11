@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Mapping, Sequence
+from typing import Any, Awaitable, Sequence
 
 from .context_controller import AdmissionCandidate
-from .message_projection import format_message_group
+from .message_projection import canonical_target_parts, format_message_group
 from .message_store import MessageStore, StoredMessage
 
 OUTPUT_TOOL_RESERVE_TOKENS = 4_096
@@ -190,33 +190,22 @@ class SendAttemptState:
 
 
 def route_for(item: StoredMessage) -> MessageRoute:
-    if item.envelope_kind == "dm":
-        peer = item.sender_slug or item.recipient_slug or ""
-        return MessageRoute(item.envelope_id, "dm", dm_peer=peer)
-    content = item.content if isinstance(item.content, Mapping) else {}
-    is_membership_event = str(content.get("event_type") or "").startswith(
-        ("channel_member_", "space_member_"),
-    )
-    # Intro prompts and membership events self-reference only to remain
-    # non-replyable in local history. They still belong to the channel route.
-    is_intro_prompt = (
-        item.sender_slug == "system"
-        and item.envelope_id.startswith("intro-prompt-")
-        and item.thread_root_id == item.envelope_id
-    )
-    if item.thread_root_id and not (is_intro_prompt or is_membership_event):
+    target = canonical_target_parts(item)
+    if target[0] == "dm":
+        return MessageRoute(item.envelope_id, "dm", dm_peer=target[1])
+    if target[0] == "thread":
         return MessageRoute(
             item.envelope_id,
             "thread",
-            item.space_id or "",
-            item.channel_id or "",
-            item.thread_root_id,
+            target[1],
+            target[2],
+            target[3],
         )
     return MessageRoute(
         item.envelope_id,
         "channel",
-        item.space_id or "",
-        item.channel_id or "",
+        target[1],
+        target[2],
     )
 
 

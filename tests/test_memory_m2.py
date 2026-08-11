@@ -9,6 +9,9 @@ docs/user-lead-designs/memory-implementation.md, named after it.
 """
 
 import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -38,6 +41,30 @@ def root(tmp_path):
 @pytest.fixture
 def store(root):
     return MemoryStore(root)
+
+
+def test_write_transaction_serializes_store_instances(root):
+    stores = (MemoryStore(root), MemoryStore(root))
+    barrier = threading.Barrier(2)
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def enter(store):
+        nonlocal active, max_active
+        barrier.wait()
+        with store.write_transaction():
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(enter, stores))
+
+    assert max_active == 1
 
 
 def _tree_snapshot(root: Path) -> dict[str, bytes]:

@@ -166,6 +166,16 @@ class _RejectingStartDriver(_ControllableDriver):
         return UnsupportedCapability("start_turn")
 
 
+class _AmbiguousStartDriver(_ControllableDriver):
+    async def start_turn(self, input):
+        self.start_calls += 1
+        return TurnStarted(
+            TurnRef("driver-ambiguous"),
+            accepted=False,
+            delivery="ambiguous_at_least_once",
+        )
+
+
 def _context():
     return SimpleNamespace(
         messages=[{"role": "user", "content": "current notice"}],
@@ -390,6 +400,19 @@ async def test_unaccepted_receipt_releases_the_event_subscriber():
     assert manager.active_turn_ref is None
     await manager.close()
 
+    ambiguous = _AmbiguousStartDriver()
+    ambiguous_manager = RuntimeManager(
+        ambiguous,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="claude-code",
+    )
+    result = await RuntimeManagerAdapter(ambiguous_manager).run_turn(_context())
+    assert result.metadata == {"accepted": False}
+    assert ambiguous.close_calls == 1
+    assert ambiguous_manager.opened is None
+    assert ambiguous_manager.native_session_id == ""
+    await ambiguous_manager.close()
+
 
 @pytest.mark.asyncio
 async def test_silent_turn_start_is_bounded_by_the_task_timeout():
@@ -408,6 +431,9 @@ async def test_silent_turn_start_is_bounded_by_the_task_timeout():
     assert manager.active_turn_ref is None
     assert manager._subscribers == set()
     assert manager._terminal == {}
+    assert driver.close_calls == 1
+    assert manager.opened is None
+    assert manager.native_session_id == ""
     driver.release_start.set()
     await manager.close()
 
@@ -469,8 +495,28 @@ async def test_compaction_completes_only_on_the_event_and_never_starts_twice():
 
 @pytest.mark.asyncio
 async def test_context_commands_are_locked_and_fail_closed_after_close():
-    driver, manager, adapter = await _open_compacting_manager(wait_seconds=10)
+    driver = _CompactingDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec(
+            "/tmp",
+            task_timeout_seconds=1,
+            auto_compact_threshold_pct=50,
+        ),
+        driver_name="codex",
+    )
+    await manager.open()
+    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
+
+    active = await manager.start_turn(TurnInput("busy"))
     assert (await adapter.get_context_snapshot()).used_tokens == 12
+    assert driver.open_calls == 1
+    assert adapter.get_context_capabilities().native_compaction is False
+    await manager.abandon_turn(active.turn_ref, reason="test_cleanup")
+
+    assert (await adapter.get_context_snapshot()).used_tokens == 12
+    assert driver.open_calls == 2
+    assert manager.spec.auto_compact_threshold_tokens == 50
 
     waiting = asyncio.create_task(adapter.compact_context())
     await asyncio.sleep(0)

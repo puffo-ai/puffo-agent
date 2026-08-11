@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from aiohttp import WSMsgType, web
 
 from puffo_agent.portal.ws_local.ws_local_client import (
     V2_CAPABILITIES,
+    _prepare_attach,
     _send_attach_command,
     run_attach,
 )
@@ -68,18 +70,21 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
                     "messages": [{"text": "hello"}],
                 }))
             elif kind == "ack":
-                # client acked; close from server side.
-                await ws.close()
+                continue
         server_done.set()
         return ws
 
     runner, base = await _start_fake_daemon(handler)
     try:
         session_dir = tmp_path / "session"
+        session_dir.mkdir()
+        (session_dir / "commands.ndjson").write_text(
+            json.dumps({"type": "detach"}) + "\n", encoding="utf-8"
+        )
         task = asyncio.create_task(run_attach(
             bundle_path,
             "abc12345",
-            bridge_url=base,
+            daemon_url=base,
             session_dir=session_dir,
         ))
 
@@ -103,20 +108,109 @@ async def test_happy_path_handshake_bundle_reply_ack_detach(tmp_path: Path):
         # Append an ack command; client should pick it up on poll.
         with commands_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({"type": "ack", "bundle_id": "b1"}) + "\n")
+            fh.write(json.dumps({"type": "detach"}) + "\n")
 
         await asyncio.wait_for(server_done.wait(), timeout=2.0)
-        await asyncio.wait_for(task, timeout=2.0)
+        assert await asyncio.wait_for(task, timeout=2.0) == 0
 
         assert received[0]["type"] == "connect"
         assert received[0]["password"] == "abc12345"
         assert received[0]["capabilities"] == list(V2_CAPABILITIES)
         assert received[1]["type"] == "ack"
         assert received[1]["bundle_id"] == "b1"
+        assert all(frame["type"] != "detach" for frame in received)
 
         status = json.loads((session_dir / "status").read_text(encoding="utf-8"))
-        assert status["state"] in ("disconnected", "connected")
+        assert status["state"] == "disconnected"
     finally:
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_server_rejection_preserves_error_status_and_nonzero_exit(tmp_path: Path):
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"fake-bundle-bytes")
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive()
+        await ws.send_json({"type": "error", "reason": "authentication failed"})
+        await ws.close()
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        session_dir = tmp_path / "session"
+        rc = await run_attach(
+            bundle_path, "wrong", daemon_url=base, session_dir=session_dir
+        )
+        status = json.loads((session_dir / "status").read_text(encoding="utf-8"))
+        assert rc == 1
+        assert status == {"state": "error", "reason": "authentication failed"}
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "reason"),
+    [
+        ("close", "connection closed unexpectedly"),
+        ("non-json", "non-JSON WS frame"),
+    ],
+)
+async def test_connected_protocol_failure_is_terminal(
+    tmp_path: Path, failure: str, reason: str,
+):
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"fake-bundle-bytes")
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive()
+        await ws.send_json({"type": "connected", "session_id": "s", "agent": {}})
+        if failure == "non-json":
+            await ws.send_str("{")
+        await ws.close()
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        session_dir = tmp_path / failure
+        assert await run_attach(
+            bundle_path, "pw", daemon_url=base, session_dir=session_dir
+        ) == 1
+        status = json.loads((session_dir / "status").read_text(encoding="utf-8"))
+        assert status == {"state": "error", "reason": reason}
+    finally:
+        await runner.cleanup()
+
+
+def test_session_protocol_files_remain_bound_after_path_swap(tmp_path: Path):
+    if not hasattr(os, "symlink"):
+        pytest.skip("symlinks unavailable")
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"bundle")
+    session_dir = tmp_path / "session"
+    prepared = _prepare_attach(bundle_path, "http://127.0.0.1:63387", session_dir)
+    assert prepared is not None
+    _, _, files, _ = prepared
+    victim = tmp_path / "victim"
+    victim.write_text("private", encoding="utf-8")
+    try:
+        (session_dir / "events.ndjson").unlink()
+        (session_dir / "events.ndjson").symlink_to(victim)
+        files.emit({"type": "safe"})
+        assert victim.read_text(encoding="utf-8") == "private"
+
+        (session_dir / "commands.ndjson").unlink()
+        (session_dir / "commands.ndjson").symlink_to(victim)
+        with pytest.raises(OSError, match="replaced"):
+            files.read_commands(0)
+    finally:
+        files.close()
 
 
 @pytest.mark.asyncio
@@ -191,7 +285,7 @@ async def test_tool_call_command_forwards_and_emits_result(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -246,7 +340,7 @@ async def test_tool_call_rejects_non_object_params(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -299,7 +393,7 @@ async def test_bom_prefixed_command_lines_are_accepted(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -346,7 +440,7 @@ async def test_end_command_is_forwarded(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
         commands_path = session_dir / "commands.ndjson"
         for _ in range(50):
@@ -387,7 +481,7 @@ async def test_detach_command_closes_ws_and_exits(tmp_path: Path):
     try:
         session_dir = tmp_path / "session"
         task = asyncio.create_task(run_attach(
-            bundle_path, "abc12345", bridge_url=base, session_dir=session_dir,
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
         ))
 
         commands_path = session_dir / "commands.ndjson"
@@ -408,5 +502,5 @@ async def test_detach_command_closes_ws_and_exits(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_missing_bundle_path_returns_error(tmp_path: Path):
     missing = tmp_path / "missing.puffoagent"
-    rc = await run_attach(missing, "abc12345", bridge_url="http://127.0.0.1:1")
+    rc = await run_attach(missing, "abc12345", daemon_url="http://127.0.0.1:1")
     assert rc == 2

@@ -69,8 +69,15 @@ class _ReceiptCommitter:
         if result.status is ReceiptWriteStatus.CONFLICT:
             return TransportOutcome.HOLD
 
-        await self._log_commit(result)
         self._notify_runtime(result)
+        try:
+            await self._log_commit(result)
+        except Exception:
+            self.client._log.exception(
+                "receipt observability failed after durable commit "
+                "(envelope_id=%s)",
+                self.payload.envelope_id,
+            )
         if result.acknowledge:
             return TransportOutcome.ACK
         if (
@@ -144,7 +151,8 @@ class _ReceiptCommitter:
             runtime.notify_delivery()
         if (
             result.disposition is ReceiptDisposition.ELIGIBLE
-            and result.status is ReceiptWriteStatus.COMMITTED
+            and result.status
+            in (ReceiptWriteStatus.COMMITTED, ReceiptWriteStatus.IDEMPOTENT)
         ):
             runtime.notify()
 
@@ -288,15 +296,24 @@ class InboundReceiptHandler:
         *,
         is_plaintext: bool,
     ) -> _ReceiptCommitter:
+        dm_peer = (
+            payload.recipient_slug
+            if payload.sender_slug == self.client.slug
+            else payload.sender_slug
+        ) if payload.envelope_kind == "dm" else ""
         thread_root_id = await self.client._resolve_incoming_thread_root(
             payload.thread_root_id,
             payload.channel_id,
             payload.space_id,
+            expected_envelope_kind=payload.envelope_kind,
+            expected_dm_peer=dm_peer,
         )
         reply_to_id = await self.client._validate_incoming_parent_id(
             payload.reply_to_id,
             payload.channel_id,
             payload.space_id,
+            expected_envelope_kind=payload.envelope_kind,
+            expected_dm_peer=dm_peer,
         )
         stored_payload = {
             "envelope_id": payload.envelope_id,

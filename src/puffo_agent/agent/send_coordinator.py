@@ -35,6 +35,9 @@ from ..crypto.primitives import Ed25519KeyPair
 from .held_context import build_held_context_output
 from .message_projection import CONTEXT_VERSION
 from .send_response_validation import (
+    coordinator_config,
+    http_error_detail,
+    optional_response_int,
     validate_channel_response,
     validate_keyless_response,
 )
@@ -376,7 +379,7 @@ class SendCoordinator:
 
         try:
             space_id = await _resolve_channel_space(
-                _CoordinatorConfig(self), destination
+                coordinator_config(self), destination
             )
         except Exception as exc:
             return failed_result(str(exc), kind="routing")
@@ -444,7 +447,7 @@ class SendCoordinator:
         resolve_space,
     ) -> dict[str, Any]:
         try:
-            space_id = await resolve_space(_CoordinatorConfig(self), destination)
+            space_id = await resolve_space(coordinator_config(self), destination)
         except Exception as exc:
             return failed_result(str(exc), kind="routing")
         lock = self._channel_locks.setdefault((space_id, destination), asyncio.Lock())
@@ -507,7 +510,7 @@ class SendCoordinator:
         except HttpError as exc:
             return SendResult(
                 state="failed",
-                error=_http_error_detail(exc.body),
+                error=http_error_detail(exc.body),
                 error_kind="http",
                 status=exc.status,
             ).to_dict()
@@ -563,8 +566,8 @@ class SendCoordinator:
                 "keyless message send returned no envelope_id",
                 kind="protocol",
             )
-        seq = _optional_response_int(raw, "seq", "keyless response")
-        queued = _optional_response_int(raw, "devices_queued", "keyless response")
+        seq = optional_response_int(raw, "seq", "keyless response")
+        queued = optional_response_int(raw, "devices_queued", "keyless response")
         missing = raw.get("missing_devices", []) if isinstance(raw, Mapping) else []
         if not isinstance(missing, list) or not all(
             isinstance(v, str) for v in missing
@@ -629,7 +632,7 @@ class SendCoordinator:
             )
         except HttpError as exc:
             return failed_result(
-                _http_error_detail(exc.body),
+                http_error_detail(exc.body),
                 kind="freshness_unavailable"
                 if exc.status in (404, 405, 503)
                 else "http",
@@ -764,13 +767,23 @@ class SendCoordinator:
                 boundary.attempt_fingerprint,
             )
         elif result.state == "sent":
-            await self._consume_held(boundary.held_key)
             result.note = f"posted {result.envelope_id} to {channel_id}{root_note}"
+            try:
+                await self._consume_held(boundary.held_key)
+            except Exception:
+                logger.exception(
+                    "sent keyless message but could not clear held state"
+                )
             if (
                 result.latest_seq_before_send == boundary.seen_seq
                 and result.seq is not None
             ):
-                await self._advance(space_id, channel_id, result.seq)
+                try:
+                    await self._advance(space_id, channel_id, result.seq)
+                except Exception:
+                    logger.exception(
+                        "sent keyless message but could not advance local boundary"
+                    )
         output = result.to_dict()
         if result.state == "held":
             output["synchronized"] = synchronized
@@ -1064,19 +1077,27 @@ class SendCoordinator:
         result: SendResult,
         action: str,
     ) -> None:
-        await self._consume_held(boundary.held_key)
         result.note = (
             f"{action} {envelope.get('envelope_id', '?')} to "
             f"{request.destination}{resolved['note']}"
         )
+        try:
+            await self._consume_held(boundary.held_key)
+        except Exception:
+            logger.exception("sent message but could not clear held state")
         # A stale send_anyway may cross messages this turn has not seen. The
         # outbound is visible, but the boundary advances only without a gap.
         if result.latest_seq_before_send == result.seen_seq:
-            await self._advance(
-                space_id,
-                channel_id,
-                result.seq,  # type: ignore[arg-type]
-            )
+            try:
+                await self._advance(
+                    space_id,
+                    channel_id,
+                    result.seq,  # type: ignore[arg-type]
+                )
+            except Exception:
+                logger.exception(
+                    "sent message but could not advance local boundary"
+                )
         if result.missing_devices:
             asyncio.create_task(
                 self._supplement_channel(
@@ -1132,7 +1153,7 @@ class SendCoordinator:
                     if exc.status < 400
                     else "http"
                 )
-                detail = _http_error_detail(exc.body)
+                detail = http_error_detail(exc.body)
                 return SendResult(
                     state="failed",
                     error=detail,
@@ -1227,7 +1248,7 @@ class SendCoordinator:
         except HttpError as exc:
             return SendResult(
                 state="failed",
-                error=_http_error_detail(exc.body),
+                error=http_error_detail(exc.body),
                 error_kind="http",
                 status=exc.status,
             ).to_dict()
@@ -1316,7 +1337,7 @@ class SendCoordinator:
             dm_peer=dm_peer,
         )
         encrypt = bool(request.attachment_paths) or await _send_encryption_required(
-            _CoordinatorConfig(self), root
+            coordinator_config(self), root
         )
         if require_encryption and not encrypt:
             return {
@@ -1367,6 +1388,7 @@ class SendCoordinator:
             channel_id=channel_id,
             recipient_slug=dm_peer,
             thread_root_id=root,
+            reply_to_id=request.root_id if root and request.root_id else None,
             content_type=content_type,
             content=content,
             recipients=devices,
@@ -1376,6 +1398,7 @@ class SendCoordinator:
             "signing_key": signing_key,
             "encrypt": encrypt,
             "recipient_slugs": recipient_slugs,
+            "root_id": root or "",
             "note": f"{visibility_note}{root_note}{attachment_note}",
         }
 
@@ -1565,7 +1588,7 @@ class SendCoordinator:
             from ..mcp.puffo_core_tools import _read_channel_members
 
             data = await _read_channel_members(
-                _CoordinatorConfig(self), space_id, channel_id
+                coordinator_config(self), space_id, channel_id
             )
             members = data.get("members") if isinstance(data, Mapping) else None
             if isinstance(members, list):
@@ -1965,36 +1988,7 @@ class SendCoordinator:
             # old callers' synchronization proof but never claims readiness.
             current.recovered_messages = [dict(row) for row in rows if "content" in row]
             if not current.recovered_messages:
-                current.diagnostic = "local held context is unavailable or unreadable"
+                current.diagnostic = (
+                    "freshness synchronized; no new model-visible channel messages"
+                )
         return True
-
-
-class _CoordinatorConfig:
-    """Duck-shaped adapter for the established routing helpers."""
-
-    def __init__(self, coordinator: SendCoordinator) -> None:
-        self.slug = coordinator.slug
-        self.keystore = coordinator.keystore
-        self.http_client = coordinator.http_client
-        self.data_client = coordinator.data_client
-        self.workspace = coordinator.workspace
-        self.keyless = bool(getattr(coordinator.http_client, "keyless", False))
-
-
-def _http_error_detail(body: str) -> str:
-    try:
-        parsed = json.loads(body)
-    except (TypeError, ValueError):
-        return str(body)[:500] or "HTTP request failed"
-    if isinstance(parsed, Mapping):
-        return str(parsed.get("message") or parsed.get("error") or parsed)[:500]
-    return str(parsed)[:500]
-
-
-def _optional_response_int(raw: Any, name: str, prefix: str) -> int | None:
-    value = raw.get(name) if isinstance(raw, Mapping) else None
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValueError(f"{prefix} has invalid {name}")
-    return value

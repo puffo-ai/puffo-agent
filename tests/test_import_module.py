@@ -14,12 +14,12 @@ import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from _bridge_support import isolated_home
+from _portal_support import isolated_home
 
 from puffo_agent.crypto.canonical import canonicalize_for_signing
 from puffo_agent.crypto.certs import derive_public_key_id
 from puffo_agent.crypto.encoding import base64url_encode
-from puffo_agent.crypto.keystore import StoredIdentity, encode_secret
+from puffo_agent.crypto.keystore import KeyStore, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 
 pytestmark = pytest.mark.asyncio
@@ -161,6 +161,7 @@ def _seed_source_agent(home: str, agent_id: str, slug: str, server_url: str) -> 
     (adir / "keys" / f"{slug}.json").write_text(
         json.dumps(identity.to_dict(), indent=2), encoding="utf-8"
     )
+    backup_dek = KeyStore(adir / "keys").load_or_create_message_backup_dek(slug)
     return {
         "root": root,
         "device_signing": device_signing,
@@ -168,6 +169,7 @@ def _seed_source_agent(home: str, agent_id: str, slug: str, server_url: str) -> 
         "old_device_id": old_device_id,
         "slug": slug,
         "agent_id": agent_id,
+        "backup_dek": backup_dek,
     }
 
 
@@ -228,6 +230,23 @@ async def test_import_happy_path(mock_server):
     assert sess["slug"] == "alpha-bot"
     assert sess["subkey_id"] and sess["subkey_secret_key"]
     assert sess["expires_at"] > int(time.time() * 1000)
+    identity_path = session_path.with_name("alpha-bot.json")
+    backup_path = (
+        Path(os.environ["PUFFO_AGENT_HOME"])
+        / "agents"
+        / "alpha"
+        / "keys"
+        / "alpha-bot.message-backup-dek-v1"
+    )
+    assert backup_path.read_bytes() == info["backup_dek"]
+    assert backup_path.stat().st_mode & 0o077 == 0
+    if os.name != "nt":
+        agent_root = identity_path.parents[1]
+        assert agent_root.stat().st_mode & 0o777 == 0o700
+        assert identity_path.parent.stat().st_mode & 0o777 == 0o700
+        assert identity_path.stat().st_mode & 0o777 == 0o600
+        assert session_path.stat().st_mode & 0o777 == 0o600
+        assert (agent_root / "agent.yml").stat().st_mode & 0o777 == 0o600
 
 
 async def test_import_skips_existing(mock_server):
@@ -327,7 +346,7 @@ async def test_revoke_pending_succeeds_on_retry(mock_server):
 
 async def test_revoke_pending_no_marker():
     from puffo_agent.portal import import_agents as imp
-    from _bridge_support import write_test_agent
+    from _portal_support import write_test_agent
 
     write_test_agent(os.environ["PUFFO_AGENT_HOME"], "alpha")
     result = await imp.revoke_pending("alpha")

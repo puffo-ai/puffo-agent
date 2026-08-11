@@ -96,31 +96,41 @@ class InboxAdmissionMixin:
 
         send_mode.raise_turn_bundle(list(self.send_mode_keys))
 
-    async def _admit_held_recovery(
+    def _validate_held_admission_turn(
         self,
         event: ProviderAdmissionEvent,
         *,
-        fired: list[bool],
-        correlation_key: str,
         active_turn_id: str,
         provider_session_id: str,
-        evidence: Any,
-        evidence_key: tuple[str, str, str, str, int, str],
+        provider_turn_id: str,
+    ) -> None:
+        if (
+            self.active.turn_id != active_turn_id
+            or self.active.provider_session_id != provider_session_id
+            or self.active.provider_turn_id != provider_turn_id
+            or event.provider_session_id != provider_session_id
+            or event.provider_turn_id != provider_turn_id
+        ):
+            raise RuntimeError("held admission crossed the active provider turn")
+
+    async def _load_held_admission_rows(
+        self,
+        *,
+        active_turn_id: str,
         displayed_ids: tuple[str, ...],
         space_id: str,
         channel_id: str,
         latest_seq: int,
-    ) -> None:
-        if fired[0] or event.planning_cycle_key != correlation_key:
-            return
+        latest_envelope_id: str,
+    ) -> tuple[StoredMessage, list[StoredMessage | None]]:
+        watermark = await self.store.get_message_by_envelope(latest_envelope_id)
         if (
-            self.active.turn_id != active_turn_id
-            or self.active.provider_session_id != provider_session_id
-            or self.active.provider_turn_id != evidence.provider_turn_id
-            or event.provider_session_id != provider_session_id
-            or event.provider_turn_id != evidence.provider_turn_id
+            watermark is None
+            or watermark.space_id != space_id
+            or watermark.channel_id != channel_id
+            or watermark.server_seq != latest_seq
         ):
-            raise RuntimeError("held admission crossed the active provider turn")
+            raise RuntimeError("held freshness proof no longer matches local storage")
         rows = [
             await self.store.get_message_by_envelope(item) for item in displayed_ids
         ]
@@ -144,6 +154,48 @@ class InboxAdmissionMixin:
             for row in rows
         ):
             raise RuntimeError("held admission rows crossed another turn boundary")
+        if watermark.envelope_id not in displayed_ids and not (
+            watermark.receipt_disposition is ReceiptDisposition.TERMINAL
+            or (
+                watermark.processing_state is ProcessingState.IN_TURN
+                and watermark.processing_turn_id == active_turn_id
+            )
+            or watermark.model_visible_at is not None
+        ):
+            raise RuntimeError("held freshness proof was not admitted to this turn")
+        return watermark, rows
+
+    async def _admit_held_recovery(
+        self,
+        event: ProviderAdmissionEvent,
+        *,
+        fired: list[bool],
+        correlation_key: str,
+        active_turn_id: str,
+        provider_session_id: str,
+        evidence: Any,
+        evidence_key: tuple[str, str, str, str, int, str],
+        displayed_ids: tuple[str, ...],
+        space_id: str,
+        channel_id: str,
+        latest_seq: int,
+    ) -> None:
+        if fired[0] or event.planning_cycle_key != correlation_key:
+            return
+        self._validate_held_admission_turn(
+            event,
+            active_turn_id=active_turn_id,
+            provider_session_id=provider_session_id,
+            provider_turn_id=evidence.provider_turn_id,
+        )
+        _, rows = await self._load_held_admission_rows(
+            active_turn_id=active_turn_id,
+            displayed_ids=displayed_ids,
+            space_id=space_id,
+            channel_id=channel_id,
+            latest_seq=latest_seq,
+            latest_envelope_id=evidence.latest_envelope_id,
+        )
         pending_ids = [
             row.envelope_id
             for row in rows
@@ -260,7 +312,7 @@ class InboxAdmissionMixin:
             latest_envelope_id,
         )
         evidence = self._held_admission_evidence.get(evidence_key)
-        if evidence is None or not evidence.displayed_ids:
+        if evidence is None:
             payload = dict(payload)
             payload["context_ready"] = False
             payload["diagnostic"] = "exact held recovery evidence unavailable"

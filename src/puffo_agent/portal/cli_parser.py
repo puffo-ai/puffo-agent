@@ -19,19 +19,31 @@ def build_parser(handlers: CommandHandlers) -> argparse.ArgumentParser:
     agent_sub = _add_agent_create_commands(sub, handlers)
     _add_agent_runtime_commands(agent_sub, handlers)
     _add_agent_management_commands(agent_sub, handlers)
-    _add_bridge_commands(sub, handlers)
+    _add_machine_commands(sub, handlers)
+    _add_attach_command(sub, handlers)
     _add_diagnostic_commands(sub)
     return parser
 
 
 def _add_core_commands(sub, handlers: CommandHandlers) -> None:
-    sub.add_parser(
+    config = sub.add_parser(
         "config",
         help=(
             "Optional: set daemon-wide model defaults. "
             "The daemon runs fine without this — agents can carry their own keys."
         ),
-    ).set_defaults(func=handlers["cmd_config"])
+    )
+    config.add_argument(
+        "--anthropic-api-key",
+        metavar="KEY",
+        help="Set daemon.yml anthropic.api_key; pass an empty value to clear it",
+    )
+    config.add_argument(
+        "--anthropic-cli-use-api-key",
+        choices=("true", "false"),
+        help="Allow Claude Code to use daemon.yml anthropic.api_key",
+    )
+    config.set_defaults(func=handlers["cmd_config"])
     start = sub.add_parser(
         "start",
         help=(
@@ -52,14 +64,6 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
             "Detach the daemon into the background with a status-bar (tray) "
             "icon; it survives the terminal closing. Quit from the icon or "
             "run `puffo-agent stop`."
-        ),
-    )
-    start.add_argument(
-        "--with-local-bridge",
-        action="store_true",
-        help=(
-            "Also serve the local bridge HTTP API (off by default; the MCP "
-            "data + rpc ports are always served)."
         ),
     )
     # Internal: the detached child that --background spawns to host the
@@ -98,7 +102,6 @@ def _add_agent_create_commands(sub, handlers: CommandHandlers):
     agent = sub.add_parser("agent", help="Manage individual agents")
     agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)
     _add_agent_create(agent_sub, handlers)
-    _add_agent_create_ws_local(agent_sub, handlers)
     _add_agent_basic_commands(agent_sub, handlers)
     return agent_sub
 
@@ -107,11 +110,10 @@ def _add_agent_create(agent_sub, handlers: CommandHandlers) -> None:
     create = agent_sub.add_parser(
         "create",
         help=(
-            "Register a new agent locally. Prompts for an LLM API key "
-            "if --api-key isn't given and no env var / daemon default "
-            "is set. The puffo_core slug/device_id/space_id still need "
-            "to be populated (via puffo-cli or by hand) before the "
-            "daemon will start the agent's worker."
+            "Register a new agent locally. Claude Code and Codex reuse their "
+            "host CLI login; --api-key is only for an explicitly configured "
+            "gateway. The puffo_core slug/device_id/space_id still need to be "
+            "populated before the daemon starts the worker."
         ),
     )
     create.add_argument("--id", required=True)
@@ -145,7 +147,7 @@ def _add_agent_create(agent_sub, handlers: CommandHandlers) -> None:
     )
     create.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "google"],
+        choices=["anthropic", "openai"],
         help="Model provider; selects the default harness",
     )
     create.add_argument(
@@ -161,48 +163,6 @@ def _add_agent_create(agent_sub, handlers: CommandHandlers) -> None:
     )
     create.add_argument("--no-dm", action="store_true", help="Don't reply on DM")
     create.set_defaults(func=handlers["cmd_agent_create"])
-
-
-def _add_agent_create_ws_local(agent_sub, handlers: CommandHandlers) -> None:
-    create_wsl = agent_sub.add_parser(
-        "create-ws-local",
-        help="Create a ws-local agent via operator approval over the machine channel.",
-    )
-    create_wsl.add_argument(
-        "--operator",
-        required=True,
-        help="Linked operator slug to request approval from",
-    )
-    create_wsl.add_argument(
-        "--passcode",
-        required=True,
-        help="Passcode for the .puffoagent bundle + ws-local attach",
-    )
-    create_wsl.add_argument(
-        "--display-name", default="", help="Suggested name for the new agent"
-    )
-    create_wsl.add_argument(
-        "--message",
-        default="",
-        help="Free-text note shown to the operator for context (why this agent is needed).",
-    )
-    create_wsl.add_argument(
-        "--wait",
-        action="store_true",
-        help="Block until the operator approves and print the final result (slug/bundle/passcode).",
-    )
-    create_wsl.add_argument(
-        "--wait-timeout",
-        type=float,
-        default=600.0,
-        help="Seconds to wait with --wait (default 600).",
-    )
-    create_wsl.add_argument(
-        "--bridge-url",
-        default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
-    )
-    create_wsl.set_defaults(func=handlers["cmd_agent_create_ws_local"])
 
 
 def _add_agent_basic_commands(agent_sub, handlers: CommandHandlers) -> None:
@@ -254,12 +214,11 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
     )
     runtime.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "google"],
+        choices=["anthropic", "openai"],
         help=(
             "Model provider. anthropic (default) pairs with claude-code; "
-            "openai pairs with codex on cli-local. google has no supported "
-            "harness today (gemini-cli is design-only). Must match the "
-            "selected harness."
+            "openai pairs with codex on cli-local. Must match the selected "
+            "harness. Hermes and Gemini remain design-only."
         ),
     )
     runtime.add_argument("--model", help="Model override (empty string clears)")
@@ -483,28 +442,6 @@ def _add_agent_maintenance_commands(agent_sub, handlers: CommandHandlers) -> Non
     refresh.set_defaults(func=handlers["cmd_agent_refresh"])
 
 
-def _add_bridge_commands(sub, handlers: CommandHandlers) -> None:
-    _add_pairing_commands(sub, handlers)
-    _add_machine_commands(sub, handlers)
-    _add_api_and_attach_commands(sub, handlers)
-
-
-def _add_pairing_commands(sub, handlers: CommandHandlers) -> None:
-    pairing = sub.add_parser(
-        "pairing",
-        help="Inspect or reset the local bridge pairing (which user can drive this daemon)",
-    )
-    pairing_sub = pairing.add_subparsers(dest="pairing_cmd", required=True)
-    pairing_sub.add_parser(
-        "show",
-        help="Print the currently paired (slug, device_id), or '(not paired)'",
-    ).set_defaults(func=handlers["cmd_pairing_show"])
-    pairing_sub.add_parser(
-        "unpair",
-        help="Delete pairing.json so a different identity can pair next",
-    ).set_defaults(func=handlers["cmd_pairing_unpair"])
-
-
 def _add_machine_commands(sub, handlers: CommandHandlers) -> None:
     machine = sub.add_parser(
         "machine",
@@ -520,6 +457,11 @@ def _add_machine_commands(sub, handlers: CommandHandlers) -> None:
         "--server-url",
         default=None,
         help="puffo-server base URL (default: the production relay).",
+    )
+    machine_link.add_argument(
+        "--code",
+        default=None,
+        help="Link code generated in the Puffo web app",
     )
     machine_link.add_argument(
         "--name",
@@ -549,35 +491,8 @@ def _add_machine_commands(sub, handlers: CommandHandlers) -> None:
     )
     machine_unlink.set_defaults(func=handlers["cmd_unlink"])
 
-    machine_wait = machine_sub.add_parser(
-        "wait-until-command",
-        help="Block until a machine command (by id) is processed; print its result.",
-    )
-    machine_wait.add_argument(
-        "--id", required=True, help="Command id to wait for (e.g. a create request_id)."
-    )
-    machine_wait.add_argument(
-        "--timeout", type=float, default=600.0, help="Seconds to wait (default 600)."
-    )
-    machine_wait.add_argument(
-        "--bridge-url",
-        default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
-    )
-    machine_wait.set_defaults(func=handlers["cmd_machine_wait_until_command"])
 
-
-def _add_api_and_attach_commands(sub, handlers: CommandHandlers) -> None:
-    api = sub.add_parser(
-        "api",
-        help="Inspect the local bridge HTTP API config",
-    )
-    api_sub = api.add_subparsers(dest="api_cmd", required=True)
-    api_sub.add_parser(
-        "status",
-        help="Print bind address, allowed origins, and pairing status",
-    ).set_defaults(func=handlers["cmd_api_status"])
-
+def _add_attach_command(sub, handlers: CommandHandlers) -> None:
     attach = sub.add_parser(
         "ws-local",
         help=(
@@ -593,9 +508,10 @@ def _add_api_and_attach_commands(sub, handlers: CommandHandlers) -> None:
         help="Passcode that decrypts the bundle (matches the create-agent UI).",
     )
     attach.add_argument(
-        "--bridge-url",
+        "--daemon-url",
+        dest="daemon_url",
         default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
+        help="Daemon ws-local base URL (default: %(default)s).",
     )
     attach.add_argument(
         "--session-dir",

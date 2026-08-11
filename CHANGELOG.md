@@ -6,6 +6,552 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The runtime foundation now has two long-lived local Drivers and one Docker
+  compatibility runtime.** Local Claude Code uses stream-json, local Codex uses
+  app-server, and Docker supports Claude Code only. Docker Codex and the
+  Hermes/Gemini execution paths are no longer admitted; their names remain
+  design-only so stale configs fail with an explicit diagnostic.
+
+- **Port 63387 is now exclusively the loopback ws-local service.** The retired
+  browser-facing Local Bridge, its pairing/API commands, and the
+  `--with-local-bridge` startup flag have been removed.
+
+## [1.2.0] — 2026-08-10
+
+### Added
+
+- **Codex agents now report and control their live context window.** Local and
+  Docker workers persist the model-reported maximum and selected compact point,
+  attach current usage to completed-turn events, and translate per-agent
+  compact percentages into Codex app-server session limits. The default follows
+  Codex's model-derived limit, while 75%, 50%, or 30% overrides are available.
+
+- **Per-agent Claude Code auto-compaction controls and context telemetry.**
+  Operators can select Claude's session-reported default or an earlier 75%,
+  50%, or 30% threshold for local and Docker CLI agents. The desktop and web
+  interfaces show the session's actual context window and compact point, while
+  completed turns report live usage without persisting it as runtime config.
+
+- **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
+  runs `codex app-server` in its own container while reusing the
+  operator's Codex account credentials. Per-agent Codex state, skills,
+  Puffo MCP tools, and container-reachable host MCP registrations are
+  mounted or synchronized into the runtime.
+
+### Changed
+
+- **Claude Code auto-compaction now uses the supported token-window CLI flag.**
+  The existing 30%, 50%, and 75% controls are translated to
+  `--autocompact <tokens>` for local and Docker agents instead of relying on
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. Claude's 100K minimum is enforced, and
+  runtime telemetry reports the effective percentage after that adjustment.
+  The bundled Docker runtime now pins a Claude Code release that supports the
+  flag.
+
+- **Port 63387 is now dedicated to `ws-local` message transport.** The legacy
+  Local Bridge HTTP APIs, pairing commands, and browser-facing management
+  surface have been removed; externally hosted agents continue to attach over
+  the `/v1/ws-local` WebSocket endpoint. Browser-originated WebSocket requests
+  and non-loopback bind addresses are rejected.
+
+- **`cli-docker` now supports only Claude Code and Codex.** Gemini CLI
+  and Hermes were removed from the Docker runtime matrix and bundled
+  image. Hermes remains available through `cli-local`.
+
+### Fixed
+
+- **Claude Code uses subscription authentication unless API-key mode is
+  explicitly enabled.** Ambient `ANTHROPIC_API_KEY` values are ignored for
+  local and Docker CLI agents, including per-agent environment and settings
+  overrides. A daemon-owned `anthropic.api_key` is passed to Claude Code only
+  when `anthropic.cli_use_api_key: true` is set. Operators can manage both
+  values with `puffo-agent config --anthropic-api-key KEY` and
+  `--anthropic-cli-use-api-key true|false`. API-key failures now show the
+  correct recovery steps and clear after the next successful turn.
+
+- **Codex Docker agents can write to their mounted workspace reliably.** The
+  container is now the effective filesystem sandbox, avoiding unsupported
+  nested sandboxing, and resumed local and Docker sessions reapply their
+  working directory and permission policy instead of falling back to
+  read-only access.
+
+- **Claude context telemetry no longer invents limits for unknown models.**
+  A transient context query timeout remains retryable on later turns, while
+  configured compact thresholds remain authoritative because Claude's context
+  query reports its raw default even when an environment override is active.
+
+- **Codex host MCP sync now includes portable OAuth credentials.** Codex
+  agents use the file-backed MCP OAuth store, and `sync_host_mcp()` copies
+  the selected credential into the isolated agent home for both
+  `cli-local` and `cli-docker`. Encrypted OS-keyring credentials are
+  detected and reported instead of being falsely reported as synchronized.
+
+- **Codex Docker workers now discover their synchronized MCP servers.**
+  The in-container Puffo MCP subprocess reads the mounted Codex home
+  instead of retaining an inaccessible host path in `CODEX_HOME`.
+
+- **Docker Desktop is now discovered even when it is missing from the
+  daemon's `PATH`.** Docker uses the same cached resolver as Claude Code
+  and Codex, including an explicit `PUFFO_DOCKER_BIN` override,
+  reconstructed user `PATH`, and known desktop-app locations. Every
+  Docker subprocess uses the resolved absolute path, and the desktop
+  home page now shows that install location instead of the Hermes
+  “Coming soon” placeholder. Live paths and known installations take
+  precedence over the executable-validated, user-writable disk cache.
+
+- **Transient Docker failures no longer trigger container recreation.**
+  Container and harness probes distinguish an explicit stale result
+  from an unavailable Docker daemon, refuse `docker rm -f` when state is
+  unknown, and preserve the host-mounted workspace and Codex session
+  during legitimate rebuilds. Docker control commands now have bounded
+  timeouts and kill and reap their child process on timeout or
+  cancellation.
+
+- **`cli-docker` Codex setup now matches the selected harness.** CLI
+  creation resolves and validates Codex before persisting an OpenAI
+  Docker agent, host Codex skills are synchronized into its isolated
+  home, and remote MCP bearer-token environment variable names are
+  forwarded through `docker exec` without exposing their values.
+  Desired MCP templates with host-only commands are skipped for both
+  container harnesses instead of failing later at first tool use.
+
+- **Codex shell commands now run in the cli-docker workspace.** The
+  app-server process runs through `docker exec`, but new threads
+  previously inherited the daemon's host cwd. On Windows that passed a
+  `C:\\...` path into the Linux container, so even read-only commands
+  failed before shell creation. Container threads now use `/workspace`
+  and rotate legacy sessions that persisted the invalid cwd; switching
+  back to `cli-local` also rotates a container thread whose `/workspace`
+  cwd cannot exist on the host.
+
+- **Puffo MCP tools now start inside `cli-docker`.** The image pins the
+  MCP SDK below 2.0 and includes the complete non-GUI dependency set
+  required by the in-container Puffo MCP server. Previously the server
+  exited during import, leaving tools such as
+  `mcp__puffo__send_message` unavailable to Claude Code.
+
+- **Skill ids ending in a newline are no longer accepted.** The daemon
+  validated ids with Python's `$`, which also matches immediately before
+  a trailing newline, so a name like `my-skill\n` passed on its way to
+  `.claude/skills/` while the server's own constraint rejected it. The
+  gap was reachable — `install_skill` takes its name from an
+  agent-supplied tool call. The anchor is now `\Z`, matching the server.
+  The two copies of the rule, in the desired-skill installer and the MCP
+  host tools, were also folded into one shared constant so they can't
+  drift apart again.
+
+## [1.1.6] — 2026-07-28
+
+### Changed
+
+- **`role_short` is now single-source-derived from `role` (PUF-401).**
+  The chip label is always derived from the `<short>: <description>`
+  role on every write path (bridge, CLI, provision, control-WS, agent
+  detail) instead of being stored independently, so it can no longer
+  orphan a stale value. Explicit `role_short` / `--role-short` is
+  deprecated: still accepted for backward compatibility but ignored,
+  with a warning when the supplied value differs from the derived one.
+  A daemon-startup backfill repairs a stale on-disk `role_short` before
+  the first server sync, so a restart fixes the chip instead of pushing
+  the stale value back.
+
+- **Default agent task timeout raised 600s → 1800s (30 min) (PUF-399).**
+  `runtime.task_timeout_seconds` — the per-agent per-turn wall-clock
+  budget — now defaults to 30 minutes so long-running projects aren't
+  cut off at 10 min. Operators can still override it per-agent in
+  `agent.yml`; only the default changed.
+
+### Added
+
+- **Plaintext (non-E2EE) sending.** Agent replies now go out as
+  plaintext envelopes by default. The daemon decides per send: if the
+  turn's triggering bundle contained an encrypted message, or the
+  target thread's root is encrypted, the reply stays E2EE — the agent
+  never downgrades a conversation's confidentiality. The encryption
+  context is scoped to the turn (cleared when it ends), so sends
+  outside any turn use the plaintext default. Applies to all send
+  paths (LLM replies, MCP tools, daemon system DMs); attachments
+  remain encrypted blob references.
+
+### Fixed
+
+- **Cap `mcp` below 2.0.** The 2.x SDK dropped the bundled
+  `mcp.server.fastmcp`; pin `mcp>=1.0,<2` until the tool servers move
+  to the standalone `fastmcp` package.
+
+## [1.1.5] — 2026-07-23
+
+### Added
+
+- **Agent DM Gate.** Inbound DMs pass through a trust ladder: blocked
+  senders are dropped silently before anything is stored; the operator
+  and the operator's other agents become contacts automatically;
+  approved contacts and senders sharing a space with the agent pass;
+  anyone else is held while the operator is asked (reply `y` to
+  allowlist and deliver, `n` to block and drop). The operator also gets
+  a recurring heads-up — "FYI, <name> is sending direct messages to
+  me." — for any non-trusted sender, at most once per 72 hours per
+  sender. New MCP tools let agents read and manage their own lists
+  (allow/blocklists are per-agent — each identity keeps its own):
+  `get_dm_allowlists()`, `get_dm_blocklists()`, `add_dm_allowlist(slug)`,
+  and `update_dm_blocklist(slug, on)`. The `auto_accept_dm` setting becomes a hidden per-agent
+  `agent.yml` flag (its CLI/UI/remote toggles are removed) and now
+  defaults to `false`, so unknown senders are held for approval out of
+  the box; setting it `true` skips only that hold.
+
+### Fixed
+
+- **Operator `y`/`n` replies crashed the daemon-side intercept.** A
+  missing attribute initialization shipped with 1.1.4's
+  command-permission timeout made the first `y`/`n` reply raise inside
+  the WS callback, so command approvals (and any other in-thread
+  approval) silently never completed.
+
+## [1.1.4] — 2026-07-22
+
+### Fixed
+
+- **Thread-root integrity, both directions.** Incoming `thread_root_id`
+  now normalizes to the canonical root before a message is stored: a
+  reference to a non-root walks up to the true root, and a reference
+  that is cross-channel, unknown, or corrupt (cycle / over-deep chain)
+  is admitted as a new root instead. Outbound sends apply matching
+  rules — a `root_id` naming a daemon-local system message (which has
+  no server row) ships as a new top-level message, a root from another
+  channel or DM is rejected with a correctable error, and a non-root
+  auto-corrects to its thread root. Previously a reply to a system
+  message triggered a spurious "thread chain looks corrupt" warning,
+  and DM sends skipped root validation entirely.
+
+- **Hidden root-level posts.** Outbound visibility is now decided after
+  thread-root resolution, so a message whose root gets wiped is
+  correctly treated as root-level and forced visible. Previously it
+  could ship hidden — and root-level messages can't fold, so it was
+  invisible in every client.
+
+- **cli-local codex agents reload MCP tools after a tool-surface change
+  (PUF-392).** Codex snapshots its MCP tools at session start and never
+  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
+  so a change to the puffo tool surface (e.g. the new `inference_level`
+  arg) left a resumed codex session on a stale set — it saw the doc but
+  the callable tool never updated. The daemon now fingerprints the tool
+  surface on boot and, when it changed, drops each cli-local codex
+  agent's CLI session so a fresh conversation reloads the tools
+  (claude-code, cli-docker, and ws-local are unaffected).
+
+### Added
+
+- **Operators tab: display names + per-card Disconnect.** Each linked
+  operator's card now shows the operator's human display name (resolved
+  on demand via a machine-authed lookup, falling back to the slug for
+  legacy pairings and until the server endpoint ships) plus a
+  **Disconnect** button — confirm dialog → revoke the pairing (server +
+  local) and pause that operator's agents.
+
+- **Self-serve `inference_level` via `refresh` (PUF-392).** Agents can
+  now `refresh(inference_level="...")` to change reasoning effort
+  mid-session — standalone or alongside a harness+model swap — which
+  persists to `agent.yml` and respawns the worker. Values are validated
+  per-harness (codex: `minimal|low|medium|high`; claude-code:
+  `low|medium|high|xhigh`), matching the effort axis PUF-373 added, so an
+  agent no longer needs a manual `agent.yml` edit or a web round-trip.
+
+- **Receive plaintext (non-E2EE) messages.** The daemon now accepts the
+  `plaintext_message_envelope` format: the signed body is verified in the
+  clear (no HPKE/AEAD, the payload's own `sender_slug` is authoritative)
+  and routed through the same store/dispatch sink as E2EE. Receive-only —
+  sending stays E2EE. Pairs with the core + puffo-server plaintext work.
+
+- **`is_encrypted` on every message.** Everything the agent sees — the
+  live inbound metadata block and the `get_post` / `get_channel_history` /
+  `get_dm_history` / `get_thread_history` tools — now shows whether a
+  message was end-to-end encrypted or sent in the clear. Stored per
+  message (a SQLite migration backfills pre-existing rows as encrypted).
+
+## [1.1.3] — 2026-07-17
+
+### Added
+
+- **Heartbeat reports `inference_level` (PUF-373).** The runtime info in
+  the agent heartbeat now carries the configured inference level so the
+  web edit UI can display the current value instead of always showing
+  the harness default.
+
+- **Per-agent inference level (PUF-373).** `runtime.inference_level`
+  (`low|medium|high|xhigh`, empty = harness default) applies to both
+  harnesses: codex gets `model_reasoning_effort` in its config.toml
+  (`xhigh` dropped — no codex tier), claude-code gets `--effort` on the
+  spawn, on cli-local and cli-docker alike. Settable from the portal UI
+  (harness-aware dropdown), the local bridge runtime editor, and a
+  linked machine's create/edit commands — invalid values are rejected
+  at every write surface.
+
+- **48h catch-up staleness gate (PUF-384).** On WS reconnect / daemon
+  restart / resume-from-pause, redelivered messages older than
+  `catchup_stale_hours` (daemon.yml, default 48; `<= 0` disables) are
+  stored to chat history and reported processed server-side, but skip
+  the LLM pipeline — no token burn replaying old context, no late
+  replies into conversations that have moved on.
+
+- **cli-local command permission over puffo-core.** The PreToolUse hook
+  gains a daemon transport: when the legacy `PUFFO_URL`/`PUFFO_BOT_TOKEN`
+  pair is absent, it POSTs `/v1/rpc/{agent}/permission-request` and the
+  daemon DMs the operator a `/permission` card, resolves their threaded
+  `y`/`n`, and returns allow/deny/timeout for the hook's exit protocol.
+  A late reply to a timed-out request gets an "already timed out — I did
+  NOT run it" note instead of a false confirmation.
+
+- **Operator report on auto-accepted channel invites.** Space-owner
+  channel invites are server-auto-accepted with no approval ask; the
+  agent now DMs the operator an informational report (inviter, channel,
+  space) instead of joining silently.
+
+### Changed
+
+- **Every operator y/n ask now renders as a `/permission` card.** Space
+  and channel invite prompts and agent-requested leave approvals build
+  their DM through one shared constructor, so web/mobile clients show
+  consistent Yes/No buttons that post `y`/`n` into the prompt's thread —
+  the same replies the daemon already accepts.
+
+### Fixed
+
+- **Catch-up redelivery loop on large backlogs.** Observed live as a
+  paused-for-weeks agent redelivering the same 200+ messages every
+  ~70s forever. Three compounding causes fixed: per-envelope
+  processing reports stretched catch-up past the WS keepalive window
+  (now buffered into one chunked `end:batch` POST); the single
+  end-of-loop ack lost all progress when the connection died (now
+  acked every 25 envelopes); and WS-frame acks landed in a dead pipe —
+  the server's pings get no pong until the listen loop starts — so
+  catch-up acks now go over HTTP `POST /messages/ack` (matching the
+  web client's pending-drain) and pending shrinks monotonically.
+
+- **Stale channel cache self-heals (PUF-376).** A membership event
+  dropped during a WS reconnect used to leave a genuinely-member
+  channel unaddressable by `send_message` until a daemon restart.
+  The member/channel cache now re-warms on every (re)connect, and a
+  `ch_` lookup miss re-warms (5s-debounced) and re-checks before
+  failing loud — on every runtime, including the cli-local /
+  cli-docker data-service path.
+
+## [1.1.2] — 2026-07-14
+
+### Added
+
+- **Report each machine's CLI usage-budget to puffo-server (PUF-364).**
+  The daemon probes every installed runtime's plan budget — claude-code
+  via `claude -p /usage`, codex via a throwaway app-server driven through
+  one trivial turn (codex only emits its budget after a turn) — normalizes
+  both to `{session, weekly}` with `used_pct` and a unix-epoch `resets_at`,
+  and POSTs the whole per-machine snapshot (latest replaces on the server).
+  Runs every 6h, or immediately on the machine-level `refresh_usage`
+  control command the UI sends. Adds `tzdata` as a dependency so Windows
+  can resolve the named timezone in claude's reset times.
+
+- **Per-agent codex turn timeout: `runtime.task_timeout_seconds` in
+  `agent.yml` (PUF-375).** Default stays 600s; raise it for agents
+  running long reasoning or complex tasks. A timed-out turn now posts
+  an operator-facing "⏱ Task exceeded the N-minute timeout" reply
+  instead of silence (and says whether the codex session was reset).
+
+### Fixed
+
+- **Stop the CLI's model-usage-cap fallback from leaking to operators
+  (PUF-380).** A `You've reached your <Model> limit. Run /usage-credits …`
+  line from the harness now matches the worker's non-auth leak filter.
+  The pattern is model-agnostic and apostrophe-robust, so future models and
+  curly-quote variants are covered without another one-off.
+
+- **codex mid-reconnect turn failures no longer drop the batch or flip
+  a false red (PUF-375).** A `turn failed: Reconnecting... N/M` from
+  the codex App Server is transient — it now routes into the existing
+  retry substrate (re-enqueue + backoff) instead of being swallowed as
+  an unhandled error, and it no longer counts toward the wedged-thread
+  rotation threshold.
+
+- **codex is now discovered inside ChatGPT.app on macOS (PUF-372
+  follow-up).** A ChatGPT desktop-app update moved the bundled codex
+  binary out of Codex.app, leaving agents unable to spawn. The resolver
+  now checks `ChatGPT.app/Contents/Resources/codex` (system and
+  per-user `Applications`, preferred over a leftover Codex.app copy),
+  which also re-points the `~/.local/bin/codex` fs-sandbox shim at the
+  new location. The "codex binary not found" error now names the bundle
+  paths tried and the restart-after-app-update remedy.
+
+## [1.1.1] — 2026-07-10
+
+### Fixed
+
+- **codex `view_image` (and other self-invoking codex tools) work on
+  macOS hosts where codex isn't at `~/.local/bin/codex` (PUF-372).**
+  codex's fs-sandbox helper re-invokes the CLI via that hardcoded path,
+  which doesn't exist on Homebrew / Codex.app installs — the tool died
+  with `execvp() ... No such file or directory`. The daemon now points
+  `~/.local/bin/codex` at the resolved binary before spawning (a real
+  file or live symlink there is never touched; a dangling link from a
+  moved install is re-pointed) and additionally prepends the binary's
+  dir to the subprocess `PATH` for name-based re-invokes.
+
+- **cli-docker no longer injects host-local MCP configs that can't run in
+  the container (PUF-34).** Host-sync now recognizes macOS host-only
+  paths (`/opt/homebrew`, `/opt/local`, `/Volumes`, `/private`) and also
+  catches host paths hidden in `args` behind a bare `npx`/`uvx` launcher.
+  Detected servers are skipped with an actionable warning ("install in
+  the image or bind-mount, then re-sync") instead of being injected as
+  dead config that failed on first use; `/tmp` args stay container-valid
+  (a `/tmp` output path is fine, a `/tmp` binary is still host-staged),
+  and the container's own `/opt/puffoagent-pkg` keeps resolving.
+
+- **Profile edits now take effect on refresh — a changed prompt forces a
+  fresh CLI session (PUF-36).** The CLI bakes the system prompt at
+  session creation, so `--resume` replayed the old one and profile edits
+  appeared silently ignored. The refresh path now compares the rebuilt
+  prompt's primer + profile slice against the current one and drops the
+  session only when that slice actually changed: memory-only rebuilds,
+  no-op refreshes (host-sync, skill installs), display_name/role-chip
+  edits, restarts, and model swaps all keep the conversation; an
+  explicit `refresh(session=True)` still always drops it.
+
+- **Role edits reach the agent's prompt.** Editing role from the web
+  updated `agent.yml` and the server identity but never the
+  `**Role:**` line in `profile.md`, so the in-prompt role stayed stale
+  on both edit paths (local bridge + control-WS). Both now rewrite the
+  first `**Role:**` line; custom profiles without one are untouched.
+
+- **Over-limit message bursts no longer drop the whole batch (PUF-363).**
+  When a thread's queued messages would, concatenated into the single
+  per-turn input block, exceed the harness input-byte budget (Claude
+  Code's 180KB pre-send cap), the consumer now dispatches the largest
+  FIFO prefix that fits and defers the remainder to following turns —
+  split only at message boundaries, nothing dropped, nothing reordered.
+  Previously the adapter rejected the whole over-limit batch with a
+  "reduce or split" reply and every message in it went unprocessed.
+  Codex gets a 4MB safety-net ceiling (it has no adapter input cap).
+
+- **Relay TLS now trusts certifi's CA bundle, so linking works on hosts
+  without a populated OpenSSL cert store.** Linking against
+  `https://chat.puffo.ai` died with `SSL: CERTIFICATE_VERIFY_FAILED —
+  unable to get local issuer certificate` on interpreters whose ambient
+  cert store isn't set up (python.org's macOS Python before running
+  "Install Certificates.command", some uv-managed builds); local testing
+  never caught it because it ran against plain `http://localhost:3000`.
+  `create_remote_http_session` now builds a module-level SSL context
+  that trusts the system store PLUS certifi's bundle (so corporate-proxy
+  roots keep working) and applies it to both the SOCKS `ProxyConnector`
+  and the default `TCPConnector`, and
+  every relay-facing HTTPS/WSS call site (link code mint / redeem /
+  approval poll / unlink, the control-WS reverse channel + `/me` liveness,
+  active-recipient fetch, slug-binding finalize) now routes through that
+  factory instead of a bare `aiohttp.ClientSession()`. `certifi` is now a
+  declared dependency.
+
+### Changed
+
+- **Long-message redaction thresholds raised to 16000/8000 chars**
+  (inline cap / `get_post_segment` page size, from 4000/2000). Per-turn
+  totals are now bounded by greedy-fill batching, so the inline cap only
+  guards session-lifetime context growth — typical code/log pastes
+  inline whole instead of collapsing to a preview placeholder. Both
+  limits now live in one shared `puffo_agent.limits` module, and the
+  redaction placeholder cites `segment_size` explicitly so paging stays
+  aligned on hosts that override the daemon page size.
+
+- **Runbook for Codex Apps connector scope failures.** The `use-host-mcp`
+  skill body now explains that Codex Apps connectors (`mcp__codex_apps__*`
+  — Drive, Gmail, …) are codex-internal, not puffo-managed MCP, so
+  `list_mcp_servers` can't see them and `sync_host_mcp` can't fix them.
+  When writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`, the fix is to
+  reconnect the connector in interactive codex (approving write scopes),
+  then `refresh(host_sync=True)` on the agent (`session=True` too on
+  cli-docker) and allow one worker turn. Docs only — no code path change.
+
+### Removed
+
+- **`SETUP_FOR_AI.md`.** The standalone AI-assistant onboarding guide was
+  last meaningfully updated at 0.9.4, had drifted from the current setup
+  flow, was referenced by nothing, and was never packaged. The living
+  onboarding pointer is the hosted `https://chat.puffo.ai/setup.md` plus
+  the in-agent skills.
+
+## [1.1.0] — 2026-07-08
+
+### Added
+
+- **Sender-identity metadata on inbound messages.** Two new fields land
+  in the structured user-block agents see: `sender_owner_slug` names
+  the operator behind an agent sender (present only for agents, sourced
+  from the attestation chain via `/identities/profiles`), and
+  `is_from_operator: true` marks a message from THIS agent's own
+  operator. Both emit conditionally so older agents don't see keys
+  their primer doesn't document. Zero extra HTTP round-trips: the
+  daemon reads `owner_slug` off the same `/identities/profiles` fetch
+  that resolves the sender's display name, caches it under the profile
+  TTL so re-ownership propagates without a daemon restart. Primer
+  documents both. `sender_type` now reads `agent` (was always
+  `human` — the upstream is-bot flag is unset pending a server-side
+  signal, but `owner_slug`'s presence is already a reliable agent
+  marker); the display value is renamed `bot` → `agent` to match the
+  `(agent)` mention suffix.
+
+### Changed
+
+- **Priority bands now receive the real is-agent signal.** The
+  message-queue priority computation had `sender_is_bot` hardcoded
+  `False` (puffo-core exposes no is-bot flag), so every sender landed
+  in the human bands and the agent bands were dead code. `owner_slug`
+  (agent-only, already fetched per sender) now drives the banding:
+  human traffic outranks agent traffic, mentions outrank both floors.
+  Behavior change in agent-dense fleets — an agent's DM/mention ranks
+  below a human's, and agent channel chatter yields to human channel
+  messages when both are queued. The flag is also renamed
+  `sender_is_bot` → `sender_is_agent` throughout, including the
+  message-dict key that rides ws-local bundles (the old key only ever
+  carried a hardcoded `false`, so no consumer could have relied on
+  its value). Mention entries follow suit: `is_bot` → `is_agent`
+  (same bundle surface; the rendered `(agent)` / `(human)` suffixes
+  are unchanged).
+
+- **Dead `followup_messages_since` removed from the primer + code.**
+  No code path has emitted the field since thread batching replaced
+  single-message dispatch, but the primer still documented it —
+  agents went looking for it and misreported batched messages as
+  message loss. The primer now documents the real shape (one turn
+  may carry several metadata blocks) and points agents at
+  `get_thread_history` / `get_channel_history` when mid-turn
+  freshness matters.
+
+### Fixed
+
+- **Multi-message batches reached CLI agents with only the last
+  message.** The thread-batched queue correctly coalesced same-root
+  messages that arrived while an agent was mid-turn, but the shell
+  appended each batch message as its own user log entry — and CLI
+  adapters transmit only the latest entry per turn (the resume-based
+  session already holds prior history), so every batched message
+  except the last was silently dropped before reaching the
+  subprocess, in DMs and channels alike. The whole batch now lands as
+  one user entry (per-message metadata blocks, blank-line separated),
+  fixing all CLI-family runtimes at the shell layer.
+
+## [1.0.8] — 2026-07-08
+
+### Added
+
+- **`puffo-agent machine link --code ABCD-1234`.** Claim a link code
+  the operator generated in the puffo web app (My Agents → Link
+  machine → *Generate code*) instead of minting one on this machine
+  and asking a browser to approve it. The machine registers itself
+  (idempotent) and POSTs `/v2/machines/links/<code>/redeem`; the
+  operator's client then issues the control cert, which the existing
+  approval poll picks up. Codes are case-insensitive and dashes are
+  optional — `abcd-2345`, `ABCD2345`, and `AB-CD-23-45` all normalize
+  to the same code. Without `--code` the mint-and-open-browser flow
+  is unchanged; the daemon still auto-starts. Requires puffo-server's
+  `/redeem` endpoint (paired server PR).
+
 ### Fixed
 
 - **Pre-turn stdout drain — no more cron chatter leaking into replies.**
@@ -3814,7 +4360,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.10.0a2...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v1.2.0
 [0.10.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a2
 [0.10.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3

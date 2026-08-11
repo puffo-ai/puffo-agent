@@ -193,16 +193,28 @@ class StandardWorkerRun:
         )
         outbox_ref[0] = outbox
         persisted = outbox.state()
-        session_ref = persisted.get("session_ref", "") or f"session_{uuid.uuid4().hex}"
         preparer = LocalRuntimePreparer(worker.daemon_cfg, worker.agent_cfg)
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
+            persisted_session_fingerprint=persisted.get(
+                "session_fingerprint", ""
+            ),
         )
+        if prepared.discarded_persisted_session:
+            session_ref = f"session_{uuid.uuid4().hex}"
+            active_turn_ref = None
+        else:
+            session_ref = (
+                persisted.get("session_ref", "")
+                or f"session_{uuid.uuid4().hex}"
+            )
+            active_turn_ref = persisted.get("active_turn_ref") or None
         outbox.set_active_turn(
-            persisted.get("active_turn_ref") or None,
+            active_turn_ref,
             session_ref=session_ref,
             native_session_id=prepared.native_session_id,
+            session_fingerprint=prepared.session_fingerprint,
         )
         worker._adapter = build_local_runtime_adapter(
             prepared, outbox=outbox, logical_session_ref=session_ref
@@ -287,6 +299,9 @@ class StandardWorkerRun:
                 persisted.get("active_turn_ref") or None,
                 session_ref=context.runtime_session_ref,
                 native_session_id=worker._adapter.get_provider_session_id() or "",
+                session_fingerprint=(
+                    context.prepared_local_runtime.session_fingerprint
+                ),
             )
             context.prepared_local_runtime.finalize_legacy_session_migration()
         if warm_ok:
@@ -449,9 +464,7 @@ class StandardWorkerRun:
                 worker._enter_auth_failed(context.paths.agent_id)
             raise
         else:
-            worker_module.Worker._resolve_health_on_success(
-                worker.runtime, context.paths.agent_id, logger
-            )
+            worker._resolve_health_after_success(context.paths.agent_id)
         if reply:
             logger.warning(
                 "agent %s: suppressed global retry plain output; outbound "
@@ -470,9 +483,7 @@ class StandardWorkerRun:
                     worker._enter_auth_failed(context.paths.agent_id)
                 raise
             else:
-                worker_module.Worker._resolve_health_on_success(
-                    worker.runtime, context.paths.agent_id, logger
-                )
+                worker._resolve_health_after_success(context.paths.agent_id)
             worker.runtime.msg_count += 1
             worker.runtime.last_event_at = int(time.time())
             if reply:

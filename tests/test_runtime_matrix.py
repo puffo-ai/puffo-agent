@@ -93,7 +93,7 @@ def test_validate_triple_accepts_supported_combinations(
     # explicitly, and via the provider-resolved default harness.
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_HERMES, "design-only"),
     (RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, HARNESS_GEMINI_CLI, "design-only"),
-    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, "", "design-only"),
+    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, "", "Driver runtime"),
     (RUNTIME_CLI_SANDBOX, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE, "reserved"),
 ])
 def test_validate_triple_rejects_unsupported_combinations(

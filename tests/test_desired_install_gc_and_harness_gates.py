@@ -1,14 +1,11 @@
-"""PUF-273: spawn-time provenance GC + cli-docker reject + hermes
-early-return.
+"""Spawn-time provenance GC, Docker asset wiring, and harness gates.
 
 Covers the three follow-up items deferred from PUF-268:
 
   (a) ``prune_stale_desired_skills`` removes only desired-installed-
       only skill dirs whose ids no longer appear in the current
       desired list. host-synced and agent-installed markers win.
-  (b) The cli-docker branch in ``portal.worker._build_adapter``
-      raises when an agent.yml carries non-empty desired_skills /
-      desired_mcps.
+  (b) The cli-docker branch forwards desired assets to its installer.
   (c) ``install_desired`` early-returns for harness=hermes without
       writing any skills or MCPs.
 """
@@ -267,7 +264,7 @@ def _make_agent_cfg(
     desired_skills: list[str] | None = None,
     desired_mcps: list[str] | None = None,
 ):
-    """Minimal stub: only the fields the cli-docker reject gate reads."""
+    """Minimal stub for the cli-docker construction boundary."""
     from types import SimpleNamespace
     runtime = SimpleNamespace(
         kind=runtime_kind,
@@ -290,6 +287,7 @@ def _make_agent_cfg(
         runtime=runtime,
         desired_skills=desired_skills or [],
         desired_mcps=desired_mcps or [],
+        env_overrides={},
         puffo_core=puffo_core,
         resolve_workspace_dir=lambda: Path("/tmp/ws"),
         resolve_claude_dir=lambda: Path("/tmp/ws/.claude"),
@@ -339,16 +337,29 @@ def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
     assert "puffo_core_keys_dir" in captured
 
 
-def test_build_adapter_cli_docker_rejects_non_empty_desired_mcps():
+def test_build_adapter_cli_docker_forwards_desired_mcps(monkeypatch):
     from puffo_agent.portal.worker import build_docker_adapter
+    from puffo_agent.agent.adapters import docker_cli as dc
+    from puffo_agent.agent import harness
 
+    captured: dict = {}
+
+    class _Stub:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    class _Harness:
+        def name(self) -> str:
+            return "claude-code"
+
+    monkeypatch.setattr(dc, "DockerCLIAdapter", _Stub)
+    monkeypatch.setattr(harness, "build_docker_harness", lambda _: _Harness())
     agent_cfg = _make_agent_cfg(
         runtime_kind="cli-docker", desired_mcps=["m1"],
     )
-    with pytest.raises(RuntimeError) as ei:
-        build_docker_adapter(_make_daemon_cfg(), agent_cfg)
-    assert "cli-docker" in str(ei.value)
-    assert "desired_mcps" in str(ei.value)
+    build_docker_adapter(_make_daemon_cfg(), agent_cfg)
+
+    assert captured["desired_mcps"] == ["m1"]
 
 
 def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
@@ -380,13 +391,22 @@ def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
     assert captured.get("agent_id") == "t-agent"
 
 
+@pytest.mark.parametrize("harness", ["hermes", "gemini-cli"])
+def test_build_adapter_rejects_design_only_docker_harnesses(harness):
+    from puffo_agent.portal.worker import build_docker_adapter
+
+    agent_cfg = _make_agent_cfg(runtime_kind="cli-docker")
+    agent_cfg.runtime.harness = harness
+
+    with pytest.raises(RuntimeError, match="design-only"):
+        build_docker_adapter(_make_daemon_cfg(), agent_cfg)
+
+
 @pytest.mark.asyncio
-async def test_docker_install_desired_skills_passes_skills_only(
+async def test_docker_install_desired_passes_assets_once(
     monkeypatch, tmp_path,
 ):
-    """The docker adapter installs skills but never MCPs — MCPs are
-    gated out upstream, so it always calls run_spawn_install with an
-    empty desired_mcps list."""
+    """The Docker adapter forwards both asset classes with its boundary."""
     from puffo_agent.agent.adapters import desired_install
     from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
 
@@ -408,16 +428,18 @@ async def test_docker_install_desired_skills_passes_skills_only(
         agent_home_dir=str(tmp_path),
         shared_fs_dir=str(tmp_path),
         desired_skills=["s1"],
+        desired_mcps=["m1"],
         puffo_core_server_url="u",
         puffo_core_slug="sl",
         puffo_core_keys_dir=str(tmp_path / "keys"),
     )
-    await adapter._install_desired_skills()
+    await adapter._install_desired()
     assert calls["desired_skills"] == ["s1"]
-    assert calls["desired_mcps"] == []
+    assert calls["desired_mcps"] == ["m1"]
+    assert calls["containerized"] is True
     # idempotent — a second call is a no-op
     calls.clear()
-    await adapter._install_desired_skills()
+    await adapter._install_desired()
     assert calls == {}
 
 

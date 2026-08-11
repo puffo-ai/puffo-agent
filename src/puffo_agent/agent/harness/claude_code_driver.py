@@ -7,6 +7,7 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from .driver import (
@@ -14,6 +15,7 @@ from .driver import (
     CompactCapability,
     CompactReceipt,
     CompactRequest,
+    ContextStatus,
     ContextStatusCapability,
     DriverCapabilities,
     Driver,
@@ -39,13 +41,20 @@ class AmbiguousDeliveryError(RuntimeError):
     """Claude may have accepted input before Puffo observed its replay."""
 
 
+class _ContextUsageUnsupported(RuntimeError):
+    pass
+
+
+_CONTEXT_USAGE_TIMEOUT_SECONDS = 2.0
+
+
 def claude_capabilities(compact_advertised: bool = False) -> DriverCapabilities:
     return DriverCapabilities(
         session_resume=True,
         inflight_turn_recovery=False,
         steer=SteerCapability.NONE,
         cancel=CancelCapability.NONE,
-        context_status=ContextStatusCapability.NONE,
+        context_status=ContextStatusCapability.PULL,
         compact=(
             CompactCapability.SESSION_COMMAND
             if compact_advertised
@@ -84,6 +93,10 @@ class ClaudeCodeCliDriver(Driver):
         self._compact_advertised = False
         self._output_block_counter = 0
         self._tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._context_request_counter = 0
+        self._context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._context_usage_supported: bool | None = None
+        self._context = ContextStatus(stale=True)
 
     async def open(
         self, spec: RuntimeSpec, resume: SessionRef | None = None
@@ -224,7 +237,51 @@ class ClaudeCodeCliDriver(Driver):
         return UnsupportedCapability("cancel")
 
     async def context_status(self):
-        return UnsupportedCapability("context_status")
+        if self._context_usage_supported is False:
+            return UnsupportedCapability("context_status")
+        if self._proc is None:
+            return ContextStatus(
+                used_tokens=self._context.used_tokens,
+                context_window=self._context.context_window,
+                stale=True,
+                measured_at=self._context.measured_at,
+            )
+        self._context_request_counter += 1
+        request_id = f"ctx_{self._context_request_counter}"
+        future = asyncio.get_running_loop().create_future()
+        self._context_requests[request_id] = future
+        try:
+            await self._write({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {"subtype": "get_context_usage"},
+            })
+            usage = await asyncio.wait_for(
+                asyncio.shield(future),
+                timeout=_CONTEXT_USAGE_TIMEOUT_SECONDS,
+            )
+        except _ContextUsageUnsupported:
+            self._context_usage_supported = False
+            return UnsupportedCapability("context_status")
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+            return ContextStatus(
+                used_tokens=self._context.used_tokens,
+                context_window=self._context.context_window,
+                stale=True,
+                measured_at=self._context.measured_at,
+            )
+        finally:
+            pending = self._context_requests.pop(request_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+        self._context_usage_supported = True
+        self._context = ContextStatus(
+            used_tokens=_positive_int(usage.get("totalTokens")),
+            context_window=_positive_int(usage.get("rawMaxTokens")),
+            stale=False,
+            measured_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return self._context
 
     async def compact(self, request: CompactRequest):
         if not self._compact_advertised:
@@ -298,13 +355,25 @@ class ClaudeCodeCliDriver(Driver):
         self._active_native_turn_id = ""
         self._tool_calls.clear()
         self._compact_advertised = False
+        self._context_usage_supported = None
+        self._context = ContextStatus(
+            used_tokens=self._context.used_tokens,
+            context_window=self._context.context_window,
+            stale=True,
+            measured_at=self._context.measured_at,
+        )
 
     def _fail_pending_futures(self, message: str) -> None:
-        for future in (self._init, self._pending_replay):
+        for future in (
+            self._init,
+            self._pending_replay,
+            *self._context_requests.values(),
+        ):
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(message))
         self._init = None
         self._pending_replay = None
+        self._context_requests.clear()
 
     async def _write(self, frame: dict[str, Any]) -> None:
         encoded = (
@@ -347,6 +416,9 @@ class ClaudeCodeCliDriver(Driver):
     async def _handle(self, frame: dict[str, Any]) -> None:
         type_ = str(frame.get("type") or "")
         subtype = str(frame.get("subtype") or "")
+        if type_ == "control_response":
+            self._handle_control_response(frame)
+            return
         if type_ == "system" and subtype == "init":
             self._complete_init(frame)
             return
@@ -381,6 +453,27 @@ class ClaudeCodeCliDriver(Driver):
             data={"record_type": type_ or "unknown"},
             native_payload=frame,
         )
+
+    def _handle_control_response(self, frame: dict[str, Any]) -> None:
+        response = frame.get("response")
+        if not isinstance(response, dict):
+            return
+        request_id = str(response.get("request_id") or "")
+        future = self._context_requests.get(request_id)
+        if future is None or future.done():
+            return
+        if response.get("subtype") == "error":
+            future.set_exception(
+                _ContextUsageUnsupported(
+                    str(response.get("error") or "context query failed")
+                )
+            )
+            return
+        usage = response.get("response")
+        if not isinstance(usage, dict):
+            future.set_exception(RuntimeError("invalid context usage response"))
+            return
+        future.set_result(usage)
 
     def _complete_init(self, frame: dict[str, Any]) -> None:
         if self._init is not None and not self._init.done():
@@ -563,6 +656,12 @@ def _normalize_content(value: Any) -> str:
             if isinstance(item, dict) and item.get("type") == "text"
         ).replace("\r\n", "\n")
     return ""
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
 
 
 ClaudeDriver = ClaudeCodeCliDriver

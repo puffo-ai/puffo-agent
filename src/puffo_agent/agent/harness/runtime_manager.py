@@ -189,19 +189,43 @@ class RuntimeManager:
             try:
                 receipt = await self.driver.start_turn(input)
             except BaseException:
-                self.active_turn_ref = None
-                self._active_driver_turn_ref = None
-                self._terminal.pop(logical, None)
+                await self._discard_failed_start_locked(logical, retire=True)
                 raise
-            if isinstance(receipt, UnsupportedCapability) or not receipt.accepted:
-                self.active_turn_ref = None
-                self._active_driver_turn_ref = None
-                self._terminal.pop(logical, None)
+            if isinstance(receipt, UnsupportedCapability):
+                await self._discard_failed_start_locked(logical, retire=False)
+                return receipt
+            if not receipt.accepted:
+                # A negative start receipt can mean the input crossed the
+                # process boundary but its acknowledgement did not. Retire the
+                # native session so an untracked old turn can never overlap the
+                # next logical turn.
+                await self._discard_failed_start_locked(logical, retire=True)
                 return receipt
             self._active_driver_turn_ref = receipt.turn_ref
             self._turn_refs[receipt.turn_ref] = logical
             self.native_turn_id = receipt.native_turn_id
             return replace(receipt, turn_ref=logical)
+
+    async def _discard_failed_start_locked(
+        self, logical: TurnRef, *, retire: bool
+    ) -> None:
+        self.active_turn_ref = None
+        self._active_driver_turn_ref = None
+        self.native_turn_id = ""
+        self._terminal.pop(logical, None)
+        self._permission_refs.clear()
+        self._continuation_admissions.clear()
+        if not retire:
+            return
+        try:
+            await self._retire_runtime_locked(preserve_session=False)
+        except Exception:
+            # Preserve the start failure as the caller-visible error while
+            # still making the next command open a fresh native session.
+            logger.exception("failed to retire runtime after turn start failure")
+            self.opened = None
+            self.native_session_id = ""
+            self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput) -> Any:
         async with self._command_lock:
@@ -233,7 +257,10 @@ class RuntimeManager:
             self._validate_active(turn)
             if permission not in self._permission_refs:
                 raise RuntimeStateError("unknown or stale permission reference")
-            return await self.driver.resolve_permission(permission, decision)
+            receipt = await self.driver.resolve_permission(permission, decision)
+            if not isinstance(receipt, UnsupportedCapability) and receipt.accepted:
+                self._permission_refs.discard(permission)
+            return receipt
 
     async def context_status(self) -> Any:
         async with self._command_lock:
@@ -711,6 +738,10 @@ class RuntimeManagerAdapter(Adapter):
         self.spec_reloader = spec_reloader
         self.compaction_wait_seconds = compaction_wait_seconds
         self.assistant_text_parts: list[str] = []
+        self._latest_context_limits: tuple[int | None, int | None] = (
+            None,
+            None,
+        )
 
     @staticmethod
     def _current_user_input(ctx: TurnContext) -> str:
@@ -907,11 +938,31 @@ class RuntimeManagerAdapter(Adapter):
         status = await self.manager.context_status()
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
+        window = status.context_window
+        threshold: int | None = None
+        pct = self.manager.spec.auto_compact_threshold_pct
+        if window and pct is not None:
+            threshold = int(window * pct / 100)
+            if (
+                self.manager.active_turn_ref is None
+                and self.manager.spec.auto_compact_threshold_tokens != threshold
+            ):
+                await self.manager.reload_resources(
+                    preserve_session=True,
+                    spec=replace(
+                        self.manager.spec,
+                        auto_compact_threshold_tokens=threshold,
+                    ),
+                )
+        self._latest_context_limits = (window, threshold)
         return normalize_context_snapshot(
             used_tokens=status.used_tokens or 0,
-            provider_context_window=status.context_window,
+            provider_context_window=window,
             measured_at=datetime.now(timezone.utc),
         )
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        return self._latest_context_limits
 
     def get_context_capabilities(self) -> ContextCapabilities:
         capabilities = (
@@ -925,7 +976,9 @@ class RuntimeManagerAdapter(Adapter):
             capabilities.context_status, "value", capabilities.context_status
         )
         return ContextCapabilities(
-            native_compaction=compact != "none",
+            native_compaction=(
+                compact != "none" and self.manager.active_turn_ref is None
+            ),
             rollover=False,
             native_measurement=context_status != "none",
             diagnostic="Driver capabilities",

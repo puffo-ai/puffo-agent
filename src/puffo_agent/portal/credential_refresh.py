@@ -36,6 +36,11 @@ from typing import Callable, Optional, Protocol
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
 from ..agent._logging import diagnostic_category
+from .host_assets import (
+    _atomic_write_private,
+    _ensure_private_directory,
+    _set_private_file_mode,
+)
 from .state import (
     sanitize_claude_code_auth_blob,
     sync_host_codex_auth_view,
@@ -734,19 +739,16 @@ class KeychainBackend:
             if not target.is_symlink() and (
                 target.read_text(encoding="utf-8") == view_blob
             ):
+                _ensure_private_directory(agent_home)
+                _ensure_private_directory(agent_claude)
+                _set_private_file_mode(target)
                 return
         except OSError:
             pass
         try:
-            agent_claude.mkdir(parents=True, exist_ok=True)
-            tmp = agent_claude / f".{target.name}.tmp.{os.getpid()}"
-            tmp.write_text(view_blob, encoding="utf-8")
-            try:
-                import stat as _stat
-                tmp.chmod(_stat.S_IRUSR | _stat.S_IWUSR)
-            except OSError:
-                pass
-            os.replace(tmp, target)
+            _ensure_private_directory(agent_home)
+            _ensure_private_directory(agent_claude)
+            _atomic_write_private(target, view_blob)
         except OSError as exc:
             logger.warning(
                 "keychain backend: sync to %s failed: %s",

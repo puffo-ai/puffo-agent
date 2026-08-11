@@ -825,6 +825,7 @@ async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(t
                 "revision": body["revision"],
                 "lifecycle": "scheduled",
                 "status": "acquired",
+                "lease_expires_at": "2030-01-01T00:00:00Z",
             }
 
     store = await make_store(tmp_path / "first")

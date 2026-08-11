@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -60,8 +61,12 @@ def test_legacy_agent_config_load_save_preserves_existing_values(home):
 
     loaded = AgentConfig.load(agent_id)
     assert loaded.runtime.kind == "cli-local"
-    assert loaded.runtime.task_timeout_seconds == 600.0
+    assert loaded.runtime.task_timeout_seconds == 1800.0
     loaded.save()
+
+    if os.name != "nt":
+        assert agent_yml_path(agent_id).parent.stat().st_mode & 0o777 == 0o700
+        assert agent_yml_path(agent_id).stat().st_mode & 0o777 == 0o600
 
     saved = yaml.safe_load(agent_yml_path(agent_id).read_text(encoding="utf-8"))
     assert saved["state"] == "paused"

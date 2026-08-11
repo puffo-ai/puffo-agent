@@ -9,6 +9,7 @@ import pytest
 from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.agent.message_projection import format_message_group
 from puffo_agent.agent.global_inbox_runtime import route_for
+from puffo_agent.agent.inbox_scheduler import InboxPlanner
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
 
@@ -94,6 +95,10 @@ async def test_membership_rendering_persists_and_wakes_work_once(
     assert f'event_type="{event_type}"' in projected
     assert 'actor_identity="@alice"' in projected
     assert route_for(rows[0]).kind == "channel"
+    assert store.target_projection(rows[0]) == "channel:space:channel"
+    assert InboxPlanner.target_projection(rows[0]) == (
+        "channel", "space", "channel"
+    )
     assert client.global_runtime.work == 1
     assert client.global_runtime.delivery == 0
     await store.close()

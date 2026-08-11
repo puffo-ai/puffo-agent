@@ -65,6 +65,7 @@ from ..agent.memory import (
     RECOLLECTION_DIR,
     ensure_memory_tree,
     request_prompt_refresh,
+    safe_memory_scope,
 )
 from ..agent.memory_errors import MemoryHistoryError, MemoryStoreError
 from ..agent.memory_store import (
@@ -81,6 +82,8 @@ SEARCH_DEFAULT_LIMIT = 20
 SEARCH_MAX_LIMIT = 50
 SEARCH_SNIPPET_LIMIT = 200
 SEARCH_PER_FILE_LIMIT = 3
+SEARCH_FILE_READ_LIMIT = 128 * 1024
+SEARCH_TOTAL_READ_LIMIT = 4 * 1024 * 1024
 
 # search_memory scans these, in this fixed order (deterministic
 # results). imports/ is deliberately absent — it is searchable only
@@ -332,44 +335,45 @@ def _store(cfg: MemoryToolsConfig) -> MemoryStore:
 
 def _run_write(cfg: MemoryToolsConfig, tool: str, op, reason: str) -> dict:
     """Primitive → git commit → post-effects → result envelope."""
+    if (
+        not isinstance(reason, str)
+        or "\x00" in reason
+        or len(reason.encode("utf-8")) > 1024
+    ):
+        raise _args_error(
+            tool,
+            f"{tool}: reason must be text no longer than 1024 bytes.",
+            "Use a short audit reason without NUL characters.",
+        )
     _ensure(cfg)
-    try:
-        res = op(_store(cfg))
-    except MemoryStoreError as exc:
-        raise _store_error(tool, exc) from exc
-    logical = res["path"]
-    changed = bool(res["changed"])
-    warnings: list[dict] = []
-
-    commit_id = None
+    store = _store(cfg)
     root = Path(cfg.memory_root)
-    if changed:
-        # Only attempt an audit commit when git is available AND our own
-        # ``.git`` audit repo exists — never stage into an enclosing
-        # repo the memory root happens to sit inside.
-        if memory_git.git_available() and (root / ".git").is_dir():
-            message = memory_git.format_commit_message(
-                tool, [logical], reason,
-            )
-            commit_id = memory_git.commit_memory_change(
-                root, [logical], message,
-            )
-            if commit_id is None:
-                warnings.append({
-                    "code": "memory_git_commit_failed",
-                    "message": (
-                        "Memory changed, but the audit commit failed; "
-                        "the change is saved but not committed."
-                    ),
-                })
-        else:
-            # Graceful degrade — the doc reserves warnings for
-            # post-effect failures; git being absent is just logged
-            # (by ensure_memory_git).
-            logger.info(
-                "memory git unavailable; %s %s left uncommitted",
-                tool, logical,
-            )
+    with store.write_transaction():
+        try:
+            res = op(store)
+        except MemoryStoreError as exc:
+            raise _store_error(tool, exc) from exc
+        logical = res["path"]
+        changed = bool(res["changed"])
+        warnings: list[dict] = []
+        commit_id = None
+        if changed:
+            if memory_git.git_available() and (root / ".git").is_dir():
+                message = memory_git.format_commit_message(tool, [logical], reason)
+                commit_id = memory_git.commit_memory_change(root, [logical], message)
+                if commit_id is None:
+                    warnings.append({
+                        "code": "memory_git_commit_failed",
+                        "message": (
+                            "Memory changed, but the audit commit failed; "
+                            "the change is saved but not committed."
+                        ),
+                    })
+            else:
+                logger.info(
+                    "memory git unavailable; %s %s left uncommitted",
+                    tool, logical,
+                )
 
     briefing_rebuilt = False
     provider_reload = "not_needed"
@@ -409,11 +413,17 @@ def _run_write(cfg: MemoryToolsConfig, tool: str, op, reason: str) -> dict:
 def _scope_files(root: Path, scope: str, pattern: str) -> list[tuple[str, Path]]:
     """(logical path, physical path) pairs under one scope, sorted for
     deterministic scan order; hidden segments and symlinks skipped."""
-    base = root / scope
-    if not base.is_dir():
+    base = safe_memory_scope(root, scope)
+    if base is None:
         return []
+    resolved_root = root.resolve()
     out: list[tuple[str, Path]] = []
     for p in sorted(base.rglob(pattern)):
+        try:
+            if not p.resolve().is_relative_to(resolved_root):
+                continue
+        except OSError:
+            continue
         rel = p.relative_to(root).as_posix()
         if any(seg.startswith(".") for seg in rel.split("/")):
             continue
@@ -434,10 +444,18 @@ def _scan_files(
     returns ``(results, truncated)``."""
     needle = query.lower()
     results: list[dict] = []
+    remaining = SEARCH_TOTAL_READ_LIMIT
+    truncated = False
     for rel, scope, path in files:
-        data = path.read_bytes()
-        if byte_cap is not None:
-            data = data[:byte_cap]
+        cap = min(byte_cap or SEARCH_FILE_READ_LIMIT, remaining)
+        if cap <= 0:
+            return results, True
+        with path.open("rb") as handle:
+            data = handle.read(cap + 1)
+        source_truncated = len(data) > cap
+        truncated = truncated or source_truncated
+        data = data[:cap]
+        remaining -= len(data)
         text = data.decode("utf-8", errors="ignore")
         per_file = 0
         for lineno, line in enumerate(text.splitlines(), start=1):
@@ -457,7 +475,7 @@ def _scan_files(
             per_file += 1
             if per_file >= SEARCH_PER_FILE_LIMIT:
                 break
-    return results, False
+    return results, truncated
 
 
 def _validate_search_args(operation: str, query: object, limit: object) -> int:

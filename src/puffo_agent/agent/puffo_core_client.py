@@ -807,6 +807,9 @@ class PuffoCoreMessageClient:
         parent_id: Optional[str],
         expected_channel_id: Optional[str],
         expected_space_id: Optional[str],
+        *,
+        expected_envelope_kind: str = "",
+        expected_dm_peer: str = "",
     ) -> Optional[str]:
         """Keep a direct parent only when it belongs to this target."""
         return await validate_incoming_parent_id(
@@ -815,6 +818,9 @@ class PuffoCoreMessageClient:
             parent_id=parent_id,
             expected_channel_id=expected_channel_id,
             expected_space_id=expected_space_id,
+            expected_envelope_kind=expected_envelope_kind,
+            expected_dm_peer=expected_dm_peer,
+            expected_self_slug=getattr(self, "slug", ""),
         )
 
     async def _validated_parent(
@@ -839,6 +845,9 @@ class PuffoCoreMessageClient:
         parent_id: Optional[str],
         expected_channel_id: Optional[str],
         expected_space_id: Optional[str],
+        *,
+        expected_envelope_kind: str = "",
+        expected_dm_peer: str = "",
     ) -> Optional[str]:
         """Resolve an inbound reply reference to its canonical thread root."""
         return await resolve_incoming_thread_root(
@@ -847,6 +856,9 @@ class PuffoCoreMessageClient:
             parent_id=parent_id,
             expected_channel_id=expected_channel_id,
             expected_space_id=expected_space_id,
+            expected_envelope_kind=expected_envelope_kind,
+            expected_dm_peer=expected_dm_peer,
+            expected_self_slug=getattr(self, "slug", ""),
         )
 
     async def rewarm_channel_caches(self) -> None:

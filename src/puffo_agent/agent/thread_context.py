@@ -17,6 +17,9 @@ async def validate_incoming_parent_id(
     parent_id: str | None,
     expected_channel_id: str | None,
     expected_space_id: str | None,
+    expected_envelope_kind: str = "",
+    expected_dm_peer: str = "",
+    expected_self_slug: str = "",
 ) -> str | None:
     """Keep a direct parent only when it belongs to the inbound target."""
     if not parent_id:
@@ -27,6 +30,9 @@ async def validate_incoming_parent_id(
         parent_id=parent_id,
         expected_channel_id=expected_channel_id,
         expected_space_id=expected_space_id,
+        expected_envelope_kind=expected_envelope_kind,
+        expected_dm_peer=expected_dm_peer,
+        expected_self_slug=expected_self_slug,
         log_label="_validate_incoming_parent_id",
     )
     return parent_id if parent is not None else None
@@ -40,6 +46,9 @@ async def validated_parent(
     expected_channel_id: str | None,
     expected_space_id: str | None,
     log_label: str,
+    expected_envelope_kind: str = "",
+    expected_dm_peer: str = "",
+    expected_self_slug: str = "",
 ) -> Any:
     """Load a parent that belongs to the expected channel and space."""
     try:
@@ -50,6 +59,28 @@ async def validated_parent(
     if parent is None:
         log.info("%s: wiped %s — parent not in local cache", log_label, parent_id)
         return None
+    if expected_envelope_kind and parent.envelope_kind != expected_envelope_kind:
+        log.info(
+            "%s: wiped %s — parent kind %r != incoming kind %r",
+            log_label,
+            parent_id,
+            parent.envelope_kind,
+            expected_envelope_kind,
+        )
+        return None
+    if expected_envelope_kind == "dm":
+        participants = {parent.sender_slug, parent.recipient_slug}
+        if (
+            not expected_dm_peer
+            or expected_dm_peer not in participants
+            or (expected_self_slug and expected_self_slug not in participants)
+        ):
+            log.info(
+                "%s: wiped %s — parent belongs to another DM",
+                log_label,
+                parent_id,
+            )
+            return None
     if expected_channel_id and parent.channel_id != expected_channel_id:
         log.info(
             "%s: wiped %s — parent channel %r != incoming channel %r",
@@ -78,6 +109,9 @@ async def resolve_incoming_thread_root(
     parent_id: str | None,
     expected_channel_id: str | None,
     expected_space_id: str | None,
+    expected_envelope_kind: str = "",
+    expected_dm_peer: str = "",
+    expected_self_slug: str = "",
 ) -> str | None:
     """Resolve a reply reference to its trusted canonical thread root."""
     if not parent_id:
@@ -98,6 +132,9 @@ async def resolve_incoming_thread_root(
             parent_id=current,
             expected_channel_id=expected_channel_id,
             expected_space_id=expected_space_id,
+            expected_envelope_kind=expected_envelope_kind,
+            expected_dm_peer=expected_dm_peer,
+            expected_self_slug=expected_self_slug,
             log_label="_resolve_incoming_thread_root",
         )
         if parent is None:

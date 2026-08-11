@@ -4,6 +4,7 @@ daemon-side handlers the rpc_service dispatches into."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -303,10 +304,8 @@ async def test_install_codex_appends_http_toml_block(tmp_path, monkeypatch):
     Whether codex's own CLI actually accepts http MCPs is its concern
     — our job is to write a spec-conformant block, not to gate."""
     ctx = _ctx(tmp_path, harness="codex")
-    monkeypatch.setattr(
-        host_mcp_handler, "_send_dm_to_operator",
-        AsyncMock(return_value="env_http_ok"),
-    )
+    send_dm = AsyncMock(return_value="env_http_ok")
+    monkeypatch.setattr(host_mcp_handler, "_send_dm_to_operator", send_dm)
     msg = await host_mcp_handler.install(
         ctx, name="coinbase-cdp-docs",
         spec={
@@ -324,6 +323,7 @@ async def test_install_codex_appends_http_toml_block(tmp_path, monkeypatch):
     assert "type" not in out
     assert "command" not in out
     assert "env_http_ok" in msg
+    assert "mcp_oauth_credentials_store" in send_dm.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -412,3 +412,75 @@ async def test_sync_codex_does_not_write_agent_file(tmp_path):
     assert "re-merges" in msg
     # No file under agent_home/.codex was touched.
     assert not (ctx.agent_home / ".codex").exists()
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_copies_only_matching_file_oauth(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    host_codex = ctx.host_home / ".codex"
+    host_codex.mkdir(parents=True)
+    (host_codex / "config.toml").write_text(
+        '[mcp_servers.linear]\nurl = "https://mcp.linear.test/mcp"\n',
+        encoding="utf-8",
+    )
+    host_credentials = {
+        "linear|hash": {
+            "server_name": "linear",
+            "server_url": "https://mcp.linear.test/mcp",
+            "client_id": "linear-client",
+            "access_token": "linear-access",
+            "refresh_token": "linear-refresh",
+            "scopes": ["read", "write"],
+        },
+        "other|hash": {
+            "server_name": "other",
+            "server_url": "https://other.test/mcp",
+            "client_id": "other-client",
+            "access_token": "other-access",
+        },
+    }
+    (host_codex / ".credentials.json").write_text(
+        json.dumps(host_credentials), encoding="utf-8",
+    )
+    agent_codex = ctx.agent_home / ".codex"
+    agent_codex.mkdir()
+    (agent_codex / ".credentials.json").write_text(
+        json.dumps({
+            "keep|hash": {
+                "server_name": "keep",
+                "server_url": "https://keep.test/mcp",
+                "access_token": "keep-access",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    msg = await host_mcp_handler.sync(ctx, template_id="linear")
+
+    synced = json.loads(
+        (agent_codex / ".credentials.json").read_text(encoding="utf-8"),
+    )
+    assert set(synced) == {"keep|hash", "linear|hash"}
+    assert synced["linear|hash"] == host_credentials["linear|hash"]
+    assert "other-access" not in json.dumps(synced)
+    if os.name != "nt":
+        assert (agent_codex / ".credentials.json").stat().st_mode & 0o077 == 0
+    assert "Copied its OAuth credential" in msg
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_reports_encrypted_oauth_is_not_portable(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    host_codex = ctx.host_home / ".codex"
+    (host_codex / "secrets").mkdir(parents=True)
+    (host_codex / "config.toml").write_text(
+        '[mcp_servers.linear]\nurl = "https://mcp.linear.test/mcp"\n',
+        encoding="utf-8",
+    )
+    (host_codex / "secrets" / "mcp_oauth.age").write_bytes(b"encrypted")
+
+    msg = await host_mcp_handler.sync(ctx, template_id="linear")
+
+    assert "OS-keyring-encrypted store" in msg
+    assert "mcp_oauth_credentials_store" in msg
+    assert not (ctx.agent_home / ".codex" / ".credentials.json").exists()

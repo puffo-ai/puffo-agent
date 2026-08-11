@@ -74,7 +74,7 @@ def build_held_context_output(
         target_ref += f":thread:{held.thread_root_id}"
     reconsideration: dict[str, Any] = {
         "context_version": CONTEXT_VERSION,
-        "context_ready": bool(held.synchronized and rows),
+        "context_ready": bool(held.synchronized),
         "draft": held.draft,
         "based_on_through_seq": held.based_on_through_seq,
         "latest_seq": held.latest_seq,
@@ -87,6 +87,7 @@ def build_held_context_output(
             "thread_root_id": held.thread_root_id,
         },
         "guidance": guidance,
+        "new_channel_context_count": len(rows),
         "participation_snapshot": _participation_snapshot(
             current_agent_slug,
             held.visible_draft_basis,
@@ -96,14 +97,15 @@ def build_held_context_output(
     }
     if held.diagnostic:
         reconsideration["diagnostic"] = held.diagnostic
-    if rows:
-        aliases = (current_agent_slug,)
+    aliases = (current_agent_slug,)
+    if held.visible_draft_basis:
         reconsideration["visible_draft_basis"] = format_message_group(
             held.visible_draft_basis,
             current_agent_aliases=aliases,
             thread_root_id=held.thread_root_id,
             chronological=True,
         )
+    if rows:
         reconsideration["new_channel_context"] = format_message_group(
             rows,
             current_agent_aliases=aliases,

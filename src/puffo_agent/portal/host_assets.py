@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,70 @@ _CLAUDE_HOME_SEED_PATHS = (
 )
 
 
+def _ensure_private_directory(path: Path) -> None:
+    """Create an owned state directory and repair its POSIX mode."""
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if os.name != "nt":
+        path.chmod(0o700)
+
+
+def _set_private_file_mode(path: Path) -> None:
+    """Repair a secret file's POSIX mode without changing Windows ACLs."""
+    if os.name != "nt":
+        path.chmod(0o600)
+
+
+def _atomic_write_private(target: Path, data: str | bytes) -> None:
+    """Atomically publish bytes from a unique, already-private inode."""
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    tmp = Path(tmp_name)
+    try:
+        if os.name != "nt" and hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        written = 0
+        while written < len(payload):
+            count = os.write(fd, payload[written:])
+            if count <= 0:
+                raise OSError("failed to write private file")
+            written += count
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, target)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+
+
+def strip_claude_api_key_from_settings(path: Path) -> bool:
+    """Remove a persisted Claude API key override from agent settings."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    env = data.get("env")
+    if not isinstance(env, dict) or "ANTHROPIC_API_KEY" not in env:
+        return False
+    clean_env = dict(env)
+    del clean_env["ANTHROPIC_API_KEY"]
+    if clean_env:
+        data["env"] = clean_env
+    else:
+        data.pop("env", None)
+    try:
+        _write_credential_view(path, json.dumps(data, indent=2))
+    except OSError:
+        return False
+    return True
+
+
 def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     """Seed a per-agent virtual ``$HOME`` from the operator's real
     ``$HOME``. Idempotent — never overwrites an existing file.
@@ -29,18 +94,23 @@ def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     ``.credentials.json`` is set up separately via
     ``sync_host_claude_code_auth_view``. Returns True if any file was copied.
     """
-    import shutil
-
-    agent_home.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(agent_home)
     copied = False
     for rel in _CLAUDE_HOME_SEED_PATHS:
         src = host_home / rel
         dst = agent_home / rel
-        if dst.exists() or not src.exists():
+        if dst.exists():
+            try:
+                _ensure_private_directory(dst.parent)
+                _set_private_file_mode(dst)
+            except OSError:
+                pass
+            continue
+        if not src.exists():
             continue
         try:
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            _ensure_private_directory(dst.parent)
+            _atomic_write_private(dst, src.read_bytes())
             copied = True
         except OSError:
             continue
@@ -82,13 +152,15 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
             kc_token = (keychain_data.get("claudeAiOauth") or {}).get("accessToken")
             ex_token = (existing.get("claudeAiOauth") or {}).get("accessToken")
             if kc_token and kc_token == ex_token:
+                _ensure_private_directory(host_creds.parent)
+                _set_private_file_mode(host_creds)
                 return False
         except Exception:
             pass  # Corrupted file — overwrite below.
 
     try:
-        host_creds.parent.mkdir(parents=True, exist_ok=True)
-        host_creds.write_text(keychain_raw, encoding="utf-8")
+        _ensure_private_directory(host_creds.parent)
+        _write_credential_view(host_creds, keychain_raw)
         return True
     except OSError:
         return False
@@ -137,19 +209,8 @@ def sanitize_codex_auth_blob(blob: str) -> str | None:
 
 
 def _write_credential_view(target: Path, blob: str) -> None:
-    """Atomic tmp+rename write at ``target``, mode 0600. ``os.replace``
-    swaps the path entry, so a legacy symlink at ``target`` is replaced,
-    not followed — the host file it pointed at stays untouched."""
-    import stat
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
-    tmp.write_text(blob, encoding="utf-8")
-    try:
-        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
-    os.replace(tmp, target)
+    """Atomically write a private credential file without a permissive window."""
+    _atomic_write_private(target, blob)
 
 
 def sync_host_claude_code_auth_view(
@@ -184,10 +245,15 @@ def sync_host_claude_code_auth_view(
     if not migrated:
         try:
             if agent_creds.read_text(encoding="utf-8") == view_blob:
+                _ensure_private_directory(agent_home)
+                _ensure_private_directory(agent_creds.parent)
+                _set_private_file_mode(agent_creds)
                 return "view (fresh)"
         except OSError:
             pass
     try:
+        _ensure_private_directory(agent_home)
+        _ensure_private_directory(agent_creds.parent)
         write_view(agent_creds, view_blob)
     except OSError:
         return "write-failed"
@@ -217,10 +283,15 @@ def sync_host_codex_auth_view(
     if not migrated:
         try:
             if agent_auth.read_text(encoding="utf-8") == view_blob:
+                _ensure_private_directory(agent_codex_home.parent)
+                _ensure_private_directory(agent_codex_home)
+                _set_private_file_mode(agent_auth)
                 return "view (fresh)"
         except OSError:
             pass
     try:
+        _ensure_private_directory(agent_codex_home.parent)
+        _ensure_private_directory(agent_codex_home)
         write_view(agent_auth, view_blob)
     except OSError:
         return "write-failed"
@@ -279,6 +350,10 @@ AGENT_INSTALLED_MARKER = "agent-installed.md"
 
 _HOST_SYNCED_MARKER_BODY = (
     "This skill is synced from the operator's ~/.claude/skills/ on "
+    "every worker start. Do not edit; changes will be overwritten.\n"
+)
+_HOST_SYNCED_CODEX_MARKER_BODY = (
+    "This skill is synced from the operator's ~/.codex/skills/ on "
     "every worker start. Do not edit; changes will be overwritten.\n"
 )
 _AGENT_INSTALLED_MARKER_BODY = (
@@ -350,6 +425,15 @@ def sync_host_skills(host_home: Path, agent_home: Path) -> int:
     )
 
 
+def sync_host_codex_skills(host_home: Path, agent_codex_home: Path) -> int:
+    """Sync host Codex skills into the isolated agent CODEX_HOME."""
+    return _sync_host_skills_dir(
+        src=host_home / ".codex" / "skills",
+        dst_root=agent_codex_home / "skills",
+        marker_body=_HOST_SYNCED_CODEX_MARKER_BODY,
+    )
+
+
 _HOST_SYNCED_GEMINI_MARKER_BODY = (
     "This skill is synced from the operator's ~/.gemini/skills/ on "
     "every worker start. Do not edit; changes will be overwritten.\n"
@@ -374,7 +458,15 @@ def sync_host_gemini_skills(host_home: Path, project_dir: Path) -> int:
 
 # Path prefixes that won't resolve inside the runtime container.
 # ``/home/agent/`` is handled separately because it IS valid inside.
-_HOST_LOCAL_COMMAND_PREFIXES = ("/Users/", "/tmp/", "/var/folders/")
+_HOST_LOCAL_COMMAND_PREFIXES = (
+    "/Users/",
+    "/tmp/",
+    "/var/folders/",
+    "/opt/homebrew/",
+    "/opt/local/",
+    "/Volumes/",
+    "/private/",
+)
 
 
 def _looks_host_local_command(command: str) -> bool:
@@ -391,17 +483,52 @@ def _looks_host_local_command(command: str) -> bool:
     return any(command.startswith(p) for p in _HOST_LOCAL_COMMAND_PREFIXES)
 
 
+def _host_local_token(cfg: dict) -> str | None:
+    """Return the first host-only executable or argument in an MCP config."""
+    if not isinstance(cfg, dict):
+        return None
+    command = cfg.get("command") or ""
+    if isinstance(command, str) and _looks_host_local_command(command):
+        return command
+    for arg in cfg.get("args") or []:
+        if (
+            isinstance(arg, str)
+            and not arg.startswith("/tmp/")
+            and _looks_host_local_command(arg)
+        ):
+            return arg
+    return None
+
+
+def filter_container_mcp_servers(
+    servers: dict[str, dict],
+) -> tuple[dict[str, dict], list[tuple[str, str]]]:
+    """Separate container-reachable MCP registrations from host-only ones."""
+    reachable: dict[str, dict] = {}
+    unreachable: list[tuple[str, str]] = []
+    for name, cfg in servers.items():
+        token = _host_local_token(cfg)
+        if token is None:
+            reachable[name] = cfg
+        else:
+            unreachable.append((name, token))
+    return reachable, unreachable
+
+
 def sync_host_mcp_servers(
     host_home: Path,
     agent_home: Path,
+    *,
+    containerized: bool = False,
 ) -> tuple[int, list[tuple[str, str]]]:
     """Merge host ``~/.claude.json`` MCP registrations into the
     per-agent ``.claude.json``.
 
     Host wins on name collision; agent-only names are preserved;
     every other key is left untouched. Returns
-    ``(merged_count, unreachable)`` — ``unreachable`` lists
-    ``(name, command)`` pairs whose command looks host-local.
+    ``(merged_count, unreachable)``. For container runtimes, host-only
+    command paths are skipped and returned in ``unreachable``; local
+    runtimes preserve them because they resolve on the host.
     """
     host_path = host_home / ".claude.json"
     if not host_path.exists():
@@ -424,24 +551,22 @@ def sync_host_mcp_servers(
         except (OSError, ValueError):
             agent_data = {}
 
+    reachable, unreachable = (
+        filter_container_mcp_servers(host_servers)
+        if containerized
+        else (host_servers, [])
+    )
     agent_servers = dict(agent_data.get("mcpServers") or {})
-    unreachable: list[tuple[str, str]] = []
-    for name, cfg in host_servers.items():
+    for name, cfg in reachable.items():
         agent_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
     agent_data["mcpServers"] = agent_servers
 
     try:
-        agent_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = agent_path.with_suffix(agent_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
-        os.replace(tmp, agent_path)
+        _ensure_private_directory(agent_home)
+        _atomic_write_private(agent_path, json.dumps(agent_data, indent=2))
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return len(reachable), unreachable
 
 
 def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
@@ -559,10 +684,9 @@ def sync_host_enabled_plugins(host_home: Path, agent_home: Path) -> int:
     agent_data["enabledPlugins"] = enabled
 
     try:
-        agent_settings.parent.mkdir(parents=True, exist_ok=True)
-        tmp = agent_settings.with_suffix(agent_settings.suffix + ".tmp")
-        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
-        os.replace(tmp, agent_settings)
+        _ensure_private_directory(agent_home)
+        _ensure_private_directory(agent_settings.parent)
+        _atomic_write_private(agent_settings, json.dumps(agent_data, indent=2))
     except OSError:
         return 0
     return len(enabled)
@@ -573,6 +697,7 @@ def sync_host_gemini_mcp_servers(
     project_dir: Path,
     *,
     extra_servers: dict | None = None,
+    containerized: bool = False,
 ) -> tuple[int, list[tuple[str, str]]]:
     """Merge host ``~/.gemini/settings.json`` MCP registrations into
     project-scope ``<project_dir>/.gemini/settings.json``.
@@ -608,14 +733,14 @@ def sync_host_gemini_mcp_servers(
         except (OSError, ValueError):
             agent_data = {}
 
+    reachable, unreachable = (
+        filter_container_mcp_servers(host_servers)
+        if containerized
+        else (host_servers, [])
+    )
     merged_servers = dict(agent_data.get("mcpServers") or {})
-    unreachable: list[tuple[str, str]] = []
-    for name, cfg in host_servers.items():
+    for name, cfg in reachable.items():
         merged_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
 
     if extra_servers:
         for name, cfg in extra_servers.items():
@@ -624,10 +749,8 @@ def sync_host_gemini_mcp_servers(
     agent_data["mcpServers"] = merged_servers
 
     try:
-        agent_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = agent_path.with_suffix(agent_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(agent_data, indent=2), encoding="utf-8")
-        os.replace(tmp, agent_path)
+        _ensure_private_directory(agent_path.parent)
+        _atomic_write_private(agent_path, json.dumps(agent_data, indent=2))
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return len(reachable), unreachable

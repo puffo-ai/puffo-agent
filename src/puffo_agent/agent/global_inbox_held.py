@@ -5,8 +5,6 @@ import time
 from typing import Any, Awaitable, Callable, Mapping, Sequence, TYPE_CHECKING
 
 from .global_inbox_types import HeldAdmissionEvidence, HeldStaging
-from .message_store import ProcessingState
-
 if TYPE_CHECKING:
     from .global_inbox_runtime import GlobalInboxRuntime
 
@@ -16,7 +14,7 @@ class HeldRecoverySource:
 
     This deliberately does not invent a remote catch-up API.  It waits for
     receipt commits, then proves the exact terminal watermark exists as a
-    pending durable row for the active provider session. The proof is
+    durable row. The proof is
     synchronization metadata only; it is independent of content pagination
     and never claims that the provider saw the recovered content.
     """
@@ -35,6 +33,82 @@ class HeldRecoverySource:
 
     def notify_delivery(self) -> None:
         self._changed.set()
+
+    def _reject_query(
+        self,
+        space_id: str,
+        channel_id: str,
+        latest_seq: int,
+        latest_envelope_id: str,
+        diagnostic: str,
+    ) -> tuple[Mapping[str, Any], ...]:
+        self.runtime.held[(space_id, channel_id)] = HeldStaging(
+            latest_seq=latest_seq,
+            latest_envelope_id=latest_envelope_id,
+            diagnostic=diagnostic,
+        )
+        return ()
+
+    @staticmethod
+    def _project_rows(
+        rows: Sequence[Any],
+        *,
+        latest_seq: int,
+        latest_envelope_id: str,
+        provider_session_id: str,
+    ) -> list[Mapping[str, Any]]:
+        return [
+            {
+                "space_id": row.space_id,
+                "channel_id": row.channel_id,
+                "thread_root_id": row.thread_root_id or "",
+                "envelope_id": row.envelope_id,
+                "server_seq": row.server_seq,
+                "latest_seq": latest_seq,
+                "latest_envelope_id": latest_envelope_id,
+                "provider_session_id": provider_session_id,
+                "sender_slug": row.sender_slug,
+                "envelope_kind": row.envelope_kind,
+                "sent_at": row.sent_at,
+                "is_encrypted": row.is_encrypted,
+                "content": row.content,
+            }
+            for row in rows
+        ]
+
+    def _record_admission_evidence(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+        latest_seq: int,
+        latest_envelope_id: str,
+        provider_session_id: str,
+        rows: Sequence[Any],
+        staging: HeldStaging,
+    ) -> None:
+        active = self.runtime.active
+        evidence = HeldAdmissionEvidence(
+            active_turn_id=active.turn_id,
+            provider_session_id=provider_session_id,
+            provider_turn_id=active.provider_turn_id or "",
+            space_id=space_id,
+            channel_id=channel_id,
+            latest_seq=latest_seq,
+            latest_envelope_id=latest_envelope_id,
+            displayed_ids=tuple(row.envelope_id for row in rows),
+        )
+        self.runtime._held_admission_evidence[
+            (
+                active.turn_id,
+                provider_session_id,
+                space_id,
+                channel_id,
+                latest_seq,
+                latest_envelope_id,
+            )
+        ] = evidence
+        staging.message_ids = evidence.displayed_ids
 
     async def wait_for_held_delivery(
         self,
@@ -99,26 +173,21 @@ class HeldRecoverySource:
             or not provider_session_id
             or active.provider_session_id != provider_session_id
         ):
-            self.runtime.held[(space_id, channel_id)] = HeldStaging(
-                latest_seq=latest_seq,
-                latest_envelope_id=latest_envelope_id,
-                diagnostic="stateful active provider session unavailable",
+            return self._reject_query(
+                space_id, channel_id, latest_seq, latest_envelope_id,
+                "stateful active provider session unavailable",
             )
-            return ()
         watermark = await self.runtime.store.get_message_by_envelope(latest_envelope_id)
         if (
             watermark is None
             or watermark.server_seq != latest_seq
             or watermark.space_id != space_id
             or watermark.channel_id != channel_id
-            or watermark.processing_state is not ProcessingState.PENDING
         ):
-            self.runtime.held[(space_id, channel_id)] = HeldStaging(
-                latest_seq=latest_seq,
-                latest_envelope_id=latest_envelope_id,
-                diagnostic="exact held watermark mismatch",
+            return self._reject_query(
+                space_id, channel_id, latest_seq, latest_envelope_id,
+                "exact held watermark mismatch",
             )
-            return ()
         staging = self.runtime.held[(space_id, channel_id)] = HeldStaging(
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
@@ -138,50 +207,43 @@ class HeldRecoverySource:
             limit=51,
         )
         if len(rows) > 50:
-            self.runtime.held[(space_id, channel_id)] = HeldStaging(
-                latest_seq=latest_seq,
-                latest_envelope_id=latest_envelope_id,
-                diagnostic="held context exceeds the bounded recovery limit",
+            return self._reject_query(
+                space_id, channel_id, latest_seq, latest_envelope_id,
+                "held context exceeds the bounded recovery limit",
             )
-            return ()
-        projected: list[Mapping[str, Any]] = []
-        for row in rows:
+        projected = self._project_rows(
+            rows,
+            latest_seq=latest_seq,
+            latest_envelope_id=latest_envelope_id,
+            provider_session_id=provider_session_id,
+        )
+        if not any(
+            row["envelope_id"] == latest_envelope_id
+            and row["server_seq"] == latest_seq
+            for row in projected
+        ):
+            # The exact watermark can already be model-visible or intentionally
+            # terminal. Keep that durable freshness proof separate from content
+            # admitted into the provider turn.
             projected.append(
                 {
-                    "space_id": row.space_id,
-                    "channel_id": row.channel_id,
-                    "thread_root_id": row.thread_root_id or "",
-                    "envelope_id": row.envelope_id,
-                    "server_seq": row.server_seq,
+                    "space_id": space_id,
+                    "channel_id": channel_id,
+                    "envelope_id": latest_envelope_id,
+                    "server_seq": latest_seq,
                     "latest_seq": latest_seq,
                     "latest_envelope_id": latest_envelope_id,
                     "provider_session_id": provider_session_id,
-                    "sender_slug": row.sender_slug,
-                    "envelope_kind": row.envelope_kind,
-                    "sent_at": row.sent_at,
-                    "is_encrypted": row.is_encrypted,
-                    "content": row.content,
+                    "proof_only": True,
                 }
             )
-        evidence = HeldAdmissionEvidence(
-            active_turn_id=active.turn_id,
-            provider_session_id=provider_session_id,
-            provider_turn_id=active.provider_turn_id or "",
+        self._record_admission_evidence(
             space_id=space_id,
             channel_id=channel_id,
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
-            displayed_ids=tuple(row.envelope_id for row in rows),
+            provider_session_id=provider_session_id,
+            rows=rows,
+            staging=staging,
         )
-        self.runtime._held_admission_evidence[
-            (
-                active.turn_id,
-                provider_session_id,
-                space_id,
-                channel_id,
-                latest_seq,
-                latest_envelope_id,
-            )
-        ] = evidence
-        staging.message_ids = evidence.displayed_ids
         return tuple(projected)

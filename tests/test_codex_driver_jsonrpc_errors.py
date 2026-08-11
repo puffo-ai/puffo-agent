@@ -173,9 +173,14 @@ async def test_reader_loop_survives_malformed_and_unroutable_frames():
     assert driver._context.used_tokens is None
 
     # A string JSON-RPC id is stored and echoed back verbatim, not coerced.
-    ((ref, request_id),) = driver._permission_requests.items()
+    ((ref, pending),) = driver._permission_requests.items()
+    request_id, method, params = pending
     assert request_id == "srv-1"
+    assert method == "item/commandExecution/requestApproval"
+    assert params == {"command": "ls"}
     await driver.resolve_permission(
         PermissionRef(str(ref)), PermissionDecision.APPROVE
     )
-    assert json.loads(proc.stdin.writes[-1])["id"] == "srv-1"
+    response = json.loads(proc.stdin.writes[-1])
+    assert response["id"] == "srv-1"
+    assert response["result"] == {"decision": "accept"}

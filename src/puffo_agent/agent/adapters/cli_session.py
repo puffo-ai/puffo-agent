@@ -287,6 +287,7 @@ INIT_TIMEOUT_SECONDS = 10.0
 # the turn. 16 MiB bounds memory per agent while comfortably covering
 # every event size seen in practice.
 STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
+CONTEXT_USAGE_TIMEOUT_SECONDS = 3.0
 
 # Read loop has no turn-correlation — collects until ``result`` — so any
 # pre-turn ``assistant`` chatter (Claude Code's internal cron ticks) leaks
@@ -361,6 +362,9 @@ class ClaudeSession:
         self._last_spawn_resumed: bool = False
         self._context_used_tokens: int = 0
         self._context_measured_at: datetime | None = None
+        self._context_usage: dict[str, object] | None = None
+        self._context_usage_supported: bool | None = None
+        self._control_request_counter = 0
         self._admission_callback: AdmissionCallback | None = None
         self._admission_planning_cycle_key: str = ""
         self._continuation_admissions: list[ToolResultAdmission] = []
@@ -540,6 +544,15 @@ class ClaudeSession:
         """
         async with self._lock:
             await self._ensure_running(system_prompt)
+            await self._refresh_context_usage()
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._context_usage is None:
+            return None, None
+        return (
+            _positive_int(self._context_usage.get("rawMaxTokens")),
+            _positive_int(self._context_usage.get("autoCompactThreshold")),
+        )
 
     def has_persisted_session(self) -> bool:
         """True when a previous run left a session id on disk — i.e.
@@ -552,8 +565,10 @@ class ClaudeSession:
             await self._kill_proc()
 
     async def get_context_snapshot(self) -> ContextSnapshot:
+        max_tokens, _ = self.context_limits()
         return normalize_context_snapshot(
             used_tokens=self._context_used_tokens,
+            provider_context_window=max_tokens,
             measured_at=self._context_measured_at,
             estimated_source="claude_usage_fallback_200000",
         )
@@ -579,6 +594,8 @@ class ClaudeSession:
             await self._kill_proc()
             self._context_used_tokens = 0
             self._context_measured_at = None
+            self._context_usage = None
+            self._context_usage_supported = None
         return RolloverResult(
             completed=True,
             previous_provider_session_id=previous,
@@ -817,6 +834,8 @@ class ClaudeSession:
         # --verbose is required with --output-format stream-json +
         # --print / streaming input; the CLI rejects the combo
         # otherwise.
+        self._context_usage = None
+        self._context_usage_supported = None
         args = [
             "--input-format",
             "stream-json",
@@ -994,6 +1013,8 @@ class ClaudeSession:
             return
         proc = self._proc
         self._proc = None
+        self._context_usage = None
+        self._context_usage_supported = None
         # Cancel the stderr drain before the subprocess goes away —
         # without this the drain awaits readline() forever on Windows
         # and blocks ``asyncio.run`` from exiting cleanly on shutdown.
@@ -1030,6 +1051,84 @@ class ClaudeSession:
             pass
 
     # ── One turn ──────────────────────────────────────────────────────────────
+
+    async def _refresh_context_usage(self) -> dict[str, object] | None:
+        if self._context_usage_supported is False or self._proc is None:
+            return None
+        proc = self._proc
+        assert proc.stdin is not None and proc.stdout is not None
+        self._control_request_counter += 1
+        request_id = f"ctx_{self._control_request_counter}"
+        frame = {
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "get_context_usage"},
+        }
+        try:
+            proc.stdin.write((json.dumps(frame) + "\n").encode("utf-8"))
+            await proc.stdin.drain()
+            usage = await asyncio.wait_for(
+                self._read_context_usage_response(proc, request_id),
+                timeout=CONTEXT_USAGE_TIMEOUT_SECONDS,
+            )
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError) as exc:
+            if isinstance(exc, RuntimeError):
+                self._context_usage_supported = False
+            logger.debug(
+                "agent %s: Claude context usage unavailable: %s",
+                self.agent_id,
+                exc,
+            )
+            return None
+        self._context_usage_supported = True
+        self._context_usage = {
+            "totalTokens": _positive_int(usage.get("totalTokens")),
+            "rawMaxTokens": _positive_int(usage.get("rawMaxTokens")),
+            "autoCompactThreshold": _positive_int(
+                usage.get("autoCompactThreshold")
+            ),
+        }
+        reported_context = _positive_int(self._context_usage.get("totalTokens"))
+        if reported_context is not None:
+            self._context_used_tokens = reported_context
+            self._context_measured_at = datetime.now(timezone.utc)
+        return self._context_usage
+
+    async def _read_context_usage_response(
+        self,
+        proc: asyncio.subprocess.Process,
+        request_id: str,
+    ) -> dict[str, object]:
+        assert proc.stdout is not None
+        while True:
+            # Queries run under the turn lock while stdout should be quiet.
+            line = await proc.stdout.readline()
+            if not line:
+                raise ConnectionError("Claude stream closed during context query")
+            event = _parse_event(line)
+            if event is None:
+                continue
+            if event.get("type") == "system":
+                self._update_session_from_event(event)
+                continue
+            if event.get("type") != "control_response":
+                logger.warning(
+                    "agent %s: ignoring unexpected %s event during context query",
+                    self.agent_id,
+                    event.get("type"),
+                )
+                continue
+            response = event.get("response") or {}
+            if not isinstance(response, dict):
+                raise RuntimeError("context query returned an invalid envelope")
+            if response.get("request_id") != request_id:
+                continue
+            if response.get("subtype") == "error":
+                raise RuntimeError(response.get("error") or "context query failed")
+            usage = response.get("response")
+            if not isinstance(usage, dict):
+                raise RuntimeError("context query returned an invalid response")
+            return usage
 
     async def _drain_stale_stdout(self) -> int:
         """Consume stdout events buffered before this turn's frame is
@@ -1317,6 +1416,7 @@ class ClaudeSession:
             state.reply_parts.append(result_text)
 
     async def _finish_turn(self, state: _ClaudeTurnState) -> TurnResult:
+        await self._refresh_context_usage()
         reply = "".join(state.reply_parts).strip()
         if _looks_like_poisoned_session(reply):
             await self._handle_poisoned_session(reply)
@@ -1344,6 +1444,7 @@ class ClaudeSession:
             tool_calls=state.tool_calls,
             metadata={
                 "session_id": self._session_id,
+                "context_tokens": self._context_used_tokens,
                 "tool_names": state.tool_names_used,
                 "send_message_targets": state.send_message_targets,
                 "assistant_text_parts": list(state.reply_parts),
@@ -1356,3 +1457,9 @@ def _parse_event(line: bytes) -> dict | None:
         return json.loads(line.decode("utf-8").strip())
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value

@@ -101,18 +101,13 @@ The supervisor. Owns process lifecycle and every long-running service.
 - **`portal/runtime_matrix.py`** — the validation core (§4). `VALID_RUNTIMES`
   (`runtime_matrix.py:27`), `HARNESS_PROVIDERS` (`runtime_matrix.py:69`),
   `validate_triple` (`runtime_matrix.py:146`).
-- **`portal/state.py`** — config model + on-disk layout: `daemon_yml_path`
-  (`state.py:684`), `agent_yml_path` (`state.py:709`), `DaemonConfig`
-  (`state.py:816`), `BridgeConfig` (`state.py:795`), and the three service ports (§9).
+- **`portal/state.py`** — config model + on-disk layout, including
+  `DaemonConfig`, `AgentConfig`, and the three loopback service configs (§9).
 - **`portal/data_service.py`** (`DataServiceConfig`, port `63386`, `data_service.py:30`)
   and **`portal/rpc_service.py`** (port `63385`) — the MCP-facing loopback services.
-- **`portal/api/`** — the optional local bridge/API on `63387`: `server.py`
-  wires routes (`api/server.py:30`), `auth.py` verifies signed requests
-  (`make_auth_middleware`, `api/auth.py:74`), `certs.py`/`ownership.py` establish who
-  owns an agent (§8).
 - **`portal/ws_local/`** — the ws-local runtime's server side: `route.py`'s
-  `WS_LOCAL_PATH = "/v1/ws-local"` (`ws_local/route.py:50`), mounted on the 63387
-  bridge (§9). External tools speak this to consume an agent over localhost WS.
+  `WS_LOCAL_PATH = "/v1/ws-local"`, served directly by `server.py` on loopback
+  port 63387 (§9). External tools speak this to consume an Agent over localhost WS.
 - **`portal/control/`** — the operator→machine control plane (`agent_create.py`,
   `agent_message.py`, `reporter.py`, `envelope.py`, `machine_auth.py`; §8).
 - **`portal/credential_refresh.py`** — daemon-owned Claude/Codex OAuth refresh
@@ -231,7 +226,7 @@ flowchart TB
         subgraph portal["portal/"]
             dmn["Daemon._reconcile_once (daemon.py:217)"]
             wrk["Worker + execution factories"]
-            svc["data 63386 / rpc 63385 / bridge 63387 (state.py)"]
+            svc["data 63386 / rpc 63385 / ws-local 63387 (state.py)"]
             ctl["control/ operator plane"]
         end
         subgraph agentpkg["agent/"]
@@ -312,10 +307,12 @@ answers WHAT engine runs inside it; provider answers WHICH model vendor.**
 | `gemini-cli` | google | design-only — rejected by `validate_triple` |
 | `codex` | openai | local `codex app-server` Driver, honors `--sandbox` policy |
 
-`hermes` / `gemini-cli` stay enumerated so a persisted agent.yml carrying one
-fails with an explicit design-only diagnostic rather than "unknown harness";
-no runtime admits them, since their provider admission happens after MCP
-execution and they cannot complete the metadata-notified Inbox contract.
+`hermes` / `gemini-cli` stay enumerated so persisted configuration receives an
+explicit design-only diagnostic rather than "unknown harness". Stale local
+Hermes configurations migrate to the provider's supported Driver; other
+unsupported combinations fail validation. No runtime admits either harness,
+since their provider admission happens after MCP execution and they cannot
+complete the metadata-notified Inbox contract.
 Defaults are provider-aware; for `cli-local`, OpenAI resolves to `codex`.
 `validate_triple` rejects mismatched
 (runtime, provider, harness) values at config load, including inferred defaults.
@@ -578,16 +575,15 @@ end-to-end.
   root/device/kem secrets + session subkeys under `keys/*.json`.
 - **Request signing:** every HTTP call is ed25519-signed (`sign_request`,
   `crypto/http_auth.py:44`); the WS handshake is subkey-signed (`ws_client.py:41`).
-- **Certs:** `create_subkey_cert` (`crypto/certs.py:28`); server-side verification
-  mirrored locally in `portal/api/certs.py` — `verify_identity_cert`
-  (`api/certs.py:23`), `verify_slug_binding` (`api/certs.py:57`),
-  `verify_device_cert` (`api/certs.py:94`).
-- **Ownership:** `agent_owner_root_pubkey` (`api/ownership.py:21`) derives an agent's
+- **Certs:** `create_subkey_cert` (`crypto/certs.py`); server-side verification
+  mirrored locally in `portal/control/certs.py`.
+- **Ownership:** `agent_owner_root_pubkey` (`portal/control/ownership.py`) derives an agent's
   owner from its on-disk identity — no forgeable `owner_slug` field.
 - **Operator control:** commands arrive as encrypted envelopes; `verify_control_cert`
   (`control/envelope.py:38`) + `decrypt_command` (`control/envelope.py:66`) gate them,
-  and machine attestation is `machine_cert` (`control/machine_auth.py:23`). The local
-  bridge (63387) enforces signatures via `make_auth_middleware` (`api/auth.py:74`).
+  and machine attestation is `machine_cert` (`control/machine_auth.py:23`). The
+  loopback ws-local service authenticates an export bundle and binds it to the
+  daemon's provisioned root identity (`portal/ws_local/auth.py`).
 - **Credential storage:** macOS Keychain (`macos/keychain.py`); OAuth refresh is
   daemon-single-writer (`credential_refresh.py:1`).
 - **AIM** is puffo-server's server-side identity/device-cert authority; puffo-agent
@@ -629,10 +625,10 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 |---|---|---|---|
 | data_service | **63386** | `state.py:782` (`data_service.py:30`) | message/history reads for tools |
 | rpc_service | **63385** | `state.py:791` | install/sync MCP RPCs |
-| bridge / API | **63387** | `state.py:807` | optional local bridge; **off by default** |
+| ws_local_service | **63387** | `state.py` / `ws_local/server.py` | authenticated external Agent attachment |
 
-**ws-local has no own port** — it is mounted at `GET /v1/ws-local` on the 63387 bridge
-(`WS_LOCAL_PATH`, `ws_local/route.py:50`, wired at `api/server.py:40`).
+The retired browser-facing Local Bridge API no longer shares port 63387;
+`GET /v1/ws-local` is the only application route on that service.
 
 ---
 
@@ -653,10 +649,10 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 | Dependency | Role | How puffo-agent touches it | Status |
 |---|---|---|---|
 | **puffo-server** | blind relay: WS control + message relay + signed HTTP | `PuffoCoreWsClient` (`ws_client.py:41`), `PuffoCoreHttpClient` (`http_client.py:26`) | BUILT |
-| **AIM** | server-side identity / device-cert authority | trusted transitively via cert-chain verify (`api/certs.py`) | BUILT (external) |
+| **AIM** | server-side identity / device-cert authority | trusted transitively via cert-chain verify (`portal/control/certs.py`) | BUILT (external) |
 | **claude CLI** | claude-code harness engine | `cli_session.py` stream-json + `--resume`; auth via `~/.claude/.credentials.json` | BUILT |
 | **codex CLI** | codex harness engine | `codex app-server` Driver | BUILT |
-| **gemini / hermes CLIs** | gemini-cli / hermes harness engines | dormant adapters in `harness/*.py`; `validate_triple` rejects both | **DESIGNED** |
+| **gemini / hermes CLIs** | proposed future harness engines | names retained for explicit config diagnostics; `validate_triple` rejects both | **DESIGNED** |
 | **macOS Keychain** | OS credential store | `macos/keychain.py` | BUILT |
 | **LiteLLM (VK gateway)** | model gateway via `ANTHROPIC_BASE_URL` | *no code on this branch* | **DESIGNED** (cloud) |
 | **E2B** | cloud sandbox | *no code on this branch*; `cli-sandbox` is the RESERVED placeholder, `cli-docker` is the built local container | **DESIGNED** (cloud) |
@@ -692,9 +688,9 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 | Where is execution chosen for a runtime? | `portal/worker.py` (`Worker._run`, Docker adapter factory) |
 | Where does the WS reconnect loop live? | `portal/worker.py:1535` (backoff `:86`) |
 | Where are the loopback service ports set? | `portal/state.py:782` / `:791` / `:807` (63386/63385/63387) |
-| Where is ws-local mounted? | `portal/ws_local/route.py:50` + `portal/api/server.py:40` |
+| Where is ws-local mounted? | `portal/ws_local/route.py` + `portal/ws_local/server.py` |
 | Where is an HTTP request signed? | `crypto/http_auth.py:44` (`sign_request`) |
-| Where is an agent's owner derived? | `portal/api/ownership.py:21` |
+| Where is an agent's owner derived? | `portal/control/ownership.py` |
 | Where is an operator command verified/decrypted? | `portal/control/envelope.py:38` / `:66` |
 | Where is (flat) memory loaded into context? | `agent/memory.py:21` (`get_context`) |
 | Where are tools registered for the agent? | `mcp/puffo_core_server.py:224` (`build_server`) |
@@ -711,7 +707,7 @@ which has been deleted.
 **What the old SVG got right** (and this doc preserves): the blind-relay E2EE framing
 ("puffo-server relays control frames it cannot read", "never sees plaintext"); the
 control-client → agent-workers → **MCP loopback** shape; the three ports
-(data **63386**, rpc **63385**, bridge **63387**, off by default); and the
+(data **63386**, rpc **63385**, ws-local **63387**); and the
 HPKE-verify / ±5-min-timestamp / replay-nonce control-frame guards.
 
 **What was stale / incomplete** in v0.4: it showed engine names as worker kinds

@@ -53,6 +53,16 @@ CODEX_CAPABILITIES = DriverCapabilities(
 logger = logging.getLogger(__name__)
 
 
+_PERMISSION_REQUEST_METHODS = frozenset({
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/permissions/requestApproval",
+    "mcpServer/elicitation/request",
+    "execCommandApproval",
+    "applyPatchApproval",
+})
+
+
 _SENSITIVE_ERROR_FIELD = re.compile(
     r"(?i)(?P<prefix>[\"']?(?:api[_-]?key|access[_-]?token|"
     r"refresh[_-]?token|authorization)[\"']?\s*[:=]\s*)"
@@ -139,6 +149,42 @@ def _classify_jsonrpc_error(error: Any) -> Exception:
     return RuntimeError(detail)
 
 
+def _permission_response(
+    method: str,
+    params: dict[str, Any],
+    decision: PermissionDecision,
+) -> dict[str, Any]:
+    """Encode one operator decision in the native Codex response schema."""
+    approved = decision is PermissionDecision.APPROVE
+    if method in {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+    }:
+        return {"decision": "accept" if approved else "decline"}
+    if method == "item/permissions/requestApproval":
+        if not approved:
+            return {"permissions": {}}
+        requested = params.get("permissions")
+        return {
+            "permissions": requested if isinstance(requested, dict) else {},
+            "scope": "session",
+        }
+    if method == "mcpServer/elicitation/request":
+        return {
+            "action": "accept" if approved else "decline",
+            "content": {} if approved else None,
+        }
+    if method in {"execCommandApproval", "applyPatchApproval"}:
+        return {
+            "decision": (
+                "approved"
+                if approved
+                else {"denied": {"rejection": "Denied by operator"}}
+            )
+        }
+    raise RuntimeError(f"unsupported permission request method: {method}")
+
+
 class CodexAppServerDriver(Driver):
     def __init__(
         self,
@@ -163,7 +209,9 @@ class CodexAppServerDriver(Driver):
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._context = ContextStatus(stale=True)
-        self._permission_requests: dict[PermissionRef, int | str] = {}
+        self._permission_requests: dict[
+            PermissionRef, tuple[int | str, str, dict[str, Any]]
+        ] = {}
         self._open_output_blocks: set[str] = set()
         # Synthetic id for the currently open id-less agent message, plus the
         # counter that keeps successive ones distinct.
@@ -178,67 +226,13 @@ class CodexAppServerDriver(Driver):
             raise RuntimeError("driver is already open")
         if self._closed:
             self._prepare_reopen()
-        if self.process_factory is None:
-            executable = spec.executable or "codex"
-            # Merge, matching ClaudeCodeCliDriver.open: `RuntimeSpec.environment`
-            # is a Mapping that invites a delta, and replacing the child's whole
-            # environment would strip PATH/HOME from `codex app-server`.
-            env = os.environ.copy()
-            env.update(spec.environment)
-            self._proc = await asyncio.create_subprocess_exec(
-                executable,
-                *spec.launch_args,
-                "app-server",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=spec.workspace_dir or None,
-                env=env,
-                # One provider frame can carry a large tool result; the default
-                # 64 KiB stream limit would terminate the reader mid-session.
-                limit=16 * 1024 * 1024,
-            )
-        else:
-            self._proc = self.process_factory(spec)
-            if asyncio.iscoroutine(self._proc):
-                self._proc = await self._proc
+        await self._start_process(spec)
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr_reader = asyncio.create_task(
             drain_subprocess_stream(getattr(self._proc, "stderr", None))
         )
-        await self._request(
-            "initialize",
-            {
-                "clientInfo": {"name": "puffo-agent", "version": "1"},
-                "capabilities": {},
-            },
-        )
-        await self._write({"method": "initialized", "params": {}})
-        thread_config = {
-            "cwd": spec.workspace_dir,
-            "approvalPolicy": (
-                "never"
-                if spec.permission_mode == "bypassPermissions"
-                else "untrusted"
-            ),
-            "sandbox": spec.sandbox,
-            **({"model": spec.model} if spec.model else {}),
-        }
-        if resume is None:
-            result = await self._request(
-                "thread/start",
-                thread_config,
-            )
-            resumed = False
-        else:
-            result = await self._request(
-                "thread/resume",
-                {
-                    "threadId": str(resume),
-                    **thread_config,
-                },
-            )
-            resumed = True
+        await self._initialize_app_server()
+        result, resumed = await self._open_thread(spec, resume)
         thread = result.get("thread", result) if isinstance(result, dict) else {}
         native = str(thread.get("id") or thread.get("threadId") or str(resume or ""))
         if not native:
@@ -268,6 +262,78 @@ class CodexAppServerDriver(Driver):
                 ),
             ),
         )
+
+    async def _start_process(self, spec: RuntimeSpec) -> None:
+        if self.process_factory is None:
+            executable = spec.executable or "codex"
+            # Merge, matching ClaudeCodeCliDriver.open: `RuntimeSpec.environment`
+            # is a Mapping that invites a delta, and replacing the child's whole
+            # environment would strip PATH/HOME from `codex app-server`.
+            env = os.environ.copy()
+            env.update(spec.environment)
+            self._proc = await asyncio.create_subprocess_exec(
+                executable,
+                *spec.launch_args,
+                "app-server",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=spec.workspace_dir or None,
+                env=env,
+                # One provider frame can carry a large tool result; the default
+                # 64 KiB stream limit would terminate the reader mid-session.
+                limit=16 * 1024 * 1024,
+            )
+        else:
+            self._proc = self.process_factory(spec)
+            if asyncio.iscoroutine(self._proc):
+                self._proc = await self._proc
+
+    async def _initialize_app_server(self) -> None:
+        await self._request(
+            "initialize",
+            {
+                "clientInfo": {"name": "puffo-agent", "version": "1"},
+                "capabilities": {},
+            },
+        )
+        await self._write({"method": "initialized", "params": {}})
+
+    async def _open_thread(
+        self, spec: RuntimeSpec, resume: SessionRef | None
+    ) -> tuple[Any, bool]:
+        thread_config = {
+            "cwd": spec.workspace_dir,
+            "approvalPolicy": (
+                "never"
+                if spec.permission_mode == "bypassPermissions"
+                else "untrusted"
+            ),
+            "sandbox": spec.sandbox,
+            **({"model": spec.model} if spec.model else {}),
+        }
+        if spec.auto_compact_threshold_tokens is not None:
+            thread_config["config"] = {
+                "model_auto_compact_token_limit": (
+                    spec.auto_compact_threshold_tokens
+                )
+            }
+        if resume is None:
+            result = await self._request(
+                "thread/start",
+                thread_config,
+            )
+            resumed = False
+        else:
+            result = await self._request(
+                "thread/resume",
+                {
+                    "threadId": str(resume),
+                    **thread_config,
+                },
+            )
+            resumed = True
+        return result, resumed
 
     async def start_turn(self, input: TurnInput):
         if self._active.value:
@@ -334,15 +400,17 @@ class CodexAppServerDriver(Driver):
     async def resolve_permission(
         self, request: PermissionRef, decision: PermissionDecision
     ):
-        request_id = self._permission_requests.pop(request, None)
-        if request_id is None:
+        pending = self._permission_requests.get(request)
+        if pending is None:
             raise RuntimeError("unknown or stale permission reference")
+        request_id, method, params = pending
         await self._write(
             {
                 "id": request_id,
-                "result": {"decision": decision.value},
+                "result": _permission_response(method, params, decision),
             }
         )
+        self._permission_requests.pop(request, None)
         await self._emit(
             HarnessEventType.PERMISSION_UPDATED,
             turn_ref=self._active,
@@ -520,9 +588,14 @@ class CodexAppServerDriver(Driver):
             )
             return
         method = str(frame.get("method") or "")
-        if "approval" in method.lower() or "permission" in method.lower():
+        if method in _PERMISSION_REQUEST_METHODS:
             ref = PermissionRef(f"perm_{uuid.uuid4().hex}")
-            self._permission_requests[ref] = request_id
+            params = (
+                frame.get("params")
+                if isinstance(frame.get("params"), dict)
+                else {}
+            )
+            self._permission_requests[ref] = (request_id, method, params)
             await self._emit(
                 HarnessEventType.PERMISSION_REQUESTED,
                 turn_ref=self._active,
@@ -757,6 +830,10 @@ class CodexAppServerDriver(Driver):
             data={"outcome": outcome},
             native_payload=frame,
         )
+        # Permission requests are scoped to the sole active turn. Once that
+        # turn terminates, the manager deliberately rejects their references;
+        # retain no unreachable request payloads in the long-lived Driver.
+        self._permission_requests.clear()
         self._active, self._active_native_turn_id = TurnRef(""), ""
 
     async def _emit(

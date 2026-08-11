@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from ..portal.host_assets import (
+    _atomic_write_private,
+    _ensure_private_directory,
+    _set_private_file_mode,
+)
 from ..portal.state import home_dir
 from .encoding import base64url_decode, base64url_encode
 
@@ -114,7 +119,7 @@ class KeyStore:
             raise
         if not stat.S_ISREG(before.st_mode):
             raise ValueError("message backup key is not a regular file")
-        if before.st_mode & 0o077:
+        if os.name != "nt" and before.st_mode & 0o077:
             raise ValueError("message backup key file permissions are unsafe")
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
@@ -126,7 +131,7 @@ class KeyStore:
                 not stat.S_ISREG(current.st_mode)
                 or current.st_ino != before.st_ino
                 or current.st_dev != before.st_dev
-                or current.st_mode & 0o077
+                or (os.name != "nt" and current.st_mode & 0o077)
             ):
                 raise ValueError("message backup key file changed unsafely")
             chunks: list[bytes] = []
@@ -167,7 +172,7 @@ class KeyStore:
         either publish exactly one complete key or load that complete key.
         """
         path = self._message_backup_dek_path(slug)
-        self.base_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _ensure_private_directory(self.base_dir)
         try:
             return self._read_private_32_byte_key(path)
         except FileNotFoundError:
@@ -182,7 +187,8 @@ class KeyStore:
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             fd = os.open(temporary, flags, 0o600)
-            os.fchmod(fd, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
             key = os.urandom(32)
             written = 0
             while written < len(key):
@@ -210,14 +216,16 @@ class KeyStore:
                 pass
 
     def save_identity(self, identity: StoredIdentity) -> None:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(self.base_dir)
         path = self._identity_path(identity.slug)
-        path.write_text(json.dumps(identity.to_dict(), indent=2))
+        _atomic_write_private(path, json.dumps(identity.to_dict(), indent=2))
 
     def load_identity(self, slug: str) -> StoredIdentity:
         path = self._identity_path(slug)
         if not path.exists():
             raise FileNotFoundError(f"identity not found: {slug}")
+        _ensure_private_directory(self.base_dir)
+        _set_private_file_mode(path)
         return StoredIdentity.from_dict(json.loads(path.read_text()))
 
     def list_identities(self) -> list[str]:
@@ -244,9 +252,9 @@ class KeyStore:
         path.unlink()
 
     def save_session(self, session: Session) -> None:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(self.base_dir)
         path = self._session_path(session.slug)
-        path.write_text(json.dumps({
+        _atomic_write_private(path, json.dumps({
             "slug": session.slug,
             "subkey_id": session.subkey_id,
             "subkey_secret_key": session.subkey_secret_key,
@@ -257,6 +265,8 @@ class KeyStore:
         path = self._session_path(slug)
         if not path.exists():
             raise FileNotFoundError(f"session not found: {slug}")
+        _ensure_private_directory(self.base_dir)
+        _set_private_file_mode(path)
         d = json.loads(path.read_text())
         session = Session(
             slug=d["slug"],
