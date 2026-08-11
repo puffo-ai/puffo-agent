@@ -663,7 +663,12 @@ class AgentConfig:
         return _agent_config_resolve(self, rel_or_abs)
 
     @classmethod
-    def load(cls, agent_id: str) -> AgentConfig:
+    def load(
+        cls,
+        agent_id: str,
+        *,
+        allow_invalid_runtime: bool = False,
+    ) -> AgentConfig:
         path = agent_yml_path(agent_id)
         _host_assets._ensure_private_directory(path.parent)
         _host_assets._set_private_file_mode(path)
@@ -672,7 +677,11 @@ class AgentConfig:
         pc = raw.get("puffo_core") or {}
         rt = raw.get("runtime") or {}
         triggers = raw.get("triggers") or {}
-        runtime = _load_runtime_config(agent_id, rt)
+        runtime = _load_runtime_config(
+            agent_id,
+            rt,
+            allow_invalid_runtime=allow_invalid_runtime,
+        )
         core = _load_puffo_core_config(agent_id, pc)
 
         return cls(
@@ -698,7 +707,12 @@ class AgentConfig:
         )
 
 
-def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
+def _load_runtime_config(
+    agent_id: str,
+    raw: dict,
+    *,
+    allow_invalid_runtime: bool = False,
+) -> RuntimeConfig:
     from .runtime_matrix import (
         RUNTIME_CLI_LOCAL,
         migrate_legacy_kind,
@@ -724,14 +738,15 @@ def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
             harness = migrated
             inference = normalize_inference_level(kind, provider, harness, inference)
     result = validate_triple(kind, provider, harness)
-    if not result.ok:
+    if not result.ok and not allow_invalid_runtime:
         raise RuntimeError(
             f"agent {agent_id!r}: invalid runtime config — {result.error}"
         )
-    effective = resolve_effective_harness(
-        kind, resolve_effective_provider(kind, provider), harness
-    )
-    _validate_inference_level(agent_id, inference, effective)
+    if result.ok:
+        effective = resolve_effective_harness(
+            kind, resolve_effective_provider(kind, provider), harness
+        )
+        _validate_inference_level(agent_id, inference, effective)
     return RuntimeConfig(
         kind=kind,
         provider=provider,

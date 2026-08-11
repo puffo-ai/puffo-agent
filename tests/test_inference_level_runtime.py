@@ -207,3 +207,30 @@ def test_cli_switch_to_harness_without_inference_support_clears_level(
     assert loaded.runtime.provider == "anthropic"
     assert loaded.runtime.harness == "claude-code"
     assert loaded.runtime.inference_level == ""
+
+
+def test_cli_runtime_edit_can_repair_a_retired_runtime_combination(
+    tmp_path, monkeypatch,
+):
+    """An upgrade diagnostic must not recommend a command that cannot run."""
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = AgentConfig(
+        id="retired-docker-codex",
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="openai",
+            harness="codex",
+            model="gpt-5.5",
+        ),
+    )
+    cfg.save()
+
+    args = build_parser().parse_args([
+        "agent", "runtime", cfg.id, "--kind", "cli-local",
+    ])
+
+    assert args.func(args) == 0
+    loaded = AgentConfig.load(cfg.id)
+    assert loaded.runtime.kind == "cli-local"
+    assert loaded.runtime.provider == "openai"
+    assert loaded.runtime.harness == "codex"

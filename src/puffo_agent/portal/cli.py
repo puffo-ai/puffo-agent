@@ -1004,7 +1004,31 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if not agent_yml_path(agent_id).exists():
         print(f"error: agent {agent_id!r} not found", file=sys.stderr)
         return 2
-    cfg = AgentConfig.load(agent_id)
+    update_requested = any(
+        getattr(args, field) is not None
+        for field in (
+            "kind",
+            "provider",
+            "model",
+            "inference_level",
+            "api_key",
+            "docker_image",
+            "permission_mode",
+            "sandbox",
+            "harness",
+        )
+    )
+    try:
+        # An explicit edit must be able to repair a runtime combination that
+        # a newer release stopped supporting. The final combination is still
+        # validated below before any bytes are written.
+        cfg = AgentConfig.load(
+            agent_id,
+            allow_invalid_runtime=update_requested,
+        )
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     touched = False
     if args.kind is not None:
