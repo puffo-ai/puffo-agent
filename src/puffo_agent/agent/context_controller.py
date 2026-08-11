@@ -150,7 +150,9 @@ class ToolResultAdmission:
             planning_cycle_key=planning_cycle_key,
             provider_turn_id=provider_turn_id,
             channel_id=channel_id,
-            tool_names=frozenset(name for name in tool_names if name),
+            tool_names=frozenset(
+                normalize_tool_name(name) for name in tool_names if name
+            ),
             tool_arguments=encoded_arguments,
             correlation_receipt=correlation_receipt,
         )
@@ -165,7 +167,8 @@ class ToolResultAdmission:
         )
 
     def matches(self, tool_name: str, arguments: Mapping[str, Any]) -> bool:
-        if self.tool_names and tool_name not in self.tool_names:
+        semantic_tool_name = normalize_tool_name(tool_name)
+        if self.tool_names and semantic_tool_name not in self.tool_names:
             return False
         if self.channel_id and str(arguments.get("channel") or "") != self.channel_id:
             return False
@@ -176,7 +179,10 @@ class ToolResultAdmission:
         observed = normalize_tool_arguments(arguments)
         if not self.tool_arguments:
             return True
-        if tool_name in {"send_message", "send_message_with_attachments"}:
+        if semantic_tool_name in {
+            "send_message",
+            "send_message_with_attachments",
+        }:
             return self.tool_arguments == observed
         # Existing history-tool registrations intentionally specify only the
         # stable semantic fields; provider pagination defaults are not part of
@@ -223,6 +229,13 @@ def normalize_tool_arguments(
         (key, json.dumps(value, sort_keys=True, separators=(",", ":"), default=str))
         for key, value in normalized.items()
     ))
+
+
+def normalize_tool_name(tool_name: str) -> str:
+    """Map trusted Puffo MCP wire names to their provider-neutral identity."""
+    name = str(tool_name or "")
+    prefix = "mcp__puffo__"
+    return name[len(prefix):] if name.startswith(prefix) else name
 
 
 @runtime_checkable

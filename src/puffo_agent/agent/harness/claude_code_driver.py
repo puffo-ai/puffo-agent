@@ -87,6 +87,8 @@ class ClaudeCodeCliDriver(Driver):
         self._runtime_ref = RuntimeRef(f"runtime_{uuid.uuid4().hex}")
         self._session_ref = SessionRef("")
         self._native_session_id = ""
+        self._resumed = False
+        self._init_commands: tuple[str, ...] = ()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._closed = False
@@ -118,8 +120,17 @@ class ClaudeCodeCliDriver(Driver):
         ]
         if spec.model:
             args.extend(["--model", spec.model])
+        self._resumed = resume is not None
+        native = str(resume) if resume is not None else str(uuid.uuid4())
+        self._native_session_id = native
+        self._session_ref = SessionRef(native)
         if resume is not None:
-            args.extend(["--resume", str(resume)])
+            args.extend(["--resume", native])
+        else:
+            # Claude Code does not emit system/init until it receives the
+            # first stream-json user frame.  Supplying the ID lets open()
+            # establish the durable session without inventing a probe turn.
+            args.extend(["--session-id", native])
         if self.process_factory is None:
             env = os.environ.copy()
             env.update(spec.environment)
@@ -144,31 +155,20 @@ class ClaudeCodeCliDriver(Driver):
         self._stderr_reader = asyncio.create_task(
             drain_subprocess_stream(getattr(self._proc, "stderr", None))
         )
-        init = await asyncio.wait_for(self._init, timeout=self.replay_timeout)
-        native = str(init.get("session_id") or "")
-        if not native:
-            raise RuntimeError("Claude system/init omitted session_id")
-        self._native_session_id = native
-        self._session_ref = SessionRef(native)
-        commands = init.get("slash_commands") or ()
-        self._compact_advertised = "/compact" in commands or "compact" in commands
-        resumed = resume is not None
-        await self._emit(
-            HarnessEventType.SESSION_RESUMED
-            if resumed
-            else HarnessEventType.SESSION_OPENED,
-            native_payload=init,
-        )
+        # Older CLI builds and test doubles may emit init eagerly.  Give the
+        # reader one scheduling opportunity while keeping current CLI startup
+        # non-blocking until the first real turn arrives.
+        await asyncio.sleep(0)
         return RuntimeOpened(
             self._runtime_ref,
             self._session_ref,
-            native,
-            resumed,
+            self._native_session_id,
+            self._resumed,
             claude_capabilities(self._compact_advertised),
             ProtocolDiagnostics(
                 executable_version=self.executable_version,
                 schema_source="documented",
-                native_capabilities=tuple(str(value) for value in commands),
+                native_capabilities=self._init_commands,
             ),
         )
 
@@ -199,9 +199,10 @@ class ClaudeCodeCliDriver(Driver):
             # path outside the cleanup strands `_active` plus an orphaned
             # replay future whose exception nobody retrieves.
             await self._write(frame)
-            observed_uuid = await asyncio.wait_for(
-                asyncio.shield(self._pending_replay), self.replay_timeout
-            )
+            async with asyncio.timeout(self.replay_timeout):
+                if self._init is not None and not self._init.done():
+                    await asyncio.shield(self._init)
+                observed_uuid = await asyncio.shield(self._pending_replay)
         except (asyncio.TimeoutError, AmbiguousDeliveryError):
             self._active = TurnRef("")
             self._active_native_turn_id = ""
@@ -355,6 +356,8 @@ class ClaudeCodeCliDriver(Driver):
         self._active_native_turn_id = ""
         self._tool_calls.clear()
         self._compact_advertised = False
+        self._resumed = False
+        self._init_commands = ()
         self._context_usage_supported = None
         self._context = ContextStatus(
             used_tokens=self._context.used_tokens,
@@ -420,7 +423,7 @@ class ClaudeCodeCliDriver(Driver):
             self._handle_control_response(frame)
             return
         if type_ == "system" and subtype == "init":
-            self._complete_init(frame)
+            await self._complete_init(frame)
             return
         if self._is_exact_replay(frame):
             await self._complete_replay(frame)
@@ -475,9 +478,29 @@ class ClaudeCodeCliDriver(Driver):
             return
         future.set_result(usage)
 
-    def _complete_init(self, frame: dict[str, Any]) -> None:
-        if self._init is not None and not self._init.done():
-            self._init.set_result(frame)
+    async def _complete_init(self, frame: dict[str, Any]) -> None:
+        if self._init is None or self._init.done():
+            return
+        native = str(frame.get("session_id") or "")
+        if not native:
+            self._init.set_exception(
+                RuntimeError("Claude system/init omitted session_id")
+            )
+            return
+        self._native_session_id = native
+        self._session_ref = SessionRef(native)
+        commands = frame.get("slash_commands") or ()
+        self._init_commands = tuple(str(value) for value in commands)
+        self._compact_advertised = (
+            "/compact" in self._init_commands or "compact" in self._init_commands
+        )
+        self._init.set_result(frame)
+        await self._emit(
+            HarnessEventType.SESSION_RESUMED
+            if self._resumed
+            else HarnessEventType.SESSION_OPENED,
+            native_payload=frame,
+        )
 
     async def _complete_replay(self, frame: dict[str, Any]) -> None:
         assert self._pending_replay is not None

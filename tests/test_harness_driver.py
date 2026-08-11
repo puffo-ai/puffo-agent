@@ -400,10 +400,11 @@ def _register_tool_admission(adapter, admitted, key, arguments, receipt):
 
 async def _emit_tool_result(
     driver, call_id, arguments, result, *, session="native-session", omitted=False,
+    tool_name="read_inbox",
 ):
     payload = {
         "_puffo_internal": "tool_result", "tool_call_id": call_id,
-        "tool_name": "read_inbox", "arguments": arguments,
+        "tool_name": tool_name, "arguments": arguments,
         "result": result, "is_error": False,
     }
     if omitted:
@@ -433,6 +434,7 @@ async def _assert_tool_result_correlations(adapter, driver, admitted):
     )
     await _emit_tool_result(
         driver, "call-1", {"limit": 1}, "[puffo:model-visible-read:receipt-1]",
+        tool_name="mcp__puffo__read_inbox",
     )
     await _wait_for_admitted(admitted)
     assert len(admitted) == 1
@@ -1372,6 +1374,44 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
         driver, started, holder["proc"]
     )
     assert (await driver.compact(CompactRequest("now"))).accepted
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_driver_accepts_init_after_first_stream_input():
+    captured = []
+    holder = {}
+
+    def factory(args, _spec):
+        captured.extend(args)
+
+        def on_frame(frame):
+            if frame.get("type") != "user":
+                return
+            holder["proc"].feed({
+                "type": "system",
+                "subtype": "init",
+                "session_id": frame["session_id"],
+                "slash_commands": ["/compact"],
+            })
+            holder["proc"].feed({**frame, "isReplay": True})
+
+        proc = _FakeProcess(on_frame)
+        holder["proc"] = proc
+        return proc
+
+    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    opened = await driver.open(RuntimeSpec("/workspace"))
+    session_id_index = captured.index("--session-id")
+    assert captured[session_id_index + 1] == opened.native_session_id
+    assert driver._init is not None and not driver._init.done()
+
+    stream = driver.events()
+    started = await driver.start_turn(TurnInput("hello"))
+
+    assert started.accepted
+    await _next_matching(stream, "session.opened")
+    await _next_matching(stream, "turn.started")
     await driver.close()
 
 
