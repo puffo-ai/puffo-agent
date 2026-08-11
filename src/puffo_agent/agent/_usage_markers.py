@@ -17,6 +17,8 @@ output, NOT on free-form agent prose (the worker uses anchored patterns).
 
 from __future__ import annotations
 
+import re
+
 # Claude Code has shipped several spellings of the same event across
 # versions and surfaces ("Claude usage limit reached. Your limit will
 # reset at 5pm", "Claude AI usage limit reached|1749924000",
@@ -50,3 +52,26 @@ def looks_like_usage_limit(text: str) -> bool:
         return False
     low = text.lower()
     return any(marker in low for marker in USAGE_LIMIT_MARKERS)
+
+
+# Only the ``Claude AI usage limit reached|<epoch>`` spelling carries a
+# machine-readable reset. The prose forms ("resets 3pm", "reset at 1pm
+# (Etc/GMT+5)") are year-less, tz-ambiguous, and differ per version —
+# guessing one wrong puts a wrong time in the operator's DM, which is
+# worse than no time at all.
+_EPOCH_RE = re.compile(r"usage limit reached\|(\d{9,11})\b", re.IGNORECASE)
+
+
+def parse_reset_epoch(text: str) -> int | None:
+    """Unix epoch from a usage-limit body, or ``None`` when the body
+    doesn't carry one in the unambiguous form. Callers degrade to a
+    reset-time-less message rather than guessing."""
+    if not text:
+        return None
+    m = _EPOCH_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:  # pragma: no cover — \d+ can't fail int()
+        return None

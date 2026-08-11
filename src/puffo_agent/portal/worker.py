@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from ..agent._usage_markers import DRAINED_RUNTIME_ERROR
+from ..agent._usage_markers import DRAINED_RUNTIME_ERROR, parse_reset_epoch
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..limits import (
@@ -1534,7 +1534,9 @@ class Worker:
                         "agent %s: adapter usage-limit error — flagging "
                         "drained, no kick-retry", agent_id,
                     )
-                    self._enter_drained(agent_id)
+                    self._enter_drained(
+                        agent_id, resets_at=parse_reset_epoch(str(exc)),
+                    )
                     turn_error = "usage limit reached"
                 elif getattr(exc, "is_auth", False):
                     # Auth: skip the pointless kick-retries — flag

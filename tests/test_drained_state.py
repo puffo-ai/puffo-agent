@@ -27,7 +27,10 @@ from puffo_agent.agent._invite_strings import (
     format_codex_drained,
     format_drained,
 )
-from puffo_agent.agent._usage_markers import looks_like_usage_limit
+from puffo_agent.agent._usage_markers import (
+    looks_like_usage_limit,
+    parse_reset_epoch,
+)
 from puffo_agent.agent.core import AgentAPIError, _classify_api_error
 from puffo_agent.portal.control.usage_snapshot import (
     apply_drained_health,
@@ -81,6 +84,81 @@ def test_usage_limit_strings_are_suppressed_not_posted(text):
 def test_does_not_fire_on_agent_prose_about_limits(prose):
     """Overreach guard: these are things an agent legitimately says."""
     assert _looks_like_drained(prose) is False
+
+
+def test_reset_epoch_parses_only_the_unambiguous_form():
+    """The `|<epoch>` spelling is the only machine-readable one. The prose
+    forms are year-less and tz-ambiguous — parsing them would put a wrong
+    time in the operator's DM, which is worse than no time."""
+    assert parse_reset_epoch("Claude AI usage limit reached|1749924000") == 1749924000
+    for prose in CLAUDE_LIMIT_STRINGS:
+        if "|" in prose:
+            continue
+        assert parse_reset_epoch(prose) is None, prose
+    assert parse_reset_epoch("") is None
+
+
+def test_drained_dm_degrades_gracefully_when_no_reset_time():
+    """Detection and time-parsing fail independently. A body that trips a
+    drained pattern but carries no parseable epoch must still produce the
+    full DM — the four recovery options stand on their own without a
+    time, and raising up-stack here would swallow the whole alert."""
+    hit = "Claude usage limit reached. Your limit will reset at 1pm (Etc/GMT+5)."
+    assert _looks_like_drained(hit) is True
+    assert parse_reset_epoch(hit) is None
+
+    msg = format_drained("agent-x", "Agent X", resets_at=parse_reset_epoch(hit))
+    assert "resets around" not in msg.lower()
+    assert "wait for the window to reset" in msg.lower()
+    # All four recoveries survive the missing time.
+    for needle in ("smaller model", "credits", "upgrade"):
+        assert needle in msg.lower(), needle
+    assert "not a sign-in problem" in msg.lower()
+
+    # An unusable epoch (provider format drift) must not raise either.
+    assert "resets around" not in format_drained(
+        "agent-x", "Agent X", resets_at=10**18,
+    ).lower()
+
+
+def test_short_lived_rate_limit_is_not_drained():
+    """`drained` means the plan's budget is spent and holding is correct.
+    A transient 429 must stay retry-able — sweeping it into drained would
+    park an agent that would have recovered on the next kick.
+
+    Note the discriminator is NOT "does it mention a reset time": it's
+    which limit is named. "rate limit reached" carries no `usage` /
+    `weekly` / `N-hour` qualifier, so no drained pattern matches it.
+    """
+    for text in (
+        "API Error: rate limit reached — please retry.",
+        "Error: 429 rate_limit_error — too many requests.",
+        "API Error: Request rejected (429)",
+    ):
+        assert _looks_like_drained(text) is False, text
+        assert looks_like_usage_limit(text) is False, text
+
+
+def test_fable5_model_limit_is_suppressed_but_not_drained(tmp_path, monkeypatch):
+    """Out-of-scope boundary (spec: LiteLLM / Fable 5 quota is NOT this
+    ticket). PUF-380's model-limit strings must keep landing in the
+    existing non-auth leak branch — suppressed from the channel, health
+    untouched — so a LiteLLM upstream copy change can't silently start
+    flipping agents into a state built for Claude/Codex plan budgets.
+    """
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    leak = "You've reached your Fable 5 limit. Try again later."
+    # Still suppressed — PUF-380 non-regression.
+    assert _suppress_worker_error_leak(leak) is None
+    # But NOT quota-classified.
+    assert _looks_like_drained(leak) is False
+
+    runtime = RuntimeState(status="running")
+    suppressed, _ = _handle_suppressed_reply(
+        leak, runtime, "agent-fable", scope="fallback",
+    )
+    assert suppressed is True
+    assert runtime.health != "drained"
 
 
 # ── Ordering: quota beats auth (the actual JYP bug) ────────────────

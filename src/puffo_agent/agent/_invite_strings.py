@@ -168,9 +168,15 @@ def _resets_clause(resets_at: int | None) -> tuple[str, str]:
         return "", ""
     from datetime import datetime
 
-    # 24h and zero-padded: the `%-d` / `%-I` no-pad flags are glibc-only
-    # and raise on Windows, which this daemon also runs on (PUF-420).
-    when = datetime.fromtimestamp(resets_at).strftime("%b %d, %H:%M")
+    try:
+        # 24h and zero-padded: the `%-d` / `%-I` no-pad flags are glibc-only
+        # and raise on Windows, which this daemon also runs on (PUF-420).
+        when = datetime.fromtimestamp(resets_at).strftime("%b %d, %H:%M")
+    except (OverflowError, OSError, TypeError, ValueError):
+        # A provider format change that yields an unusable epoch must not
+        # take the DM down with it — the message is still worth sending
+        # without a time, and "wait for the reset" stands on its own.
+        return "", ""
     return f" It resets around **{when}**.", f"额度大约在 **{when}** 重置。"
 
 
