@@ -119,9 +119,10 @@ def validate_runtime_event(event: RuntimeEvent) -> None:
         if payload["state"] not in TOOL_STATES:
             raise ValueError("invalid tool state")
     if event.type == "permission.updated":
-        if set(payload) != {"permission_ref", "state", "title"}:
+        required = {"permission_ref", "state"}
+        if not required <= set(payload) or not set(payload) <= required | {"title"}:
             raise ValueError("permission.updated missing required fields")
-        if payload["title"] != _SAFE_PERMISSION_TITLE:
+        if "title" in payload and payload["title"] != _SAFE_PERMISSION_TITLE:
             raise ValueError("permission title must use the fixed metadata vocabulary")
         if payload["state"] not in PERMISSION_STATES:
             raise ValueError("invalid permission state")

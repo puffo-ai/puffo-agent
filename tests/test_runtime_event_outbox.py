@@ -243,6 +243,23 @@ def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
             "payload": {"text": "Reading a private file"},
         },
         {
+            "version": 1, "event_id": "legacy-permission-absent",
+            "agent_id": "agent", "session_ref": "session", "turn_ref": "turn",
+            "scope": {"kind": "operator"}, "type": "permission.updated",
+            "occurred_at": "2026-07-30T12:00:00Z",
+            "payload": {"permission_ref": "perm-1", "state": "pending"},
+        },
+        {
+            "version": 1, "event_id": "legacy-permission-titled",
+            "agent_id": "agent", "session_ref": "session", "turn_ref": "turn",
+            "scope": {"kind": "operator"}, "type": "permission.updated",
+            "occurred_at": "2026-07-30T12:00:00Z",
+            "payload": {
+                "permission_ref": "perm-2", "state": "pending",
+                "title": "private title", "detail": "private detail",
+            },
+        },
+        {
             "version": 1, "event_id": "legacy-terminal", "agent_id": "agent",
             "session_ref": "session", "turn_ref": "turn",
             "scope": {"kind": "operator"}, "type": "turn.finished",
@@ -276,6 +293,11 @@ def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
     values = [row.event for row in migrated.prefix()]
     assert [(value["type"], value["payload"]) for value in values] == [
         ("activity.updated", {"text": "Working"}),
+        ("permission.updated", {"permission_ref": "perm-1", "state": "pending"}),
+        ("permission.updated", {
+            "permission_ref": "perm-2", "state": "pending",
+            "title": "Permission required",
+        }),
         ("turn.finished", {
             "outcome": "failed",
             "error": {

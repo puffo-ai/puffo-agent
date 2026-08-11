@@ -80,6 +80,9 @@ def test_lifecycle_accepts_exact_closed_terminal_outcomes(outcome):
 
 
 def test_schema_rejects_open_enum_values_and_extra_payload_fields():
+    event("permission.updated", {
+        "permission_ref": "perm", "state": "pending",
+    })
     invalid = [
         ("tool.updated", {
             "tool_call_ref": "tool", "label": "Tool", "state": "waiting",

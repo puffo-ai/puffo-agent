@@ -60,11 +60,13 @@ def _metadata_only_event(value: Any) -> RuntimeEvent | None:
     elif event_type == "permission.updated":
         if not isinstance(payload.get("permission_ref"), str):
             return None
+        legacy_title = payload.get("title")
         payload = {
             "permission_ref": payload.get("permission_ref"),
             "state": payload.get("state"),
-            "title": "Permission required",
         }
+        if legacy_title is not None:
+            payload["title"] = "Permission required"
     elif event_type == "turn.finished":
         outcome = payload.get("outcome")
         if not isinstance(outcome, str) or outcome not in TURN_OUTCOMES:
