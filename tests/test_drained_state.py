@@ -33,10 +33,7 @@ from puffo_agent.portal.control.usage_snapshot import (
     apply_drained_health,
     drained_harnesses,
 )
-from puffo_agent.portal.credential_refresh import (
-    RefreshOutcome,
-    _classify_failed_refresh,
-)
+from puffo_agent.portal.credential_refresh import _classify_failed_refresh
 from puffo_agent.portal.state import RuntimeState
 from puffo_agent.portal.worker import (
     Worker,
@@ -121,13 +118,58 @@ def test_worker_flips_drained_not_auth_failed_on_mixed_body(tmp_path, monkeypatc
     assert RuntimeState.load("agent-jyp").health == "drained"
 
 
+# Matches BOTH worker pattern sets. Unlike QUOTA_WITH_AUTH_WORDING —
+# which only collides at the substring layer (core / refresher) — the
+# worker's auth patterns are anchored, so a collision there needs a body
+# that opens with a real auth marker. No shipped Claude Code output does
+# this today; the guard below is defence against a future pattern added
+# to either set, and this body is deliberately synthetic.
+QUOTA_WITH_ANCHORED_AUTH = (
+    "OAuth token has expired\nClaude usage limit reached. "
+    "Your limit will reset at 1pm."
+)
+
+
+def test_drained_body_does_not_fire_the_auth_recovery_callbacks(
+    tmp_path, monkeypatch,
+):
+    """Health alone is not enough. Found by mutation: dropping the
+    ``not is_drained`` guard leaves the final health at ``drained``
+    (the drained branch runs second and overwrites it) while the auth
+    branch has ALREADY fired ``on_auth_failed_enter`` — which is the DM
+    that tells the operator to run `claude auth login`. The JYP surface
+    would be back, with a green health assertion covering it.
+    """
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    runtime = RuntimeState(status="running")
+    auth_dm: list[int] = []
+    refresher_kicks: list[int] = []
+    drained_dm: list[int] = []
+
+    _handle_suppressed_reply(
+        QUOTA_WITH_ANCHORED_AUTH,
+        runtime,
+        "agent-no-auth-dm",
+        scope="api-error-retry",
+        on_auth_failure=lambda: refresher_kicks.append(1),
+        on_auth_failed_enter=lambda: auth_dm.append(1),
+        on_drained_enter=lambda: drained_dm.append(1),
+    )
+    assert auth_dm == []          # no "run claude auth login" DM
+    assert refresher_kicks == []  # no credential-refresh wake either
+    assert drained_dm == [1]
+
+
 def test_refresher_does_not_call_a_spent_quota_an_auth_failure():
     """The other half of the JYP surface: the credential refresher's own
     probe hits the same limit and flips EVERY agent on the host."""
     outcome = _classify_failed_refresh(
         QUOTA_WITH_AUTH_WORDING, "", rc=1, elapsed=0.5, log_prefix="test",
     )
-    assert outcome is RefreshOutcome.RATE_LIMITED
+    # By value, not identity: test_credential_refresher reloads the module,
+    # so a second RefreshOutcome class can exist in the same run and `is`
+    # compares two enums that are equal in every way that matters.
+    assert outcome.value == "rate_limited"
 
 
 def test_refresher_still_reports_a_genuine_auth_failure():
@@ -137,7 +179,7 @@ def test_refresher_still_reports_a_genuine_auth_failure():
         "OAuth token revoked: authentication failed", "",
         rc=1, elapsed=0.5, log_prefix="test",
     )
-    assert outcome is RefreshOutcome.AUTH_FAILED
+    assert outcome.value == "auth_failed"
 
 
 def test_auth_body_without_quota_wording_still_flips_auth_failed(
