@@ -1345,7 +1345,7 @@ class RuntimeState:
     #   "codex_thread_wedged" - thread rotated (timeouts/failures/thread-limit);
     #                           auto-recovers; never overwrites stronger reds
     #   "unknown"             - no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | drained | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> "RuntimeState | None":

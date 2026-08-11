@@ -19,6 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from ..agent._usage_markers import DRAINED_RUNTIME_ERROR
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..limits import (
@@ -430,6 +431,25 @@ _AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bauthentication_error\b", re.IGNORECASE),
 )
 
+# Quota-class patterns: the plan's usage budget is spent. Anchored (this
+# runs against free-form agent prose) and matched BEFORE the auth set —
+# a usage-limit body can carry auth-adjacent wording, and reading it as
+# auth sends the operator to `claude auth login` for nothing, which is
+# the JYP mis-surface this ticket fixes.
+#
+# Claude Code has shipped several spellings across versions/surfaces
+# ("Claude usage limit reached. Your limit will reset at …", "Claude AI
+# usage limit reached|<epoch>", "5-hour limit reached ∙ resets …",
+# "Usage limit reached · resets at …"); these key on the stable core of
+# each rather than one release's exact sentence.
+_DRAINED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(?:usage|weekly)\s+limit\s+reached\b", re.IGNORECASE),
+    re.compile(r"\b\d+\s*-?\s*hour\s+limit\s+reached\b", re.IGNORECASE),
+    re.compile(r"\blimit\s+will\s+reset\s+at\b", re.IGNORECASE),
+    re.compile(r"\bquota\s+exceeded\b", re.IGNORECASE),
+    re.compile(r"\binsufficient_quota\b", re.IGNORECASE),
+)
+
 # Worker-layer leak patterns NOT in the auth-class set. Sources:
 # Claude Code error reference (CLI message-to-recovery table) +
 # Claude API platform docs (canonical <type>_error identifiers).
@@ -460,6 +480,7 @@ _NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     *_AUTH_ERROR_PATTERNS,
+    *_DRAINED_PATTERNS,
     *_NON_AUTH_LEAK_PATTERNS,
 )
 
@@ -479,6 +500,18 @@ def _looks_like_auth_error(reply: str) -> bool:
     if not reply:
         return False
     for pattern in _AUTH_ERROR_PATTERNS:
+        if pattern.search(reply):
+            return True
+    return False
+
+
+def _looks_like_drained(reply: str) -> bool:
+    """True iff ``reply`` is one of the definitive quota-exhausted
+    strings. Drives the ``runtime.health=drained`` flip. Checked before
+    :func:`_looks_like_auth_error` at every call site."""
+    if not reply:
+        return False
+    for pattern in _DRAINED_PATTERNS:
         if pattern.search(reply):
             return True
     return False
@@ -505,6 +538,7 @@ def _handle_suppressed_reply(
     scope: str,
     on_auth_failure: Optional[Callable[[], None]] = None,
     on_auth_failed_enter: Optional[Callable[[], None]] = None,
+    on_drained_enter: Optional[Callable[[], None]] = None,
     auth_error_message: str | None = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
@@ -524,11 +558,18 @@ def _handle_suppressed_reply(
     here so a 401-leak short-circuits the 2-min poll instead of
     waiting for the next tick. ``on_auth_failed_enter`` fires ONLY on
     the was-ok→auth_failed transition (not re-entries), giving the
-    per-session DM dedup a natural firing edge."""
+    per-session DM dedup a natural firing edge.
+
+    Quota is classified first and is mutually exclusive with auth: a
+    ``drained`` body can carry auth-adjacent wording, and letting the
+    auth branch claim it is exactly the JYP mis-surface (spent quota →
+    "run `claude auth login`", which can't help). ``on_drained_enter``
+    is the ``drained`` analogue of ``on_auth_failed_enter``."""
     safe_reply = _suppress_worker_error_leak(reply)
     if safe_reply is not None:
         return False, 0.0
-    is_auth = _looks_like_auth_error(reply)
+    is_drained = _looks_like_drained(reply)
+    is_auth = not is_drained and _looks_like_auth_error(reply)
     backoff = random.uniform(
         _SUPPRESSION_BACKOFF_MIN_SECONDS,
         _SUPPRESSION_BACKOFF_MAX_SECONDS,
@@ -556,7 +597,19 @@ def _handle_suppressed_reply(
                     "agent %s: on_auth_failed_enter callback raised: %s",
                     agent_id, exc,
                 )
-    if is_auth and auth_error_message:
+    if is_drained:
+        was_ok = runtime.health != "drained"
+        runtime.health = "drained"
+        if was_ok and on_drained_enter is not None:
+            try:
+                on_drained_enter()
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: on_drained_enter callback raised: %s",
+                    agent_id, exc,
+                )
+        runtime.error = DRAINED_RUNTIME_ERROR
+    elif is_auth and auth_error_message:
         runtime.error = auth_error_message
     elif scope == "api-error-retry":
         if is_auth:
@@ -715,6 +768,90 @@ class Worker:
         if was_ok:
             self._on_auth_failed_enter()
 
+    def _enter_drained(self, agent_id: str, *, resets_at: int | None = None) -> None:
+        """Flip ``drained`` + DM the operator once. Sibling of
+        :meth:`_enter_auth_failed`, minus the refresher kick — a
+        credential refresh can't refill a spent quota."""
+        rt = self.runtime
+        was_ok = rt.health != "drained"
+        rt.health = "drained"
+        rt.error = DRAINED_RUNTIME_ERROR
+        rt.save(agent_id)
+        if was_ok:
+            self._on_drained_enter(resets_at=resets_at)
+
+    def _on_drained_enter(self, *, resets_at: int | None = None) -> None:
+        """Fire the operator DM once per drained episode. Re-arms on
+        CLEAR or on a failed send, same contract as the auth_failed DM."""
+        if self._drained_notification_sent:
+            return
+        self._drained_notification_sent = True
+        try:
+            asyncio.create_task(self._notify_operator_of_drained(resets_at))
+        except Exception as exc:  # noqa: BLE001
+            self._drained_notification_sent = False
+            logger.warning(
+                "agent %s: couldn't schedule drained DM: %s",
+                self.agent_cfg.id, exc,
+            )
+
+    async def _notify_operator_of_drained(self, resets_at: int | None) -> None:
+        """DM the operator the bilingual quota-exhausted recovery copy."""
+        client = self._client
+        if client is None:
+            self._drained_notification_sent = False
+            logger.warning(
+                "agent %s: drained DM skipped — client not yet warm",
+                self.agent_cfg.id,
+            )
+            return
+        operator_slug = getattr(client, "operator_slug", "") or ""
+        if not operator_slug:
+            logger.warning(
+                "agent %s: drained but no operator_slug — not DMing",
+                self.agent_cfg.id,
+            )
+            return
+        from ..agent._invite_strings import format_codex_drained, format_drained
+
+        display_name = (
+            getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        )
+        runtime = getattr(self.agent_cfg, "runtime", None)
+        harness = getattr(runtime, "harness", "") if runtime is not None else ""
+        formatter = format_codex_drained if harness == "codex" else format_drained
+        text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception as exc:  # noqa: BLE001
+            self._drained_notification_sent = False
+            logger.warning(
+                "agent %s: drained DM send failed: %s", self.agent_cfg.id, exc,
+            )
+
+    @staticmethod
+    def _clear_drained_if_recoverable(
+        runtime: "RuntimeState",
+        agent_id: str,
+        log: logging.Logger,
+    ) -> bool:
+        """Clear ``drained`` on a successful turn — a turn only completes
+        once the window has actually refilled, so success IS the reset
+        signal. Returns True iff it cleared, so the caller can re-arm the
+        DM dedup. Deliberately not hooked to ``on_refresh_success``:
+        credentials and quota are orthogonal."""
+        if runtime.health != "drained":
+            return False
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info(
+            "agent %s: successful turn while drained; "
+            "runtime.health cleared back to ok",
+            agent_id,
+        )
+        return True
+
     def _on_auth_failed_enter(self) -> None:
         """Fire the operator DM once per auth_failed episode. The flag
         re-arms on OAuth refresh, successful API-key recovery, or a failed
@@ -857,6 +994,12 @@ class Worker:
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
             self._auth_failed_notification_sent = False
+        # Both the normal-success finally and the retry-success callback
+        # funnel through here, so this is the one place the drained clear
+        # needs to live.
+        if Worker._clear_drained_if_recoverable(self.runtime, agent_id, logger):
+            # Re-arm so the next genuine exhaustion DMs again.
+            self._drained_notification_sent = False
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
@@ -902,6 +1045,9 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        # Same dedup for the drained ENTER DM; re-armed on CLEAR (a
+        # successful turn or a sub-100% usage snapshot) and failed send.
+        self._drained_notification_sent = False
         self._claude_api_key_mode = (
             agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
             and bool(_claude_cli_api_key(
@@ -1381,7 +1527,16 @@ class Worker:
                 # Adapter surfaced an "API Error" string. Mark turn
                 # errored and re-raise; the consumer loop re-enqueues
                 # the batch with cursor preserved and backs off.
-                if getattr(exc, "is_auth", False):
+                if getattr(exc, "is_drained", False):
+                    # Quota spent: retrying just re-hits the limit. Flag
+                    # drained + DM now; consumer holds the batch.
+                    logger.warning(
+                        "agent %s: adapter usage-limit error — flagging "
+                        "drained, no kick-retry", agent_id,
+                    )
+                    self._enter_drained(agent_id)
+                    turn_error = "usage limit reached"
+                elif getattr(exc, "is_auth", False):
                     # Auth: skip the pointless kick-retries — flag
                     # auth_failed + DM now; consumer abandons (redelivers).
                     logger.warning(
@@ -1470,6 +1625,7 @@ class Worker:
                     scope="fallback",
                     on_auth_failure=self._notify_refresh_needed,
                     on_auth_failed_enter=self._on_auth_failed_enter,
+                    on_drained_enter=self._on_drained_enter,
                     auth_error_message=self._auth_failed_error(
                         self._claude_api_key_mode,
                     ),
@@ -1516,6 +1672,7 @@ class Worker:
                     scope="api-error-retry",
                     on_auth_failure=self._notify_refresh_needed,
                     on_auth_failed_enter=self._on_auth_failed_enter,
+                    on_drained_enter=self._on_drained_enter,
                     auth_error_message=self._auth_failed_error(
                         self._claude_api_key_mode,
                     ),

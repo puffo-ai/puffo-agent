@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from ._auth_markers import looks_like_auth_error
+from ._usage_markers import looks_like_usage_limit
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
@@ -21,11 +22,32 @@ class AgentAPIError(Exception):
     OAuth, invalid key). Retrying that is pointless, so the consumer
     skips the kick-retries and the worker flips ``auth_failed`` + DMs the
     operator instead.
+
+    ``is_drained`` is the same shape for a spent plan quota. It's a
+    separate flag rather than a second ``is_auth`` because the two need
+    opposite recovery copy — re-login does nothing for an exhausted
+    quota, which is the whole bug this ticket fixes.
     """
 
-    def __init__(self, message: str, *, is_auth: bool = False) -> None:
+    def __init__(
+        self, message: str, *, is_auth: bool = False, is_drained: bool = False,
+    ) -> None:
         super().__init__(message)
         self.is_auth = is_auth
+        self.is_drained = is_drained
+
+
+def _classify_api_error(joined: str) -> tuple[bool, bool, str]:
+    """``(is_auth, is_drained, label)`` for an adapter body containing
+    ``API Error``. Quota is tested first: a usage-limit body can carry
+    auth-adjacent wording, and ``looks_like_auth_error`` is a substring
+    match, so auth-first reads a spent quota as an expired sign-in and
+    sends the operator to `claude auth login` for nothing."""
+    if looks_like_usage_limit(joined):
+        return False, True, "quota-drained"
+    if looks_like_auth_error(joined):
+        return True, False, "auth-failed"
+    return False, False, "rate-limited"
 
 
 def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
@@ -277,15 +299,16 @@ class PuffoAgent:
         if is_silent(joined):
             return None
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, label = _classify_api_error(joined)
             self.logger.warning(
                 "[api-error-retry] adapter still %s; raising for "
                 "consumer-side handling",
-                "auth-failed" if is_auth else "rate-limited",
+                label,
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error' on retry",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
         if not text_parts and not result.reply:
             return None
@@ -369,15 +392,16 @@ class PuffoAgent:
         # internals and spam the thread on transient rate-limits.
         # Raise so the consumer can re-enqueue after a backoff.
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, label = _classify_api_error(joined)
             self.logger.warning(
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
                 "contained 'API Error' (%s); suppressing post",
-                "auth-failed" if is_auth else "rate-limited",
+                label,
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error'",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
 
         if not text_parts and not result.reply:
