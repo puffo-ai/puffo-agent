@@ -91,12 +91,11 @@ def _dm_frame(sender: str, content: str, *, seq: int, **extra) -> dict:
 
 
 def _wire_dm_frame(sender: str, content: str, *, envelope_id: str, **extra) -> dict:
-    """A ``message`` frame in the shape the Server actually sends.
+    """A legacy sequence-less ``message`` compatibility frame.
 
-    ``AgentServerMsg::Message`` declares no ``seq`` member, so the live wire
-    never carries one — every fixture above supplies a sequence the bridge
-    only ever sees in tests, which is how the sequence-less lane shipped
-    unexercised.
+    Current Server frames carry ``seq``. The parser intentionally retains this
+    older additive shape for mixed-version rollout and daemon-local producers,
+    so its verdict persistence still needs direct coverage.
     """
     frame = _dm_frame(sender, content, seq=0, **extra)
     del frame["seq"]
@@ -176,13 +175,13 @@ async def test_foreign_dm_over_bridge_is_gated_not_eligible(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_seqless_bridge_frames_carry_their_verdict_into_storage(tmp_path):
-    """The real wire shape persists its gate verdict, both dispositions.
+async def test_legacy_seqless_bridge_frames_carry_verdict_into_storage(tmp_path):
+    """The compatibility wire shape persists both gate dispositions.
 
-    Every case here rides one ``message`` frame with no ``seq`` key — the
-    only shape production sends — through ``_dispatch_bridge_frame``. That
-    lane used to write through ``MessageStore.store``, which records no
-    disposition at all, so all three symptoms below shared one root:
+    Every case here rides one legacy ``message`` frame with no ``seq`` key
+    through ``_dispatch_bridge_frame``. That lane used to write through
+    ``MessageStore.store``, which records no disposition at all, so all three
+    symptoms below shared one root:
 
       * a held foreign DM landed with a NULL disposition, which
         ``promote_gated_receipt`` can never release, and the Server's first

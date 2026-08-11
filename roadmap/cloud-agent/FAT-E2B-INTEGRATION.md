@@ -1,5 +1,10 @@
 # FAT `puffo-agent` → E2B cloud drop-in
 
+> **Historical implementation note.** This records an earlier E2B integration
+> slice and its then-current dependencies. Use
+> [`../../docs/FAT-CLOUD-ARCHITECTURE.md`](../../docs/FAT-CLOUD-ARCHITECTURE.md)
+> for the current keyless runtime and rollout contract.
+
 Notes for making the FAT `puffo-agent` a clean drop-in for the thin
 `puffo-agent-cloud` in the E2B/cloud image. Two independent changes
 landed here: **slim packaging** (so `pip install puffo-agent` is Qt-free)

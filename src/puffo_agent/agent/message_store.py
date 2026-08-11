@@ -539,13 +539,13 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
     ) -> ReceiptResult:
         """Persist one gate verdict for a delivery that carries no ``server_seq``.
 
-        The cloud-bridge ``Message`` frame has no delivery sequence, so the
-        keyless transport cannot use ``store_receipt``. It still has to persist
-        the *verdict*: a plain ``store()`` writes a NULL disposition, which
-        makes a held foreign DM unpromotable and indistinguishable from an
-        un-classified row. This is ``store_receipt``'s sequence-less sibling —
-        same dispositions, same ack rule, local ordering instead of a server
-        frontier.
+        Current bridge frames carry a Server sequence and use
+        ``store_receipt``. Compatibility frames and daemon-local events can be
+        sequence-less and still have to persist the *verdict*: a plain
+        ``store()`` writes a NULL disposition, which makes a held foreign DM
+        unpromotable and indistinguishable from an un-classified row. This is
+        ``store_receipt``'s sequence-less sibling: same dispositions and ACK
+        rule, local ordering instead of a Server frontier.
         """
         async with self._inbox_lock:
             from .receipt_persistence import store_local_receipt_unlocked

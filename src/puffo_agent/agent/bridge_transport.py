@@ -401,10 +401,10 @@ async def store_bridge_payload(
 ) -> bool:
     """Persist one keyless bridge message into the global durable inbox.
 
-    The current bridge wire does not carry the native delivery ``seq``.
-    Such messages therefore use the explicit local-ordinal lane instead
-    of inventing a freshness boundary. Once the bridge exposes a trusted
-    server sequence this path can use ``store_receipt`` directly.
+    Current Server bridge frames carry an authoritative positive ``seq`` and
+    use ``store_receipt``. Older bridge senders and daemon-local callers may
+    omit it; those messages use the explicit local-ordinal lane instead of
+    inventing a freshness boundary.
 
     Every shared policy gate runs before persistence, in the native
     order — see the module's ingress policy contract.
@@ -537,10 +537,10 @@ async def _commit_bridge_verdict(
         row["content"] = verdict.content
         row["content_type"] = "text/plain"
     if server_seq is None:
-        # The live bridge wire carries no delivery sequence, so this is the
-        # lane every real keyless message takes. It must persist the verdict:
-        # a plain ``store()`` drops it, leaving a gated DM unpromotable and
-        # a terminal row invisible to prior context.
+        # Compatibility/local-event frames may omit a delivery sequence. This
+        # lane must still persist the verdict: a plain ``store()`` drops it,
+        # leaving a gated DM unpromotable and a terminal row invisible to prior
+        # context.
         local = await client.store.store_local_receipt(
             row,
             disposition=verdict.disposition,

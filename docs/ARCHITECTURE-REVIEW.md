@@ -1,5 +1,10 @@
 # Architecture-doc review — `docs/ARCHITECTURE.md` (puffo-agent)
 
+> **Historical review snapshot.** This file evaluates the architecture document
+> and source tree at commit `54895f3`. Its verdict does not apply to the current
+> integration branch. Use [`ARCHITECTURE.md`](ARCHITECTURE.md) for the current
+> runtime contract.
+
 > **Object under review:** `docs/ARCHITECTURE.md` (741 lines, 5 Mermaid diagrams),
 > which claims to be cited `file:line` against tree tip `54895f3`.
 > **Method:** the 7-dimension rubric at

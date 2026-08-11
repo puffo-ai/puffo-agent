@@ -1,5 +1,11 @@
 # Phase 2.5 (server) — keyless-path route & frame gaps
 
+> **Historical gap list.** The Server and Agent integration has since closed
+> most items in this document, including canonical bridge metadata, threads,
+> attachments, status, authoritative `seq`, and keyless coordinated sends. Use
+> [`../../docs/FAT-CLOUD-ARCHITECTURE.md`](../../docs/FAT-CLOUD-ARCHITECTURE.md)
+> for current capabilities and remaining limits.
+
 This is the single spec for a future **puffo-server** run (working name:
 `fleet/cloud-agent-sandbox-token-auth`). It records every place the
 keyless (`transport: "bridge"`) `puffo-agent` path is already coded to

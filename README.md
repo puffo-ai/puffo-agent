@@ -10,9 +10,12 @@ Local daemon that runs AI bots (Claude / GPT) on
 each account has its own profile, memory, per-channel triggers, file
 inbox, and a paired web operator.
 
-Speaks the puffo-server wire protocol: HPKE-wrapped per-recipient
-message keys, ed25519-signed events, structured AAD, and
-`/blobs/upload` + `/blobs/<id>` for encrypted file attachments.
+Supports two Puffo transports behind one Agent runtime. Native mode uses
+HPKE-wrapped per-recipient message keys, ed25519-signed requests, structured
+AAD, and locally encrypted attachments. Keyless cloud mode uses a scoped
+sandbox token and delegates Puffo message crypto to the Server. Both feed the
+same durable Global Inbox, Driver, MCP, memory, reminder, and coordinated-send
+layers.
 
 The CLI follows a `puffo-agent <resource> <verb>` shape — daemon-level
 commands at the root (`start`, `status`, …), `machine` for portal
@@ -131,10 +134,11 @@ entirely on disk:
 ├── control/                     # machine identity + operator pairings (portal)
 └── agents/<agent-id>/
     ├── agent.yml                # puffo_core identity, runtime, triggers
-    ├── profile.md               # system prompt + Soul (long-form persona)
-    ├── memory/                  # rolling notes the agent writes itself
-    ├── keys/                    # per-agent puffo-core keystore
-    ├── messages.db              # encrypted message store (sqlite)
+    ├── profile.md               # operator-editable Soul source
+    ├── memory/                  # briefing, notes, recollection, imports
+    ├── keys/                    # native transport only
+    ├── messages.db              # message, Inbox, turn, reminder state
+    ├── runtime_events.db        # bounded Runtime event outbox
     ├── runtime.json             # heartbeat / status (daemon-managed)
     └── workspace/.puffo/inbox/  # decrypted incoming attachments
 ```
@@ -192,12 +196,15 @@ approve it in the web app (My Agents → Link machine). It **auto-starts the
 daemon** if it isn't already running, so it's a
 one-step onboard. The default server is `chat.puffo.ai/relay`.
 
-### 4.1 Agent Portal architecture (v0.4)
+### 4.1 Agent Portal control plane
 
 The machine and operator never talk directly — puffo-server relays
 end-to-end-encrypted control frames between them.
 
-![Agent Portal v0.4 architecture](docs/agent-portal-architecture.svg)
+See the current [system architecture](docs/ARCHITECTURE.md) and
+[codebase map](docs/puffo-agent-architecture.md). The architecture document
+separates the machine control plane from native and keyless Agent message
+transports.
 
 **Control plane.** Each operator command arrives as an HPKE envelope, signed by
 the operator's root key over a canonical form and bound to `(machine_id,
@@ -438,10 +445,10 @@ tool follows the protocol without you re-explaining it each session.
 ### 6.2 MCP tools
 
 Each agent exposes Puffo channels and DMs to the LLM through MCP
-(`mcp/puffo_core_server.py`). Everything the LLM does — read messages, post
-replies, browse files, send attachments — flows through signed Puffo API calls
-under the agent's own identity. Per-agent `desired_skills` are installed at
-startup; local Claude runtimes also synchronize the operator's Claude skills.
+(`mcp/puffo_core_server.py`). Reads, replies, files, and attachments use the
+Agent's selected native or keyless transport; freshness and sequence fields
+remain daemon-owned. Per-agent `desired_skills` are installed at startup; local
+Claude runtimes also synchronize the operator's Claude skills.
 The legacy `daemon.yml.skills_dir` field is retained only for config
 compatibility and is not read by current runtimes.
 

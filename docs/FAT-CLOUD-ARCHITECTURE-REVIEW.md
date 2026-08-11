@@ -1,5 +1,12 @@
 # FAT-CLOUD Architecture Doc — Rubric Review + Delta-from-Desktop Cross-Comparison
 
+> **Historical review snapshot.** This file evaluates the former
+> `fleet/fatcloud-arch-*` branches and phase documents. Its status labels and
+> file-presence claims are not current. Use
+> [`FAT-CLOUD-ARCHITECTURE.md`](FAT-CLOUD-ARCHITECTURE.md) for the implemented
+> keyless transport and [`ARCHITECTURE.md`](ARCHITECTURE.md) for the complete
+> Agent runtime.
+
 > **Subject.** `docs/FAT-CLOUD-ARCHITECTURE.md` (this worktree, branch
 > `fleet/fatcloud-arch-review`, stacked on `fleet/fatcloud-arch-doc`).
 > **Rubric.** `puffo-server roadmap/cloud-agent/ARCH-DOC-REVIEW-RUBRIC.md` (7 dims + 3 hard metrics).

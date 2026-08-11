@@ -1,5 +1,11 @@
 # Keyless outbound dispatch (T23 phase 1)
 
+> **Historical phase note.** The integration branch has moved beyond this
+> phase and now includes sequenced bridge delivery, Global Inbox coordination,
+> Runtime events, and Reminders. Use
+> [`../../docs/FAT-CLOUD-ARCHITECTURE.md`](../../docs/FAT-CLOUD-ARCHITECTURE.md)
+> for the current contract.
+
 How a **keyless cloud agent** (`puffo_core.transport == "bridge"`, no
 signing key on disk) does all outbound tool work — and why native
 (keystore-backed) agents are untouched.
