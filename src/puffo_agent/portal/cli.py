@@ -698,33 +698,14 @@ def cmd_agent_resume(args: argparse.Namespace) -> int:
 
 
 def _summarise_credentials(path: Path) -> str:
-    """One-line description of a ``.credentials.json`` file (mtime,
-    expiry, token presence, scopes) for the refresh-ping diagnostic."""
-    import json as _json
-
+    """Describe the credential file without reading secret-bearing content."""
     if not path.exists():
         return "not present"
     try:
         st = path.stat()
     except OSError as exc:
         return f"stat failed: {exc}"
-    try:
-        data = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return f"size={st.st_size}B mtime={_format_ts(int(st.st_mtime))} parse-error"
-    oauth = data.get("claudeAiOauth") or {}
-    expires_ms = oauth.get("expiresAt")
-    if isinstance(expires_ms, (int, float)):
-        expires_in = int(expires_ms / 1000 - time.time())
-        expires_at = _format_ts(int(expires_ms / 1000))
-        expiry_info = f"expiresAt={expires_at} ({expires_in:+d}s from now)"
-    else:
-        expiry_info = "expiresAt=(missing)"
-    scopes = oauth.get("scopes") or []
-    return (
-        f"mtime={_format_ts(int(st.st_mtime))} {expiry_info} "
-        f"scopes={scopes!r}"
-    )
+    return f"size={st.st_size}B mtime={_format_ts(int(st.st_mtime))}"
 
 
 def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
@@ -756,8 +737,8 @@ def cmd_agent_refresh_token(args: argparse.Namespace) -> int:
         "next reconcile tick (typically <1s)."
     )
     print(
-        f"after a few seconds, re-check {host_creds} mtime + "
-        "expiresAt to confirm the refresh landed."
+        f"after a few seconds, re-check {host_creds} mtime "
+        "to confirm the refresh landed."
     )
     return 0
 
