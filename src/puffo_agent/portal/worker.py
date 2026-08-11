@@ -517,6 +517,23 @@ def _looks_like_drained(reply: str) -> bool:
     return False
 
 
+def _turn_api_error_action(exc: BaseException) -> tuple[str, int | None]:
+    """``(action, resets_at)`` for an :class:`AgentAPIError` raised
+    mid-turn — ``"drained"``, ``"auth"``, or ``"retry"``.
+
+    Module-level rather than inline in the turn handler so the ordering
+    is reachable from a test: the handler lives in a closure inside
+    ``_run``. Drained is tested first for the reason it is everywhere
+    else in this path — the auth branch DMs the operator to re-login,
+    which cannot refill a spent quota.
+    """
+    if getattr(exc, "is_drained", False):
+        return "drained", parse_reset_epoch(str(exc))
+    if getattr(exc, "is_auth", False):
+        return "auth", None
+    return "retry", None
+
+
 def _suppress_worker_error_leak(reply: str) -> str | None:
     """Return ``None`` when ``reply`` matches a worker-error
     pattern, signalling the caller to suppress the channel post and
@@ -1527,18 +1544,17 @@ class Worker:
                 # Adapter surfaced an "API Error" string. Mark turn
                 # errored and re-raise; the consumer loop re-enqueues
                 # the batch with cursor preserved and backs off.
-                if getattr(exc, "is_drained", False):
+                action, resets_at = _turn_api_error_action(exc)
+                if action == "drained":
                     # Quota spent: retrying just re-hits the limit. Flag
                     # drained + DM now; consumer holds the batch.
                     logger.warning(
                         "agent %s: adapter usage-limit error — flagging "
                         "drained, no kick-retry", agent_id,
                     )
-                    self._enter_drained(
-                        agent_id, resets_at=parse_reset_epoch(str(exc)),
-                    )
+                    self._enter_drained(agent_id, resets_at=resets_at)
                     turn_error = "usage limit reached"
-                elif getattr(exc, "is_auth", False):
+                elif action == "auth":
                     # Auth: skip the pointless kick-retries — flag
                     # auth_failed + DM now; consumer abandons (redelivers).
                     logger.warning(

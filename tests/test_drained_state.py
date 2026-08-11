@@ -43,6 +43,7 @@ from puffo_agent.portal.worker import (
     _handle_suppressed_reply,
     _looks_like_drained,
     _suppress_worker_error_leak,
+    _turn_api_error_action,
 )
 
 
@@ -84,6 +85,42 @@ def test_usage_limit_strings_are_suppressed_not_posted(text):
 def test_does_not_fire_on_agent_prose_about_limits(prose):
     """Overreach guard: these are things an agent legitimately says."""
     assert _looks_like_drained(prose) is False
+
+
+def test_turn_api_error_routes_drained_before_auth():
+    """The adapter-raised path, which is how a real drained turn arrives.
+    A quota error carrying auth-adjacent wording must route to
+    ``drained`` — routing it to ``auth`` is the JYP mis-surface, and the
+    auth branch DMs the operator a login command that can't help.
+    """
+    drained = AgentAPIError(
+        "API Error: Claude AI usage limit reached|1749924000",
+        is_drained=True,
+    )
+    assert _turn_api_error_action(drained) == ("drained", 1749924000)
+
+    # Both flags set (a classifier regression upstream) still routes to
+    # drained — the safe side of the split.
+    both = AgentAPIError("API Error: usage limit reached", is_auth=True,
+                         is_drained=True)
+    assert _turn_api_error_action(both)[0] == "drained"
+
+    assert _turn_api_error_action(
+        AgentAPIError("API Error: OAuth token has expired", is_auth=True),
+    ) == ("auth", None)
+    assert _turn_api_error_action(AgentAPIError("API Error: 500")) == (
+        "retry", None,
+    )
+
+
+def test_turn_api_error_drained_without_epoch_still_routes():
+    """Detection and time-parsing are independent: a prose-only limit body
+    must still route to drained, just with no reset time for the DM."""
+    exc = AgentAPIError(
+        "API Error: Claude usage limit reached. Your limit will reset at 1pm.",
+        is_drained=True,
+    )
+    assert _turn_api_error_action(exc) == ("drained", None)
 
 
 def test_reset_epoch_parses_only_the_unambiguous_form():
