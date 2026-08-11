@@ -73,9 +73,9 @@ pip install puffo-agent
 pip install puffo-agent==1.2.0
 ```
 
-The Agent Foundation `1.3.0a1` candidate is for staging validation and is
+The Agent Foundation `2.0.0a1` candidate is for staging validation and is
 published to TestPyPI only. See
-[`docs/RELEASE-CANDIDATE-1.3.0a1.md`](docs/RELEASE-CANDIDATE-1.3.0a1.md) for
+[`docs/RELEASE-CANDIDATE-2.0.0a1.md`](docs/RELEASE-CANDIDATE-2.0.0a1.md) for
 the install command, test scope, and stable-release TODOs.
 
 Both paths install the `puffo-agent` console script. The CLI's
