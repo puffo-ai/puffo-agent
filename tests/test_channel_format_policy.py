@@ -123,6 +123,90 @@ def test_name_only_cache_update_preserves_policy(tmp_path, monkeypatch):
     assert disk_cache.load_channel("ch_a")["is_encrypted"] is False
 
 
+@pytest.mark.asyncio
+async def test_channel_update_refreshes_policy_and_disk(tmp_path, monkeypatch):
+    monkeypatch.setattr(pcc.disk_cache, "_cache_root", lambda: tmp_path)
+    client = _client()
+
+    await client._handle_channel_update({
+        "type": "channel_update",
+        "channel_id": "ch_a",
+        "space_id": "sp_1",
+        "name": "general",
+        "is_encrypted": False,
+    })
+
+    assert client._channel_space["ch_a"] == "sp_1"
+    assert client._channel_name_cache["ch_a"] == "general"
+    assert client.channel_policy("ch_a") is False
+    assert disk_cache.load_channel("ch_a")["is_encrypted"] is False
+    client.store.mark_channel_space.assert_awaited_once_with("ch_a", "sp_1")
+
+
+@pytest.mark.asyncio
+async def test_name_only_channel_update_preserves_policy(tmp_path, monkeypatch):
+    monkeypatch.setattr(pcc.disk_cache, "_cache_root", lambda: tmp_path)
+    disk_cache.persist_channel("ch_a", "general", "sp_1", False)
+    client = _client()
+    client._channel_encrypted["ch_a"] = False
+
+    await client._handle_channel_update({
+        "channel_id": "ch_a",
+        "space_id": "sp_1",
+        "name": "renamed",
+        "is_encrypted": None,
+    })
+
+    assert client.channel_policy("ch_a") is False
+    assert disk_cache.load_channel("ch_a")["name"] == "renamed"
+    assert disk_cache.load_channel("ch_a")["is_encrypted"] is False
+
+
+@pytest.mark.asyncio
+async def test_channel_update_without_name_uses_id_and_ignores_bad_updates(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(pcc.disk_cache, "_cache_root", lambda: tmp_path)
+    client = _client()
+    client.store.mark_channel_space.side_effect = RuntimeError("db down")
+
+    await client._handle_channel_update({
+        "channel_id": "ch_created",
+        "space_id": "sp_1",
+        "is_encrypted": False,
+    })
+    await client._handle_channel_update({"space_id": "sp_1"})
+    await client._handle_channel_update({"channel_id": "ch_bad"})
+
+    cached = disk_cache.load_channel("ch_created")
+    assert cached["name"] == "ch_created"
+    assert cached["is_encrypted"] is False
+    assert "ch_bad" not in client._channel_space
+
+
+@pytest.mark.asyncio
+async def test_listen_wires_channel_update_handler(monkeypatch):
+    client = _client()
+    client.slug = "alice-0001"
+    client.keystore = MagicMock()
+    client.keystore.load_identity.return_value = MagicMock(
+        kem_secret_key=encode_secret(Ed25519KeyPair.generate().secret_bytes()),
+        identity_cert_json="",
+        server_url="http://localhost:3000",
+    )
+    client.store.open = AsyncMock()
+    client._consume_queue = AsyncMock()
+    client._invite_poll_loop = AsyncMock()
+    client._warm_task = None
+    ws = MagicMock()
+    ws.run = AsyncMock()
+    monkeypatch.setattr(pcc, "PuffoCoreWsClient", MagicMock(return_value=ws))
+
+    await client.listen(AsyncMock())
+
+    assert ws.on_channel_update == client._handle_channel_update
+
+
 def test_legacy_null_cache_entry_fails_safe_to_encrypted(tmp_path, monkeypatch):
     monkeypatch.setattr(disk_cache, "_cache_root", lambda: tmp_path)
     disk_cache._atomic_write_json(
@@ -269,14 +353,17 @@ async def test_plaintext_send_to_flipped_encrypted_channel_recovers(monkeypatch)
     _patch_builders(monkeypatch)
     cfg = _Cfg(fail_first="/v2/messages/plaintext", refreshed_policy=True)
     inp = MagicMock()
+    recipients = AsyncMock(return_value=["alice-0001"])
+    monkeypatch.setattr(pct, "_resolve_channel_recipient_slugs", recipients)
 
     env = await pct._post_respecting_channel_format(
-        cfg, inp, MagicMock(), False, ["alice-0001"], "ch_abc",
+        cfg, inp, MagicMock(), False, [], "ch_abc", "sp_1",
     )
 
     assert [p for p, _ in cfg.posts] == ["/v2/messages/plaintext", "/messages"]
     assert env["type"] == "message_envelope"
     assert cfg.refreshed == ["ch_abc"]
+    recipients.assert_awaited_once_with(cfg, "sp_1", "ch_abc")
 
 
 @pytest.mark.asyncio
@@ -388,6 +475,15 @@ async def test_encrypted_send_requires_recipient_devices(monkeypatch):
             _Cfg(), MagicMock(), MagicMock(), True,
             ["alice-0001"], "ch_abc",
         )
+
+
+@pytest.mark.asyncio
+async def test_encrypted_channel_requires_resolvable_members():
+    cfg = _Cfg()
+    cfg.http_client.get = AsyncMock(return_value={"members": [{"slug": ""}]})
+
+    with pytest.raises(RuntimeError, match="no resolvable members"):
+        await pct._resolve_channel_recipient_slugs(cfg, "sp_1", "ch_abc")
 
 
 @pytest.mark.asyncio

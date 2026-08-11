@@ -89,20 +89,22 @@ def persist_channel(
     if not channel_id or not name:
         return
     try:
+        payload = {
+            "channel_id": channel_id,
+            "name": name,
+            "space_id": space_id,
+            "fetched_at": int(time.time()),
+        }
         if is_encrypted is _UNSET:
             existing = load_channel(channel_id) or {}
-            policy = existing.get("is_encrypted") is not False
+            policy = existing.get("is_encrypted")
+            if isinstance(policy, bool):
+                payload["is_encrypted"] = policy
         else:
-            policy = bool(is_encrypted)
+            payload["is_encrypted"] = bool(is_encrypted)
         _atomic_write_json(
             _cache_root() / "channels" / f"{_safe(channel_id)}.json",
-            {
-                "channel_id": channel_id,
-                "name": name,
-                "space_id": space_id,
-                "is_encrypted": policy,
-                "fetched_at": int(time.time()),
-            },
+            payload,
         )
     except OSError as exc:
         logger.debug("persist_channel(%s) failed: %s", channel_id, exc)

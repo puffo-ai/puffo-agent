@@ -51,14 +51,38 @@ async def _send_encryption_required(cfg, channel_id=None):
     return await getter(channel_id)
 
 
+async def _resolve_channel_recipient_slugs(
+    cfg: Any, space_id: str, channel_id: str,
+) -> list[str]:
+    members_resp = await cfg.http_client.get(
+        f"/spaces/{space_id}/channels/{channel_id}/members"
+    )
+    slugs = [
+        member.get("slug", "")
+        for member in members_resp.get("members", [])
+        if member.get("slug")
+    ]
+    if not slugs:
+        raise RuntimeError(
+            f"channel {channel_id} has no resolvable members "
+            f"(searched space {space_id})"
+        )
+    return slugs
+
+
 async def _post_respecting_channel_format(
     cfg, inp, signing_key, encrypt: bool,
     recipient_slugs: list, channel_id: Optional[str],
+    space_id: Optional[str] = None,
 ) -> dict:
     """Post in the cached format, refreshing once on a mismatch."""
     for attempt in (0, 1):
         devices: list = []
         if encrypt:
+            if not recipient_slugs and channel_id:
+                recipient_slugs = await _resolve_channel_recipient_slugs(
+                    cfg, space_id or "", channel_id,
+                )
             devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
             if not devices:
                 raise RuntimeError("no recipient devices found")
@@ -514,19 +538,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # _maybe_cache_channel_space) is authoritative for
             # channels the agent can reach. Miss → bail loud.
             send_space_id = await _resolve_channel_space(cfg, channel_id)
-            members_resp = await cfg.http_client.get(
-                f"/spaces/{send_space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(
-                    f"channel {channel_id} has no resolvable members "
-                    f"(searched space {send_space_id})"
-                )
+            recipient_slugs = []
 
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
@@ -561,6 +573,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         envelope = await _post_respecting_channel_format(
             cfg, inp, signing_key, encrypt, recipient_slugs, channel_id,
+            send_space_id,
         )
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
@@ -1119,18 +1132,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # silent fallback to ``cfg.space_id``, because targeting
             # the wrong space produced FB-76 mismaps.
             send_space_id = await _resolve_channel_space(cfg, channel_id)
-            members_resp = await cfg.http_client.get(
-                f"/spaces/{send_space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(
-                    f"send_message_with_attachments: channel {channel_id} has no resolvable members"
-                )
+            recipient_slugs = []
 
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
@@ -1166,6 +1168,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         envelope = await _post_respecting_channel_format(
             cfg, inp, signing_key, encrypt, recipient_slugs, channel_id,
+            send_space_id,
         )
         names = ", ".join(t.name for t in targets)
         thread_note = f" in thread {resolved_root}" if resolved_root else ""

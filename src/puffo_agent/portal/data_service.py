@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from aiohttp import web
 
+from ..agent import disk_cache
 from ..agent.message_store import DataNotFound, MessageStore
 from ._port import bind_tcp_with_fallback
 from .state import agent_dir
@@ -410,9 +411,14 @@ async def update_profile_cache(request: web.Request) -> web.Response:
 async def get_send_encryption(request: web.Request) -> web.Response:
     agent_id = request.match_info["agent_id"]
     channel_id = request.query.get("channel_id") or ""
-    client = _client_for(agent_id)
-    if client is None or not channel_id:
+    if not channel_id:
         return web.json_response({"encrypt": True})
+    client = _client_for(agent_id)
+    if client is None:
+        cached = disk_cache.load_channel(channel_id) or {}
+        return web.json_response({
+            "encrypt": cached.get("is_encrypted") is not False,
+        })
     if request.query.get("refresh") == "1":
         encrypt = await client.refresh_channel_policy(channel_id)
     else:

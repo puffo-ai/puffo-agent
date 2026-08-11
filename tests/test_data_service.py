@@ -233,6 +233,8 @@ async def test_send_encryption_fail_safe_for_unknown_agent() -> None:
 
 @pytest.mark.asyncio
 async def test_send_encryption_decision_matrix_over_http() -> None:
+    _isolated_home()
+
     class _Client:
         def __init__(self):
             self.policies = {"ch_plain": False, "ch_encrypted": True}
@@ -265,6 +267,18 @@ async def test_send_encryption_decision_matrix_over_http() -> None:
             assert await ask(base + "?channel_id=ch_encrypted") is True
             assert await ask(base + "?channel_id=ch_stale&refresh=1") is False
             assert message_client.refreshes == ["ch_stale"]
+
+            ds.disk_cache.persist_channel(
+                "ch_offline_plain", "plain", "sp_1", False,
+            )
+            offline = "/v1/data/offline-agent/send-encryption"
+            assert await ask(
+                offline + "?channel_id=ch_offline_plain"
+            ) is False
+            assert await ask(
+                offline + "?channel_id=ch_offline_plain&refresh=1"
+            ) is False
+            assert await ask(offline + "?channel_id=ch_unknown") is True
 
             from puffo_agent.mcp.data_client import DataClient
             dc = DataClient(

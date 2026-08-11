@@ -1141,6 +1141,7 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = handle_envelope
         self._ws.on_event = self._handle_event
+        self._ws.on_channel_update = self._handle_channel_update
         # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
         await self.store.open()
@@ -2674,6 +2675,37 @@ class PuffoCoreMessageClient:
         except Exception:
             pass
         return channel_id
+
+    async def _handle_channel_update(self, update: dict) -> None:
+        channel_id = update.get("channel_id")
+        space_id = update.get("space_id")
+        if not isinstance(channel_id, str) or not channel_id:
+            return
+        if not isinstance(space_id, str) or not space_id:
+            return
+
+        self._channel_space[channel_id] = space_id
+        name = update.get("name")
+        if isinstance(name, str) and name.strip():
+            name = name.strip()
+            self._channel_name_cache[channel_id] = name
+        else:
+            name = self._channel_name_cache.get(channel_id, "")
+
+        policy = update.get("is_encrypted")
+        if isinstance(policy, bool):
+            self._channel_encrypted[channel_id] = policy
+
+        cached = disk_cache.load_channel(channel_id) or {}
+        cache_name = name or cached.get("name") or channel_id
+        if isinstance(policy, bool):
+            disk_cache.persist_channel(channel_id, cache_name, space_id, policy)
+        else:
+            disk_cache.persist_channel(channel_id, cache_name, space_id)
+        try:
+            await self.store.mark_channel_space(channel_id, space_id)
+        except Exception:
+            pass
 
     def channel_policy(self, channel_id: str) -> bool:
         if not channel_id:

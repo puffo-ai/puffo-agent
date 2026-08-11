@@ -162,9 +162,6 @@ async def test_whoami_includes_display_name():
 async def test_send_message_plaintext_when_daemon_says_unencrypted():
     cfg, http, ms = _setup()
     await ms.mark_channel_space("ch_abc", "sp_test")
-    http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
-        "members": [{"slug": "alice-0001", "role": "owner"}],
-    }
 
     async def _no_encrypt(channel_id):
         return False
@@ -181,12 +178,44 @@ async def test_send_message_plaintext_when_daemon_says_unencrypted():
     assert not any(
         p.startswith("/certs/sync") for m, p, _ in http.calls if m == "GET"
     )
+    assert not any(
+        p.endswith("/members") for m, p, _ in http.calls if m == "GET"
+    )
     post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
     assert len(post_calls) == 1
     path, body = post_calls[0]
     assert path == "/v2/messages/plaintext"
     assert body["type"] == "plaintext_message_envelope"
     assert body["signed_payload"]["payload"]["channel_id"] == "ch_abc"
+
+
+@pytest.mark.asyncio
+async def test_plaintext_attachment_send_skips_channel_members(tmp_path):
+    cfg, http, ms = _setup()
+    cfg.workspace = str(tmp_path)
+    (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+    await ms.mark_channel_space("ch_abc", "sp_test")
+
+    async def _no_encrypt(channel_id):
+        return False
+
+    ms.get_send_encryption = _no_encrypt
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message_with_attachments", {
+        "paths": ["note.txt"],
+        "channel": "ch_abc",
+        "visibility_level": "human",
+    })
+
+    assert "uploaded 1 file" in result
+    assert not any(
+        p.endswith("/members") or p.startswith("/certs/sync")
+        for method, p, _ in http.calls if method == "GET"
+    )
+    assert any(
+        method == "POST" and p == "/v2/messages/plaintext"
+        for method, p, _ in http.calls
+    )
 
 
 @pytest.mark.asyncio
