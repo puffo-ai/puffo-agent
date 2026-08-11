@@ -87,6 +87,37 @@ def test_does_not_fire_on_agent_prose_about_limits(prose):
     assert _looks_like_drained(prose) is False
 
 
+def test_detection_is_case_insensitive():
+    """Provider copy has shipped both cases; the `.lower()` in the
+    substring path and the `IGNORECASE` on the anchored patterns are the
+    same guarantee, so pin both rather than trusting one."""
+    for text in ("USAGE LIMIT REACHED", "Usage Limit Reached", "usage limit reached"):
+        assert _looks_like_drained(text) is True, text
+        assert looks_like_usage_limit(text) is True, text
+    assert parse_reset_epoch("CLAUDE AI USAGE LIMIT REACHED|1749924000") == 1749924000
+
+
+def test_drained_dm_renders_without_a_display_name():
+    """``display_name`` falls back to the agent id upstream, but an empty
+    one must still produce a sendable DM — the operator losing the whole
+    alert to a formatting hole is worse than an ugly label."""
+    msg = format_drained("agent-x", "")
+    assert msg.strip()
+    assert "not a sign-in problem" in msg.lower()
+    assert format_codex_drained("agent-x", "").strip()
+
+
+def test_used_pct_accepts_int_and_float():
+    """The provider serializes usage as int today; ``>= 100`` on a float
+    must behave the same if that changes."""
+    for value in (100, 100.0, 100.5):
+        snap = {"claude-code": {"session": {"used_pct": value}}}
+        assert "claude-code" in drained_harnesses(snap), value
+    for value in (99, 99.9):
+        snap = {"claude-code": {"session": {"used_pct": value}}}
+        assert drained_harnesses(snap) == {}, value
+
+
 def test_turn_api_error_routes_drained_before_auth():
     """The adapter-raised path, which is how a real drained turn arrives.
     A quota error carrying auth-adjacent wording must route to
