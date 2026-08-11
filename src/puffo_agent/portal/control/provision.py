@@ -24,6 +24,7 @@ from ..state import (
     derive_role_short,
     is_valid_agent_id,
 )
+from ..subagent_provision import validate_desired_subagents, write_subagents
 from .certs import CertError, verify_device_cert, verify_identity_cert, verify_slug_binding
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,15 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         isinstance(value, str) and value for value in desired_mcps
     ):
         raise ProvisionError("desired_mcps must be a list of non-empty template-id strings")
+    # Sub-agents arrive as inline .md rather than template ids, so they're
+    # validated here — pre-finalize, before any identity is materialized —
+    # and written at create time by write_agent_from_context.
+    try:
+        desired_subagents = validate_desired_subagents(
+            payload.get("desired_subagents"), harness=runtime.harness,
+        )
+    except ValueError as exc:
+        raise ProvisionError(f"desired_subagents: {exc}")
     return {
         "agent_id": slug,
         "display_name": display_name,
@@ -191,6 +201,7 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         "runtime": runtime,
         "desired_skills": list(desired_skills),
         "desired_mcps": list(desired_mcps),
+        "desired_subagents": desired_subagents,
         "bundle": bundle,
     }
 
@@ -223,7 +234,7 @@ def write_agent_from_context(context: dict) -> dict:
         raise ProvisionError(f"agent directory {target} already exists")
     try:
         target.mkdir(parents=True, exist_ok=False)
-        AgentConfig(
+        cfg = AgentConfig(
             id=agent_id,
             state="running",
             display_name=context["display_name"],
@@ -242,14 +253,22 @@ def write_agent_from_context(context: dict) -> dict:
             desired_skills=context["desired_skills"],
             desired_mcps=context["desired_mcps"],
             created_at=int(time.time()),
-        ).save()
+        )
+        cfg.save()
         (target / "memory").mkdir(exist_ok=True)
         (target / "profile.md").write_text(context["profile_text"], encoding="utf-8")
+        subagents = write_subagents(
+            cfg.resolve_claude_dir(), context.get("desired_subagents") or [],
+        )
         _write_keystore(context)
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
-    return {"agent_id": agent_id, "agent_dir": str(target)}
+    return {
+        "agent_id": agent_id,
+        "agent_dir": str(target),
+        "subagents": subagents,
+    }
 
 
 async def provision_agent_from_bundle(

@@ -151,7 +151,10 @@ async def test_create_delegates_to_control_provisioner(home, monkeypatch):
         server_url="https://relay.example",
         paired_root_pubkey="operator-key",
     )
-    assert result == {"ok": True, "agent_slug": "helper-1"}
+    # PUF-395: the response now carries the sub-agents written at create time
+    # so the caller can show what landed. Absent from the stub's return value
+    # → empty list, not a missing key: the field is part of the contract.
+    assert result == {"ok": True, "agent_slug": "helper-1", "subagents": []}
     assert seen["operator_key"] == "operator-key"
     assert seen["params"]["puffo_core"]["server_url"] == "https://relay.example"
 

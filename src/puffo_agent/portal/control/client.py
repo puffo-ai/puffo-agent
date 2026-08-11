@@ -196,7 +196,11 @@ async def _create_agent_command(
         return {"ok": False, "error": exc.reason}
     except ControlError as exc:
         return {"ok": False, "error": str(exc)}
-    return {"ok": True, "agent_slug": result["agent_id"]}
+    return {
+        "ok": True,
+        "agent_slug": result["agent_id"],
+        "subagents": result.get("subagents", []),
+    }
 
 
 async def post_usage_snapshot(machine, base: str) -> bool:
