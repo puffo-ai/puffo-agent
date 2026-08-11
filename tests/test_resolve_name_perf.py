@@ -13,6 +13,7 @@ import os
 import sys
 
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -38,6 +39,10 @@ def _bare_client(http: _FakeHttp) -> PuffoCoreMessageClient:
     client.http = http  # type: ignore[assignment]
     client._space_name_cache = {}
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
+    client._channel_space = {}
+    client.store = MagicMock()
+    client.store.mark_channel_space = AsyncMock()
     return client
 
 
@@ -128,3 +133,31 @@ async def test_resolve_channel_name_falls_back_to_events_on_miss(monkeypatch):
     assert name == "general"
     # Both endpoints hit (channels first empty, then events replay).
     assert http.gets == ["/spaces/sp_1/channels", "/spaces/sp_1/events"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_channel_name_falls_back_when_channel_fetch_fails(monkeypatch):
+    import puffo_agent.agent.puffo_core_client as mod
+    monkeypatch.setattr(mod.disk_cache, "persist_channel", lambda *a, **k: None)
+
+    http = _FakeHttp({
+        "/spaces/sp_1/events": {"events": [], "has_more": False},
+    })
+    client = _bare_client(http)
+
+    assert await client._resolve_channel_name("sp_1", "ch_a") == "ch_a"
+    assert http.gets == ["/spaces/sp_1/channels", "/spaces/sp_1/events"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_channel_name_ignores_malformed_channel(monkeypatch):
+    import puffo_agent.agent.puffo_core_client as mod
+    monkeypatch.setattr(mod.disk_cache, "persist_channel", lambda *a, **k: None)
+
+    http = _FakeHttp({
+        "/spaces/sp_1/channels": {"channels": [None]},
+        "/spaces/sp_1/events": {"events": [], "has_more": False},
+    })
+    client = _bare_client(http)
+
+    assert await client._resolve_channel_name("sp_1", "ch_a") == "ch_a"

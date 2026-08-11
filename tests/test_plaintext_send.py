@@ -1,22 +1,20 @@
-"""Plaintext (non-E2EE) send: producer round-trip + the daemon-level
-encryption decision + the client DM send branch."""
-
 import logging
 import os
 import sys
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent import send_mode
+from puffo_agent.crypto.http_client import HttpError
+from puffo_agent.crypto.keystore import encode_secret
 from puffo_agent.crypto.message import (
     EncryptInput,
     build_plaintext_message,
     read_plaintext_message,
 )
 from puffo_agent.crypto.primitives import Ed25519KeyPair
-from puffo_agent.crypto.keystore import encode_secret
 
 
 def _inp(**over):
@@ -31,13 +29,6 @@ def _inp(**over):
     )
     base.update(over)
     return EncryptInput(**base)
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry():
-    send_mode._turn_bundle_encrypted.clear()
-    yield
-    send_mode._turn_bundle_encrypted.clear()
 
 
 # ── producer ─────────────────────────────────────────────────────────
@@ -72,70 +63,20 @@ def test_wrong_key_fails_verification():
         read_plaintext_message(env, Ed25519KeyPair.generate().public_key_bytes())
 
 
-# ── decision ─────────────────────────────────────────────────────────
-
-
-class _Row:
-    def __init__(self, is_encrypted):
-        self.is_encrypted = is_encrypted
-
-
 class _Store:
-    def __init__(self, row=None, raise_=False):
-        self.row = row
-        self.raise_ = raise_
-
-    async def get_message_by_envelope(self, _eid):
-        if self.raise_:
-            raise RuntimeError("db down")
-        return self.row
-
-
-@pytest.mark.asyncio
-async def test_default_is_plaintext():
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
-
-
-@pytest.mark.asyncio
-async def test_encrypted_bundle_forces_encryption():
-    send_mode.note_turn_bundle(["a-1"], True)
-    assert await send_mode.encryption_required("a-1", _Store(), None) is True
-    # A later all-plaintext bundle releases it.
-    send_mode.note_turn_bundle(["a-1"], False)
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
-
-
-@pytest.mark.asyncio
-async def test_encrypted_thread_root_forces_encryption():
-    assert (
-        await send_mode.encryption_required("a-1", _Store(_Row(True)), "msg_r")
-        is True
-    )
-    assert (
-        await send_mode.encryption_required("a-1", _Store(_Row(False)), "msg_r")
-        is False
-    )
-
-
-@pytest.mark.asyncio
-async def test_unknown_root_and_store_failure_fail_safe_to_encrypted():
-    assert await send_mode.encryption_required("a-1", _Store(None), "msg_r") is True
-    assert (
-        await send_mode.encryption_required("a-1", _Store(raise_=True), "msg_r")
-        is True
-    )
+    pass
 
 
 # ── client DM send branch ────────────────────────────────────────────
 
 
-def _make_client(flag: bool):
+def _make_client():
     from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "agent-1"
     client._log = logging.getLogger("plaintext-send-test")
-    client.store = _Store(row=None)
+    client.store = _Store()
 
     kp = Ed25519KeyPair.generate()
 
@@ -168,22 +109,12 @@ def _make_client(flag: bool):
         return [RecipientDevice(device_id="dev_1", kem_public_key=_os.urandom(32))]
 
     client._fetch_device_keys = _fetch
-    send_mode.note_turn_bundle(["agent-1"], flag)
     return client, posts, fetched
 
 
 @pytest.mark.asyncio
-async def test_send_dm_goes_plaintext_by_default():
-    client, posts, fetched = _make_client(flag=False)
-    env = await client._send_dm("op-1", "hi", "")
-    assert env["type"] == "plaintext_message_envelope"
-    assert posts[0][0] == "/v2/messages/plaintext"
-    assert fetched == []  # no device resolution on the plaintext path
-
-
-@pytest.mark.asyncio
-async def test_send_dm_encrypts_when_turn_bundle_was_encrypted():
-    client, posts, fetched = _make_client(flag=True)
+async def test_send_dm_is_always_encrypted():
+    client, posts, fetched = _make_client()
     env = await client._send_dm("op-1", "hi", "")
     assert env["type"] == "message_envelope"
     assert posts[0][0] == "/messages"
@@ -191,23 +122,52 @@ async def test_send_dm_encrypts_when_turn_bundle_was_encrypted():
 
 
 @pytest.mark.asyncio
-async def test_in_process_data_client_delegates_to_send_mode():
+async def test_send_dm_stops_when_recipient_has_no_devices():
+    client, posts, _ = _make_client()
+
+    async def no_devices(_slugs):
+        return []
+
+    client._fetch_device_keys = no_devices
+
+    assert await client._send_dm("op-1", "hi", "") is None
+    assert posts == []
+
+
+@pytest.mark.asyncio
+async def test_send_dm_surfaces_http_failure():
+    client, _, _ = _make_client()
+    client.http.post = AsyncMock(side_effect=HttpError(500, "failed"))
+
+    with pytest.raises(HttpError):
+        await client._send_dm("op-1", "hi", "")
+
+
+@pytest.mark.asyncio
+async def test_in_process_data_client_reads_channel_policy():
     from puffo_agent.portal.ws_local.in_process_data_client import (
         InProcessDataClient,
     )
 
     c = InProcessDataClient.__new__(InProcessDataClient)
-    c._store = _Store(_Row(False))
-    assert await c.get_send_encryption("a-1", "msg_r") is False
-    send_mode.note_turn_bundle(["a-1"], True)
-    assert await c.get_send_encryption("a-1", None) is True
+    class _Client:
+        def channel_policy(self, channel_id):
+            return channel_id == "ch_encrypted"
+
+    c._client = _Client()
+    assert await c.get_send_encryption("ch_plaintext") is False
+    assert await c.get_send_encryption("ch_encrypted") is True
 
 
 @pytest.mark.asyncio
-async def test_clear_turn_bundle_restores_the_plaintext_default():
-    send_mode.note_turn_bundle(["a-1"], True)
-    assert await send_mode.encryption_required("a-1", _Store(), None) is True
-    send_mode.clear_turn_bundle(["a-1"])
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
-    # Clearing an unset key is a no-op.
-    send_mode.clear_turn_bundle(["never-set"])
+async def test_in_process_data_client_refreshes_channel_policy():
+    from puffo_agent.portal.ws_local.in_process_data_client import (
+        InProcessDataClient,
+    )
+
+    c = InProcessDataClient.__new__(InProcessDataClient)
+    c._client = MagicMock()
+    c._client.refresh_channel_policy = AsyncMock(return_value=False)
+
+    assert await c.refresh_channel_policy("ch_plaintext") is False
+    c._client.refresh_channel_policy.assert_awaited_once_with("ch_plaintext")

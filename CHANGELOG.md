@@ -6,6 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Channel messages now follow the channel's encryption setting.** Replies
+  and channel-scoped system messages track live server-managed policy changes,
+  recover after a format mismatch, and avoid member and device-key lookups for
+  plaintext channels. Direct messages remain end-to-end encrypted.
+
 ## [1.2.0] — 2026-08-10
 
 ### Added

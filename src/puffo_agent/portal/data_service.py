@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 
 from aiohttp import web
 
+from ..agent import disk_cache
 from ..agent.message_store import DataNotFound, MessageStore
 from ._port import bind_tcp_with_fallback
 from .state import agent_dir
@@ -408,19 +409,20 @@ async def update_profile_cache(request: web.Request) -> web.Response:
 
 
 async def get_send_encryption(request: web.Request) -> web.Response:
-    """Daemon-level send-mode decision for out-of-process senders (the
-    MCP subprocess). Fail-safe: unknown agent/store answers encrypt."""
-    from ..agent import send_mode
-
     agent_id = request.match_info["agent_id"]
-    slug = request.query.get("slug", "")
-    root = request.query.get("thread_root_id") or None
-    store = await _store_for(request.app, agent_id)
-    if store is None:
+    channel_id = request.query.get("channel_id") or ""
+    if not channel_id:
         return web.json_response({"encrypt": True})
-    encrypt = await send_mode.encryption_required(
-        slug or agent_id, store, root,
-    )
+    client = _client_for(agent_id)
+    if client is None:
+        cached = disk_cache.load_channel(channel_id) or {}
+        return web.json_response({
+            "encrypt": cached.get("is_encrypted") is not False,
+        })
+    if request.query.get("refresh") == "1":
+        encrypt = await client.refresh_channel_policy(channel_id)
+    else:
+        encrypt = client.channel_policy(channel_id)
     return web.json_response({"encrypt": bool(encrypt)})
 
 

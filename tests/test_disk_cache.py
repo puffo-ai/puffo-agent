@@ -39,6 +39,7 @@ def test_persist_space_and_channel():
     assert space and space["name"] == "Demo Space"
     assert channel and channel["name"] == "general"
     assert channel["space_id"] == "sp_1"
+    assert "is_encrypted" not in channel
 
 
 def test_load_all_returns_dict_keyed_by_id():

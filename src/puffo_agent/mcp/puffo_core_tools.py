@@ -9,7 +9,6 @@ local tools live in ``host_tools.py``.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import urllib.parse
 from dataclasses import dataclass
@@ -35,6 +34,7 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from ..agent.channel_format import is_channel_format_mismatch
 from ..limits import MESSAGE_SEGMENT_CHARS
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
@@ -42,13 +42,92 @@ from ._host_mcp import PuffoRpcClient
 logger = logging.getLogger(__name__)
 
 
-async def _send_encryption_required(cfg, resolved_root):
-    """Daemon-level send-mode decision. Data-client shims without the
-    method (older harnesses) fail safe to E2EE."""
+async def _send_encryption_required(cfg, channel_id=None):
+    if not channel_id:
+        return True
     getter = getattr(cfg.data_client, "get_send_encryption", None)
     if getter is None:
         return True
-    return await getter(cfg.slug, resolved_root or None)
+    return await getter(channel_id)
+
+
+async def _resolve_channel_recipient_slugs(
+    cfg: Any, space_id: str, channel_id: str,
+) -> list[str]:
+    members_resp = await cfg.http_client.get(
+        f"/spaces/{space_id}/channels/{channel_id}/members"
+    )
+    slugs = [
+        member.get("slug", "")
+        for member in members_resp.get("members", [])
+        if member.get("slug")
+    ]
+    if not slugs:
+        raise RuntimeError(
+            f"channel {channel_id} has no resolvable members "
+            f"(searched space {space_id})"
+        )
+    return slugs
+
+
+async def _post_respecting_channel_format(
+    cfg, inp, signing_key, encrypt: bool,
+    recipient_slugs: list, channel_id: Optional[str],
+    space_id: Optional[str] = None,
+) -> dict:
+    """Post in the cached format, refreshing once on a mismatch."""
+    for attempt in (0, 1):
+        devices: list = []
+        if encrypt:
+            if not recipient_slugs and channel_id:
+                recipient_slugs = await _resolve_channel_recipient_slugs(
+                    cfg, space_id or "", channel_id,
+                )
+            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
+            if not devices:
+                raise RuntimeError("no recipient devices found")
+        inp.recipients = devices
+        try:
+            if encrypt:
+                envelope, content_key = encrypt_message_with_content_key(
+                    inp, signing_key,
+                )
+                # Server expects the envelope at the top level, not wrapped.
+                resp = await cfg.http_client.post("/messages", envelope) or {}
+                missing = resp.get("missing_devices") or []
+                if missing:
+                    asyncio.create_task(_supplement_missing_devices(
+                        cfg.http_client, envelope, content_key,
+                        recipient_slugs, missing,
+                    ))
+            else:
+                envelope = build_plaintext_message(inp, signing_key)
+                await cfg.http_client.post("/v2/messages/plaintext", envelope)
+            return envelope
+        except Exception as exc:
+            if not is_channel_format_mismatch(exc) or attempt == 1:
+                raise
+            wanted = await _refresh_channel_policy(cfg, channel_id)
+            if wanted is None or wanted == encrypt:
+                raise
+            logger.info(
+                "channel %s wants %s; resending",
+                channel_id or "?", "e2ee" if wanted else "plaintext",
+            )
+            encrypt = wanted
+
+
+async def _refresh_channel_policy(
+    cfg, channel_id: Optional[str],
+) -> Optional[bool]:
+    getter = getattr(cfg.data_client, "refresh_channel_policy", None)
+    if getter is None or not channel_id:
+        return None
+    try:
+        return await getter(channel_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("refresh_channel_policy(%s) failed: %s", channel_id, exc)
+        return None
 
 
 async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
@@ -459,19 +538,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # _maybe_cache_channel_space) is authoritative for
             # channels the agent can reach. Miss → bail loud.
             send_space_id = await _resolve_channel_space(cfg, channel_id)
-            members_resp = await cfg.http_client.get(
-                f"/spaces/{send_space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(
-                    f"channel {channel_id} has no resolvable members "
-                    f"(searched space {send_space_id})"
-                )
+            recipient_slugs = []
 
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
@@ -485,12 +552,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             dm_peer=recipient_slug,
         )
-        encrypt = await _send_encryption_required(cfg, resolved_root)
-        devices: list = []
-        if encrypt:
-            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-            if not devices:
-                raise RuntimeError("no recipient devices found")
+        encrypt = await _send_encryption_required(cfg, channel_id)
         # Visibility floors key off the RESOLVED root — a wiped root makes
         # this a root-level post, which can't fold in the UI.
         effective_visible, visibility_note = await _resolve_visibility(
@@ -507,23 +569,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             thread_root_id=resolved_root,
             content_type="text/plain",
             content=text,
-            recipients=devices,
+            recipients=[],
         )
-        if encrypt:
-            envelope, content_key = encrypt_message_with_content_key(
-                inp, signing_key,
-            )
-            # Server expects the envelope at the top level, not wrapped.
-            resp = await cfg.http_client.post("/messages", envelope) or {}
-            missing = resp.get("missing_devices") or []
-            if missing:
-                asyncio.create_task(_supplement_missing_devices(
-                    cfg.http_client, envelope, content_key,
-                    recipient_slugs, missing,
-                ))
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            await cfg.http_client.post("/v2/messages/plaintext", envelope)
+        envelope = await _post_respecting_channel_format(
+            cfg, inp, signing_key, encrypt, recipient_slugs, channel_id,
+            send_space_id,
+        )
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
             f"{visibility_note}"
@@ -1081,18 +1132,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             # silent fallback to ``cfg.space_id``, because targeting
             # the wrong space produced FB-76 mismaps.
             send_space_id = await _resolve_channel_space(cfg, channel_id)
-            members_resp = await cfg.http_client.get(
-                f"/spaces/{send_space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(
-                    f"send_message_with_attachments: channel {channel_id} has no resolvable members"
-                )
+            recipient_slugs = []
 
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
@@ -1109,14 +1149,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             space_id=send_space_id,
             dm_peer=recipient_slug,
         )
-        encrypt = await _send_encryption_required(cfg, resolved_root)
-        devices: list = []
-        if encrypt:
-            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-            if not devices:
-                raise RuntimeError(
-                    "send_message_with_attachments: no recipient devices found"
-                )
+        encrypt = await _send_encryption_required(cfg, channel_id)
         effective_visible, visibility_note = await _resolve_visibility(
             visibility_level, channel_ref, caption, resolved_root or "", cfg.http_client,
         )
@@ -1131,22 +1164,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             thread_root_id=resolved_root,
             content_type=ATTACHMENT_CONTENT_TYPE,
             content=body_content,
-            recipients=devices,
+            recipients=[],
         )
-        if encrypt:
-            envelope, content_key = encrypt_message_with_content_key(
-                inp, signing_key,
-            )
-            resp = await cfg.http_client.post("/messages", envelope) or {}
-            missing = resp.get("missing_devices") or []
-            if missing:
-                asyncio.create_task(_supplement_missing_devices(
-                    cfg.http_client, envelope, content_key,
-                    recipient_slugs, missing,
-                ))
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            await cfg.http_client.post("/v2/messages/plaintext", envelope)
+        envelope = await _post_respecting_channel_format(
+            cfg, inp, signing_key, encrypt, recipient_slugs, channel_id,
+            send_space_id,
+        )
         names = ", ".join(t.name for t in targets)
         thread_note = f" in thread {resolved_root}" if resolved_root else ""
         return (
@@ -1375,4 +1398,3 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         _note_contact(cfg, target, blocked=False)
         return f"unblocked {target}"
-

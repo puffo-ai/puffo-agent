@@ -52,6 +52,7 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     # /channels response so the immediately-following
     # ``_resolve_channel_name`` inside the intro nudge becomes a hit.
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     # Read by ``_maybe_announce_membership_change`` on the OTHER-signer
     # accept_channel_invite path; empty so the predicate bails cleanly.
     client._channel_space = {}
@@ -191,6 +192,23 @@ async def test_intro_nudge_persists_envelope_to_messages_db():
     # space without an extra round-trip.
     assert await store.lookup_channel_space("ch_1") == "sp_1"
 
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_plaintext_channel_intro_uses_cached_channel_policy():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_encrypted["ch_1"] = False
+
+    await client._enqueue_channel_intro_nudge(
+        space_id="sp_1", channel_id="ch_1",
+    )
+
+    _, _, root_id = await client._queue.get()
+    assert client._thread_state[root_id].messages[0]["is_encrypted"] is False
+    envelope = await store.get_message_by_envelope(root_id)
+    assert envelope is not None and envelope.is_encrypted is False
     await store.close()
 
 

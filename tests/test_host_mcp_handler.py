@@ -12,6 +12,9 @@ import pytest
 
 from puffo_agent.portal import host_mcp_handler
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
+from puffo_agent.crypto.message import RecipientDevice
+from puffo_agent.crypto.keystore import encode_secret
+from puffo_agent.crypto.primitives import Ed25519KeyPair
 
 
 def _ctx(
@@ -58,6 +61,52 @@ def _write_host_claude_json(host_home: Path, servers: dict[str, Any]) -> None:
     (host_home / ".claude.json").write_text(
         json.dumps({"mcpServers": servers}), encoding="utf-8",
     )
+
+
+@pytest.mark.asyncio
+async def test_operator_dm_is_always_encrypted(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    ctx.keystore.load_session.return_value.subkey_secret_key = encode_secret(
+        Ed25519KeyPair.generate().secret_bytes(),
+    )
+    monkeypatch.setattr(
+        host_mcp_handler,
+        "_fetch_device_keys",
+        AsyncMock(return_value=[
+            RecipientDevice(device_id="dev_1", kem_public_key=b"k" * 32),
+        ]),
+    )
+    monkeypatch.setattr(
+        host_mcp_handler,
+        "encrypt_message",
+        lambda inp, key: {"envelope_id": "env_1", "type": "message_envelope"},
+    )
+
+    envelope_id = await host_mcp_handler._send_dm_to_operator(ctx, "hello")
+
+    assert envelope_id == "env_1"
+    ctx.http_client.post.assert_awaited_once_with(
+        "/messages",
+        {"envelope_id": "env_1", "type": "message_envelope"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_dm_requires_recipient_devices(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    ctx.keystore.load_session.return_value.subkey_secret_key = encode_secret(
+        Ed25519KeyPair.generate().secret_bytes(),
+    )
+    monkeypatch.setattr(
+        host_mcp_handler,
+        "_fetch_device_keys",
+        AsyncMock(return_value=[]),
+    )
+
+    with pytest.raises(RuntimeError, match="no recipient devices"):
+        await host_mcp_handler._send_dm_to_operator(ctx, "hello")
+
+    ctx.http_client.post.assert_not_awaited()
 
 
 # ── install ────────────────────────────────────────────────────────

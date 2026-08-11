@@ -37,6 +37,7 @@ def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     client._channel_space = {}
     client._space_name_cache = {}
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     client._space_members = {}
     client._processed_membership_event_ids = set()
 
@@ -211,6 +212,26 @@ async def test_membership_envelope_persists_to_messages_db():
     history = await store.get_channel_history(channel_id="ch_1", limit=10)
     assert len(history) == 1
     assert history[0].envelope_id == root_id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_plaintext_channel_membership_message_uses_cached_policy():
+    store = await _make_store()
+    client = _make_client(store)
+    client._channel_space["ch_1"] = "sp_1"
+    client._channel_encrypted["ch_1"] = False
+
+    await client._enqueue_membership_system_message(
+        channel_id="ch_1",
+        actor_slug="alice-0001",
+        action="joined",
+    )
+
+    _, _, root_id = await client._queue.get()
+    assert client._thread_state[root_id].messages[0]["is_encrypted"] is False
+    envelope = await store.get_message_by_envelope(root_id)
+    assert envelope is not None and envelope.is_encrypted is False
     await store.close()
 
 

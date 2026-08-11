@@ -20,6 +20,7 @@ from ..portal.state import home_dir
 
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 
 def _cache_root() -> Path:
@@ -79,18 +80,31 @@ def persist_space(space_id: str, name: str) -> None:
         logger.debug("persist_space(%s) failed: %s", space_id, exc)
 
 
-def persist_channel(channel_id: str, name: str, space_id: str = "") -> None:
+def persist_channel(
+    channel_id: str,
+    name: str,
+    space_id: str = "",
+    is_encrypted: bool | object = _UNSET,
+) -> None:
     if not channel_id or not name:
         return
     try:
+        payload = {
+            "channel_id": channel_id,
+            "name": name,
+            "space_id": space_id,
+            "fetched_at": int(time.time()),
+        }
+        if is_encrypted is _UNSET:
+            existing = load_channel(channel_id) or {}
+            policy = existing.get("is_encrypted")
+            if isinstance(policy, bool):
+                payload["is_encrypted"] = policy
+        else:
+            payload["is_encrypted"] = bool(is_encrypted)
         _atomic_write_json(
             _cache_root() / "channels" / f"{_safe(channel_id)}.json",
-            {
-                "channel_id": channel_id,
-                "name": name,
-                "space_id": space_id,
-                "fetched_at": int(time.time()),
-            },
+            payload,
         )
     except OSError as exc:
         logger.debug("persist_channel(%s) failed: %s", channel_id, exc)

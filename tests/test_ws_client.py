@@ -294,17 +294,27 @@ async def test_event_and_cert_handlers():
     server._push_after_connect = [
         {"type": "cert_update", "entry": {"seq": 5, "kind": "subkey_cert"}},
         {"type": "event", "scope": "sp_123", "event": {"action": "join"}},
+        {
+            "type": "channel_update",
+            "space_id": "sp_123",
+            "channel_id": "ch_123",
+            "is_encrypted": False,
+        },
     ]
     await server.start()
 
     cert_updates = []
     events = []
+    channel_updates = []
 
     async def on_cert(entry):
         cert_updates.append(entry)
 
     async def on_event(scope, event):
         events.append((scope, event))
+
+    async def on_channel_update(update):
+        channel_updates.append(update)
 
     http = FakeHttpClient()
     client = PuffoCoreWsClient(
@@ -314,6 +324,7 @@ async def test_event_and_cert_handlers():
     client.ws_url = f"ws://127.0.0.1:{server.port}"
     client.on_cert_update = on_cert
     client.on_event = on_event
+    client.on_channel_update = on_channel_update
 
     task = asyncio.create_task(client.connect_once())
     await asyncio.sleep(0.5)
@@ -328,7 +339,32 @@ async def test_event_and_cert_handlers():
     assert len(events) == 1
     assert events[0][0] == "sp_123"
     assert events[0][1]["action"] == "join"
+    assert channel_updates == [{
+        "type": "channel_update",
+        "space_id": "sp_123",
+        "channel_id": "ch_123",
+        "is_encrypted": False,
+    }]
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_channel_update_handler_failure_isolated(caplog):
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient(
+        "http://localhost:3000", ks, "alice-0001", FakeHttpClient(),
+    )
+
+    await client._handle_frame(json.dumps({"type": "unknown"}))
+    await client._handle_frame(json.dumps({"type": "channel_update"}))
+
+    async def fail(update):
+        raise RuntimeError("callback failed")
+
+    client.on_channel_update = fail
+    await client._handle_frame(json.dumps({"type": "channel_update"}))
+
+    assert "on_channel_update callback failed" in caplog.text
 
 
 @pytest.mark.asyncio

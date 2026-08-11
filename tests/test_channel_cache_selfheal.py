@@ -67,6 +67,7 @@ async def test_warm_caches_only_server_returned_channels(monkeypatch):
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client._channel_space = {}
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     client.http = MagicMock()
     # Server returns ONLY the member channel (it is membership-filtered).
     client.http.get = AsyncMock(
