@@ -997,13 +997,10 @@ def _apply_cli_inference_level(
     return 0, False, True
 
 
-def cmd_agent_runtime(args: argparse.Namespace) -> int:
-    """Show or update the runtime: block in agent.yml. Fields are
-    optional; invoking with no flags just prints the current block."""
-    agent_id = args.id
-    if not agent_yml_path(agent_id).exists():
-        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
-        return 2
+def _load_runtime_command_config(
+    agent_id: str,
+    args: argparse.Namespace,
+) -> AgentConfig | None:
     update_requested = any(
         getattr(args, field) is not None
         for field in (
@@ -1021,13 +1018,25 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     try:
         # An explicit edit must be able to repair a runtime combination that
         # a newer release stopped supporting. The final combination is still
-        # validated below before any bytes are written.
-        cfg = AgentConfig.load(
+        # validated by cmd_agent_runtime before any bytes are written.
+        return AgentConfig.load(
             agent_id,
             allow_invalid_runtime=update_requested,
         )
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return None
+
+
+def cmd_agent_runtime(args: argparse.Namespace) -> int:
+    """Show or update the runtime: block in agent.yml. Fields are
+    optional; invoking with no flags just prints the current block."""
+    agent_id = args.id
+    if not agent_yml_path(agent_id).exists():
+        print(f"error: agent {agent_id!r} not found", file=sys.stderr)
+        return 2
+    cfg = _load_runtime_command_config(agent_id, args)
+    if cfg is None:
         return 2
 
     touched = False
