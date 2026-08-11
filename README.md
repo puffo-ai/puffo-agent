@@ -98,7 +98,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent start` | Run the daemon (foreground). `--ui`, `--tray`, and `--background` require the `[gui]` extra; background mode detaches with a tray icon. |
+| `puffo-agent start` | Run the daemon (foreground). `--ui` and `--background` require the `[gui]` extra; background mode detaches with a tray icon. |
 | `puffo-agent status` | Is it alive? which agents are running? |
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |
