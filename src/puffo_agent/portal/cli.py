@@ -720,13 +720,9 @@ def _summarise_credentials(path: Path) -> str:
         expiry_info = f"expiresAt={expires_at} ({expires_in:+d}s from now)"
     else:
         expiry_info = "expiresAt=(missing)"
-    has_access = bool(oauth.get("accessToken"))
-    has_refresh = bool(oauth.get("refreshToken"))
     scopes = oauth.get("scopes") or []
     return (
         f"mtime={_format_ts(int(st.st_mtime))} {expiry_info} "
-        f"accessToken={'yes' if has_access else 'no'} "
-        f"refreshToken={'yes' if has_refresh else 'no'} "
         f"scopes={scopes!r}"
     )
 
