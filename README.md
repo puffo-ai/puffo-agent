@@ -22,7 +22,7 @@ commands at the root (`start`, `status`, …), `machine` for portal
 linking, and `agent` for the bots themselves.
 
 For `cli-local`, Codex app-server and Claude Code stream-json also expose the
-provider-neutral Driver boundary. Their safe six-type execution
+provider-neutral Driver boundary. Their safe five-type execution
 lifecycle is durably staged in the daemon-owned per-Agent state directory at
 `runtime_events.db`, beside `messages.db` and never in the user workspace; raw
 provider frames, reasoning, tool payloads, credentials, and Inbox contents are
