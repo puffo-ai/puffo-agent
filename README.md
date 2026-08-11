@@ -62,7 +62,7 @@ Python:
 ```bash
 uv tool install puffo-agent
 # pin to a specific version:
-uv tool install puffo-agent==1.2.0
+uv tool install puffo-agent==1.3.0
 ```
 
 Otherwise use pip:
@@ -70,7 +70,7 @@ Otherwise use pip:
 ```bash
 pip install puffo-agent
 # pin to a specific version:
-pip install puffo-agent==1.2.0
+pip install puffo-agent==1.3.0
 ```
 
 Both paths install the `puffo-agent` console script. The CLI's
