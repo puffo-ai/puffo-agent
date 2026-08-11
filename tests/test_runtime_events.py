@@ -12,7 +12,6 @@ import puffo_agent
 from puffo_agent.agent.harness.driver import HarnessEvent, SessionRef, TurnRef
 from puffo_agent.agent._logging import RUNTIME_EVENT_NAMES, log_runtime_event
 from puffo_agent.agent.runtime_events import (
-    DeltaCoalescer,
     LifecycleValidator,
     RuntimeEvent,
     RuntimeEventProjector,
@@ -29,10 +28,10 @@ def event(type_: str, payload: dict, **kwargs) -> RuntimeEvent:
     )
 
 
-def test_schema_has_exact_v1_envelope_and_six_types():
+def test_schema_has_exact_v1_envelope_and_metadata_only_types():
     assert RUNTIME_EVENT_TYPES == {
-        "turn.started", "activity.updated", "output.updated", "tool.updated",
-        "permission.updated", "turn.finished",
+        "turn.started", "activity.updated", "tool.updated", "permission.updated",
+        "turn.finished",
     }
     value = event("turn.started", {}).as_dict()
     assert set(value) == {
@@ -62,18 +61,10 @@ def test_runtime_event_v1_scope_is_operator_only():
             TrustedScope(**kwargs)
 
 
-def test_lifecycle_and_output_blocks():
+def test_lifecycle_accepts_metadata_without_output_blocks():
     validator = LifecycleValidator()
     validator.accept(event("turn.started", {}))
-    validator.accept(event("output.updated", {
-        "block_id": "out", "kind": "result", "phase": "start",
-    }))
-    validator.accept(event("output.updated", {
-        "block_id": "out", "kind": "result", "phase": "delta", "delta": "ok",
-    }))
-    validator.accept(event("output.updated", {
-        "block_id": "out", "kind": "result", "phase": "end",
-    }))
+    validator.accept(event("activity.updated", {"text": "Working"}))
     validator.accept(event("turn.finished", {"outcome": "succeeded"}))
     assert validator.active_turn_ref is None
 
@@ -126,7 +117,7 @@ def test_runtime_event_is_immutable_after_id_assignment():
     assert value.as_dict()["event_id"] == "evt_fixed"
 
 
-def test_privacy_scope_and_redaction_projection():
+def test_assistant_output_is_not_projected_to_remote_events():
     secret = "sk-secret-native-tool-input"
     projector = RuntimeEventProjector(
         agent_id="agent_1", session_ref="session_1",
@@ -142,10 +133,7 @@ def test_privacy_scope_and_redaction_projection():
         },
     )
     public = projector.project(native)
-    assert public is not None
-    encoded = json.dumps(public.as_dict())
-    assert secret not in encoded
-    assert public.scope.as_dict() == {"kind": "operator"}
+    assert public is None
     assert TrustedScope.from_runtime_context(["ctx_1"]).as_dict() == {
         "kind": "operator",
     }
@@ -157,8 +145,7 @@ def test_privacy_scope_and_redaction_projection():
 def test_projection_is_provider_neutral_and_uses_only_logical_references():
     def projected(driver):
         ids = iter([
-            "evt_start", "evt_activity", "evt_block_start", "evt_delta",
-            "evt_end", "evt_done",
+            "evt_start", "evt_done",
         ])
         projector = RuntimeEventProjector(
             agent_id="agent", session_ref="logical_session",
@@ -205,8 +192,6 @@ def test_projection_is_provider_neutral_and_uses_only_logical_references():
         result = []
         for value in values:
             payload = value.as_dict()["payload"]
-            if "block_id" in payload:
-                payload["block_id"] = "<logical-output-block>"
             result.append(
                 (value.type, payload, value.session_ref, value.turn_ref)
             )
@@ -239,11 +224,7 @@ def test_privacy_redacts_every_non_allowlisted_native_or_model_field():
         },
         native_payload={"raw": secrets[1], "authorization": secrets[4]},
     ))
-    assert public is not None
-    encoded = json.dumps(public.as_dict())
-    assert "safe visible text" in encoded
-    assert all(secret not in encoded for secret in secrets)
-    assert public.scope.as_dict() == {"kind": "operator"}
+    assert public is None
 
 
 def test_started_projection_is_fixed_ordered_lifecycle_pair():
@@ -334,16 +315,6 @@ def test_finished_error_rejects_nonfailed_outcomes():
             }})
 
 
-def test_coalescing_reconstructs_text_with_fewer_rows():
-    coalescer = DeltaCoalescer(max_bytes=4)
-    output = []
-    for token in "abcdefghij":
-        output.extend(coalescer.add(token))
-    output.extend(coalescer.flush())
-    assert "".join(output) == "abcdefghij"
-    assert len(output) < 10
-
-
 def test_log_command_normalization_and_projection_boundaries_are_closed(caplog):
     logger = logging.getLogger("test.runtime.boundaries")
     caplog.set_level(logging.INFO, logger=logger.name)
@@ -364,7 +335,7 @@ def test_log_command_normalization_and_projection_boundaries_are_closed(caplog):
     log_runtime_event(
         logger, "runtime.projected",
         agent_id="agent", session_ref="session", turn_ref="turn",
-        event_id="evt", event_type="output.updated",
+        event_id="evt", event_type="tool.updated",
     )
     parsed = [
         json.loads(record.getMessage().split("runtime_event=", 1)[1])
@@ -410,16 +381,7 @@ def test_every_logged_runtime_event_name_is_supported():
     assert unsupported == {}
 
 
-def test_second_output_block_is_accepted_and_terminal_state_is_pruned():
-    """Two output blocks in one turn, then no per-turn state survives it.
-
-    A provider frame carrying two content blocks opens a second block after the
-    first has ended.  The validator must admit that (the drivers emit it), and
-    once the turn is terminal neither the validator nor the projector may keep
-    rows for it -- both live for the whole daemon lifetime, so an un-pruned
-    table grows without bound and makes the validator's open-block scan cost
-    grow with process age.
-    """
+def test_assistant_blocks_are_omitted_and_terminal_metadata_is_pruned():
     projector = RuntimeEventProjector(agent_id="agent_1", session_ref="s_1")
     validator = LifecycleValidator()
 
@@ -438,20 +400,18 @@ def test_second_output_block_is_accepted_and_terminal_state_is_pruned():
         source.append(normalized("turn.tool_started", tool_call_ref=block))
     source.append(normalized("turn.completed", outcome="succeeded"))
 
-    phases = []
+    projected_types = []
     for item in source:
         for projected in projector.project_all(item):
             validator.accept(projected)
-            if projected.type == "output.updated":
-                phases.append(projected.payload["phase"])
+            projected_types.append(projected.type)
 
-    # Both blocks materialize a full start -> delta -> end, so the second one
-    # was not suppressed as a duplicate of the first.
-    assert phases == ["start", "delta", "end"] * 2
+    assert "output.updated" not in projected_types
+    assert projected_types == [
+        "turn.started", "activity.updated", "tool.updated", "tool.updated",
+        "turn.finished",
+    ]
     assert validator.active_turn_ref is None
-    assert validator._blocks == {}
-    assert projector._block_refs == {}
     assert projector._tool_refs == {}
-    assert projector._started_blocks == set()
     # The turn is still remembered as terminal, so a late event is rejected.
     assert "turn_1" in validator._finished

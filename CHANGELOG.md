@@ -33,9 +33,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   areas.** Semantic MCP tools provide controlled reads, writes, search,
   refresh, reload, and Git-backed history.
 
-- **Runtime events are durable and replayable.** Codex app-server and Claude
-  Code stream-json events are normalized behind one Driver contract, persisted
-  locally, and uploaded in bounded idempotent batches.
+- **Runtime lifecycle metadata is durable and replayable.** Codex app-server and
+  Claude Code stream-json events are normalized behind one Driver contract.
+  Only fixed-vocabulary lifecycle, tool, permission, and terminal metadata is
+  uploaded in bounded idempotent batches; assistant output remains local unless
+  a future end-to-end encrypted content contract is introduced.
 
 ### Changed
 

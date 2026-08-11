@@ -1612,17 +1612,16 @@ async def test_two_output_blocks_in_one_turn_keep_distinct_block_ids(provider):
     assert [value.data["text"] for value in deltas] == ["first", "second"]
     assert len(set(block_ids)) == 2, block_ids
 
-    # The identity only matters because of what it does downstream: replaying
-    # the driver's own events must not trip the lifecycle validator.
+    # Replaying the driver's events must preserve lifecycle metadata while
+    # keeping all assistant text local to the Runtime Manager.
     projector = RuntimeEventProjector(agent_id="agent_1", session_ref="s_1")
     validator = LifecycleValidator()
-    phases = []
+    projected_types = []
     for value in collected:
         for projected in projector.project_all(value):
             validator.accept(projected)
-            if projected.type == "output.updated":
-                phases.append(projected.payload["phase"])
-    assert phases == ["start", "delta", "end"] * 2
+            projected_types.append(projected.type)
+    assert "output.updated" not in projected_types
     assert validator.active_turn_ref is None
 
 

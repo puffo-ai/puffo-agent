@@ -178,7 +178,7 @@ def test_maximum_timestamp_initial_estimate_covers_zero_microsecond_form():
 
 
 @pytest.mark.asyncio
-async def test_buffered_output_pressure_discards_nonterminal_but_keeps_terminal(
+async def test_assistant_output_is_not_persisted_but_terminal_is_kept(
     tmp_path,
 ):
     outbox = RuntimeEventOutbox(
@@ -188,7 +188,6 @@ async def test_buffered_output_pressure_discards_nonterminal_but_keeps_terminal(
     sink = RuntimeEventProjectingSink(
         outbox,
         RuntimeEventProjector(agent_id="agent", session_ref="session"),
-        delta_bytes=1024,
     )
 
     def native(type_, data=None):
@@ -222,6 +221,46 @@ def test_location_is_daemon_agent_state_beside_messages_not_workspace(tmp_path):
     outbox.close()
 
 
+def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
+    path = tmp_path / "runtime_events.db"
+    outbox = RuntimeEventOutbox(path)
+    legacy_rows = [
+        {
+            "version": 1, "event_id": "legacy-output", "agent_id": "agent",
+            "session_ref": "session", "turn_ref": "turn",
+            "scope": {"kind": "operator"}, "type": "output.updated",
+            "occurred_at": "2026-07-30T12:00:00Z",
+            "payload": {
+                "block_id": "out", "kind": "result", "phase": "delta",
+                "delta": "private assistant output",
+            },
+        },
+        {
+            "version": 1, "event_id": "legacy-activity", "agent_id": "agent",
+            "session_ref": "session", "turn_ref": "turn",
+            "scope": {"kind": "operator"}, "type": "activity.updated",
+            "occurred_at": "2026-07-30T12:00:00Z",
+            "payload": {"text": "Reading a private file"},
+        },
+    ]
+    for value in legacy_rows:
+        encoded = json.dumps(value, separators=(",", ":")).encode()
+        outbox._db.execute(
+            "INSERT INTO events(event_id,event_type,event_json,byte_count) VALUES(?,?,?,?)",
+            (value["event_id"], value["type"], encoded, len(encoded)),
+        )
+    outbox._db.commit()
+    outbox.close()
+
+    migrated = RuntimeEventOutbox(path)
+    values = [row.event for row in migrated.prefix()]
+    assert [(value["type"], value["payload"]) for value in values] == [
+        ("activity.updated", {"text": "Working"}),
+    ]
+    assert "private" not in json.dumps(values)
+    migrated.close()
+
+
 @pytest.mark.asyncio
 async def test_byte_bound_and_terminal_capacity_reservation(tmp_path):
     start = event(1)
@@ -248,12 +287,11 @@ async def test_byte_bound_and_terminal_capacity_reservation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_coalescing_sink_projects_normalized_lifecycle(tmp_path):
+async def test_sink_projects_metadata_lifecycle_without_assistant_output(tmp_path):
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
     sink = RuntimeEventProjectingSink(
         outbox,
         RuntimeEventProjector(agent_id="agent", session_ref="session"),
-        delta_bytes=4,
     )
 
     def native(type_, data=None):
@@ -272,19 +310,11 @@ async def test_coalescing_sink_projects_normalized_lifecycle(tmp_path):
     ))
     await sink(native("turn.completed", {"outcome": "succeeded"}))
     values = [row.event for row in outbox.prefix()]
-    deltas = [
-        item["payload"]["delta"] for item in values
-        if item["type"] == "output.updated"
-        and item["payload"]["phase"] == "delta"
+    assert [value["type"] for value in values] == [
+        "turn.started", "activity.updated", "turn.finished",
     ]
-    assert "".join(deltas) == "abcdefghij"
-    assert len(deltas) < 10
-    assert values[0]["type"] == "turn.started"
-    assert values[-1] == {
-        **values[-1],
-        "type": "turn.finished",
-        "payload": {"outcome": "succeeded"},
-    }
+    assert values[-1]["payload"] == {"outcome": "succeeded"}
+    assert "abcdefghij" not in json.dumps(values)
     outbox.close()
 
 
@@ -564,9 +594,10 @@ async def test_runtime_event_transport_enforces_complete_body_limits_and_progres
 
     # A singleton over the complete-frame cap is quarantined without a call.
     oversized = RuntimeEventOutbox(tmp_path / "oversized.db")
-    huge = RuntimeEvent(agent_id="agent", session_ref="session", turn_ref="turn",
-                        type="output.updated", payload={"block_id": "out", "kind": "result", "phase": "delta", "delta": "x" * (256 * 1024)},
-                        event_id="huge")
+    huge = RuntimeEvent(
+        agent_id="agent", session_ref="session", turn_ref="turn",
+        type="turn.started", payload={}, event_id="x" * (256 * 1024),
+    )
     await oversized.enqueue(huge)
     calls = []
     async def never(_path, body):
@@ -587,11 +618,7 @@ async def test_log_boundaries_are_json_safe_and_content_free(tmp_path, caplog):
     secret = "sk-super-secret-payload-123456"
     value = RuntimeEvent(
         agent_id="agent", session_ref="session", turn_ref="turn",
-        type="output.updated",
-        payload={
-            "block_id": "out", "kind": "result", "phase": "delta",
-            "delta": secret,
-        },
+        type="turn.started", payload={},
         event_id="evt_log",
     )
     await outbox.enqueue(value)
@@ -639,7 +666,7 @@ async def test_log_boundaries_are_json_safe_and_content_free(tmp_path, caplog):
     assert enqueued == {
         "event": "runtime.enqueued", "agent_id": "agent",
         "session_ref": "session", "turn_ref": "turn",
-        "event_id": "evt_log", "event_type": "output.updated",
+        "event_id": "evt_log", "event_type": "turn.started",
         "outbox_sequence": 1,
     }
     assert any(

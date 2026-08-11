@@ -9,18 +9,12 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, TypeVar
 
 from ._logging import log_runtime_event
 from .harness.driver import HarnessEvent, HarnessEventType
-from .runtime_events import (
-    DeltaCoalescer,
-    LifecycleValidator,
-    RuntimeEvent,
-    RuntimeEventProjector,
-)
+from .runtime_events import LifecycleValidator, RuntimeEvent, RuntimeEventProjector
 
 APPEND_PATH = "/v2/agent-runtime/events:append"
 # These responses describe the upload channel, not a specific event row.  In
@@ -30,6 +24,56 @@ APPEND_PATH = "/v2/agent-runtime/events:append"
 _DEGRADED_CHANNEL_HTTP_STATUSES = frozenset({401, 403, 404, 405})
 
 _Result = TypeVar("_Result")
+
+
+def _metadata_only_event(value: Any) -> RuntimeEvent | None:
+    """Sanitize one pre-1.3 outbox row without retaining content fields."""
+    if not isinstance(value, dict):
+        return None
+    if value.get("version") != 1 or value.get("scope") != {"kind": "operator"}:
+        return None
+    for field in ("event_id", "agent_id", "session_ref", "turn_ref", "occurred_at"):
+        if not isinstance(value.get(field), str) or not value[field]:
+            return None
+    event_type = value.get("type")
+    payload = value.get("payload")
+    if not isinstance(payload, dict) or event_type == "output.updated":
+        return None
+    if event_type == "turn.started":
+        payload = {}
+    elif event_type == "activity.updated":
+        payload = {"text": None if payload.get("text") is None else "Working"}
+    elif event_type == "tool.updated":
+        if not isinstance(payload.get("tool_call_ref"), str):
+            return None
+        payload = {
+            "tool_call_ref": payload.get("tool_call_ref"),
+            "label": "Tool",
+            "state": payload.get("state"),
+        }
+    elif event_type == "permission.updated":
+        if not isinstance(payload.get("permission_ref"), str):
+            return None
+        payload = {
+            "permission_ref": payload.get("permission_ref"),
+            "state": payload.get("state"),
+            "title": "Permission required",
+        }
+    elif event_type != "turn.finished":
+        return None
+    try:
+        return RuntimeEvent(
+            version=value.get("version"),
+            event_id=value.get("event_id"),
+            agent_id=value.get("agent_id"),
+            session_ref=value.get("session_ref"),
+            turn_ref=value.get("turn_ref"),
+            type=event_type,
+            occurred_at=value.get("occurred_at"),
+            payload=payload,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def runtime_event_outbox_path(agent_state_dir: str | Path) -> Path:
@@ -137,8 +181,29 @@ class RuntimeEventOutbox:
             );
             """
         )
+        self._migrate_metadata_only_rows(db)
         db.commit()
         return db
+
+    def _migrate_metadata_only_rows(self, db: sqlite3.Connection) -> None:
+        """Prevent queued pre-1.3 content from crossing the upload boundary."""
+        rows = db.execute(
+            "SELECT sequence, event_type, event_json FROM events ORDER BY sequence"
+        ).fetchall()
+        for row in rows:
+            try:
+                raw = json.loads(row["event_json"])
+            except (TypeError, ValueError):
+                raw = None
+            event = _metadata_only_event(raw)
+            if event is None or event.type != row["event_type"]:
+                db.execute("DELETE FROM events WHERE sequence = ?", (row["sequence"],))
+                continue
+            encoded = self.canonical_bytes(event)
+            db.execute(
+                "UPDATE events SET event_json = ?, byte_count = ? WHERE sequence = ?",
+                (encoded, len(encoded), row["sequence"]),
+            )
 
     def _call(self, work: Callable[[], _Result]) -> _Result:
         """Run DB work on the owning thread and block for its result."""
@@ -569,25 +634,20 @@ class RuntimeEventUploader:
 
 
 class RuntimeEventProjectingSink:
-    """Durably project the Runtime Manager's normalized event stream.
+    """Durably project metadata from the Runtime Manager's event stream.
 
-    Token-sized deltas are coalesced before immutable public event IDs are
-    allocated. The lifecycle validator runs on the exact rows that enter the
-    outbox, never on provider-native timing or IDs.
+    Assistant output, reasoning, tool content, and provider-native payloads are
+    deliberately not projected into this remotely uploaded outbox.
     """
 
     def __init__(
         self,
         outbox: RuntimeEventOutbox,
         projector: RuntimeEventProjector,
-        *,
-        delta_bytes: int = 4096,
     ):
         self.outbox = outbox
         self.projector = projector
         self.validator = LifecycleValidator()
-        self.delta_bytes = delta_bytes
-        self._coalescers: dict[tuple[str, str], DeltaCoalescer] = {}
 
     async def __call__(self, event: HarnessEvent) -> None:
         kind = (
@@ -602,64 +662,7 @@ class RuntimeEventProjectingSink:
             turn_ref=str(event.turn_ref) if event.turn_ref is not None else "",
             event_type=kind,
         )
-        if kind == "turn.assistant_delta" and event.turn_ref is not None:
-            text = event.data.get("text")
-            if not isinstance(text, str) or not text:
-                return
-            key = (
-                str(event.turn_ref),
-                str(event.data.get("block_id") or "result"),
-            )
-            coalescer = self._coalescers.setdefault(
-                key, DeltaCoalescer(self.delta_bytes)
-            )
-            for chunk in coalescer.add(text):
-                await self._project(replace(
-                    event, data={**event.data, "text": chunk}
-                ))
-            return
-        if kind == "turn.assistant_completed" and event.turn_ref is not None:
-            key = (
-                str(event.turn_ref),
-                str(event.data.get("block_id") or "result"),
-            )
-            coalescer = self._coalescers.pop(key, None)
-            if coalescer is not None:
-                for chunk in coalescer.flush():
-                    await self._project(replace(
-                        event,
-                        type=HarnessEventType.ASSISTANT_DELTA,
-                        data={**event.data, "text": chunk},
-                    ))
-            await self._project(event)
-            return
-        if kind in {"turn.completed", "turn.abandoned"}:
-            await self._flush_turn(event)
         await self._project(event)
-
-    async def _flush_turn(self, terminal: HarnessEvent) -> None:
-        turn = str(terminal.turn_ref) if terminal.turn_ref is not None else ""
-        for key, coalescer in tuple(self._coalescers.items()):
-            if key[0] != turn:
-                continue
-            for chunk in coalescer.flush():
-                try:
-                    await self._project(replace(
-                        terminal,
-                        type=HarnessEventType.ASSISTANT_DELTA,
-                        data={"text": chunk, "block_id": key[1]},
-                    ))
-                except OutboxCapacityError:
-                    break
-            try:
-                await self._project(replace(
-                    terminal,
-                    type=HarnessEventType.ASSISTANT_COMPLETED,
-                    data={"block_id": key[1]},
-                ))
-            except OutboxCapacityError:
-                pass
-            self._coalescers.pop(key, None)
 
     async def _project(self, event: HarnessEvent) -> None:
         for projected in self.projector.project_all(event):

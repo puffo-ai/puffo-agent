@@ -417,7 +417,8 @@ async def test_runtime_start_pair_never_leaks_raw_boundaries_before_ack(
     assert [(row["type"], row["payload"]) for row in projected[:2]] == [
         ("turn.started", {}), ("activity.updated", {"text": "Working"}),
     ]
-    assert any(row["payload"].get("delta") == "safe output" for row in projected)
+    assert not any(row["type"] == "output.updated" for row in projected)
+    assert "safe output" not in json.dumps(projected)
     assert any(row["type"] == "tool.updated" for row in projected)
 
     entered, release, uploads = asyncio.Event(), asyncio.Event(), []

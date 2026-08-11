@@ -257,10 +257,14 @@ the provider at a safe lifecycle boundary.
 
 ## 8. Runtime Events And Reminders
 
-Local Drivers emit normalized events into `runtime_events.db`. A background
-uploader appends bounded, idempotent batches to the Server. The Server provides
-session/turn replay and queues cancellation or permission commands; the Agent
-acknowledges accepted commands over its active transport.
+Local Drivers emit normalized events to the Runtime Manager. Its remote event
+projector writes only fixed-vocabulary lifecycle, tool, permission, and terminal
+metadata into `runtime_events.db`; assistant output and provider/model-authored
+text stay local. A background uploader appends bounded, idempotent metadata
+batches to the Server. The Server provides session/turn replay and queues
+cancellation or permission commands; the Agent acknowledges accepted commands
+over its active transport. Uploading execution text requires a future end-to-end
+encrypted contract and is not part of Runtime Events v1.
 
 Reminders are one-shot scheduled occurrences in `messages.db`. The Agent owns
 plaintext intent and local firing. It encrypts remote payloads, while the Server
