@@ -158,10 +158,9 @@ def _seed_source_agent(home: str, agent_id: str, slug: str, server_url: str) -> 
         slug_binding_json=json.dumps(_build_signed_slug_binding(root, slug)),
         identity_cert_json=json.dumps(_build_signed_identity_cert(root)),
     )
-    (adir / "keys" / f"{slug}.json").write_text(
-        json.dumps(identity.to_dict(), indent=2), encoding="utf-8"
-    )
-    backup_dek = KeyStore(adir / "keys").load_or_create_message_backup_dek(slug)
+    key_store = KeyStore(adir / "keys")
+    key_store.save_identity(identity)
+    backup_dek = key_store.load_or_create_message_backup_dek(slug)
     return {
         "root": root,
         "device_signing": device_signing,

@@ -85,7 +85,7 @@ def test_redact_token_omits_raw_value():
     out = diag._redact_token("sk-ant-supersecret-9999")
     assert "supersecret" not in out
     assert "len=" in out
-    assert "sha256_prefix=" in out
+    assert "sha256" not in out
 
 
 def test_summarise_blob_redacts_oauth_tokens():

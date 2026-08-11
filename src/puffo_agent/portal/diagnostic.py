@@ -6,8 +6,8 @@ subcommand:
 
   - Returns a structured ``ProbeReport`` (markdown) on stdout.
   - Classifies each step as ``OK`` / ``FAIL`` / ``NEEDS_ATTENTION``.
-  - Redacts secrets aggressively — token strings are shown only as
-    ``len=NNN sha256_prefix=XXXXXXXX``, never raw.
+  - Redacts secrets aggressively — token strings are shown only by length,
+    never raw or as a reusable fingerprint.
 
 Cross-platform: every subcommand runs everywhere, but non-Darwin hosts
 get a ``skipped: not applicable`` body so Linux/Windows reviewers can
@@ -17,7 +17,6 @@ also sanity-check the output format.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -103,11 +102,10 @@ class ProbeReport:
 
 
 def _redact_token(s: str) -> str:
-    """Show length + sha256 prefix, never raw token."""
+    """Show only token length, never raw content or a stable fingerprint."""
     if not s:
         return "(empty)"
-    digest = hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
-    return f"len={len(s)} sha256_prefix={digest}"
+    return f"len={len(s)}"
 
 
 def _summarise_blob(raw: str) -> str:

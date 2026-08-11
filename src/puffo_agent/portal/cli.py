@@ -710,8 +710,8 @@ def _summarise_credentials(path: Path) -> str:
         return f"stat failed: {exc}"
     try:
         data = _json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return f"size={st.st_size}B mtime={_format_ts(int(st.st_mtime))} parse-error: {exc}"
+    except (OSError, ValueError):
+        return f"size={st.st_size}B mtime={_format_ts(int(st.st_mtime))} parse-error"
     oauth = data.get("claudeAiOauth") or {}
     expires_ms = oauth.get("expiresAt")
     if isinstance(expires_ms, (int, float)):
