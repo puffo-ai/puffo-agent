@@ -1268,6 +1268,7 @@ class PuffoCoreMessageClient:
         on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
         last_envelope: str,
         is_auth: bool = False,
+        is_drained: bool = False,
     ) -> None:
         """Loop the API-Error kick-retry path until the agent
         succeeds, the retry cap is hit, or a non-retry exception
@@ -1295,15 +1296,17 @@ class PuffoCoreMessageClient:
         # by the kick's successful dispatch) or by in-batch dedup.
         entry.dispatching_ids = set()
 
-        if is_auth:
-            # Retrying is pointless until re-login (worker already set
-            # auth_failed + DMed). Don't fire the abandon callback — it
-            # would overwrite auth_failed; cursor stays un-advanced so
-            # the batch redelivers on recovery.
+        if is_auth or is_drained:
+            # Retrying is pointless until re-login / quota reset (the
+            # worker already set health + DMed). Don't fire the abandon
+            # callback — it would overwrite that health; cursor stays
+            # un-advanced so the batch redelivers on recovery.
             self._log.warning(
-                "agent reply was an auth error for thread %s (last envelope "
-                "%s); skipping kick-retries until operator re-login",
+                "agent reply was %s for thread %s (last envelope %s); "
+                "skipping kick-retries until %s",
+                "an auth error" if is_auth else "a quota-exhausted error",
                 root_id, last_envelope,
+                "operator re-login" if is_auth else "the usage window resets",
             )
             return
 
@@ -1596,8 +1599,8 @@ class PuffoCoreMessageClient:
                 # via ``on_api_error_retry``; if ``--resume`` is no
                 # longer valid the adapter falls back to the original
                 # payload on its own so the agent has something to
-                # work from. Auth errors skip retries entirely (the
-                # worker already flipped auth_failed + DMed).
+                # work from. Auth and quota-drained errors skip retries
+                # entirely (the worker already flipped health + DMed).
                 last_envelope = batch[-1].get("envelope_id", "") if batch else ""
                 await self._do_api_error_retries(
                     root_id=root_id,
@@ -1609,6 +1612,7 @@ class PuffoCoreMessageClient:
                     on_turn_success=on_turn_success,
                     last_envelope=last_envelope,
                     is_auth=getattr(exc, "is_auth", False),
+                    is_drained=getattr(exc, "is_drained", False),
                 )
                 continue
             except asyncio.CancelledError:
