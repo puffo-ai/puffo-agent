@@ -384,12 +384,17 @@ orphan run row.
 
 ### 5.3 Auto-accept invites + DM intercept
 
-Agents auto-accept space and channel invites whose inviter root pubkey
-matches the agent's `declared_operator_public_key` (set at agent
-creation, baked into the identity cert). Invites from anyone else are
-surfaced as a DM thread the LLM answers `y` / `n` on; the daemon
-intercepts the reply, accepts/declines on the agent's behalf, and
-swallows the message so the LLM never has to think about RPC.
+Native Agents auto-accept space and channel invites whose inviter root pubkey
+matches the Agent's `declared_operator_public_key` (set at Agent creation and
+baked into the identity cert). Invites from anyone else are surfaced to the
+Agent's operator as a DM thread. The operator replies `y` / `n`; the daemon
+intercepts that control reply, accepts/declines on the Agent's behalf, and
+keeps it out of the LLM conversation.
+
+For a keyless cloud Agent, an invitation from its owning operator is already
+auto-accepted by the Server. Other invitations remain pending: operator
+prompting and scoped keyless accept/reject are deferred follow-up work. They
+are not automatically rejected.
 
 ## 6. Advanced topics
 
