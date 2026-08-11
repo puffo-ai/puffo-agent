@@ -242,6 +242,19 @@ def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
             "occurred_at": "2026-07-30T12:00:00Z",
             "payload": {"text": "Reading a private file"},
         },
+        {
+            "version": 1, "event_id": "legacy-terminal", "agent_id": "agent",
+            "session_ref": "session", "turn_ref": "turn",
+            "scope": {"kind": "operator"}, "type": "turn.finished",
+            "occurred_at": "2026-07-30T12:00:01Z",
+            "payload": {
+                "outcome": "failed",
+                "error": {
+                    "code": "provider-secret", "message": "private diagnostic",
+                    "retryable": True,
+                },
+            },
+        },
     ]
     for value in legacy_rows:
         encoded = json.dumps(value, separators=(",", ":")).encode()
@@ -256,6 +269,14 @@ def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
     values = [row.event for row in migrated.prefix()]
     assert [(value["type"], value["payload"]) for value in values] == [
         ("activity.updated", {"text": "Working"}),
+        ("turn.finished", {
+            "outcome": "failed",
+            "error": {
+                "code": "unknown",
+                "message": "The Agent runtime could not complete the turn.",
+                "retryable": True,
+            },
+        }),
     ]
     assert "private" not in json.dumps(values)
     migrated.close()

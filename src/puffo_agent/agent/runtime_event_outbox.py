@@ -14,7 +14,13 @@ from typing import Any, Awaitable, Callable, Iterable, TypeVar
 
 from ._logging import log_runtime_event
 from .harness.driver import HarnessEvent, HarnessEventType
-from .runtime_events import LifecycleValidator, RuntimeEvent, RuntimeEventProjector
+from .runtime_events import (
+    TURN_OUTCOMES,
+    LifecycleValidator,
+    RuntimeEvent,
+    RuntimeEventProjector,
+    safe_error,
+)
 
 APPEND_PATH = "/v2/agent-runtime/events:append"
 # These responses describe the upload channel, not a specific event row.  In
@@ -59,7 +65,18 @@ def _metadata_only_event(value: Any) -> RuntimeEvent | None:
             "state": payload.get("state"),
             "title": "Permission required",
         }
-    elif event_type != "turn.finished":
+    elif event_type == "turn.finished":
+        outcome = payload.get("outcome")
+        if outcome not in TURN_OUTCOMES:
+            return None
+        legacy_error = payload.get("error")
+        payload = {"outcome": outcome}
+        if outcome == "failed" and isinstance(legacy_error, dict):
+            payload["error"] = safe_error(
+                str(legacy_error.get("code") or "unknown"),
+                retryable=legacy_error.get("retryable") is True,
+            )
+    else:
         return None
     try:
         return RuntimeEvent(
