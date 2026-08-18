@@ -1410,6 +1410,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     target_count=len(planned.targets),
                     error_category="provider_error",
                     error_type=type(exc).__name__,
+                    error_code=getattr(exc, "error_code", None),
                     outcome="requeued" if terminal else "degraded",
                 )
             finally:

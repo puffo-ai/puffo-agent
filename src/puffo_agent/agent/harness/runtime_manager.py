@@ -21,6 +21,7 @@ from ..context_controller import (
     ToolResultAdmission,
     normalize_context_snapshot,
 )
+from ..errors import AgentAPIError
 from .driver import (
     CompactRequest,
     Driver,
@@ -45,7 +46,11 @@ COMPACTION_WAIT_SECONDS = 120.0
 
 
 class RuntimeStateError(RuntimeError):
-    pass
+    """Internal state-machine contract violation, never retried automatically."""
+
+    def __init__(self, message: str, *, error_code: str | None = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 class _EventStream(AsyncIterator[HarnessEvent]):
@@ -114,6 +119,10 @@ class RuntimeManager:
         self._permission_refs: set[PermissionRef] = set()
         self._continuation_admissions: list[ToolResultAdmission] = []
         self._compaction: asyncio.Future[None] | None = None
+        # True from a resumed open until its first turn succeeds; an
+        # invalid --resume target isn't always a synchronous open failure.
+        # See _consume_event_locked.
+        self._resume_unconfirmed = False
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -159,6 +168,7 @@ class RuntimeManager:
         # Preserve the durable Puffo logical reference independently of the
         # native provider session ID.
         self.opened = replace(opened, session_ref=self.session_ref)
+        self._resume_unconfirmed = opened.resumed
         self._reader = asyncio.create_task(self._consume_events())
         if self.agent_id:
             register_runtime_manager(self.agent_id, self)
@@ -517,6 +527,11 @@ class RuntimeManager:
             self._fail_compaction_locked("runtime exited")
             await self._publish_event(event)
             active = self.active_turn_ref
+            # A crash before this resumed session's first success is
+            # treated the same as the turn.completed case below: discard
+            # the session id so the retry gets a fresh session.
+            unconfirmed = self._resume_unconfirmed
+            self._resume_unconfirmed = False
             try:
                 if active is not None:
                     abandoned = HarnessEvent(
@@ -529,7 +544,10 @@ class RuntimeManager:
                         occurred_at=event.occurred_at,
                         data={
                             "outcome": "abandoned",
-                            "error_code": "runtime_exited",
+                            "error_code": (
+                                "resume_unconfirmed" if unconfirmed
+                                else "runtime_exited"
+                            ),
                             "retryable": True,
                         },
                     )
@@ -537,7 +555,36 @@ class RuntimeManager:
             finally:
                 await self.driver.close()
                 self.opened = None
+                if unconfirmed:
+                    self.native_session_id = ""
             return True
+        if event.type in {
+            HarnessEventType.TURN_COMPLETED, "turn.completed",
+        } and logical_turn is not None:
+            outcome = str(event.data.get("outcome") or "succeeded")
+            if outcome == "succeeded":
+                self._resume_unconfirmed = False
+            elif self._resume_unconfirmed:
+                # First turn on a resumed session failed before any turn
+                # ever succeeded (e.g. claude-code's "No conversation
+                # found" on an invalid --resume target, reported as an
+                # ordinary failed turn.completed rather than a driver
+                # exception). Discard the session id and force retryable
+                # so the retry opens a fresh session instead of resuming
+                # the same unusable one forever.
+                self._resume_unconfirmed = False
+                self._fail_compaction_locked("resume unconfirmed")
+                unconfirmed = replace(event, data={
+                    **event.data,
+                    "error_code": event.data.get("error_code")
+                    or "resume_unconfirmed",
+                    "retryable": True,
+                })
+                await self._publish_terminal_locked(unconfirmed, logical_turn)
+                await self.driver.close()
+                self.opened = None
+                self.native_session_id = ""
+                return True
         if event.type in {
             HarnessEventType.TURN_COMPLETED,
             HarnessEventType.TURN_ABANDONED,
@@ -799,9 +846,14 @@ class RuntimeManagerAdapter(Adapter):
             if event_type in {"turn.completed", "turn.abandoned"}:
                 outcome = str(event.data.get("outcome") or "succeeded")
                 if event_type == "turn.abandoned" or outcome != "succeeded":
-                    raise RuntimeStateError(
-                        f"provider turn ended with outcome {outcome}"
+                    error_code = str(event.data.get("error_code") or outcome)
+                    message = (
+                        f"provider turn ended with outcome {outcome} "
+                        f"(error_code={error_code})"
                     )
+                    if event.data.get("retryable"):
+                        raise AgentAPIError(message, error_code=error_code)
+                    raise RuntimeStateError(message, error_code=error_code)
                 metadata.update({
                     key: value for key, value in event.data.items()
                     if key in {

@@ -8,8 +8,13 @@ class AgentAPIError(Exception):
 
     ``is_auth`` distinguishes credentials requiring operator action from
     retryable provider failures, which are re-enqueued with backoff.
+    ``error_code`` is an optional short tag for allowlisted logging.
     """
 
-    def __init__(self, message: str, *, is_auth: bool = False) -> None:
+    def __init__(
+        self, message: str, *, is_auth: bool = False,
+        error_code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.is_auth = is_auth
+        self.error_code = error_code
