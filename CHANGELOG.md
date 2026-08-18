@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a17] - 2026-08-18
+
+> Staging candidate restoring Claude Code progress after runtime context-window
+> discovery.
+
+### Fixed
+
+- **Claude Code no longer stalls before a turn when its learned context usage
+  requires compaction.** The runtime now applies the learned native
+  `--autocompact` threshold when it reloads Claude Code and permits `/compact`
+  before the deferred `system/init` frame. Admitted turns resume the existing
+  Profile Log stream of bounded assistant status and tool labels.
+
 ## [2.0.0a16] - 2026-08-17
 
 > Staging candidate closing the message-contract acceptance gaps and restoring
