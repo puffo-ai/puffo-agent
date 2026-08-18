@@ -102,6 +102,9 @@ class ClaudeCodeCliDriver(Driver):
         self._context_usage_supported: bool | None = None
         self._context = ContextStatus(stale=True)
 
+    def current_capabilities(self) -> DriverCapabilities:
+        return claude_capabilities(self._compact_advertised)
+
     async def open(
         self, spec: RuntimeSpec, resume: SessionRef | None = None
     ) -> RuntimeOpened:
@@ -238,6 +241,10 @@ class ClaudeCodeCliDriver(Driver):
                 context_window=self._context.context_window,
                 stale=True,
                 measured_at=self._context.measured_at,
+                auto_compact_threshold_tokens=(
+                    self._context.auto_compact_threshold_tokens
+                ),
+                auto_compact_enabled=self._context.auto_compact_enabled,
             )
         self._context_request_counter += 1
         request_id = f"ctx_{self._context_request_counter}"
@@ -262,17 +269,36 @@ class ClaudeCodeCliDriver(Driver):
                 context_window=self._context.context_window,
                 stale=True,
                 measured_at=self._context.measured_at,
+                auto_compact_threshold_tokens=(
+                    self._context.auto_compact_threshold_tokens
+                ),
+                auto_compact_enabled=self._context.auto_compact_enabled,
             )
         finally:
             pending = self._context_requests.pop(request_id, None)
             if pending is not None and not pending.done():
                 pending.cancel()
         self._context_usage_supported = True
+        auto_compact_threshold = _positive_int(
+            usage.get("autoCompactThreshold")
+        )
+        raw_auto_compact_enabled = usage.get("isAutoCompactEnabled")
+        auto_compact_enabled = (
+            raw_auto_compact_enabled
+            if isinstance(raw_auto_compact_enabled, bool)
+            else None
+        )
+        if auto_compact_enabled is True and auto_compact_threshold is not None:
+            # Claude exposes this control response before system/init, which
+            # lets context admission discover /compact for the first turn.
+            self._compact_advertised = True
         self._context = ContextStatus(
             used_tokens=_positive_int(usage.get("totalTokens")),
             context_window=_positive_int(usage.get("rawMaxTokens")),
             stale=False,
             measured_at=datetime.now(timezone.utc).isoformat(),
+            auto_compact_threshold_tokens=auto_compact_threshold,
+            auto_compact_enabled=auto_compact_enabled,
         )
         return self._context
 
@@ -356,6 +382,10 @@ class ClaudeCodeCliDriver(Driver):
             context_window=self._context.context_window,
             stale=True,
             measured_at=self._context.measured_at,
+            auto_compact_threshold_tokens=(
+                self._context.auto_compact_threshold_tokens
+            ),
+            auto_compact_enabled=self._context.auto_compact_enabled,
         )
 
     def _fail_pending_futures(self, message: str) -> None:
@@ -486,7 +516,7 @@ class ClaudeCodeCliDriver(Driver):
         self._session_ref = SessionRef(native)
         commands = frame.get("slash_commands") or ()
         self._init_commands = tuple(str(value) for value in commands)
-        self._compact_advertised = (
+        self._compact_advertised = self._compact_advertised or (
             "/compact" in self._init_commands or "compact" in self._init_commands
         )
         self._init.set_result(frame)
@@ -620,15 +650,19 @@ class ClaudeCodeCliDriver(Driver):
         context_tokens = input_tokens + int(
             usage.get("cache_read_input_tokens") or 0
         )
+        outcome = "failed" if subtype not in {"success", ""} else "succeeded"
+        data: dict[str, Any] = {
+            "outcome": outcome,
+            "input_tokens": input_tokens,
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "context_tokens": context_tokens,
+        }
+        if outcome == "failed":
+            data["error_code"] = _result_error_code(frame, subtype)
         await self._emit(
             HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
-            data={
-                "outcome": "failed" if subtype not in {"success", ""} else "succeeded",
-                "input_tokens": input_tokens,
-                "output_tokens": int(usage.get("output_tokens") or 0),
-                "context_tokens": context_tokens,
-            },
+            data=data,
             native_payload=frame,
         )
         self._clear_pending_replay()
@@ -712,6 +746,18 @@ def _positive_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         return None
     return value
+
+
+def _result_error_code(frame: dict[str, Any], subtype: str) -> str:
+    errors = frame.get("errors")
+    if isinstance(errors, list) and any(
+        "No conversation found with session ID:" in value
+        for value in errors
+        if isinstance(value, str)
+    ):
+        return "invalid_resume"
+    normalized = subtype.strip().lower()
+    return normalized or "execution_error"
 
 
 ClaudeDriver = ClaudeCodeCliDriver
