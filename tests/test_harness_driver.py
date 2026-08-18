@@ -1423,16 +1423,16 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
             proc = _FakeProcess()
             proc.feed({
                 "type": "system", "subtype": "init",
-                "session_id": f"claude-{len(captured)}", "slash_commands": [],
+                "session_id": f"claude-{len(captured)}", "slash_commands": ["/compact"],
             })
             return proc
         return factory
 
     posix = []
     driver = ClaudeCodeCliDriver(make_factory(posix), replay_timeout=1)
-    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    opened = await driver.open(RuntimeSpec("/workspace", executable="claude", launch_args=("--autocompact", "100000"), auto_compact_threshold_tokens=500000))
     await driver.close()
-    assert posix[:2] == ["claude", "-p"]
+    assert posix[:4] == ["claude", "--autocompact", "500000", "-p"] and opened.capabilities.compact == "session_command"
 
     monkeypatch.setattr(
         driver_mod, "normalize_launch_argv",
@@ -1440,9 +1440,9 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
     )
     windows = []
     driver = ClaudeCodeCliDriver(make_factory(windows), replay_timeout=1)
-    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    await driver.open(RuntimeSpec("/workspace", executable="claude", auto_compact_threshold_tokens=500000))
     await driver.close()
-    assert windows[:4] == ["cmd.exe", "/c", "claude.cmd", "-p"]
+    assert windows[:6] == ["cmd.exe", "/c", "claude.cmd", "--autocompact", "500000", "-p"]
 
 
 @pytest.mark.asyncio

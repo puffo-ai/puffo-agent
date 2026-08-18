@@ -109,9 +109,20 @@ class ClaudeCodeCliDriver(Driver):
             raise RuntimeError("driver is already open")
         if self._closed:
             self._prepare_reopen()
+        launch_args = list(spec.launch_args)
+        if spec.auto_compact_threshold_tokens is not None:
+            launch_args = _replace_option_value(
+                launch_args,
+                "--autocompact",
+                str(spec.auto_compact_threshold_tokens),
+            )
+            # The CLI can receive /compact as its first stream-json user
+            # frame. Treat the configured native threshold as the startup
+            # capability so context admission can compact before system/init.
+            self._compact_advertised = True
         args = [
             *normalize_launch_argv(spec.executable or "claude"),
-            *spec.launch_args,
+            *launch_args,
             "-p",
             "--input-format",
             "stream-json",
@@ -675,6 +686,26 @@ def _normalize_content(value: Any) -> str:
             if isinstance(item, dict) and item.get("type") == "text"
         ).replace("\r\n", "\n")
     return ""
+
+
+def _replace_option_value(args: list[str], option: str, value: str) -> list[str]:
+    """Return argv with exactly one current value for ``option``."""
+    normalized: list[str] = []
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument == option:
+            index += 1
+            if index < len(args) and not args[index].startswith("-"):
+                index += 1
+            continue
+        if argument.startswith(f"{option}="):
+            index += 1
+            continue
+        normalized.append(argument)
+        index += 1
+    normalized.extend((option, value))
+    return normalized
 
 
 def _positive_int(value: Any) -> int | None:
