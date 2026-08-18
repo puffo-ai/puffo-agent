@@ -163,6 +163,8 @@ class ContextStatus:
     context_window: int | None = None
     stale: bool = False
     measured_at: str = ""
+    auto_compact_threshold_tokens: int | None = None
+    auto_compact_enabled: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +258,10 @@ class HarnessEvent:
 
 class Driver(ABC):
     """The exact common command/event surface implemented by Drivers."""
+
+    def current_capabilities(self) -> DriverCapabilities | None:
+        """Return capabilities learned after ``open``, when available."""
+        return None
 
     @abstractmethod
     async def open(

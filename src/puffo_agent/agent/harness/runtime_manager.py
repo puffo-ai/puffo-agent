@@ -25,6 +25,7 @@ from ..errors import AgentAPIError
 from .driver import (
     CompactRequest,
     Driver,
+    DriverCapabilities,
     HarnessEvent,
     HarnessEventType,
     PermissionDecision,
@@ -123,6 +124,7 @@ class RuntimeManager:
         # invalid --resume target isn't always a synchronous open failure.
         # See _consume_event_locked.
         self._resume_unconfirmed = False
+        self._confirmed_native_session_id = ""
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -153,7 +155,7 @@ class RuntimeManager:
                 exc_info=True,
             )
             await self.driver.close()
-            self.native_session_id = ""
+            self._clear_native_session()
             try:
                 opened = await self.driver.open(self.spec, None)
             except Exception:
@@ -168,7 +170,10 @@ class RuntimeManager:
         # Preserve the durable Puffo logical reference independently of the
         # native provider session ID.
         self.opened = replace(opened, session_ref=self.session_ref)
-        self._resume_unconfirmed = opened.resumed
+        self._resume_unconfirmed = (
+            opened.resumed
+            and opened.native_session_id != self._confirmed_native_session_id
+        )
         self._reader = asyncio.create_task(self._consume_events())
         if self.agent_id:
             register_runtime_manager(self.agent_id, self)
@@ -234,7 +239,7 @@ class RuntimeManager:
             # still making the next command open a fresh native session.
             logger.exception("failed to retire runtime after turn start failure")
             self.opened = None
-            self.native_session_id = ""
+            self._clear_native_session()
             self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput) -> Any:
@@ -422,7 +427,7 @@ class RuntimeManager:
         self.opened = None
         if not preserve_session:
             self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
-            self.native_session_id = ""
+            self._clear_native_session()
 
     def events(self) -> AsyncIterator[HarnessEvent]:
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
@@ -532,6 +537,11 @@ class RuntimeManager:
             # the session id so the retry gets a fresh session.
             unconfirmed = self._resume_unconfirmed
             self._resume_unconfirmed = False
+            failed_native_session_id = self.native_session_id
+            if unconfirmed:
+                # The event retains the failed native id for diagnostics, but
+                # durable manager state must already point at a fresh session.
+                self._clear_native_session()
             try:
                 if active is not None:
                     abandoned = HarnessEvent(
@@ -539,7 +549,7 @@ class RuntimeManager:
                         driver=self.driver_name,
                         session_ref=self.session_ref,
                         turn_ref=active,
-                        native_session_id=self.native_session_id,
+                        native_session_id=failed_native_session_id,
                         native_turn_id=self.native_turn_id,
                         occurred_at=event.occurred_at,
                         data={
@@ -553,10 +563,10 @@ class RuntimeManager:
                     )
                     await self._publish_terminal_locked(abandoned, active)
             finally:
-                await self.driver.close()
-                self.opened = None
-                if unconfirmed:
-                    self.native_session_id = ""
+                try:
+                    await self.driver.close()
+                finally:
+                    self.opened = None
             return True
         if event.type in {
             HarnessEventType.TURN_COMPLETED, "turn.completed",
@@ -564,26 +574,9 @@ class RuntimeManager:
             outcome = str(event.data.get("outcome") or "succeeded")
             if outcome == "succeeded":
                 self._resume_unconfirmed = False
-            elif self._resume_unconfirmed:
-                # First turn on a resumed session failed before any turn
-                # ever succeeded (e.g. claude-code's "No conversation
-                # found" on an invalid --resume target, reported as an
-                # ordinary failed turn.completed rather than a driver
-                # exception). Discard the session id and force retryable
-                # so the retry opens a fresh session instead of resuming
-                # the same unusable one forever.
-                self._resume_unconfirmed = False
-                self._fail_compaction_locked("resume unconfirmed")
-                unconfirmed = replace(event, data={
-                    **event.data,
-                    "error_code": event.data.get("error_code")
-                    or "resume_unconfirmed",
-                    "retryable": True,
-                })
-                await self._publish_terminal_locked(unconfirmed, logical_turn)
-                await self.driver.close()
-                self.opened = None
-                self.native_session_id = ""
+                self._confirmed_native_session_id = self.native_session_id
+            elif event.data.get("error_code") == "invalid_resume":
+                await self._retire_invalid_resume_locked(event, logical_turn)
                 return True
         if event.type in {
             HarnessEventType.TURN_COMPLETED,
@@ -595,6 +588,24 @@ class RuntimeManager:
         else:
             await self._publish_event(event)
         return False
+
+    async def _retire_invalid_resume_locked(
+        self, event: HarnessEvent, logical_turn: TurnRef
+    ) -> None:
+        # Claude can report an unusable --resume target only after a user
+        # frame. The explicit error remains authoritative even when this
+        # session succeeded before a process restart.
+        self._resume_unconfirmed = False
+        self._fail_compaction_locked("resume unconfirmed")
+        terminal = replace(event, data={**event.data, "retryable": True})
+        self._clear_native_session()
+        try:
+            await self._publish_terminal_locked(terminal, logical_turn)
+        finally:
+            try:
+                await self.driver.close()
+            finally:
+                self.opened = None
 
     async def _publish_event(self, event: HarnessEvent) -> None:
         if self.event_sink is not None:
@@ -770,6 +781,18 @@ class RuntimeManager:
         if not isinstance(turn, TurnRef) or self.active_turn_ref != turn:
             raise RuntimeStateError("stale or foreign turn reference")
 
+    def _clear_native_session(self) -> None:
+        cleared = self.native_session_id
+        self.native_session_id = ""
+        if self._confirmed_native_session_id == cleared:
+            self._confirmed_native_session_id = ""
+
+    def current_capabilities(self) -> DriverCapabilities | None:
+        dynamic = self.driver.current_capabilities()
+        if dynamic is not None:
+            return dynamic
+        return self.opened.capabilities if self.opened is not None else None
+
 
 class RuntimeManagerAdapter(Adapter):
     """Blocking compatibility facade over the event-driven Runtime Manager."""
@@ -896,7 +919,12 @@ class RuntimeManagerAdapter(Adapter):
             metadata["context_window"] = context_window
             pct = self.manager.spec.auto_compact_threshold_pct
             threshold = (
-                int(context_window * pct / 100) if pct is not None else None
+                int(context_window * pct / 100)
+                if pct is not None
+                else (
+                    self.manager.spec.auto_compact_threshold_tokens
+                    or status.auto_compact_threshold_tokens
+                )
             )
             self._latest_context_limits = (context_window, threshold)
         if status.measured_at:
@@ -979,6 +1007,25 @@ class RuntimeManagerAdapter(Adapter):
             return completed
         return TurnResult(reply="", metadata={"stream_error": "runtime_exited"})
 
+    async def run_retry_turn(
+        self,
+        kick_text: str,
+        fallback_user_message: str,
+        ctx: TurnContext,
+    ) -> TurnResult:
+        # A preserved native session already contains the original input and
+        # only needs a cheap continuation. A retired session needs the exact
+        # durable fallback because its replacement has no prior transcript.
+        content = (
+            kick_text
+            if self.manager.native_session_id
+            else fallback_user_message
+        )
+        return await self.run_turn(replace(
+            ctx,
+            messages=[{"role": "user", "content": content}],
+        ))
+
     def register_continuation_callback(
         self,
         callback,
@@ -1032,11 +1079,7 @@ class RuntimeManagerAdapter(Adapter):
         return value or None
 
     def inbox_notice_delivery_capability(self) -> str:
-        capabilities = (
-            self.manager.opened.capabilities
-            if self.manager.opened is not None
-            else None
-        )
+        capabilities = self.manager.current_capabilities()
         steer = (
             capabilities.steer
             if capabilities is not None
@@ -1065,7 +1108,10 @@ class RuntimeManagerAdapter(Adapter):
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
         window = status.context_window
-        threshold: int | None = None
+        threshold = (
+            self.manager.spec.auto_compact_threshold_tokens
+            or status.auto_compact_threshold_tokens
+        )
         pct = self.manager.spec.auto_compact_threshold_pct
         if window and pct is not None:
             threshold = int(window * pct / 100)
@@ -1091,10 +1137,7 @@ class RuntimeManagerAdapter(Adapter):
         return self._latest_context_limits
 
     def get_context_capabilities(self) -> ContextCapabilities:
-        capabilities = (
-            self.manager.opened.capabilities
-            if self.manager.opened is not None else None
-        )
+        capabilities = self.manager.current_capabilities()
         if capabilities is None:
             return super().get_context_capabilities()
         compact = getattr(capabilities.compact, "value", capabilities.compact)
