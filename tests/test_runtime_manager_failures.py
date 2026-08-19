@@ -830,6 +830,29 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
 
 
 @pytest.mark.asyncio
+async def test_context_rollover_preserves_logical_session_and_opens_fresh_native():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    await manager.open()
+
+    result = await adapter.rollover_context()
+
+    assert result.completed is True
+    assert result.previous_provider_session_id == "native-old"
+    assert result.provider_session_id == "native-session-2"
+    assert manager.session_ref == SessionRef("logical-session")
+    assert manager.opened is not None and manager.opened.resumed is False
+    assert adapter.get_context_capabilities().rollover is True
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path):
     driver = _ControllableDriver()
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")

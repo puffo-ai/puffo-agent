@@ -167,6 +167,9 @@ the user-led 50% soft-target policy remains authoritative.
    resource reload cannot re-arm invalid-resume detection for that session.
 7. Retry with a short continuation only when the native session survives;
    otherwise send the exact durable fallback to the fresh session.
+8. If native compaction is unavailable or exhausts its bounded attempts and
+   even the smallest batch cannot fit, open a fresh native provider session
+   while preserving the Puffo logical session.
 
 The resulting recovery paths stay bounded by the existing Global Inbox retry
 budget. No new retry loop or provider-specific policy threshold is introduced.

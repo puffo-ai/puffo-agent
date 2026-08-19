@@ -18,6 +18,7 @@ from ..context_controller import (
     ContextCapabilities,
     ContextSnapshot,
     ProviderAdmissionEvent,
+    RolloverResult,
     ToolResultAdmission,
     normalize_context_snapshot,
 )
@@ -315,6 +316,24 @@ class RuntimeManager:
             if self._closed:
                 raise RuntimeStateError("runtime is closed")
             return await self.driver.context_status()
+
+    async def rollover_native_session(self) -> tuple[str, str]:
+        """Open a fresh provider session while preserving Puffo's session."""
+        async with self._command_lock:
+            if self._closed:
+                raise RuntimeStateError("runtime is closed")
+            if self.active_turn_ref is not None:
+                raise RuntimeStateError(
+                    "cannot roll over while a turn is active"
+                )
+            previous = self.native_session_id
+            self._fail_compaction_locked("native session rollover")
+            await self._stop_reader()
+            await self.driver.close()
+            self.opened = None
+            self._clear_native_session()
+            opened = await self._open_locked(resume=False)
+            return previous, opened.native_session_id
 
     async def begin_compaction(
         self, request: CompactRequest | None = None
@@ -1181,7 +1200,7 @@ class RuntimeManagerAdapter(Adapter):
             native_compaction=(
                 compact != "none" and self.manager.active_turn_ref is None
             ),
-            rollover=False,
+            rollover=self.manager.active_turn_ref is None,
             native_measurement=context_status != "none",
             diagnostic="Driver capabilities",
         )
@@ -1216,6 +1235,18 @@ class RuntimeManagerAdapter(Adapter):
             completed=True,
             provider_session_id=self.get_provider_session_id(),
             diagnostic="compaction completed",
+        )
+
+    async def rollover_context(self) -> RolloverResult:
+        previous, current = await self.manager.rollover_native_session()
+        return RolloverResult(
+            completed=True,
+            previous_provider_session_id=previous or None,
+            provider_session_id=current or None,
+            diagnostic=(
+                "fresh native session opened after bounded context controls "
+                "were exhausted"
+            ),
         )
 
 
