@@ -521,6 +521,10 @@ class InboundReceiptHandler:
         )
         content: dict[str, Any] = {
             "text": llm_text,
+            # Keep the durable source separate from its bounded prompt view.
+            # get_post_segment pages this value while ordinary Inbox/history
+            # projections continue to read ``text``.
+            "original_content": payload.content,
             "attachment_paths": attachment_paths,
             "mentions": mentions,
             "sender_display_name": names["sender_display_name"],

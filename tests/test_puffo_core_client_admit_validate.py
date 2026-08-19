@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -32,6 +33,7 @@ from puffo_agent.crypto.http_client import PuffoCoreHttpClient
 from puffo_agent.crypto.keystore import KeyStore
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
+from puffo_agent.mcp.core_post_tools import _get_post_segment
 
 
 def _now_ms() -> int:
@@ -522,6 +524,55 @@ async def test_native_ingress_withholds_uncleared_sender_content(
     assert outcome is TransportOutcome.ACK
     assert saved == ["env_friend"]
     assert (inbox_root / "env_friend").exists()
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_native_long_message_keeps_segment_source_after_prompt_redaction(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    client = _native_client(tmp_path)
+    client._max_inline_chars = 100
+    client._segment_chars = 80
+    await client.store.open()
+    client.http.blocklist_reachable = True
+    client._contacts.note_allowed(FRIEND_SLUG)
+
+    original = "0123456789" * 25
+    payloads = {
+        "env_long": _dm_payload(
+            FRIEND_SLUG,
+            original,
+            envelope_id="env_long",
+        ),
+    }
+    outcome = await _handler(client, payloads).handle(
+        _delivery("env_long", FRIEND_SLUG, 1)
+    )
+    assert outcome is TransportOutcome.ACK
+
+    stored = await client.store.get_visible_message_by_envelope("env_long")
+    assert stored is not None
+    assert "inbound message was too long" in stored.content["text"]
+    assert stored.content["original_content"] == original
+
+    class _StoreDataClient:
+        async def get_message_by_envelope(self, envelope_id):
+            return await client.store.get_visible_message_by_envelope(envelope_id)
+
+    segment = await _get_post_segment(
+        SimpleNamespace(
+            slug=SELF_SLUG,
+            agent_id=SELF_SLUG,
+            data_client=_StoreDataClient(),
+        ),
+        "env_long",
+        1,
+        80,
+    )
+    assert segment["segment"]["count"] == 4
+    assert segment["segment"]["text"] == original[80:160]
     await client.store.close()
 
 
