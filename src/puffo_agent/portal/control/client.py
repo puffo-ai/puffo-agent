@@ -80,8 +80,12 @@ def _apply_refresh(agent_slug: str, params: dict) -> dict:
         }
     harness = params.get("harness")
     model = params.get("model")
-    host_sync = bool(params.get("host_sync", False))
-    session = bool(params.get("session", False))
+    # PUF-431: the web's Refresh button sends no params, and a user who
+    # hits Refresh wants everything current from disk — session dropped,
+    # profile.md + memory reloaded, MCP + skills re-synced. Callers that
+    # want a narrower refresh pass the flags explicitly.
+    host_sync = bool(params.get("host_sync", True))
+    session = bool(params.get("session", True))
     if (harness is None) != (model is None):
         return {
             "ok": False,
