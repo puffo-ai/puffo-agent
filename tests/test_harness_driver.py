@@ -213,6 +213,7 @@ def test_typed_refs_are_not_interchangeable():
 
 
 def test_codex_effective_capabilities():
+    assert CodexAppServerDriver().current_capabilities() == CODEX_CAPABILITIES
     assert CODEX_CAPABILITIES.session_resume is True
     assert CODEX_CAPABILITIES.inflight_turn_recovery is False
     assert CODEX_CAPABILITIES.steer == "current_turn"

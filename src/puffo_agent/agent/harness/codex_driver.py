@@ -227,6 +227,9 @@ class CodexAppServerDriver(Driver):
         self._usage_baseline: tuple[int, int] | None = None
         self._usage_latest: dict[str, int] = {}
 
+    def current_capabilities(self) -> DriverCapabilities:
+        return CODEX_CAPABILITIES
+
     async def open(
         self, spec: RuntimeSpec, resume: SessionRef | None = None
     ) -> RuntimeOpened:

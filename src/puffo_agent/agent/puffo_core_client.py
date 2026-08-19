@@ -296,6 +296,7 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = receipt_handler.handle
         self._ws.on_event = self._handle_event
+        self._ws.on_space_membership_changed = self._handle_space_membership_changed
         # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
         await self.store.open()
@@ -401,6 +402,11 @@ class PuffoCoreMessageClient:
             return
         await self._handle_invite_cancellation_event(kind, payload)
 
+    async def _handle_space_membership_changed(self, space_id: str) -> None:
+        """Invalidate the roster projection without emitting a second event."""
+        if space_id:
+            self._space_members.pop(space_id, None)
+
     async def _prepare_membership_event(
         self,
         kind: str | None,
@@ -413,6 +419,7 @@ class PuffoCoreMessageClient:
             self._log.exception("mark_channel_space from %s failed", kind)
         if kind in (
             EventKind.ACCEPT_SPACE_INVITE,
+            EventKind.REDEEM_INVITE_CAPABILITY,
             EventKind.LEAVE_SPACE,
             EventKind.REMOVE_FROM_SPACE,
         ):
@@ -524,6 +531,7 @@ class PuffoCoreMessageClient:
             EventKind.LEAVE_SPACE,
             EventKind.REMOVE_FROM_SPACE,
             EventKind.ACCEPT_SPACE_INVITE,
+            EventKind.REDEEM_INVITE_CAPABILITY,
         ):
             await self._maybe_announce_space_membership_change(kind, event, payload)
             return True

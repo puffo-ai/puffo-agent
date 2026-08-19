@@ -423,6 +423,8 @@ def _space_membership_actor(
     if kind == EventKind.ACCEPT_SPACE_INVITE:
         inviter = _inviter_slug(payload, inviter_by_event_id)
         return event.get("signer_slug") or "", "joined_space", "", inviter
+    if kind == EventKind.REDEEM_INVITE_CAPABILITY:
+        return payload.get("redeemer_slug") or "", "joined_space", "", ""
     if kind == EventKind.LEAVE_SPACE:
         return event.get("signer_slug") or "", "left_space", "", ""
     if kind == EventKind.REMOVE_FROM_SPACE:

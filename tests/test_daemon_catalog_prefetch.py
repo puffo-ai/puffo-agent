@@ -23,6 +23,26 @@ def test_daemon_run_calls_model_catalog_prefetch_at_startup():
     assert "model_catalog" in source and "prefetch" in source
 
 
+def test_capabilities_fetch_claude_catalog_after_late_login(monkeypatch):
+    from puffo_agent.agent import cli_bin, model_catalog
+    from puffo_agent.portal.control.client import build_capabilities
+
+    calls = []
+    monkeypatch.setattr(cli_bin, "resolve_claude_bin", lambda: "/bin/claude")
+    monkeypatch.setattr(cli_bin, "claude_has_credentials", lambda: True)
+    monkeypatch.setattr(cli_bin, "resolve_codex_bin", lambda: None)
+    monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ("claude-code", "codex"))
+    monkeypatch.setattr(
+        model_catalog,
+        "provider_models",
+        lambda harness, *, fetch=False: calls.append((harness, fetch)) or [],
+    )
+
+    build_capabilities()
+
+    assert calls == [("claude-code", True), ("codex", False)]
+
+
 def test_run_daemon_short_circuit_does_not_prefetch(monkeypatch):
     """The already-running short-circuit lives in ``run_daemon``, not
     ``Daemon.run`` — so a second daemon getting refused mustn't fire a

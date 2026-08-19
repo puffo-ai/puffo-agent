@@ -14,6 +14,7 @@ import websockets.exceptions  # websockets>=16 lazy-loads submodules; bare `impo
 
 from .encoding import base64url_encode, generate_nonce
 from .http_client import PuffoCoreHttpClient
+from .http_session import create_remote_ssl_context
 from .keystore import KeyStore, decode_secret
 from .primitives import Ed25519KeyPair
 
@@ -58,6 +59,7 @@ class DeliveryResult:
 MessageHandler = Callable[[ServerDelivery], Awaitable[TransportOutcome]]
 EventHandler = Callable[[str, dict], Coroutine[Any, Any, None]]
 CertHandler = Callable[[dict], Coroutine[Any, Any, None]]
+SpaceMembershipHandler = Callable[[str], Coroutine[Any, Any, None]]
 
 
 class PuffoCoreWsClient:
@@ -79,6 +81,7 @@ class PuffoCoreWsClient:
         self.on_message: MessageHandler | None = None
         self.on_event: EventHandler | None = None
         self.on_cert_update: CertHandler | None = None
+        self.on_space_membership_changed: SpaceMembershipHandler | None = None
         # Fires after every (re)connect handshake, before catch-up.
         self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
         self._catchup_lock = asyncio.Lock()
@@ -313,13 +316,24 @@ class PuffoCoreWsClient:
                 except Exception:
                     logger.exception("on_event callback failed")
 
+        elif msg_type == "space_membership_changed":
+            space_id = msg.get("space_id")
+            if self.on_space_membership_changed and isinstance(space_id, str):
+                try:
+                    await self.on_space_membership_changed(space_id)
+                except Exception:
+                    logger.exception("on_space_membership_changed callback failed")
+
     async def _listen_loop(self) -> None:
         async for raw in self._ws:
             await self._handle_frame(raw)
 
     async def connect_once(self) -> None:
         await self.http_client._ensure_subkey()
-        async with websockets.connect(self.ws_url) as ws:
+        ssl_context = (
+            create_remote_ssl_context() if self.ws_url.startswith("wss://") else None
+        )
+        async with websockets.connect(self.ws_url, ssl=ssl_context) as ws:
             self._ws = ws
             self.session_id = await self._handshake(ws)
             logger.info("[%s] WS connected, session=%s", self.slug, self.session_id)
