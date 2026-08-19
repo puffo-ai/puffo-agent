@@ -47,19 +47,6 @@ logger = logging.getLogger(__name__)
 COMPACTION_WAIT_SECONDS = 120.0
 
 
-def _claude_autocompact_tokens(*, pct: float, max_context: int) -> int:
-    """Percentage -> token threshold, floored to what the CLI accepts.
-
-    Duplicating the raw `window * pct / 100` math here (instead of routing
-    through this shared helper) previously let a live-reported native
-    window pull the threshold below Claude Code's --autocompact minimum
-    (100k), so every relaunch failed before init.
-    """
-    from ...portal.control.context_telemetry import claude_autocompact_tokens
-
-    return claude_autocompact_tokens(pct=pct, max_context=max_context) or max_context
-
-
 class RuntimeStateError(RuntimeError):
     """Internal state-machine contract violation, never retried automatically."""
 
@@ -982,14 +969,11 @@ class RuntimeManagerAdapter(Adapter):
             and context_window > 0
         ):
             metadata["context_window"] = context_window
-            pct = self.manager.spec.auto_compact_threshold_pct
+            # threshold is pinned at launch, not re-derived here -- see
+            # get_context_snapshot() below for why.
             threshold = (
-                _claude_autocompact_tokens(pct=pct, max_context=context_window)
-                if pct is not None
-                else (
-                    self.manager.spec.auto_compact_threshold_tokens
-                    or status.auto_compact_threshold_tokens
-                )
+                self.manager.spec.auto_compact_threshold_tokens
+                or status.auto_compact_threshold_tokens
             )
             self._latest_context_limits = (context_window, threshold)
         if status.measured_at:
@@ -1173,24 +1157,15 @@ class RuntimeManagerAdapter(Adapter):
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
         window = status.context_window
+        # Pinned at launch (local_runtime.py, via claude_autocompact_tokens())
+        # and never re-derived here: the driver's live-reported window can
+        # itself already reflect our own configured --autocompact ceiling,
+        # so multiplying it by the percentage again compounds the threshold
+        # smaller on every poll instead of holding it stable.
         threshold = (
             self.manager.spec.auto_compact_threshold_tokens
             or status.auto_compact_threshold_tokens
         )
-        pct = self.manager.spec.auto_compact_threshold_pct
-        if window and pct is not None:
-            threshold = _claude_autocompact_tokens(pct=pct, max_context=window)
-            if (
-                self.manager.active_turn_ref is None
-                and self.manager.spec.auto_compact_threshold_tokens != threshold
-            ):
-                await self.manager.reload_resources(
-                    preserve_session=True,
-                    spec=replace(
-                        self.manager.spec,
-                        auto_compact_threshold_tokens=threshold,
-                    ),
-                )
         self._latest_context_limits = (window, threshold)
         return normalize_context_snapshot(
             used_tokens=status.used_tokens or 0,

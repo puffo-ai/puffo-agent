@@ -27,7 +27,6 @@ from puffo_agent.agent.harness.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
-    _claude_autocompact_tokens,
 )
 from puffo_agent.agent.runtime_event_outbox import (
     RuntimeEventOutbox,
@@ -813,11 +812,11 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
     await manager.abandon_turn(active.turn_ref, reason="test_cleanup")
 
     assert (await adapter.get_context_snapshot()).used_tokens == 12
-    assert driver.open_calls == 2
-    # window=100, pct=50 -> raw 50, floored to Claude Code's --autocompact
-    # minimum (100k) so a small/stale reported window can't relaunch with
-    # an argument the CLI rejects outright.
-    assert manager.spec.auto_compact_threshold_tokens == 100_000
+    # No spurious reopen: the threshold is never re-derived from the
+    # driver's live-reported window (see the pinned-threshold test below),
+    # so a second snapshot has nothing new to reconcile and reload.
+    assert driver.open_calls == 1
+    assert manager.spec.auto_compact_threshold_tokens is None
 
     waiting = asyncio.create_task(adapter.compact_context())
     await asyncio.sleep(0)
@@ -833,13 +832,42 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
             await command()
 
 
-def test_claude_autocompact_tokens_floors_a_live_reported_window():
-    # equation-7256-87f7's real failure: native window=300000, pct=30 ->
-    # raw 90000, which Claude Code's --autocompact rejects (min 100k) and
-    # crashes the CLI before init on every single relaunch.
-    assert _claude_autocompact_tokens(pct=30, max_context=300_000) == 100_000
-    # Above the floor, the percentage still applies normally.
-    assert _claude_autocompact_tokens(pct=30, max_context=500_000) == 150_000
+class _AutocompactEchoDriver(_ControllableDriver):
+    """Reports back exactly the ceiling it was launched with.
+
+    Models Claude Code's real behavior once --autocompact is active: its
+    live context_window echoes the configured ceiling rather than the
+    model's raw capacity.
+    """
+
+    async def context_status(self):
+        return ContextStatus(used_tokens=1, context_window=300_000)
+
+
+@pytest.mark.asyncio
+async def test_context_snapshot_never_recomputes_a_pinned_threshold():
+    # equation-7256-87f7's real failure: launched with threshold=300_000
+    # (1_000_000 window * 30%). Claude Code then echoes context_window
+    # back as 300_000 too. Re-deriving `window * pct / 100` from that on
+    # every poll shrank the threshold each time (300k -> 90k -> ...)
+    # until the CLI rejected the value outright. It must stay pinned.
+    driver = _AutocompactEchoDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec(
+            "/tmp",
+            auto_compact_threshold_pct=30,
+            auto_compact_threshold_tokens=300_000,
+        ),
+        driver_name="claude",
+    )
+    await manager.open()
+    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
+
+    for _ in range(3):
+        await adapter.get_context_snapshot()
+        assert manager.spec.auto_compact_threshold_tokens == 300_000
+    assert driver.open_calls == 1
 
 
 @pytest.mark.asyncio
