@@ -231,14 +231,14 @@ def test_classify_failed_refresh_prefers_auth_failed_over_rate_limit():
 
 
 def test_propagate_auth_failed_does_not_bump_streak(tmp_path):
-    """AUTH_FAILED skips the consecutive_non_success streak so a later
-    RATE_LIMITED / FAILED outcome starts fresh at 1, not N+1."""
+    """AUTH_FAILED skips the failure streak so a later RATE_LIMITED /
+    FAILED outcome starts fresh at 1, not N+1."""
     _write_creds(tmp_path, expires_in_seconds=7200)
     r = CredentialRefresher(host_home=tmp_path)
-    r._consecutive_non_success = 0
+    r._consecutive_failed = 0
 
     r._propagate_outcome(RefreshOutcome.AUTH_FAILED)
-    assert r._consecutive_non_success == 0
+    assert r._consecutive_failed == 0
 
     r._propagate_outcome(RefreshOutcome.FAILED)
-    assert r._consecutive_non_success == 1
+    assert r._consecutive_failed == 1
