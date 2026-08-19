@@ -107,11 +107,20 @@ def target_label(
     channel_id = str(_value(message, "channel_id") or "")
     if not channel_id or str(_value(message, "envelope_kind", "")) == "dm":
         peer = _dm_peer(message, current_agent_aliases)
-        return (
+        header = (
             f"context context_version={CONTEXT_VERSION} "
             f"target_type=\"dm\" target_ref={_quoted(f'dm:{peer}')} "
             f"peer_identity={_quoted('@' + peer)}"
         )
+        # DM replies can already carry a thread_root_id (send_message's
+        # root_id validates against the DM's own history), but target_ref
+        # stays dm:<peer> -- DMs aren't independently routable per thread.
+        root_id = _effective_thread_root(
+            message, explicit_thread_root_id=thread_root_id,
+        )
+        if root_id:
+            header += f" thread_root_id={_quoted(root_id)}"
+        return header
     space_id = str(_value(message, "space_id") or "")
     effective_thread_root_id = _effective_thread_root(
         message, explicit_thread_root_id=thread_root_id,

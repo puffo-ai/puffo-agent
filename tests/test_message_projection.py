@@ -114,6 +114,23 @@ def test_dm_projection_preserves_paths_mentions_visibility_and_reply_count():
         "reply_count=2",
     ):
         assert field in output
+    assert "thread_root_id" not in output
+
+
+def test_dm_projection_exposes_thread_root_id_but_keeps_dm_routing():
+    # send_message already validates root_id against the DM's own history
+    # (see _validate_outgoing_root_scope's dm_peer branch); the agent just
+    # needs to see the root here to pass it back. Routing stays dm:<peer> --
+    # DMs aren't independently routable per thread like channels are.
+    row = message(
+        envelope_id="dm_reply", envelope_kind="dm", channel_id="", space_id="",
+        thread_root_id="dm_root", sender_slug="bob-9",
+        content={"text": "replying in-thread"},
+    )
+    output = format_message_group([row])
+    assert 'target_type="dm"' in output
+    assert 'target_ref="dm:bob-9"' in output
+    assert 'thread_root_id="dm_root"' in output
 
 
 def test_attachment_paths_are_projected_relative_to_the_harness_workspace():
