@@ -21,6 +21,7 @@ from puffo_agent.portal.credential_refresh import (
     CodexFileBackend,
     CredentialRefresher,
     FileBackend,
+    RefreshOutcome,
 )
 
 
@@ -68,21 +69,23 @@ def test_detect_fires_on_fingerprint_change(tmp_path, monkeypatch):
     r = CredentialRefresher(host_home=tmp_path)
     fired: list[int] = []
     r.register_on_refresh_success(lambda: fired.append(1))
+    r._consecutive_non_success = 3
 
     seq = {"fp": (1, 10)}
     monkeypatch.setattr(r.backend, "fingerprint", lambda: seq["fp"])
 
-    # No baseline yet → no fire.
+    # No baseline yet → establish it without firing.
     r._detect_external_rotation()
     assert fired == []
+    assert r._last_handled_credential_revision == (1, 10)
 
-    r._record_cred_fingerprint()        # baseline = (1, 10)
     seq["fp"] = (2, 11)                  # operator re-login
     r._detect_external_rotation()
     assert fired == [1]
+    assert r._last_handled_credential_revision == (2, 11)
+    assert r._consecutive_non_success == 0
 
     # Unchanged on the next tick → no re-fire.
-    r._record_cred_fingerprint()        # baseline = (2, 11)
     r._detect_external_rotation()
     assert fired == [1]
 
@@ -98,7 +101,38 @@ async def test_first_tick_establishes_baseline_without_firing(tmp_path):
 
     await r._tick()
     assert fired == []
-    assert r._last_cred_fingerprint is not None
+    assert r._last_handled_credential_revision is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", [RefreshOutcome.FAILED, RefreshOutcome.UNCHANGED],
+)
+async def test_rotation_during_non_success_refresh_is_not_lost(
+    tmp_path, monkeypatch, outcome,
+):
+    """An operator login racing a failed refresh must still reload providers."""
+    _write_creds(tmp_path, expires_in_seconds=3600)
+    r = CredentialRefresher(host_home=tmp_path)
+    fired: list[int] = []
+    r.register_on_refresh_success(lambda: fired.append(1))
+
+    revision = {"current": (1, 10)}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+    r._detect_external_rotation()  # startup baseline
+
+    async def refresh_while_operator_logs_in():
+        revision["current"] = (2, 11)
+        return outcome
+
+    monkeypatch.setattr(r.backend, "refresh", refresh_while_operator_logs_in)
+
+    await r._tick(triggered_by_agent=True)
+
+    assert fired == [1]
+    assert r._last_handled_credential_revision == (2, 11)
 
 
 # ── daemon: restart auth_failed agents on recovery ─────────────────

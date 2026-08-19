@@ -931,11 +931,12 @@ class CredentialRefresher:
         self._lock = asyncio.Lock()
         self._consecutive_non_success = 0
         self._rate_limit_retry_task: asyncio.Task | None = None
-        # Last host-credential fingerprint, for spotting an external
-        # rotation (operator re-login) on copy-mode hosts with no symlink
-        # to carry it. ``None`` until the first tick sets a baseline (so
-        # we don't false-fire on start).
-        self._last_cred_fingerprint: tuple[int, int] | None = None
+        # Last host-credential revision handled by this daemon. A revision is
+        # handled only after this daemon has requested provider reloads for its
+        # own workers. Each daemon keeps this independently; the host refresh
+        # lock serializes credential writes but does not broadcast reloads.
+        # ``None`` until the first tick establishes the startup baseline.
+        self._last_handled_credential_revision: tuple[int, int] | None = None
 
     def register_agent(self, agent_home: Path) -> None:
         self._agent_homes.add(Path(agent_home))
@@ -952,15 +953,18 @@ class CredentialRefresher:
         except ValueError:
             pass
 
-    def _fire_refresh_success(self) -> None:
+    def _fire_refresh_success(self) -> bool:
         # list(...) defensive copy: callback may (un)register during dispatch.
+        dispatched = True
         for cb in list(self._on_refresh_success):
             try:
                 cb()
             except Exception as exc:
+                dispatched = False
                 logger.warning(
                     "credential refresh-success callback raised: %s", exc,
                 )
+        return dispatched
 
     def notify_refresh_needed(self) -> None:
         """In-process trigger from an agent that just saw a 401."""
@@ -1091,44 +1095,62 @@ class CredentialRefresher:
             stop_task.cancel()
             refresh_task.cancel()
 
-    def _detect_external_rotation(self) -> None:
+    def _detect_external_rotation(self) -> bool:
         """Spot an external host-credential change (operator re-login)
-        against the last fingerprint and, if changed, sync to agents +
-        fire refresh-success — the copy-mode (Windows) counterpart to the
-        macOS Keychain rotation poll. No-op for backends without
-        ``fingerprint`` (e.g. Keychain, which has its own poll)."""
+        against the last revision handled by this daemon.
+
+        Return whether a changed revision was synced and dispatched. The first
+        observation establishes the startup baseline because provider runtimes
+        open from that same credential. Backends without ``fingerprint`` (for
+        example Keychain) use their own external-rotation poll.
+        """
         fingerprint = getattr(self.backend, "fingerprint", None)
         if fingerprint is None:
-            return
+            return False
         current = fingerprint()
-        if current is None or self._last_cred_fingerprint is None:
-            return
-        if current != self._last_cred_fingerprint:
-            logger.info(
-                "external credential rotation detected (host file changed) "
-                "— syncing agents + firing refresh-success",
-            )
-            self._sync_views()
-            self._fire_refresh_success()
+        if current is None:
+            return False
+        if self._last_handled_credential_revision is None:
+            self._last_handled_credential_revision = current
+            return False
+        if current == self._last_handled_credential_revision:
+            return False
+        logger.info(
+            "external credential rotation detected (host file changed) "
+            "— syncing agents + firing refresh-success",
+        )
+        self._sync_views()
+        if self._fire_refresh_success():
+            # An operator-supplied replacement is a successful recovery just
+            # like a backend REFRESHED outcome. Drop any failure streak so an
+            # old refresh_broken state cannot re-wedge the reloaded providers.
+            self._propagate_outcome(RefreshOutcome.REFRESHED)
+            self._last_handled_credential_revision = current
+            return True
+        return False
 
-    def _record_cred_fingerprint(self) -> None:
+    def _record_handled_credential_revision(self) -> None:
         fingerprint = getattr(self.backend, "fingerprint", None)
         if fingerprint is None:
             return
         current = fingerprint()
         if current is not None:
-            self._last_cred_fingerprint = current
+            self._last_handled_credential_revision = current
 
     async def _tick(self, *, triggered_by_agent: bool = False) -> None:
-        """One refresh cycle: detect external rotation, check expiry,
-        refresh if needed, sync views regardless so rotation propagates.
-        The trailing fingerprint record absorbs our own refresh so it
-        isn't re-seen as 'external' next tick."""
-        self._detect_external_rotation()
+        """One refresh cycle with before/after credential reconciliation.
+
+        The second rotation check is required because an operator can replace
+        the host credential while a provider refresh subprocess is running.
+        A failed or unchanged refresh must not acknowledge that replacement
+        without requesting provider reloads in this daemon.
+        """
+        rotation_handled = self._detect_external_rotation()
         expires_in = self.expires_in_seconds()
         if expires_in is None and not triggered_by_agent:
-            self._sync_views()
-            self._record_cred_fingerprint()
+            if not rotation_handled:
+                self._sync_views()
+            self._detect_external_rotation()
             return
         should_refresh = triggered_by_agent or (
             expires_in is not None
@@ -1138,8 +1160,10 @@ class CredentialRefresher:
             await self._refresh_now(
                 expires_in=expires_in, by_agent=triggered_by_agent,
             )
-        self._sync_views()
-        self._record_cred_fingerprint()
+        # Re-read after refresh: the canonical credential may have changed
+        # concurrently even when backend.refresh() returned FAILED/UNCHANGED.
+        if not self._detect_external_rotation() and not rotation_handled:
+            self._sync_views()
 
     async def _refresh_now(
         self, *, expires_in: int | None, by_agent: bool,
@@ -1185,8 +1209,8 @@ class CredentialRefresher:
             # Never reopen a provider runtime before its sanitized view holds
             # the replacement credential.
             self._sync_views()
-            self._record_cred_fingerprint()
-            self._fire_refresh_success()
+            if self._fire_refresh_success():
+                self._record_handled_credential_revision()
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
         if outcome is RefreshOutcome.REFRESHED:
