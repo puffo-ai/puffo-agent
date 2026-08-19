@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import os
@@ -62,6 +63,8 @@ REFRESH_LOCK_POLL_SECONDS = 0.1
 # 2 ticks ≈ 4 min @ 120s poll: surfaces fast, doesn't false-positive on
 # a single transient subprocess hiccup.
 REFRESH_BROKEN_THRESHOLD = 2
+
+CredentialRevision = tuple[int, int] | str
 
 # Haiku to dodge per-model rate-limit windows on operator's Opus/Sonnet.
 # Override via env or auto-disable on model_not_found (see _probe_model_disabled).
@@ -314,10 +317,15 @@ class CredentialBackend(Protocol):
         """Host-global lock file for this provider's canonical login."""
         ...
 
-    def sync_to_agent(self, agent_home: Path) -> None:
+    def sync_to_agent(self, agent_home: Path) -> bool | None:
         """Mirror the canonical credentials to one agent's per-agent
         ``.credentials.json``. Called by the refresher's fan-out after
-        every tick (refresh or not) so external rotation propagates."""
+        every tick (refresh or not) so external rotation propagates.
+
+        Return ``False`` when the view could not be made current. ``None``
+        remains accepted for compatibility with older backends and test
+        doubles, and is treated as success by the coordinator.
+        """
         ...
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
@@ -414,8 +422,13 @@ class FileBackend:
         )
         return RefreshOutcome.REFRESHED
 
-    def sync_to_agent(self, agent_home: Path) -> None:
-        sync_host_claude_code_auth_view(self.host_home, agent_home)
+    def sync_to_agent(self, agent_home: Path) -> bool:
+        result = sync_host_claude_code_auth_view(self.host_home, agent_home)
+        return result not in {
+            "no-host-file",
+            "unparseable-host-file",
+            "write-failed",
+        }
 
     def fingerprint(self) -> tuple[int, int] | None:
         """(mtime_ns, size) of the host credential. Lets the refresher
@@ -547,14 +560,19 @@ class CodexFileBackend:
         )
         return RefreshOutcome.REFRESHED
 
-    def sync_to_agent(self, agent_home: Path) -> None:
+    def sync_to_agent(self, agent_home: Path) -> bool:
         agent_codex_home = agent_home / ".codex"
         # Only codex agents have a ``.codex`` subdir (created lazily by
         # ``LocalRuntimePreparer._prepare_codex_spec``). Skip claude-only
         # agents to avoid cluttering them with a stray auth.json.
         if not agent_codex_home.exists():
-            return
-        sync_host_codex_auth_view(self.host_home, agent_codex_home)
+            return True
+        result = sync_host_codex_auth_view(self.host_home, agent_codex_home)
+        return result not in {
+            "no-host-file",
+            "unparseable-host-file",
+            "write-failed",
+        }
 
     def fingerprint(self) -> tuple[int, int] | None:
         """(mtime_ns, size) of the host codex auth — external-rotation
@@ -616,8 +634,9 @@ class KeychainBackend:
     ):
         self.home = home
         self.cache = cache
-        # Last blob propagated to agents — cheap byte-equality key so
-        # the poll loop only fans out on real changes.
+        # Last blob materialized in the daemon cache. Delivery acknowledgement
+        # is tracked separately by ``CredentialRefresher`` so a failed agent
+        # view write or reload request remains retryable.
         self._last_propagated_blob: Optional[str] = None
 
     @property
@@ -685,7 +704,6 @@ class KeychainBackend:
 
     async def refresh(self) -> RefreshOutcome:
         from ..macos.keychain import read_keychain_blob
-
         host_home = Path.home()
         kr_before = read_keychain_blob()
         before_blob = kr_before.blob if kr_before.ok else None
@@ -736,6 +754,8 @@ class KeychainBackend:
                 logger.warning(
                     "claude credential refresh: cache write failed: %s", exc,
                 )
+                return RefreshOutcome.FAILED
+            self._last_propagated_blob = kr_after.blob
             if before_blob is not None and before_blob == kr_after.blob:
                 logger.info(
                     "claude credential refresh ok in %.1fs but Keychain "
@@ -744,7 +764,6 @@ class KeychainBackend:
                     elapsed,
                 )
                 return RefreshOutcome.UNCHANGED
-            self._last_propagated_blob = kr_after.blob
             logger.info(
                 "claude credential refresh ok in %.1fs (Keychain rotated)",
                 elapsed,
@@ -768,6 +787,8 @@ class KeychainBackend:
             logger.warning(
                 "claude credential refresh: cache write failed: %s", exc,
             )
+            return RefreshOutcome.FAILED
+        self._last_propagated_blob = disk_after
         if disk_before is not None and disk_before == disk_after:
             logger.info(
                 "claude credential refresh ok in %.1fs (Keychain dead; "
@@ -775,7 +796,6 @@ class KeychainBackend:
                 elapsed,
             )
             return RefreshOutcome.UNCHANGED
-        self._last_propagated_blob = disk_after
         logger.info(
             "claude credential refresh ok in %.1fs (Keychain dead; "
             "disk file rotated)",
@@ -783,7 +803,7 @@ class KeychainBackend:
         )
         return RefreshOutcome.REFRESHED
 
-    def sync_to_agent(self, agent_home: Path) -> None:
+    def sync_to_agent(self, agent_home: Path) -> bool:
         """Atomic-write the sanitized (refresh-token-free) view of the
         canonical blob to the agent's per-agent ``.credentials.json``.
         Cache → disk file fallthrough so this works even when the
@@ -793,7 +813,7 @@ class KeychainBackend:
         cache_blob = self.cache.read()
         blob = cache_blob or _read_disk_credentials_blob(Path.home())
         if not blob:
-            return
+            return False
         if cache_blob is None:
             logger.debug(
                 "keychain-backend sync_to_agent: source=disk (cache empty) "
@@ -807,7 +827,7 @@ class KeychainBackend:
                 "syncing to %s",
                 agent_home,
             )
-            return
+            return False
         agent_claude = agent_home / ".claude"
         target = agent_claude / ".credentials.json"
         try:
@@ -817,7 +837,7 @@ class KeychainBackend:
                 _ensure_private_directory(agent_home)
                 _ensure_private_directory(agent_claude)
                 _set_private_file_mode(target)
-                return
+                return True
         except OSError:
             pass
         try:
@@ -829,6 +849,22 @@ class KeychainBackend:
                 "keychain backend: sync to %s failed: %s",
                 agent_home, exc,
             )
+            return False
+        return True
+
+    def fingerprint(self) -> CredentialRevision | None:
+        """Content revision of the daemon cache used for agent views.
+
+        Content hashing avoids treating an idempotent cache rewrite as a new
+        login while keeping credential material out of logs and state.
+        """
+        try:
+            blob = self.cache.read()
+        except OSError:
+            return None
+        if blob is None:
+            return None
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     async def bootstrap(self) -> tuple[bool, Optional[str]]:
         from ..macos.keychain import bootstrap_from_keychain
@@ -879,14 +915,18 @@ class KeychainBackend:
                 kr.error,
             )
             return False
-        if blob == self._last_propagated_blob:
+        try:
+            cached_blob = self.cache.read()
+        except OSError:
+            cached_blob = None
+        if blob == cached_blob:
             return False
-        self._last_propagated_blob = blob
         try:
             self.cache.write(blob)
         except OSError as exc:
             logger.warning("keychain poll: cache write failed: %s", exc)
             return False
+        self._last_propagated_blob = blob
         logger.info("keychain poll: token rotation detected; fanning out")
         return True
 
@@ -935,8 +975,10 @@ class CredentialRefresher:
         # handled only after this daemon has requested provider reloads for its
         # own workers. Each daemon keeps this independently; the host refresh
         # lock serializes credential writes but does not broadcast reloads.
-        # ``None`` until the first tick establishes the startup baseline.
-        self._last_handled_credential_revision: tuple[int, int] | None = None
+        # Absence is itself a valid startup baseline. Keep a separate bit so a
+        # credential first created after daemon startup is treated as a change.
+        self._credential_revision_initialized = False
+        self._last_handled_credential_revision: CredentialRevision | None = None
 
     def register_agent(self, agent_home: Path) -> None:
         self._agent_homes.add(Path(agent_home))
@@ -1017,7 +1059,10 @@ class CredentialRefresher:
         try:
             ok, reason = await self.backend.bootstrap()
             if not ok:
-                logger.warning(
+                log_bootstrap = (
+                    logger.info if reason == "no-host-codex-auth" else logger.warning
+                )
+                log_bootstrap(
                     "credential backend bootstrap reported not-ok: %s", reason,
                 )
         except Exception as exc:
@@ -1078,9 +1123,13 @@ class CredentialRefresher:
             except Exception as exc:
                 logger.warning("external-rotation poll errored: %s", exc)
                 continue
+            # The backend poll only refreshes the daemon cache. Reconciliation
+            # owns view sync + runtime reload acknowledgement and retries a
+            # previously unhandled cache revision even when this poll found no
+            # newer Keychain value.
             if rotated:
-                self._sync_views()
-                self._fire_refresh_success()
+                logger.debug("external credential cache revision updated")
+            self._detect_external_rotation()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
         stop_task = asyncio.create_task(stop_event.wait())
@@ -1095,23 +1144,27 @@ class CredentialRefresher:
             stop_task.cancel()
             refresh_task.cancel()
 
+    def _current_credential_revision(self) -> CredentialRevision | None:
+        fingerprint = getattr(self.backend, "fingerprint", None)
+        if fingerprint is None:
+            return None
+        return fingerprint()
+
     def _detect_external_rotation(self) -> bool:
         """Spot an external host-credential change (operator re-login)
         against the last revision handled by this daemon.
 
         Return whether a changed revision was synced and dispatched. The first
         observation establishes the startup baseline because provider runtimes
-        open from that same credential. Backends without ``fingerprint`` (for
-        example Keychain) use their own external-rotation poll.
+        open from that same credential. Keychain polling first updates its
+        daemon cache, whose content revision then follows this same path.
         """
-        fingerprint = getattr(self.backend, "fingerprint", None)
-        if fingerprint is None:
-            return False
-        current = fingerprint()
-        if current is None:
-            return False
-        if self._last_handled_credential_revision is None:
+        current = self._current_credential_revision()
+        if not self._credential_revision_initialized:
+            self._credential_revision_initialized = True
             self._last_handled_credential_revision = current
+            return False
+        if current is None:
             return False
         if current == self._last_handled_credential_revision:
             return False
@@ -1119,8 +1172,7 @@ class CredentialRefresher:
             "external credential rotation detected (host file changed) "
             "— syncing agents + firing refresh-success",
         )
-        self._sync_views()
-        if self._fire_refresh_success():
+        if self._sync_views() is not False and self._fire_refresh_success():
             # An operator-supplied replacement is a successful recovery just
             # like a backend REFRESHED outcome. Drop any failure streak so an
             # old refresh_broken state cannot re-wedge the reloaded providers.
@@ -1129,13 +1181,13 @@ class CredentialRefresher:
             return True
         return False
 
-    def _record_handled_credential_revision(self) -> None:
-        fingerprint = getattr(self.backend, "fingerprint", None)
-        if fingerprint is None:
-            return
-        current = fingerprint()
-        if current is not None:
-            self._last_handled_credential_revision = current
+    def _record_handled_credential_revision(
+        self,
+        revision: CredentialRevision | None,
+    ) -> None:
+        self._credential_revision_initialized = True
+        if revision is not None:
+            self._last_handled_credential_revision = revision
 
     async def _tick(self, *, triggered_by_agent: bool = False) -> None:
         """One refresh cycle with before/after credential reconciliation.
@@ -1204,13 +1256,15 @@ class CredentialRefresher:
                 )
                 return
             assert outcome is not None
-            self._propagate_outcome(outcome)
         if outcome is RefreshOutcome.REFRESHED:
             # Never reopen a provider runtime before its sanitized view holds
             # the replacement credential.
-            self._sync_views()
-            if self._fire_refresh_success():
-                self._record_handled_credential_revision()
+            revision = self._current_credential_revision()
+            if self._sync_views() is not False and self._fire_refresh_success():
+                self._record_handled_credential_revision(revision)
+                self._propagate_outcome(outcome)
+            return
+        self._propagate_outcome(outcome)
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
         if outcome is RefreshOutcome.REFRESHED:
@@ -1369,13 +1423,22 @@ class CredentialRefresher:
                     agent_id, exc,
                 )
 
-    def _sync_views(self) -> None:
+    def _sync_views(self) -> bool:
         """Mirror canonical credentials to every registered agent."""
+        synced = True
         for agent_home in self._agent_homes:
             try:
-                self.backend.sync_to_agent(agent_home)
+                result = self.backend.sync_to_agent(agent_home)
+                if result is False:
+                    synced = False
+                    logger.warning(
+                        "credential view-sync incomplete for %s",
+                        agent_home,
+                    )
             except Exception as exc:
+                synced = False
                 logger.warning(
                     "credential view-sync failed for %s: %s",
                     agent_home, exc,
                 )
+        return synced

@@ -90,6 +90,71 @@ def test_detect_fires_on_fingerprint_change(tmp_path, monkeypatch):
     assert fired == [1]
 
 
+def test_first_credential_after_missing_startup_baseline_fires(
+    tmp_path, monkeypatch,
+):
+    r = CredentialRefresher(host_home=tmp_path)
+    fired: list[int] = []
+    r.register_on_refresh_success(lambda: fired.append(1))
+
+    revision = {"current": None}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+
+    assert r._detect_external_rotation() is False
+    assert r._credential_revision_initialized is True
+    assert r._last_handled_credential_revision is None
+
+    revision["current"] = (1, 10)
+    assert r._detect_external_rotation() is True
+    assert fired == [1]
+    assert r._last_handled_credential_revision == (1, 10)
+
+
+def test_rotation_is_retried_until_views_and_reload_dispatch_succeed(
+    tmp_path, monkeypatch,
+):
+    r = CredentialRefresher(host_home=tmp_path)
+    agent_home = tmp_path / "agent"
+    r.register_agent(agent_home)
+
+    revision = {"current": (1, 10)}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+    assert r._detect_external_rotation() is False
+
+    sync_ok = {"value": False}
+    monkeypatch.setattr(
+        r.backend, "sync_to_agent", lambda _home: sync_ok["value"],
+    )
+    callback_ok = {"value": False}
+    fired: list[int] = []
+
+    def reload_provider():
+        fired.append(1)
+        if not callback_ok["value"]:
+            raise OSError("reload flag unavailable")
+
+    r.register_on_refresh_success(reload_provider)
+    revision["current"] = (2, 11)
+
+    assert r._detect_external_rotation() is False
+    assert fired == []
+    assert r._last_handled_credential_revision == (1, 10)
+
+    sync_ok["value"] = True
+    assert r._detect_external_rotation() is False
+    assert fired == [1]
+    assert r._last_handled_credential_revision == (1, 10)
+
+    callback_ok["value"] = True
+    assert r._detect_external_rotation() is True
+    assert fired == [1, 1]
+    assert r._last_handled_credential_revision == (2, 11)
+
+
 @pytest.mark.asyncio
 async def test_first_tick_establishes_baseline_without_firing(tmp_path):
     """A fresh daemon start must NOT fire refresh-success (which would

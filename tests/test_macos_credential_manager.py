@@ -592,6 +592,34 @@ def test_keychain_backend_poll_external_rotation_detects_change(
     assert backend._last_propagated_blob == _REFRESHED_BLOB
 
 
+def test_keychain_rotation_stays_retryable_when_cache_write_fails(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(cm, "is_macos", lambda: True)
+    backend = _make_keychain_backend(tmp_path)
+    backend._last_propagated_blob = _BLOB
+    backend.cache.write(_BLOB)
+    monkeypatch.setattr(
+        cm, "read_keychain_blob",
+        lambda timeout=cm.SECURITY_TIMEOUT_SECONDS: cm.KeychainReadResult(
+            True, _REFRESHED_BLOB, None, None,
+        ),
+    )
+
+    real_write = backend.cache.write
+    monkeypatch.setattr(
+        backend.cache,
+        "write",
+        lambda _blob: (_ for _ in ()).throw(OSError("disk unavailable")),
+    )
+    assert asyncio.run(backend.poll_external_rotation()) is False
+    assert backend._last_propagated_blob == _BLOB
+
+    monkeypatch.setattr(backend.cache, "write", real_write)
+    assert asyncio.run(backend.poll_external_rotation()) is True
+    assert backend._last_propagated_blob == _REFRESHED_BLOB
+
+
 def test_keychain_backend_poll_external_rotation_no_change_returns_false(
     monkeypatch, tmp_path,
 ):
