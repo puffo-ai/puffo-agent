@@ -425,9 +425,7 @@ def _attachment_content(text: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_native_ingress_withholds_uncleared_sender_content(
-    tmp_path, monkeypatch
-):
+async def test_native_ingress_withholds_uncleared_sender_content(tmp_path, monkeypatch):
     """The native gate decides before, and reveals nothing after.
 
     Four production failures, one boundary:
@@ -464,7 +462,6 @@ async def test_native_ingress_withholds_uncleared_sender_content(
         ),
     }
     handler = _handler(client, payloads)
-
     # ── cold-start blocklist: unreadable ⇒ hold, not admit ────────────
     outcome = await handler.handle(_delivery("env_stranger", STRANGER_SLUG, 1))
     assert outcome is TransportOutcome.HOLD
@@ -524,6 +521,9 @@ async def test_native_ingress_withholds_uncleared_sender_content(
     assert outcome is TransportOutcome.ACK
     assert saved == ["env_friend"]
     assert (inbox_root / "env_friend").exists()
+    stored = await client.store.get_visible_message_by_envelope("env_friend")
+    assert stored is not None
+    assert "original_content" not in stored.content
     await client.store.close()
 
 

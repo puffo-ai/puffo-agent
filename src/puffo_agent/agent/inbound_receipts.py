@@ -531,7 +531,7 @@ class InboundReceiptHandler:
             "channel_name": names["channel_name"],
             "space_name": names["space_name"],
         }
-        if payload.content != llm_text:
+        if raw_text != llm_text:
             # Keep a durable source when the prompt view was bounded or
             # normalized. Unchanged short strings need no duplicate copy.
             content["original_content"] = payload.content
