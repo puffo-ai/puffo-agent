@@ -6,6 +6,24 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a18] - 2026-08-19
+
+> Staging candidate making Claude Code and Codex account changes safe for
+> already-running Agent runtimes.
+
+### Fixed
+
+- **Provider account changes now take effect without restarting the Agent.**
+  Canonical credentials are copied into each Agent view before its provider
+  runtime reloads at an idle turn boundary; the Puffo logical session remains
+  continuous and the native session is resumed when still available.
+- **Credential refresh is serialized across local Puffo daemons.** Production
+  and staging processes sharing one host login use a provider-level OS lock,
+  preventing rotating refresh credentials from racing each other.
+- **Transient provider failures no longer discard resumable sessions.** A new
+  native session is created only when the provider explicitly reports that the
+  saved session or transcript is missing or incompatible.
+
 ## [2.0.0a17] - 2026-08-18
 
 > Staging candidate restoring Claude Code progress after runtime context-window
