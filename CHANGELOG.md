@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a21] - 2026-08-19
+
+> Staging candidate preventing Claude Code context observation from corrupting
+> its next process launch and improving local crash diagnostics.
+
+### Fixed
+
+- **Claude Code autocompact remains stable across context observations.** The
+  launch-time token ceiling is authoritative for Claude; a reported live
+  context window no longer reapplies the percentage and progressively shrinks
+  the next `--autocompact` value below the CLI minimum.
+- **Unexpected Claude Code exits include bounded local diagnostics.** The daemon
+  logs only the final 8 KiB of child-process stderr, making pre-init failures
+  diagnosable without unbounded buffering or remote telemetry.
+
 ## [2.0.0a20] - 2026-08-19
 
 > Staging candidate recovering provider runtimes and bounded context without
