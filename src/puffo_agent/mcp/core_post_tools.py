@@ -20,6 +20,13 @@ from .puffo_core_tools import (
 )
 
 
+def _segment_source_text(content: Any) -> str:
+    """Return the durable body rather than its bounded prompt projection."""
+    if isinstance(content, dict) and "original_content" in content:
+        return _history_text(content["original_content"])
+    return _history_text(content)
+
+
 async def _get_post_segment(
     cfg: Any,
     envelope_id: str,
@@ -42,12 +49,10 @@ async def _get_post_segment(
             "message_id": envelope_id,
         }
 
-    # ``content`` carries either a bare string (plain message)
-    # or the ``puffo/message+attachments/v1`` dict shape; pull
-    # the text out of the latter so segmenting works on the
-    # human-readable portion in both cases.
-    content = msg.content
-    text = _history_text(content)
+    # Eligible inbound rows carry a bounded ``text`` projection plus the
+    # durable source. Legacy/outbound rows may still be a bare string or a
+    # structured message without ``original_content``.
+    text = _segment_source_text(msg.content)
 
     if not text:
         return {

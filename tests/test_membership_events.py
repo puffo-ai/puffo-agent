@@ -12,6 +12,7 @@ and "not for me" no-ops.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -104,6 +105,38 @@ def _make_client(
 
     client.http = _StubHttp()
     return client, sent
+
+
+@pytest.mark.asyncio
+async def test_capability_redemption_invalidates_roster_and_announces_join():
+    client, _ = _make_client()
+    client._space_members["sp_1"] = {"alice-0001": "human"}
+    client._channel_space["ch_1"] = "sp_1"
+    client._processed_membership_event_ids = set()
+    client._log = logging.getLogger(__name__)
+    announcements = []
+
+    async def enqueue(**message):
+        announcements.append(message)
+
+    client._enqueue_membership_system_message = enqueue
+    event = {
+        "event_id": "ev_redeem",
+        "kind": "redeem_invite_capability",
+        "signer_slug": "alice-0001",
+        "payload": {"space_id": "sp_1", "redeemer_slug": "alice-0001"},
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert "sp_1" not in client._space_members
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "joined_space",
+        "kicker_slug": "",
+        "inviter_slug": "",
+        "event_id": "ev_redeem",
+    }]
 
 
 # ─── leave_space (synthetic cascade + self-signed) ─────────────────

@@ -487,6 +487,7 @@ class Daemon:
                     agent_id,
                     exc,
                 )
+                raise
 
         refresher.register_on_refresh_success(on_refresh_success)
         # Stash callback identity for _stop_worker's unregister.

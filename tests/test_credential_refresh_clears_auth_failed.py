@@ -300,17 +300,29 @@ async def test_external_rotation_loop_fires_on_detected_rotation(
     monkeypatch.setattr(_kc, "KEYCHAIN_POLL_INTERVAL_SECONDS", 0.01)
 
     poll_calls = {"n": 0}
+    revision = {"current": (1, 10)}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+    r._detect_external_rotation()
 
     async def fake_poll() -> bool:
         poll_calls["n"] += 1
-        return poll_calls["n"] == 1
+        if poll_calls["n"] == 1:
+            revision["current"] = (2, 11)
+            return True
+        return False
 
     monkeypatch.setattr(
         r.backend, "poll_external_rotation", fake_poll, raising=False,
     )
     sync_calls = {"n": 0}
     monkeypatch.setattr(
-        r, "_sync_views", lambda: sync_calls.__setitem__("n", sync_calls["n"] + 1),
+        r,
+        "_sync_views",
+        lambda: (
+            sync_calls.__setitem__("n", sync_calls["n"] + 1) or True
+        ),
     )
 
     fired: list[str] = []

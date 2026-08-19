@@ -493,12 +493,16 @@ def build_capabilities() -> dict:
         "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
         "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
     }
+    claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
             "provider": h,
             "models": [
                 {"id": o.id, "label": o.label, "alias": o.is_alias}
-                for o in provider_models(h, fetch=False)
+                for o in provider_models(
+                    h,
+                    fetch=h == "claude-code" and claude_ready,
+                )
                 if o.id
             ],
         }

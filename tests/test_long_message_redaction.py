@@ -346,7 +346,8 @@ async def test_segment_attachments_content_dict_segments_text():
     payload = "z" * 3000
     tool = _collect_tool("get_post_segment", _StubDataClient(
         _StubMessage(envelope_id="env_attach", content={
-            "text": payload,
+            "text": "[bounded prompt projection]",
+            "original_content": {"text": payload},
             "attachments": [{"name": "screenshot.png"}],
         }),
     ))

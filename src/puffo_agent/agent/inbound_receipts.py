@@ -531,6 +531,10 @@ class InboundReceiptHandler:
             "channel_name": names["channel_name"],
             "space_name": names["space_name"],
         }
+        if raw_text != llm_text:
+            # Keep a durable source when the prompt view was bounded or
+            # normalized. Unchanged short strings need no duplicate copy.
+            content["original_content"] = payload.content
         # Only carried when authenticated facts actually classified the
         # sender; absent means projection falls back to ``unknown``.
         if names.get("sender_type"):

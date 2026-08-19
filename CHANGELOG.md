@@ -6,6 +6,41 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a20] - 2026-08-19
+
+> Staging candidate recovering provider runtimes and bounded context without
+> breaking the Puffo logical conversation.
+
+### Fixed
+
+- **Crashed or abandoned provider turns now enter bounded recovery.** Retryable
+  runtime exits reach the existing session-transfer path instead of being
+  requeued forever against the same broken runtime state.
+- **Invalid Claude Code resume targets recover automatically.** Puffo retires a
+  native session when Claude explicitly reports that it no longer exists, while
+  preserving valid sessions across ordinary failures and resource reloads.
+- **Context admission can recover after compaction is unavailable.** Puffo tries
+  native compaction, shrinks the pending Inbox batch, and finally rolls over the
+  provider-native session while preserving Puffo session history, memory, and
+  workspace state.
+- **DM thread replies expose their root message ID.** Agents can now route a
+  reply back into the originating DM thread without changing DM target identity.
+- **Provider account changes are acknowledged only after delivery.** External
+  Claude Code and Codex credential revisions remain retryable until Agent views
+  are current and each daemon has requested provider reload, including login
+  changes that race a failed or unchanged refresh.
+- **Long-message segment reads use the durable source body.** Bounded Inbox
+  projections no longer truncate later segment reads, while unchanged
+  structured messages avoid storing a duplicate body.
+- **Link-based space joins refresh Agent membership context.** The Agent now
+  consumes the signed join event and invalidates its cached roster when the
+  Server announces a membership projection change.
+- **Late provider login self-recovers.** A daemon started before Claude Code
+  login refreshes the account model catalog on a later capability heartbeat,
+  and Codex advertises its fixed capabilities before opening a runtime.
+- **Signed WebSocket and HTTP transports share one trust policy.** Both now use
+  the certifi-backed remote TLS context, avoiding macOS/Homebrew CA divergence.
+
 ## [2.0.0a19] - 2026-08-19
 
 > Staging candidate preserving provider conversations while Agent resources and
