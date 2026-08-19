@@ -1124,7 +1124,7 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
     archived_dir().mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = archived_dir() / f"{agent_id}-{stamp}"
-    from .daemon import _retry_move
+    from .daemon import _leave_spaces_before_revoke, _retry_move
     from .import_agents import (
         revoke_archived_device,
         write_archived_pending_revoke,
@@ -1141,6 +1141,18 @@ def cmd_agent_archive(args: argparse.Namespace) -> int:
             )
             return 1
         if cfg.puffo_core.is_configured():
+            # Same fanout the daemon's archive path runs — archiving via
+            # the CLI otherwise leaves the agent in every channel roster.
+            if not await _leave_spaces_before_revoke(
+                agent_id, dest, slug=cfg.puffo_core.slug
+            ):
+                print(
+                    "warning: could not leave every space; revoke deferred "
+                    "to the daemon's next startup sweep",
+                    file=sys.stderr,
+                )
+                print(f"archived {agent_id!r} → {dest}")
+                return 0
             try:
                 await revoke_archived_device(dest, slug=cfg.puffo_core.slug)
                 print(f"revoked {agent_id!r} device server-side")
