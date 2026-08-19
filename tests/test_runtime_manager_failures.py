@@ -845,17 +845,21 @@ class _AutocompactEchoDriver(_ControllableDriver):
 
 
 @pytest.mark.asyncio
-async def test_context_snapshot_never_recomputes_a_pinned_threshold():
+async def test_context_snapshot_stays_pinned_once_it_matches_launch():
     # equation-7256-87f7's real failure: launched with threshold=300_000
-    # (1_000_000 window * 30%). Claude Code then echoes context_window
-    # back as 300_000 too. Re-deriving `window * pct / 100` from that on
-    # every poll shrank the threshold each time (300k -> 90k -> ...)
-    # until the CLI rejected the value outright. It must stay pinned.
+    # (opus-4-7's 1_000_000 static window * 30%, per PR #219's
+    # claude_autocompact_tokens()). Claude Code then echoes context_window
+    # back as 300_000 too -- re-deriving `window * pct / 100` from *that*
+    # on every poll shrank the threshold each time (300k -> 90k -> ...)
+    # until the CLI rejected the value outright. Re-resolving from the
+    # static per-model table instead must always land back on 300_000, so
+    # no poll ever disagrees with launch and reloads.
     driver = _AutocompactEchoDriver()
     manager = RuntimeManager(
         driver,
         RuntimeSpec(
             "/tmp",
+            model="opus-4-7",
             auto_compact_threshold_pct=30,
             auto_compact_threshold_tokens=300_000,
         ),
@@ -868,6 +872,29 @@ async def test_context_snapshot_never_recomputes_a_pinned_threshold():
         await adapter.get_context_snapshot()
         assert manager.spec.auto_compact_threshold_tokens == 300_000
     assert driver.open_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_context_snapshot_corrects_a_stale_threshold_exactly_once():
+    # pct is configured but the spec's token value predates it (e.g. a
+    # live config change after launch) -- the first poll must resolve
+    # the correct value from the static table and reload once to apply
+    # it; every poll after that already agrees, so no further reload.
+    driver = _AutocompactEchoDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", model="opus-4-7", auto_compact_threshold_pct=30),
+        driver_name="claude",
+    )
+    await manager.open()
+    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
+
+    await adapter.get_context_snapshot()
+    assert manager.spec.auto_compact_threshold_tokens == 300_000
+    assert driver.open_calls == 2
+
+    await adapter.get_context_snapshot()
+    assert driver.open_calls == 2
 
 
 @pytest.mark.asyncio

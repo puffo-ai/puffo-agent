@@ -47,6 +47,16 @@ logger = logging.getLogger(__name__)
 COMPACTION_WAIT_SECONDS = 120.0
 
 
+def _resolve_claude_autocompact_tokens(*, model: str, pct: float) -> int | None:
+    """Same call local_runtime.py makes at launch -- static per-model window,
+    never the driver's live-reported one (see PR #219: once --autocompact is
+    active, Claude echoes that configured ceiling back as its own window).
+    """
+    from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+    return claude_autocompact_tokens(model=model, pct=pct)
+
+
 class RuntimeStateError(RuntimeError):
     """Internal state-machine contract violation, never retried automatically."""
 
@@ -969,12 +979,20 @@ class RuntimeManagerAdapter(Adapter):
             and context_window > 0
         ):
             metadata["context_window"] = context_window
-            # threshold is pinned at launch, not re-derived here -- see
-            # get_context_snapshot() below for why.
-            threshold = (
+            fallback = (
                 self.manager.spec.auto_compact_threshold_tokens
                 or status.auto_compact_threshold_tokens
             )
+            pct = self.manager.spec.auto_compact_threshold_pct
+            # Resolved the same way as get_context_snapshot() below -- see
+            # there for why context_window itself isn't the input.
+            threshold = (
+                _resolve_claude_autocompact_tokens(
+                    model=self.manager.spec.model, pct=pct
+                )
+                if pct is not None
+                else None
+            ) or fallback
             self._latest_context_limits = (context_window, threshold)
         if status.measured_at:
             metadata["context_measured_at"] = status.measured_at
@@ -1157,15 +1175,35 @@ class RuntimeManagerAdapter(Adapter):
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
         window = status.context_window
-        # Pinned at launch (local_runtime.py, via claude_autocompact_tokens())
-        # and never re-derived here: the driver's live-reported window can
-        # itself already reflect our own configured --autocompact ceiling,
-        # so multiplying it by the percentage again compounds the threshold
-        # smaller on every poll instead of holding it stable.
-        threshold = (
+        fallback = (
             self.manager.spec.auto_compact_threshold_tokens
             or status.auto_compact_threshold_tokens
         )
+        pct = self.manager.spec.auto_compact_threshold_pct
+        threshold = fallback
+        if pct is not None:
+            # Once --autocompact is active, Claude's live context_window
+            # echoes back our own configured ceiling, not the model's raw
+            # capacity (see PR #219) -- resolve from the static per-model
+            # table instead, exactly as local_runtime.py did at launch.
+            # Deterministic for a fixed model+pct, so this never drifts
+            # from what's already running and the reload below is really
+            # just a safety net for a pct that changed after launch.
+            threshold = _resolve_claude_autocompact_tokens(
+                model=self.manager.spec.model, pct=pct
+            ) or fallback
+            if (
+                threshold is not None
+                and self.manager.active_turn_ref is None
+                and self.manager.spec.auto_compact_threshold_tokens != threshold
+            ):
+                await self.manager.reload_resources(
+                    preserve_session=True,
+                    spec=replace(
+                        self.manager.spec,
+                        auto_compact_threshold_tokens=threshold,
+                    ),
+                )
         self._latest_context_limits = (window, threshold)
         return normalize_context_snapshot(
             used_tokens=status.used_tokens or 0,
