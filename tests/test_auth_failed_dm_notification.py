@@ -419,7 +419,7 @@ def test_oauth_copy_quotes_agent_id_for_markdown_safety():
     assert "`a-b-c`" in text
 
 
-def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
+def test_daemon_on_refresh_success_resets_dedup(monkeypatch, tmp_path):
     """PR #70 nit #1: the daemon's refresh-success closure resets
     ``worker._auth_failed_notification_sent``. The pieces are
     unit-tested individually; this pins the wiring between
@@ -448,11 +448,19 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
         class puffo_core:
             slug = "alice-0001"
 
+        @staticmethod
+        def resolve_workspace_dir():
+            return tmp_path / "workspace"
+
     class _StubWorker:
         agent_cfg = _StubAgentCfg()
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
         _refresh_success_callback = None
+
+        @staticmethod
+        def notify_refresh():
+            pass
 
     class _StubDaemon:
         refresher = _StubRefresher()

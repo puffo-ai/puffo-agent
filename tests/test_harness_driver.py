@@ -1939,7 +1939,6 @@ def _build_projection_adapter(tmp_path, driver, monkeypatch):
         migration_source="fresh",
         legacy_session_path=tmp_path / "legacy.json",
         preparer=_StubPreparer(),
-        session_fingerprint="fp",
     )
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db", max_rows=1)
     monkeypatch.setattr(local_runtime, "build_driver", lambda name: driver)

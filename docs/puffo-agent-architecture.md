@@ -98,7 +98,7 @@ Current concrete engines:
 - `portal/ws_local/`: externally attached runtime.
 
 `agent/harness/local_runtime.py` resolves host binaries, isolated homes,
-session fingerprints, managed config, and common Driver binding. Docker reuses
+durable native-session resume, managed config, and common Driver binding. Docker reuses
 the same Driver and Runtime Manager contracts through a `docker exec -i`
 process factory. `portal/runtime_matrix.py` is the source of truth for supported
 runtime/provider/harness combinations.

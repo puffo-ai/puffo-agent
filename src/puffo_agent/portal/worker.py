@@ -1217,32 +1217,29 @@ async def _process_refresh_flags(
     refresh_agent_flag: Path,
     refresh_host_sync_flag: Path,
     refresh_session_flag: Path,
+    refresh_provider_auth_flag: Path,
     display_name: str = "",
     role: str = "",
     role_short: str = "",
     puffo_handle: str = "",
     workspace_shared_status: str = "existing",
 ) -> None:
-    """Consume any worker-scope refresh flags into a single
-    ``adapter.reload(prompt, with_session=…)`` call at turn start.
-    Order: host sync → CLAUDE.md rebuild → session drop. A changed
-    primer/profile slice drops the session too (``--resume`` would replay
-    the stale baked prompt); memory-only or no-op rebuilds keep it.
-    ``puffo_handle`` rides along with the other identity fields: this
-    rebuild regenerates the managed profile block, so omitting it would
-    revert an imported agent's model-facing handle to ``agent_id`` on the
-    first refresh flag."""
+    """Consume worker refresh flags in one idle-boundary adapter reload.
+
+    Resource and credential changes preserve session identity. Only an explicit
+    session refresh starts a new logical and native provider conversation.
+    """
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()
-    if not (host_sync_seen or agent_seen or session_seen):
+    provider_auth_seen = refresh_provider_auth_flag.exists()
+    if not (host_sync_seen or agent_seen or session_seen or provider_auth_seen):
         return
 
     if host_sync_seen:
         _sync_refresh_host_assets(agent_id)
 
     new_prompt: str | None = None
-    prompt_changed = False
     if agent_seen:
         try:
             new_prompt = _rebuild_managed_system_prompt(
@@ -1258,14 +1255,7 @@ async def _process_refresh_flags(
                 puffo_handle=puffo_handle,
                 workspace_shared_status=workspace_shared_status,
             )
-            from ..agent.shared_content import MEMORY_SECTION_HEADER
-
-            def _session_core(prompt: str) -> str:
-                return prompt.split(MEMORY_SECTION_HEADER, 1)[0]
-
-            prompt_changed = _session_core(new_prompt) != _session_core(
-                puffo.system_prompt
-            )
+            prompt_changed = new_prompt != puffo.system_prompt
             puffo.system_prompt = new_prompt
             logger.info(
                 "agent %s: system prompt rebuilt from disk (changed=%s)",
@@ -1282,8 +1272,13 @@ async def _process_refresh_flags(
     try:
         await adapter.reload(
             new_prompt if new_prompt is not None else puffo.system_prompt,
-            with_session=session_seen or prompt_changed,
+            with_session=session_seen,
         )
+        if provider_auth_seen:
+            logger.info(
+                "agent %s: provider runtime reloaded after credential replacement",
+                agent_id,
+            )
     except Exception as exc:
         logger.warning(
             "agent %s: adapter.reload after refresh failed: %s",
@@ -1291,7 +1286,12 @@ async def _process_refresh_flags(
             exc,
         )
 
-    for flag in (refresh_host_sync_flag, refresh_agent_flag, refresh_session_flag):
+    for flag in (
+        refresh_host_sync_flag,
+        refresh_agent_flag,
+        refresh_session_flag,
+        refresh_provider_auth_flag,
+    ):
         try:
             flag.unlink()
         except OSError:

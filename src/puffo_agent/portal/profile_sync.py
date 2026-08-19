@@ -201,8 +201,7 @@ async def sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
 
 
 def write_refresh_agent_flag(cfg: AgentConfig, *, reason: str) -> None:
-    """Drop ``refresh_agent.flag`` so the worker rebuilds its system
-    prompt on the next batch. Best-effort."""
+    """Request an idle-boundary system-prompt and provider refresh."""
     from .state import refresh_agent_flag_path
     flag_path = refresh_agent_flag_path(cfg.resolve_workspace_dir())
     try:

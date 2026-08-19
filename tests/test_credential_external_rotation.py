@@ -5,8 +5,8 @@ FileBackend's symlink-propagation assumption doesn't hold.
 - backends expose a ``fingerprint`` so the refresher can spot the change
 - the refresher fires refresh-success on a detected change (not on the
   first/baseline tick)
-- the daemon's on_refresh_success restarts agents that were auth_failed
-  so their claude session respawns with the fresh credential
+- the daemon's on_refresh_success reloads healthy and auth-failed provider
+  runtimes at an idle boundary without restarting the whole agent
 """
 
 from __future__ import annotations
@@ -108,8 +108,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
     from puffo_agent.portal import daemon as daemon_module
     from puffo_agent.portal.state import RuntimeState
 
-    flag = tmp_path / "restart.flag"
-    monkeypatch.setattr(daemon_module, "restart_flag_path", lambda aid: flag)
+    flag = tmp_path / "refresh_provider_auth.flag"
+    monkeypatch.setattr(
+        daemon_module, "refresh_provider_auth_flag_path", lambda workspace: flag,
+    )
 
     class _StubRefresher:
         def __init__(self):
@@ -124,6 +126,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
     class _StubAgentCfg:
         id = "t-agent"
 
+        @staticmethod
+        def resolve_workspace_dir():
+            return tmp_path / "workspace"
+
         class runtime:
             harness = "claude-code"
 
@@ -135,6 +141,11 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
         _refresh_success_callback = None
+        refresh_notifications = 0
+
+        @classmethod
+        def notify_refresh(cls):
+            cls.refresh_notifications += 1
 
     class _StubDaemon:
         refresher = _StubRefresher()
@@ -152,17 +163,19 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
     return d, w, flag
 
 
-def test_on_refresh_success_restarts_auth_failed_agent(tmp_path, monkeypatch):
+def test_on_refresh_success_reloads_auth_failed_agent(tmp_path, monkeypatch):
     d, w, flag = _daemon_harness(monkeypatch, tmp_path, "auth_failed")
     d.refresher.callback()
     assert w.runtime.health == "ok"
-    assert flag.exists()        # restart requested to pick up new cred
+    assert flag.exists()
+    assert w.refresh_notifications == 1
 
 
-def test_on_refresh_success_no_restart_when_healthy(tmp_path, monkeypatch):
+def test_on_refresh_success_reloads_healthy_agent(tmp_path, monkeypatch):
     d, w, flag = _daemon_harness(monkeypatch, tmp_path, "ok")
     d.refresher.callback()
-    assert not flag.exists()    # nothing to recover → no restart
+    assert flag.exists()
+    assert w.refresh_notifications == 1
 
 
 # ── new message while auth_failed wakes the refresher ──────────────

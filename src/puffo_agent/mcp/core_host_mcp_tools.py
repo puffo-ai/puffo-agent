@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -67,8 +68,8 @@ def register_host_mcp_tools(mcp: FastMCP, cfg: Any) -> None:
         """Copy the operator's ``~/.claude.json#mcpServers[<id>]``
         entry into your own ``<agent>/.claude.json``. Pair with
         ``install_host_mcp`` once the operator finishes OAuth on host,
-        then call ``refresh()`` so claude respawns and picks up the
-        new MCP.
+        then the runtime automatically reloads the provider at the next
+        idle boundary so it picks up the new MCP.
 
         If the host config doesn't have the entry yet, returns an
         error asking you to call ``install_host_mcp`` first (and
@@ -80,4 +81,12 @@ def register_host_mcp_tools(mcp: FastMCP, cfg: Any) -> None:
                 "on this MCP runtime, so the puffo-agent daemon's "
                 "rpc_service isn't reachable."
             )
-        return await cfg.rpc_client.sync_mcp(template_id=template_id)
+        result = await cfg.rpc_client.sync_mcp(template_id=template_id)
+        workspace = getattr(cfg, "workspace", None)
+        synced = result.startswith(("Verified host's ", "Synced host's "))
+        if workspace and synced:
+            from .host_tools import _touch_refresh_flag
+
+            _touch_refresh_flag(Path(workspace), "refresh_agent")
+            result += " Runtime refresh requested."
+        return result

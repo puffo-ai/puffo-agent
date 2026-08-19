@@ -180,6 +180,56 @@ class _AmbiguousStartDriver(_ControllableDriver):
         )
 
 
+class _ResumeBoundaryDriver(_ControllableDriver):
+    def __init__(self, resume_error: Exception) -> None:
+        super().__init__()
+        self.resume_error = resume_error
+        self.resume_values: list[SessionRef | None] = []
+
+    async def open(self, spec, resume=None):
+        self.resume_values.append(resume)
+        if resume is not None:
+            raise self.resume_error
+        return await super().open(spec, resume)
+
+
+@pytest.mark.asyncio
+async def test_native_resume_falls_back_only_when_session_is_missing():
+    driver = _ResumeBoundaryDriver(RuntimeError("Codex thread not found"))
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    opened = await manager.open()
+
+    assert driver.resume_values == [SessionRef("native-old"), None]
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_native_resume_keeps_session_on_transient_error():
+    driver = _ResumeBoundaryDriver(
+        AgentAPIError("provider temporarily unavailable", is_auth=False)
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    with pytest.raises(AgentAPIError, match="temporarily unavailable"):
+        await manager.open()
+    assert driver.resume_values == [SessionRef("native-old")]
+    assert manager.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-old"
+
+
 def _context():
     return SimpleNamespace(
         messages=[{"role": "user", "content": "current notice"}],

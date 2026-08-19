@@ -6,6 +6,43 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a19] - 2026-08-19
+
+> Staging candidate preserving provider conversations while Agent resources and
+> credentials change.
+
+### Fixed
+
+- **Profile and runtime configuration changes no longer discard valid native
+  sessions.** Claude Code and Codex now receive the persisted session ID and
+  decide whether it can be resumed; Puffo falls back to a fresh provider
+  session only when the provider explicitly rejects the saved one.
+- **Puffo logical sessions remain continuous across provider reloads.** The
+  retired configuration-derived session fingerprint is removed from durable
+  runtime state during the existing SQLite migration path.
+- **Managed profile, skill, and MCP changes reload automatically.** Existing
+  mutation paths request the current idle-boundary resource refresh instead of
+  asking the Agent to call `refresh()` manually. Explicit
+  `refresh(session=True)` still starts a new conversation.
+
+## [2.0.0a18] - 2026-08-19
+
+> Staging candidate making Claude Code and Codex account changes safe for
+> already-running Agent runtimes.
+
+### Fixed
+
+- **Provider account changes now take effect without restarting the Agent.**
+  Canonical credentials are copied into each Agent view before its provider
+  runtime reloads at an idle turn boundary; the Puffo logical session remains
+  continuous and the native session is resumed when still available.
+- **Credential refresh is serialized across local Puffo daemons.** Production
+  and staging processes sharing one host login use a provider-level OS lock,
+  preventing rotating refresh credentials from racing each other.
+- **Transient provider failures no longer discard resumable sessions.** A new
+  native session is created only when the provider explicitly reports that the
+  saved session or transcript is missing or incompatible.
+
 ## [2.0.0a17] - 2026-08-18
 
 > Staging candidate restoring Claude Code progress after runtime context-window

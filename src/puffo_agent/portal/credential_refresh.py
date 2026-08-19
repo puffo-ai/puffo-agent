@@ -1,8 +1,9 @@
 """Daemon-owned Claude / Codex OAuth credential refresh.
 
-All refresh writes go through ONE process (the daemon), so
-Anthropic + OpenAI's single-use rotating refresh tokens can't be
-raced by N agent workers burning each other's in-memory copies.
+All refresh writes go through a daemon-owned coordinator. An OS-backed
+host lock also serializes separate Puffo daemons (for example production
+and staging), so Anthropic + OpenAI's rotating refresh tokens can't be
+raced by workers or sibling daemon processes.
 
 ``CredentialRefresher`` owns an ``asyncio.Lock`` (single-writer),
 the agent-home registry, the ``notify_refresh_needed`` wake event,
@@ -29,9 +30,10 @@ import os
 import random
 import re
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Protocol
+from typing import AsyncIterator, Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
@@ -54,6 +56,8 @@ logger = logging.getLogger(__name__)
 REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
+REFRESH_LOCK_TIMEOUT_SECONDS = REFRESH_ONESHOT_TIMEOUT_SECONDS + 15
+REFRESH_LOCK_POLL_SECONDS = 0.1
 
 # 2 ticks ≈ 4 min @ 120s poll: surfaces fast, doesn't false-positive on
 # a single transient subprocess hiccup.
@@ -69,6 +73,58 @@ REFRESH_PROBE_MODEL = os.environ.get(
 # then probes drop ``--model`` and use claude's default. Daemon restart
 # resets — fine, the worst case is one extra failed tick before re-latching.
 _probe_model_disabled = False
+
+
+def _try_lock_file(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@asynccontextmanager
+async def _host_refresh_lock(path: Path) -> AsyncIterator[None]:
+    """Serialize provider refreshes across every Puffo daemon on this host."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    deadline = time.monotonic() + REFRESH_LOCK_TIMEOUT_SECONDS
+    try:
+        while True:
+            try:
+                _try_lock_file(fd)
+                acquired = True
+                break
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"credential refresh lock timed out: {path}"
+                    )
+                await asyncio.sleep(REFRESH_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        if acquired:
+            _unlock_file(fd)
+        os.close(fd)
 
 # 5-15s randomised so fleet retries don't synchronise post rate-limit.
 RATE_LIMIT_FAST_RETRY_MIN_SECONDS = 5.0
@@ -253,6 +309,11 @@ class CredentialBackend(Protocol):
         every invocation."""
         ...
 
+    @property
+    def refresh_lock_path(self) -> Path:
+        """Host-global lock file for this provider's canonical login."""
+        ...
+
     def sync_to_agent(self, agent_home: Path) -> None:
         """Mirror the canonical credentials to one agent's per-agent
         ``.credentials.json``. Called by the refresher's fan-out after
@@ -282,6 +343,10 @@ class FileBackend:
     @property
     def host_credentials(self) -> Path:
         return self.host_home / ".claude" / ".credentials.json"
+
+    @property
+    def refresh_lock_path(self) -> Path:
+        return self.host_home / ".claude" / ".puffo-refresh.lock"
 
     def expires_in_seconds(self) -> int | None:
         try:
@@ -395,6 +460,10 @@ class CodexFileBackend:
     @property
     def host_auth(self) -> Path:
         return self.host_home / ".codex" / "auth.json"
+
+    @property
+    def refresh_lock_path(self) -> Path:
+        return self.host_home / ".codex" / ".puffo-refresh.lock"
 
     def expires_in_seconds(self) -> int | None:
         try:
@@ -550,6 +619,12 @@ class KeychainBackend:
         # Last blob propagated to agents — cheap byte-equality key so
         # the poll loop only fans out on real changes.
         self._last_propagated_blob: Optional[str] = None
+
+    @property
+    def refresh_lock_path(self) -> Path:
+        # Anchor outside PUFFO_AGENT_HOME so production and staging daemons
+        # coordinate access to the same login Keychain credential.
+        return Path.home() / ".claude" / ".puffo-refresh.lock"
 
     def expires_in_seconds(self) -> int | None:
         """Cache → Keychain → disk file. The disk fallthrough handles
@@ -1069,34 +1144,48 @@ class CredentialRefresher:
     async def _refresh_now(
         self, *, expires_in: int | None, by_agent: bool,
     ) -> None:
-        """Single-writer refresh through the backend; the lock makes
-        the rotating-RT race unwinnable."""
+        """Serialize refreshes within this daemon and across sibling daemons."""
         # Fire only on REFRESHED: UNCHANGED / FAILED leave the on-disk
         # token unchanged, so clearing auth_failed would oscillate.
         outcome: RefreshOutcome | None = None
         async with self._lock:
-            before = self.expires_in_seconds()
-            if (
-                not by_agent
-                and before is not None
-                and before > REFRESH_SAFETY_MARGIN_SECONDS
-            ):
-                logger.debug(
-                    "another caller already refreshed (now expires in %ds)",
-                    before,
+            lock_path = self.backend.refresh_lock_path
+            try:
+                async with _host_refresh_lock(lock_path):
+                    before = self.expires_in_seconds()
+                    if (
+                        not by_agent
+                        and before is not None
+                        and before > REFRESH_SAFETY_MARGIN_SECONDS
+                    ):
+                        logger.debug(
+                            "another daemon already refreshed "
+                            "(now expires in %ds)", before,
+                        )
+                        return
+                    logger.info(
+                        "refreshing credentials (expires_in=%s, by_agent=%s)",
+                        expires_in, by_agent,
+                    )
+                    try:
+                        outcome = await self.backend.refresh()
+                    except Exception as exc:
+                        logger.warning("backend refresh errored: %s", exc)
+                        outcome = RefreshOutcome.FAILED
+            except TimeoutError:
+                logger.warning(
+                    "credential refresh deferred: another daemon held the "
+                    "provider lock for more than %ds",
+                    REFRESH_LOCK_TIMEOUT_SECONDS,
                 )
                 return
-            logger.info(
-                "refreshing credentials (expires_in=%s, by_agent=%s)",
-                expires_in, by_agent,
-            )
-            try:
-                outcome = await self.backend.refresh()
-            except Exception as exc:
-                logger.warning("backend refresh errored: %s", exc)
-                outcome = RefreshOutcome.FAILED
+            assert outcome is not None
             self._propagate_outcome(outcome)
         if outcome is RefreshOutcome.REFRESHED:
+            # Never reopen a provider runtime before its sanitized view holds
+            # the replacement credential.
+            self._sync_views()
+            self._record_cred_fingerprint()
             self._fire_refresh_success()
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:

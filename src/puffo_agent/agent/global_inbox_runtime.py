@@ -122,9 +122,14 @@ class TurnStatusLifecycle(Protocol):
     """Optional worker-owned mirror of the active Global Inbox turn.
 
     The runtime owns only the durable turn lifecycle; it notifies this
-    callback with immutable active-union snapshots so the worker can drive
-    Server processing-row status without moving status policy in here.
+    callback with immutable notice and active-union snapshots so the worker
+    can drive Server status without moving status policy in here.
     """
+
+    async def on_notice_admitted(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        """Report that a provider accepted an Inbox notice for this turn."""
 
     async def on_turn_active(
         self, *, turn_id: str, message_ids: tuple[str, ...]
@@ -837,6 +842,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             if self.coordinator is not None:
                 self.coordinator.provider_session_id = provider_session_id
             self._write_current_turn(planned)
+        await self._notify_status_notice_admitted(
+            tuple(planned.notice_message_ids)
+        )
         log_runtime_event(
             logger,
             "turn.admitted",
@@ -856,6 +864,28 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             message_count=len(self.active.message_ids),
             outcome="bound",
         )
+
+    async def _notify_status_notice_admitted(
+        self, message_ids: tuple[str, ...]
+    ) -> None:
+        """Expose provider admission without claiming Inbox rows were read."""
+        if (
+            self.status_lifecycle is None
+            or not self.active.turn_id
+            or not message_ids
+        ):
+            return
+        try:
+            await self.status_lifecycle.on_notice_admitted(
+                turn_id=self.active.turn_id,
+                message_ids=message_ids,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: status lifecycle notice notify failed",
+                self.agent_id,
+                exc_info=True,
+            )
 
     async def _notify_status_active(self) -> None:
         """Expose the exact active union to the worker's status lifecycle.

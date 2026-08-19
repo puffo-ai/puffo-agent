@@ -572,7 +572,7 @@ orthogonal axes; combine them freely.
 | `refresh()` | Rebuild `CLAUDE.md` + re-sync puffo default skills. Subprocess respawns on next turn, session preserved. |
 | `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
 | `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
-| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
+| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, and respawn the worker. The same harness resumes its session; a different harness falls back to a new native session. |
 | `refresh(inference_level="medium")` | Set reasoning effort, persist to `agent.yml`, respawn. Standalone or alongside a harness+model swap. |
 
 **When to use:**

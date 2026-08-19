@@ -554,9 +554,8 @@ async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
         )
         return (
             f"Verified host's ~/.codex/config.toml has {template_id!r}."
-            f"{oauth_note} Call refresh() - your codex worker re-merges the "
-            "host's mcp_servers into your own config on every restart, so "
-            "the new entry will be live immediately."
+            f"{oauth_note} Your codex worker re-merges the host's "
+            "mcp_servers into its own config on provider reload."
         )
 
     host_claude_json = ctx.host_home / ".claude.json"
@@ -580,8 +579,7 @@ async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
     _atomic_write_claude_json(agent_claude_json, agent_data)
     return (
         f"Synced host's {template_id!r} entry into your "
-        f"~/.claude.json. Call refresh() so claude respawns and "
-        f"loads it."
+        f"~/.claude.json. It is ready for the next provider reload."
     )
 
 

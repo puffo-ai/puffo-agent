@@ -275,7 +275,7 @@ async def test_sync_copies_host_entry_to_agent(tmp_path):
         (ctx.agent_home / ".claude.json").read_text(encoding="utf-8"),
     )
     assert agent_data["mcpServers"]["gmail-read"] == entry
-    assert "refresh()" in msg
+    assert "provider reload" in msg
 
 
 # ── codex harness path ─────────────────────────────────────────────
@@ -394,8 +394,8 @@ async def test_sync_codex_validates_host_entry_present(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sync_codex_does_not_write_agent_file(tmp_path):
-    """Codex sync verifies host has the entry and points the agent
-    at refresh() — the worker's restart code does the re-merge.
+    """Codex sync verifies the host entry and leaves re-merging to the
+    provider reload requested by the MCP tool wrapper.
     Agent-side write would just get overwritten with the same
     content on the next restart, so we skip it."""
     ctx = _ctx(tmp_path, harness="codex")
@@ -408,7 +408,7 @@ async def test_sync_codex_does_not_write_agent_file(tmp_path):
 
     msg = await host_mcp_handler.sync(ctx, template_id="gmail-read")
 
-    assert "refresh()" in msg
+    assert "provider reload" in msg
     assert "re-merges" in msg
     # No file under agent_home/.codex was touched.
     assert not (ctx.agent_home / ".codex").exists()

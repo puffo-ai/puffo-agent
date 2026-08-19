@@ -214,7 +214,8 @@ def delete_flag_path(agent_id: str) -> Path:
     return agent_dir(agent_id) / ".puffo-agent" / "delete.flag"
 
 
-# Refresh flags — 5 axes touched by MCP refresh() / CLI / control-ws.
+# Refresh flags — user-facing refresh axes plus the daemon-owned provider-auth
+# reload signal.
 # All under ``<workspace>/.puffo-agent/`` so the location is reachable
 # from both the worker and the MCP subprocess in cli-docker.
 
@@ -229,6 +230,17 @@ def refresh_host_sync_flag_path(workspace: Path) -> Path:
 
 def refresh_session_flag_path(workspace: Path) -> Path:
     return workspace / ".puffo-agent" / "refresh_session.flag"
+
+
+def refresh_provider_auth_flag_path(workspace: Path) -> Path:
+    """Request an idle-boundary provider runtime reload after OAuth changes.
+
+    Unlike ``refresh_session.flag``, this preserves the Puffo logical session
+    and asks the harness to resume its native session with the replacement
+    credential. The runtime manager falls back to a fresh native session only
+    when that saved session is explicitly unavailable.
+    """
+    return workspace / ".puffo-agent" / "refresh_provider_auth.flag"
 
 
 def refresh_model_flag_path(workspace: Path) -> Path:

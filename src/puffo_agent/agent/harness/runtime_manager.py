@@ -54,6 +54,37 @@ class RuntimeStateError(RuntimeError):
         self.error_code = error_code
 
 
+def _native_resume_is_unavailable(exc: Exception) -> bool:
+    """Whether the provider explicitly rejected the saved native session."""
+    text = str(exc).lower()
+    identifies_session = any(
+        marker in text
+        for marker in (
+            "session",
+            "thread",
+            "conversation",
+            "rollout",
+            "transcript",
+        )
+    )
+    unavailable = any(
+        marker in text
+        for marker in (
+            "not found",
+            "does not exist",
+            "failed to find",
+            "is gone",
+            "no rollout",
+            "cannot resume",
+            "unable to resume",
+            "incompatible",
+            "invalid session",
+            "invalid thread",
+        )
+    )
+    return identifies_session and unavailable
+
+
 class _EventStream(AsyncIterator[HarnessEvent]):
     """Subscriber handle that releases its queue whether or not it is iterated.
 
@@ -142,19 +173,21 @@ class RuntimeManager:
         )
         try:
             opened = await self.driver.open(self.spec, native_resume)
-        except Exception:
-            if native_resume is None:
-                try:
-                    await self.driver.close()
-                except Exception:
-                    logger.exception("failed to close runtime after open failure")
+        except Exception as exc:
+            try:
+                await self.driver.close()
+            except Exception:
+                logger.exception("failed to close runtime after open failure")
+            # Network, auth, rate-limit, and process failures retry the same
+            # native session. Only explicit absence/incompatibility permits a
+            # transparent fresh native session.
+            if native_resume is None or not _native_resume_is_unavailable(exc):
                 raise
             logger.warning(
                 "%s could not resume native session; starting a fresh session",
                 self.driver_name,
                 exc_info=True,
             )
-            await self.driver.close()
             self._clear_native_session()
             try:
                 opened = await self.driver.open(self.spec, None)

@@ -203,12 +203,13 @@ async def test_refresh_now_fires_on_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr(r.backend, "refresh", fake_refresh)
 
-    fired: list[str] = []
-    r.register_on_refresh_success(lambda: fired.append("ok"))
+    events: list[str] = []
+    monkeypatch.setattr(r, "_sync_views", lambda: events.append("views_synced"))
+    r.register_on_refresh_success(lambda: events.append("callback"))
 
     await r._refresh_now(expires_in=10, by_agent=True)
     assert refresh_called["n"] == 1
-    assert fired == ["ok"]
+    assert events == ["views_synced", "callback"]
 
 
 @pytest.mark.asyncio

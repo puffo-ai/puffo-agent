@@ -205,18 +205,20 @@ def _register_skill_tools(mcp: FastMCP, workspace: str, harness: str) -> None:
         """Install a new skill at project scope."""
         _require_claude_code(harness, "install_skill")
         dst = _install_skill(Path(workspace), name, content)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
             f"installed skill {name!r} at project scope ({dst}). "
-            "Call refresh() so your next turn picks it up."
+            "Runtime refresh requested; your next turn will pick it up."
         )
     @mcp.tool()
     async def uninstall_skill(name: str) -> str:
         """Remove a skill you previously installed."""
         _require_claude_code(harness, "uninstall_skill")
         _uninstall_skill(Path(workspace), name)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
-            f"uninstalled skill {name!r}. Call refresh() so your next "
-            "turn stops seeing it."
+            f"uninstalled skill {name!r}. Runtime refresh requested; your "
+            "next turn will stop seeing it."
         )
     @mcp.tool()
     async def list_skills() -> str:
@@ -244,18 +246,20 @@ def _register_mcp_tools(mcp: FastMCP, workspace: str, runtime_kind: str, harness
             Path(workspace), name, command, args, env,
             check_host_local=check_host_local,
         )
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
             f"registered MCP server {name!r} at project scope ({path}). "
-            "Call refresh() so the claude subprocess respawns."
+            "Runtime refresh requested so the provider reloads it."
         )
     @mcp.tool()
     async def uninstall_mcp_server(name: str) -> str:
         """Remove an MCP server you previously registered."""
         _require_claude_code(harness, "uninstall_mcp_server")
         _uninstall_mcp_server(Path(workspace), name)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
-            f"removed MCP server {name!r}. Call refresh() so the claude "
-            "subprocess respawns without it."
+            f"removed MCP server {name!r}. Runtime refresh requested so the "
+            "provider reloads without it."
         )
     @mcp.tool()
     async def list_mcp_servers() -> str:

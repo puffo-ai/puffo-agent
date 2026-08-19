@@ -1,10 +1,10 @@
 """One table-driven regression test for the worker Global Inbox status lifecycle.
 
-The durable Global Inbox turn — not WebSocket receipt — owns
-``StatusReporter.begin_turn`` / ``end_turn_batch``: exactly one begin on the
-first real admitted message, exactly one terminal batch over the exact active
-union, and no Server processing rows for synthetic ``intro-prompt-*``
-envelopes even though busy state is shown.
+The durable Global Inbox turn — not WebSocket receipt — owns status reporting:
+provider admission emits one provisional busy heartbeat, while ``read_inbox``
+owns ``StatusReporter.begin_turn`` and the first real processing row. Terminal
+cleanup settles the exact active union, and synthetic ``intro-prompt-*``
+envelopes show busy state without creating Server processing rows.
 """
 
 from __future__ import annotations
@@ -36,6 +36,8 @@ class _LifecycleRunner:
 
     async def __call__(self, planned):
         await self.adapter.admit()
+        if self.outcome == "no_read":
+            return None
         await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         if self.expand:
             await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
@@ -57,6 +59,7 @@ _CASES = [
     {"id": "provider_failure", "outcome": "failure", "expand": False},
     {"id": "cancelled", "outcome": "cancelled", "expand": False},
     {"id": "retry_same_turn", "outcome": "retry", "expand": False},
+    {"id": "success_without_read", "outcome": "no_read", "expand": False},
     {"id": "synthetic_intro", "outcome": "success", "expand": False, "synthetic": True},
 ]
 
@@ -83,11 +86,12 @@ def _assert_status_wire(case: dict, http, lifecycle) -> None:
     batch_runs = _batch_runs(http)
     turns = 2 if case.get("second") else 1
     # Clean per-turn state: a subsequent case/turn cannot inherit runs.
+    assert lifecycle._notice_began is False
     assert lifecycle._began is False
+    heartbeats = [
+        body for path, body in http.calls if path == "/agents/me/heartbeat"
+    ]
     if case.get("synthetic"):
-        heartbeats = [
-            body for path, body in http.calls if path == "/agents/me/heartbeat"
-        ]
         # Busy is shown for the synthetic turn, but no processing row reaches
         # the wire for the synthetic id.
         assert [body["status"] for body in heartbeats] == ["busy", "idle"]
@@ -96,6 +100,17 @@ def _assert_status_wire(case: dict, http, lifecycle) -> None:
         assert batch_runs == []
         assert not any("/processing/" in path for path, _ in http.calls)
         return
+    if case["outcome"] == "no_read":
+        assert [body["status"] for body in heartbeats] == ["busy", "idle"]
+        assert heartbeats[0]["current_message_id"] == "m1"
+        assert begin_runs == {}
+        assert batch_runs == []
+        return
+    assert len(heartbeats) == turns
+    assert [body["status"] for body in heartbeats] == ["busy"] * turns
+    assert heartbeats[0]["current_message_id"] == "m1"
+    if case.get("second"):
+        assert heartbeats[1]["current_message_id"] == "m3"
     # Exactly one begin per logical turn, and one terminal batch per turn.
     assert len(begin_runs) == turns
     assert len(batch_runs) == turns

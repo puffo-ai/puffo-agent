@@ -10,7 +10,6 @@ those responsibilities belong to :mod:`codex_driver`,
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -67,7 +66,6 @@ from ..runtime_event_outbox import (
     RuntimeEventProjectingSink,
 )
 from ..runtime_events import RuntimeEventProjector, TrustedScope
-from ..shared_content import MEMORY_SECTION_HEADER
 from . import UnsupportedDriver, build_driver
 from .driver import (
     Driver,
@@ -177,39 +175,6 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def compute_session_fingerprint(
-    *,
-    agent_cfg: AgentConfig,
-    harness_name: str,
-    provider: str,
-    spec: RuntimeSpec,
-) -> str:
-    """Fingerprint only inputs that make a native session incompatible.
-
-    Shared by the host-local and Docker runtime owners so a persisted
-    logical session stays comparable across restarts of the same runtime.
-    """
-    prompt_core = spec.system_prompt.split(MEMORY_SECTION_HEADER, 1)[0]
-    payload = {
-        "version": 1,
-        "harness": harness_name,
-        "provider": provider,
-        "model": spec.model,
-        "workspace": str(Path(spec.workspace_dir).resolve()),
-        "sandbox": spec.sandbox,
-        "permission_mode": spec.permission_mode,
-        "inference_level": agent_cfg.runtime.inference_level,
-        "llm_base_url": agent_cfg.runtime.llm_base_url.rstrip("/"),
-        "prompt_core_sha256": hashlib.sha256(
-            prompt_core.encode("utf-8")
-        ).hexdigest(),
-    }
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    return "v1:" + hashlib.sha256(encoded).hexdigest()
-
-
 def build_codex_gateway_provider(
     *,
     model: str,
@@ -250,8 +215,6 @@ class RuntimePreparer(Protocol):
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec: ...
 
-    def session_fingerprint(self, spec: RuntimeSpec) -> str: ...
-
 
 @dataclass(slots=True)
 class PreparedLocalRuntime:
@@ -261,8 +224,6 @@ class PreparedLocalRuntime:
     migration_source: str
     legacy_session_path: Path
     preparer: RuntimePreparer
-    session_fingerprint: str
-    discarded_persisted_session: bool = False
 
     def finalize_legacy_session_migration(self) -> None:
         """Retire the pre-Driver session sentinel after durable adoption."""
@@ -328,17 +289,11 @@ class LocalRuntimePreparer:
         *,
         system_prompt: str,
         persisted_native_session_id: str = "",
-        persisted_session_fingerprint: str = "",
     ) -> PreparedLocalRuntime:
         spec = await self.refresh_spec(system_prompt)
-        session_fingerprint = self.session_fingerprint(spec)
         legacy_path = self._legacy_session_path()
         legacy_id = self._load_legacy_session_id(legacy_path)
-        discarded_persisted_session = bool(
-            persisted_native_session_id
-            and persisted_session_fingerprint != session_fingerprint
-        )
-        if persisted_native_session_id and not discarded_persisted_session:
+        if persisted_native_session_id:
             native_session_id = persisted_native_session_id
             source = "runtime_event_outbox"
         elif legacy_id:
@@ -346,18 +301,7 @@ class LocalRuntimePreparer:
             source = "legacy_session_file"
         else:
             native_session_id = ""
-            source = (
-                "fresh_incompatible_persisted_session"
-                if discarded_persisted_session
-                else "fresh"
-            )
-        if discarded_persisted_session:
-            logger.info(
-                "agent %s: starting a fresh %s session because the durable "
-                "session fingerprint is missing or incompatible",
-                self.agent_id,
-                self.harness_name,
-            )
+            source = "fresh"
         return PreparedLocalRuntime(
             harness_name=self.harness_name,
             spec=spec,
@@ -365,20 +309,6 @@ class LocalRuntimePreparer:
             migration_source=source,
             legacy_session_path=legacy_path,
             preparer=self,
-            session_fingerprint=session_fingerprint,
-            discarded_persisted_session=discarded_persisted_session,
-        )
-
-    def session_fingerprint(self, spec: RuntimeSpec) -> str:
-        """Fingerprint only inputs that make a native session incompatible."""
-        return compute_session_fingerprint(
-            agent_cfg=self.agent_cfg,
-            harness_name=self.harness_name,
-            provider=resolve_effective_provider(
-                self.agent_cfg.runtime.kind or "cli-local",
-                self.agent_cfg.runtime.provider,
-            ),
-            spec=spec,
         )
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
@@ -839,7 +769,6 @@ def build_local_runtime_adapter(
     projecting_sink = RuntimeEventProjectingSink(outbox, projector)
     legacy_projector = _LegacyStatusProjector(prepared.preparer.agent_id)
     manager: RuntimeManager
-    session_fingerprint = [prepared.session_fingerprint]
 
     async def persist_event(event: HarnessEvent) -> None:
         try:
@@ -877,7 +806,6 @@ def build_local_runtime_adapter(
                 active_turn,
                 session_ref=logical_session,
                 native_session_id=manager.native_session_id,
-                session_fingerprint=session_fingerprint[0],
             )
         except Exception as exc:
             logger.warning(
@@ -888,9 +816,7 @@ def build_local_runtime_adapter(
             )
 
     async def reload_spec(system_prompt: str) -> RuntimeSpec:
-        spec = await prepared.preparer.refresh_spec(system_prompt)
-        session_fingerprint[0] = prepared.preparer.session_fingerprint(spec)
-        return spec
+        return await prepared.preparer.refresh_spec(system_prompt)
 
     manager = RuntimeManager(
         driver,
@@ -917,6 +843,5 @@ __all__ = [
     "VALID_SANDBOX_MODES",
     "build_local_runtime_adapter",
     "build_codex_gateway_provider",
-    "compute_session_fingerprint",
     "remove_legacy_permission_hook",
 ]

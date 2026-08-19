@@ -142,7 +142,7 @@ async def test_old_codex_agent_imports_session_with_matching_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_durable_session_resumes_only_with_matching_fingerprint(
+async def test_durable_session_resumes_across_prompt_refresh(
     puffo_home, monkeypatch,
 ):
     import puffo_agent.agent.harness.local_runtime as local_runtime
@@ -156,7 +156,7 @@ async def test_durable_session_resumes_only_with_matching_fingerprint(
         lambda *_args: "view",
     )
     config = AgentConfig(
-        id="fingerprinted-claude",
+        id="durable-claude",
         runtime=RuntimeConfig(
             kind="cli-local",
             provider="anthropic",
@@ -164,22 +164,17 @@ async def test_durable_session_resumes_only_with_matching_fingerprint(
         ),
     )
     preparer = LocalRuntimePreparer(DaemonConfig(), config)
-    baseline = await preparer.prepare(system_prompt="stable prompt")
     resumed = await preparer.prepare(
         system_prompt="stable prompt",
         persisted_native_session_id="native-old",
-        persisted_session_fingerprint=baseline.session_fingerprint,
     )
-    rotated = await preparer.prepare(
+    refreshed = await preparer.prepare(
         system_prompt="changed identity prompt",
         persisted_native_session_id="native-old",
-        persisted_session_fingerprint=baseline.session_fingerprint,
     )
 
     assert resumed.native_session_id == "native-old"
-    assert not resumed.discarded_persisted_session
-    assert rotated.native_session_id == ""
-    assert rotated.discarded_persisted_session
+    assert refreshed.native_session_id == "native-old"
 
 
 class _ResumeFallbackDriver(Driver):

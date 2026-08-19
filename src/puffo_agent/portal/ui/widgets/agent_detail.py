@@ -42,6 +42,7 @@ from ...profile_sync import (
     profile_summary,
     update_profile_summary,
     upload_avatar,
+    write_refresh_agent_flag,
 )
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
@@ -932,6 +933,7 @@ class AgentDetail(QWidget):
         try:
             cfg.save()
             update_profile_summary(cfg, soul)
+            write_refresh_agent_flag(cfg, reason="desktop agent profile")
         except Exception as exc:
             QMessageBox.warning(self, "Save", f"failed to persist: {exc}")
             return

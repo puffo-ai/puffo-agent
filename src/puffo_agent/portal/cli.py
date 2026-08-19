@@ -854,7 +854,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     values. With flags ⇒ update agent.yml, then sync to server."""
     import asyncio
 
-    from .profile_sync import sync_agent_profile
+    from .profile_sync import sync_agent_profile, write_refresh_agent_flag
 
     agent_id = args.id
     if not agent_yml_path(agent_id).exists():
@@ -918,6 +918,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         patch["role_short"] = derived
 
     cfg.save()
+    write_refresh_agent_flag(cfg, reason="cli agent profile")
 
     try:
         asyncio.run(sync_agent_profile(cfg, patch))
@@ -1191,6 +1192,9 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    from .profile_sync import write_refresh_agent_flag
+
+    write_refresh_agent_flag(cfg, reason="cli profile editor")
     return 0
 
 

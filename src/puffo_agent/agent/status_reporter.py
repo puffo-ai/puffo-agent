@@ -36,8 +36,9 @@ def _is_local_only_envelope(message_id: str) -> bool:
 class StatusReporter:
     """Owns the heartbeat loop and turn lifecycle hooks.
 
-    Spawn ``run_heartbeat_loop`` once on startup, then call
-    ``begin_turn`` / ``end_turn`` from the message handler.
+    Spawn ``run_heartbeat_loop`` once on startup. A provider admission calls
+    ``begin_notice_turn``; concrete Inbox admission then calls ``begin_turn``
+    and the matching terminal method.
     """
 
     def __init__(
@@ -143,6 +144,33 @@ class StatusReporter:
         """Best-effort status refresh used after bridge reconnects."""
         await self._send_heartbeat()
 
+    async def begin_notice_turn(self, message_id: str) -> None:
+        """Report a provider turn before the model reads its Inbox.
+
+        ``message_id`` is only a UI routing anchor. This method deliberately
+        does not create a processing run: the message remains pending until
+        ``read_inbox`` exposes it to the model and ``begin_turn`` is called.
+        """
+        self._current_status = "busy"
+        self._current_message_id = (
+            None if _is_local_only_envelope(message_id) else message_id
+        )
+        await self._send_heartbeat()
+
+    async def end_notice_turn(
+        self,
+        *,
+        succeeded: bool,
+        error_text: str | None = None,
+    ) -> None:
+        """Settle a notice turn that never created a processing run."""
+        if not succeeded:
+            await self.report_error(error_text or "agent turn failed")
+            return
+        self._current_status = "idle"
+        self._current_message_id = None
+        await self._send_heartbeat()
+
     async def begin_turn(self, message_id: str, *, run_id: str | None = None) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = run_id or f"run_{uuid.uuid4().hex}"
@@ -160,9 +188,14 @@ class StatusReporter:
             # immediate busy heartbeat so the agent shows in-progress
             # while it composes (e.g. its intro). No current_message_id:
             # the message doesn't exist server-side.
+            should_emit = (
+                self._current_status != "busy"
+                or self._current_message_id is not None
+            )
             self._current_status = "busy"
             self._current_message_id = None
-            await self._send_heartbeat()
+            if should_emit:
+                await self._send_heartbeat()
             return run_id
         try:
             await self._http.post(

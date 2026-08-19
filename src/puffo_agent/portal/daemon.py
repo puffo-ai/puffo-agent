@@ -59,6 +59,7 @@ from .state import (
     is_pid_alive,
     read_daemon_pid,
     refresh_model_flag_path,
+    refresh_provider_auth_flag_path,
     refresh_runtime_flag_path,
     refresh_session_flag_path,
     refresh_token_request_path,
@@ -455,7 +456,6 @@ class Daemon:
         agent_id = agent_cfg.id
 
         def on_refresh_success() -> None:
-            was_auth_failed = worker.runtime.health == "auth_failed"
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime,
                 agent_id,
@@ -464,25 +464,29 @@ class Daemon:
             # Re-arm the auth_failed DM dedup so a re-expiry this
             # session re-notifies the operator.
             worker._auth_failed_notification_sent = False
-            if was_auth_failed:
-                # The running adapter session still holds the stale
-                # credential; a restart re-links the fresh cred and
-                # redelivers the stalled batch (cursor wasn't advanced).
-                try:
-                    flag = restart_flag_path(agent_id)
-                    flag.parent.mkdir(parents=True, exist_ok=True)
-                    flag.write_text("")
-                    logger.info(
-                        "agent %s: credential recovered — requesting restart "
-                        "to pick up the new credential",
-                        agent_id,
-                    )
-                except OSError as exc:
-                    logger.warning(
-                        "agent %s: could not write restart flag: %s",
-                        agent_id,
-                        exc,
-                    )
+            # Long-lived Claude/Codex subprocesses may retain the credential
+            # they opened with. Reload only the provider runtime at the
+            # worker's next idle boundary; keep the bridge connection and
+            # Puffo logical session intact.
+            try:
+                flag = refresh_provider_auth_flag_path(
+                    agent_cfg.resolve_workspace_dir()
+                )
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                flag.write_text(
+                    '{"source":"credential_replaced"}', encoding="utf-8"
+                )
+                worker.notify_refresh()
+                logger.info(
+                    "agent %s: credential replaced — provider reload requested",
+                    agent_id,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: could not request provider credential reload: %s",
+                    agent_id,
+                    exc,
+                )
 
         refresher.register_on_refresh_success(on_refresh_success)
         # Stash callback identity for _stop_worker's unregister.

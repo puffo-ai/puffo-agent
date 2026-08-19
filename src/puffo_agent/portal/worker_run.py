@@ -44,12 +44,13 @@ class WorkerRunPaths:
     system_prompt: str
 
     @property
-    def refresh_flags(self) -> tuple[Path, Path, Path]:
+    def refresh_flags(self) -> tuple[Path, Path, Path, Path]:
         root = Path(self.workspace_path) / ".puffo-agent"
         return (
             root / "refresh_agent.flag",
             root / "refresh_host_sync.flag",
             root / "refresh_session.flag",
+            root / "refresh_provider_auth.flag",
         )
 
 
@@ -77,6 +78,12 @@ class WorkerRunServices:
 
 
 class _NoopStatusReporter:
+    async def begin_notice_turn(self, _mid):
+        return None
+
+    async def end_notice_turn(self, **_kwargs):
+        return None
+
     async def begin_turn(self, _mid, *, run_id=None):
         return None
 
@@ -99,30 +106,41 @@ class _NoopStatusReporter:
 class GlobalInboxStatusLifecycle:
     """Mirror one durable Global Inbox turn into Server processing rows.
 
-    ``begin_turn`` fires once for the first admitted real message. Run ids are
+    Provider admission first emits a provisional busy status anchored to the
+    notice's first message without creating a processing row. ``begin_turn``
+    fires only when ``read_inbox`` admits the first real message. Run ids are
     derived from the durable turn and message identities, so crash recovery
-    reopens and settles the same Server row. Later active-union expansions do
-    not reopen rows. Terminal cleanup settles the exact active union in one
-    ``end_turn_batch`` with the same success/error result. State always resets
-    so the next turn cannot inherit runs.
+    reopens and settles the same Server row. Terminal cleanup settles either
+    the exact active union or the provisional status. State always resets so
+    the next turn cannot inherit runs.
     """
 
     def __init__(self, reporter) -> None:
         self._reporter = reporter
+        self._notice_began = False
         self._began = False
         self._turn_id: str | None = None
+
+    async def on_notice_admitted(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        if not message_ids:
+            return
+        self._claim_turn(turn_id)
+        if self._notice_began or self._began:
+            return
+        self._notice_began = True
+        await self._reporter.begin_notice_turn(message_ids[0])
 
     async def on_turn_active(
         self, *, turn_id: str, message_ids: tuple[str, ...]
     ) -> None:
         if not message_ids:
             return
+        self._claim_turn(turn_id)
         if self._began:
-            if self._turn_id != turn_id:
-                raise RuntimeError("status lifecycle already owns another turn")
             return
         self._began = True
-        self._turn_id = turn_id
         await self._reporter.begin_turn(
             message_ids[0],
             run_id=self._run_id(turn_id, message_ids[0]),
@@ -136,14 +154,24 @@ class GlobalInboxStatusLifecycle:
         succeeded: bool,
         error_text: str | None,
     ) -> None:
-        if self._began and self._turn_id != turn_id:
+        if (self._notice_began or self._began) and self._turn_id != turn_id:
             raise RuntimeError("status lifecycle terminal turn does not match")
         runs = self._build_runs(turn_id, message_ids, succeeded, error_text)
         try:
             if runs:
                 await self._reporter.end_turn_batch(runs)
+            elif self._notice_began:
+                await self._reporter.end_notice_turn(
+                    succeeded=succeeded,
+                    error_text=error_text,
+                )
         finally:
             self.reset()
+
+    def _claim_turn(self, turn_id: str) -> None:
+        if self._turn_id is not None and self._turn_id != turn_id:
+            raise RuntimeError("status lifecycle already owns another turn")
+        self._turn_id = turn_id
 
     def _build_runs(
         self,
@@ -165,6 +193,7 @@ class GlobalInboxStatusLifecycle:
         return runs
 
     def reset(self) -> None:
+        self._notice_began = False
         self._began = False
         self._turn_id = None
 
@@ -317,9 +346,6 @@ class StandardWorkerRun:
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
-            persisted_session_fingerprint=persisted.get(
-                "session_fingerprint", ""
-            ),
         )
         try:
             return await self._bind_driver_runtime(
@@ -345,20 +371,15 @@ class StandardWorkerRun:
         from ..agent.harness.docker_runtime import DockerRuntimePreparer
         from ..agent.harness.local_runtime import build_local_runtime_adapter
 
-        if prepared.discarded_persisted_session:
-            session_ref = f"session_{uuid.uuid4().hex}"
-            active_turn_ref = None
-        else:
-            session_ref = (
-                persisted.get("session_ref", "")
-                or f"session_{uuid.uuid4().hex}"
-            )
-            active_turn_ref = persisted.get("active_turn_ref") or None
+        session_ref = (
+            persisted.get("session_ref", "")
+            or f"session_{uuid.uuid4().hex}"
+        )
+        active_turn_ref = persisted.get("active_turn_ref") or None
         outbox.set_active_turn(
             active_turn_ref,
             session_ref=session_ref,
             native_session_id=prepared.native_session_id,
-            session_fingerprint=prepared.session_fingerprint,
         )
         driver = None
         cleanup = None
@@ -474,9 +495,6 @@ class StandardWorkerRun:
                 persisted.get("active_turn_ref") or None,
                 session_ref=context.runtime_session_ref,
                 native_session_id=worker._adapter.get_provider_session_id() or "",
-                session_fingerprint=(
-                    context.prepared_local_runtime.session_fingerprint
-                ),
             )
             context.prepared_local_runtime.finalize_legacy_session_migration()
         if warm_ok:
@@ -581,7 +599,12 @@ class StandardWorkerRun:
         return RuntimeEventUploader(context.runtime_event_outbox, append_transport)
 
     async def _apply_refresh(self, context: WorkerRunContext) -> None:
-        refresh_agent, refresh_host, refresh_session = context.paths.refresh_flags
+        (
+            refresh_agent,
+            refresh_host,
+            refresh_session,
+            refresh_provider_auth,
+        ) = context.paths.refresh_flags
         paths = context.paths
         worker = self.worker
         await worker_module._process_refresh_flags(
@@ -601,6 +624,7 @@ class StandardWorkerRun:
             refresh_agent_flag=refresh_agent,
             refresh_host_sync_flag=refresh_host,
             refresh_session_flag=refresh_session,
+            refresh_provider_auth_flag=refresh_provider_auth,
         )
 
     async def _execute_global_turn(self, context: WorkerRunContext, planned):

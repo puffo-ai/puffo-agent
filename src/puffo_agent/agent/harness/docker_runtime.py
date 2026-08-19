@@ -65,7 +65,6 @@ from .local_runtime import (
     PreparedLocalRuntime,
     _read_json_object,
     build_codex_gateway_provider,
-    compute_session_fingerprint,
     remove_legacy_permission_hook,
 )
 
@@ -137,17 +136,11 @@ class DockerRuntimePreparer:
         *,
         system_prompt: str,
         persisted_native_session_id: str = "",
-        persisted_session_fingerprint: str = "",
     ) -> PreparedLocalRuntime:
         spec = await self.refresh_spec(system_prompt)
-        session_fingerprint = self.session_fingerprint(spec)
         legacy_path = self._legacy_session_path()
         legacy_id = self._load_legacy_session_id(legacy_path)
-        discarded_persisted_session = bool(
-            persisted_native_session_id
-            and persisted_session_fingerprint != session_fingerprint
-        )
-        if persisted_native_session_id and not discarded_persisted_session:
+        if persisted_native_session_id:
             native_session_id = persisted_native_session_id
             source = "runtime_event_outbox"
         elif legacy_id:
@@ -155,18 +148,7 @@ class DockerRuntimePreparer:
             source = "legacy_session_file"
         else:
             native_session_id = ""
-            source = (
-                "fresh_incompatible_persisted_session"
-                if discarded_persisted_session
-                else "fresh"
-            )
-        if discarded_persisted_session:
-            logger.info(
-                "agent %s: starting a fresh %s session because the durable "
-                "session fingerprint is missing or incompatible",
-                self.agent_id,
-                self.harness_name,
-            )
+            source = "fresh"
         await self.ensure_container()
         return PreparedLocalRuntime(
             harness_name=self.harness_name,
@@ -175,19 +157,6 @@ class DockerRuntimePreparer:
             migration_source=source,
             legacy_session_path=legacy_path,
             preparer=self,
-            session_fingerprint=session_fingerprint,
-            discarded_persisted_session=discarded_persisted_session,
-        )
-
-    def session_fingerprint(self, spec: RuntimeSpec) -> str:
-        """Fingerprint only inputs that make a native session incompatible."""
-        return compute_session_fingerprint(
-            agent_cfg=self.agent_cfg,
-            harness_name=self.harness_name,
-            provider=resolve_effective_provider(
-                "cli-docker", self.agent_cfg.runtime.provider
-            ),
-            spec=spec,
         )
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:

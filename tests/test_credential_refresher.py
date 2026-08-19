@@ -428,6 +428,8 @@ def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch)
     captured: list[RefreshOutcome] = []
 
     class _FakeBackend:
+        refresh_lock_path = tmp_path / "fake-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -453,6 +455,8 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     captured: list[RefreshOutcome] = []
 
     class _ExplodingBackend:
+        refresh_lock_path = tmp_path / "exploding-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
