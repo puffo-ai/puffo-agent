@@ -812,11 +812,8 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
     await manager.abandon_turn(active.turn_ref, reason="test_cleanup")
 
     assert (await adapter.get_context_snapshot()).used_tokens == 12
-    # No spurious reopen: the threshold is never re-derived from the
-    # driver's live-reported window (see the pinned-threshold test below),
-    # so a second snapshot has nothing new to reconcile and reload.
-    assert driver.open_calls == 1
-    assert manager.spec.auto_compact_threshold_tokens is None
+    assert driver.open_calls == 2
+    assert manager.spec.auto_compact_threshold_tokens == 50
 
     waiting = asyncio.create_task(adapter.compact_context())
     await asyncio.sleep(0)
@@ -851,9 +848,8 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
     # claude_autocompact_tokens()). Claude Code then echoes context_window
     # back as 300_000 too -- re-deriving `window * pct / 100` from *that*
     # on every poll shrank the threshold each time (300k -> 90k -> ...)
-    # until the CLI rejected the value outright. Re-resolving from the
-    # static per-model table instead must always land back on 300_000, so
-    # no poll ever disagrees with launch and reloads.
+    # until the CLI rejected the value outright. The launch spec must stay
+    # authoritative across later observations.
     driver = _AutocompactEchoDriver()
     manager = RuntimeManager(
         driver,
@@ -863,7 +859,7 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
             auto_compact_threshold_pct=30,
             auto_compact_threshold_tokens=300_000,
         ),
-        driver_name="claude",
+        driver_name="claude-code",
     )
     await manager.open()
     adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
@@ -871,30 +867,10 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
     for _ in range(3):
         await adapter.get_context_snapshot()
         assert manager.spec.auto_compact_threshold_tokens == 300_000
+    metadata = {}
+    await adapter._refresh_terminal_context(metadata)
+    assert adapter.context_limits() == (300_000, 300_000)
     assert driver.open_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_context_snapshot_corrects_a_stale_threshold_exactly_once():
-    # pct is configured but the spec's token value predates it (e.g. a
-    # live config change after launch) -- the first poll must resolve
-    # the correct value from the static table and reload once to apply
-    # it; every poll after that already agrees, so no further reload.
-    driver = _AutocompactEchoDriver()
-    manager = RuntimeManager(
-        driver,
-        RuntimeSpec("/tmp", model="opus-4-7", auto_compact_threshold_pct=30),
-        driver_name="claude",
-    )
-    await manager.open()
-    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
-
-    await adapter.get_context_snapshot()
-    assert manager.spec.auto_compact_threshold_tokens == 300_000
-    assert driver.open_calls == 2
-
-    await adapter.get_context_snapshot()
-    assert driver.open_calls == 2
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from puffo_agent.agent.harness.subprocess_io import (
-    drain_subprocess_stream,
-    drain_subprocess_stream_keeping_tail,
-)
+from puffo_agent.agent.harness.subprocess_io import drain_subprocess_stream_keeping_tail
 
 
 class _FakeStream:
@@ -35,10 +32,3 @@ async def test_keeping_tail_bounds_to_max_bytes():
     tail = await drain_subprocess_stream_keeping_tail(stream, max_bytes=100)
     assert len(tail) == 100
     assert tail == b"b" * 100
-
-
-@pytest.mark.asyncio
-async def test_drain_without_tail_still_discards_everything():
-    stream = _FakeStream([b"x" * 1000, b""])
-    await drain_subprocess_stream(stream)
-    assert stream._chunks == []

@@ -25,6 +25,7 @@ from ..context_controller import (
 from ..errors import AgentAPIError
 from .driver import (
     CompactRequest,
+    ContextStatus,
     Driver,
     DriverCapabilities,
     HarnessEvent,
@@ -45,16 +46,6 @@ logger = logging.getLogger(__name__)
 # Compaction is a provider-side summarization pass over the whole thread, so
 # the per-request timeout is far too tight to bound its completion.
 COMPACTION_WAIT_SECONDS = 120.0
-
-
-def _resolve_claude_autocompact_tokens(*, model: str, pct: float) -> int | None:
-    """Same call local_runtime.py makes at launch -- static per-model window,
-    never the driver's live-reported one (see PR #219: once --autocompact is
-    active, Claude echoes that configured ceiling back as its own window).
-    """
-    from ...portal.control.context_telemetry import claude_autocompact_tokens
-
-    return claude_autocompact_tokens(model=model, pct=pct)
 
 
 class RuntimeStateError(RuntimeError):
@@ -880,6 +871,25 @@ class RuntimeManagerAdapter(Adapter):
             None,
         )
 
+    def _context_threshold(
+        self,
+        status: ContextStatus,
+        context_window: int | None,
+    ) -> int | None:
+        configured = (
+            self.manager.spec.auto_compact_threshold_tokens
+            or status.auto_compact_threshold_tokens
+        )
+        pct = self.manager.spec.auto_compact_threshold_pct
+        # Claude echoes the configured --autocompact ceiling as its live
+        # context window. The launch spec is therefore authoritative; applying
+        # the percentage again compounds the threshold on every observation.
+        if pct is None or self.manager.driver_name == "claude-code":
+            return configured
+        if context_window is not None and context_window > 0:
+            return int(context_window * pct / 100)
+        return configured
+
     @staticmethod
     def _current_user_input(ctx: TurnContext) -> str:
         if not ctx.messages:
@@ -979,20 +989,7 @@ class RuntimeManagerAdapter(Adapter):
             and context_window > 0
         ):
             metadata["context_window"] = context_window
-            fallback = (
-                self.manager.spec.auto_compact_threshold_tokens
-                or status.auto_compact_threshold_tokens
-            )
-            pct = self.manager.spec.auto_compact_threshold_pct
-            # Resolved the same way as get_context_snapshot() below -- see
-            # there for why context_window itself isn't the input.
-            threshold = (
-                _resolve_claude_autocompact_tokens(
-                    model=self.manager.spec.model, pct=pct
-                )
-                if pct is not None
-                else None
-            ) or fallback
+            threshold = self._context_threshold(status, context_window)
             self._latest_context_limits = (context_window, threshold)
         if status.measured_at:
             metadata["context_measured_at"] = status.measured_at
@@ -1175,23 +1172,13 @@ class RuntimeManagerAdapter(Adapter):
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
         window = status.context_window
-        fallback = (
-            self.manager.spec.auto_compact_threshold_tokens
-            or status.auto_compact_threshold_tokens
-        )
+        threshold = self._context_threshold(status, window)
         pct = self.manager.spec.auto_compact_threshold_pct
-        threshold = fallback
-        if pct is not None:
-            # Once --autocompact is active, Claude's live context_window
-            # echoes back our own configured ceiling, not the model's raw
-            # capacity (see PR #219) -- resolve from the static per-model
-            # table instead, exactly as local_runtime.py did at launch.
-            # Deterministic for a fixed model+pct, so this never drifts
-            # from what's already running and the reload below is really
-            # just a safety net for a pct that changed after launch.
-            threshold = _resolve_claude_autocompact_tokens(
-                model=self.manager.spec.model, pct=pct
-            ) or fallback
+        if (
+            self.manager.driver_name != "claude-code"
+            and window is not None
+            and pct is not None
+        ):
             if (
                 threshold is not None
                 and self.manager.active_turn_ref is None
