@@ -1265,6 +1265,22 @@ async def test_claude_driver_reopens_cleanly_after_closing_an_active_turn():
     await driver.close()
 
 
+@pytest.mark.asyncio
+async def test_claude_driver_logs_stderr_tail_on_unexpected_exit(caplog):
+    proc = _FakeProcess()
+    driver = ClaudeCodeCliDriver(lambda *_args: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    proc.stderr.feed_data(b"panic: something broke\n")
+    proc.stderr.feed_eof()
+    with caplog.at_level("WARNING", logger="puffo_agent.agent.harness.claude_code_driver"):
+        proc.stdout.feed_eof()
+        await _wait_until(lambda: driver._reader.done())
+
+    assert "panic: something broke" in caplog.text
+    await driver.close()
+
+
 async def _assert_claude_unsupported_calls_write_nothing(
     driver, started, process,
 ):

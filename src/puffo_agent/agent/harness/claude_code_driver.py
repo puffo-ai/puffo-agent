@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -35,7 +36,9 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from .subprocess_io import drain_subprocess_stream
+from .subprocess_io import drain_subprocess_stream_keeping_tail
+
+logger = logging.getLogger(__name__)
 
 
 class _ContextUsageUnsupported(RuntimeError):
@@ -169,7 +172,7 @@ class ClaudeCodeCliDriver(Driver):
         self._init = asyncio.get_running_loop().create_future()
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr_reader = asyncio.create_task(
-            drain_subprocess_stream(getattr(self._proc, "stderr", None))
+            drain_subprocess_stream_keeping_tail(getattr(self._proc, "stderr", None))
         )
         # Older CLI builds and test doubles may emit init eagerly.  Give the
         # reader one scheduling opportunity while keeping current CLI startup
@@ -436,10 +439,30 @@ class ClaudeCodeCliDriver(Driver):
             if self._init is not None and not self._init.done():
                 self._init.set_exception(RuntimeError("Claude exited before init"))
             if not self._closed:
+                await self._log_unexpected_exit()
                 await self._emit(
                     HarnessEventType.RUNTIME_EXITED,
                     turn_ref=self._active if self._active.value else None,
                 )
+
+    async def _log_unexpected_exit(self) -> None:
+        """Best-effort: surface the child's stderr tail when it dies unasked.
+
+        Diagnostic only — swallows its own failures so a broken stderr
+        capture never masks the real RUNTIME_EXITED event.
+        """
+        tail = b""
+        try:
+            if self._stderr_reader is not None:
+                tail = await asyncio.wait_for(self._stderr_reader, timeout=1.0)
+        except Exception:  # noqa: BLE001
+            pass
+        returncode = getattr(self._proc, "returncode", None)
+        logger.warning(
+            "claude process exited unexpectedly (returncode=%s) stderr_tail=%r",
+            returncode,
+            tail.decode("utf-8", errors="replace"),
+        )
 
     async def _handle(self, frame: dict[str, Any]) -> None:
         type_ = str(frame.get("type") or "")
