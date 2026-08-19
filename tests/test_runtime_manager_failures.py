@@ -27,6 +27,7 @@ from puffo_agent.agent.harness.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
+    _claude_autocompact_tokens,
 )
 from puffo_agent.agent.runtime_event_outbox import (
     RuntimeEventOutbox,
@@ -813,7 +814,10 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
 
     assert (await adapter.get_context_snapshot()).used_tokens == 12
     assert driver.open_calls == 2
-    assert manager.spec.auto_compact_threshold_tokens == 50
+    # window=100, pct=50 -> raw 50, floored to Claude Code's --autocompact
+    # minimum (100k) so a small/stale reported window can't relaunch with
+    # an argument the CLI rejects outright.
+    assert manager.spec.auto_compact_threshold_tokens == 100_000
 
     waiting = asyncio.create_task(adapter.compact_context())
     await asyncio.sleep(0)
@@ -827,6 +831,15 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
     for command in (adapter.compact_context, adapter.get_context_snapshot):
         with pytest.raises(RuntimeStateError, match="runtime is closed"):
             await command()
+
+
+def test_claude_autocompact_tokens_floors_a_live_reported_window():
+    # equation-7256-87f7's real failure: native window=300000, pct=30 ->
+    # raw 90000, which Claude Code's --autocompact rejects (min 100k) and
+    # crashes the CLI before init on every single relaunch.
+    assert _claude_autocompact_tokens(pct=30, max_context=300_000) == 100_000
+    # Above the floor, the percentage still applies normally.
+    assert _claude_autocompact_tokens(pct=30, max_context=500_000) == 150_000
 
 
 @pytest.mark.asyncio

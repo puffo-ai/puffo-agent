@@ -47,6 +47,19 @@ logger = logging.getLogger(__name__)
 COMPACTION_WAIT_SECONDS = 120.0
 
 
+def _claude_autocompact_tokens(*, pct: float, max_context: int) -> int:
+    """Percentage -> token threshold, floored to what the CLI accepts.
+
+    Duplicating the raw `window * pct / 100` math here (instead of routing
+    through this shared helper) previously let a live-reported native
+    window pull the threshold below Claude Code's --autocompact minimum
+    (100k), so every relaunch failed before init.
+    """
+    from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+    return claude_autocompact_tokens(pct=pct, max_context=max_context) or max_context
+
+
 class RuntimeStateError(RuntimeError):
     """Internal state-machine contract violation, never retried automatically."""
 
@@ -971,7 +984,7 @@ class RuntimeManagerAdapter(Adapter):
             metadata["context_window"] = context_window
             pct = self.manager.spec.auto_compact_threshold_pct
             threshold = (
-                int(context_window * pct / 100)
+                _claude_autocompact_tokens(pct=pct, max_context=context_window)
                 if pct is not None
                 else (
                     self.manager.spec.auto_compact_threshold_tokens
@@ -1166,7 +1179,7 @@ class RuntimeManagerAdapter(Adapter):
         )
         pct = self.manager.spec.auto_compact_threshold_pct
         if window and pct is not None:
-            threshold = int(window * pct / 100)
+            threshold = _claude_autocompact_tokens(pct=pct, max_context=window)
             if (
                 self.manager.active_turn_ref is None
                 and self.manager.spec.auto_compact_threshold_tokens != threshold
