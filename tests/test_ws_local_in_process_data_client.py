@@ -212,25 +212,31 @@ async def test_one_send_encryption_policy_across_both_authoring_lanes(
     client = InProcessDataClient(store, MagicMock())
     send_mode.clear_turn_bundle(["agent-0001"])
     try:
-        # (a) The shim returns the send_mode decision, not a constant.
+        # (a) The shim returns the send_mode decision, not a constant:
+        # an explicitly plaintext bundle downgrades, an encrypted one
+        # (or no bound turn at all — the fail-safe) encrypts.
+        send_mode.note_turn_bundle(["agent-0001"], False)
         assert await client.get_send_encryption("agent-0001", None) is False
         send_mode.note_turn_bundle(["agent-0001"], True)
         assert await client.get_send_encryption("agent-0001", None) is True
         assert await send_mode.encryption_required("agent-0001", store, None) is True
+        send_mode.clear_turn_bundle(["agent-0001"])
+        assert await client.get_send_encryption("agent-0001", None) is True
 
         # (b) An encrypted trigger keeps a rootless daemon-authored DM E2EE —
         # that is the envelope dm_gate's operator prompt is built from.
-        send_mode.clear_turn_bundle(["agent-0001"])
         built: dict = {}
         _stub_dm_crypto(monkeypatch, built)
         assert await _daemon_dm_path(store, require_encryption=True) == "/messages"
         assert "plaintext" not in built
 
-        # The untriggered default is unchanged: still policy-driven.
+        # An explicitly plaintext turn is still policy-driven.
+        send_mode.note_turn_bundle(["agent-0001"], False)
         built.clear()
         assert await _daemon_dm_path(store, require_encryption=False) == (
             "/v2/messages/plaintext"
         )
+        send_mode.clear_turn_bundle(["agent-0001"])
 
         # (c) dm_gate supplies that trigger fact, so a prompt quoting a
         # decrypted stranger DM never reaches the plaintext endpoint.

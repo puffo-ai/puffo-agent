@@ -837,9 +837,8 @@ async def test_turn_send_mode_tracks_encrypted_bundle_and_clears(tmp_path):
         send_mode_keys=("agent-send-mode",),
     )
     assert await runtime.process_once()
-    assert not await send_mode.encryption_required(
-        "agent-send-mode", store, None
-    )
+    # Finalize clears the bundle; no bound turn fails safe to encrypted.
+    assert await send_mode.encryption_required("agent-send-mode", store, None)
     await store.close()
 
 

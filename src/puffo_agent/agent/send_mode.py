@@ -2,7 +2,10 @@
 
 Encrypt when the turn's triggering bundle contained an encrypted
 message, or when the send targets a thread whose root is encrypted.
-Everything else goes out as a plaintext envelope.
+Only a turn whose bundle was explicitly plaintext (and no encrypted
+thread root) may downgrade; with no bound turn at all — e.g. a
+background-task wakeup after the daemon turn finalized — the trigger's
+confidentiality is unknown and the decision fails safe to E2EE.
 """
 
 from __future__ import annotations
@@ -48,10 +51,14 @@ async def encryption_required(
     thread_root_id: str | None,
 ) -> bool:
     """Return whether the active turn or target thread requires E2EE."""
-    if turn_bundle_encrypted(key):
+    bundle = _turn_bundle_encrypted.get(key)
+    if bundle:
         return True
     if not thread_root_id:
-        return False
+        # ``bundle is None`` means no turn is bound (the flag is cleared at
+        # turn end): fail safe to E2EE rather than silently downgrading a
+        # turn-unbound send to plaintext.
+        return bundle is None
     try:
         row = await store.get_message_by_envelope(thread_root_id)
     except Exception:

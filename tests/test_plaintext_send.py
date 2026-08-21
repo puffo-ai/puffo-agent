@@ -92,7 +92,15 @@ class _Store:
 
 
 @pytest.mark.asyncio
-async def test_default_is_plaintext():
+async def test_no_bound_turn_fails_safe_to_encrypted():
+    # With no turn bundle noted at all (e.g. a turn-unbound background
+    # wakeup) the trigger's confidentiality is unknown: encrypt.
+    assert await send_mode.encryption_required("a-1", _Store(), None) is True
+
+
+@pytest.mark.asyncio
+async def test_plaintext_bundle_allows_downgrade():
+    send_mode.note_turn_bundle(["a-1"], False)
     assert await send_mode.encryption_required("a-1", _Store(), None) is False
 
 
@@ -204,10 +212,12 @@ async def test_in_process_data_client_delegates_to_send_mode():
 
 
 @pytest.mark.asyncio
-async def test_clear_turn_bundle_restores_the_plaintext_default():
+async def test_clear_turn_bundle_restores_the_fail_safe_default():
     send_mode.note_turn_bundle(["a-1"], True)
     assert await send_mode.encryption_required("a-1", _Store(), None) is True
     send_mode.clear_turn_bundle(["a-1"])
-    assert await send_mode.encryption_required("a-1", _Store(), None) is False
+    # Cleared == no bound turn: back to the encrypted fail-safe, not to
+    # the plaintext downgrade.
+    assert await send_mode.encryption_required("a-1", _Store(), None) is True
     # Clearing an unset key is a no-op.
     send_mode.clear_turn_bundle(["never-set"])

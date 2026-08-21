@@ -354,7 +354,9 @@ async def test_send_encryption_decision_matrix_over_http() -> None:
                 assert resp.status == 200
                 return (await resp.json())["encrypt"]
 
-            assert await ask(base) is False  # default plaintext
+            assert await ask(base) is True  # no bound turn: fail-safe
+            send_mode.note_turn_bundle(["bot-1"], False)
+            assert await ask(base) is False  # explicit plaintext bundle
             assert await ask(base + "&thread_root_id=msg_pt") is False
             assert await ask(base + "&thread_root_id=msg_enc") is True  # legacy row
             assert await ask(base + "&thread_root_id=msg_gone") is True  # fail-safe
