@@ -6,6 +6,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a22] - 2026-08-21
+
+> Staging candidate fixing turn-unbound sends (background-task wakeups after
+> the daemon turn finalized) so they never downgrade to plaintext and report
+> honest errors.
+
+### Fixed
+
+- **Channel sends are always E2EE and no longer consult the turn-scoped
+  send-mode flag.** A turn-unbound text send previously read the cleared flag
+  as "plaintext" and failed with `encryption_required` while the attachment
+  path went through; the channel-is-always-E2EE invariant now lives in the
+  route resolver.
+- **The send-mode decision fails safe to E2EE when no turn is bound.** Only a
+  turn whose bundle was explicitly plaintext (or a plaintext thread root) may
+  downgrade; turn-unbound rootless DMs — including daemon-authored DMs and
+  operator approval prompts — previously went out as plaintext envelopes. An
+  operator with no E2EE devices now gets a loud "no recipient devices found"
+  failure instead of a silent plaintext delivery.
+- **Turn-unbound operations report honest, actionable errors.** `send_anyway`
+  ineligibility from a missing active identity, and both Inbox/model-visible
+  read gates, now explain that the operation is not bound to an admitted turn
+  and that recovery comes with the next admitted turn, instead of pointing at
+  read/catch-up procedures that are themselves rejected in this state.
+
 ## [2.0.0a21] - 2026-08-19
 
 > Staging candidate preventing Claude Code context observation from corrupting
