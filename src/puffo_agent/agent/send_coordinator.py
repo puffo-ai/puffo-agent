@@ -793,9 +793,22 @@ class SendCoordinator:
                 space_id, channel_id, fingerprint, content_digest
             )
             if not reconsideration.eligible:
+                if reconsideration.reason == "missing_active_identity":
+                    # Outside an admitted daemon turn (e.g. a background-task
+                    # wakeup) there is no identity to validate catch-up
+                    # against; pointing at the normal held procedure would
+                    # send the model in circles.
+                    message = (
+                        "no active daemon turn; send_anyway is unavailable "
+                        "until the next admitted turn delivers fresh context"
+                    )
+                else:
+                    message = (
+                        "send_anyway requires exact held catch-up and an "
+                        "admitted same-Turn read through that boundary"
+                    )
                 result = failed_result(
-                    "send_anyway requires exact held catch-up and an admitted "
-                    "same-Turn read through that boundary",
+                    message,
                     kind="reconsideration_ineligible",
                 )
                 result["_reconsideration_audit"] = reconsideration.audit_fields()
@@ -867,11 +880,6 @@ class SendCoordinator:
             )
         except Exception as exc:
             return failed_result(str(exc), kind="validation")
-        if not resolved["encrypt"]:
-            return failed_result(
-                "plaintext channel sends are not supported",
-                kind="encryption_required",
-            )
 
         envelope, content_key = encrypt_message_with_content_key(
             resolved["input"],
@@ -1236,15 +1244,15 @@ class SendCoordinator:
             space_id=space_id,
             dm_peer=dm_peer,
         )
-        encrypt = bool(request.attachment_paths) or await _send_encryption_required(
-            coordinator_config(self), root
+        # Channel routes are always E2EE. The daemon-level send-mode decision
+        # only exists to allow the plaintext DM downgrade; consulting it for
+        # channels made turn-unbound sends (background wakeups, where the
+        # turn-scoped bundle flag is already cleared) fail as "plaintext".
+        encrypt = (
+            require_encryption
+            or bool(request.attachment_paths)
+            or await _send_encryption_required(coordinator_config(self), root)
         )
-        if require_encryption and not encrypt:
-            return {
-                "encrypt": False,
-                "note": root_note,
-                "recipient_slugs": recipient_slugs,
-            }
 
         attachments, attachment_note = await self._prepare_attachments(
             request, materialized

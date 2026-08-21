@@ -632,7 +632,11 @@ class InboxAdmissionMixin:
                 latest_seq=through_seq,
                 state="no_active_turn",
             )
-            raise RuntimeError("no active provider turn for model-visible read")
+            raise RuntimeError(
+                "no active provider turn for model-visible read; reads "
+                "outside an admitted turn (e.g. a background-task wakeup) "
+                "become available on the next admitted turn"
+            )
         await self._add_visible_message_ids(
             visible_ids,
             space_id=space_id if has_boundary else None,
@@ -1026,7 +1030,11 @@ class InboxAdmissionMixin:
         requesting_provider_session_id = self.active.provider_session_id
         requesting_provider_turn_id = self.active.provider_turn_id
         if not requesting_turn_id:
-            raise RuntimeError("no active daemon turn for Inbox read")
+            raise RuntimeError(
+                "no active daemon turn for Inbox read; pending messages "
+                "are delivered on the next admitted turn (reads are not "
+                "available from a background-task wakeup)"
+            )
         page = await self.store.read_inbox_page(
             target=target, cursor=cursor, limit=limit
         )

@@ -973,6 +973,9 @@ async def test_legacy_dm_transports_preserve_optional_metadata(
 
 @pytest.mark.asyncio
 async def test_plaintext_channel_no_downgrade():
+    """A channel send never downgrades: even when the daemon-level send-mode
+    decision says plaintext (turn bundle cleared, e.g. a turn-unbound
+    background wakeup), the channel envelope still goes out encrypted."""
     coordinator, _, http = await coordinator_fixture()
 
     async def plaintext(_slug, _root):
@@ -982,9 +985,14 @@ async def test_plaintext_channel_no_downgrade():
     result = await coordinator.send(SemanticSendRequest(
         destination="ch_a", text="must not downgrade",
     ))
-    assert result["state"] == "failed"
-    assert result["error_kind"] == "encryption_required"
-    assert not [call for call in http.calls if call[0].startswith("POST")]
+    assert result["state"] == "sent", result
+    posts = [
+        call for call in http.calls
+        if call[0] == "POST" and call[1] == CHANNEL_SEND_PATH
+    ]
+    assert posts
+    envelope = posts[-1][2]["envelope"]
+    assert envelope["type"] != "plaintext_message_envelope"
 
 
 @pytest.mark.asyncio
