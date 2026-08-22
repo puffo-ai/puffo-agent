@@ -324,7 +324,17 @@ async def test_notice_delivery_capability_matrix_is_turn_guarded():
     assert not await next_turn.offer(
         named_turn_id="active", active_turn_id="active", deliver=deliver
     )
-    assert delivered == ["delivered", "delivered"]
+
+    live_capability = NoticeDeliveryCapability.NEXT_TURN
+    dynamic = InboxNoticeDelivery(lambda: live_capability)
+    assert not await dynamic.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    live_capability = NoticeDeliveryCapability.GATED
+    assert await dynamic.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    assert delivered == ["delivered", "delivered", "delivered"]
 
 
 @pytest.mark.asyncio

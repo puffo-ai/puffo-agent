@@ -671,7 +671,7 @@ def _metadata_driver(provider, provider_inputs):
         "type": "system", "subtype": "init",
         "session_id": "native-session", "slash_commands": [],
     })
-    return proc, ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=0.5)
+    return proc, ClaudeCodeCliDriver(lambda *_args: proc, input_ack_timeout=0.5)
 
 
 async def _metadata_store(tmp_path):
@@ -1072,7 +1072,7 @@ async def test_claude_driver_emits_compaction_boundary_and_clears_tool_calls():
         "type": "system", "subtype": "init",
         "session_id": "claude-1", "slash_commands": [],
     })
-    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc, input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     stream = driver.events()
     await driver.start_turn(TurnInput("hello"))
@@ -1249,7 +1249,7 @@ async def test_claude_driver_reopens_cleanly_after_closing_an_active_turn():
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     first = await driver.start_turn(TurnInput("first"))
     assert first.accepted
@@ -1321,7 +1321,7 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     opened = await driver.open(RuntimeSpec("/workspace"))
     assert "--replay-user-messages" in captured_args
     assert opened.capabilities.compact == "session_command"
@@ -1395,7 +1395,7 @@ async def test_claude_driver_accepts_init_after_first_stream_input():
         holder["proc"] = proc
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     opened = await driver.open(RuntimeSpec("/workspace"))
     session_id_index = captured.index("--session-id")
     assert captured[session_id_index + 1] == opened.native_session_id
@@ -1430,7 +1430,7 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
         return factory
 
     posix = []
-    driver = ClaudeCodeCliDriver(make_factory(posix), replay_timeout=1)
+    driver = ClaudeCodeCliDriver(make_factory(posix), input_ack_timeout=1)
     opened = await driver.open(RuntimeSpec("/workspace", executable="claude", launch_args=("--autocompact", "100000"), auto_compact_threshold_tokens=500000))
     await driver.close()
     assert posix[:4] == ["claude", "--autocompact", "500000", "-p"] and opened.capabilities.compact == "session_command"
@@ -1440,7 +1440,7 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
         lambda executable: ["cmd.exe", "/c", executable + ".cmd"],
     )
     windows = []
-    driver = ClaudeCodeCliDriver(make_factory(windows), replay_timeout=1)
+    driver = ClaudeCodeCliDriver(make_factory(windows), input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace", executable="claude", auto_compact_threshold_tokens=500000))
     await driver.close()
     assert windows[:6] == ["cmd.exe", "/c", "claude.cmd", "--autocompact", "500000", "-p"]
@@ -1459,7 +1459,7 @@ async def test_claude_driver_resume_flag_maps_to_resumed_system_init():
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     opened = await driver.open(
         RuntimeSpec("/workspace"), SessionRef("native-claude-session")
     )
@@ -1484,7 +1484,7 @@ async def test_claude_driver_stdin_delivery_does_not_wait_for_replay():
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     receipt = await driver.start_turn(TurnInput("accepted maybe"))
     assert receipt.accepted
@@ -1559,7 +1559,7 @@ def _two_block_claude_driver():
         "type": "system", "subtype": "init",
         "session_id": "claude-1", "slash_commands": [],
     })
-    return proc, ClaudeCodeCliDriver(lambda _args, _spec: proc, replay_timeout=1)
+    return proc, ClaudeCodeCliDriver(lambda _args, _spec: proc, input_ack_timeout=1)
 
 
 def _two_message_codex_driver():
@@ -1782,7 +1782,7 @@ def _token_telemetry_driver(provider):
     holder["proc"] = proc
     return (
         proc,
-        ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=1),
+        ClaudeCodeCliDriver(lambda *_args: proc, input_ack_timeout=1),
         (40, 30, 84),
     )
 

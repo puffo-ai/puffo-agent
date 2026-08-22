@@ -299,6 +299,24 @@ class RuntimeManager:
             )
             if isinstance(receipt, UnsupportedCapability):
                 return receipt
+            if not receipt.accepted and not receipt.session_reusable:
+                event = HarnessEvent(
+                    type=HarnessEventType.TURN_ABANDONED,
+                    driver=self.driver_name,
+                    session_ref=self.session_ref,
+                    turn_ref=turn,
+                    native_session_id=self.native_session_id,
+                    native_turn_id=self.native_turn_id,
+                    data={
+                        "outcome": "abandoned",
+                        "error_code": "input_admission_ambiguous",
+                        "retryable": True,
+                    },
+                )
+                try:
+                    await self._publish_terminal_locked(event, turn)
+                finally:
+                    await self._retire_runtime_locked(preserve_session=False)
             return replace(receipt, turn_ref=turn)
 
     async def cancel_turn(self, turn: TurnRef) -> Any:

@@ -221,12 +221,15 @@ failures. Provider-native diagnostics stay opaque and are not serialized.
 are rejected by the current runtime matrix.
 
 Codex accepts active-turn Inbox deltas through native `turn/steer`. Claude Code
-stream-json accepts another user frame, but even one written immediately after
-a tool result is queued as a separate Claude native turn; an arbitrary busy-time
-write can also interrupt the current request. Puffo therefore does not report
-that write as admission into the active logical turn. Its durable delta remains
-pending until the current terminal event, then starts as a separately tracked
-turn.
+exposes gated delivery only after `system/init` advertises the exact
+`msg_lifecycle_v1` protocol. Puffo then writes at most one additional stream-json
+user frame and considers it accepted only after the matching
+`command_lifecycle: queued` record. The active Puffo turn owns both native
+command UUIDs and emits one logical terminal event after every owned command is
+terminal. Without that capability, with an unknown lifecycle dialect, or when
+the queue acknowledgement is absent, the durable Inbox delta remains pending
+and is delivered by the next Puffo turn. Capability is read live because Claude
+does not publish it until the first input has started the native session.
 
 ## 6. Durable State
 

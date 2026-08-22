@@ -32,9 +32,18 @@ class InboxNoticeDelivery:
 
     def __init__(
         self,
-        capability: NoticeDeliveryCapability | str = NoticeDeliveryCapability.NEXT_TURN,
+        capability: (
+            NoticeDeliveryCapability
+            | str
+            | Callable[[], NoticeDeliveryCapability | str]
+        ) = NoticeDeliveryCapability.NEXT_TURN,
     ) -> None:
-        self.capability = NoticeDeliveryCapability(capability)
+        self._capability = capability
+
+    @property
+    def capability(self) -> NoticeDeliveryCapability:
+        value = self._capability() if callable(self._capability) else self._capability
+        return NoticeDeliveryCapability(value)
 
     async def offer(
         self,

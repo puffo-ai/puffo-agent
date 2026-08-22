@@ -149,6 +149,7 @@ class InputReceipt:
     turn_ref: TurnRef
     correlation_id: str = ""
     delivery: str = "accepted"
+    session_reusable: bool = True
 
 
 @dataclass(frozen=True, slots=True)

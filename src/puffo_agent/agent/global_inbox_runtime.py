@@ -219,7 +219,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.formatter = self._format_for_provider
         capability = getattr(adapter, "inbox_notice_delivery_capability", None)
         self.notice_delivery = notice_delivery or InboxNoticeDelivery(
-            capability() if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
+            capability if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
         )
         self._busy_notice_task: asyncio.Task[None] | None = None
         self._busy_notice_dirty = False
