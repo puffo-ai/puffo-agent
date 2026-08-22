@@ -1112,7 +1112,18 @@ class Worker:
         return info
 
     def _build_status_reporter(self, client) -> StatusReporter:
+        from ..agent.processing_receipts import ProcessingReportDispatcher
+
         bridge = getattr(client, "_bridge", None)
+        processing_reports = None
+        if bridge is None and not bool(getattr(client.http, "keyless", False)):
+            store = getattr(client, "store", None)
+            if store is not None:
+                processing_reports = ProcessingReportDispatcher(store, client.http)
+                client._processing_reports = processing_reports
+                register_connected = getattr(client, "add_connected_callback", None)
+                if callable(register_connected):
+                    register_connected(processing_reports.on_transport_connected)
         reporter = StatusReporter(
             client.http,
             runtime_health_provider=(
@@ -1120,6 +1131,7 @@ class Worker:
             ),
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
+            processing_reports=processing_reports,
         )
         if bridge is not None:
             bridge.add_connected_callback(reporter.report_current_status)

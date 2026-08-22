@@ -1,17 +1,17 @@
 """Reports agent status (idle / busy / error) and per-message
 processing runs to the server. Server is the source of truth;
-this module only emits events, best-effort.
+terminal processing runs use a durable local replay queue.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
+from .processing_receipts import ProcessingReportDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,7 @@ class StatusReporter:
         runtime_health_provider: Optional[Callable[[], str]] = None,
         runtime_provider: Optional[Callable[[], dict[str, Any]]] = None,
         status_sender: Optional[Callable[..., Awaitable[None]]] = None,
+        processing_reports: ProcessingReportDispatcher | None = None,
     ) -> None:
         self._http = http
         # Keyless (bridge) agents can't sign the HTTP status routes, so the
@@ -77,25 +78,52 @@ class StatusReporter:
         # Agent Portal: reports kind/provider/harness/model so the operator's
         # portal can show + pre-select the live model.
         self._runtime_provider = runtime_provider
-        self._stop = asyncio.Event()
+        self._processing_reports = processing_reports
+        if processing_reports is not None:
+            processing_reports.set_status_refresh(self.report_current_status)
+        self._run_stop: asyncio.Event | None = None
 
     async def run_heartbeat_loop(self) -> None:
         # Native agents POST /agents/me/heartbeat; keyless bridge agents emit a
         # status frame over the bridge (``_send_heartbeat`` routes by transport).
         # Send one immediately so a fresh agent doesn't sit
         # offline waiting for the first scheduled tick.
-        await self._send_heartbeat()
-        while not self._stop.is_set():
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._interval)
-            except asyncio.TimeoutError:
-                pass
-            if self._stop.is_set():
-                break
+        if self._run_stop is not None:
+            raise RuntimeError("status reporter is already running")
+        stop = asyncio.Event()
+        self._run_stop = stop
+        replay_task = None
+        if self._processing_reports is not None:
+            replay_task = asyncio.create_task(self._processing_reports.run())
+        try:
             await self._send_heartbeat()
+            while not stop.is_set():
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=self._interval)
+                except asyncio.TimeoutError:
+                    pass
+                if stop.is_set():
+                    break
+                await self._send_heartbeat()
+        finally:
+            if self._processing_reports is not None:
+                self._processing_reports.stop()
+            if replay_task is not None:
+                replay_task.cancel()
+                try:
+                    await replay_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:  # noqa: BLE001 - cleanup must release the latch
+                    logger.warning("processing report replay stopped", exc_info=True)
+            if self._run_stop is stop:
+                self._run_stop = None
 
     def stop(self) -> None:
-        self._stop.set()
+        if self._run_stop is not None:
+            self._run_stop.set()
+        if self._processing_reports is not None:
+            self._processing_reports.stop()
 
     async def _emit_keyless(
         self,
@@ -238,6 +266,12 @@ class StatusReporter:
         body: dict[str, Any] = {"run_id": run_id, "succeeded": succeeded}
         if error_text is not None:
             body["error_text"] = error_text[:1024]  # server MAX_TEXT_LEN
+        if self._processing_reports is not None:
+            await self._finish_processing_runs(
+                ({"message_id": message_id, **body},),
+                any_failed=not succeeded,
+            )
+            return
         try:
             await self._http.post(
                 f"/messages/{message_id}/processing/end", body
@@ -298,12 +332,18 @@ class StatusReporter:
             self._current_message_id = None
             await self._send_heartbeat()
             return
+        any_failed = any(not r["succeeded"] for r in runs)
+        if self._processing_reports is not None:
+            await self._finish_processing_runs(
+                payload_runs,
+                any_failed=any_failed,
+            )
+            return
         try:
             await self._http.post(
                 "/messages/processing/end:batch", {"runs": payload_runs},
             )
             # Server flips agent_status atomically — mirror locally.
-            any_failed = any(not r["succeeded"] for r in runs)
             self._current_status = "error" if any_failed else "idle"
             self._current_message_id = None
         except HttpError as exc:
@@ -314,6 +354,31 @@ class StatusReporter:
             logger.warning(
                 "end_turn_batch (%d runs) errored (%s)", len(runs), exc,
             )
+
+    async def _finish_processing_runs(
+        self,
+        runs: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        *,
+        any_failed: bool,
+    ) -> None:
+        self._current_status = "error" if any_failed else "idle"
+        self._current_message_id = None
+        try:
+            result = await self._processing_reports.enqueue(runs, immediate=True)
+        except Exception:  # noqa: BLE001 - status must not break the turn
+            logger.warning("failed to persist processing reports", exc_info=True)
+            await self._send_heartbeat()
+            return
+        if (
+            result.state != "uploaded"
+            or result.requested_pending
+            or result.count != len(runs)
+        ):
+            # The terminal batch will eventually settle Server status. Until
+            # then, or after a mixed old/current batch, re-assert the live
+            # snapshot. Server rate-limits duplicate beats but accepts visible
+            # status/message transitions immediately.
+            await self._send_heartbeat()
 
     async def report_error(self, error_text: str) -> None:
         """Catch-all for unrecoverable failures; cleared by the
@@ -379,7 +444,3 @@ class StatusReporter:
             logger.log(level, "heartbeat failed (%s)", exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning("heartbeat errored (%s)", exc)
-
-
-def _ts_ms() -> int:
-    return int(time.time() * 1000)

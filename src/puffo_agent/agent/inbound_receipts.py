@@ -444,7 +444,7 @@ class InboundReceiptHandler:
             self.client._catchup_stale_ms,
             root_id or payload.envelope_id,
         )
-        self.client._report_stale_processed(payload.envelope_id)
+        await self.client._report_stale_processed(payload.envelope_id)
         return await committer.commit(
             ReceiptDisposition.TERMINAL,
             "stale catch-up",

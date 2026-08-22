@@ -13,6 +13,10 @@ import aiosqlite
 from ..portal.state import home_dir
 from . import message_store_models as _models
 from .inbox_store import InboxStoreMixin
+from .processing_receipts import (
+    PROCESSING_REPORT_SCHEMA,
+    ProcessingReportStoreMixin,
+)
 from .reminder_store import ReminderStoreMixin
 
 # Stable facade: callers continue importing store value types from this module
@@ -291,7 +295,7 @@ CREATE TABLE IF NOT EXISTS reminder_occurrences (
 );
 CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
     ON reminder_occurrences (state, intended_at_ms, occurrence_id);
-"""
+""" + PROCESSING_REPORT_SCHEMA
 
 
 def _history_order(
@@ -313,8 +317,12 @@ def _history_order(
     return f"{column_prefix}sent_at {direction}, {envelope} {direction}", oldest_first
 
 
-class MessageStore(ReminderStoreMixin, InboxStoreMixin):
-    """Own all durable message, Inbox, and reminder state for one Agent."""
+class MessageStore(
+    ProcessingReportStoreMixin,
+    ReminderStoreMixin,
+    InboxStoreMixin,
+):
+    """Own durable message, Inbox, reminder, and receipt-report state."""
 
     NOTICE_WINDOW_MS = 3_000
 

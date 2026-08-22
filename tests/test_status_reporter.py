@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.status_reporter import StatusReporter
+from puffo_agent.agent.processing_receipts import ProcessingReportResult
 from puffo_agent.crypto.http_client import HttpError
 
 
@@ -281,6 +282,28 @@ async def test_end_turn_batch_failure_flips_status_to_error():
         "error_text": "claude rate limit",
     }
     assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_mixed_replay_batch_reasserts_current_terminal_status(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None
+    )
+
+    class MixedReplay:
+        def set_status_refresh(self, callback):
+            self.status_refresh = callback
+
+        async def enqueue(self, _runs, *, immediate=False):
+            assert immediate is True
+            return ProcessingReportResult("uploaded", count=2)
+
+    http = FakeHttp()
+    rep = StatusReporter(http, processing_reports=MixedReplay())
+
+    await rep.end_turn("msg_current", "run_current", succeeded=True)
+
+    assert http.calls == [("/agents/me/heartbeat", {"status": "idle"})]
 
 
 @pytest.mark.asyncio

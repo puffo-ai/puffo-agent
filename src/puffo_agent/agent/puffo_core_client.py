@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional
 
 from ..crypto import ws_client as _ws_config
@@ -115,6 +114,7 @@ from .outbound_messages import (
     send_native_fallback_dm,
 )
 from .permission_prompt import format_permission_prompt
+from .processing_receipts import processing_run_id
 from .thread_context import (
     resolve_incoming_thread_root,
     validate_incoming_parent_id,
@@ -220,40 +220,22 @@ class PuffoCoreMessageClient:
             now_ms = int(time.time() * 1000)
         return sent_at < now_ms - self._catchup_stale_ms
 
-    def _report_stale_processed(self, envelope_id: str) -> None:
-        """Batched best-effort processing report; never blocks catch-up."""
-        self._stale_report_buf.append(envelope_id)
-        if self._stale_flush_task is None or self._stale_flush_task.done():
-            self._stale_flush_task = asyncio.ensure_future(self._flush_stale_reports())
-
-    async def _flush_stale_reports(self) -> None:
-        await asyncio.sleep(1.0)  # coalesce the burst
-        # re-sweeps mid-flush arrivals
-        while self._stale_report_buf:
-            buf, self._stale_report_buf = self._stale_report_buf, []
-            await self._post_stale_runs(buf)
-
-    async def _post_stale_runs(self, buf: list[str]) -> None:
-        runs = [
-            {
-                "run_id": f"run_{uuid.uuid4().hex}",
-                "message_id": mid,
-                "succeeded": True,
-            }
-            for mid in buf
-        ]
-        for i in range(0, len(runs), 200):  # request-size cap
-            try:
-                await self.http.post(
-                    "/messages/processing/end:batch",
-                    {"runs": runs[i : i + 200]},
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._log.debug(
-                    "stale-processed flush failed (%d runs): %s",
-                    len(runs[i : i + 200]),
-                    exc,
-                )
+    async def _report_stale_processed(self, envelope_id: str) -> None:
+        """Durably queue one catch-up receipt before transport ACK."""
+        dispatcher = self._processing_reports
+        if dispatcher is None:
+            return
+        await dispatcher.enqueue(
+            (
+                {
+                    "run_id": processing_run_id(
+                        f"stale-catchup:{self.slug}", envelope_id
+                    ),
+                    "message_id": envelope_id,
+                    "succeeded": True,
+                },
+            )
+        )
 
     async def listen(
         self,
