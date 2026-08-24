@@ -126,6 +126,22 @@ TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
 
 
+def failure_outcome(exc: Exception) -> str:
+    """``drained`` | ``auth_failed`` | ``api_error_abandoned`` |
+    ``provider_failed`` | ``failed``. Quota before auth."""
+    if isinstance(exc, AgentAPIError):
+        if exc.is_drained:
+            return "drained"
+        return "auth_failed" if exc.is_auth else "api_error_abandoned"
+    if isinstance(exc, ProviderFailureError):
+        return (
+            "drained"
+            if getattr(exc, "error_code", None) == "quota_exhausted"
+            else "provider_failed"
+        )
+    return "failed"
+
+
 class GlobalInboxRuntime(
     AutonomousTurnLifecycleMixin,
     InboxAdmissionMixin,
@@ -1231,6 +1247,7 @@ class GlobalInboxRuntime(
                 can_retry = (
                     isinstance(exc, AgentAPIError)
                     and not exc.is_auth
+                    and not exc.is_drained
                     and self.active.turn_id == planned.turn_id
                     and retries < self.max_api_retries
                     and hasattr(self.run_turn, "handle_global_inbox_retry")
@@ -1364,11 +1381,7 @@ class GlobalInboxRuntime(
     async def _handle_process_failure(
         self, planned: PlannedTurn, process_started: float, exc: Exception
     ) -> tuple[bool, str, str]:
-        process_outcome = "failed"
-        if isinstance(exc, AgentAPIError):
-            process_outcome = "auth_failed" if exc.is_auth else "api_error_abandoned"
-        elif isinstance(exc, ProviderFailureError):
-            process_outcome = "provider_failed"
+        process_outcome = failure_outcome(exc)
         async with self._turn_state_lock:
             terminal = await self._requeue_active_turn(
                 planned, process_started, "provider_error"
@@ -1729,6 +1742,7 @@ class GlobalInboxRuntime(
                     "auth_failed",
                     "api_error_abandoned",
                     "provider_failed",
+                    "drained",
                 }
                 else "failed"
             )
@@ -1821,10 +1835,17 @@ class GlobalInboxRuntime(
                 await self._run_retry(planned)
                 return None
             except Exception as exc:
-                if isinstance(exc, AgentAPIError) and exc.is_auth:
-                    return "crash resume auth failure", "auth_failed"
-                if isinstance(exc, ProviderFailureError):
+                outcome = failure_outcome(exc)
+                if outcome == "drained":
+                    return (
+                        "crash resume quota exhausted"
+                        if isinstance(exc, AgentAPIError)
+                        else str(exc)
+                    ), "drained"
+                if outcome == "provider_failed":
                     return str(exc), "provider_failed"
+                if outcome == "auth_failed":
+                    return "crash resume auth failure", "auth_failed"
                 if not isinstance(exc, AgentAPIError):
                     return (
                         f"crash resume unsafe failure: {type(exc).__name__}",

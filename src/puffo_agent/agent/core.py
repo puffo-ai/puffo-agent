@@ -3,6 +3,7 @@ import asyncio
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
+from ._usage_markers import looks_like_usage_limit
 from .adapters import Adapter, TurnContext
 from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
 from .errors import AgentAPIError
@@ -23,6 +24,16 @@ def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
     if len(cleaned) == 1:
         return cleaned[0]
     return "\n".join(f"- {p}" for p in cleaned)
+
+
+def _classify_api_error(joined: str) -> tuple[bool, bool, str]:
+    """``(is_auth, is_drained, label)`` for an ``API Error`` body.
+    Quota first: auth markers are substrings and match quota bodies."""
+    if looks_like_usage_limit(joined):
+        return False, True, "quota-drained"
+    if looks_like_auth_error(joined):
+        return True, False, "auth-failed"
+    return False, False, "rate-limited"
 
 
 def _user_message_preview(messages: list[dict]) -> str:
@@ -246,10 +257,11 @@ class PuffoAgent:
         if is_silent(joined):
             return None
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, _label = _classify_api_error(joined)
             raise AgentAPIError(
                 "agent adapter output contained 'API Error' on global retry",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
         if not text_parts and not result.reply:
             return None
@@ -342,15 +354,16 @@ class PuffoAgent:
         if is_silent(joined):
             return None
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, label = _classify_api_error(joined)
             self.logger.warning(
                 "[api-error-retry] adapter still %s; raising for "
                 "consumer-side handling",
-                "auth-failed" if is_auth else "rate-limited",
+                label,
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error' on retry",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
         if not text_parts and not result.reply:
             return None
@@ -459,15 +472,16 @@ class PuffoAgent:
             return None
 
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, label = _classify_api_error(joined)
             self.logger.warning(
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
                 "contained 'API Error' (%s); suppressing post",
-                "auth-failed" if is_auth else "rate-limited",
+                label,
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error'",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
 
         if not text_parts and not result.reply:

@@ -490,6 +490,92 @@ class Worker:
             )
         return provider_failure_message("authentication")
 
+    def _enter_drained(self, agent_id: str, resets_at: int | None = None) -> None:
+        """``drained`` + one operator DM per episode. No refresher kick."""
+        from ..agent._usage_markers import DRAINED_RUNTIME_ERROR
+
+        rt = self.runtime
+        was_ok = rt.health != "drained"
+        rt.health = "drained"
+        rt.error = DRAINED_RUNTIME_ERROR
+        rt.save(agent_id)
+        if resets_at is not None:
+            self._drained_resets_at = resets_at
+        if was_ok:
+            self._on_drained_enter()
+
+    def _on_drained_enter(self) -> None:
+        """One DM per episode; re-arms on successful turn / failed send."""
+        if self._drained_notification_sent:
+            return
+        self._drained_notification_sent = True
+        try:
+            asyncio.create_task(self._notify_operator_of_drained())
+        except Exception as exc:  # noqa: BLE001
+            self._drained_notification_sent = False  # re-arm
+            logger.warning(
+                "agent %s: couldn't schedule drained DM: %s",
+                self.agent_cfg.id,
+                exc,
+            )
+
+    async def _notify_operator_of_drained(self) -> None:
+        """Bilingual quota DM; re-arm semantics of the auth-failed sibling."""
+        client = self._client
+        if client is None:
+            self._drained_notification_sent = False  # still warming: re-arm
+            logger.warning(
+                "agent %s: drained DM skipped — client not yet warm",
+                self.agent_cfg.id,
+            )
+            return
+        operator_slug = getattr(client, "operator_slug", "") or ""
+        if not operator_slug:
+            # stay gated: re-arming would respin every drained turn
+            logger.warning(
+                "agent %s: drained but no operator_slug — not DMing",
+                self.agent_cfg.id,
+            )
+            return
+        from ..agent._invite_strings import format_codex_drained, format_drained
+
+        display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
+        runtime = getattr(self.agent_cfg, "runtime", None)
+        harness = getattr(runtime, "harness", "") if runtime is not None else ""
+        resets_at = getattr(self, "_drained_resets_at", None)
+        formatter = format_codex_drained if harness == "codex" else format_drained
+        text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception as exc:
+            self._drained_notification_sent = False  # re-arm
+            logger.exception(
+                "agent %s: drained DM to %s raised: %s",
+                self.agent_cfg.id,
+                operator_slug,
+                exc,
+            )
+            return
+        logger.info(
+            "agent %s: notified operator @%s of quota exhaustion",
+            self.agent_cfg.id,
+            operator_slug,
+        )
+
+    @staticmethod
+    def _clear_drained(
+        runtime: RuntimeState,
+        agent_id: str,
+        log: logging.Logger,
+    ) -> None:
+        """``drained`` → ``ok``; leaves every other health alone."""
+        if runtime.health != "drained":
+            return
+        runtime.health = "ok"
+        runtime.error = ""
+        runtime.save(agent_id)
+        log.info("agent %s: runtime.health drained → ok", agent_id)
+
     @staticmethod
     def _flip_health_in_progress(
         runtime: RuntimeState,
@@ -539,6 +625,10 @@ class Worker:
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
             self._auth_failed_notification_sent = False
+        # a completed turn is proof quota is available again
+        Worker._clear_drained(self.runtime, agent_id, logger)
+        self._drained_notification_sent = False
+        self._drained_resets_at = None
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
@@ -623,6 +713,8 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        self._drained_notification_sent = False
+        self._drained_resets_at: int | None = None
         self._claude_api_key_mode = (
             agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
             and bool(

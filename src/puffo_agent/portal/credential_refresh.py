@@ -38,6 +38,7 @@ from typing import AsyncIterator, Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
+from ..agent._usage_markers import looks_like_usage_limit
 from ..agent._logging import diagnostic_category
 from .host_assets import (
     _atomic_write_private,
@@ -201,6 +202,14 @@ def _classify_failed_refresh(
     # Model-not-found latches per-daemon-life, so it wins even when
     # the response also looks rate-limit-shaped.
     _maybe_disable_probe_model(out_tail, err_tail)
+    # quota before auth; RATE_LIMITED not drained here
+    if looks_like_usage_limit(out_tail) or looks_like_usage_limit(err_tail):
+        logger.warning(
+            "%s usage limit reached rc=%d in %.1fs — quota exhausted, not "
+            "an auth failure | stdout: %s | stderr: %s",
+            log_prefix, rc, elapsed, out_tail, err_tail,
+        )
+        return RefreshOutcome.RATE_LIMITED
     # Auth-failed before rate-limit: Anthropic sometimes wraps a 401
     # on a revoked RT in rate-limit-adjacent wording; only operator
     # re-login recovers, so DM now rather than after the 2-tick streak.
@@ -1351,7 +1360,7 @@ class CredentialRefresher:
                 continue
             if rs.health in (
                 "auth_failed", "api_error_abandoned", "provider_error",
-                "refresh_broken", "in_progress", "unhandled_error",
+                "refresh_broken", "drained", "in_progress", "unhandled_error",
             ):
                 continue
             rs.health = "refresh_broken"
@@ -1411,7 +1420,9 @@ class CredentialRefresher:
                 continue
             if rs is None:
                 continue
-            if rs.health in ("auth_failed", "api_error_abandoned", "in_progress"):
+            if rs.health in (
+                "auth_failed", "api_error_abandoned", "drained", "in_progress",
+            ):
                 continue
             rs.health = "auth_failed"
             rs.error = msg

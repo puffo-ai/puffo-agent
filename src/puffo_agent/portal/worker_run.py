@@ -20,7 +20,9 @@ from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
+from ..agent.errors import ProviderFailureError
 from ..agent.processing_receipts import processing_run_id
+from ..agent._usage_markers import parse_reset_epoch
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -505,7 +507,11 @@ class StandardWorkerRun:
     @staticmethod
     def _retryable_local_warm_error(exc: Exception) -> bool:
         if isinstance(exc, worker_module.AgentAPIError):
-            return not exc.is_auth
+            # drained: hold-no-retry, same as auth
+            return not exc.is_auth and not exc.is_drained
+        if isinstance(exc, ProviderFailureError):
+            # quota arrives here, not as AgentAPIError
+            return getattr(exc, "error_code", None) != "quota_exhausted"
         return not isinstance(
             exc,
             (
@@ -819,6 +825,11 @@ class StandardWorkerRun:
                     )
                 elif outcome == "auth_failed":
                     worker._enter_auth_failed(agent_id)
+                elif outcome == "drained":
+                    # reset epoch, when the body carried one, feeds the DM
+                    worker._enter_drained(
+                        agent_id, parse_reset_epoch(error_text or "")
+                    )
                 elif outcome == "api_error_abandoned":
                     worker_module.Worker._mark_api_error_abandoned_if_in_progress(
                         worker.runtime, agent_id, error_text, logger

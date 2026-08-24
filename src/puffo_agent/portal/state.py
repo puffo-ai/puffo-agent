@@ -944,6 +944,9 @@ class RuntimeState:
     #                           refresh outcomes; cleared by next
     #                           REFRESHED. Does not overwrite the stronger
     #                           provider and authentication signals above.
+    #   "drained"             — plan quota spent; hold-no-retry until the
+    #                           usage window resets. Not a credential
+    #                           failure: re-login does not recover it
     #   "unhandled_error"     — non-AgentAPIError raised in the turn and
     #                           no category red was set; cleared by
     #                           next successful turn
@@ -955,7 +958,7 @@ class RuntimeState:
     #                           NOT overwrite the stronger downstream
     #                           signals above.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:

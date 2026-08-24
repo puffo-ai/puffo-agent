@@ -28,7 +28,7 @@ from ..state import (
 from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
-from .usage_snapshot import collect_usage_snapshot
+from .usage_snapshot import apply_drained_health, collect_usage_snapshot
 
 log = logging.getLogger("puffo_agent.control")
 
@@ -205,6 +205,11 @@ async def post_usage_snapshot(machine, base: str) -> bool:
     snapshot = await collect_usage_snapshot(Path.home())
     if not snapshot:
         return False
+    # local health first: survives a failed POST
+    try:
+        apply_drained_health(snapshot)
+    except Exception as exc:  # noqa: BLE001 — reporting must not block the POST
+        log.warning("control: drained health update failed: %s", exc)
     path = f"/v2/machines/{machine.machine_id}/usage"
     body = json.dumps({"snapshot": snapshot}).encode()
     headers = machine_auth.signed_headers(machine, "POST", path, body)

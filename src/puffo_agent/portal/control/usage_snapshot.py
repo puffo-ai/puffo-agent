@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 
 from ..._proc import no_window_kwargs
+from ...agent._usage_markers import DRAINED_RUNTIME_ERROR
 from ...agent.cli_bin import resolve_claude_bin, resolve_codex_bin
 from ..state import AgentConfig, discover_agents
 
@@ -121,15 +122,75 @@ def parse_codex_rate_limits(raw: dict | None) -> dict | None:
     return out or None
 
 
-def machine_harnesses() -> set[str]:
-    """Harnesses in use by this machine's agents (drives which /usage to probe)."""
-    harnesses = set()
+def agent_harnesses() -> dict[str, str]:
+    """``{agent_id: harness}`` for this machine's agents."""
+    out: dict[str, str] = {}
     for agent_id in discover_agents():
         try:
-            harnesses.add(AgentConfig.load(agent_id).runtime.harness or "claude-code")
+            out[agent_id] = AgentConfig.load(agent_id).runtime.harness or "claude-code"
         except Exception:  # noqa: BLE001 — a broken agent.yml shouldn't block the rest
             continue
-    return harnesses
+    return out
+
+
+def machine_harnesses() -> set[str]:
+    """Harnesses in use by this machine's agents (drives which /usage to probe)."""
+    return set(agent_harnesses().values())
+
+
+def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
+    """``{harness: resets_at}`` per spent harness; soonest reset or ``None``.
+    Weekly spent counts even with session headroom."""
+    out: dict[str, int | None] = {}
+    for harness, budgets in (snapshot or {}).items():
+        if not isinstance(budgets, dict):
+            continue
+        resets: list[int] = []
+        spent = False
+        for window in ("session", "weekly"):
+            entry = budgets.get(window)
+            if not isinstance(entry, dict):
+                continue
+            if (entry.get("used_pct") or 0) < 100:
+                continue
+            spent = True
+            if isinstance(entry.get("resets_at"), int):
+                resets.append(entry["resets_at"])
+        if spent:
+            out[harness] = min(resets) if resets else None
+    return out
+
+
+def apply_drained_health(snapshot: dict) -> None:
+    """Snapshot → ``runtime.health``: spent → ``drained``, recovered → ``ok``.
+    State only; the DM stays with the worker. Other reds untouched."""
+    from ..state import RuntimeState
+
+    spent = drained_harnesses(snapshot)
+    for agent_id, harness in agent_harnesses().items():
+        if harness not in (snapshot or {}):
+            continue
+        try:
+            rs = RuntimeState.load(agent_id)
+        except Exception:  # noqa: BLE001
+            continue
+        if rs is None:
+            continue
+        if harness in spent:
+            if rs.health in ("ok", "unknown", ""):
+                rs.health = "drained"
+                rs.error = DRAINED_RUNTIME_ERROR
+            else:
+                continue
+        elif rs.health == "drained":
+            rs.health = "ok"
+            rs.error = ""
+        else:
+            continue
+        try:
+            rs.save(agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("usage: drained flip failed for %s: %s", agent_id, exc)
 
 
 async def _run_claude_usage(claude_bin: str, host_home: Path) -> str | None:
