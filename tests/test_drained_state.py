@@ -417,6 +417,20 @@ def test_enter_drained_notifies_once_per_episode(tmp_path, monkeypatch):
     assert w._drained_notification_sent is True
 
 
+def test_snapshot_clearing_health_does_not_buy_a_second_dm(tmp_path, monkeypatch):
+    """The snapshot poller clears ``runtime.health`` without touching the
+    worker's flag, so the was-ok edge alone cannot gate the DM — only a
+    successful turn re-arms it."""
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    stub = _stub_create_task(monkeypatch)
+    w = _drained_worker("agent-resnap")
+    w._enter_drained("agent-resnap")
+    assert stub.calls == 1
+    w.runtime.health = "ok"  # snapshot clear: flag untouched
+    w._enter_drained("agent-resnap")
+    assert stub.calls == 1
+
+
 def test_scheduling_failure_re_arms_the_notification(tmp_path, monkeypatch):
     """A DM that never got scheduled must not consume the episode's one
     shot, or the operator hears nothing at all."""
