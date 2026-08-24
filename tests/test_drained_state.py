@@ -35,8 +35,12 @@ from puffo_agent.agent._usage_markers import (
     parse_reset_epoch,
 )
 from puffo_agent.agent.core import _classify_api_error
+from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.errors import AgentAPIError, ProviderFailureError
-from puffo_agent.agent.global_inbox_runtime import failure_outcome
+from puffo_agent.agent._failure_outcomes import (
+    crash_resume_terminal,
+    failure_outcome,
+)
 from puffo_agent.agent.provider_failures import classify_provider_failure
 from puffo_agent.portal.control.usage_snapshot import (
     apply_drained_health,
@@ -277,6 +281,42 @@ def test_api_error_auth_and_plain_outcomes_are_unchanged():
     ) == "auth_failed"
     assert failure_outcome(AgentAPIError("API Error: 500")) == "api_error_abandoned"
     assert failure_outcome(RuntimeError("boom")) == "failed"
+
+
+def test_crash_resume_terminal_returns_drained_for_both_exception_shapes():
+    """API-error drained gets the fixed text; provider-error drained keeps
+    the body, which carries the reset epoch."""
+    assert crash_resume_terminal(
+        AgentAPIError("usage limit reached", is_drained=True),
+    ) == ("crash resume quota exhausted", "drained")
+    assert crash_resume_terminal(
+        ProviderFailureError("usage limit reached|1780000000",
+                             error_code="quota_exhausted"),
+    ) == ("usage limit reached|1780000000", "drained")
+
+
+def test_crash_resume_terminal_keeps_the_pre_drained_outcomes():
+    assert crash_resume_terminal(
+        ProviderFailureError("nope", error_code="permission_denied"),
+    ) == ("nope", "provider_failed")
+    assert crash_resume_terminal(
+        AgentAPIError("OAuth token has expired", is_auth=True),
+    ) == ("crash resume auth failure", "auth_failed")
+    assert crash_resume_terminal(RuntimeError("boom")) == (
+        "crash resume unsafe failure: RuntimeError",
+        "degraded",
+    )
+
+
+def test_crash_resume_terminal_defers_a_retryable_api_error():
+    # None: caller owns the retry budget
+    assert crash_resume_terminal(AgentAPIError("API Error: 500")) is None
+
+
+def test_recovery_retries_defer_the_terminal_split_to_the_helper():
+    src = inspect.getsource(GlobalInboxRuntime._run_recovery_retries)
+    assert "crash_resume_terminal(exc)" in src
+    assert "self.max_api_retries" in src
 
 
 def test_settle_process_health_routes_drained_with_the_reset_epoch():

@@ -30,7 +30,8 @@ from .context_controller import (
     ProviderAdmissionEvent,
     ToolResultAdmission,
 )
-from .errors import AgentAPIError, ProviderFailureError
+from .errors import AgentAPIError
+from ._failure_outcomes import crash_resume_terminal, failure_outcome
 from .inbox_scheduler import (
     COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
@@ -124,22 +125,6 @@ __all__ = [
 
 TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
-
-
-def failure_outcome(exc: Exception) -> str:
-    """``drained`` | ``auth_failed`` | ``api_error_abandoned`` |
-    ``provider_failed`` | ``failed``. Quota before auth."""
-    if isinstance(exc, AgentAPIError):
-        if exc.is_drained:
-            return "drained"
-        return "auth_failed" if exc.is_auth else "api_error_abandoned"
-    if isinstance(exc, ProviderFailureError):
-        return (
-            "drained"
-            if getattr(exc, "error_code", None) == "quota_exhausted"
-            else "provider_failed"
-        )
-    return "failed"
 
 
 class GlobalInboxRuntime(
@@ -1835,22 +1820,9 @@ class GlobalInboxRuntime(
                 await self._run_retry(planned)
                 return None
             except Exception as exc:
-                outcome = failure_outcome(exc)
-                if outcome == "drained":
-                    return (
-                        "crash resume quota exhausted"
-                        if isinstance(exc, AgentAPIError)
-                        else str(exc)
-                    ), "drained"
-                if outcome == "provider_failed":
-                    return str(exc), "provider_failed"
-                if outcome == "auth_failed":
-                    return "crash resume auth failure", "auth_failed"
-                if not isinstance(exc, AgentAPIError):
-                    return (
-                        f"crash resume unsafe failure: {type(exc).__name__}",
-                        "degraded",
-                    )
+                terminal = crash_resume_terminal(exc)
+                if terminal is not None:
+                    return terminal
                 if retries >= self.max_api_retries:
                     return "crash resume retry budget exhausted", "api_error_abandoned"
                 retries += 1
