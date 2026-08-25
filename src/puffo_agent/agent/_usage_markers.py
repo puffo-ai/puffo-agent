@@ -45,9 +45,4 @@ def parse_reset_epoch(text: str) -> int | None:
     if not text:
         return None
     m = _EPOCH_RE.search(text)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:  # pragma: no cover — \d+ can't fail int()
-        return None
+    return int(m.group(1)) if m else None

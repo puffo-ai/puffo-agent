@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`drained` runtime health for a spent plan quota.** When the Claude Code /
+  Codex usage limit is exhausted, the agent flips to `drained` instead of the
+  misleading `auth_failed` ("run `claude auth login`"), holds messages without
+  retrying, and DMs the operator once per episode with a bilingual
+  explanation, the real recovery options, and a predicted reset time (from the
+  error body, the usage snapshot, or an on-the-spot `/usage` probe). The
+  periodic usage snapshot also marks and clears `drained` for every agent on
+  the spent harness — including idle live workers — and a successful turn
+  clears the state. Quota-exhausted refresh probes no longer count toward the
+  `refresh_broken` streak. (#228)
+
 ## [2.0.2] - 2026-08-25
 
 ### Fixed

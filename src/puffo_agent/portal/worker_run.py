@@ -824,7 +824,6 @@ class StandardWorkerRun:
             elif outcome == "auth_failed":
                 worker._enter_auth_failed(agent_id)
             elif outcome == "drained":
-                # reset epoch, when the body carried one, feeds the DM
                 worker._enter_drained(
                     agent_id, parse_reset_epoch(error_text or "")
                 )
