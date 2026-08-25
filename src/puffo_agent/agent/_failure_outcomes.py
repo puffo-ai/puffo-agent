@@ -18,7 +18,7 @@ def failure_outcome(exc: Exception) -> str:
     if isinstance(exc, ProviderFailureError):
         return (
             "drained"
-            if getattr(exc, "error_code", None) == "quota_exhausted"
+            if exc.error_code == "quota_exhausted"
             else "provider_failed"
         )
     return "failed"
