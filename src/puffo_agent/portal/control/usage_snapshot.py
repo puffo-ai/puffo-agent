@@ -161,14 +161,59 @@ def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
     return out
 
 
+_live_workers_provider = None
+
+
+def set_live_workers(provider) -> None:
+    """Daemon registers ``lambda: self.workers`` so the snapshot flip can
+    reach in-memory worker state (the worker heartbeat overwrites a
+    disk-only flip within seconds, and the status reporter reads memory)."""
+    global _live_workers_provider
+    _live_workers_provider = provider
+
+
+def _live_workers() -> dict:
+    if _live_workers_provider is None:
+        return {}
+    try:
+        return dict(_live_workers_provider())
+    except Exception:  # noqa: BLE001 — fall back to the on-disk path
+        return {}
+
+
+def _apply_to_live_worker(worker, agent_id: str, spent_reset) -> None:
+    """In-memory flip through the worker's own ENTER/CLEAR so it survives
+    the heartbeat, reaches the status reporter, and DMs once per episode.
+    ``spent_reset`` is ``(True, resets_at)`` or ``(False, None)``."""
+    is_spent, resets_at = spent_reset
+    if is_spent:
+        if worker.runtime.health in ("ok", "unknown", ""):
+            worker._enter_drained(agent_id, resets_at)
+    elif worker.runtime.health == "drained":
+        worker._clear_drained(worker.runtime, agent_id, logger)
+
+
 def apply_drained_health(snapshot: dict) -> None:
     """Snapshot → ``runtime.health``: spent → ``drained``, recovered → ``ok``.
-    State only; the DM stays with the worker. Other reds untouched."""
+    Agents with a live worker are updated in memory (worker ENTER/CLEAR);
+    the rest through the on-disk state. Other reds untouched."""
     from ..state import RuntimeState
 
     spent = drained_harnesses(snapshot)
+    live = _live_workers()
     for agent_id, harness in agent_harnesses().items():
         if harness not in (snapshot or {}):
+            continue
+        worker = live.get(agent_id)
+        if worker is not None:
+            try:
+                _apply_to_live_worker(
+                    worker, agent_id, (harness in spent, spent.get(harness)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "usage: live drained flip failed for %s: %s", agent_id, exc,
+                )
             continue
         try:
             rs = RuntimeState.load(agent_id)
@@ -191,6 +236,19 @@ def apply_drained_health(snapshot: dict) -> None:
             rs.save(agent_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("usage: drained flip failed for %s: %s", agent_id, exc)
+
+
+async def predicted_reset_epoch(harness: str) -> int | None:
+    """Probe /usage and return the spent window's reset epoch for
+    ``harness``, or ``None``. Used to put a predicted reset time in the
+    drained DM when the error body carried none."""
+    try:
+        snapshot = await collect_usage_snapshot(Path.home())
+    except Exception:  # noqa: BLE001 — the DM matters more than its timestamp
+        return None
+    if not snapshot:
+        return None
+    return drained_harnesses(snapshot).get(harness)
 
 
 async def _run_claude_usage(claude_bin: str, host_home: Path) -> str | None:

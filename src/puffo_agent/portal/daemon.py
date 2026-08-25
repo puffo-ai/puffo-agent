@@ -36,6 +36,7 @@ from .data_service import (
 )
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
+from .control.usage_snapshot import set_live_workers
 from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
     DAEMON_STARTUP_OBSERVATION_SECONDS,
@@ -99,6 +100,9 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
+        # Usage-snapshot drained flips must reach live workers' in-memory
+        # state, not just runtime.json (the heartbeat overwrites disk).
+        set_live_workers(lambda: self.workers)
         self._paused_reported: set[str] = set()
         # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()

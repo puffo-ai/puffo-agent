@@ -202,14 +202,14 @@ def _classify_failed_refresh(
     # Model-not-found latches per-daemon-life, so it wins even when
     # the response also looks rate-limit-shaped.
     _maybe_disable_probe_model(out_tail, err_tail)
-    # quota before auth; RATE_LIMITED not drained here
+    # quota before auth: a spent-quota body carries auth-adjacent wording
     if looks_like_usage_limit(out_tail) or looks_like_usage_limit(err_tail):
         logger.warning(
             "%s usage limit reached rc=%d in %.1fs — quota exhausted, not "
             "an auth failure | stdout: %s | stderr: %s",
             log_prefix, rc, elapsed, out_tail, err_tail,
         )
-        return RefreshOutcome.RATE_LIMITED
+        return RefreshOutcome.QUOTA_EXHAUSTED
     # Auth-failed before rate-limit: Anthropic sometimes wraps a 401
     # on a revoked RT in rate-limit-adjacent wording; only operator
     # re-login recovers, so DM now rather than after the 2-tick streak.
@@ -301,6 +301,10 @@ class RefreshOutcome(enum.Enum):
     # ``auth_failed`` immediately (no 2-tick streak, no fast retry) so
     # the worker's operator-DM path fires — the loop can't self-recover.
     AUTH_FAILED = "auth_failed"
+    # Spent plan quota: the refresh loop itself isn't broken, so this
+    # neither counts toward the refresh_broken streak nor fast-retries —
+    # only the usage window resetting recovers it.
+    QUOTA_EXHAUSTED = "quota_exhausted"
 
 
 class CredentialBackend(Protocol):
@@ -1298,6 +1302,10 @@ class CredentialRefresher:
             # worker's DM path surfaces re-login instructions to the
             # operator.
             self._flip_auth_failed()
+            return
+        if outcome is RefreshOutcome.QUOTA_EXHAUSTED:
+            # Spent quota is not a broken refresh loop: no streak, no
+            # flip, no fast retry — the natural poll observes the reset.
             return
         self._consecutive_non_success += 1
         if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:

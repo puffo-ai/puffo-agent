@@ -543,6 +543,18 @@ class Worker:
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
         resets_at = getattr(self, "_drained_resets_at", None)
+        if resets_at is None:
+            # The error body rarely carries a reset time — predict one
+            # off the /usage budget instead. Best-effort: the DM matters
+            # more than its timestamp.
+            from .control.usage_snapshot import predicted_reset_epoch
+
+            try:
+                resets_at = await predicted_reset_epoch(harness or "claude-code")
+            except Exception:  # noqa: BLE001
+                resets_at = None
+            if resets_at is not None:
+                self._drained_resets_at = resets_at
         formatter = format_codex_drained if harness == "codex" else format_drained
         text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
         try:
