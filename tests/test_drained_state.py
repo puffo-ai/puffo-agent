@@ -141,6 +141,42 @@ def test_fable5_model_limit_is_not_quota_classified():
     assert _classify_api_error(leak) == (False, False, "rate-limited")
 
 
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "quota exceeded for model Fable 5; other models remain available",
+        "insufficient_quota for model gpt-5.4 — switch model to continue",
+    ],
+)
+def test_model_scoped_generic_quota_is_not_plan_level(diagnostic):
+    """The generic quota markers also fire for per-model ceilings; when
+    the body itself scopes the limit to a model, draining the whole
+    account would park an agent whose other models still work."""
+    assert looks_like_usage_limit(diagnostic) is False
+    # Core API-error path: not drained, stays a plain rate-limit retry.
+    assert _classify_api_error(f"API Error: {diagnostic}") == (
+        False, False, "rate-limited",
+    )
+    # Provider chain: classifier → exception → outcome ends provider_failed.
+    code = classify_provider_failure(status=None, diagnostic=diagnostic)
+    assert code == "quota_exhausted"
+    assert failure_outcome(
+        ProviderFailureError(diagnostic, error_code=code),
+    ) == "provider_failed"
+
+
+def test_unscoped_generic_quota_still_means_the_plan():
+    """Non-regression for the model-scope guard: a bare generic marker
+    with no model mention keeps meaning account-level exhaustion, and
+    the anchored plan spellings stay plan-level even when nearby text
+    mentions a model."""
+    assert looks_like_usage_limit("quota exceeded") is True
+    assert looks_like_usage_limit("insufficient_quota") is True
+    assert looks_like_usage_limit(
+        "Claude usage limit reached — try a smaller model",
+    ) is True
+
+
 # ── Ordering at the provider-failure classifier ────────────────────
 #
 # On 2.0.0 a spent quota surfaces through the driver's JSON-RPC / stream
