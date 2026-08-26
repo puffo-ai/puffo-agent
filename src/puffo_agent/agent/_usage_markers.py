@@ -9,10 +9,8 @@ from __future__ import annotations
 
 import re
 
-# stable cores, not full sentences: spelling drifts per release.
-# Plan-scoped by construction: these are the spellings Claude Code /
-# Codex ship for the account/plan budget, so they mean drained even if
-# surrounding text happens to mention a model.
+# Shipped Claude Code / Codex plan-budget spellings — plan-scoped by
+# construction. Stable cores, not full sentences: spelling drifts per release.
 PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "usage limit reached",
     "hour limit reached",
@@ -22,10 +20,7 @@ PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "you have hit your usage limit",
 )
 
-# Generic quota vocabulary: also emitted for per-model and per-project
-# ceilings, so on its own it is ambiguous. It promotes to plan-drained
-# only with positive account/plan-scope evidence in the same body;
-# otherwise the classifier keeps it at the weaker ``quota_exhausted``.
+# Ambiguous on their own: also emitted for per-model / per-project ceilings.
 GENERIC_QUOTA_MARKERS: tuple[str, ...] = (
     "quota exceeded",
     "insufficient_quota",
@@ -35,11 +30,9 @@ USAGE_LIMIT_MARKERS: tuple[str, ...] = (
     PLAN_LIMIT_MARKERS + GENERIC_QUOTA_MARKERS
 )
 
-# Positive plan/account scope must be grammatically bound to the quota
-# marker. Mere co-presence is not enough: diagnostics often explain that a
-# model/project quota was exceeded while the account quota remains available.
-# Deliberately excludes "project": a per-project ceiling is not the provider
-# plan.
+# Plan scope must be grammatically bound to the marker — co-presence is not
+# enough ("quota exceeded for model X; account quota remains available").
+# Excludes "project": a per-project ceiling is not the provider plan.
 _PLAN_SCOPE = r"(?:account|plan|subscription|organization)"
 _PLAN_SCOPED_QUOTA_RES: tuple[re.Pattern[str], ...] = (
     # "quota exceeded for this account", "insufficient_quota on your plan"

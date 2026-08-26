@@ -545,8 +545,7 @@ class Worker:
         resets_at = getattr(self, "_drained_resets_at", None)
         if resets_at is None:
             # The error body rarely carries a reset time — predict one
-            # off the /usage budget instead. Best-effort: the DM matters
-            # more than its timestamp.
+            # off the /usage budget instead, best-effort.
             from .control.usage_snapshot import predicted_reset_epoch
 
             try:

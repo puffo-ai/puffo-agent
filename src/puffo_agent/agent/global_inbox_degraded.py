@@ -22,10 +22,8 @@ class DegradedRecoveryMixin:
         self._degraded = False
         self._degraded_until: float | None = None
         self._degraded_attempts = 0
-        # Hold-no-retry for a spent plan quota: rows stay pending but no
-        # provider turn is scheduled until ``drained_check`` reports the
-        # quota cleared (usage-snapshot driven) and a wake arrives.
-        # ``notify()`` deliberately does not clear this gate.
+        # The drained park (see _park_drained). notify() deliberately
+        # clears only the backoff, never this gate.
         self.drained_check = drained_check
         self._parked_drained = False
 

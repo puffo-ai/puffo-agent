@@ -1304,7 +1304,7 @@ class CredentialRefresher:
             self._flip_auth_failed()
             return
         if outcome is RefreshOutcome.QUOTA_EXHAUSTED:
-            return  # not a broken loop: no streak, no flip, no fast retry
+            return
         self._consecutive_non_success += 1
         if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
             self._flip_refresh_broken(outcome)

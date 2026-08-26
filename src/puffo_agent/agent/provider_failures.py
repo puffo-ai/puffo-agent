@@ -136,9 +136,6 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     # order: hard 401 -> plan quota -> broad quota -> auth substrings
     if status == 401:
         return "authentication"
-    # Only the anchored plan-level markers mean the whole account is
-    # spent (-> drained). Broad quota wording ("reached your ... limit")
-    # also matches per-model limits and must stay quota_exhausted.
     if looks_like_usage_limit(normalized):
         return "plan_drained"
     if (
