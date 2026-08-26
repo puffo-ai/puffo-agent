@@ -22,9 +22,10 @@ PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "you have hit your usage limit",
 )
 
-# Generic quota vocabulary: also emitted for per-model / per-project
-# ceilings, so it means plan-drained only when the body does not scope
-# the limit to a model.
+# Generic quota vocabulary: also emitted for per-model and per-project
+# ceilings, so on its own it is ambiguous. It promotes to plan-drained
+# only with positive account/plan-scope evidence in the same body;
+# otherwise the classifier keeps it at the weaker ``quota_exhausted``.
 GENERIC_QUOTA_MARKERS: tuple[str, ...] = (
     "quota exceeded",
     "insufficient_quota",
@@ -34,7 +35,9 @@ USAGE_LIMIT_MARKERS: tuple[str, ...] = (
     PLAN_LIMIT_MARKERS + GENERIC_QUOTA_MARKERS
 )
 
-_MODEL_SCOPED_RE = re.compile(r"\bmodels?\b")
+# Positive plan/account scope. Deliberately excludes "project": a
+# per-project ceiling is not the provider plan.
+_PLAN_SCOPE_RE = re.compile(r"\b(?:account|plan|subscription|organization)s?\b")
 
 
 # one wording across worker + snapshot paths; says nothing about signing in
@@ -45,17 +48,18 @@ DRAINED_RUNTIME_ERROR = (
 
 
 def looks_like_usage_limit(text: str) -> bool:
-    """True only for plan/account-level exhaustion. A generic quota
-    marker in a body that scopes the limit to a model (\"quota exceeded
-    for model X; other models remain available\") is a per-model
-    ceiling, not a drained account."""
+    """True only for plan/account-level exhaustion, on positive evidence:
+    a shipped plan spelling, or generic quota vocabulary explicitly
+    scoped to the account/plan. A bare or model-/project-scoped
+    ``quota exceeded`` stays ambiguous — draining the whole account on
+    it would park an agent whose plan still has budget."""
     if not text:
         return False
     low = text.lower()
     if any(marker in low for marker in PLAN_LIMIT_MARKERS):
         return True
     if any(marker in low for marker in GENERIC_QUOTA_MARKERS):
-        return _MODEL_SCOPED_RE.search(low) is None
+        return _PLAN_SCOPE_RE.search(low) is not None
     return False
 
 

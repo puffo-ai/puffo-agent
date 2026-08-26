@@ -146,12 +146,19 @@ def test_fable5_model_limit_is_not_quota_classified():
     [
         "quota exceeded for model Fable 5; other models remain available",
         "insufficient_quota for model gpt-5.4 — switch model to continue",
+        # Model identifiers without the literal noun "model".
+        "quota exceeded for gpt-5.4; switch to gpt-4.1",
+        "gpt-5.4 quota exceeded; other providers remain available",
+        # Bare generic markers: no account/plan evidence at all.
+        "quota exceeded",
+        "insufficient_quota",
     ],
 )
-def test_model_scoped_generic_quota_is_not_plan_level(diagnostic):
-    """The generic quota markers also fire for per-model ceilings; when
-    the body itself scopes the limit to a model, draining the whole
-    account would park an agent whose other models still work."""
+def test_generic_quota_without_plan_evidence_is_not_plan_level(diagnostic):
+    """Generic quota vocabulary also fires for per-model and per-project
+    ceilings, so absence of a model mention is not evidence of account
+    scope — promoting an ambiguous marker to the strongest whole-account
+    state would park an agent whose plan still has budget."""
     assert looks_like_usage_limit(diagnostic) is False
     # Core API-error path: not drained, stays a plain rate-limit retry.
     assert _classify_api_error(f"API Error: {diagnostic}") == (
@@ -165,13 +172,15 @@ def test_model_scoped_generic_quota_is_not_plan_level(diagnostic):
     ) == "provider_failed"
 
 
-def test_unscoped_generic_quota_still_means_the_plan():
-    """Non-regression for the model-scope guard: a bare generic marker
-    with no model mention keeps meaning account-level exhaustion, and
-    the anchored plan spellings stay plan-level even when nearby text
-    mentions a model."""
-    assert looks_like_usage_limit("quota exceeded") is True
-    assert looks_like_usage_limit("insufficient_quota") is True
+def test_account_scoped_quota_survives_an_incidental_model_mention():
+    """The scope test must read the limit's scope, not token presence:
+    an account-scoped body that mentions a model in passing is still the
+    plan, and the anchored plan spellings stay plan-level regardless."""
+    body = "The model returned an error: quota exceeded for this account"
+    assert looks_like_usage_limit(body) is True
+    assert classify_provider_failure(
+        status=None, diagnostic=body,
+    ) == "plan_drained"
     assert looks_like_usage_limit(
         "Claude usage limit reached — try a smaller model",
     ) is True
@@ -216,14 +225,14 @@ def test_provider_classifier_still_reports_a_genuine_auth_failure():
 @pytest.mark.parametrize(
     "diagnostic",
     [
-        "insufficient_quota",
-        "quota exceeded for this project",
+        "insufficient_quota for your account",
+        "quota exceeded for this plan",
         "you have hit your usage limit",
     ],
 )
 def test_provider_classifier_marks_plan_level_exhaustion(diagnostic):
-    """Anchored plan-level markers are the only ones that may drain the
-    whole account."""
+    """Plan-drained needs positive evidence: a shipped plan spelling, or
+    generic quota vocabulary explicitly scoped to the account/plan."""
     assert classify_provider_failure(
         status=None, diagnostic=diagnostic,
     ) == "plan_drained"
@@ -235,10 +244,15 @@ def test_provider_classifier_marks_plan_level_exhaustion(diagnostic):
         "your credit balance is too low to run this request",
         "billing_error: payment required",
         "you have reached your monthly limit",
+        # Bare generic markers are ambiguous, not account evidence.
+        "insufficient_quota",
+        "quota exceeded",
+        # A per-project ceiling is not the provider plan.
+        "quota exceeded for this project",
     ],
 )
 def test_provider_classifier_keeps_broad_quota_shapes_unclassified(diagnostic):
-    """Broad quota wording stays ``quota_exhausted`` (provider_failed
+    """Ambiguous quota wording stays ``quota_exhausted`` (provider_failed
     hold), never account-wide ``drained``."""
     assert classify_provider_failure(
         status=None, diagnostic=diagnostic,
