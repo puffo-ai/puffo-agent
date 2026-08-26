@@ -8,9 +8,8 @@ class AgentAPIError(Exception):
 
     ``is_auth`` distinguishes credentials requiring operator action from
     retryable provider failures, which are re-enqueued with backoff.
-    ``is_drained`` is spent plan quota: operator-visible like ``is_auth``
-    but hold-no-retry, and recovered by the usage window resetting rather
-    than by signing in again. The two are mutually exclusive.
+    ``is_drained``: spent plan quota — hold-no-retry, recovered by the
+    window reset, not re-login. Mutually exclusive with ``is_auth``.
     ``error_code`` is an optional short tag for allowlisted logging.
     """
 

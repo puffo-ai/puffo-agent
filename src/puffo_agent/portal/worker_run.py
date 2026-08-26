@@ -734,8 +734,7 @@ class StandardWorkerRun:
             covers_renotice_enabled=(
                 True if worker.daemon_cfg.covers_renotice else None
             ),
-            # Unpark only after the usage snapshot cleared the worker's
-            # drained health AND a wake arrives (inbound message/reminder).
+            # unpark = snapshot-cleared health + a wake
             drained_check=lambda: worker.runtime.health == "drained",
         )
         coordinator = SendCoordinator(

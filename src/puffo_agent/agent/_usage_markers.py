@@ -1,16 +1,14 @@
 """Usage-limit (quota) markers. Sibling of ``_auth_markers``.
 
-Call order at every site: usage-limit BEFORE auth — auth markers are bare
-substrings and a spent-quota body carries auth-adjacent wording.
-Substring match: adapter error output only, not free-form agent prose.
+Check quota BEFORE auth at every site: spent-quota bodies carry
+auth-adjacent wording. Input: adapter error output, not agent prose.
 """
 
 from __future__ import annotations
 
 import re
 
-# Shipped Claude Code / Codex plan-budget spellings — plan-scoped by
-# construction. Stable cores, not full sentences: spelling drifts per release.
+# shipped plan-budget spellings; stable cores — full sentences drift per release
 PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "usage limit reached",
     "hour limit reached",
@@ -20,7 +18,7 @@ PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "you have hit your usage limit",
 )
 
-# Ambiguous on their own: also emitted for per-model / per-project ceilings.
+# ambiguous alone: also fired for per-model / per-project ceilings
 GENERIC_QUOTA_MARKERS: tuple[str, ...] = (
     "quota exceeded",
     "insufficient_quota",
@@ -30,9 +28,9 @@ USAGE_LIMIT_MARKERS: tuple[str, ...] = (
     PLAN_LIMIT_MARKERS + GENERIC_QUOTA_MARKERS
 )
 
-# Plan scope must be grammatically bound to the marker — co-presence is not
-# enough ("quota exceeded for model X; account quota remains available").
-# Excludes "project": a per-project ceiling is not the provider plan.
+# scope must bind to the marker — co-presence is not evidence
+# ("quota exceeded for model X; account quota remains available").
+# "project" excluded: not the provider plan.
 _PLAN_SCOPE = r"(?:account|plan|subscription|organization)"
 _PLAN_SCOPED_QUOTA_RES: tuple[re.Pattern[str], ...] = (
     # "quota exceeded for this account", "insufficient_quota on your plan"
@@ -59,11 +57,9 @@ DRAINED_RUNTIME_ERROR = (
 
 
 def looks_like_usage_limit(text: str) -> bool:
-    """True only for plan/account-level exhaustion, on positive evidence:
-    a shipped plan spelling, or generic quota vocabulary explicitly
-    scoped to the account/plan. A bare or model-/project-scoped
-    ``quota exceeded`` stays ambiguous — draining the whole account on
-    it would park an agent whose plan still has budget."""
+    """Plan/account-level exhaustion only, on positive evidence: a plan
+    spelling, or generic quota grammatically scoped to the account.
+    Everything else stays ambiguous — never drain on ambiguity."""
     if not text:
         return False
     low = text.lower()

@@ -16,8 +16,7 @@ def failure_outcome(exc: Exception) -> str:
             return "drained"
         return "auth_failed" if exc.is_auth else "api_error_abandoned"
     if isinstance(exc, ProviderFailureError):
-        # plan_drained only: quota_exhausted also covers per-model limits,
-        # which must not park the whole account.
+        # plan_drained only — quota_exhausted includes per-model limits
         return (
             "drained"
             if exc.error_code == "plan_drained"

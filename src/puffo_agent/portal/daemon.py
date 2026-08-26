@@ -100,8 +100,7 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
-        # Usage-snapshot drained flips must reach live workers' in-memory
-        # state, not just runtime.json (the heartbeat overwrites disk).
+        # snapshot drained flips must reach worker memory, not just disk
         set_live_workers(lambda: self.workers)
         self._paused_reported: set[str] = set()
         # Shared attach registry for the ws-local loopback endpoint.

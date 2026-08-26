@@ -301,9 +301,8 @@ class RefreshOutcome(enum.Enum):
     # ``auth_failed`` immediately (no 2-tick streak, no fast retry) so
     # the worker's operator-DM path fires — the loop can't self-recover.
     AUTH_FAILED = "auth_failed"
-    # Spent plan quota: the refresh loop itself isn't broken, so this
-    # neither counts toward the refresh_broken streak nor fast-retries —
-    # only the usage window resetting recovers it.
+    # spent plan quota — not a broken loop: no streak, no fast retry;
+    # only the window reset recovers it
     QUOTA_EXHAUSTED = "quota_exhausted"
 
 

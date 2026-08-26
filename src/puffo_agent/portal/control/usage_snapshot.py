@@ -139,11 +139,9 @@ def machine_harnesses() -> set[str]:
 
 
 def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
-    """``{harness: resets_at}`` per spent harness. The reset is the time
-    at which EVERY exhausted window has cleared (their max) — the soonest
-    reset would promise capacity while another window is still spent —
-    and ``None`` when any exhausted window has no known reset.
-    Weekly spent counts even with session headroom."""
+    """``{harness: resets_at}`` per spent harness. Reset = when EVERY
+    exhausted window clears (max); ``None`` if any is unknown. Weekly
+    spent counts even with session headroom."""
     out: dict[str, int | None] = {}
     for harness, budgets in (snapshot or {}).items():
         if not isinstance(budgets, dict):
@@ -171,9 +169,8 @@ _live_workers_provider = None
 
 
 def set_live_workers(provider) -> None:
-    """Daemon registers ``lambda: self.workers`` so the snapshot flip can
-    reach in-memory worker state (the worker heartbeat overwrites a
-    disk-only flip within seconds, and the status reporter reads memory)."""
+    """Daemon registers ``lambda: self.workers`` — a disk-only flip is
+    heartbeat-overwritten, and the status reporter reads memory."""
     global _live_workers_provider
     _live_workers_provider = provider
 
@@ -188,9 +185,8 @@ def _live_workers() -> dict:
 
 
 def _apply_to_live_worker(worker, agent_id: str, spent_reset) -> None:
-    """In-memory flip through the worker's own ENTER/CLEAR so it survives
-    the heartbeat, reaches the status reporter, and DMs once per episode.
-    ``spent_reset`` is ``(True, resets_at)`` or ``(False, None)``."""
+    """In-memory flip via the worker's own ENTER/CLEAR — survives the
+    heartbeat, DMs once per episode. ``spent_reset``: ``(spent, resets_at)``."""
     is_spent, resets_at = spent_reset
     if is_spent:
         if worker.runtime.health in ("ok", "unknown", ""):
@@ -245,9 +241,8 @@ def apply_drained_health(snapshot: dict) -> None:
 
 
 async def predicted_reset_epoch(harness: str) -> int | None:
-    """Probe /usage and return the spent window's reset epoch for
-    ``harness``, or ``None``. Used to put a predicted reset time in the
-    drained DM when the error body carried none."""
+    """Probe /usage → reset epoch for ``harness``, or ``None``. Feeds the
+    drained DM when the error body carried no time."""
     try:
         snapshot = await collect_usage_snapshot(Path.home())
     except Exception:  # noqa: BLE001 — the DM matters more than its timestamp

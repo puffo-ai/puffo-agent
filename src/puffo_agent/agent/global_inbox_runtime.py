@@ -1674,7 +1674,7 @@ class GlobalInboxRuntime(
             )
         self.health = RuntimeHealth(state, diagnostic)
         if state == "drained":
-            # Crash-resumed drained turn: same hold as the live path.
+            # crash-resume drained: same park as the live path
             self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
         if activated:

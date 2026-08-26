@@ -1,6 +1,4 @@
-"""Failure gates for the Global Inbox runtime: the degraded backoff
-window, and the drained park that holds durable work without retrying a
-spent plan quota."""
+"""Failure gates for the Global Inbox runtime: degraded backoff + drained park."""
 
 from __future__ import annotations
 
@@ -8,9 +6,8 @@ import time
 
 from .global_inbox_types import RuntimeHealth
 
-# A degrade is a transient provider incident, never a durable verdict about
-# pending Inbox work.  Recovery is a bounded backoff window the runtime re-arms
-# itself, so requeued rows stay retryable without depending on unrelated ingress.
+# degrade = transient incident, not a verdict on pending rows; the runtime
+# re-arms its own bounded backoff so retries don't depend on unrelated ingress
 DEGRADED_RECOVERY_BASE_SECONDS = 5.0
 DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 
@@ -22,8 +19,7 @@ class DegradedRecoveryMixin:
         self._degraded = False
         self._degraded_until: float | None = None
         self._degraded_attempts = 0
-        # The drained park (see _park_drained). notify() deliberately
-        # clears only the backoff, never this gate.
+        # drained park (see _park_drained); notify() never clears it
         self.drained_check = drained_check
         self._parked_drained = False
 
@@ -41,14 +37,12 @@ class DegradedRecoveryMixin:
             DEGRADED_RECOVERY_MAX_SECONDS,
         )
         self._degraded_until = time.monotonic() + backoff
-        # Arm the autonomous recovery wake through the existing coalescer only:
-        # no extra task, timer, or thread, so shutdown behaviour is unchanged.
+        # wake rides the existing coalescer — no extra task/timer/thread
         self.coalescer.notify(delay_seconds=backoff)
 
     def _park_drained(self) -> None:
-        """Hold, don't retry: a spent quota is not recovered by backoff.
-        Durable rows stay pending; the gate in ``process_once`` clears
-        once ``drained_check`` reports the quota back and a wake arrives."""
+        """Hold, don't retry — backoff can't refill a quota. Rows stay
+        pending; unpark = ``drained_check`` clear + a wake."""
         self.health = RuntimeHealth(
             "degraded",
             "provider quota exhausted; parked until the usage window resets",
@@ -72,8 +66,7 @@ class DegradedRecoveryMixin:
             else self._degraded_until - time.monotonic()
         )
         if remaining > 0:
-            # An earlier coalescer deadline may have fired ahead of the degrade
-            # wake and consumed it; re-arm so the window still ends in a retry.
+            # an earlier coalescer deadline may have consumed the wake; re-arm
             self.coalescer.notify(delay_seconds=remaining)
             return False
         self._degraded = False
