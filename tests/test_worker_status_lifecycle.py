@@ -61,7 +61,7 @@ _CASES = [
     {"id": "success_then_second_turn", "outcome": "success", "expand": False, "second": True},
     {"id": "provider_failure", "outcome": "failure", "expand": False},
     {"id": "quota_drained", "outcome": "failure", "expand": False,
-     "error_code": "quota_exhausted"},
+     "error_code": "plan_drained"},
     {"id": "cancelled", "outcome": "cancelled", "expand": False},
     {"id": "retry_same_turn", "outcome": "retry", "expand": False},
     {"id": "retry_exhausted", "outcome": "retry_exhausted", "expand": False},
@@ -227,7 +227,7 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         "cancelled": "cancelled",
         "retry_exhausted": "api_error_abandoned",
     }.get(case["outcome"], "succeeded")
-    if case.get("error_code") == "quota_exhausted":
+    if case.get("error_code") == "plan_drained":
         # spent quota splits out of provider_failed: hold, don't retry
         expected_outcome = "drained"
     assert process_outcomes[0][0] == expected_outcome

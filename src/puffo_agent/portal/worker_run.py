@@ -511,8 +511,8 @@ class StandardWorkerRun:
             # drained: hold-no-retry, same as auth
             return not exc.is_auth and not exc.is_drained
         if isinstance(exc, ProviderFailureError):
-            # quota arrives here, not as AgentAPIError
-            return exc.error_code != "quota_exhausted"
+            # plan quota arrives here, not as AgentAPIError
+            return exc.error_code != "plan_drained"
         return not isinstance(
             exc,
             (
@@ -734,6 +734,9 @@ class StandardWorkerRun:
             covers_renotice_enabled=(
                 True if worker.daemon_cfg.covers_renotice else None
             ),
+            # Unpark only after the usage snapshot cleared the worker's
+            # drained health AND a wake arrives (inbound message/reminder).
+            drained_check=lambda: worker.runtime.health == "drained",
         )
         coordinator = SendCoordinator(
             slug=client.slug,

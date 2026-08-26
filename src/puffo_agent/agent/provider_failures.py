@@ -31,6 +31,11 @@ PROVIDER_FAILURES: Mapping[str, ProviderFailure] = MappingProxyType(
             "The requested operation was not permitted.",
             runtime_event_code="permission_denied",
         ),
+        "plan_drained": ProviderFailure(
+            "The provider plan's usage quota is spent; wait for the "
+            "usage window to reset.",
+            runtime_event_code="provider_unavailable",
+        ),
         "quota_exhausted": ProviderFailure(
             "The selected provider model has reached its usage limit; "
             "switch models or wait for the limit to reset.",
@@ -128,12 +133,16 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     if status is None:
         match = _DIAGNOSTIC_HTTP_STATUS.search(normalized)
         status = int(match.group(1)) if match is not None else None
-    # order: hard 401 -> quota -> auth substrings
+    # order: hard 401 -> plan quota -> broad quota -> auth substrings
     if status == 401:
         return "authentication"
+    # Only the anchored plan-level markers mean the whole account is
+    # spent (-> drained). Broad quota wording ("reached your ... limit")
+    # also matches per-model limits and must stay quota_exhausted.
+    if looks_like_usage_limit(normalized):
+        return "plan_drained"
     if (
-        looks_like_usage_limit(normalized)
-        or ("reached your" in normalized and "limit" in normalized)
+        ("reached your" in normalized and "limit" in normalized)
         or ("hit your" in normalized and "limit" in normalized)
         or "credit balance is too low" in normalized
         or "billing_error" in normalized

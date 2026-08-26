@@ -139,7 +139,10 @@ def machine_harnesses() -> set[str]:
 
 
 def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
-    """``{harness: resets_at}`` per spent harness; soonest reset or ``None``.
+    """``{harness: resets_at}`` per spent harness. The reset is the time
+    at which EVERY exhausted window has cleared (their max) — the soonest
+    reset would promise capacity while another window is still spent —
+    and ``None`` when any exhausted window has no known reset.
     Weekly spent counts even with session headroom."""
     out: dict[str, int | None] = {}
     for harness, budgets in (snapshot or {}).items():
@@ -147,6 +150,7 @@ def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
             continue
         resets: list[int] = []
         spent = False
+        all_known = True
         for window in ("session", "weekly"):
             entry = budgets.get(window)
             if not isinstance(entry, dict):
@@ -156,8 +160,10 @@ def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
             spent = True
             if isinstance(entry.get("resets_at"), int):
                 resets.append(entry["resets_at"])
+            else:
+                all_known = False
         if spent:
-            out[harness] = min(resets) if resets else None
+            out[harness] = max(resets) if resets and all_known else None
     return out
 
 

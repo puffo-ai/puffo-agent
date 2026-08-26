@@ -161,6 +161,7 @@ class GlobalInboxRuntime(
         process_outcome: ProcessOutcomeCallback | None = None,
         channel_audience_loader: ChannelAudienceLoader | None = None,
         covers_renotice_enabled: bool | None = None,
+        drained_check: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -193,6 +194,12 @@ class GlobalInboxRuntime(
         self._degraded = False
         self._degraded_until: float | None = None
         self._degraded_attempts = 0
+        # Hold-no-retry for a spent plan quota: rows stay pending but no
+        # provider turn is scheduled until ``drained_check`` reports the
+        # quota cleared (usage-snapshot driven) and a wake arrives.
+        # ``notify()`` deliberately does not clear this gate.
+        self.drained_check = drained_check
+        self._parked_drained = False
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
@@ -1123,6 +1130,16 @@ class GlobalInboxRuntime(
         # no extra task, timer, or thread, so shutdown behaviour is unchanged.
         self.coalescer.notify(delay_seconds=backoff)
 
+    def _park_drained(self) -> None:
+        """Hold, don't retry: a spent quota is not recovered by backoff.
+        Durable rows stay pending; the gate in ``process_once`` clears
+        once ``drained_check`` reports the quota back and a wake arrives."""
+        self.health = RuntimeHealth(
+            "degraded",
+            "provider quota exhausted; parked until the usage window resets",
+        )
+        self._parked_drained = True
+
     def _try_degraded_recovery(self) -> bool:
         """Return whether a degraded runtime may retry its durable work now."""
         if not self._degraded:
@@ -1372,11 +1389,14 @@ class GlobalInboxRuntime(
                 planned, process_started, "provider_error"
             )
         terminal_error = operator_failure_text(exc)
-        self._degrade(
-            "turn failed and was requeued"
-            if terminal
-            else "turn failed outside the active durable turn"
-        )
+        if process_outcome == "drained":
+            self._park_drained()
+        else:
+            self._degrade(
+                "turn failed and was requeued"
+                if terminal
+                else "turn failed outside the active durable turn"
+            )
         log_runtime_event(
             logger,
             "turn.failed",
@@ -1395,6 +1415,10 @@ class GlobalInboxRuntime(
         return terminal, process_outcome, terminal_error
 
     async def process_once(self) -> bool:
+        if self._parked_drained:
+            if self.drained_check is not None and self.drained_check():
+                return False
+            self._parked_drained = False
         if not self._try_degraded_recovery():
             return False
         if self._autonomous_settle_pending is not None:
@@ -1705,6 +1729,9 @@ class GlobalInboxRuntime(
                 activated=activated,
             )
         self.health = RuntimeHealth(state, diagnostic)
+        if state == "drained":
+            # Crash-resumed drained turn: same hold as the live path.
+            self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
         if activated:
             await self._notify_status_terminal(

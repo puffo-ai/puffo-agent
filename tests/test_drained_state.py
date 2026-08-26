@@ -145,15 +145,16 @@ def test_fable5_model_limit_is_not_quota_classified():
 #
 # On 2.0.0 a spent quota surfaces through the driver's JSON-RPC / stream
 # error path, so `classify_provider_failure` is the load-bearing site —
-# the one that decides `quota_exhausted` vs `authentication`.
+# the one that decides `plan_drained` vs `authentication`.
 
 
 def test_provider_classifier_puts_quota_before_auth_substrings():
-    """The JYP repro at the 2.0.0 site: a quota body carrying
-    auth-adjacent wording must classify quota, not authentication."""
+    """The JYP repro at the 2.0.0 site: a plan-quota body carrying
+    auth-adjacent wording must classify as plan exhaustion, not
+    authentication."""
     assert classify_provider_failure(
         status=None, diagnostic=QUOTA_WITH_AUTH_WORDING,
-    ) == "quota_exhausted"
+    ) == "plan_drained"
 
 
 def test_provider_classifier_keeps_hard_401_as_authentication():
@@ -179,18 +180,46 @@ def test_provider_classifier_still_reports_a_genuine_auth_failure():
 @pytest.mark.parametrize(
     "diagnostic",
     [
-        "your credit balance is too low to run this request",
-        "billing_error: payment required",
         "insufficient_quota",
         "quota exceeded for this project",
-        "you have reached your monthly limit",
         "you have hit your usage limit",
     ],
 )
-def test_provider_classifier_recognises_every_quota_shape(diagnostic):
+def test_provider_classifier_marks_plan_level_exhaustion(diagnostic):
+    """Anchored plan-level markers are the only ones that may drain the
+    whole account."""
+    assert classify_provider_failure(
+        status=None, diagnostic=diagnostic,
+    ) == "plan_drained"
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "your credit balance is too low to run this request",
+        "billing_error: payment required",
+        "you have reached your monthly limit",
+    ],
+)
+def test_provider_classifier_keeps_broad_quota_shapes_unclassified(diagnostic):
+    """Broad quota wording stays ``quota_exhausted`` (provider_failed
+    hold), never account-wide ``drained``."""
     assert classify_provider_failure(
         status=None, diagnostic=diagnostic,
     ) == "quota_exhausted"
+
+
+def test_per_model_limit_never_reaches_drained_through_the_driver_path():
+    """Full classifier → exception → outcome regression for the declared
+    out-of-scope boundary: a LiteLLM/Fable per-model limit flows through
+    the 2.0 driver path as quota_exhausted and must settle as
+    provider_failed — draining would park the whole account over one
+    model's ceiling."""
+    diagnostic = "You've reached your Fable 5 limit. Try again later."
+    code = classify_provider_failure(status=None, diagnostic=diagnostic.lower())
+    assert code == "quota_exhausted"
+    outcome = failure_outcome(ProviderFailureError(diagnostic, error_code=code))
+    assert outcome == "provider_failed"
 
 
 def test_provider_classifier_rate_limit_is_not_quota():
@@ -317,16 +346,20 @@ def test_auth_failed_flip_skips_a_drained_agent(tmp_path, monkeypatch):
 # ── Outcome dispatch ───────────────────────────────────────────────
 
 
-def test_provider_quota_failure_routes_to_drained():
-    """`quota_exhausted` is neither retryable nor is_auth, so it arrives
+def test_provider_plan_failure_routes_to_drained():
+    """`plan_drained` is neither retryable nor is_auth, so it arrives
     as ProviderFailureError — the 2.0.0 shape of the JYP body."""
-    exc = ProviderFailureError("usage limit", error_code="quota_exhausted")
+    exc = ProviderFailureError("usage limit", error_code="plan_drained")
     assert failure_outcome(exc) == "drained"
 
 
 def test_other_provider_failures_do_not_route_to_drained():
     assert failure_outcome(
         ProviderFailureError("nope", error_code="permission_denied"),
+    ) == "provider_failed"
+    # Per-model quota stays a provider failure, not an account drain.
+    assert failure_outcome(
+        ProviderFailureError("model limit", error_code="quota_exhausted"),
     ) == "provider_failed"
 
 
@@ -357,7 +390,7 @@ def test_crash_resume_terminal_returns_drained_for_both_exception_shapes():
     ) == ("crash resume quota exhausted", "drained")
     assert crash_resume_terminal(
         ProviderFailureError("usage limit reached|1780000000",
-                             error_code="quota_exhausted"),
+                             error_code="plan_drained"),
     ) == ("usage limit reached|1780000000", "drained")
 
 
@@ -492,12 +525,16 @@ def test_local_warm_holds_on_a_drained_api_error():
     ) is False
 
 
-def test_local_warm_holds_on_a_quota_provider_failure():
-    """The 2.0.0 arrival shape — quota reaches warm as
-    ProviderFailureError, not AgentAPIError."""
+def test_local_warm_holds_on_a_plan_quota_provider_failure():
+    """The 2.0.0 arrival shape — plan quota reaches warm as
+    ProviderFailureError, not AgentAPIError. A per-model limit keeps
+    the pre-existing warm retry."""
     assert StandardWorkerRun._retryable_local_warm_error(
-        ProviderFailureError("usage limit", error_code="quota_exhausted"),
+        ProviderFailureError("usage limit", error_code="plan_drained"),
     ) is False
+    assert StandardWorkerRun._retryable_local_warm_error(
+        ProviderFailureError("model limit", error_code="quota_exhausted"),
+    ) is True
 
 
 def test_local_warm_still_retries_a_plain_rate_limit():
@@ -802,8 +839,20 @@ def test_codex_at_100_is_drained():
         "session": {"used_pct": 100},
         "weekly": {"used_pct": 100, "resets_at": 1770000000},
     }}
-    # No resets_at on the session window → the soonest KNOWN reset wins.
-    assert drained_harnesses(snapshot) == {"codex": 1770000000}
+    # One exhausted window with no reset timestamp → the overall
+    # recovery time is unknown, not the other window's reset.
+    assert drained_harnesses(snapshot) == {"codex": None}
+
+
+def test_dual_exhausted_windows_report_the_later_reset():
+    """Capacity only returns once EVERY exhausted window has cleared.
+    Reporting the sooner reset would DM the operator a time at which the
+    weekly quota is still spent."""
+    snapshot = {"claude-code": {
+        "session": {"used_pct": 100, "resets_at": 1760000100},
+        "weekly": {"used_pct": 100, "resets_at": 1760000200},
+    }}
+    assert drained_harnesses(snapshot) == {"claude-code": 1760000200}
 
 
 def test_below_100_is_not_drained():
