@@ -244,6 +244,31 @@ async def test_status_frame_carries_bounded_runtime():
 
 
 @pytest.mark.asyncio
+async def test_status_frame_carries_health_on_the_wire():
+    """Bridge agents have no signed heartbeat route, so the status frame
+    is the only way `health` (e.g. `drained`) reaches the server's
+    `agent_status` row — dropping it leaves keyless agents permanently
+    green in the operator UI."""
+    bridge_app = _MockBridgeApp()
+    async with TestClient(TestServer(_build_app(bridge_app))) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        await c.connect()
+        try:
+            await c.send_status("idle", health="drained")
+            await c.send_status("idle", health="h" * 300)
+            await c.send_status("idle", health=None)
+            await asyncio.sleep(0)
+        finally:
+            await c.close()
+
+    assert bridge_app.recv_statuses[0]["health"] == "drained"
+    assert len(bridge_app.recv_statuses[1]["health"]) == 256
+    # No health known → no field, not an empty string the server must parse.
+    assert "health" not in bridge_app.recv_statuses[2]
+
+
+@pytest.mark.asyncio
 async def test_status_rejects_invalid_state_and_clears_non_busy_message_id():
     bridge_app = _MockBridgeApp()
     async with TestClient(TestServer(_build_app(bridge_app))) as client:

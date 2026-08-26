@@ -598,12 +598,14 @@ class _CaptureSender:
         current_message_id=None,
         error_text=None,
         runtime=None,
+        health=None,
     ):
         self.calls.append({
             "status": status,
             "current_message_id": current_message_id,
             "error_text": error_text,
             "runtime": runtime,
+            "health": health,
         })
         if self._boom:
             raise RuntimeError("bridge ws closed")
@@ -623,6 +625,7 @@ async def test_keyless_begin_turn_emits_busy_over_bridge():
         "current_message_id": "msg_42",
         "error_text": None,
         "runtime": None,
+        "health": None,
     }]
     assert rep._current_status == "busy"
 
@@ -722,6 +725,7 @@ async def test_keyless_status_includes_runtime():
             "harness": "codex",
             "model": "gpt-5",
         },
+        "health": None,
     }]
 
 

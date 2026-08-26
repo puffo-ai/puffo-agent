@@ -1189,6 +1189,38 @@ def test_usage_post_survives_a_drained_flip_failure(monkeypatch):
     assert posted == ["https://s/v2/machines/m-1/usage"]
 
 
+def test_keyless_status_emit_carries_the_drained_health():
+    """Bridge-backed agents surface health only through the status frame;
+    the reporter must feed the provider's value into the sender or a
+    drained keyless agent stays green server-side."""
+    from puffo_agent.agent.status_reporter import StatusReporter
+
+    sent = []
+
+    async def _sender(status, **kwargs):
+        sent.append((status, kwargs))
+
+    reporter = StatusReporter(
+        type("Http", (), {"keyless": True})(),
+        runtime_health_provider=lambda: "drained",
+        status_sender=_sender,
+    )
+    asyncio.run(reporter._emit_keyless("idle", None, None))
+    assert sent[0][1]["health"] == "drained"
+
+    def _broken() -> str:
+        raise RuntimeError("state not ready")
+
+    reporter = StatusReporter(
+        type("Http", (), {"keyless": True})(),
+        runtime_health_provider=_broken,
+        status_sender=_sender,
+    )
+    # A broken provider must not cost the status frame itself.
+    asyncio.run(reporter._emit_keyless("idle", None, None))
+    assert sent[1][1]["health"] is None
+
+
 # ── Operator-facing copy ───────────────────────────────────────────
 
 

@@ -1061,9 +1061,7 @@ class Worker:
                     register_connected(processing_reports.on_transport_connected)
         reporter = StatusReporter(
             client.http,
-            runtime_health_provider=(
-                None if bridge is not None else lambda: self.runtime.health
-            ),
+            runtime_health_provider=lambda: self.runtime.health,
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
             processing_reports=processing_reports,

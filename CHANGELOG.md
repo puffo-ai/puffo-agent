@@ -16,7 +16,9 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   error body, the usage snapshot, or an on-the-spot `/usage` probe). The
   periodic usage snapshot also marks and clears `drained` for every agent on
   the spent harness — including idle live workers — and a successful turn
-  clears the state. Quota-exhausted refresh probes no longer count toward the
+  clears the state. Bridge/keyless agents now report `health` on their status
+  frames, so the server sees `drained` (and every other health state) for
+  them too. Quota-exhausted refresh probes no longer count toward the
   `refresh_broken` streak. (#228)
 
 ## [2.0.2] - 2026-08-25

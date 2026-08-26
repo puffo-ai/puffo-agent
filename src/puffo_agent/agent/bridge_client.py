@@ -619,6 +619,7 @@ class CloudBridgeClient:
         current_message_id: Optional[str] = None,
         error_text: Optional[str] = None,
         runtime: Optional[dict[str, Any]] = None,
+        health: Optional[str] = None,
     ) -> None:
         """Report runtime status over the bridge — the keyless equivalent of the
         signed ``POST /agents/me/heartbeat`` + processing-run status flips. A
@@ -634,6 +635,8 @@ class CloudBridgeClient:
             frame["current_message_id"] = current_message_id[:1024]
         if error_text is not None:
             frame["error_text"] = error_text[:1024]
+        if health:
+            frame["health"] = health[:256]
         if runtime is not None:
             text_fields = (
                 "kind", "provider", "harness", "model", "inference_level",

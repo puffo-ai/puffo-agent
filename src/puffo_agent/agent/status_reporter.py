@@ -136,12 +136,19 @@ class StatusReporter:
         exception-swallowing)."""
         if self._status_sender is None:
             return
+        health: str | None = None
+        if self._runtime_health_provider is not None:
+            try:
+                health = self._runtime_health_provider()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("runtime_health_provider raised (%s)", exc)
         try:
             await self._status_sender(
                 status,
                 current_message_id=current_message_id,
                 error_text=error_text,
                 runtime=self._runtime_payload(),
+                health=health,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("keyless status emit (%s) failed (%s)", status, exc)
