@@ -35,9 +35,27 @@ USAGE_LIMIT_MARKERS: tuple[str, ...] = (
     PLAN_LIMIT_MARKERS + GENERIC_QUOTA_MARKERS
 )
 
-# Positive plan/account scope. Deliberately excludes "project": a
-# per-project ceiling is not the provider plan.
-_PLAN_SCOPE_RE = re.compile(r"\b(?:account|plan|subscription|organization)s?\b")
+# Positive plan/account scope must be grammatically bound to the quota
+# marker. Mere co-presence is not enough: diagnostics often explain that a
+# model/project quota was exceeded while the account quota remains available.
+# Deliberately excludes "project": a per-project ceiling is not the provider
+# plan.
+_PLAN_SCOPE = r"(?:account|plan|subscription|organization)"
+_PLAN_SCOPED_QUOTA_RES: tuple[re.Pattern[str], ...] = (
+    # "quota exceeded for this account", "insufficient_quota on your plan"
+    re.compile(
+        rf"\b(?:quota exceeded|insufficient_quota)\b\s+"
+        rf"(?:for|on|under)\s+(?:(?:this|the|your|our|my|an)\s+)?"
+        rf"{_PLAN_SCOPE}\b",
+    ),
+    # "account quota exceeded", "organization's usage quota exceeded"
+    re.compile(
+        rf"\b{_PLAN_SCOPE}(?:'s)?\s+"
+        rf"(?:(?:usage|spending|billing)\s+)?quota exceeded\b",
+    ),
+    # "account insufficient_quota", "subscription's insufficient_quota"
+    re.compile(rf"\b{_PLAN_SCOPE}(?:'s)?\s+insufficient_quota\b"),
+)
 
 
 # one wording across worker + snapshot paths; says nothing about signing in
@@ -59,7 +77,7 @@ def looks_like_usage_limit(text: str) -> bool:
     if any(marker in low for marker in PLAN_LIMIT_MARKERS):
         return True
     if any(marker in low for marker in GENERIC_QUOTA_MARKERS):
-        return _PLAN_SCOPE_RE.search(low) is not None
+        return any(pattern.search(low) for pattern in _PLAN_SCOPED_QUOTA_RES)
     return False
 
 

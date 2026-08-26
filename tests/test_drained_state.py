@@ -172,18 +172,47 @@ def test_generic_quota_without_plan_evidence_is_not_plan_level(diagnostic):
     ) == "provider_failed"
 
 
-def test_account_scoped_quota_survives_an_incidental_model_mention():
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The model returned an error: quota exceeded for this account",
+        "insufficient_quota on your plan",
+        "organization quota exceeded",
+        "subscription's usage quota exceeded",
+    ],
+)
+def test_relationally_account_scoped_quota_is_plan_level(body):
     """The scope test must read the limit's scope, not token presence:
     an account-scoped body that mentions a model in passing is still the
-    plan, and the anchored plan spellings stay plan-level regardless."""
-    body = "The model returned an error: quota exceeded for this account"
+    plan."""
     assert looks_like_usage_limit(body) is True
     assert classify_provider_failure(
         status=None, diagnostic=body,
     ) == "plan_drained"
+
+
+def test_anchored_plan_spelling_survives_an_incidental_model_mention():
+    """Known provider plan spellings stay plan-level regardless."""
     assert looks_like_usage_limit(
         "Claude usage limit reached — try a smaller model",
     ) is True
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "quota exceeded for model gpt-5.4; account quota remains available",
+        "project quota exceeded; organization quota is unaffected",
+        "quota exceeded for this project; your subscription is still active",
+        "the account can continue using other models; quota exceeded for gpt-5.4",
+    ],
+)
+def test_unrelated_plan_words_do_not_promote_narrow_quota(diagnostic):
+    """A plan noun elsewhere in the diagnostic is not scope evidence."""
+    assert looks_like_usage_limit(diagnostic) is False
+    assert classify_provider_failure(
+        status=None, diagnostic=diagnostic,
+    ) == "quota_exhausted"
 
 
 # ── Ordering at the provider-failure classifier ────────────────────
