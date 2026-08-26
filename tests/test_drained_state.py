@@ -412,6 +412,43 @@ def test_crash_resume_terminal_defers_a_retryable_api_error():
     assert crash_resume_terminal(AgentAPIError("API Error: 500")) is None
 
 
+def test_crash_resumed_drained_terminal_parks_the_runtime():
+    """A daemon restart during a drained window must land in the same
+    hold as the live path — without the park, the recovered rows would
+    re-enter the retry loop against the still-spent account."""
+    runtime = GlobalInboxRuntime.__new__(GlobalInboxRuntime)
+    runtime._turn_state_lock = asyncio.Lock()
+    runtime._parked_drained = False
+    runtime.drained_check = lambda: True
+    runtime.process_outcome = None
+
+    async def _requeue_recovery_run(*_args, **_kwargs):
+        return True
+
+    async def _notify_status_terminal(**_kwargs):
+        return None
+
+    runtime._requeue_recovery_run = _requeue_recovery_run
+    runtime._notify_status_terminal = _notify_status_terminal
+    runtime._clear_terminal_turn = lambda: None
+    runtime.notify = lambda: None
+
+    settled = asyncio.run(runtime._unwind_recovery(
+        raw={},
+        run=None,
+        durable_ids=(),
+        recovery_started=0.0,
+        diagnostic="crash resume quota exhausted",
+        state="drained",
+        defer_requeued_recovery=True,
+        activated=True,
+    ))
+
+    assert settled is False
+    assert runtime._parked_drained is True
+    assert runtime.health.state == "drained"
+
+
 def test_recovery_retries_stop_at_a_drained_terminal():
     """Crash resume must not spend its retry budget re-hitting a spent
     quota: the first drained failure ends the loop as terminal instead
