@@ -62,16 +62,12 @@ from .provider_failures import operator_failure_text
 logger = logging.getLogger(__name__)
 
 
-# A degrade is a transient provider incident, never a durable verdict about
-# pending Inbox work.  Recovery is a bounded backoff window the runtime re-arms
-# itself, so requeued rows stay retryable without depending on unrelated ingress.
-DEGRADED_RECOVERY_BASE_SECONDS = 5.0
-DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_covers import CoversReconciliationMixin
+from .global_inbox_degraded import DegradedRecoveryMixin
 from .autonomous_turns import AutonomousTurnLifecycleMixin
 from .global_inbox_types import (
     opt_str,
@@ -131,6 +127,7 @@ class GlobalInboxRuntime(
     AutonomousTurnLifecycleMixin,
     InboxAdmissionMixin,
     CoversReconciliationMixin,
+    DegradedRecoveryMixin,
 ):
     """One serial provider boundary over the durable global Inbox."""
 
@@ -191,15 +188,7 @@ class GlobalInboxRuntime(
         # turn owner and in-memory exact union, so they share one short lock.
         self._turn_state_lock = asyncio.Lock()
         self._stopping = False
-        self._degraded = False
-        self._degraded_until: float | None = None
-        self._degraded_attempts = 0
-        # Hold-no-retry for a spent plan quota: rows stay pending but no
-        # provider turn is scheduled until ``drained_check`` reports the
-        # quota cleared (usage-snapshot driven) and a wake arrives.
-        # ``notify()`` deliberately does not clear this gate.
-        self.drained_check = drained_check
-        self._parked_drained = False
+        self._init_recovery_gates(drained_check)
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
@@ -265,9 +254,7 @@ class GlobalInboxRuntime(
         return self.workspace / ".puffo-agent" / "current_turn.json"
 
     def notify(self) -> None:
-        self._degraded = False
-        self._degraded_until = None
-        self._degraded_attempts = 0
+        self._clear_degraded_backoff()
         delay = self._busy_notice_delay_seconds if self.active.turn_id else 0.0
         self.coalescer.notify(delay_seconds=delay)
         self._schedule_busy_notice()
@@ -1117,47 +1104,6 @@ class GlobalInboxRuntime(
             except FileNotFoundError:
                 pass
 
-    def _degrade(self, diagnostic: str) -> None:
-        self.health = RuntimeHealth("degraded", diagnostic)
-        self._degraded = True
-        self._degraded_attempts += 1
-        backoff = min(
-            DEGRADED_RECOVERY_BASE_SECONDS * 2 ** (self._degraded_attempts - 1),
-            DEGRADED_RECOVERY_MAX_SECONDS,
-        )
-        self._degraded_until = time.monotonic() + backoff
-        # Arm the autonomous recovery wake through the existing coalescer only:
-        # no extra task, timer, or thread, so shutdown behaviour is unchanged.
-        self.coalescer.notify(delay_seconds=backoff)
-
-    def _park_drained(self) -> None:
-        """Hold, don't retry: a spent quota is not recovered by backoff.
-        Durable rows stay pending; the gate in ``process_once`` clears
-        once ``drained_check`` reports the quota back and a wake arrives."""
-        self.health = RuntimeHealth(
-            "degraded",
-            "provider quota exhausted; parked until the usage window resets",
-        )
-        self._parked_drained = True
-
-    def _try_degraded_recovery(self) -> bool:
-        """Return whether a degraded runtime may retry its durable work now."""
-        if not self._degraded:
-            return True
-        remaining = (
-            0.0
-            if self._degraded_until is None
-            else self._degraded_until - time.monotonic()
-        )
-        if remaining > 0:
-            # An earlier coalescer deadline may have fired ahead of the degrade
-            # wake and consumed it; re-arm so the window still ends in a retry.
-            self.coalescer.notify(delay_seconds=remaining)
-            return False
-        self._degraded = False
-        self._degraded_until = None
-        return True
-
     async def _resolve_context_plan(self, planned: PlannedTurn) -> PlannedTurn | None:
         rollover_seen = False
         for _ in range(self.max_context_decisions):
@@ -1415,10 +1361,8 @@ class GlobalInboxRuntime(
         return terminal, process_outcome, terminal_error
 
     async def process_once(self) -> bool:
-        if self._parked_drained:
-            if self.drained_check is not None and self.drained_check():
-                return False
-            self._parked_drained = False
+        if not self._drained_park_allows_processing():
+            return False
         if not self._try_degraded_recovery():
             return False
         if self._autonomous_settle_pending is not None:
