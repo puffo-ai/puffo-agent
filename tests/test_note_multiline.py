@@ -196,3 +196,24 @@ def test_leading_indent_on_the_first_line_is_not_preserved():
     parsed = _parse_note(note("  indented first\n    second"))
     assert parsed is not None
     assert parsed["message"] == "indented first\n    second"
+
+
+def test_parse_note_skips_blank_and_colonless_lines_between_fields():
+    parsed = _parse_note(
+        "/note \n\nprose without colon\ncolor: #fff\nlabel: X\nmessage: hi"
+    )
+    assert parsed["label"] == "X"
+    assert parsed["message"] == "hi"
+
+
+def test_parse_note_dedupes_and_drops_bare_mention_tokens():
+    parsed = _parse_note(
+        "/note \ncolor: #fff\nlabel: X\nmentions: @bob @bob @ carol"
+    )
+    assert parsed["mentions"] == ["bob", "carol"]
+
+
+def test_unknown_field_outside_the_body_is_ignored():
+    parsed = _parse_note("/note \nfoo: bar\nlabel: X\nmessage: hi")
+    assert parsed["label"] == "X"
+    assert parsed["message"] == "hi"

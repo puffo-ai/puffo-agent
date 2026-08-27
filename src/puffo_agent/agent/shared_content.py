@@ -983,7 +983,7 @@ message: Alice can sanity-check our token-refresh discussion.
 # The description goes into the YAML frontmatter Claude Code reads
 # for skill discovery; the body is everything below the frontmatter.
 DEFAULT_SKILL_USE_PUFFO_NOTES = """\
-# Skill: use_puffo_notes
+# Skill: use-puffo-notes
 
 Sticky-notes are lightweight status markers on a thread. Each note is
 a colored pill a human sees at a glance — a label (Waiting /

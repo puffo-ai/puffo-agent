@@ -246,3 +246,172 @@ async def test_get_thread_notes_tool_limit_one():
     out = await _call(mcp, "get_thread_notes", {"root_id": "msg_root", "limit": 1})
     assert "msg_note_1" in out       # Complete is newest → in effect
     assert "msg_note_0" not in out
+
+
+# ---- read-tool edge branches ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_channel_notes_rejects_hash_addressing():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "get_channel_notes", {"channel": "#general"})
+    assert "channel id" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_channel_notes_non_channel_ref_resolves_loudly():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "get_channel_notes", {"channel": "some-slug"})
+    assert "not a channel id" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_channel_notes_unknown_channel_reports():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    out = await _call(mcp, "get_channel_notes", {"channel": "ch_missing"})
+    assert "no such channel" in out
+
+
+@pytest.mark.asyncio
+async def test_get_channel_notes_empty_channel_reports():
+    cfg, http, ms = _setup()
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+    })
+    mcp = _build_tools(cfg)
+    out = await _call(mcp, "get_channel_notes", {"channel": "ch_abc"})
+    assert "no active notes" in out
+
+
+@pytest.mark.asyncio
+async def test_get_thread_notes_requires_root_id():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "get_thread_notes", {"root_id": "  "})
+    assert "root_id" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_get_thread_notes_unknown_root_reports():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    out = await _call(mcp, "get_thread_notes", {"root_id": "msg_missing"})
+    assert "no such thread" in out
+
+
+@pytest.mark.asyncio
+async def test_get_thread_notes_empty_thread_reports():
+    cfg, http, ms = _setup()
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+    })
+    mcp = _build_tools(cfg)
+    out = await _call(mcp, "get_thread_notes", {"root_id": "msg_root"})
+    assert "no notes on this thread" in out
+
+
+# ---- add_note destination resolution --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_note_requires_root_id():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {"root_id": "  ", "preset": "waiting"})
+    assert "root_id required" in str(exc.value)
+
+
+async def _seed_dm_certs(http, peer="alice-0001"):
+    from puffo_agent.crypto.encoding import base64url_encode
+    from puffo_agent.crypto.primitives import KemKeyPair
+
+    http.responses[f"/certs/sync?slugs={peer}"] = {
+        "entries": [
+            {
+                "seq": 1, "kind": "device_cert", "slug": "agent-0001",
+                "cert": {
+                    "device_id": "dev_test",
+                    "kem_public_key": base64url_encode(
+                        KemKeyPair.generate().public_key_bytes()
+                    ),
+                },
+            },
+            {
+                "seq": 2, "kind": "device_cert", "slug": peer,
+                "cert": {
+                    "device_id": "dev_alice",
+                    "kem_public_key": base64url_encode(
+                        KemKeyPair.generate().public_key_bytes()
+                    ),
+                },
+            },
+        ],
+        "has_more": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_note_on_inbound_dm_root_targets_the_sender():
+    cfg, http, ms = _setup()
+    await ms.store({
+        "envelope_id": "msg_dm_root", "envelope_kind": "dm",
+        "sender_slug": "alice-0001", "recipient_slug": "agent-0001",
+        "content_type": "text/plain", "content": "hi",
+        "sent_at": _now_ms(),
+    })
+    await _seed_dm_certs(http)
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "add_note", {
+        "root_id": "msg_dm_root", "preset": "processing", "message": "on it",
+    })
+    assert "posted" in result
+    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
+    assert len(post_calls) == 1
+    assert post_calls[0][1]["recipient_slug"] == "alice-0001"
+
+
+@pytest.mark.asyncio
+async def test_add_note_on_outbound_dm_root_targets_the_recipient():
+    cfg, http, ms = _setup()
+    await ms.store({
+        "envelope_id": "msg_dm_root", "envelope_kind": "dm",
+        "sender_slug": "agent-0001", "recipient_slug": "alice-0001",
+        "content_type": "text/plain", "content": "hi",
+        "sent_at": _now_ms(),
+    })
+    await _seed_dm_certs(http)
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "add_note", {
+        "root_id": "msg_dm_root", "preset": "processing", "message": "on it",
+    })
+    assert "posted" in result
+    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
+    assert post_calls[0][1]["recipient_slug"] == "alice-0001"
+
+
+@pytest.mark.asyncio
+async def test_add_note_root_without_channel_or_dm_errors():
+    cfg, http, ms = _setup()
+    await ms.store({
+        "envelope_id": "msg_odd", "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "content_type": "text/plain", "content": "odd",
+        "sent_at": _now_ms(),
+    })
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc:
+        await _call(mcp, "add_note", {"root_id": "msg_odd", "preset": "waiting"})
+    assert "cannot resolve" in str(exc.value)

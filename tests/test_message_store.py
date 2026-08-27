@@ -1965,3 +1965,12 @@ async def test_note_queries_require_the_marker_space():
     notes = await store.get_channel_notes("ch_1")
     assert [m.envelope_id for m in notes] == ["env_real"]
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_empty_root_raises():
+    store = _temp_store()
+    await store.open()
+    with pytest.raises(DataNotFound):
+        await store.get_thread_notes("")
+    await store.close()

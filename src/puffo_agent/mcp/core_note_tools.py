@@ -264,7 +264,10 @@ def _register_add_note(
         - ``label`` — the pill text; **required with ``color``**, and
           only valid for a custom note (presets set their own label).
         - ``message`` — the note body.
-        - ``mentions`` — slugs who should act (waiting + custom only)."""
+        - ``mentions`` — slugs who should act (waiting + custom only).
+
+        See the managed ``use-puffo-notes`` skill for the preset
+        protocol and typical flow."""
         mention_list = [m.lstrip("@") for m in (mentions or []) if m and m.strip()]
         note_color, note_label, note_mentions = _resolve_note_style(
             preset, color.strip(), label.strip(), mention_list, cfg.slug,
