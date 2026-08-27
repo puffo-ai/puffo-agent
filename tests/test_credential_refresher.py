@@ -6,19 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from pathlib import Path
 
-import pytest
 
 from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (
-    RATE_LIMIT_FAST_RETRY_MAX_SECONDS,
-    RATE_LIMIT_FAST_RETRY_MIN_SECONDS,
     REFRESH_BROKEN_THRESHOLD,
     REFRESH_PROBE_MODEL,
-    REFRESH_SAFETY_MARGIN_SECONDS,
     CredentialRefresher,
     FileBackend,
     RefreshOutcome,
@@ -433,6 +428,8 @@ def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch)
     captured: list[RefreshOutcome] = []
 
     class _FakeBackend:
+        refresh_lock_path = tmp_path / "fake-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -458,6 +455,8 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     captured: list[RefreshOutcome] = []
 
     class _ExplodingBackend:
+        refresh_lock_path = tmp_path / "exploding-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -477,7 +476,7 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     assert captured == [RefreshOutcome.FAILED]
 
 
-def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, caplog):
+def test_filebackend_unchanged_redacts_stdout_and_stderr(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.credential_refresh import FileBackend
     _write_creds(tmp_path, expires_in_seconds=3600)
     backend = FileBackend(host_home=tmp_path)
@@ -495,8 +494,9 @@ def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, cap
     outcome = asyncio.run(backend.refresh())
     assert outcome is RefreshOutcome.UNCHANGED
     joined = " ".join(rec.getMessage() for rec in caplog.records)
-    assert "hello-out" in joined
-    assert "hello-err" in joined
+    assert "hello-out" not in joined
+    assert "hello-err" not in joined
+    assert "output_category=unchanged" in joined
 
 
 def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):

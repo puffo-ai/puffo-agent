@@ -23,21 +23,12 @@ class InProcessDataClient:
     the existing tool implementations don't notice the swap.
     """
 
-    def __init__(self, store: "MessageStore", client: "PuffoCoreMessageClient") -> None:
+    def __init__(self, store: MessageStore, client: PuffoCoreMessageClient) -> None:
         self._store = store
         self._client = client
 
     async def close(self) -> None:
         return None
-
-    async def get_send_encryption(
-        self, slug: str, thread_root_id: str | None,
-    ) -> bool:
-        from ...agent import send_mode
-
-        return await send_mode.encryption_required(
-            slug, self._store, thread_root_id,
-        )
 
     async def lookup_channel_space(self, channel_id: str) -> str | None:
         space_id = await self._store.lookup_channel_space(channel_id)
@@ -52,50 +43,76 @@ class InProcessDataClient:
         channel_id: str,
         limit: int = 20,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
-    ) -> list["ChannelRoot"]:
+        before_seq: int | None = None,
+        after_seq: int | None = None,
+    ) -> list[ChannelRoot]:
         return await self._store.get_channel_roots(
             channel_id=channel_id,
             limit=limit,
             since_envelope_id=since_envelope_id,
+            before_envelope_id=before_envelope_id,
             before_ts=before_ts,
             after_ts=after_ts,
+            before_seq=before_seq,
+            after_seq=after_seq,
         )
 
     async def get_dm_history(
-        self, peer_slug: str, limit: int = 20, before: int | None = None,
-    ) -> list["StoredMessage"]:
-        return await self._store.get_dm_history(peer_slug, limit, before)
+        self,
+        peer_slug: str,
+        limit: int = 20,
+        before: int | None = None,
+        before_envelope_id: str | None = None,
+        after_envelope_id: str | None = None,
+    ) -> list[StoredMessage]:
+        return await self._store.get_dm_history(
+            peer_slug=peer_slug,
+            limit=limit,
+            before=before,
+            before_envelope_id=before_envelope_id,
+            after_envelope_id=after_envelope_id,
+        )
 
     async def get_thread_messages(
         self,
         root_id: str,
         limit: int = 50,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
-    ) -> list["StoredMessage"]:
+        before_seq: int | None = None,
+        after_seq: int | None = None,
+    ) -> list[StoredMessage]:
         return await self._store.get_thread_messages(
             root_id=root_id,
             limit=limit,
             since_envelope_id=since_envelope_id,
+            before_envelope_id=before_envelope_id,
             before_ts=before_ts,
             after_ts=after_ts,
+            before_seq=before_seq,
+            after_seq=after_seq,
         )
 
     async def get_channel_notes(
         self, channel_id: str, limit: int = 20,
-    ) -> list["StoredMessage"]:
+    ) -> list[StoredMessage]:
         return await self._store.get_channel_notes(channel_id, limit=limit)
 
     async def get_thread_notes(
         self, root_id: str, limit: int = 20,
-    ) -> list["StoredMessage"]:
+    ) -> list[StoredMessage]:
         return await self._store.get_thread_notes(root_id, limit=limit)
 
     async def get_message_by_envelope(self, envelope_id: str) -> Any:
-        return await self._store.get_message_by_envelope(envelope_id)
+        # Model-visible lane (get_post / get_post_segment): a foreign DM
+        # held for operator approval stays withheld, matching the HTTP
+        # data service and the DM/thread reads.
+        return await self._store.get_visible_message_by_envelope(envelope_id)
 
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,

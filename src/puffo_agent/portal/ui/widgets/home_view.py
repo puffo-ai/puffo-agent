@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
 
 from ...state import RuntimeState, discover_agents
 from ..assets import logo_path
-from ..names import resolve_display_name
 
 
 class _LogoLabel(QLabel):
@@ -70,7 +69,6 @@ class _CliCard(QFrame):
         self.setObjectName("card")
         self._resolver = resolver
         self._cred_check = cred_check
-        self._coming_soon = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 12, 16, 12)
@@ -118,20 +116,7 @@ class _CliCard(QFrame):
         self._path_label.setVisible(False)
         layout.addWidget(self._path_label)
 
-    def mark_coming_soon(self) -> None:
-        self._coming_soon = True
-
     def refresh(self) -> None:
-        if self._coming_soon:
-            self._dot.setStyleSheet("font-size: 14pt; color: #d8b834;")
-            self._status_label.setText("coming soon")
-            self._status_label.setStyleSheet(
-                "color: #9ca3af; font-size: 9pt; font-style: italic;"
-            )
-            self._path_label.setText("Hermes integration ships in a future release.")
-            self._toggle.setEnabled(False)
-            self._toggle.setVisible(False)
-            return
         try:
             path = self._resolver()
         except Exception:
@@ -203,31 +188,18 @@ class HomeView(QWidget):
         title_row.addWidget(open_btn)
         outer.addLayout(title_row)
 
-        # Bridge / pairing card
-        bridge_card, bridge_layout = _card()
-        bridge_title = QLabel("Local bridge")
-        bridge_title.setStyleSheet(
-            "color: #6b7280; font-size: 10pt; text-transform: uppercase;"
-        )
-        bridge_layout.addWidget(bridge_title)
-        self._bridge_status = QLabel("…")
-        self._bridge_status.setStyleSheet(
-            "font-size: 13pt; font-weight: 500; color: #1f2937;"
-        )
-        self._bridge_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bridge_layout.addWidget(self._bridge_status)
-        outer.addWidget(bridge_card)
-
         # AI tool cards
         from ....agent.cli_bin import (
             claude_has_credentials,
             codex_has_credentials,
             resolve_claude_bin,
             resolve_codex_bin,
+            resolve_docker_bin,
         )
         cli_specs: list[tuple[str, Callable[[], Optional[str]], Optional[Callable[[], bool]]]] = [
             ("Claude Code", resolve_claude_bin, claude_has_credentials),
             ("Codex",       resolve_codex_bin,  codex_has_credentials),
+            ("Docker",      resolve_docker_bin, None),
         ]
         cli_grid = QHBoxLayout()
         cli_grid.setSpacing(12)
@@ -236,10 +208,6 @@ class HomeView(QWidget):
             card = _CliCard(label, resolver, cred_check)
             self._cli_cards.append(card)
             cli_grid.addWidget(card, stretch=1)
-        hermes_card = _CliCard("Hermes", lambda: None)
-        hermes_card.mark_coming_soon()
-        self._cli_cards.append(hermes_card)
-        cli_grid.addWidget(hermes_card, stretch=1)
         outer.addLayout(cli_grid)
 
         # Agent count card
@@ -271,7 +239,6 @@ class HomeView(QWidget):
         for card in self._cli_cards:
             card.refresh()
         self._refresh_counts()
-        self._refresh_bridge()
 
     @staticmethod
     def _footer_text() -> str:
@@ -280,28 +247,6 @@ class HomeView(QWidget):
         except importlib.metadata.PackageNotFoundError:
             version = "unknown"
         return f"puffo-agent v{version}"
-
-    def _refresh_bridge(self) -> None:
-        from ...api.pairing import load_pairing
-        pairing = load_pairing()
-        if pairing is None:
-            self._bridge_status.setText(
-                "<span style='color:#9ca3af;'>● Not paired</span> &nbsp; "
-                "<a href='https://chat.puffo.ai/chat/agents' "
-                "style='color:#3b82f6; text-decoration:none;'>"
-                "Pair at chat.puffo.ai/chat/agents →</a>"
-            )
-            self._bridge_status.setOpenExternalLinks(True)
-            return
-        name = resolve_display_name(pairing.slug) or pairing.slug
-        device = pairing.device_id
-        if len(device) > 28:
-            device = device[:24] + "…"
-        self._bridge_status.setText(
-            f"<span style='color:#22c55e;'>● Paired</span> &nbsp; "
-            f"<b>{name}</b> &nbsp; "
-            f"<span style='color:#6b7280; font-size:9pt;'>device: {device}</span>"
-        )
 
     def _refresh_counts(self) -> None:
         ids = discover_agents()

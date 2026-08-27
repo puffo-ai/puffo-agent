@@ -1,9 +1,7 @@
 """Agent profile ``role`` / ``role_short`` plumbing.
 
 Covers the local pieces: ``AgentConfig`` load/save round-trip with
-the new fields, ``_derive_role_short`` helper in the bridge handler
-and the CLI helper. The bridge HTTP endpoints + server-side derive
-have their own tests in puffo-server.
+the new fields and the CLI helper.
 """
 
 from __future__ import annotations
@@ -17,15 +15,14 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.portal.api.handlers import _derive_role_short
 from puffo_agent.portal.cli import _derive_role_short_cli
-from puffo_agent.portal.state import AgentConfig
+from puffo_agent.portal.state import AgentConfig, derive_role_short
 
 
 # ─── _derive_role_short (bridge handler + CLI mirror) ─────────────
 
 
-@pytest.mark.parametrize("derive", [_derive_role_short, _derive_role_short_cli])
+@pytest.mark.parametrize("derive", [derive_role_short, _derive_role_short_cli])
 def test_derive_matches_recommended_shape(derive):
     """``<short>: <description>`` → returns the trimmed prefix."""
     assert derive("coder: main puffo-core coder") == "coder"
@@ -34,7 +31,7 @@ def test_derive_matches_recommended_shape(derive):
     assert derive("coder :  desc") == "coder"
 
 
-@pytest.mark.parametrize("derive", [_derive_role_short, _derive_role_short_cli])
+@pytest.mark.parametrize("derive", [derive_role_short, _derive_role_short_cli])
 def test_derive_rejects_non_matching_shapes(derive):
     """Anything not matching the recommended shape returns the empty
     string so the caller can store an explicit-empty role_short
@@ -51,11 +48,7 @@ def test_derive_rejects_non_matching_shapes(derive):
     assert derive(f"{too_long}: x") == ""
 
 
-def test_bridge_and_cli_derive_agree():
-    """Belt-and-suspenders: the two derives must stay in lockstep
-    with each other (and with the server). They duplicate logic for
-    different call sites — if one drifts, the agent.yml stored locally
-    could disagree with what the server stores."""
+def test_cli_and_canonical_derive_agree():
     cases = [
         "coder: main coder",
         "plain text no colon",
@@ -66,7 +59,7 @@ def test_bridge_and_cli_derive_agree():
         "",
     ]
     for c in cases:
-        assert _derive_role_short(c) == _derive_role_short_cli(c), c
+        assert derive_role_short(c) == _derive_role_short_cli(c), c
 
 
 # ─── AgentConfig round-trip with role fields ──────────────────────
@@ -80,7 +73,7 @@ def test_agent_config_yaml_roundtrip_preserves_role(monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         monkeypatch.setenv("PUFFO_AGENT_HOME", tmp)
 
-        # Reproduce the on-disk shape ``bridge create_agent`` writes.
+        # Reproduce the on-disk shape agent provisioning writes.
         agent_id = "smoke-bot"
         agents_dir = os.path.join(tmp, "agents", agent_id)
         os.makedirs(agents_dir)
@@ -100,7 +93,7 @@ def test_agent_config_yaml_roundtrip_preserves_role(monkeypatch):
                     "operator_slug": "alice-0001",
                 },
                 "runtime": {
-                    "kind": "chat-local",
+                    "kind": "cli-local",
                     "provider": "anthropic",
                     "model": "claude-sonnet-4-6",
                     "api_key": "sk-ant-test",
@@ -147,7 +140,7 @@ def test_agent_config_load_defaults_role_to_empty(monkeypatch):
                     "space_id": "sp_legacy",
                 },
                 "runtime": {
-                    "kind": "chat-local",
+                    "kind": "cli-local",
                     "provider": "anthropic",
                 },
                 "profile": "profile.md",

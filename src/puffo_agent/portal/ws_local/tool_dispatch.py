@@ -22,14 +22,19 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     # send
     "send_message",
     "send_message_with_attachments",
+    "mark_covered",
     # read / navigation
+    "read_inbox",
+    "read_history",
+    # durable Agent-local reminders
+    "create_reminder",
+    "list_reminders",
+    "cancel_reminder",
+    "replace_reminder",
     "get_user_info",
     "whoami",
     "get_post",
     "get_post_segment",
-    "get_channel_history",
-    "get_dm_history",
-    "get_thread_history",
     "get_channel_notes",
     "get_thread_notes",
     "add_note",
@@ -42,6 +47,13 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     # membership
     "leave_space",
     "leave_channel",
+    # bridge-only sandbox lifecycle (registered only when
+    # cfg.bridge_client is set — native agents never see these)
+    "schedule_wake",
+    "cancel_wake",
+    "get_scheduled_wake",
+    "get_runtime_status",
+    "keep_alive",
 })
 
 
@@ -80,7 +92,7 @@ def build_dispatch(
     from ...mcp.puffo_core_tools import register_core_tools
 
     captured = _CapturedRegistration(handlers={})
-    register_core_tools(captured, cfg)
+    register_core_tools(captured, cfg, result_surface="raw")
     return {
         name: captured.handlers[name]
         for name in allowed

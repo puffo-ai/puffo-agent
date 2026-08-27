@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import io
 import os
+from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -20,6 +22,9 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent import _require_python_311
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _VersionInfo(tuple):
@@ -68,3 +73,20 @@ def test_require_python_311_passes_on_312_and_later(monkeypatch):
     monkeypatch.setattr(sys, "version_info", _VersionInfo(3, 14, 4))
     monkeypatch.setattr(sys, "stderr", io.StringIO())
     _require_python_311()
+
+
+def test_package_module_is_a_working_cli_entry_point(tmp_path):
+    """A blocked Windows console-script shim must not strand the operator."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_REPO_ROOT / "src")
+    result = subprocess.run(
+        [sys.executable, "-m", "puffo_agent", "version"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("puffo-agent ")

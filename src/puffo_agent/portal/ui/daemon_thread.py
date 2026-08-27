@@ -15,19 +15,46 @@ from ..state import read_daemon_pid, write_stop_request
 logger = logging.getLogger(__name__)
 
 
+def install_daemon_watchdog(app, daemon_thread: DaemonThread):
+    """Exit the Qt application when its in-process daemon terminates."""
+    from PySide6.QtCore import QTimer
+
+    timer = QTimer()
+    timer.setInterval(100)
+
+    def _poll() -> None:
+        if daemon_thread.is_alive():
+            return
+        timer.stop()
+        app.exit(daemon_thread.exit_code or (1 if daemon_thread.failed else 0))
+
+    timer.timeout.connect(_poll)
+    timer.start()
+    return timer
+
+
 class DaemonThread(threading.Thread):
-    def __init__(self, with_local_bridge: bool = False) -> None:
+    def __init__(self) -> None:
         super().__init__(name="puffo-daemon", daemon=False)
-        self._stop_requested = False
-        self._with_local_bridge = with_local_bridge
+        self._stop_requested = threading.Event()
+        self.exit_code: int | None = None
+        self.startup_error: BaseException | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.startup_error is not None or self.exit_code not in (None, 0)
 
     def run(self) -> None:
         from ..daemon import run_daemon
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_daemon(with_local_bridge=self._with_local_bridge))
-        except Exception:
+            self.exit_code = loop.run_until_complete(
+                run_daemon(self._stop_requested)
+            )
+        except BaseException as exc:
+            self.startup_error = exc
+            self.exit_code = 1
             logger.exception("daemon thread crashed")
         finally:
             try:
@@ -36,22 +63,26 @@ class DaemonThread(threading.Thread):
                 pass
 
     def request_stop(self) -> bool:
-        """Write the stop sentinel iff we own the daemon. Returns True
-        when written (caller should wait for ``os._exit``), False when
-        another daemon owns the PID file."""
-        if self._stop_requested:
+        """Request stop only when this live thread can own the daemon."""
+        if self._stop_requested.is_set():
             return True
-        self._stop_requested = True
+        if not self.is_alive():
+            return False
         owner = read_daemon_pid()
-        if owner != os.getpid():
+        if owner not in (None, os.getpid()):
             logger.info(
                 "not writing stop sentinel: PID owner=%s, ours=%s",
                 owner, os.getpid(),
             )
             return False
+        # This in-process event reaches run_daemon even when startup has not
+        # published its PID yet, or the sentinel write itself fails.
+        self._stop_requested.set()
+        if owner is None:
+            return True
         try:
-            write_stop_request()
+            write_stop_request(owner)
             return True
         except Exception:
             logger.exception("failed to write stop sentinel")
-            return False
+            return True

@@ -10,10 +10,10 @@ import sys
 import webbrowser
 
 from ...crypto.http_session import create_remote_http_session
-from ..api.ownership import is_owner
 from ..state import AgentConfig, discover_agents
 from . import machine_auth
 from .envelope import ControlError, verify_control_cert
+from .ownership import is_owner
 from .store import (
     ControlPairing,
     current_machine_id,

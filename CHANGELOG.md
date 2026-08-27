@@ -8,6 +8,766 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Invite-link channel joins are announced to the agent.** When someone
+  joins channels by redeeming an invite link, the server's synthetic
+  `add_to_channel` events now produce a per-channel system message
+  ("X joined channel #name (invited by Y)", with Y the link's creator)
+  in each affected channel the agent is a member of, alongside the
+  existing space-level join announcement.
+- **`drained` runtime health for a spent plan quota.** When the Claude Code /
+  Codex usage limit is exhausted, the agent flips to `drained` instead of the
+  misleading `auth_failed` ("run `claude auth login`"), holds messages without
+  retrying, and DMs the operator once per episode with a bilingual
+  explanation, the real recovery options, and a predicted reset time (from the
+  error body, the usage snapshot, or an on-the-spot `/usage` probe). The
+  periodic usage snapshot also marks and clears `drained` for every agent on
+  the spent harness — including idle live workers — and a successful turn
+  clears the state. Bridge/keyless agents now report `health` on their status
+  frames, so the server sees `drained` (and every other health state) for
+  them too. Quota-exhausted refresh probes no longer count toward the
+  `refresh_broken` streak. (#228)
+
+## [2.0.2] - 2026-08-25
+
+### Fixed
+
+- **Windows background daemons survive terminal closure.** Detached children
+  break away from the launcher's Job object instead of being terminated with
+  the PowerShell or Terminal window. Managed Windows machines whose App Control
+  policy blocks the pip/uv-generated `puffo-agent.exe` shim can use the new
+  equivalent `python -m puffo_agent` entry point. (#292)
+
+## [2.0.1] - 2026-08-24
+
+### Changed
+
+- **Channel sends follow the channel's format policy.** The channel's
+  `is_encrypted` field alone decides sealed vs signed-plaintext for channel
+  sends; DMs stay encrypted and the agent cannot choose the format. The
+  policy is cached (disk + memory), kept live by `channel_update` frames,
+  and a `CHANNEL_FORMAT_MISMATCH` rejection refreshes the policy once and
+  resends in the channel's current format. (#212)
+
+### Fixed
+
+- **Codex resume recovery.** A resume against a thread with no rollout on disk
+  ("no rollout found") is classified as `invalid_resume` and falls back to a
+  fresh session instead of dying in a blind retry loop; unclassified resume
+  failures fall back after a bounded streak while recoverable provider
+  failures never lose the session; failed turn starts keep the persisted
+  native session id, and retries replay the durable payload unless the
+  input provably reached the transcript. (#290)
+- Background startup now distinguishes slow, stalled, stopped, and exited
+  daemons without terminating a live process after a fixed observation window.
+- Detached startup reports success when a concurrently launched child exits
+  because another daemon won startup, and avoids redundant daemon imports in
+  the parent CLI process.
+- The daemon publishes control-plane readiness before worker preparation, so
+  background startup returns promptly while preserving bounded stalled-start
+  and stalled-stop diagnostics.
+- Windows background Agents now launch Claude Code, Codex, and memory Git
+  subprocesses without opening visible console windows.
+
+## [2.0.0] - 2026-08-23
+
+> Stable Agent Foundation 2.0 release, promoted from `2.0.0a25` without
+> additional runtime changes after the staged alpha hardening cycle.
+
+### Added
+
+- **Durable multi-target Inbox and turn coordination.** Agents batch pending
+  work across channels, threads, DMs, spaces, and reminders while preserving
+  routing, freshness, processing disposition, and restart recovery.
+- **Driver-based Claude Code and Codex runtimes.** Provider sessions expose a
+  normalized lifecycle, streaming activity, context telemetry, compaction,
+  steering where supported, and explicit provider failure semantics.
+
+### Changed
+
+- **Existing Agent state upgrades in place.** Supported 1.2 installations keep
+  their identity, keys, profile, memory, workspace, message history, and Puffo
+  logical session while the 2.0 runtime adopts the new storage and Driver
+  contracts.
+- **Agent collaboration is model-directed.** Structured Inbox context,
+  reminders, held-draft reconsideration, and semantic messaging tools provide
+  evidence without reducing reply, wait, clarification, or silence decisions
+  to hard-coded social rules.
+
+### Fixed
+
+- **Staged reliability hardening through `2.0.0a25`.** The stable build includes
+  the alpha-cycle fixes for long-message reads, account cutover, degraded
+  provider sessions, autocompaction, background sends, active long turns,
+  message disposition, thread preservation, lifecycle-gated delivery, durable
+  processed receipts, autonomous provider runs, encryption isolation, and
+  provider retry classification.
+
+## [2.0.0a25] - 2026-08-23
+
+> Staging candidate hardening Claude turn delivery, runtime recovery, and
+> durable processing acknowledgements across provider and daemon restarts.
+
+### Added
+
+- **Claude lifecycle-gated Inbox delivery.** When the CLI advertises the
+  supported lifecycle capability, steering waits for the native command's
+  queued acknowledgement and fails closed for unknown lifecycle dialects.
+  Ambiguous queue timeouts retire the native session before retry. (#274)
+- **Durable processed-receipt replay.** Failed server acknowledgements are
+  queued locally, retried with bounded backoff, and replayed after restart;
+  acknowledgements conditionally remove only the exact payload sent. (#280)
+- **Autonomous provider-run adoption.** Harness runs started by background
+  tasks are bound to durable daemon turns, including deferred adoption,
+  Inbox reads, freshness-aware sends, and idempotent terminal recovery. (#283)
+
+### Changed
+
+- **Outbound encryption is decided per send.** Turn-scoped send-mode state was
+  removed so one route cannot leak its encryption decision into another. (#281)
+
+### Fixed
+
+- **Provider failures retain their recovery semantics.** Authentication,
+  permission, quota, rate-limit, availability, invalid-resume, and runtime-exit
+  outcomes now use one operator-safe classification path without converting
+  permission errors into sign-in failures or losing retry boundaries. The CLI
+  also exposes detached headless startup for safe upgrade restart flows. (#282)
+
+## [2.0.0a24] - 2026-08-22
+
+> Staging candidate closing the audited message-reliability gaps: silent
+> "read but never answered" loss, silent empty-history rendering on data
+> failures, and thread demotion when the root is not locally readable.
+
+### Added
+
+- **Message covers: explicit disposition with finalize reconciliation.**
+  `send_message` / `send_message_with_attachments` / `create_reminder`
+  accept `covers=[message_id...]`; a new `mark_covered` tool settles
+  messages that need no reply. At turn end the daemon reconciles read
+  human messages against declared covers, always emits a
+  `turn.uncovered_messages` observation event, and — behind the
+  `covers_renotice` flag (`PUFFO_COVERS_RENOTICE` env override) —
+  redelivers uncovered rows exactly once. A reconciliation failure emits
+  `turn.cover_reconciliation_failed` and falls back to a durable
+  store-side partition instead of silently settling the turn. (#276)
+
+### Fixed
+
+- **Data-service read failures raise `DataUnavailable` instead of
+  rendering an empty history.** 5xx and transport errors on the five read
+  paths surface as explicit, retryable tool errors; 404 absence semantics
+  are unchanged. (#277)
+- **Locally unverifiable thread roots are preserved, not erased.** A
+  reply whose claimed root is not in the local store keeps the claim with
+  a `thread_root_unverified` mark, the root's later arrival runs the
+  deferred ownership check, and outbound replies into such threads keep
+  threading under the claimed id after scope validation instead of
+  degrading to channel level. (#278)
+
+## [2.0.0a23] - 2026-08-22
+
+> Staging candidate removing the flat 30-minute turn ceiling so long tasks
+> are never killed while still producing output.
+
+### Fixed
+
+- **The turn timeout extends on activity instead of capping total wall-clock
+  time.** `task_timeout_seconds` (default 1800s) was enforced as a hard cap on
+  the whole provider turn, silently truncating long tasks that were still
+  actively working — the canned timeout reply was dropped by the no-send
+  guard, the in-turn messages were marked processed, and nothing surfaced in
+  any failure stat. Every assistant delta and tool event now pushes the
+  deadline back out, so the timeout only fires after genuine end-to-end
+  silence — a runtime that is actually stuck (for example a resumed child
+  process that died before init), which is what the timeout existed to catch.
+  A task that keeps producing output can now run indefinitely; stopping it is
+  the operator's call, not the daemon's. (#273)
+
+## [2.0.0a22] - 2026-08-21
+
+> Staging candidate fixing turn-unbound sends (background-task wakeups after
+> the daemon turn finalized) so they never downgrade to plaintext and report
+> honest errors.
+
+### Fixed
+
+- **Channel sends are always E2EE and no longer consult the turn-scoped
+  send-mode flag.** A turn-unbound text send previously read the cleared flag
+  as "plaintext" and failed with `encryption_required` while the attachment
+  path went through; the channel-is-always-E2EE invariant now lives in the
+  route resolver.
+- **The send-mode decision fails safe to E2EE when no turn is bound.** Only a
+  turn whose bundle was explicitly plaintext (or a plaintext thread root) may
+  downgrade; turn-unbound rootless DMs — including daemon-authored DMs and
+  operator approval prompts — previously went out as plaintext envelopes. An
+  operator with no E2EE devices now gets a loud "no recipient devices found"
+  failure instead of a silent plaintext delivery.
+- **Turn-unbound operations report honest, actionable errors.** `send_anyway`
+  ineligibility from a missing active identity, and both Inbox/model-visible
+  read gates, now explain that the operation is not bound to an admitted turn
+  and that recovery comes with the next admitted turn, instead of pointing at
+  read/catch-up procedures that are themselves rejected in this state.
+
+## [2.0.0a21] - 2026-08-19
+
+> Staging candidate preventing Claude Code context observation from corrupting
+> its next process launch and improving local crash diagnostics.
+
+### Fixed
+
+- **Claude Code autocompact remains stable across context observations.** The
+  launch-time token ceiling is authoritative for Claude; a reported live
+  context window no longer reapplies the percentage and progressively shrinks
+  the next `--autocompact` value below the CLI minimum.
+- **Unexpected Claude Code exits include bounded local diagnostics.** The daemon
+  logs only the final 8 KiB of child-process stderr, making pre-init failures
+  diagnosable without unbounded buffering or remote telemetry.
+
+## [2.0.0a20] - 2026-08-19
+
+> Staging candidate recovering provider runtimes and bounded context without
+> breaking the Puffo logical conversation.
+
+### Fixed
+
+- **Crashed or abandoned provider turns now enter bounded recovery.** Retryable
+  runtime exits reach the existing session-transfer path instead of being
+  requeued forever against the same broken runtime state.
+- **Invalid Claude Code resume targets recover automatically.** Puffo retires a
+  native session when Claude explicitly reports that it no longer exists, while
+  preserving valid sessions across ordinary failures and resource reloads.
+- **Context admission can recover after compaction is unavailable.** Puffo tries
+  native compaction, shrinks the pending Inbox batch, and finally rolls over the
+  provider-native session while preserving Puffo session history, memory, and
+  workspace state.
+- **DM thread replies expose their root message ID.** Agents can now route a
+  reply back into the originating DM thread without changing DM target identity.
+- **Provider account changes are acknowledged only after delivery.** External
+  Claude Code and Codex credential revisions remain retryable until Agent views
+  are current and each daemon has requested provider reload, including login
+  changes that race a failed or unchanged refresh.
+- **Long-message segment reads use the durable source body.** Bounded Inbox
+  projections no longer truncate later segment reads, while unchanged
+  structured messages avoid storing a duplicate body.
+- **Link-based space joins refresh Agent membership context.** The Agent now
+  consumes the signed join event and invalidates its cached roster when the
+  Server announces a membership projection change.
+- **Late provider login self-recovers.** A daemon started before Claude Code
+  login refreshes the account model catalog on a later capability heartbeat,
+  and Codex advertises its fixed capabilities before opening a runtime.
+- **Signed WebSocket and HTTP transports share one trust policy.** Both now use
+  the certifi-backed remote TLS context, avoiding macOS/Homebrew CA divergence.
+
+## [2.0.0a19] - 2026-08-19
+
+> Staging candidate preserving provider conversations while Agent resources and
+> credentials change.
+
+### Fixed
+
+- **Profile and runtime configuration changes no longer discard valid native
+  sessions.** Claude Code and Codex now receive the persisted session ID and
+  decide whether it can be resumed; Puffo falls back to a fresh provider
+  session only when the provider explicitly rejects the saved one.
+- **Puffo logical sessions remain continuous across provider reloads.** The
+  retired configuration-derived session fingerprint is removed from durable
+  runtime state during the existing SQLite migration path.
+- **Managed profile, skill, and MCP changes reload automatically.** Existing
+  mutation paths request the current idle-boundary resource refresh instead of
+  asking the Agent to call `refresh()` manually. Explicit
+  `refresh(session=True)` still starts a new conversation.
+
+## [2.0.0a18] - 2026-08-19
+
+> Staging candidate making Claude Code and Codex account changes safe for
+> already-running Agent runtimes.
+
+### Fixed
+
+- **Provider account changes now take effect without restarting the Agent.**
+  Canonical credentials are copied into each Agent view before its provider
+  runtime reloads at an idle turn boundary; the Puffo logical session remains
+  continuous and the native session is resumed when still available.
+- **Credential refresh is serialized across local Puffo daemons.** Production
+  and staging processes sharing one host login use a provider-level OS lock,
+  preventing rotating refresh credentials from racing each other.
+- **Transient provider failures no longer discard resumable sessions.** A new
+  native session is created only when the provider explicitly reports that the
+  saved session or transcript is missing or incompatible.
+
+## [2.0.0a17] - 2026-08-18
+
+> Staging candidate restoring Claude Code progress after runtime context-window
+> discovery.
+
+### Fixed
+
+- **Claude Code no longer stalls before a turn when its learned context usage
+  requires compaction.** The runtime now applies the learned native
+  `--autocompact` threshold when it reloads Claude Code and permits `/compact`
+  before the deferred `system/init` frame. Admitted turns resume the existing
+  Profile Log stream of bounded assistant status and tool labels.
+
+## [2.0.0a16] - 2026-08-17
+
+> Staging candidate closing the message-contract acceptance gaps and restoring
+> legacy token-usage audit metadata.
+
+### Fixed
+
+- **Inbound attachment paths now work in local and Docker harnesses.** Model
+  context consistently receives workspace-relative paths instead of host-only
+  absolute paths, including the retained compatibility/retry projection.
+- **Message metadata uses one model-facing vocabulary.** Compatibility prompts
+  and send results expose `message_id`, authenticated system messages retain
+  `sender_type="system"`, and native plus keyless self-sent history preserves
+  `human_visible` without weakening approval-prompt redaction.
+- **Completed turns again report the 1.2 token-usage shape.** Runtime history
+  records input/output token counts and an optional current-context value for
+  successful turns, including events recovered from the durable outbox;
+  failed, cancelled, and abandoned turns remain usage-free.
+
+## [2.0.0a15] - 2026-08-17
+
+> Staging candidate removing the fixed Inbox delay for idle Agents.
+
+### Fixed
+
+- **Idle Agents now begin Inbox processing immediately.** The three-second,
+  non-resetting aggregation window applies only while a durable turn is active;
+  startup recovery with pending work also wakes immediately.
+- **Bursts of immediate notifications no longer enqueue redundant planning
+  cycles.** Multiple committed receipts share one unconsumed wake while the
+  next plan reads the complete durable pending set.
+
+## [2.0.0a14] - 2026-08-17
+
+> Staging candidate unifying Docker execution with the shared Driver and
+> Runtime Manager architecture.
+
+### Changed
+
+- **Docker Claude Code and Codex now use the same Driver contracts as local
+  runtimes.** Docker owns process placement, mounts, credentials, and bounded
+  container lifecycle while provider protocol behavior remains in the shared
+  Claude stream-json and Codex app-server Drivers.
+- **The legacy Docker-only Adapter and duplicate harness wrappers were
+  removed.** Existing Agent configuration, isolated homes, sessions, skills,
+  MCP servers, memory, shared workspace access, and resource limits are
+  prepared by one Docker runtime owner.
+
+### Fixed
+
+- **Docker Codex again runs as a supported first-class runtime.** The bundled
+  image contains both supported CLIs and the Puffo MCP dependencies, and
+  existing containers are recreated once for the new harness-aware layout.
+
+## [2.0.0a13] - 2026-08-16
+
+> Integrated staging candidate built from the merged Agent Foundation,
+> flat-memory compatibility, and current control-plane fixes.
+
+### Fixed
+
+- **Web Refresh now performs a complete refresh by default.** A parameterless
+  control command reloads the session and host-managed skills/MCP state as well
+  as the Agent prompt; callers can still request a narrower refresh explicitly.
+- **Credential recovery no longer re-flags healthy Agents as broken.** External
+  Claude credential rotation and successful refreshes clear the shared failure
+  state, while a benign unchanged fresh credential is not counted as failure.
+- **Archived and deleted Agents leave their spaces before device revocation.**
+  The daemon and CLI use the same ordered flow, preserve retryable failures for
+  a later sweep, and avoid leaving ordinary channel-roster memberships behind.
+
+## [2.0.0a12] — 2026-08-16
+
+> Staging candidate restoring Puffo Agent 1.2 memory compatibility while
+> retaining the structured-memory alpha data and tools.
+
+### Fixed
+
+- **Existing Agent memory again follows the 1.2 runtime contract.** The full
+  root `profile.md` and flat `memory/*.md` files are loaded into Codex and
+  Claude Code prompts without destructive startup migration or alpha briefing
+  limits. Existing structured briefing data remains visible through a
+  read-only compatibility view, including notes moved by earlier alpha builds.
+- **Custom memory directories work in Docker runtimes.** Claude Code and Codex
+  containers now mount the resolved Agent memory directory at the canonical
+  MCP path instead of silently reading the default Agent-home directory.
+- **Runtime observability can no longer block Agent execution.** Profile Logs,
+  Runtime Events upload, and the local runtime-state snapshot are treated as
+  best-effort observations after a provider event occurs. A full or unhealthy
+  Runtime Events outbox no longer prevents a real Codex or Claude Code turn
+  from starting or completing.
+
+## [2.0.0a11] — 2026-08-15
+
+> Staging candidate for authoritative Harness context telemetry.
+
+### Fixed
+
+- **Codex context usage follows the current app-server schema.** The Driver
+  reads `tokenUsage.last.totalTokens` while retaining the older flattened
+  fallback, so admission, compaction, and Web telemetry use the same value.
+- **Claude Code reports a native post-turn context snapshot.** The Runtime
+  Manager queries `get_context_usage` after the provider Turn is terminal and
+  falls back to the result-frame estimate only when native telemetry is
+  unavailable. Telemetry timeout cannot retroactively fail a completed Turn.
+- **Keyless Agents retain context limits in runtime status.** Cloud bridge
+  heartbeats now preserve `max_context` and `auto_compact_threshold_pct` just
+  like signed local-agent heartbeats.
+
+## [2.0.0a10] — 2026-08-15
+
+> Staging candidate for explicit Inbox reads and unified held-send context.
+
+### Changed
+
+- **An Inbox wake now explicitly requires reading pending content.** The
+  metadata-only notice directs the Agent to call `read_inbox` before deciding
+  what to do, while leaving the resulting response or silence to the Agent.
+- **Model-facing reads and sends share one semantic context grammar.** The
+  stdio MCP boundary returns text-only `window`, `message`, `draft`,
+  participation, and held-reconsideration blocks without duplicating nested
+  transport JSON. Internal daemon, RPC, and ws-local contracts remain
+  structured.
+
+## [2.0.0a9] — 2026-08-15
+
+> Staging candidate for bounded Inbox and conversation-history reads.
+
+### Changed
+
+- **Unread work and supplementary history now have explicit MCP intents.**
+  `read_inbox` reads the Agent's pending Inbox snapshot, while `read_history`
+  retrieves bounded DM, channel, or thread context with stable opaque cursors
+  and explicit local-history boundaries. Both tools use the same semantic
+  Puffo message projection without exposing transport JSON.
+- **Every pending row actually shown to the model joins the active turn.** This
+  includes rows reached through history lookup, while channel freshness only
+  advances when the returned window proves one complete sequenced boundary.
+
+## [2.0.0a8] — 2026-08-15
+
+> Staging candidate for unified semantic conversation reads.
+
+### Changed
+
+- **Inbox and history browsing now expose one semantic MCP tool.**
+  `read_messages(view="pending" | "history")` replaces the overlapping Inbox,
+  channel, thread, and DM read tools. Both views use the same Puffo context
+  grammar and explicit older/newer window boundaries; pending admission and
+  history lookup remain distinct intents behind that interface.
+
+## [2.0.0a7] — 2026-08-15
+
+> Staging candidate for session-aware Inbox turns and model-visible history
+> admission.
+
+### Changed
+
+- **Inbox notices are scoped to the native provider session.** New ingress is
+  coalesced without repeatedly starting empty turns, while work that arrives
+  during a busy Claude Code turn remains pending for the next tracked turn.
+- **Any model-visible channel read joins the active durable turn.** Exact
+  pending rows returned by channel, thread, or post history move to `in_turn`;
+  a successful provider turn processes them and failure or cancellation
+  returns them to `pending`.
+
+### Fixed
+
+- **Turn completion and retry no longer race late Inbox admission.** Durable
+  state, provider-session correlation, restart recovery, and processing-run
+  reporting now converge on the same exact message set.
+
+## [2.0.0a6] — 2026-08-14
+
+> Corrected staging build for the A5 Inbox and history contract.
+
+### Changed
+
+- **History ordering and MCP registration now satisfy the repository's
+  structural limits.** Shared ordering policy is centralized, while channel
+  and DM tool registration remain behaviorally identical and retain their
+  established order.
+
+## [2.0.0a5] — 2026-08-14
+
+> Staging candidate for daemon-owned Inbox turns and unambiguous history reads.
+
+### Changed
+
+- **Global Inbox turns now start locally before provider input.** A
+  `read_inbox` call directly moves the exact returned pending rows into that
+  active turn; successful turns process them and failed or interrupted turns
+  return them to pending. There is no second model-to-daemon Inbox ACK.
+- **Claude replay is telemetry rather than a delivery gate.** Writing the
+  provider input establishes delivery, while replay events can still enrich
+  provider session and turn diagnostics without delaying the turn lifecycle.
+- **History pagination uses explicit units.** Channel and thread readers now
+  expose envelope, server-sequence, and millisecond timestamp bounds under
+  distinct names. The former short names remain as compatibility aliases.
+
+### Fixed
+
+- **Inbox admission no longer depends on provider-specific tool-result
+  correlation.** Native, Docker, and external harnesses share the same durable
+  daemon-owned pending, in-turn, processed, and retry lifecycle.
+
+## [2.0.0a4] — 2026-08-12
+
+> Staging candidate for the complete one-shot Reminder lifecycle.
+
+### Added
+
+- **Scheduled reminders can be replaced atomically.** The new semantic
+  `replace_reminder` tool preserves omitted fields, fences live delivery, and
+  converges after an uncertain network result without creating duplicate work.
+
+### Changed
+
+- **Cancellation now coordinates with remote custody.** Prepared reminders can
+  be cancelled until delivery starts, and retained terminal snapshots rebuild
+  matching local cancelled or fired state after restart.
+- **Delivery claims stay internal.** Reminder tools continue to show claimed
+  work as `scheduled`; the transient SQLite custody state is not part of the
+  public lifecycle.
+
+## [2.0.0a3] — 2026-08-12
+
+> Staging-only prompt candidate for manual conversation validation.
+
+### Changed
+
+- **Agent communication now follows concise standing guidance.** Concrete
+  Inbox work defaults to a useful response or clarification, multi-Agent work
+  uses lightweight claims, thread routing is explicit, and the former
+  four-outcome `decide-response` skill is no longer installed.
+
+## [2.0.0a2] — 2026-08-12
+
+> Pre-release candidate for staging validation only. It is not the stable
+> `2.0.0` release and supersedes the TestPyPI-only `2.0.0a1` candidate.
+
+### Added
+
+- **Keyless Agents can durably ask their operator about foreign DMs and space
+  invitations.** Approval decisions survive restart and replay through the
+  bridge without giving the model transport credentials.
+
+- **Every Agent workspace exposes the Puffo-home collaboration directory as
+  `shared/`.** Existing Agents are repaired during daemon reconciliation,
+  Docker retains `.shared` as a compatibility alias, and existing conflicting
+  files are preserved rather than overwritten.
+
+### Fixed
+
+- **Restored Agent Foundation compatibility needed for staging.** Docker Codex,
+  Windows Claude shim launch handling, legacy daemon stop requests, Global
+  Inbox status lifecycle, local Runtime Event status, telemetry privacy, and
+  optional context baselines now follow the post-`2.0.0a1` contracts.
+
+- **Shared-workspace attachments retain the workspace escape boundary.** The
+  managed `shared/` target is accepted explicitly while unrelated symlink
+  escapes remain rejected.
+
+## [2.0.0a1] — 2026-08-11
+
+> Pre-release published to TestPyPI for staging validation only. It is not the
+> stable `2.0.0` release. It supersedes the incorrectly numbered,
+> TestPyPI-only `1.3.0a1` artifact; no stable `1.3.0` was published.
+
+### Added
+
+- **A durable Global Inbox now coordinates work across spaces and targets.**
+  Inbound messages are persisted before acknowledgement, batched into
+  metadata-only wake notices, admitted into turns through explicit reads, and
+  recovered safely after restarts.
+
+- **Native and keyless cloud Agents now share coordinated channel sends.**
+  Freshness checks can hold stale drafts, recover the blocking context, and let
+  the model revise, wait, remain silent, or explicitly send anyway without
+  exposing sequence ownership to the model.
+
+- **Keyless cloud Agents now use a scoped Server bridge.** The bridge supports
+  backfill, acknowledgements, authoritative channel sequences, attachments,
+  runtime commands, status, and the same model-facing Inbox and MCP behavior as
+  native Agents.
+
+- **One-shot reminders survive offline periods.** Local scheduling is backed by
+  encrypted Server snapshots, renewable delivery claims, reconstruction,
+  cancellation, and replacement semantics.
+
+- **Agent memory now has bounded briefing, notes, recollection, and import
+  areas.** Semantic MCP tools provide controlled reads, writes, search,
+  refresh, reload, and Git-backed history.
+
+- **Runtime lifecycle metadata is durable and replayable.** Codex app-server and
+  Claude Code stream-json events are normalized behind one Driver contract.
+  Only fixed-vocabulary lifecycle, tool, permission, and terminal metadata is
+  uploaded in bounded idempotent batches; assistant output remains local unless
+  a future end-to-end encrypted content contract is introduced.
+
+### Changed
+
+- **The runtime foundation now has two long-lived local Drivers and one Docker
+  compatibility runtime.** Local Claude Code uses stream-json, local Codex uses
+  app-server, and Docker supports Claude Code only. Docker Codex and the
+  Hermes/Gemini execution paths are no longer admitted; their names remain
+  design-only so stale configs fail with an explicit diagnostic.
+
+- **Port 63387 is now exclusively the loopback ws-local service.** The retired
+  browser-facing Local Bridge, its pairing/API commands, and the
+  `--with-local-bridge` startup flag have been removed.
+
+## [1.2.0] — 2026-08-10
+
+### Added
+
+- **Codex agents now report and control their live context window.** Local and
+  Docker workers persist the model-reported maximum and selected compact point,
+  attach current usage to completed-turn events, and translate per-agent
+  compact percentages into Codex app-server session limits. The default follows
+  Codex's model-derived limit, while 75%, 50%, or 30% overrides are available.
+
+- **Per-agent Claude Code auto-compaction controls and context telemetry.**
+  Operators can select Claude's session-reported default or an earlier 75%,
+  50%, or 30% threshold for local and Docker CLI agents. The desktop and web
+  interfaces show the session's actual context window and compact point, while
+  completed turns report live usage without persisting it as runtime config.
+
+- **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
+  runs `codex app-server` in its own container while reusing the
+  operator's Codex account credentials. Per-agent Codex state, skills,
+  Puffo MCP tools, and container-reachable host MCP registrations are
+  mounted or synchronized into the runtime.
+
+### Changed
+
+- **Claude Code auto-compaction now uses the supported token-window CLI flag.**
+  The existing 30%, 50%, and 75% controls are translated to
+  `--autocompact <tokens>` for local and Docker agents instead of relying on
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. Claude's 100K minimum is enforced, and
+  runtime telemetry reports the effective percentage after that adjustment.
+  The bundled Docker runtime now pins a Claude Code release that supports the
+  flag.
+
+- **Port 63387 is now dedicated to `ws-local` message transport.** The legacy
+  Local Bridge HTTP APIs, pairing commands, and browser-facing management
+  surface have been removed; externally hosted agents continue to attach over
+  the `/v1/ws-local` WebSocket endpoint. Browser-originated WebSocket requests
+  and non-loopback bind addresses are rejected.
+
+- **`cli-docker` now supports only Claude Code and Codex.** Gemini CLI
+  and Hermes were removed from the Docker runtime matrix and bundled
+  image. Hermes remains available through `cli-local`.
+
+### Fixed
+
+- **Claude Code uses subscription authentication unless API-key mode is
+  explicitly enabled.** Ambient `ANTHROPIC_API_KEY` values are ignored for
+  local and Docker CLI agents, including per-agent environment and settings
+  overrides. A daemon-owned `anthropic.api_key` is passed to Claude Code only
+  when `anthropic.cli_use_api_key: true` is set. Operators can manage both
+  values with `puffo-agent config --anthropic-api-key KEY` and
+  `--anthropic-cli-use-api-key true|false`. API-key failures now show the
+  correct recovery steps and clear after the next successful turn.
+
+- **Codex Docker agents can write to their mounted workspace reliably.** The
+  container is now the effective filesystem sandbox, avoiding unsupported
+  nested sandboxing, and resumed local and Docker sessions reapply their
+  working directory and permission policy instead of falling back to
+  read-only access.
+
+- **Claude context telemetry no longer invents limits for unknown models.**
+  A transient context query timeout remains retryable on later turns, while
+  configured compact thresholds remain authoritative because Claude's context
+  query reports its raw default even when an environment override is active.
+
+- **Codex host MCP sync now includes portable OAuth credentials.** Codex
+  agents use the file-backed MCP OAuth store, and `sync_host_mcp()` copies
+  the selected credential into the isolated agent home for both
+  `cli-local` and `cli-docker`. Encrypted OS-keyring credentials are
+  detected and reported instead of being falsely reported as synchronized.
+
+- **Codex Docker workers now discover their synchronized MCP servers.**
+  The in-container Puffo MCP subprocess reads the mounted Codex home
+  instead of retaining an inaccessible host path in `CODEX_HOME`.
+
+- **Docker Desktop is now discovered even when it is missing from the
+  daemon's `PATH`.** Docker uses the same cached resolver as Claude Code
+  and Codex, including an explicit `PUFFO_DOCKER_BIN` override,
+  reconstructed user `PATH`, and known desktop-app locations. Every
+  Docker subprocess uses the resolved absolute path, and the desktop
+  home page now shows that install location instead of the Hermes
+  “Coming soon” placeholder. Live paths and known installations take
+  precedence over the executable-validated, user-writable disk cache.
+
+- **Transient Docker failures no longer trigger container recreation.**
+  Container and harness probes distinguish an explicit stale result
+  from an unavailable Docker daemon, refuse `docker rm -f` when state is
+  unknown, and preserve the host-mounted workspace and Codex session
+  during legitimate rebuilds. Docker control commands now have bounded
+  timeouts and kill and reap their child process on timeout or
+  cancellation.
+
+- **`cli-docker` Codex setup now matches the selected harness.** CLI
+  creation resolves and validates Codex before persisting an OpenAI
+  Docker agent, host Codex skills are synchronized into its isolated
+  home, and remote MCP bearer-token environment variable names are
+  forwarded through `docker exec` without exposing their values.
+  Desired MCP templates with host-only commands are skipped for both
+  container harnesses instead of failing later at first tool use.
+
+- **Codex shell commands now run in the cli-docker workspace.** The
+  app-server process runs through `docker exec`, but new threads
+  previously inherited the daemon's host cwd. On Windows that passed a
+  `C:\\...` path into the Linux container, so even read-only commands
+  failed before shell creation. Container threads now use `/workspace`
+  and rotate legacy sessions that persisted the invalid cwd; switching
+  back to `cli-local` also rotates a container thread whose `/workspace`
+  cwd cannot exist on the host.
+
+- **Puffo MCP tools now start inside `cli-docker`.** The image pins the
+  MCP SDK below 2.0 and includes the complete non-GUI dependency set
+  required by the in-container Puffo MCP server. Previously the server
+  exited during import, leaving tools such as
+  `mcp__puffo__send_message` unavailable to Claude Code.
+
+- **Skill ids ending in a newline are no longer accepted.** The daemon
+  validated ids with Python's `$`, which also matches immediately before
+  a trailing newline, so a name like `my-skill\n` passed on its way to
+  `.claude/skills/` while the server's own constraint rejected it. The
+  gap was reachable — `install_skill` takes its name from an
+  agent-supplied tool call. The anchor is now `\Z`, matching the server.
+  The two copies of the rule, in the desired-skill installer and the MCP
+  host tools, were also folded into one shared constant so they can't
+  drift apart again.
+
+## [1.1.6] — 2026-07-28
+
+### Changed
+
+- **`role_short` is now single-source-derived from `role` (PUF-401).**
+  The chip label is always derived from the `<short>: <description>`
+  role on every write path (bridge, CLI, provision, control-WS, agent
+  detail) instead of being stored independently, so it can no longer
+  orphan a stale value. Explicit `role_short` / `--role-short` is
+  deprecated: still accepted for backward compatibility but ignored,
+  with a warning when the supplied value differs from the derived one.
+  A daemon-startup backfill repairs a stale on-disk `role_short` before
+  the first server sync, so a restart fixes the chip instead of pushing
+  the stale value back.
+
+- **Default agent task timeout raised 600s → 1800s (30 min) (PUF-399).**
+  `runtime.task_timeout_seconds` — the per-agent per-turn wall-clock
+  budget — now defaults to 30 minutes so long-running projects aren't
+  cut off at 10 min. Operators can still override it per-agent in
+  `agent.yml`; only the default changed.
+
+### Added
+
 - **Plaintext (non-E2EE) sending.** Agent replies now go out as
   plaintext envelopes by default. The daemon decides per send: if the
   turn's triggering bundle contained an encrypted message, or the
@@ -17,6 +777,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   outside any turn use the plaintext default. Applies to all send
   paths (LLM replies, MCP tools, daemon system DMs); attachments
   remain encrypted blob references.
+
+### Fixed
+
+- **Cap `mcp` below 2.0.** The 2.x SDK dropped the bundled
+  `mcp.server.fastmcp`; pin `mcp>=1.0,<2` until the tool servers move
+  to the standalone `fastmcp` package.
 
 ## [1.1.5] — 2026-07-23
 
@@ -4197,7 +4963,13 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.10.0a2...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.2
+[2.0.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.1
+[2.0.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0
+[2.0.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a2
+[2.0.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a1
+[1.2.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v1.2.0
 [0.10.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a2
 [0.10.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3

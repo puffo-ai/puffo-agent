@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from ..portal.host_assets import (
+    _atomic_write_private,
+    _ensure_private_directory,
+    _set_private_file_mode,
+)
 from ..portal.state import home_dir
 from .encoding import base64url_decode, base64url_encode
 
@@ -91,15 +98,134 @@ class KeyStore:
     def _session_path(self, slug: str) -> Path:
         return self.base_dir / f"{slug}.session.json"
 
+    def _message_backup_dek_path(self, slug: str) -> Path:
+        """Private v1 custody path for an Agent-owned remote-data DEK."""
+        if (
+            not isinstance(slug, str)
+            or not slug
+            or "/" in slug
+            or "\\" in slug
+            or slug in {".", ".."}
+        ):
+            raise ValueError("invalid key owner")
+        return self.base_dir / f"{slug}.message-backup-dek-v1"
+
+    @staticmethod
+    def _read_private_32_byte_key(path: Path) -> bytes:
+        """Read one regular 0600-ish key file without following links."""
+        try:
+            before = os.lstat(path)
+        except FileNotFoundError:
+            raise
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("message backup key is not a regular file")
+        if os.name != "nt" and before.st_mode & 0o077:
+            raise ValueError("message backup key file permissions are unsafe")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags)
+        try:
+            current = os.fstat(fd)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or current.st_ino != before.st_ino
+                or current.st_dev != before.st_dev
+                or (os.name != "nt" and current.st_mode & 0o077)
+            ):
+                raise ValueError("message backup key file changed unsafely")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 64)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if sum(len(part) for part in chunks) > 32:
+                    break
+            key = b"".join(chunks)
+        finally:
+            os.close(fd)
+        if len(key) != 32:
+            raise ValueError("message backup key has invalid length")
+        return key
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Best-effort durability for an atomic key publication on POSIX."""
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def load_or_create_message_backup_dek(self, slug: str) -> bytes:
+        """Return one stable random 32-byte MessageBackupDEK for this Agent.
+
+        It lives beside the Agent's existing private key state, never in
+        ``messages.db`` or an identity/session JSON file.  A prepared 0600
+        temporary file is hard-linked into place, so competing first opens
+        either publish exactly one complete key or load that complete key.
+        """
+        path = self._message_backup_dek_path(slug)
+        _ensure_private_directory(self.base_dir)
+        try:
+            return self._read_private_32_byte_key(path)
+        except FileNotFoundError:
+            pass
+
+        temporary = self.base_dir / (
+            f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
+        )
+        fd: int | None = None
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(temporary, flags, 0o600)
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            key = os.urandom(32)
+            written = 0
+            while written < len(key):
+                count = os.write(fd, key[written:])
+                if count <= 0:
+                    raise OSError("failed to write message backup key")
+                written += count
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            try:
+                # link(2) creates the destination atomically and refuses to
+                # replace a concurrent creator's file.
+                os.link(temporary, path)
+            except FileExistsError:
+                return self._read_private_32_byte_key(path)
+            self._fsync_directory(self.base_dir)
+            return key
+        finally:
+            if fd is not None:
+                os.close(fd)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
     def save_identity(self, identity: StoredIdentity) -> None:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(self.base_dir)
         path = self._identity_path(identity.slug)
-        path.write_text(json.dumps(identity.to_dict(), indent=2))
+        _atomic_write_private(path, json.dumps(identity.to_dict(), indent=2))
 
     def load_identity(self, slug: str) -> StoredIdentity:
         path = self._identity_path(slug)
         if not path.exists():
             raise FileNotFoundError(f"identity not found: {slug}")
+        _ensure_private_directory(self.base_dir)
+        _set_private_file_mode(path)
         return StoredIdentity.from_dict(json.loads(path.read_text()))
 
     def list_identities(self) -> list[str]:
@@ -126,9 +252,9 @@ class KeyStore:
         path.unlink()
 
     def save_session(self, session: Session) -> None:
-        self.base_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_private_directory(self.base_dir)
         path = self._session_path(session.slug)
-        path.write_text(json.dumps({
+        _atomic_write_private(path, json.dumps({
             "slug": session.slug,
             "subkey_id": session.subkey_id,
             "subkey_secret_key": session.subkey_secret_key,
@@ -139,6 +265,8 @@ class KeyStore:
         path = self._session_path(slug)
         if not path.exists():
             raise FileNotFoundError(f"session not found: {slug}")
+        _ensure_private_directory(self.base_dir)
+        _set_private_file_mode(path)
         d = json.loads(path.read_text())
         session = Session(
             slug=d["slug"],

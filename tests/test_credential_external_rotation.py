@@ -5,8 +5,8 @@ FileBackend's symlink-propagation assumption doesn't hold.
 - backends expose a ``fingerprint`` so the refresher can spot the change
 - the refresher fires refresh-success on a detected change (not on the
   first/baseline tick)
-- the daemon's on_refresh_success restarts agents that were auth_failed
-  so their claude session respawns with the fresh credential
+- the daemon's on_refresh_success reloads healthy and auth-failed provider
+  runtimes at an idle boundary without restarting the whole agent
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from puffo_agent.portal.credential_refresh import (
     CodexFileBackend,
     CredentialRefresher,
     FileBackend,
+    RefreshOutcome,
 )
 
 
@@ -68,23 +69,90 @@ def test_detect_fires_on_fingerprint_change(tmp_path, monkeypatch):
     r = CredentialRefresher(host_home=tmp_path)
     fired: list[int] = []
     r.register_on_refresh_success(lambda: fired.append(1))
+    r._consecutive_non_success = 3
 
     seq = {"fp": (1, 10)}
     monkeypatch.setattr(r.backend, "fingerprint", lambda: seq["fp"])
 
-    # No baseline yet → no fire.
+    # No baseline yet → establish it without firing.
     r._detect_external_rotation()
     assert fired == []
+    assert r._last_handled_credential_revision == (1, 10)
 
-    r._record_cred_fingerprint()        # baseline = (1, 10)
     seq["fp"] = (2, 11)                  # operator re-login
     r._detect_external_rotation()
     assert fired == [1]
+    assert r._last_handled_credential_revision == (2, 11)
+    assert r._consecutive_non_success == 0
 
     # Unchanged on the next tick → no re-fire.
-    r._record_cred_fingerprint()        # baseline = (2, 11)
     r._detect_external_rotation()
     assert fired == [1]
+
+
+def test_first_credential_after_missing_startup_baseline_fires(
+    tmp_path, monkeypatch,
+):
+    r = CredentialRefresher(host_home=tmp_path)
+    fired: list[int] = []
+    r.register_on_refresh_success(lambda: fired.append(1))
+
+    revision = {"current": None}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+
+    assert r._detect_external_rotation() is False
+    assert r._credential_revision_initialized is True
+    assert r._last_handled_credential_revision is None
+
+    revision["current"] = (1, 10)
+    assert r._detect_external_rotation() is True
+    assert fired == [1]
+    assert r._last_handled_credential_revision == (1, 10)
+
+
+def test_rotation_is_retried_until_views_and_reload_dispatch_succeed(
+    tmp_path, monkeypatch,
+):
+    r = CredentialRefresher(host_home=tmp_path)
+    agent_home = tmp_path / "agent"
+    r.register_agent(agent_home)
+
+    revision = {"current": (1, 10)}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+    assert r._detect_external_rotation() is False
+
+    sync_ok = {"value": False}
+    monkeypatch.setattr(
+        r.backend, "sync_to_agent", lambda _home: sync_ok["value"],
+    )
+    callback_ok = {"value": False}
+    fired: list[int] = []
+
+    def reload_provider():
+        fired.append(1)
+        if not callback_ok["value"]:
+            raise OSError("reload flag unavailable")
+
+    r.register_on_refresh_success(reload_provider)
+    revision["current"] = (2, 11)
+
+    assert r._detect_external_rotation() is False
+    assert fired == []
+    assert r._last_handled_credential_revision == (1, 10)
+
+    sync_ok["value"] = True
+    assert r._detect_external_rotation() is False
+    assert fired == [1]
+    assert r._last_handled_credential_revision == (1, 10)
+
+    callback_ok["value"] = True
+    assert r._detect_external_rotation() is True
+    assert fired == [1, 1]
+    assert r._last_handled_credential_revision == (2, 11)
 
 
 @pytest.mark.asyncio
@@ -98,7 +166,38 @@ async def test_first_tick_establishes_baseline_without_firing(tmp_path):
 
     await r._tick()
     assert fired == []
-    assert r._last_cred_fingerprint is not None
+    assert r._last_handled_credential_revision is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", [RefreshOutcome.FAILED, RefreshOutcome.UNCHANGED],
+)
+async def test_rotation_during_non_success_refresh_is_not_lost(
+    tmp_path, monkeypatch, outcome,
+):
+    """An operator login racing a failed refresh must still reload providers."""
+    _write_creds(tmp_path, expires_in_seconds=3600)
+    r = CredentialRefresher(host_home=tmp_path)
+    fired: list[int] = []
+    r.register_on_refresh_success(lambda: fired.append(1))
+
+    revision = {"current": (1, 10)}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+    r._detect_external_rotation()  # startup baseline
+
+    async def refresh_while_operator_logs_in():
+        revision["current"] = (2, 11)
+        return outcome
+
+    monkeypatch.setattr(r.backend, "refresh", refresh_while_operator_logs_in)
+
+    await r._tick(triggered_by_agent=True)
+
+    assert fired == [1]
+    assert r._last_handled_credential_revision == (2, 11)
 
 
 # ── daemon: restart auth_failed agents on recovery ─────────────────
@@ -108,8 +207,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
     from puffo_agent.portal import daemon as daemon_module
     from puffo_agent.portal.state import RuntimeState
 
-    flag = tmp_path / "restart.flag"
-    monkeypatch.setattr(daemon_module, "restart_flag_path", lambda aid: flag)
+    flag = tmp_path / "refresh_provider_auth.flag"
+    monkeypatch.setattr(
+        daemon_module, "refresh_provider_auth_flag_path", lambda workspace: flag,
+    )
 
     class _StubRefresher:
         def __init__(self):
@@ -124,6 +225,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
     class _StubAgentCfg:
         id = "t-agent"
 
+        @staticmethod
+        def resolve_workspace_dir():
+            return tmp_path / "workspace"
+
         class runtime:
             harness = "claude-code"
 
@@ -135,6 +240,11 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
         _refresh_success_callback = None
+        refresh_notifications = 0
+
+        @classmethod
+        def notify_refresh(cls):
+            cls.refresh_notifications += 1
 
     class _StubDaemon:
         refresher = _StubRefresher()
@@ -152,17 +262,19 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
     return d, w, flag
 
 
-def test_on_refresh_success_restarts_auth_failed_agent(tmp_path, monkeypatch):
+def test_on_refresh_success_reloads_auth_failed_agent(tmp_path, monkeypatch):
     d, w, flag = _daemon_harness(monkeypatch, tmp_path, "auth_failed")
     d.refresher.callback()
     assert w.runtime.health == "ok"
-    assert flag.exists()        # restart requested to pick up new cred
+    assert flag.exists()
+    assert w.refresh_notifications == 1
 
 
-def test_on_refresh_success_no_restart_when_healthy(tmp_path, monkeypatch):
+def test_on_refresh_success_reloads_healthy_agent(tmp_path, monkeypatch):
     d, w, flag = _daemon_harness(monkeypatch, tmp_path, "ok")
     d.refresher.callback()
-    assert not flag.exists()    # nothing to recover → no restart
+    assert flag.exists()
+    assert w.refresh_notifications == 1
 
 
 # ── new message while auth_failed wakes the refresher ──────────────

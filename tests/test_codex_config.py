@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tomllib
@@ -12,6 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from puffo_agent.mcp.config import (
     _toml_escape,
     _toml_key,
+    write_cli_mcp_config,
     write_codex_mcp_config,
 )
 
@@ -41,6 +43,22 @@ def test_round_trip_full_doc(tmp_path):
     assert puffo["env"]["PUFFO_CORE_SLUG"] == "alice-noun-abcd"
     assert puffo["env"]["PUFFO_WORKSPACE"] == "/tmp/work"
     assert puffo["env"]["PYTHONUSERBASE"] == "/Users/op/.local"
+    if os.name != "nt":
+        assert dest.stat().st_mode & 0o777 == 0o600
+
+
+def test_cli_config_with_secret_env_is_owner_only(tmp_path):
+    dest = tmp_path / "mcp.json"
+    write_cli_mcp_config(
+        dest,
+        command="python3",
+        args=["-m", "puffo_agent.mcp.puffo_core_server"],
+        env={"PUFFO_LOCAL_SERVICE_TOKEN": "secret"},
+    )
+
+    assert json.loads(dest.read_text(encoding="utf-8"))["mcpServers"]["puffo"]
+    if os.name != "nt":
+        assert dest.stat().st_mode & 0o777 == 0o600
 
 
 def test_env_omitted_when_empty(tmp_path):
@@ -126,6 +144,7 @@ def test_extra_servers_pass_through_when_puffo_unconfigured(tmp_path):
     write_codex_mcp_config(dest, extra_servers=extras)
     doc = _read_toml(dest)
     assert doc["cli_auth_credentials_store"] == "file"
+    assert doc["mcp_oauth_credentials_store"] == "file"
     servers = doc.get("mcp_servers") or {}
     assert "filesystem" in servers
     assert "puffo" not in servers
@@ -247,3 +266,62 @@ def test_env_keys_with_dots_are_quoted(tmp_path):
     )
     doc = _read_toml(dest)
     assert doc["mcp_servers"]["fs"]["env"]["MY.VAR"] == "value"
+
+
+def test_litellm_provider_block(tmp_path):
+    """Gateway/VK path: a provider dict emits a codex custom model_provider
+    pointing at the LiteLLM gateway with wire_api=responses."""
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(
+        dest,
+        provider={
+            "name": "litellm",
+            "base_url": "https://gw.example/v1",
+            "env_key": "OPENAI_API_KEY",
+            "model": "codex",
+            "wire_api": "responses",
+        },
+    )
+    doc = _read_toml(dest)
+    assert doc["model"] == "codex"
+    assert doc["model_provider"] == "litellm"
+    prov = doc["model_providers"]["litellm"]
+    assert prov["base_url"] == "https://gw.example/v1"
+    assert prov["env_key"] == "OPENAI_API_KEY"
+    assert prov["wire_api"] == "responses"
+    # cli_auth store still emitted (unchanged) — codex file-mode auth.
+    assert doc["cli_auth_credentials_store"] == "file"
+
+
+def test_no_provider_block_when_absent(tmp_path):
+    """OAuth path (no provider) must not emit any model_provider — preserves
+    the existing ChatGPT-OAuth behavior."""
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(dest)
+    raw = dest.read_text(encoding="utf-8")
+    assert "model_provider" not in raw
+    assert "[model_providers" not in raw
+    doc = _read_toml(dest)
+    assert doc["cli_auth_credentials_store"] == "file"
+
+
+def test_provider_coexists_with_puffo_mcp(tmp_path):
+    """Provider block + puffo_core MCP server in one doc still parses (bare
+    keys before all tables)."""
+    dest = tmp_path / "config.toml"
+    write_codex_mcp_config(
+        dest,
+        command="/usr/bin/python3",
+        args=["-m", "puffo_agent.mcp.puffo_core_server"],
+        env={"PUFFO_CORE_SLUG": "bob-verb-1234"},
+        provider={
+            "name": "litellm",
+            "base_url": "https://gw.example/v1",
+            "env_key": "OPENAI_API_KEY",
+            "model": "gpt-5.2-codex",
+        },
+    )
+    doc = _read_toml(dest)
+    assert doc["model_provider"] == "litellm"
+    assert doc["model_providers"]["litellm"]["wire_api"] == "responses"  # default
+    assert doc["mcp_servers"]["puffo"]["env"]["PUFFO_CORE_SLUG"] == "bob-verb-1234"

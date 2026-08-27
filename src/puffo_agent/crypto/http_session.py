@@ -11,11 +11,6 @@ from aiohttp_socks import ProxyConnector
 
 _SOCKS_SCHEMES = {"socks4", "socks4a", "socks5", "socks5h"}
 
-# System store first, certifi on top: some interpreters ship an empty
-# ambient store; corporate-proxy hosts need their OS-installed roots.
-_SSL_CONTEXT = ssl.create_default_context()
-_SSL_CONTEXT.load_verify_locations(cafile=certifi.where())
-
 
 def _env_proxy_for_url(url: str) -> str | None:
     parsed = urlsplit(url)
@@ -31,6 +26,13 @@ def _is_socks_proxy(proxy_url: str) -> bool:
     return urlsplit(proxy_url).scheme.lower() in _SOCKS_SCHEMES
 
 
+def create_remote_ssl_context() -> ssl.SSLContext:
+    """Fresh trust store shared by remote HTTP and WebSocket transports."""
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.load_verify_locations(cafile=certifi.where())
+    return ssl_ctx
+
+
 def create_remote_http_session(
     base_url: str,
     *,
@@ -40,10 +42,19 @@ def create_remote_http_session(
     if timeout is not None:
         kwargs["timeout"] = timeout
 
+    # Fresh TLS trust per session (PUF-192). aiohttp caches its default verified
+    # SSLContext at import (a process-wide singleton). E2B's egress proxy
+    # TLS-intercepts the relay and (re)generates its per-sandbox proxy CA on a
+    # cold restore, so a reused cached context can't verify the intercepted cert
+    # and every request to the relay fails until the process restarts. Building
+    # the context here means a session recreated after a CA change picks the new
+    # CA up — the same fix bridge_client applies at the WS.
+    ssl_ctx = create_remote_ssl_context()
+
     proxy_url = _env_proxy_for_url(base_url)
     if proxy_url and _is_socks_proxy(proxy_url):
-        connector = ProxyConnector.from_url(proxy_url, ssl=_SSL_CONTEXT)
+        connector = ProxyConnector.from_url(proxy_url, ssl=ssl_ctx)
         return aiohttp.ClientSession(connector=connector, trust_env=False, **kwargs)
 
-    connector = aiohttp.TCPConnector(ssl=_SSL_CONTEXT)
+    connector = aiohttp.TCPConnector(ssl=ssl_ctx)
     return aiohttp.ClientSession(connector=connector, trust_env=True, **kwargs)

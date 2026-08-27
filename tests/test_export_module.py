@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from _bridge_support import isolated_home, write_test_agent
+from _portal_support import isolated_home, write_test_agent
 
 
 @pytest.fixture(autouse=True)

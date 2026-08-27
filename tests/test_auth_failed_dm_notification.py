@@ -2,14 +2,12 @@
 ``runtime.health = auth_failed`` ENTER. Fire-once-per-agent-per-
 session, reset on auth_failed CLEAR.
 
-Tests four invariants:
+Tests three invariants:
   1. The bilingual ``format_oauth_expired`` copy contains both
      English + Chinese strands + concrete recovery instructions.
-  2. ``_handle_suppressed_reply`` fires ``on_auth_failed_enter``
-     only on was-ok → auth_failed transition (NOT re-entry).
-  3. ``Worker._on_auth_failed_enter`` is dedup-gated by
+  2. ``Worker._on_auth_failed_enter`` is dedup-gated by
      ``_auth_failed_notification_sent``.
-  4. ``daemon.on_refresh_success`` reset arms the next ENTER.
+  3. ``daemon.on_refresh_success`` reset arms the next ENTER.
 """
 from __future__ import annotations
 
@@ -19,8 +17,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent._invite_strings import format_oauth_expired
-from puffo_agent.portal.state import RuntimeState
-from puffo_agent.portal.worker import _handle_suppressed_reply
 
 
 # ── (1) format_oauth_expired bilingual copy ────────────────────────
@@ -63,102 +59,7 @@ def test_oauth_copy_degrades_when_display_name_missing():
     assert "****" not in text
 
 
-# ── (2) _handle_suppressed_reply on_auth_failed_enter edge ─────────
-
-
-def _make_runtime(health: str = "ok") -> RuntimeState:
-    rt = RuntimeState(status="running", started_at=0, msg_count=0)
-    rt.health = health
-    return rt
-
-
-def test_on_auth_failed_enter_fires_on_fresh_transition(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    rt = _make_runtime("ok")
-    fired: list[int] = []
-
-    def cb():
-        fired.append(1)
-
-    suppressed, _ = _handle_suppressed_reply(
-        "Not logged in · Please run /login",
-        rt,
-        "t-agent",
-        scope="fallback",
-        on_auth_failed_enter=cb,
-    )
-    assert suppressed is True
-    assert rt.health == "auth_failed"
-    assert fired == [1]
-
-
-def test_on_auth_failed_enter_does_NOT_fire_on_re_entry(tmp_path, monkeypatch):
-    """Second 401 on an already auth_failed runtime should NOT fire
-    the ENTER callback. This is the operator's load-bearing
-    "no message storm" invariant."""
-    monkeypatch.chdir(tmp_path)
-    rt = _make_runtime("auth_failed")
-    fired: list[int] = []
-
-    def cb():
-        fired.append(1)
-
-    suppressed, _ = _handle_suppressed_reply(
-        "OAuth token revoked",
-        rt,
-        "t-agent",
-        scope="fallback",
-        on_auth_failed_enter=cb,
-    )
-    assert suppressed is True
-    assert rt.health == "auth_failed"
-    assert fired == []  # dedup: no notification on re-entry
-
-
-def test_on_auth_failed_enter_silent_when_clean_reply(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    rt = _make_runtime("ok")
-    fired: list[int] = []
-
-    def cb():
-        fired.append(1)
-
-    suppressed, _ = _handle_suppressed_reply(
-        "Hello, world.",
-        rt,
-        "t-agent",
-        scope="fallback",
-        on_auth_failed_enter=cb,
-    )
-    assert suppressed is False
-    assert rt.health == "ok"
-    assert fired == []
-
-
-def test_on_auth_failed_enter_callback_exception_does_not_crash(
-    tmp_path, monkeypatch,
-):
-    """If the DM-task-create callback raises, the suppression flow
-    still completes — operator DM is best-effort, runtime state
-    update is load-bearing."""
-    monkeypatch.chdir(tmp_path)
-    rt = _make_runtime("ok")
-
-    def cb():
-        raise RuntimeError("loop closed")
-
-    suppressed, _ = _handle_suppressed_reply(
-        "Not logged in · Please run /login",
-        rt,
-        "t-agent",
-        scope="fallback",
-        on_auth_failed_enter=cb,
-    )
-    assert suppressed is True
-    assert rt.health == "auth_failed"
-
-
-# ── (3) Worker._on_auth_failed_enter dedup gate ────────────────────
+# ── (2) Worker._on_auth_failed_enter dedup gate ────────────────────
 
 
 class _StubLoop:
@@ -235,7 +136,7 @@ def test_worker_reset_arms_next_notify(monkeypatch):
     assert stub_loop.calls == 2
 
 
-# ── (4) _notify_operator_of_auth_failed_oauth client guards ────────
+# ── (3) _notify_operator_of_auth_failed_oauth client guards ────────
 
 
 import asyncio
@@ -419,7 +320,7 @@ def test_oauth_copy_quotes_agent_id_for_markdown_safety():
     assert "`a-b-c`" in text
 
 
-def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
+def test_daemon_on_refresh_success_resets_dedup(monkeypatch, tmp_path):
     """PR #70 nit #1: the daemon's refresh-success closure resets
     ``worker._auth_failed_notification_sent``. The pieces are
     unit-tested individually; this pins the wiring between
@@ -448,11 +349,19 @@ def test_daemon_on_refresh_success_resets_dedup(monkeypatch):
         class puffo_core:
             slug = "alice-0001"
 
+        @staticmethod
+        def resolve_workspace_dir():
+            return tmp_path / "workspace"
+
     class _StubWorker:
         agent_cfg = _StubAgentCfg()
         runtime = RuntimeState(status="running", started_at=0, msg_count=0)
         _auth_failed_notification_sent = True
         _refresh_success_callback = None
+
+        @staticmethod
+        def notify_refresh():
+            pass
 
     class _StubDaemon:
         refresher = _StubRefresher()

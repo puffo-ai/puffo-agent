@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -32,7 +31,9 @@ from .host_tools import (
     _uninstall_skill,
     _write_refresh_model_flag,
 )
+from .memory_tools import MemoryToolsConfig, register_memory_tools
 from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
+from ..portal.local_service_auth import read_local_service_token
 
 logger = logging.getLogger(__name__)
 
@@ -114,24 +115,16 @@ def mcp_tool_fingerprint() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _register_local_tools(
-    mcp: FastMCP,
-    workspace: str,
-    runtime_kind: str = "",
-    harness: str = "",
-) -> None:
-    """Register system/local tools that don't depend on the messaging API."""
+def _require_claude_code(harness: str, tool: str) -> None:
+    if harness and harness != "claude-code":
+        raise RuntimeError(
+            f"{tool} is only supported under the claude-code "
+            f"harness (this agent is using {harness!r})."
+        )
 
-    # Closure harness — the tool's own ``harness`` param shadows it below.
+
+def _register_refresh_tool(mcp: FastMCP, workspace: str, runtime_kind: str, harness: str) -> None:
     agent_current_harness = harness
-
-    def _require_claude_code(tool: str) -> None:
-        if harness and harness != "claude-code":
-            raise RuntimeError(
-                f"{tool} is only supported under the claude-code "
-                f"harness (this agent is using {harness!r})."
-            )
-
     @mcp.tool()
     async def refresh(
         harness: Optional[str] = None,
@@ -187,7 +180,7 @@ def _register_local_tools(
                 ws,
                 harness=harness or "",
                 model=model or "",
-                inference_level=inference_level or "",
+                inference_level=inference_level,
             )
             parts: list[str] = []
             if harness is not None:
@@ -206,26 +199,27 @@ def _register_local_tools(
                 touched.append("refresh_session")
         return "refresh requested: " + ", ".join(touched)
 
+def _register_skill_tools(mcp: FastMCP, workspace: str, harness: str) -> None:
     @mcp.tool()
     async def install_skill(name: str, content: str) -> str:
         """Install a new skill at project scope."""
-        _require_claude_code("install_skill")
+        _require_claude_code(harness, "install_skill")
         dst = _install_skill(Path(workspace), name, content)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
             f"installed skill {name!r} at project scope ({dst}). "
-            "Call refresh() so your next turn picks it up."
+            "Runtime refresh requested; your next turn will pick it up."
         )
-
     @mcp.tool()
     async def uninstall_skill(name: str) -> str:
         """Remove a skill you previously installed."""
-        _require_claude_code("uninstall_skill")
+        _require_claude_code(harness, "uninstall_skill")
         _uninstall_skill(Path(workspace), name)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
-            f"uninstalled skill {name!r}. Call refresh() so your next "
-            "turn stops seeing it."
+            f"uninstalled skill {name!r}. Runtime refresh requested; your "
+            "next turn will stop seeing it."
         )
-
     @mcp.tool()
     async def list_skills() -> str:
         """List every skill available to you, tagged by scope."""
@@ -237,6 +231,7 @@ def _register_local_tools(
             for scope, name in entries
         )
 
+def _register_mcp_tools(mcp: FastMCP, workspace: str, runtime_kind: str, harness: str) -> None:
     @mcp.tool()
     async def install_mcp_server(
         name: str,
@@ -245,27 +240,27 @@ def _register_local_tools(
         env: Optional[dict[str, str]] = None,
     ) -> str:
         """Register a new stdio MCP server at project scope."""
-        _require_claude_code("install_mcp_server")
+        _require_claude_code(harness, "install_mcp_server")
         check_host_local = runtime_kind != "cli-local"
         path = _install_mcp_server(
             Path(workspace), name, command, args, env,
             check_host_local=check_host_local,
         )
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
             f"registered MCP server {name!r} at project scope ({path}). "
-            "Call refresh() so the claude subprocess respawns."
+            "Runtime refresh requested so the provider reloads it."
         )
-
     @mcp.tool()
     async def uninstall_mcp_server(name: str) -> str:
         """Remove an MCP server you previously registered."""
-        _require_claude_code("uninstall_mcp_server")
+        _require_claude_code(harness, "uninstall_mcp_server")
         _uninstall_mcp_server(Path(workspace), name)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
-            f"removed MCP server {name!r}. Call refresh() so the claude "
-            "subprocess respawns without it."
+            f"removed MCP server {name!r}. Runtime refresh requested so the "
+            "provider reloads without it."
         )
-
     @mcp.tool()
     async def list_mcp_servers() -> str:
         """List every MCP server available to you, tagged by scope.
@@ -294,6 +289,31 @@ def _register_local_tools(
                 lines.append(f"{tag} {name}")
         return "\n".join(lines)
 
+def _register_local_tools(
+    mcp: FastMCP,
+    workspace: str,
+    runtime_kind: str = "",
+    harness: str = "",
+) -> None:
+    """Register system/local tools that do not depend on messaging."""
+    _register_refresh_tool(mcp, workspace, runtime_kind, harness)
+    _register_skill_tools(mcp, workspace, harness)
+    _register_mcp_tools(mcp, workspace, runtime_kind, harness)
+
+
+
+
+class _BridgeNoKeysStore(KeyStore):
+    """Bridge transport (T23): the agent holds no local keys. Tools
+    that still hit a signed path get a clear error instead of a
+    FileNotFoundError, until phase 2 rewires them keyless."""
+
+    def load_identity(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
+    def load_session(self, slug: str):
+        raise RuntimeError("bridge transport: agent holds no local keys")
+
 
 def build_server(
     slug: str,
@@ -304,28 +324,44 @@ def build_server(
     workspace: str,
     agent_id: str,
     data_service_url: str,
+    shared_workspace: str = "",
     runtime_kind: str = "",
     harness: str = "",
+    memory_dir: str = "",
+    transport: str = "",
+    local_service_token: str = "",
 ) -> FastMCP:
-    ks = KeyStore(keystore_dir)
-    http = PuffoCoreHttpClient(server_url, ks, slug)
-    data = DataClient(data_service_url, agent_id)
+    ks = (
+        _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
+        else KeyStore(keystore_dir)
+    )
+    # Keyless (T23 bridge) tools do all outbound work over the unsigned
+    # ``/v2/cloud-agents/*`` routes (egress-injected ``x-sandbox-token``),
+    # so the subprocess is self-sufficient with no local keystore. The
+    # ``_BridgeNoKeysStore`` guard above stays as a defensive dead-end for
+    # any residual signed call.
+    http = PuffoCoreHttpClient(
+        server_url, ks, slug, keyless=(transport == "bridge"),
+    )
+    data = DataClient(data_service_url, agent_id, local_service_token)
 
     # None when PUFFO_RPC_URL is unset; tools surface a clear error
     # instead of crashing the whole MCP at startup.
     rpc_url = os.environ.get("PUFFO_RPC_URL", "")
     rpc_client = (
-        PuffoRpcClient(rpc_url, agent_id) if rpc_url else None
+        PuffoRpcClient(rpc_url, agent_id, local_service_token) if rpc_url else None
     )
 
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
+        agent_id=agent_id,
         device_id=device_id,
         keystore=ks,
         http_client=http,
         data_client=data,
         space_id=space_id,
         workspace=workspace,
+        shared_workspace=shared_workspace or None,
         rpc_client=rpc_client,
     )
 
@@ -337,6 +373,17 @@ def build_server(
     )
     register_core_tools(mcp, core_cfg)
     _register_local_tools(mcp, workspace, runtime_kind, harness)
+
+    # Memory root: PUFFO_MEMORY_DIR when set; otherwise the default
+    # AgentConfig layout where memory/ and workspace/ are siblings
+    # under the agent dir. ``maintenance`` stays False here — the
+    # agent-facing server never gets recollection/ write scope.
+    if not memory_dir:
+        memory_dir = str(Path(workspace).parent / "memory")
+    mem_cfg = MemoryToolsConfig(
+        memory_root=memory_dir, workspace=workspace, maintenance=False,
+    )
+    register_memory_tools(mcp, mem_cfg)
     return mcp
 
 
@@ -365,10 +412,14 @@ def _cfg_from_env() -> dict[str, str]:
         "space_id": os.environ.get("PUFFO_CORE_SPACE_ID", ""),
         "keystore_dir": os.environ.get("PUFFO_CORE_KEYSTORE_DIR", ""),
         "workspace": os.environ.get("PUFFO_WORKSPACE", "/workspace"),
+        "shared_workspace": os.environ.get("PUFFO_SHARED_WORKSPACE", ""),
         "agent_id": agent_id,
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),
         "harness": os.environ.get("PUFFO_HARNESS", ""),
+        "memory_dir": os.environ.get("PUFFO_MEMORY_DIR", ""),
+        "transport": os.environ.get("PUFFO_CORE_TRANSPORT", ""),
+        "local_service_token": read_local_service_token(),
     }
 
 

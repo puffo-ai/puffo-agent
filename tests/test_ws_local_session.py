@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,7 +71,7 @@ def _msg(eid: str) -> dict:
 
 def _make_session(transport, queue, reporter, *, acked, replies,
                   now=lambda: 0.0, ack_timeout_s=5.0, ping_interval_s=10.0,
-                  sleep=_never, tool_dispatch=None):
+                  sleep=_never, tool_dispatch=None, capabilities=()):
     async def on_acked(bundle):
         acked.append(bundle)
 
@@ -96,12 +97,33 @@ def _make_session(transport, queue, reporter, *, acked, replies,
         ping_interval_s=ping_interval_s,
         sleep=sleep,
         make_run_id=lambda: "run_x",
+        capabilities=capabilities,
     )
 
 
 def _counter_queue() -> BundleQueue:
     seq = itertools.count(1)
     return BundleQueue(make_id=lambda: f"bdl_{next(seq)}")
+
+
+def _planned_turn() -> SimpleNamespace:
+    return SimpleNamespace(
+        turn_id="turn_1",
+        items=[SimpleNamespace(envelope_id="a", content="hello")],
+        targets=[("sp", "ch", "")],
+        routes=[
+            SimpleNamespace(
+                envelope_id="a",
+                kind="channel",
+                space_id="sp",
+                channel_id="ch",
+                thread_root_id="",
+                dm_peer="",
+            )
+        ],
+        notice_generation=0,
+        target_summary="{}",
+    )
 
 
 # ── happy path ───────────────────────────────────────────────────────────────
@@ -361,15 +383,53 @@ async def test_ack_after_end_is_noop():
 async def test_unknown_end_id_is_ignored():
     t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
     acked, replies = [], []
-    sess = _make_session(t, q, r, acked=acked, replies=replies)
+    sess = _make_session(
+        t,
+        q,
+        r,
+        acked=acked,
+        replies=replies,
+        capabilities=("multi-target-v2", "explicit-admission-v2"),
+    )
     task = asyncio.ensure_future(sess.run())
     await asyncio.sleep(0)
-    await sess.deliver("r1", _msg("a"), {"channel_id": "c"})
+    await sess.deliver_planned(_planned_turn())
     t.feed({"type": "end", "bundle_id": "bdl_nope"})
     t.feed_close()
     await task
     assert acked == []
     assert q.has_inflight is False  # rolled back on close, not advanced
+    assert not any(frame.get("type") == "error" for frame in t.sent)
+
+
+@pytest.mark.asyncio
+async def test_v2_end_before_admission_requeues_and_closes_connection():
+    t, q, r = FakeTransport(), _counter_queue(), FakeReporter()
+    acked, replies = [], []
+    sess = _make_session(
+        t,
+        q,
+        r,
+        acked=acked,
+        replies=replies,
+        capabilities=("multi-target-v2", "explicit-admission-v2"),
+    )
+    task = asyncio.ensure_future(sess.run())
+    await asyncio.sleep(0)
+    await sess.deliver_planned(_planned_turn())
+
+    t.feed({"type": "end", "bundle_id": "bdl_1"})
+    await task
+
+    assert not sess.alive
+    assert t.closed
+    assert acked == []
+    assert not q.has_inflight
+    assert q.pending_count() == 1
+    assert t.sent[-1] == {
+        "type": "error",
+        "reason": "v2 bundle ended before explicit admission",
+    }
 
 
 @pytest.mark.asyncio

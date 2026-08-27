@@ -7,6 +7,7 @@ envelope, and asserts the machine verifies, decrypts, and rejects tampering.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -78,6 +79,9 @@ def test_machine_identity_is_stable(home):
     b = store.load_or_create_machine()
     assert a.machine_id == b.machine_id
     assert a.machine_id.startswith("mac_")
+    if os.name != "nt":
+        assert store.control_dir().stat().st_mode & 0o777 == 0o700
+        assert (store.control_dir() / "machine.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_control_cert_verifies_and_pins_operator(home):
@@ -144,5 +148,7 @@ def test_pairing_persist_round_trip(home):
     )
     store.save_pairing(p)
     assert store.get_pairing("operator-0001").operator_root_pubkey == "oprootpk"
+    if os.name != "nt":
+        assert (store.control_dir() / "pairings.json").stat().st_mode & 0o777 == 0o600
     assert store.delete_pairing("operator-0001") is True
     assert store.get_pairing("operator-0001") is None

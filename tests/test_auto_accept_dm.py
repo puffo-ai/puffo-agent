@@ -5,14 +5,11 @@ both mutation paths (CLI + linked-machine control op)."""
 
 from __future__ import annotations
 
-import argparse
-import json
 import logging
-from pathlib import Path
 
 import pytest
 
-from _bridge_support import isolated_home
+from _portal_support import isolated_home
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -178,26 +175,113 @@ def test_pending_dm_approvals_non_dict_json_returns_empty(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Keyless resumable approval record (backward compatible)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "server_seq, prompt_envelope_id, prompt_thread_id",
+    [
+        (None, None, None),
+        (41, "prompt_env_1", "prompt_thread_1"),
+    ],
+)
+def test_keyless_approval_record_round_trip_and_rejects_malformed(
+    tmp_path, server_seq, prompt_envelope_id, prompt_thread_id,
+):
+    """A validated keyless approval record round-trips through the shared
+    pending file, malformed keyless records are rejected, and legacy native
+    records keep loading unchanged.
+
+    The bridge orchestrator later keys a resumable approval by held envelope,
+    so a restart must reproduce every field exactly (including an absent
+    server sequence) or the reply cannot be correlated. The malformed cases
+    guard silent corruption: a hand-edited or half-written keyless record
+    must never resurface as approval state. The legacy row pins that the
+    same file keeps loading native records untouched.
+    """
+    isolated_home()
+    from puffo_agent.portal.state import agent_dir
+    from puffo_agent.agent.dm_approvals import (
+        KEYLESS_APPROVAL_KIND,
+        KeylessDmApproval,
+        load_pending_dm_approvals,
+        parse_keyless_approval,
+        save_pending_dm_approvals,
+    )
+
+    agent_dir("alpha").mkdir(parents=True, exist_ok=True)
+    record = KeylessDmApproval(
+        envelope_id="held_env_1",
+        sender_slug="mallory-9",
+        operator_slug="op-1",
+        server_seq=server_seq,
+        prompt_client_ref="prompt-ref-abc",
+        prompt_envelope_id=prompt_envelope_id,
+        prompt_thread_id=prompt_thread_id,
+        decision="pending",
+        phase="pending",
+    )
+    pending = {
+        record.envelope_id: record.to_dict(),
+        # One legacy native prompt record must keep loading unchanged.
+        "native_prompt_env_1": {
+            "sender_slug": "alice-1234",
+            "sender_display_name": "Alice",
+        },
+        # Malformed keyless records must be rejected, not resurfaced.
+        "bad_env_1": {
+            "kind": KEYLESS_APPROVAL_KIND,
+            "envelope_id": "bad_env_1",
+            "sender_slug": "mallory-9",
+            "operator_slug": "op-1",
+            "server_seq": "not-an-int",
+            "prompt_client_ref": "prompt-ref",
+            "decision": "pending",
+            "phase": "pending",
+        },
+        "bad_env_2": {
+            "kind": KEYLESS_APPROVAL_KIND,
+            "envelope_id": "wrong-key",
+            "sender_slug": "mallory-9",
+            "operator_slug": "op-1",
+            "server_seq": None,
+            "prompt_client_ref": "prompt-ref",
+            "decision": "maybe",  # not in the exact decision vocabulary
+            "phase": "pending",
+        },
+    }
+    save_pending_dm_approvals("alpha", pending)
+    loaded = load_pending_dm_approvals("alpha")
+
+    assert parse_keyless_approval(loaded[record.envelope_id]) == record
+    assert loaded["native_prompt_env_1"] == {
+        "sender_slug": "alice-1234",
+        "sender_display_name": "Alice",
+    }
+    assert "bad_env_1" not in loaded
+    assert "bad_env_2" not in loaded
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Gate logic — manual client surgery, no WS / HTTP
 # ─────────────────────────────────────────────────────────────────────
 
 
-def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
-    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
-
-    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
-    client.slug = "agent-1"
-    client.operator_slug = operator_slug
-    client.auto_accept_dm = auto_accept_dm
-    client._pending_dm_approvals = {}
-    client._last_dm_sender = ""
-    client._log = logging.getLogger("auto-accept-dm-test")
-
+def _attach_http_stubs(client) -> None:
     sent_dms: list[dict] = []
 
-    async def _stub_send_dm(slug, text, root_id):  # mirror real _send_dm arity
+    async def _stub_send_dm(
+        slug, text, root_id, *, require_encryption=False,
+    ):
         env_id = f"prompt_env_{len(sent_dms) + 1}"
-        sent_dms.append({"to": slug, "text": text, "root_id": root_id, "env_id": env_id})
+        sent_dms.append({
+            "to": slug,
+            "text": text,
+            "root_id": root_id,
+            "env_id": env_id,
+            "require_encryption": require_encryption,
+        })
         return {"envelope_id": env_id}
 
     async def _stub_fetch_user_profile(slug, *, force_refresh=False):
@@ -237,6 +321,15 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     client._fetch_user_profile = _stub_fetch_user_profile  # type: ignore[assignment]
     client._fetch_owner_slug = _stub_fetch_owner_slug  # type: ignore[assignment]
     client._owner_of = owner_of  # type: ignore[attr-defined]  # tests inject owners
+    client._sent_dms = sent_dms  # type: ignore[attr-defined]
+    client._posts = posts  # type: ignore[attr-defined]
+    client._deletes = deletes  # type: ignore[attr-defined]
+    client._gets = gets  # type: ignore[attr-defined]
+    client._pending_rows = pending_rows  # type: ignore[attr-defined]
+    client._spaces_rows = spaces_rows  # type: ignore[attr-defined]
+
+
+def _attach_ws_stub(client) -> None:
 
     # Stub WS whose on_message the drain feeds re-fetched envelopes through.
     handled: list[dict] = []
@@ -248,9 +341,20 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     class _StubWs:
         on_message = None
 
+        async def dispatch_delivery(self, item):
+            from types import SimpleNamespace
+            from puffo_agent.crypto.ws_client import TransportOutcome
+
+            handled.append(item["envelope"])
+            return SimpleNamespace(outcome=TransportOutcome.ACK)
+
     ws = _StubWs()
     ws.on_message = _stub_on_message  # type: ignore[assignment]
     client._ws = ws  # type: ignore[assignment]
+    client._handled = handled  # type: ignore[attr-defined]
+
+
+def _attach_notice_and_roster_stubs(client) -> None:
 
     class _StubNoticeStore:
         def __init__(self):
@@ -280,14 +384,21 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
 
     client._get_space_members = _stub_get_space_members  # type: ignore[assignment]
     client._space_members_stub = space_members  # type: ignore[attr-defined]
-    client._spaces_rows = spaces_rows  # type: ignore[attr-defined]
 
-    client._sent_dms = sent_dms  # type: ignore[attr-defined]
-    client._posts = posts  # type: ignore[attr-defined]
-    client._deletes = deletes  # type: ignore[attr-defined]
-    client._gets = gets  # type: ignore[attr-defined]
-    client._pending_rows = pending_rows  # type: ignore[attr-defined]
-    client._handled = handled  # type: ignore[attr-defined]
+
+def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    client.slug = "agent-1"
+    client.operator_slug = operator_slug
+    client.auto_accept_dm = auto_accept_dm
+    client._pending_dm_approvals = {}
+    client._last_dm_sender = ""
+    client._log = logging.getLogger("auto-accept-dm-test")
+    _attach_http_stubs(client)
+    _attach_ws_stub(client)
+    _attach_notice_and_roster_stubs(client)
     return client
 
 
@@ -476,7 +587,9 @@ async def test_gate_skips_when_operator_slug_missing(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_gate_delivers_ungated_when_prompt_send_fails(tmp_path):
+async def test_gate_holds_gated_when_prompt_send_fails(tmp_path):
+    """Approval is a control plane: an unreachable operator (e.g. zero
+    encryption devices → the DM send raises) must not open the gate."""
     isolated_home()
     from puffo_agent.portal.state import agent_dir
 
@@ -490,13 +603,14 @@ async def test_gate_delivers_ungated_when_prompt_send_fails(tmp_path):
     handled = await client._maybe_gate_foreign_dm(
         sender_slug="alice-1234", text="hi",
     )
-    # Prompt couldn't be sent → deliver ungated rather than swallow the DM.
-    assert handled is False
+    # Prompt couldn't be sent → hold the DM gated (fail-closed). No
+    # pending entry is recorded, so the next DM retries the prompt.
+    assert handled is True
     assert client._pending_dm_approvals == {}
 
 
 @pytest.mark.asyncio
-async def test_gate_delivers_ungated_when_prompt_has_no_envelope_id(tmp_path):
+async def test_gate_holds_gated_when_prompt_has_no_envelope_id(tmp_path):
     isolated_home()
     from puffo_agent.portal.state import agent_dir
 
@@ -510,7 +624,7 @@ async def test_gate_delivers_ungated_when_prompt_has_no_envelope_id(tmp_path):
     handled = await client._maybe_gate_foreign_dm(
         sender_slug="alice-1234", text="hi",
     )
-    assert handled is False
+    assert handled is True
     assert client._pending_dm_approvals == {}
 
 
@@ -669,29 +783,6 @@ async def test_outbound_dm_to_already_allowed_peer_is_noop():
     assert client._sent_dms == []
 
 
-def test_blocked_channel_message_drop_is_wired_in_handle_envelope():
-    """handle_envelope is a closure inside listen(); pin the blocked-
-    sender channel-drop branch at source level so a revert can't slip
-    past the unit tests (the full path is exercised by live smoke)."""
-    import inspect
-    from puffo_agent.agent import puffo_core_client as pcc
-
-    src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
-    assert 'payload.envelope_kind != "dm"' in src
-    assert "_contacts.is_blocked(payload.sender_slug)" in src
-    assert "_BLOCKED_MESSAGE_PLACEHOLDER" in src
-
-
-def test_gate_consults_contact_cache_for_allowlist():
-    """The DM gate must bypass allowlisted senders via the shared cache
-    (not an ad-hoc set), so an operator/MCP allowlist takes effect."""
-    import inspect
-    from puffo_agent.agent import puffo_core_client as pcc
-
-    src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
-    assert "await self._contacts.is_allowed(payload.sender_slug)" in src
-
-
 # ─────────────────────────────────────────────────────────────────────
 # DM Gate ladder: trusted contacts, shared-space pass, 72h FYI
 # ─────────────────────────────────────────────────────────────────────
@@ -801,35 +892,6 @@ async def test_dm_notice_noop_without_operator():
     assert client._sent_dms == []
 
 
-def test_gate_ladder_wiring_order():
-    """handle_envelope's ladder order is the contract: blocked-DM drop
-    before persistence; FYI before the permission prompt; shared-space
-    check gates the prompt."""
-    import inspect
-    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
-    src = inspect.getsource(PuffoCoreMessageClient)
-    drop = src.index("dm_gate: dropped DM from blocked")
-    store = src.index('"envelope_id": payload.envelope_id', drop)
-    assert drop < store, "blocked-DM drop must precede persistence"
-    fyi = src.index("_maybe_send_dm_notice(payload.sender_slug)")
-    gate = src.index("_maybe_gate_foreign_dm(", fyi)
-    assert fyi < gate, "FYI must precede the permission prompt"
-    shared = src.index("_shares_space_with(payload.sender_slug)")
-    assert fyi < shared < gate, "shared-space pass sits between FYI and gate"
-
-
-def test_gate_ladder_fyi_covers_contacts_too():
-    """FYI exempts only the operator and co-owned agents — an allowlisted
-    contact's DM still notifies, so the is_allowed check must sit AFTER
-    the notice call in the ladder."""
-    import inspect
-    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
-    src = inspect.getsource(PuffoCoreMessageClient)
-    fyi = src.index("_maybe_send_dm_notice(payload.sender_slug)")
-    allowed = src.index("_contacts.is_allowed(payload.sender_slug)", fyi)
-    assert fyi < allowed, "FYI must fire before the contact-pass check"
-
-
 @pytest.mark.asyncio
 async def test_shares_space_skips_malformed_space_rows():
     client = _make_client(auto_accept_dm=False)
@@ -873,14 +935,20 @@ async def test_mcp_get_dm_allowlists_lists_sorted_slugs():
     ]
     tool = mcp._tool_manager._tools["get_dm_allowlists"]
     out = await tool.fn()
-    assert out == "DM allowlist:\n- alice-1234\n- zed-9"
+    assert out == {
+        "context_version": 1,
+        "count": 2,
+        "identities": ["@alice-1234", "@zed-9"],
+    }
 
 
 @pytest.mark.asyncio
 async def test_mcp_get_dm_allowlists_empty():
     mcp, http = _build_mcp_with_tools()
     tool = mcp._tool_manager._tools["get_dm_allowlists"]
-    assert await tool.fn() == "DM allowlist is empty."
+    assert await tool.fn() == {
+        "context_version": 1, "count": 0, "identities": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -892,14 +960,20 @@ async def test_mcp_get_dm_blocklists_filters_user_targets():
         {"target": "user"},  # malformed row skipped
     ]
     tool = mcp._tool_manager._tools["get_dm_blocklists"]
-    assert await tool.fn() == "DM blocklist:\n- spammer-1"
+    assert await tool.fn() == {
+        "context_version": 1,
+        "count": 1,
+        "identities": ["@spammer-1"],
+    }
 
 
 @pytest.mark.asyncio
 async def test_mcp_get_dm_blocklists_empty():
     mcp, http = _build_mcp_with_tools()
     tool = mcp._tool_manager._tools["get_dm_blocklists"]
-    assert await tool.fn() == "DM blocklist is empty."
+    assert await tool.fn() == {
+        "context_version": 1, "count": 0, "identities": [],
+    }
 
 
 def test_mcp_tool_names_include_read_tools():

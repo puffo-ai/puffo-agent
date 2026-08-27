@@ -1,0 +1,791 @@
+"""Keyless cloud-bridge WS client (T23 phase 1, experimental).
+
+Ported from the thin runtime's
+``packages/puffo-agent-cloud/src/puffo_agent_cloud/cloud_client.py``
+(proven in E2B, PR #157) with frame semantics unchanged. The server
+holds all crypto — frames are plaintext JSON, authenticated by the
+``x-sandbox-token`` header. Wire spec:
+``puffo-server/roadmap/cloud-agent/BRIDGE-WIRE-PROTOCOL.md``.
+
+Selected per agent via ``puffo_core.transport: "bridge"`` in agent.yml;
+the default ``"native"`` transport keeps today's signed-crypto path and
+never imports this module. Deliberately does NOT import anything from
+``crypto/`` (slated for deletion once the bridge is the only transport).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import ssl
+import uuid
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+
+import aiohttp
+
+from ..limits import MAX_INBOUND_ATTACHMENT_BYTES
+
+logger = logging.getLogger(__name__)
+
+
+# Module constant (not class attribute) so tests can monkeypatch a
+# short interval. Server recv-timeout is 90s.
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _fresh_tls_context() -> ssl.SSLContext:
+    """A fresh default TLS trust context, rebuilt on every (re)connect.
+
+    aiohttp caches its default verified ``SSLContext`` at import time (the
+    module-level ``connector._SSL_CONTEXT_VERIFIED`` singleton) and reuses it for
+    the whole process. E2B's egress proxy TLS-intercepts the relay host to inject
+    ``x-sandbox-token`` and installs its ``E2B Proxy CA`` into the sandbox system
+    trust store at boot (~boot + 2s). If the daemon imports aiohttp *before* that
+    CA lands — a boot-time race — the cached context never picks it up and every
+    connection to the intercepted relay loops on ``CERTIFICATE_VERIFY_FAILED``
+    until the process is restarted. Building the context here re-reads the system
+    trust store on each call, so a lost boot race self-heals on the next connect.
+    See PUF-192.
+    """
+    return ssl.create_default_context()
+
+
+class BridgeError(Exception):
+    """Server-emitted ``error`` frame (code + message). Categories:
+    ``NO_SUBKEY``, ``NOT_AUTHORIZED``, ``DECRYPT_FAILED``,
+    ``BAD_FRAME``, ``INTERNAL``."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class BridgeClosed(Exception):
+    """Raised when ``send_*`` is called after the WS closed and
+    before reconnect."""
+
+
+class CloudBridgeClient:
+    """One-WS-per-agent plaintext bridge. ``send_*`` methods are
+    request/response (correlated by ``client_ref`` or FIFO);
+    ``frames()`` yields the inbound stream (``message`` /
+    ``pending_delivered`` / uncorrelated ``error``). A background
+    task pumps a heartbeat every 30s (server recv-timeout = 90s)."""
+
+    def __init__(
+        self, cloud_url: str, sandbox_token: str, agent_slug: str,
+    ) -> None:
+        ws_base = cloud_url.replace("http", "ws", 1)
+        self._url = f"{ws_base.rstrip('/')}/v2/cloud-agents/subscribe"
+        # Keep the original http(s):// base for the keyless blob REST
+        # routes (``upload_blob`` / ``download_blob``) — same
+        # ``x-sandbox-token`` auth as the WS, no signed-crypto seam.
+        self._http_base = cloud_url.rstrip("/")
+        self._token = sandbox_token
+        self._slug = agent_slug
+        self._session: aiohttp.ClientSession | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        # client_ref → Future for ack correlation (one ack per send).
+        self._send_acks: dict[str, asyncio.Future] = {}
+        # FIFO of futures awaiting ack_result / spaces / invites (no
+        # client_ref in the spec — only one in-flight at a time).
+        self._ack_result_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._spaces_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._invites_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        # client_ref → Future for decide_invitation_result correlation
+        # (one result per decision send).
+        self._decide_waiters: dict[str, asyncio.Future] = {}
+        self._connected_callbacks: list[Callable[[], Awaitable[None]]] = []
+
+    def add_connected_callback(
+        self, callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._connected_callbacks.append(callback)
+
+    async def connect(self) -> None:
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None),
+        )
+        headers = {"x-sandbox-token": self._token}
+        # F2: guard the whole handshake so EVERY failure path closes the
+        # half-open session/ws — the handshake error, a connector/OS error
+        # or TimeoutError from ws_connect/receive, and each bad-frame
+        # BridgeError. self.close() null-checks _ws/_session, so a pre-
+        # ws_connect failure (session only) still closes cleanly and
+        # leaves self._session is None.
+        try:
+            try:
+                self._ws = await self._session.ws_connect(
+                    self._url, headers=headers, heartbeat=None,
+                    ssl=_fresh_tls_context(),
+                )
+            except aiohttp.WSServerHandshakeError as exc:
+                raise BridgeError(
+                    "HANDSHAKE",
+                    f"WS upgrade failed (status={exc.status}): {exc.message}",
+                ) from exc
+            # Wait for the first frame — must be 'connected'.
+            first = await self._ws.receive(timeout=10.0)
+            if first.type != aiohttp.WSMsgType.TEXT:
+                raise BridgeError(
+                    "HANDSHAKE",
+                    f"expected text 'connected', got {first.type!r}",
+                )
+            try:
+                frame = json.loads(first.data)
+            except json.JSONDecodeError as exc:
+                raise BridgeError(
+                    "HANDSHAKE", f"bad first frame: {exc}",
+                ) from exc
+            if frame.get("type") != "connected":
+                raise BridgeError(
+                    "HANDSHAKE",
+                    f"expected 'connected', got {frame.get('type')!r}",
+                )
+        except BaseException:
+            await self.close()
+            raise
+        logger.info("cloud bridge: WS connected (slug=%s)", self._slug)
+        # Start the heartbeat only after a clean handshake so no failure
+        # path leaves a live heartbeat task behind.
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        for callback in tuple(self._connected_callbacks):
+            try:
+                await callback()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("cloud bridge: connected callback failed: %s", exc)
+
+    async def frames(self) -> AsyncIterator[dict]:
+        # Yields message / pending_delivered / uncorrelated error.
+        # ping swallowed (no reply per spec §5.1); ack / ack_result /
+        # spaces routed to send_*() futures.
+        if self._ws is None:
+            return
+        async for msg in self._ws:
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                if msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    logger.info(
+                        "cloud bridge: WS closing (%s)", msg.type,
+                    )
+                    break
+                continue
+            try:
+                frame = json.loads(msg.data)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "cloud bridge: dropped non-JSON WS frame",
+                )
+                continue
+            kind = frame.get("type", "")
+            if self._route_frame(kind, frame):
+                continue
+            yield frame
+
+    def _route_frame(self, kind: str, frame: dict) -> bool:
+        """Route a correlated response/error frame to its waiter future.
+
+        Returns ``True`` when the frame was consumed by a waiter (or is a
+        swallowed keepalive / uncorrelated diagnostic), so ``frames()``
+        yields only message / pending_delivered / uncorrelated error
+        frames. Sync (no awaits) so it can't interleave with a concurrent
+        ``send_*`` popping or finally-cleaning the same waiter maps.
+        """
+        if kind == "ping":
+            # Server keepalive — no reply per spec §5.1.
+            return True
+        if kind == "ack":
+            client_ref = frame.get("client_ref")
+            if client_ref and client_ref in self._send_acks:
+                fut = self._send_acks.pop(client_ref)
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            # Unsolicited ack (e.g. server-side resend / lost
+            # correlation) — surface it for diagnostics.
+            logger.debug(
+                "cloud bridge: ack with unknown client_ref=%r",
+                client_ref,
+            )
+            return True
+        if kind == "ack_result":
+            if not self._ack_result_waiters.empty():
+                fut = self._ack_result_waiters.get_nowait()
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug("cloud bridge: ack_result with no waiter")
+            return True
+        if kind == "spaces":
+            if not self._spaces_waiters.empty():
+                fut = self._spaces_waiters.get_nowait()
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug("cloud bridge: spaces with no waiter")
+            return True
+        if kind == "invites":
+            if not self._invites_waiters.empty():
+                fut = self._invites_waiters.get_nowait()
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug("cloud bridge: invites with no waiter")
+            return True
+        if kind == "decide_invitation_result":
+            client_ref = frame.get("client_ref")
+            if client_ref and client_ref in self._decide_waiters:
+                fut = self._decide_waiters.pop(client_ref)
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug(
+                "cloud bridge: decide_invitation_result with unknown "
+                "client_ref=%r",
+                client_ref,
+            )
+            return True
+        if kind == "error" and frame.get("client_ref"):
+            # An error correlated to a send — route to that future
+            # as an exception.
+            client_ref = frame["client_ref"]
+            if client_ref in self._send_acks:
+                fut = self._send_acks.pop(client_ref)
+                if not fut.done():
+                    fut.set_exception(BridgeError(
+                        frame.get("code", "ERROR"),
+                        frame.get("message", ""),
+                    ))
+                return True
+            if client_ref in self._decide_waiters:
+                fut = self._decide_waiters.pop(client_ref)
+                if not fut.done():
+                    fut.set_exception(BridgeError(
+                        frame.get("code", "ERROR"),
+                        frame.get("message", ""),
+                    ))
+                return True
+        return False
+
+    async def _heartbeat_loop(self) -> None:
+        while self._ws is not None and not self._ws.closed:
+            try:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                return
+            if self._ws is None or self._ws.closed:
+                return
+            try:
+                await self._ws.send_json({"type": "heartbeat"})
+            except (aiohttp.ClientError, ConnectionError) as exc:
+                logger.warning(
+                    "cloud bridge: heartbeat send failed: %s", exc,
+                )
+                return
+
+    async def _require_ws(self) -> aiohttp.ClientWebSocketResponse:
+        if self._ws is None or self._ws.closed:
+            raise BridgeClosed("WS is not connected")
+        return self._ws
+
+    async def upload_blob(self, data: bytes) -> dict:
+        """Keyless blob upload: POST the raw plaintext bytes to the
+        sandbox blob route, authenticated by ``x-sandbox-token`` (no
+        signed crypto — the server holds the at-rest store). Returns the
+        server ack JSON ``{ blob_id, size_bytes, uploaded_at }``.
+
+        Raises ``BridgeError`` on any non-2xx / transport / bad-body
+        failure so the caller (an outbound attachment send) surfaces a
+        clear tool error rather than silently dropping the file. Opens a
+        short-lived session per call so blob HTTP is independent of the
+        WS lifecycle.
+        """
+        url = f"{self._http_base}/v2/cloud-agents/blobs/upload"
+        headers = {
+            "x-sandbox-token": self._token,
+            "content-type": "application/octet-stream",
+        }
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as session:
+                async with session.post(
+                    url, data=data, headers=headers,
+                    ssl=_fresh_tls_context(),
+                ) as resp:
+                    body = await resp.read()
+                    if resp.status // 100 != 2:
+                        raise BridgeError(
+                            "BLOB_UPLOAD",
+                            f"upload failed (status={resp.status}): "
+                            f"{body[:200]!r}",
+                        )
+                    try:
+                        return json.loads(body)
+                    except json.JSONDecodeError as exc:
+                        raise BridgeError(
+                            "BLOB_UPLOAD",
+                            f"upload returned non-JSON body: {exc}",
+                        ) from exc
+        except aiohttp.ClientError as exc:
+            raise BridgeError(
+                "BLOB_UPLOAD", f"upload transport error: {exc}",
+            ) from exc
+
+    async def download_blob(self, blob_id: str) -> bytes | None:
+        """Keyless blob download by id: GET the raw bytes from the
+        sandbox blob route, authenticated by ``x-sandbox-token`` (no
+        decrypt). Fail-soft — returns ``None`` on any non-200 (404
+        BLOB_NOT_FOUND, 413 FILE_TOO_LARGE, 401 UNAUTHORIZED) or
+        transport error, logging at WARNING; a missing / oversized /
+        unfetchable blob must never crash the inbound turn or the listen
+        loop.
+        """
+        url = f"{self._http_base}/v2/cloud-agents/blobs/{blob_id}"
+        headers = {"x-sandbox-token": self._token}
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as session:
+                async with session.get(
+                    url, headers=headers, ssl=_fresh_tls_context(),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            "cloud bridge: blob download failed "
+                            "(%s, status=%s)", blob_id, resp.status,
+                        )
+                        return None
+                    if (
+                        resp.content_length is not None
+                        and resp.content_length > MAX_INBOUND_ATTACHMENT_BYTES
+                    ):
+                        logger.warning(
+                            "cloud bridge: blob download exceeds %d bytes (%s)",
+                            MAX_INBOUND_ATTACHMENT_BYTES,
+                            blob_id,
+                        )
+                        return None
+                    body = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > MAX_INBOUND_ATTACHMENT_BYTES:
+                            logger.warning(
+                                "cloud bridge: blob download exceeds %d bytes (%s)",
+                                MAX_INBOUND_ATTACHMENT_BYTES,
+                                blob_id,
+                            )
+                            return None
+                    return bytes(body)
+        except Exception as exc:  # noqa: BLE001 — fail-soft download
+            logger.warning(
+                "cloud bridge: blob download error (%s): %s", blob_id, exc,
+            )
+            return None
+
+    async def _token_request(
+        self, method: str, path: str, *, json_body: Any = None,
+    ) -> tuple[int, Any]:
+        """Keyless REST call on the sandbox HTTP surface: send ``method``
+        to ``{http_base}{path}`` authenticated by ``x-sandbox-token``
+        (the same seam ``upload_blob`` / ``download_blob`` use — no
+        signed crypto). ``json_body`` is sent as a JSON request body when
+        given. Returns ``(status, parsed_json_or_None)``; an empty or
+        non-JSON body (e.g. a 204) parses to ``None``. Wraps transport
+        failures in ``BridgeError`` so lifecycle callers surface a clean
+        error instead of a raw aiohttp exception.
+
+        Opens a short-lived session per call so lifecycle HTTP stays
+        independent of the WS lifecycle (mirrors the blob routes).
+        """
+        url = f"{self._http_base}{path}"
+        headers = {"x-sandbox-token": self._token}
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as session:
+                async with session.request(
+                    method, url, headers=headers, json=json_body,
+                    ssl=_fresh_tls_context(),
+                ) as resp:
+                    body = await resp.read()
+                    if not body:
+                        return resp.status, None
+                    try:
+                        return resp.status, json.loads(body)
+                    except json.JSONDecodeError:
+                        return resp.status, None
+        except aiohttp.ClientError as exc:
+            raise BridgeError(
+                "LIFECYCLE", f"{method} {path} transport error: {exc}",
+            ) from exc
+
+    async def schedule_wake(
+        self,
+        *,
+        after_seconds: int | None = None,
+        wake_at: str | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Schedule a server-side wake for this sandbox: POST
+        ``/v2/cloud-agents/schedule-wake`` keyless. Pass exactly one of
+        ``after_seconds`` (relative) or ``wake_at`` (absolute ISO ts) —
+        the caller enforces that; ``reason`` rides along when non-empty.
+        Returns the server's confirmed ``{wake_at, reason}``. Non-2xx /
+        transport → ``BridgeError``."""
+        body: dict[str, Any] = {}
+        if after_seconds is not None:
+            body["after_seconds"] = after_seconds
+        if wake_at is not None:
+            body["wake_at"] = wake_at
+        if reason:
+            body["reason"] = reason
+        status, parsed = await self._token_request(
+            "POST", "/v2/cloud-agents/schedule-wake", json_body=body,
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "SCHEDULE_WAKE",
+                f"schedule-wake failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def get_scheduled_wake(self) -> dict:
+        """Read the current scheduled wake: GET
+        ``/v2/cloud-agents/scheduled-wake`` keyless. Returns the server
+        body — ``{wake_at, reason}`` when one is set, or ``{wake_at:
+        None}`` when none is scheduled. Non-2xx / transport →
+        ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "GET", "/v2/cloud-agents/scheduled-wake",
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "SCHEDULED_WAKE",
+                f"scheduled-wake read failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {"wake_at": None}
+
+    async def cancel_wake(self) -> dict:
+        """Cancel the scheduled wake: DELETE
+        ``/v2/cloud-agents/scheduled-wake`` keyless. Returns the parsed
+        body, or ``{}`` on an empty 204. Non-2xx / transport →
+        ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "DELETE", "/v2/cloud-agents/scheduled-wake",
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "CANCEL_WAKE",
+                f"cancel-wake failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def runtime_status(self) -> dict:
+        """Read this sandbox's runtime status: GET
+        ``/v2/cloud-agents/runtime-status`` keyless. Returns the server
+        body (``{state, timeout_at, seconds_until_sleep?, sandbox_id}``);
+        ``seconds_until_sleep`` may be ``None`` when the server can't
+        compute it — surfaced verbatim, never fabricated. Non-2xx /
+        transport → ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "GET", "/v2/cloud-agents/runtime-status",
+        )
+        if status // 100 != 2:
+            raise BridgeError(
+                "RUNTIME_STATUS",
+                f"runtime-status read failed (status={status}): {parsed!r}",
+            )
+        return parsed if isinstance(parsed, dict) else {}
+
+    async def keepalive(self, seconds: int) -> dict:
+        """Push back this sandbox's auto-sleep deadline: POST
+        ``/v2/cloud-agents/keepalive`` ``{seconds}`` keyless.
+
+        Normalizes the "deadline-refresh not landed upstream" signal to
+        a first-class result so the caller branches without catching:
+          - 2xx → ``{"available": True, **body}`` (body carries
+            ``timeout_at`` / ``seconds_until_sleep``).
+          - 501 / 503, or a 2xx body with ``available`` false →
+            ``{"available": False, "detail": <msg>}``.
+        Any other non-2xx / transport failure → ``BridgeError``."""
+        status, parsed = await self._token_request(
+            "POST", "/v2/cloud-agents/keepalive",
+            json_body={"seconds": seconds},
+        )
+        parsed = parsed if isinstance(parsed, dict) else {}
+        if status in (501, 503):
+            detail = (
+                parsed.get("error")
+                or parsed.get("detail")
+                or f"keepalive unavailable (status={status})"
+            )
+            return {"available": False, "detail": detail}
+        if status // 100 == 2:
+            if parsed.get("available") is False:
+                detail = (
+                    parsed.get("error")
+                    or parsed.get("detail")
+                    or "keepalive reported unavailable"
+                )
+                return {"available": False, "detail": detail}
+            return {"available": True, **parsed}
+        raise BridgeError(
+            "KEEPALIVE",
+            f"keepalive failed (status={status}): {parsed!r}",
+        )
+
+    async def send_send(
+        self,
+        *,
+        plaintext: str,
+        recipient_slug: Optional[str] = None,
+        space_id: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        reply_to_id: Optional[str] = None,
+        thread_root_id: Optional[str] = None,
+        attachments: Optional[list[dict]] = None,
+        client_ref: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> dict:
+        # Pass EITHER recipient_slug (DM) OR space_id+channel_id
+        # (channel); spec rejects mixed-shape frames as BAD_FRAME.
+        # ``reply_to_id`` / ``thread_root_id`` are route-agnostic thread
+        # linkage — the same snake_case field names a human/web message
+        # carries; added only when truthy so a top-level post stays
+        # shape-identical to the pre-threading frame.
+        # ``attachments`` is the canonical top-level list of
+        # ``AttachmentRef`` dicts ({ blob_id, filename?, mime_type?,
+        # size_bytes? }); blobs were already uploaded keyless via
+        # ``upload_blob``. Added only when non-empty so a plain send
+        # stays byte-shape-identical to the pre-attachment frame.
+        # ``client_ref`` is the correlation id: a caller-supplied
+        # non-empty string is used verbatim for both the outbound frame
+        # and the waiter (the resumable approval flow sends a stable
+        # prompt ref), otherwise the existing ``r_<random>`` is generated.
+        # An empty / whitespace-only / non-string caller value fails before
+        # a frame is sent.
+        if client_ref is not None:
+            if not isinstance(client_ref, str) or not client_ref.strip():
+                raise ValueError(f"invalid client_ref: {client_ref!r}")
+        ws = await self._require_ws()
+        if client_ref is None:
+            client_ref = f"r_{uuid.uuid4().hex[:12]}"
+        frame: dict[str, Any] = {
+            "type": "send",
+            "plaintext": plaintext,
+            "client_ref": client_ref,
+        }
+        if recipient_slug:
+            frame["recipient_slug"] = recipient_slug
+        if space_id:
+            frame["space_id"] = space_id
+        if channel_id:
+            frame["channel_id"] = channel_id
+        if reply_to_id:
+            frame["reply_to_id"] = reply_to_id
+        if thread_root_id:
+            frame["thread_root_id"] = thread_root_id
+        if attachments:
+            frame["attachments"] = attachments
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._send_acks[client_ref] = fut
+        await ws.send_json(frame)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._send_acks.pop(client_ref, None)
+
+    async def send_fetch_pending(self, *, limit: Optional[int] = None) -> None:
+        # Resulting message + pending_delivered surface via frames().
+        ws = await self._require_ws()
+        frame: dict[str, Any] = {"type": "fetch_pending"}
+        if limit is not None:
+            frame["limit"] = limit
+        await ws.send_json(frame)
+
+    async def send_status(
+        self,
+        status: str,
+        *,
+        current_message_id: Optional[str] = None,
+        error_text: Optional[str] = None,
+        runtime: Optional[dict[str, Any]] = None,
+        health: Optional[str] = None,
+    ) -> None:
+        """Report runtime status over the bridge — the keyless equivalent of the
+        signed ``POST /agents/me/heartbeat`` + processing-run status flips. A
+        keyless bridge agent has no signing key, so it can't call those HTTP
+        routes; the server folds this frame into the same ``agent_status`` row +
+        WS broadcast, so the operator's status dot + Log are identical.
+        Fire-and-forget (no reply frame)."""
+        ws = await self._require_ws()
+        if status not in {"idle", "busy", "error"}:
+            raise ValueError(f"invalid agent status: {status}")
+        frame: dict[str, Any] = {"type": "status", "status": status}
+        if status == "busy" and current_message_id is not None:
+            frame["current_message_id"] = current_message_id[:1024]
+        if error_text is not None:
+            frame["error_text"] = error_text[:1024]
+        if health:
+            frame["health"] = health[:256]
+        if runtime is not None:
+            text_fields = (
+                "kind", "provider", "harness", "model", "inference_level",
+            )
+            bounded_runtime: dict[str, Any] = {
+                key: str(runtime.get(key, ""))[:256]
+                for key in text_fields
+                if key in runtime
+            }
+            for key in ("max_context", "auto_compact_threshold_pct"):
+                value = runtime.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    bounded_runtime[key] = value
+            frame["runtime"] = bounded_runtime
+        await ws.send_json(frame)
+
+    def _discard_waiter(
+        self, queue: asyncio.Queue, fut: asyncio.Future,
+    ) -> None:
+        """Remove ``fut`` from a FIFO waiter queue in place (F3).
+
+        Sync (no awaits) so it can't interleave with ``frames()`` popping
+        the same queue. Drains the queue, keeps every waiter that isn't
+        ``fut``, and re-enqueues them in order — so a timed-out waiter is
+        pulled out and the next real ``ack_result`` / ``spaces`` frame
+        isn't mis-delivered to a dead future.
+        """
+        remaining = []
+        while not queue.empty():
+            item = queue.get_nowait()
+            if item is not fut:
+                remaining.append(item)
+        for item in remaining:
+            queue.put_nowait(item)
+
+    async def send_ack(
+        self, envelope_ids: list[str], *, timeout: float = 30.0,
+    ) -> dict:
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        await self._ack_result_waiters.put(fut)
+        await ws.send_json({"type": "ack", "envelope_ids": envelope_ids})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._discard_waiter(self._ack_result_waiters, fut)
+            raise
+
+    async def send_list_spaces(self, *, timeout: float = 30.0) -> dict:
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        await self._spaces_waiters.put(fut)
+        await ws.send_json({"type": "list_spaces"})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._discard_waiter(self._spaces_waiters, fut)
+            raise
+
+    async def send_list_invites(self, *, timeout: float = 30.0) -> dict:
+        """Read this agent's authoritative pending invitations.
+
+        Sends exactly ``{"type": "list_invites"}`` and returns the
+        correlated ``invites`` frame (uncorrelated FIFO — the spec has
+        no ``client_ref`` for this request, so one in-flight at a time).
+        Shares the ``send_list_spaces`` send-before-wait, timeout,
+        cancellation, and ``BridgeClosed`` conventions.
+        """
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        await self._invites_waiters.put(fut)
+        await ws.send_json({"type": "list_invites"})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._discard_waiter(self._invites_waiters, fut)
+            raise
+
+    async def send_decide_invitation(
+        self,
+        *,
+        invitation_event_id: str,
+        decision: str,
+        client_ref: str,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Submit the authenticated bridge Agent's invitation decision.
+
+        The frame carries exactly ``type``, ``client_ref``,
+        ``invitation_event_id``, and ``decision`` (``accept`` /
+        ``reject``) — no Agent slug, no signed payload, per the keyless
+        contract. ``client_ref`` is required and caller-supplied so the
+        resumable flow can retry with a stable ref. Returns the
+        correlated ``decide_invitation_result`` frame; a correlated
+        ``error`` frame raises ``BridgeError``; a timed-out or cancelled
+        waiter is removed so the next result is never misdelivered.
+        """
+        if not isinstance(invitation_event_id, str) or not invitation_event_id:
+            raise ValueError("invitation_event_id must be a non-empty string")
+        if decision not in {"accept", "reject"}:
+            raise ValueError(f"invalid decision: {decision!r}")
+        if not isinstance(client_ref, str) or not client_ref.strip():
+            raise ValueError(f"invalid client_ref: {client_ref!r}")
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._decide_waiters[client_ref] = fut
+        await ws.send_json({
+            "type": "decide_invitation",
+            "client_ref": client_ref,
+            "invitation_event_id": invitation_event_id,
+            "decision": decision,
+        })
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._decide_waiters.pop(client_ref, None)
+
+    async def close(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._heartbeat_task
+            self._heartbeat_task = None
+        if self._ws is not None and not self._ws.closed:
+            with contextlib.suppress(Exception):
+                await self._ws.close()
+        self._ws = None
+        if self._session is not None and not self._session.closed:
+            with contextlib.suppress(Exception):
+                await self._session.close()
+        self._session = None
+        # Cancel pending waiters with a clean BridgeClosed.
+        for fut in list(self._send_acks.values()):
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        self._send_acks.clear()
+        while not self._ack_result_waiters.empty():
+            fut = self._ack_result_waiters.get_nowait()
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        while not self._spaces_waiters.empty():
+            fut = self._spaces_waiters.get_nowait()
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        while not self._invites_waiters.empty():
+            fut = self._invites_waiters.get_nowait()
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        for fut in list(self._decide_waiters.values()):
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        self._decide_waiters.clear()

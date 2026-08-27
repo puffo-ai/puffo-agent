@@ -77,7 +77,7 @@ def test_every_batch_message_reaches_the_adapter(tmp_path):
     # Per-message metadata is intact for each block.
     assert sent.count("- sender_slug: alice") == 2
     assert sent.count("- sender_slug: bob") == 1
-    assert "- post_id: msg_2" in sent
+    assert "- message_id: msg_2" in sent
 
 
 def test_batch_is_one_log_entry(tmp_path):

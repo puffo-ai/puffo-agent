@@ -1,198 +1,177 @@
-# puffo-agent Codebase Architecture
+# Puffo Agent Codebase Map
 
-This document summarizes the current architecture of `puffo-agent` as read from
-the source tree. The companion diagram is
-[`puffo-agent-architecture.drawio`](puffo-agent-architecture.drawio).
+This is a navigation guide for the current Python repository. Use
+[`ARCHITECTURE.md`](ARCHITECTURE.md) for behavioral contracts and
+[`FAT-CLOUD-ARCHITECTURE.md`](FAT-CLOUD-ARCHITECTURE.md) for the keyless cloud
+transport delta.
 
-## Scope
+`puffo-agent-architecture.drawio` is an older editable visual snapshot. It is
+kept as source material, but the Mermaid diagrams in the two canonical
+documents above describe the current implementation.
 
-`puffo-agent` is a local Python daemon that supervises many Puffo bot accounts
-on one machine. Each agent has isolated on-disk state, an optional local or
-containerized LLM runtime, Puffo Core credentials, message storage, and local
-workspace files.
+## Package Shape
 
-The package is distributed as `puffo-agent`; the Python module is
-`puffo_agent`. The console entry point is:
+The PyPI package is `puffo-agent`, the Python package is `puffo_agent`, and the
+console entry point is `puffo_agent.portal.cli:main`.
 
-- `puffo-agent = puffo_agent.portal.cli:main`
+| Package area | Responsibility |
+| --- | --- |
+| `portal/` | CLI, daemon, per-Agent worker lifecycle, config/state, machine control, loopback services, desktop UI, import/export. |
+| `agent/` | Transport facade, durable message/Inbox state, Global Inbox orchestration, model context, sends, reminders, memory, and Runtime events. |
+| `agent/harness/` | Provider-neutral Driver protocol, Runtime Manager, Codex app-server Driver, Claude stream-json Driver, and local/Docker runtime preparation. |
+| `agent/adapters/` | Compatibility Adapter facade consumed by the common Inbox runtime. |
+| `crypto/` | Native signed HTTP, encrypted WS, identity keys, message envelopes, and attachment crypto. |
+| `mcp/` | Model-facing Puffo, Inbox/history, membership, memory, reminder, host, and file tools. |
+| `macos/` | Host credential integration. |
+| `tests/` | Contract, regression, integration, packaging, and UI-helper coverage. |
 
-## Top-Level Shape
+## Composition Roots
 
-| Area | Main modules | Responsibility |
-| --- | --- | --- |
-| CLI and daemon | `portal/cli.py`, `portal/daemon.py`, `portal/state.py` | Start/stop/status commands, read and write on-disk config, reconcile desired agent state into running workers. |
-| Worker runtime | `portal/worker.py`, `agent/core.py`, `agent/adapters/*`, `agent/harness/*`, `agent/providers/*` | Run one agent loop, build system prompt, dispatch messages to the selected runtime, record runtime state. |
-| Puffo protocol | `crypto/*`, `agent/message_store.py`, `agent/status_reporter.py` | Signed HTTP, WebSocket relay, HPKE/AEAD message encryption, local encrypted message history, status reporting. |
-| Local bridge | `portal/api/*` | Loopback HTTP API for local web clients to pair, manage agents, inspect files/logs, import/export, and attach WS-local tools. |
-| Remote control | `portal/control/*` | Machine linking, operator pairings, encrypted control WebSocket, remote create/edit/pause/resume/archive/refresh commands. |
-| Local services | `portal/data_service.py`, `portal/rpc_service.py`, `portal/ws_local/*` | Loopback data/RPC APIs and WS-local attachment protocol used by MCP and external tools. |
-| MCP tools | `mcp/*` | Stdio MCP server exposing Puffo messaging tools plus host-side skill/MCP/refresh tools to CLI runtimes. |
-| Desktop UI | `portal/ui/*` | PySide6 desktop window, tray runner, agent/operator/log/workspace views. |
-| Tests | `tests/*` | Pytest suite covering crypto, bridge, control, worker/runtime, MCP, WS-local, UI helpers, and packaging behavior. |
+### Daemon
 
-## Runtime Flow
+Start at `portal/daemon.py` for process ownership. The daemon:
 
-1. The operator starts `puffo-agent start`.
-2. `portal.daemon.Daemon` loads `DaemonConfig`, starts auxiliary loopback
-   services, starts credential refresh loops, starts the remote control manager,
-   then repeatedly reconciles `~/.puffo-agent/agents/`.
-3. Each discovered `agent.yml` becomes a `portal.worker.Worker` unless the agent
-   is paused, deleted, archived, or invalid.
-4. The worker builds an adapter from `runtime.kind`:
-   - `chat-local`: direct provider-backed chat adapter.
-   - `sdk-local`: Claude SDK adapter.
-   - `cli-local`: local CLI process with isolated per-agent home.
-   - `cli-docker`: Dockerized CLI process with mounted agent state.
-   - `ws-local`: attached local WebSocket tool session.
-5. The worker owns the Puffo Core listen/send loop, persists `runtime.json`,
-   writes managed prompt files, and calls `agent.core.PuffoAgent` for each turn.
-6. `PuffoAgent` converts Puffo messages into adapter `TurnContext`, tracks a
-   conversation log and memory, then routes replies either through explicit MCP
-   `send_message` calls or fallback assistant output.
+1. loads `daemon.yml` and control state;
+2. starts data, RPC, WS-local, and remote-control services;
+3. scans `agents/<agent-id>/agent.yml`;
+4. creates, restarts, pauses, archives, or removes workers to match desired
+   state;
+5. owns shutdown and process-level diagnostics.
 
-The important design point is that the daemon is the reconciler and single
-owner of worker lifecycles. Most management actions write `agent.yml` or a
-sentinel flag; the next reconcile tick applies the state transition.
+Management commands mutate desired state or write a lifecycle flag. They do not
+reach into a running Driver directly.
 
-## On-Disk Contract
+### Worker
 
-The filesystem is the internal control plane. By default state is under
-`~/.puffo-agent/`, with `PUFFO_AGENT_HOME` as an override.
+`portal/worker_run.py:StandardWorkerRun` is the non-WS-local composition root.
+It prepares paths and prompts, builds transport and runtime state, warms them,
+constructs the Global Inbox and send coordinator, starts background services,
+listens, and cleans up.
+
+The central assembly is `_build_global_runtime()`:
+
+```text
+MessageStore
+  + provider Adapter/Driver
+  + ContextController
+  + BaselineAdapter / ActiveBoundaryAdapter
+  + HeldRecoverySource
+  + SendCoordinator
+  + ReminderScheduler
+  -> GlobalInboxRuntime
+```
+
+`portal/ws_local/` is a separate runtime attachment path. It keeps the daemon as
+transport/tool owner while an external process supplies the Agent brain.
+
+## Message Subsystem
+
+| Concern | Owner |
+| --- | --- |
+| Native receive | `agent/inbound_receipts.py` and native helpers behind `PuffoCoreMessageClient`. |
+| Keyless receive | `agent/bridge_client.py`, `agent/bridge_transport.py`. |
+| Shared ingress policy | `agent/ingress_policy.py`, `agent/dm_gate.py`, membership modules. |
+| Persistence and frontiers | `agent/message_store.py`, `agent/receipt_persistence.py`, `agent/inbox_store.py`. |
+| Route/thread normalization | `agent/thread_context.py`, `agent/message_store_models.py`. |
+| Model-readable context | `agent/message_projection.py`, `agent/prior_context.py`, `agent/message_context.py`. |
+| Global scheduling | `agent/inbox_scheduler.py`, `agent/global_inbox_runtime.py`. |
+| Context admission | `agent/context_controller.py`, `agent/global_inbox_admission.py`. |
+| Held recovery | `agent/global_inbox_held.py`, `agent/held_context.py`. |
+| Outbound coordination | `agent/send_coordinator.py`, `agent/global_inbox_send.py`, `agent/outbound_messages.py`. |
+
+`PuffoCoreMessageClient` is a compatibility facade and state owner, not the place to
+add another policy. Put transport-specific mechanics in native/bridge modules
+and shared behavior in the leaf policy/projection/store modules.
+
+## Runtime Subsystem
+
+`agent/harness/driver.py` defines the common command and event vocabulary.
+`RuntimeManager` owns one active runtime/session/turn state machine and enforces
+capability checks and terminal transitions.
+
+Current concrete engines:
+
+- `agent/harness/codex_driver.py`: Codex app-server.
+- `agent/harness/claude_code_driver.py`: Claude Code stream-json CLI.
+- `agent/harness/docker_runtime.py`: per-Agent Docker placement and mounts for both Drivers.
+- `agent/harness/docker_support.py`: pinned image and bounded Docker lifecycle helpers.
+- `portal/ws_local/`: externally attached runtime.
+
+`agent/harness/local_runtime.py` resolves host binaries, isolated homes,
+durable native-session resume, managed config, and common Driver binding. Docker reuses
+the same Driver and Runtime Manager contracts through a `docker exec -i`
+process factory. `portal/runtime_matrix.py` is the source of truth for supported
+runtime/provider/harness combinations.
+
+## MCP Subsystem
+
+`mcp/puffo_core_server.py` is the stdio MCP entry point. Registration is split
+by capability under `mcp/core_*_tools.py`; the older
+`mcp/puffo_core_tools.py` remains a compatibility facade and shared helper
+owner.
+
+Read tools route through the daemon data service or in-process data client and
+return the common message projection. Send tools call the daemon-owned
+`SendCoordinator`; the model never supplies sequence or baseline fields.
+
+Memory tools are split between `mcp/memory_tools.py` and
+`mcp/memory_tool_registration.py`. Reminder lifecycle tools are registered from
+`mcp/lifecycle_tools.py` and `mcp/lifecycle_tool_registration.py`.
+
+## Durable State
 
 ```text
 ~/.puffo-agent/
   daemon.yml
-  daemon.pid
   control/
   shared/
   agents/<agent-id>/
     agent.yml
     profile.md
-    memory/
     keys/
     messages.db
+    runtime_events.db
     runtime.json
-    workspace/.puffo/inbox/
-  archived/
+    memory/
+    workspace/
+      shared -> ../../../shared/
 ```
 
-Key conventions:
+| Artifact | Owner |
+| --- | --- |
+| `agent.yml` | Desired Agent, runtime, and Puffo transport configuration. |
+| `profile.md` | Operator-editable source persona; synchronized into managed briefing content. |
+| `messages.db` | Messages, receipt decisions, Inbox/turn state, frontiers, and reminders. |
+| `runtime_events.db` | Bounded local outbox and resumable local Driver session references. |
+| `runtime.json` | Daemon health and status projection for CLI/UI. |
+| `memory/` | Bounded briefing, notes, recollection, imports, and Git history. |
+| `workspace/shared/` | Managed link to the Puffo-home cross-Agent collaboration directory. |
+| `workspace/.puffo/inbox/` | Materialized inbound attachments. |
 
-- `agent.yml` is the desired state for an agent.
-- `runtime.json` is daemon-managed live state for CLI/UI visibility.
-- `archive.flag`, `delete.flag`, `restart.flag`, and refresh flags request
-  lifecycle changes.
-- Per-agent virtual homes isolate `.claude`, `.codex`, sessions, credentials,
-  and workspace-level prompt/config files.
+Native Agents use `keys/`. Keyless bridge Agents use a scoped token and do not
+need local Puffo message keys.
 
-## Local Bridge
+## Control And Services
 
-`portal/api/server.py` builds an aiohttp app bound to loopback. It exposes:
+| Area | Start here |
+| --- | --- |
+| Machine link and pairings | `portal/control/link.py`, `portal/control/store.py`. |
+| Authenticated control WS | `portal/control/client.py`, `portal/control/envelope.py`. |
+| Remote Agent mutation | `portal/control/provision.py`, `portal/control/agent_message.py`. |
+| Data service (`63386`) | `portal/data_service.py`. |
+| RPC service (`63385`) | `portal/rpc_service.py`. |
+| WS-local (`63387`) | `portal/ws_local/server.py`, `portal/ws_local/session.py`. |
+| Desktop UI | `portal/ui/`. |
 
-- Discovery and pairing: `/v1/info`, `/v1/providers`, `/v1/pair`,
-  `/v1/pairing`.
-- Agent management: list/create/get/delete, profile/runtime update,
-  pause/resume/restart/archive.
-- Operator support: logs, workspace file browse/read, import/export,
-  revoke-pending.
-- WS-local: `GET /v1/ws-local`.
+## Safe Change Boundaries
 
-The bridge is intentionally not load-bearing for agent message delivery. If it
-cannot bind its port, the daemon can continue running workers.
-
-## Remote Control Plane
-
-`portal/control` links a local machine to one or more remote operators:
-
-- `store.py` persists the machine identity and operator pairings.
-- `link.py` registers the machine, mints a link code, and migrates owned local
-  agents after approval.
-- `machine_auth.py` signs machine HTTP and WebSocket frames.
-- `envelope.py` verifies and decrypts operator command envelopes.
-- `client.py` maintains the machine control WebSocket and executes commands.
-
-Remote control commands deliberately reuse the same local state model as the
-bridge. For example, pause/resume updates `agent.yml`, archive touches
-`archive.flag`, and refresh writes workspace refresh flags. This keeps one
-execution path: the daemon reconcile loop.
-
-## Puffo Core And Crypto
-
-The `crypto` package implements the wire-protocol primitives used by the agent
-runtime and MCP tools:
-
-- `http_auth.py` signs and verifies HTTP requests.
-- `http_client.py` wraps signed Puffo Core HTTP calls and rotates subkeys.
-- `ws_client.py` maintains the Puffo Core WebSocket relay.
-- `message.py` encrypts/decrypts message envelopes with content-key wrapping.
-- `attachments.py` handles encrypted blob upload/download paths.
-- `keystore.py`, `certs.py`, `primitives.py`, `canonical.py`, and `v2_aad.py`
-  hold identity/session keys, certificate helpers, canonical signing bytes,
-  HPKE/AEAD primitives, and AAD construction.
-
-Message encryption separates:
-
-- Inner signed payload bytes.
-- Outer content ciphertext bound to envelope metadata through AAD.
-- Per-recipient HPKE-wrapped content keys.
-- Supplementation envelopes for newly discovered recipient devices.
-
-## MCP And Host Tooling
-
-`mcp/puffo_core_server.py` is the stdio MCP entry point used by CLI runtimes. It
-combines:
-
-- Puffo Core messaging tools from `mcp/puffo_core_tools.py`.
-- Local host tools from `mcp/host_tools.py` for skill and MCP management.
-- Data reads through `mcp/data_client.py` against the daemon data service.
-- Optional daemon-mediated RPC through `mcp/_host_mcp.py`.
-
-Adapter setup in `portal/worker.py` injects the correct environment for local
-or Docker runtimes. Docker runtimes use host aliases for loopback services,
-while local CLI runtimes use `127.0.0.1`.
-
-## WS-Local
-
-`portal/ws_local` supports externally attached local tools that do not run
-inside the daemon's normal adapter process:
-
-- `protocol.py` defines strict JSON frames such as `connect`, `bundle`,
-  `ack`, `end`, `tool_call`, and `tool_result`.
-- `hub.py` tracks attach points.
-- `route.py` exposes the bridge WebSocket route.
-- `session.py` runs a turn session over an abstract transport.
-- `tool_dispatch.py` exposes the allowed Puffo tools.
-- `ws_local_client.py` is the attach-side client entry path.
-
-The daemon handles Puffo decryption/encryption; the attached tool sees
-plaintext bundles and returns tool results or turn completion frames.
-
-## Testing Map
-
-The repository has a broad pytest suite. Useful clusters:
-
-- Bridge and local API: `test_bridge_*`, `test_log_endpoint.py`,
-  `test_pause_resume_archive.py`.
-- Remote control: `test_control_client.py`, `test_control_envelope.py`,
-  `test_link_migrate_soul_sync.py`.
-- Worker/runtime/adapters: `test_worker_*`, `test_runtime_matrix.py`,
-  `test_cli_session_recovery.py`, `test_codex_*`, `test_harness.py`.
-- Puffo crypto/protocol: `test_crypto_primitives.py`, `test_message.py`,
-  `test_http_client.py`, `test_ws_client.py`, `test_keystore_and_certs.py`.
-- MCP/data/RPC: `test_puffo_core_tools.py`, `test_puffo_core_server_lifespan.py`,
-  `test_data_service.py`, `test_rpc_service.py`, `test_host_mcp_handler.py`.
-- WS-local: `test_ws_local_*`.
-- UI helpers: `test_ui_mcp_probe.py`, `test_ui_mcp_scanner.py`,
-  `test_ui_views.py`.
-
-## Architectural Invariants
-
-- Agent lifecycle is file-driven and reconciled by the daemon.
-- Worker processes/tasks are per-agent; agent state is isolated on disk.
-- The bridge and control plane mutate desired state, not running workers
-  directly.
-- Puffo Core traffic is signed, encrypted where required, and uses per-agent
-  keystore material.
-- CLI runtimes receive Puffo capabilities through generated MCP config and
-  per-agent prompt/config files.
-- Loopback services are local integration surfaces, not public network APIs.
+- A wire field change must be traced through Server producer, native/bridge
+  parser, persisted model, projection, MCP serialization, and tests.
+- A message behavior rule belongs once in shared ingress, context, or send
+  policy, not once per transport.
+- Provider-specific commands and frames stop at a Driver.
+- Durable state changes need explicit migration and restart behavior.
+- Prompt and model-facing context changes must preserve target, sender, time,
+  sequence, thread, visibility, and truncation semantics.
+- Keep tests around protocol invariants and reproduced regressions; avoid
+  duplicating the same behavior across every facade.

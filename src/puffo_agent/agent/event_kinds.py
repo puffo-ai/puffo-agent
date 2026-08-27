@@ -24,3 +24,5 @@ class EventKind(StrEnum):
     REMOVE_FROM_SPACE = "remove_from_space"
     REMOVE_FROM_CHANNEL = "remove_from_channel"
     CREATE_CHANNEL = "create_channel"
+    ADD_TO_CHANNEL = "add_to_channel"
+    REDEEM_INVITE_CAPABILITY = "redeem_invite_capability"

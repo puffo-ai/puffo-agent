@@ -12,6 +12,7 @@ and "not for me" no-ops.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
@@ -51,6 +52,7 @@ def _make_client(
     client._channel_space = {}
     client._space_name_cache = {}
     client._channel_name_cache = {}
+    client._channel_encrypted = {}
     client._space_members = {}
     client._processed_invite_ids = set()
     client._pending_invite_dms = {}
@@ -104,6 +106,38 @@ def _make_client(
 
     client.http = _StubHttp()
     return client, sent
+
+
+@pytest.mark.asyncio
+async def test_capability_redemption_invalidates_roster_and_announces_join():
+    client, _ = _make_client()
+    client._space_members["sp_1"] = {"alice-0001": "human"}
+    client._channel_space["ch_1"] = "sp_1"
+    client._processed_membership_event_ids = set()
+    client._log = logging.getLogger(__name__)
+    announcements = []
+
+    async def enqueue(**message):
+        announcements.append(message)
+
+    client._enqueue_membership_system_message = enqueue
+    event = {
+        "event_id": "ev_redeem",
+        "kind": "redeem_invite_capability",
+        "signer_slug": "alice-0001",
+        "payload": {"space_id": "sp_1", "redeemer_slug": "alice-0001"},
+    }
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert "sp_1" not in client._space_members
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "joined_space",
+        "kicker_slug": "",
+        "inviter_slug": "",
+        "event_id": "ev_redeem",
+    }]
 
 
 # ─── leave_space (synthetic cascade + self-signed) ─────────────────
@@ -511,3 +545,249 @@ async def test_membership_change_with_no_operator_slug_logs_but_doesnt_crash():
     assert "ch_1" not in client._channel_space
     # No DM attempted.
     assert sent == []
+
+
+# ─── add_to_channel (synthetic invite-link channel join) ───────────
+
+
+def _announce_client(
+    rewarm_reveals: dict[str, str] | None = None,
+) -> tuple[PuffoCoreMessageClient, list[dict]]:
+    client, _ = _make_client()
+    client._processed_membership_event_ids = set()
+    client._log = logging.getLogger(__name__)
+    announcements: list[dict] = []
+
+    async def enqueue(**message):
+        announcements.append(message)
+
+    client._enqueue_membership_system_message = enqueue
+    client._rewarm_calls = 0
+
+    async def rewarm(*, force: bool = False):
+        client._rewarm_calls += 1
+        client._channel_space.update(rewarm_reveals or {})
+
+    client.rewarm_channel_caches = rewarm
+    return client, announcements
+
+
+def _add_to_channel_event(
+    added_slug: str = "alice-0001",
+    channel_id: str = "ch_1",
+    event_id: str = "ev_add_1",
+) -> dict:
+    """Wire shape from puffo-server #325: server-signed synthetic
+    join, ``signer_slug`` is the invite link's issuer."""
+    return {
+        "event_id": event_id,
+        "kind": "add_to_channel",
+        "signer_slug": "op-1",
+        "signer_device_id": "",
+        "signer_subkey_id": "",
+        "signature": "server-auto:invite-capability-add-to-channel",
+        "payload": {
+            "space_id": "sp_1",
+            "channel_id": channel_id,
+            "added_slug": added_slug,
+            "source_invite_id": "inv_1",
+            "source_redemption_id": "red_1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_announces_join_with_link_issuer_as_inviter():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(scope="sp_1", event=_add_to_channel_event())
+
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "joined",
+        "kicker_slug": "",
+        "inviter_slug": "op-1",
+        "event_id": "ev_add_1",
+    }]
+    assert client._rewarm_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_cache_miss_rewarms_then_announces():
+    """First-connect race: the join can arrive before the fire-and-
+    forget warm task lands. A cache miss must rewarm and re-check
+    instead of concluding the channel isn't ours."""
+    client, announcements = _announce_client(
+        rewarm_reveals={"ch_1": "sp_1"},
+    )
+    assert client._channel_space == {}
+
+    await client._handle_event(scope="sp_1", event=_add_to_channel_event())
+
+    assert client._rewarm_calls == 1
+    assert [(a["channel_id"], a["action"]) for a in announcements] == [
+        ("ch_1", "joined"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_unknown_after_rewarm_is_noop():
+    """Rewarm ran but still doesn't list the channel: genuinely not
+    ours, no announcement (matches the server's members-only
+    delivery)."""
+    client, announcements = _announce_client()
+
+    await client._handle_event(
+        scope="sp_1",
+        event=_add_to_channel_event(channel_id="ch_elsewhere"),
+    )
+
+    assert client._rewarm_calls == 1
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_missing_channel_id_is_noop():
+    client, announcements = _announce_client()
+    event = _add_to_channel_event()
+    del event["payload"]["channel_id"]
+
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert client._rewarm_calls == 0
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_leave_channel_cache_miss_does_not_rewarm():
+    """Only add_to_channel implies membership; other kinds still
+    drop unknown channels without a rewarm round-trip."""
+    client, announcements = _announce_client()
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "event_id": "ev_leave_x",
+            "kind": "leave_channel",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1", "channel_id": "ch_elsewhere"},
+        },
+    )
+
+    assert client._rewarm_calls == 0
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_for_self_is_noop():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event=_add_to_channel_event(added_slug="agent-1"),
+    )
+
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_missing_added_slug_is_noop():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+    event = _add_to_channel_event()
+    del event["payload"]["added_slug"]
+
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_ws_redelivery_announces_once():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+    event = _add_to_channel_event()
+
+    await client._handle_event(scope="sp_1", event=event)
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert len(announcements) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_per_channel_events_each_announce():
+    """One redemption can grant several channels; the server emits
+    one event per channel and each gets its own announcement."""
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+    client._channel_space["ch_priv"] = "sp_1"
+
+    await client._handle_event(scope="sp_1", event=_add_to_channel_event())
+    await client._handle_event(
+        scope="sp_1",
+        event=_add_to_channel_event(channel_id="ch_priv", event_id="ev_add_2"),
+    )
+
+    assert [(a["channel_id"], a["event_id"]) for a in announcements] == [
+        ("ch_1", "ev_add_1"),
+        ("ch_priv", "ev_add_2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_other_member_leave_channel_still_announces_left():
+    """Kinds behind ``add_to_channel`` in the actor dispatch keep
+    working: another member's voluntary exit announces "left"."""
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "event_id": "ev_leave_1",
+            "kind": "leave_channel",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1", "channel_id": "ch_1"},
+        },
+    )
+
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "left",
+        "kicker_slug": "",
+        "inviter_slug": "",
+        "event_id": "ev_leave_1",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_miss_without_rewarm_callback_is_noop():
+    """Callers that don't provide ``rewarm_channels`` keep the plain
+    drop-on-miss behavior."""
+    from puffo_agent.agent.membership_actions import (
+        maybe_announce_membership_change,
+    )
+
+    announcements: list[dict] = []
+
+    async def enqueue(**message):
+        announcements.append(message)
+
+    event = _add_to_channel_event()
+    await maybe_announce_membership_change(
+        kind="add_to_channel",
+        event=event,
+        payload=event["payload"],
+        slug="agent-1",
+        channel_spaces={},
+        inviter_by_event_id={},
+        processed_event_ids=set(),
+        enqueue_message=enqueue,
+        log=logging.getLogger(__name__),
+    )
+
+    assert announcements == []

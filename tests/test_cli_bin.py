@@ -1,12 +1,33 @@
 """Unit tests for ``puffo_agent.agent.cli_bin``."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 
 from puffo_agent.agent import cli_bin
+
+
+@pytest.mark.parametrize(
+    ("resolver", "credential_check", "expected"),
+    [
+        (lambda: None, lambda: True, "not_installed"),
+        (lambda: "/bin/tool", lambda: False, "need_login"),
+        (lambda: "/bin/tool", lambda: True, "ready"),
+    ],
+)
+def test_cli_tool_status(resolver, credential_check, expected):
+    assert cli_bin.cli_tool_status(resolver, credential_check) == expected
+
+
+def test_cli_tool_status_treats_probe_errors_as_unavailable():
+    def fail():
+        raise RuntimeError("probe failed")
+
+    assert cli_bin.cli_tool_status(fail, lambda: True) == "not_installed"
+    assert cli_bin.cli_tool_status(lambda: "/bin/tool", fail) == "need_login"
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +100,31 @@ def test_claude_resolver_uses_its_own_env(tmp_path, monkeypatch):
     assert cli_bin.resolve_claude_bin() == str(fake_claude)
 
 
+def test_docker_env_override_wins(tmp_path, monkeypatch):
+    fake = _make_exe(tmp_path, "fake_docker")
+    monkeypatch.setenv("PUFFO_DOCKER_BIN", str(fake))
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/other/docker")
+    assert cli_bin.resolve_docker_bin() == str(fake)
+
+
+def test_docker_bundle_path_hit_when_paths_miss(tmp_path, monkeypatch):
+    bundled = _make_exe(tmp_path, "docker_bundled")
+    monkeypatch.delenv("PUFFO_DOCKER_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    monkeypatch.setattr(cli_bin, "_docker_bundle_paths", lambda: [bundled])
+    assert cli_bin.resolve_docker_bin() == str(bundled)
+
+
+def test_windows_docker_bundle_paths_include_per_user_desktop(monkeypatch):
+    monkeypatch.setattr(cli_bin.sys, "platform", "win32")
+    paths = [str(path).lower() for path in cli_bin._docker_bundle_paths()]
+    assert any(
+        "programs\\dockerdesktop\\resources\\bin\\docker.exe" in path
+        for path in paths
+    )
+    assert any("docker\\docker\\resources\\bin\\docker.exe" in path for path in paths)
+
+
 @pytest.mark.parametrize("platform_value,want_first", [
     ("darwin", "/Applications/ChatGPT.app/Contents/Resources/codex"),
     ("win32", "codex.exe"),  # contains-check
@@ -107,8 +153,7 @@ def test_darwin_bundle_paths_include_chatgpt_app(monkeypatch):
         and p != "/Applications/ChatGPT.app/Contents/Resources/codex"
         for p in paths
     ), "expected the ~/Applications ChatGPT.app path too"
-    # ChatGPT.app preferred over a leftover Codex.app copy — _first_existing
-    # takes the first hit.
+    # ChatGPT.app is preferred over a leftover Codex.app copy.
     assert paths.index("/Applications/ChatGPT.app/Contents/Resources/codex") < paths.index(
         "/Applications/Codex.app/Contents/Resources/codex"
     )
@@ -176,6 +221,33 @@ def test_resolved_path_survives_restart_via_disk_cache(tmp_path, monkeypatch):
     assert cli_bin.resolve_codex_bin() == str(real)  # served from disk cache
 
 
+def test_live_path_beats_user_writable_disk_cache(tmp_path, monkeypatch):
+    cached = _make_exe(tmp_path, "cached_codex")
+    live = _make_exe(tmp_path, "live_codex")
+    cache_file = tmp_path / "home" / "resolved_clis.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text(json.dumps({"codex": str(cached)}), encoding="utf-8")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name, path=None: str(live) if path is None else None,
+    )
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+
+    assert cli_bin.resolve_codex_bin() == str(live)
+
+
+def test_non_executable_disk_cache_entry_is_ignored(tmp_path, monkeypatch):
+    cached = _make_exe(tmp_path, "cached_codex")
+    cache_file = tmp_path / "home" / "resolved_clis.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text(json.dumps({"codex": str(cached)}), encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+    monkeypatch.setattr(cli_bin.os, "access", lambda path, mode: False)
+
+    assert cli_bin.resolve_codex_bin() is None
+
+
 def test_disk_cache_rejected_when_binary_gone(tmp_path, monkeypatch):
     """A cached path that no longer exists falls through to a fresh
     lookup instead of returning a dead path."""
@@ -208,6 +280,85 @@ def test_hermes_bundle_paths_per_platform(platform_value, want_substr, monkeypat
     assert paths, f"no candidates for platform {platform_value!r}"
     first = paths[0].as_posix() if platform_value != "win32" else str(paths[0])
     assert want_substr in first
+
+
+def test_windows_claude_bundle_paths_include_npm_global_shims(monkeypatch):
+    """Regression-pin for the A1 gap: the Windows Claude candidates must
+    list the npm-global ``%APPDATA%\\npm`` ``.exe``, ``.cmd``, ``.ps1``
+    shims in that order, or ``resolve_claude_bin`` never finds the shim
+    a fresh shell actually runs."""
+    monkeypatch.setattr(cli_bin.sys, "platform", "win32")
+    paths = [str(path).lower() for path in cli_bin._claude_bundle_paths()]
+    assert r"%appdata%\npm\claude.exe" in paths
+    assert r"%appdata%\npm\claude.cmd" in paths
+    assert r"%appdata%\npm\claude.ps1" in paths
+    assert paths.index(r"%appdata%\npm\claude.exe") < paths.index(
+        r"%appdata%\npm\claude.cmd"
+    ) < paths.index(r"%appdata%\npm\claude.ps1")
+
+
+@pytest.mark.parametrize(
+    ("platform_value", "executable", "siblings", "expected"),
+    [
+        # POSIX: the executable passes through untouched, whatever its shape.
+        ("darwin", "claude", (), ("claude",)),
+        ("linux", "claude", (), ("claude",)),
+        (
+            "linux",
+            r"C:\Program Files\Claude\claude.exe",
+            (),
+            (r"C:\Program Files\Claude\claude.exe",),
+        ),
+        # Windows: .exe sibling wins over every shim.
+        (
+            "win32", "claude",
+            ("claude.exe", "claude.cmd", "claude.bat", "claude.ps1"),
+            ("claude.exe",),
+        ),
+        # Windows: .cmd beats .bat and both run through cmd.exe /c.
+        (
+            "win32", "claude",
+            ("claude.bat", "claude.cmd"),
+            ("cmd.exe", "/c", "claude.cmd"),
+        ),
+        ("win32", "claude", ("claude.cmd",), ("cmd.exe", "/c", "claude.cmd")),
+        ("win32", "claude", ("claude.bat",), ("cmd.exe", "/c", "claude.bat")),
+        # Windows: .ps1 runs through powershell.exe -NoProfile -NonInteractive -File.
+        (
+            "win32", "claude",
+            ("claude.ps1",),
+            ("powershell.exe", "-NoProfile", "-NonInteractive", "-File", "claude.ps1"),
+        ),
+        # Windows: extensionless path with no sibling launches directly.
+        ("win32", "claude", (), ("claude",)),
+        # Windows: an explicit .exe path passes straight through.
+        ("win32", "claude.exe", (), ("claude.exe",)),
+        # Windows: paths with spaces stay single argv elements.
+        (
+            "win32",
+            os.path.join("Program Files", "Claude", "claude"),
+            (os.path.join("Program Files", "Claude", "claude.cmd"),),
+            (
+                "cmd.exe", "/c",
+                os.path.join("Program Files", "Claude", "claude.cmd"),
+            ),
+        ),
+    ],
+)
+def test_normalize_launch_argv(
+    platform_value, executable, siblings, expected, tmp_path, monkeypatch,
+):
+    """Regression-pin for the A1 gap: ``create_subprocess_exec`` cannot run
+    a Windows ``.cmd`` / ``.bat`` / ``.ps1`` shim directly, so the launch
+    argv must wrap it in the right interpreter. Sibling checks resolve
+    against the test cwd, so each case writes the sibling files it names."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_bin.sys, "platform", platform_value)
+    for name in siblings:
+        path = tmp_path / Path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    assert cli_bin.normalize_launch_argv(executable) == list(expected)
 
 
 # ── credential presence (UI 3-state status) ──────────────────────────
@@ -244,7 +395,6 @@ def test_claude_has_credentials_false_when_file_missing(tmp_path, monkeypatch):
 def test_claude_has_credentials_macos_falls_back_to_keychain(tmp_path, monkeypatch):
     """When the file is missing on macOS, the Keychain probe (``security
     find-generic-password``) decides. rc=0 → True, rc!=0 → False."""
-    import subprocess as _sp
 
     monkeypatch.setattr("puffo_agent.agent.cli_bin.sys.platform", "darwin")
 

@@ -115,6 +115,39 @@ class _FakeProc:
         self._killed = True
 
 
+class _ContextUsageProc:
+    def __init__(self, context_response: dict):
+        self.stdout = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        self.frames: list[dict] = []
+        self.context_response = context_response
+        self.stdin = _FakeStdin(on_write=self._on_write)
+        self.returncode = None
+
+    def _on_write(self) -> None:
+        frame = json.loads(self.stdin.buffer.decode("utf-8").splitlines()[-1])
+        self.frames.append(frame)
+        if frame["type"] == "user":
+            event = {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess-1",
+                "usage": {
+                    "input_tokens": 3,
+                    "cache_read_input_tokens": 7,
+                    "output_tokens": 2,
+                },
+            }
+        else:
+            event = {
+                "type": "control_response",
+                "response": {
+                    "request_id": frame["request_id"],
+                    **self.context_response,
+                },
+            }
+        self.stdout.feed_data((json.dumps(event) + "\n").encode())
+
+
 def _make_session(tmp_path: Path, audit: bool = True) -> ClaudeSession:
     """Build a ClaudeSession pointed at tmp_path. ``build_command``
     is unused — tests inject ``_proc`` directly.
@@ -140,6 +173,99 @@ def _read_audit_events(path: Path) -> list[dict]:
         if line:
             out.append(json.loads(line))
     return out
+
+
+def test_audit_log_summarizes_sensitive_turn_and_tool_payloads(tmp_path):
+    secret = "sensitive-payload-that-must-never-be-logged"
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, agent_id="agent")
+
+    audit.write("turn.input", content=secret)
+    audit.write("assistant.text", text=secret)
+    audit.write(
+        "tool",
+        id="call-1",
+        name="mcp__puffo__send_message",
+        input={"text": secret, "token": secret},
+    )
+    raw = path.read_text(encoding="utf-8")
+    assert secret not in raw
+
+    events = _read_audit_events(path)
+    assert events[0]["content_summary"]["length"] == len(secret)
+    assert events[1]["text_summary"]["length"] == len(secret)
+    assert events[2]["id"] == "call-1"
+    assert events[2]["input_summary"]["fields"] == ["text", "token"]
+    assert "sha256" not in events[2]["input_summary"]
+
+
+def test_audit_log_rotates_with_bounded_backup_count(tmp_path):
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, agent_id="agent", max_bytes=128, backup_count=2)
+    for index in range(12):
+        audit.write("turn.end", attempt=index, diagnostic="x" * 80)
+
+    assert path.exists()
+    assert path.with_name("audit.log.1").exists()
+    assert path.with_name("audit.log.2").exists()
+    assert not path.with_name("audit.log.3").exists()
+
+
+def test_audit_log_write_pipeline_is_fully_best_effort(tmp_path, monkeypatch):
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, agent_id="agent")
+
+    import puffo_agent.agent.adapters.cli_session as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "safe_value_summary",
+        lambda _value: (_ for _ in ()).throw(RuntimeError("summary")),
+    )
+    audit.write("turn.input", content="secret")
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        cli_module.json,
+        "dumps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TypeError("serialize")),
+    )
+    audit.write("turn.end", attempt=1)
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        audit,
+        "_rotate_if_needed",
+        lambda: (_ for _ in ()).throw(OSError("rotate")),
+    )
+    audit.write("turn.end", attempt=2)
+    monkeypatch.undo()
+
+    audit.path = tmp_path
+    monkeypatch.setattr(
+        cli_module.logger,
+        "warning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("logger")),
+    )
+    audit.write("turn.end", attempt=3)
+
+
+def test_claude_stderr_logs_only_safe_summary(tmp_path, caplog):
+    secret = "provider stderr includes bearer secret-message-body"
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader()
+        reader.feed_data((secret + "\n").encode())
+        reader.feed_eof()
+        await session._drain_stderr(type("Proc", (), {"stderr": reader})())
+
+    caplog.set_level(logging.WARNING)
+    asyncio.run(drive())
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    assert secret not in joined
+    assert "category=authentication" in joined
+    assert "sha256=" not in joined
 
 
 # ── Test 1: big line ─────────────────────────────────────────────────────────
@@ -201,7 +327,684 @@ def test_input_tokens_include_cache_creation(tmp_path):
 
     out = asyncio.run(drive())
     assert out.input_tokens == 3 + 331  # cache read (142928) excluded
+    assert out.metadata["context_tokens"] == 3 + 331 + 142928
     assert out.output_tokens == 26
+    snap = asyncio.run(session.get_context_snapshot())
+    assert snap.used_tokens == 3 + 331 + 142928
+    assert snap.context_window == 200_000
+    assert "fallback" in snap.source
+
+
+def test_admission_waits_for_first_valid_post_write_provider_event(tmp_path):
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-admitted",
+        "usage": {"input_tokens": 1},
+    }
+    lines = [
+        b"not json\n",
+        b"[1, 2, 3]\n",
+        (json.dumps(result) + "\n").encode(),
+    ]
+    session = _make_session(tmp_path, audit=False)
+    events = []
+
+    async def admitted(event):
+        assert session._proc.stdin.buffer
+        events.append(event)
+
+    async def drive():
+        session.register_admission_callback(admitted, "cycle-a")
+        session._proc = _FakeProc(
+            pre_turn_lines=[b'{"type":"stale"}\n'],
+            stdout_lines=lines,
+        )
+        return await session._one_turn("hello")
+
+    out = asyncio.run(drive())
+    assert out.input_tokens == 1
+    assert len(events) == 1
+    assert events[0].planning_cycle_key == "cycle-a"
+    assert events[0].provider_session_id == "sess-admitted"
+
+
+def test_held_continuations_match_tool_results_in_same_claude_turn(tmp_path):
+    lines = [
+        b'{"type":"system","subtype":"init","session_id":"sess-held"}\n',
+        b'{"type":"system","subtype":"status","session_id":"sess-held"}\n',
+        (
+            b'{"type":"assistant","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_use","id":"send-1","name":"mcp__puffo__send_message",'
+            b'"input":{"channel":"ch-a","text":"a"}},'
+            b'{"type":"tool_use","id":"send-2","name":"mcp__puffo__send_message",'
+            b'"input":{"channel":"ch-b","text":"b"}}]}}\n'
+        ),
+        (
+            b'{"type":"user","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_result","tool_use_id":"unrelated","content":"ok"}]}}\n'
+        ),
+        (
+            b'{"type":"user","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_result","tool_use_id":"send-2","content":"held-b"}]}}\n'
+        ),
+        (
+            b'{"type":"user","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_result","tool_use_id":"send-1","content":"held-a"}]}}\n'
+        ),
+        (
+            b'{"type":"result","subtype":"success","session_id":"sess-held",'
+            b'"usage":{"input_tokens":1}}\n'
+        ),
+    ]
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    async def continuation_a(event):
+        admitted.append(("continuation-a", event))
+
+    async def continuation_b(event):
+        admitted.append(("continuation-b", event))
+
+    async def initial(event):
+        admitted.append(("initial", event))
+        session.register_continuation_callback(
+            continuation_a, "held-continuation-a", channel_id="ch-a",
+        )
+        session.register_continuation_callback(
+            continuation_b, "held-continuation-b", channel_id="ch-b",
+        )
+
+    async def drive():
+        session.register_admission_callback(initial, "initial")
+        session._proc = _FakeProc(stdout_lines=lines)
+        return await session._one_turn("hello")
+
+    asyncio.run(drive())
+    assert [kind for kind, _event in admitted] == [
+        "initial", "continuation-b", "continuation-a",
+    ]
+    initial_event = admitted[0][1]
+    continuation_b_event = admitted[1][1]
+    continuation_a_event = admitted[2][1]
+    assert initial_event.planning_cycle_key == "initial"
+    assert continuation_b_event.planning_cycle_key == "held-continuation-b"
+    assert continuation_a_event.planning_cycle_key == "held-continuation-a"
+    assert {
+        initial_event.provider_turn_id,
+        continuation_a_event.provider_turn_id,
+        continuation_b_event.provider_turn_id,
+    } == {initial_event.provider_turn_id}
+    assert initial_event.provider_turn_id.startswith("claude-turn-")
+
+
+def _history_tool_result(tool_use_id, receipt, *, is_error=False):
+    return {
+        "type": "user",
+        "session_id": "sess-history",
+        "message": {"content": [{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "is_error": is_error,
+            "content": f"history\n[puffo:model-visible-read:{receipt}]",
+        }]},
+    }
+
+
+def _history_tool_uses():
+    return {
+        "type": "assistant",
+        "session_id": "sess-history",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "mcp__puffo__get_channel_history",
+                    "input": arguments,
+                }
+                for call_id, arguments in (
+                    ("read-a", {"channel": "ch-a"}),
+                    ("read-b", {"channel": "ch-a"}),
+                    ("read-b-wrong-arguments", {"channel": "ch-other"}),
+                    ("read-failed", {"channel": "ch-a"}),
+                    ("read-clamped", {"channel": "ch-a", "limit": 200}),
+                )
+            ],
+        },
+    }
+
+
+def _history_provider_lines():
+    encode = lambda event: (json.dumps(event) + "\n").encode()
+    wrong_tool = {
+        "type": "assistant",
+        "session_id": "sess-history",
+        "message": {"content": [{
+            "type": "tool_use",
+            "id": "wrong-tool",
+            "name": "mcp__puffo__get_post",
+            "input": {"post_ref": "ch-a"},
+        }]},
+    }
+    return [
+        encode({"type": "system", "subtype": "init", "session_id": "sess-history"}),
+        encode(_history_tool_uses()),
+        encode(wrong_tool),
+        encode(_history_tool_result("wrong-tool", "receipt-b")),
+        # A matching receipt alone must not consume the continuation: this
+        # otherwise-valid history call has a different semantic target.
+        encode(_history_tool_result("read-b-wrong-arguments", "receipt-b")),
+        encode(_history_tool_result("read-b", "receipt-b")),
+        encode(_history_tool_result("read-failed", "receipt-failed", is_error=True)),
+        encode(_history_tool_result("read-clamped", "receipt-clamped")),
+        encode(_history_tool_result("read-a", "receipt-a")),
+        encode({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "sess-history",
+            "usage": {"input_tokens": 1},
+        }),
+    ]
+
+
+def _history_admission_callback(admitted, label):
+    async def callback(event):
+        admitted.append((label, event))
+
+    return callback
+
+
+async def _register_history_continuations(session, admitted, event):
+    admitted.append(("initial", event))
+    cases = (
+        ("a", "receipt-a", {"channel": "ch-a"}),
+        ("b", "receipt-b", {"channel": "ch-a"}),
+        ("failed", "receipt-failed", {"channel": "ch-a"}),
+        ("clamped", "receipt-clamped", {"channel": "ch-a", "limit": 999}),
+    )
+    for label, receipt, arguments in cases:
+        session.register_continuation_callback(
+            _history_admission_callback(admitted, label),
+            f"visible-read-{label}",
+            tool_names=("get_channel_history",),
+            tool_arguments=arguments,
+            correlation_receipt=receipt,
+        )
+
+
+def _assert_history_continuations(session, admitted):
+    assert [kind for kind, _event in admitted] == [
+        "initial", "b", "clamped", "a",
+    ]
+    assert {event.provider_turn_id for _, event in admitted} == {
+        admitted[0][1].provider_turn_id,
+    }
+    assert [event.tool_call_id for _, event in admitted[1:]] == [
+        "read-b", "read-clamped", "read-a",
+    ]
+    assert session._continuation_admissions == []
+    with pytest.raises(RuntimeError, match="no active Claude provider turn"):
+        session.register_continuation_callback(
+            lambda _event: None,
+            "late-visible-read",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-late",
+        )
+
+
+def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    async def drive():
+        async def initial(event):
+            await _register_history_continuations(session, admitted, event)
+
+        session.register_admission_callback(initial, "initial")
+        session._proc = _FakeProc(stdout_lines=_history_provider_lines())
+        return await session._one_turn("hello")
+
+    asyncio.run(drive())
+    _assert_history_continuations(session, admitted)
+
+
+def test_claude_receipt_continuation_rejects_wrong_arguments_before_exact_result(
+    tmp_path,
+):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    async def callback(event):
+        admitted.append(event.tool_call_id)
+
+    def result(tool_use_id):
+        return {
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": "history\n[puffo:model-visible-read:receipt-a]",
+            }]},
+        }
+
+    async def drive():
+        provider_turn_id = "claude-turn-held"
+        session._active_provider_turn_id = provider_turn_id
+        session.register_continuation_callback(
+            callback,
+            "held-a",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-a",
+        )
+        session._active_puffo_tool_calls.update({
+            "wrong": ("get_channel_history", {"channel": "ch-other"}),
+            "exact": ("get_channel_history", {"channel": "ch-a"}),
+        })
+        await session._fire_matching_continuations(result("wrong"), provider_turn_id)
+        assert admitted == []
+        assert len(session._continuation_admissions) == 1
+        await session._fire_matching_continuations(result("exact"), provider_turn_id)
+
+    asyncio.run(drive())
+    assert admitted == ["exact"]
+
+
+def test_claude_turn_end_discards_old_history_continuation(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    def encode(event):
+        return (json.dumps(event) + "\n").encode()
+
+    async def old_initial(_event):
+        async def old_continuation(_admission):
+            admitted.append("old")
+
+        session.register_continuation_callback(
+            old_continuation,
+            "old",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="old-receipt",
+        )
+
+    async def new_initial(_event):
+        async def new_continuation(_admission):
+            admitted.append("new")
+
+        session.register_continuation_callback(
+            new_continuation,
+            "new",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="new-receipt",
+        )
+
+    async def drive():
+        session.register_admission_callback(old_initial, "first")
+        session._proc = _FakeProc(stdout_lines=[
+            encode({"type": "system", "session_id": "sess-history"}),
+            encode({
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess-history",
+            }),
+        ])
+        await session._one_turn("first")
+        assert session._continuation_admissions == []
+
+        session.register_admission_callback(new_initial, "second")
+        session._proc = _FakeProc(stdout_lines=[
+            encode({"type": "system", "session_id": "sess-history"}),
+                encode({
+                    "type": "assistant",
+                    "session_id": "sess-history",
+                    "message": {"content": [
+                        {
+                            "type": "tool_use",
+                            "id": "stale-call",
+                            "name": "mcp__puffo__get_channel_history",
+                            "input": {"channel": "ch-a"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "new-call",
+                            "name": "mcp__puffo__get_channel_history",
+                            "input": {"channel": "ch-a"},
+                        },
+                    ]},
+                }),
+                encode({
+                    "type": "user",
+                    "session_id": "sess-history",
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "stale-call",
+                        "content": (
+                            "[puffo:model-visible-read:old-receipt]"
+                        ),
+                }]},
+            }),
+            encode({
+                "type": "user",
+                "session_id": "sess-history",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "new-call",
+                    "content": (
+                        "[puffo:model-visible-read:new-receipt]"
+                    ),
+                }]},
+            }),
+            encode({
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess-history",
+            }),
+        ])
+        await session._one_turn("second")
+
+    asyncio.run(drive())
+    assert admitted == ["new"]
+
+
+def test_compact_unsupported_without_text_frame_and_rollover_clears(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    session._save_session_id("sess-roll")
+    session._context_used_tokens = 123
+    captured_proc = None
+
+    class LiveFakeProc(_FakeProc):
+        def __init__(self):
+            super().__init__()
+            self._wait_calls = 0
+
+        async def wait(self):
+            self._wait_calls += 1
+            if not self._terminated:
+                raise asyncio.TimeoutError
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            super().terminate()
+
+    async def install_live_proc():
+        nonlocal captured_proc
+        captured_proc = LiveFakeProc()
+        session._proc = captured_proc
+
+    asyncio.run(install_live_proc())
+
+    compact = asyncio.run(session.compact_context())
+    assert compact.completed is False
+    assert session._proc is captured_proc
+    assert bytes(captured_proc.stdin.buffer) == b""
+
+    rolled = asyncio.run(session.rollover_context())
+    assert rolled.completed is True
+    assert rolled.previous_provider_session_id == "sess-roll"
+    assert session.get_provider_session_id() is None
+    assert asyncio.run(session.get_context_snapshot()).used_tokens == 0
+    assert not session.session_file.exists()
+    assert captured_proc._terminated is True
+    assert bytes(captured_proc.stdin.buffer) == b""
+    assert b"/compact" not in captured_proc.stdin.buffer
+
+
+def test_valid_stream_event_admits_before_later_stream_failure(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    events = []
+
+    async def admitted(event):
+        events.append(event)
+
+    class ValidThenFailure:
+        def __init__(self):
+            self.triggered = False
+            self.emitted = False
+
+        async def readline(self):
+            if not self.triggered:
+                await asyncio.Future()
+            if not self.emitted:
+                self.emitted = True
+                return b'{"type":"assistant","message":{"content":[]}}\n'
+            raise ConnectionResetError("later failure")
+
+    async def drive():
+        session.register_admission_callback(admitted, "failed-after-admit")
+        proc = _FakeProc()
+        reader = ValidThenFailure()
+        proc.stdout = reader
+        proc.stdin = _FakeStdin(on_write=lambda: setattr(reader, "triggered", True))
+        session._proc = proc
+        result = await session._one_turn("hello")
+        return result, proc
+
+    result, proc = asyncio.run(drive())
+    assert result.metadata["stream_error"] == "readline_pipe"
+    assert len(events) == 1
+    assert events[0].planning_cycle_key == "failed-after-admit"
+    submitted = bytes(proc.stdin.buffer)
+    assert b'"type": "user"' in submitted
+    assert b"/compact" not in submitted
+
+
+def test_context_usage_control_response_overrides_result_estimate(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        proc = _ContextUsageProc({
+            "subtype": "success",
+            "response": {
+                "totalTokens": 142_000,
+                "rawMaxTokens": 1_000_000,
+                "autoCompactThreshold": 967_000,
+            },
+        })
+        session._proc = proc
+        return await session._one_turn("hi"), proc.frames
+
+    out, frames = asyncio.run(drive())
+    assert [frame["type"] for frame in frames] == ["user", "control_request"]
+    assert frames[1]["request"] == {"subtype": "get_context_usage"}
+    assert out.metadata["context_tokens"] == 142_000
+    assert session.context_limits() == (1_000_000, 967_000)
+
+
+def test_context_usage_invalid_total_keeps_result_estimate(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        proc = _ContextUsageProc({
+            "subtype": "success",
+            "response": {
+                "totalTokens": "unknown",
+                "rawMaxTokens": 1_000_000,
+            },
+        })
+        session._proc = proc
+        return await session._one_turn("hi")
+
+    out = asyncio.run(drive())
+    assert out.metadata["context_tokens"] == 10
+    assert session.context_limits() == (1_000_000, None)
+
+
+def test_context_usage_error_keeps_result_fallback_and_disables_retry(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        proc = _ContextUsageProc({
+            "subtype": "error",
+            "error": "unsupported request",
+        })
+        session._proc = proc
+        result = await session._one_turn("hi")
+        assert await session._refresh_context_usage() is None
+        return result, proc.frames
+
+    out, frames = asyncio.run(drive())
+    assert out.metadata["context_tokens"] == 10
+    assert session.context_limits() == (None, None)
+    assert [frame["type"] for frame in frames] == ["user", "control_request"]
+
+
+def test_context_usage_timeout_remains_retryable(tmp_path, monkeypatch):
+    session = _make_session(tmp_path, audit=False)
+
+    async def timeout(*_args):
+        raise asyncio.TimeoutError
+
+    async def drive():
+        session._proc = _ContextUsageProc({})
+        monkeypatch.setattr(session, "_read_context_usage_response", timeout)
+        assert await session._refresh_context_usage() is None
+        assert await session._refresh_context_usage() is None
+
+    asyncio.run(drive())
+    assert session._context_usage_supported is not False
+
+
+def test_turn_ignores_late_context_control_response(tmp_path, monkeypatch):
+    late_response = {
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": "ctx_timed_out",
+            "response": {"totalTokens": 42},
+        },
+    }
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "result": "still works",
+        "usage": {},
+    }
+    lines = [
+        (json.dumps(late_response) + "\n").encode(),
+        (json.dumps(result) + "\n").encode(),
+    ]
+    session = _make_session(tmp_path, audit=False)
+
+    async def no_refresh():
+        return None
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=lines)
+        monkeypatch.setattr(session, "_refresh_context_usage", no_refresh)
+        return await session._one_turn("hi")
+
+    assert asyncio.run(drive()).reply == "still works"
+
+
+def test_context_usage_reader_ignores_unrelated_events(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        events = [
+            b"not-json\n",
+            json.dumps({
+                "type": "system",
+                "subtype": "status",
+                "session_id": "sess-2",
+            }).encode() + b"\n",
+            json.dumps({
+                "type": "system",
+                "subtype": "status",
+                "session_id": "sess-2",
+            }).encode() + b"\n",
+            json.dumps({"type": "assistant", "message": {}}).encode() + b"\n",
+            json.dumps({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "stale",
+                    "response": {},
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "wanted",
+                    "response": {"rawMaxTokens": 200_000},
+                },
+            }).encode() + b"\n",
+        ]
+        for event in events:
+            reader.feed_data(event)
+        proc = type("Proc", (), {"stdout": reader})()
+        return await session._read_context_usage_response(proc, "wanted")
+
+    assert asyncio.run(drive()) == {"rawMaxTokens": 200_000}
+    assert session._session_id == "sess-2"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "invalid",
+        {"subtype": "success", "request_id": "wanted", "response": []},
+    ],
+)
+def test_context_usage_reader_rejects_invalid_response(tmp_path, response):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        reader.feed_data(json.dumps({
+            "type": "control_response",
+            "response": response,
+        }).encode() + b"\n")
+        proc = type("Proc", (), {"stdout": reader})()
+        await session._read_context_usage_response(proc, "wanted")
+
+    with pytest.raises(RuntimeError, match="invalid"):
+        asyncio.run(drive())
+
+
+def test_context_usage_reader_rejects_closed_stream(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        proc = type("Proc", (), {"stdout": reader})()
+        await session._read_context_usage_response(proc, "wanted")
+
+    with pytest.raises(ConnectionError, match="stream closed"):
+        asyncio.run(drive())
+
+
+def test_warm_refreshes_context_usage_under_session_lock(tmp_path, monkeypatch):
+    session = _make_session(tmp_path, audit=False)
+    calls = []
+
+    async def ensure(system_prompt):
+        calls.append(("ensure", system_prompt))
+
+    async def refresh():
+        calls.append(("refresh", None))
+
+    monkeypatch.setattr(session, "_ensure_running", ensure)
+    monkeypatch.setattr(session, "_refresh_context_usage", refresh)
+
+    asyncio.run(session.warm("system"))
+    assert calls == [("ensure", "system"), ("refresh", None)]
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, "200000"])
+def test_context_limits_reject_invalid_sdk_values(tmp_path, value):
+    session = _make_session(tmp_path, audit=False)
+    session._context_usage = {"rawMaxTokens": value}
+    assert session.context_limits() == (None, None)
 
 
 # ── Test 2: stream overflow recovery ─────────────────────────────────────────
@@ -727,7 +1530,10 @@ def test_one_turn_drains_pre_turn_cron_stdout(tmp_path):
     pre = [e for e in events if e.get("event") == "turn.pre_drain"]
     assert len(pre) == 1
     assert pre[0]["event_type"] == "assistant"
-    assert "News check complete" in pre[0]["text"]
+    assert "text" not in pre[0]
+    assert pre[0]["text_summary"]["length"] == len(
+        "News check complete. 3 new items."
+    )
 
 
 def test_drain_consumes_stale_result_so_next_turn_doesnt_break_early(tmp_path):
@@ -798,3 +1604,79 @@ def test_drain_swallows_readline_error_and_hands_off_to_main_loop(tmp_path):
     out = asyncio.run(drive())
     assert out.metadata.get("stream_error") == "readline_limit"
     assert out.reply == ""
+
+
+# ── Session rotation on model change (PUF-159) ───────────────────────────────
+#
+# A transcript born under one model must not be --resume'd under another:
+# cross-family replay injects the old model's thinking blocks into the new
+# provider's API (a kimi-born session resumed under an Anthropic model makes
+# claude-code send clear_thinking_20251015 without thinking enabled → 400 on
+# every turn until the session rotates).
+
+
+def _write_session_file(tmp_path: Path, sid: str, model: str | None) -> Path:
+    data: dict = {"session_id": sid, "updated_at": 1}
+    if model is not None:
+        data["model"] = model
+    f = tmp_path / "session.json"
+    f.write_text(json.dumps(data), encoding="utf-8")
+    return f
+
+
+def _make_model_session(tmp_path: Path, model: str) -> ClaudeSession:
+    return ClaudeSession(
+        agent_id="test-agent",
+        session_file=tmp_path / "session.json",
+        build_command=lambda args: ["true"],
+        cwd=str(tmp_path),
+        env={},
+        audit=None,
+        model=model,
+    )
+
+
+def test_session_rotates_when_model_changed(tmp_path, caplog):
+    _write_session_file(tmp_path, "sess-kimi", "kimi-k3")
+    with caplog.at_level(logging.INFO):
+        session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == ""  # fresh session, no --resume
+    assert not (tmp_path / "session.json").exists()  # stale file dropped
+    assert "rotating CLI session" in caplog.text
+
+
+def test_session_kept_when_model_unchanged(tmp_path):
+    _write_session_file(tmp_path, "sess-opus", "claude-opus-4-7")
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == "sess-opus"
+    assert (tmp_path / "session.json").exists()
+
+
+def test_legacy_session_file_without_model_is_kept(tmp_path):
+    # Pre-PUF-159 files carry no model — keep them (one gratuitous reset per
+    # fleet on upgrade would be worse); the model lands on the next save.
+    _write_session_file(tmp_path, "sess-legacy", None)
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == "sess-legacy"
+
+
+def test_session_kept_when_no_model_configured(tmp_path):
+    # model="" (legacy caller) → scoping disabled entirely.
+    _write_session_file(tmp_path, "sess-any", "kimi-k3")
+    session = _make_model_session(tmp_path, "")
+    assert session._session_id == "sess-any"
+
+
+def test_save_records_model(tmp_path):
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    session._save_session_id("sess-new")
+    data = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert data["session_id"] == "sess-new"
+    assert data["model"] == "claude-opus-4-7"
+
+
+def test_save_omits_model_when_unset(tmp_path):
+    session = _make_model_session(tmp_path, "")
+    session._save_session_id("sess-new")
+    data = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert "model" not in data

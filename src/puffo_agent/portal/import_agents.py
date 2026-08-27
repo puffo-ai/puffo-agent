@@ -21,7 +21,6 @@ handled by the separate ``revoke_pending`` helper.
 
 from __future__ import annotations
 
-import asyncio
 import enum
 import json
 import logging
@@ -33,23 +32,21 @@ from pathlib import Path
 import aiohttp
 
 from ..crypto.certs import create_subkey_cert
-from ..crypto.encoding import base64url_decode, base64url_encode
+from ..crypto.encoding import base64url_encode
 from ..crypto.http_auth import sign_request
 from ..crypto.http_session import create_remote_http_session
 from ..crypto.keystore import KeyStore, StoredIdentity, decode_secret, encode_secret
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from .export import (
-    ImportPackError,
     UnpackedBundle,
     sanitize_staged_agent,
     unpack,
-    write_unpacked_to_dir,
 )
+from .host_assets import _atomic_write_private, _ensure_private_directory
 from .migration_certs import (
     build_root_key_envelope,
     create_device_cert,
     create_device_revocation,
-    create_slug_binding,
 )
 from .state import agent_dir, agent_yml_path, agents_dir
 
@@ -132,7 +129,7 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
 
     _cleanup_staging(agent_id)
     stage_dir = staging_dir(agent_id)
-    write_unpacked_to_dir(files, stage_dir)
+    _write_unpacked_private(files, stage_dir)
     sanitize_staged_agent(stage_dir)
 
     old_identity = _load_old_identity(stage_dir)
@@ -213,6 +210,18 @@ async def _import_one(agent_id: str, files: dict[str, bytes]) -> AgentImportResu
     )
 
 
+def _write_unpacked_private(files: dict[str, bytes], dest: Path) -> None:
+    """Materialize a decrypted bundle under private staging permissions."""
+    if dest.exists():
+        raise ImportError(f"staging destination already exists: {dest}")
+    _ensure_private_directory(dest.parent)
+    _ensure_private_directory(dest)
+    for rel, data in files.items():
+        target = dest / rel
+        _ensure_private_directory(target.parent)
+        _atomic_write_private(target, data)
+
+
 def _load_old_identity(stage_dir: Path) -> StoredIdentity:
     keys_dir = stage_dir / "keys"
     if not keys_dir.is_dir():
@@ -262,20 +271,31 @@ def _write_new_identity(
         identity_profile_json=old_identity.identity_profile_json,
     )
     keys_dir = stage_dir / "keys"
+    backup_dek_name = f"{old_identity.slug}.message-backup-dek-v1"
+    backup_dek_path = keys_dir / backup_dek_name
+    if backup_dek_path.exists():
+        if backup_dek_path.is_symlink() or not backup_dek_path.is_file():
+            raise ImportError("bundle message backup key is not a regular file")
+        if backup_dek_path.stat().st_size != 32:
+            raise ImportError("bundle message backup key has invalid length")
+        backup_dek_path.chmod(0o600)
     for path in list(keys_dir.iterdir()):
-        if path.is_file() and path.name != "registered-agents.json":
+        if path.is_file() and path.name not in {
+            "registered-agents.json",
+            backup_dek_name,
+        }:
             path.unlink()
     out_path = keys_dir / f"{old_identity.slug}.json"
-    out_path.write_text(json.dumps(new_identity.to_dict(), indent=2), encoding="utf-8")
+    _atomic_write_private(out_path, json.dumps(new_identity.to_dict(), indent=2))
 
     if new_subkey is not None and new_subkey_cert is not None:
         session_path = keys_dir / f"{old_identity.slug}.session.json"
-        session_path.write_text(json.dumps({
+        _atomic_write_private(session_path, json.dumps({
             "slug": old_identity.slug,
             "subkey_id": new_subkey_cert["subkey_id"],
             "subkey_secret_key": encode_secret(new_subkey.secret_bytes()),
             "expires_at": new_subkey_cert["expires_at"],
-        }, indent=2), encoding="utf-8")
+        }, indent=2))
 
     _patch_agent_yml_device_id(stage_dir / "agent.yml", new_device_id)
 
@@ -298,11 +318,12 @@ async def _register_new_device_subkey(
 
 
 def _set_state_running(agent_id: str) -> None:
-    from .state import AgentConfig
+    import yaml
 
-    cfg = AgentConfig.load(agent_id)
-    cfg.state = "running"
-    cfg.save()
+    path = agent_yml_path(agent_id)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw["state"] = "running"
+    _atomic_write_private(path, yaml.safe_dump(raw, sort_keys=False))
 
 
 def _patch_agent_yml_device_id(yml_path: Path, new_device_id: str) -> None:
@@ -312,14 +333,14 @@ def _patch_agent_yml_device_id(yml_path: Path, new_device_id: str) -> None:
     pc = raw.get("puffo_core") or {}
     pc["device_id"] = new_device_id
     raw["puffo_core"] = pc
-    yml_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    _atomic_write_private(yml_path, yaml.safe_dump(raw, sort_keys=False))
 
 
 def _commit_staging(agent_id: str, stage_dir: Path) -> None:
     target = agent_dir(agent_id)
     if target.exists():
         raise ImportError(f"agent dir appeared during import: {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_directory(target.parent)
     shutil.move(str(stage_dir), str(target))
 
 

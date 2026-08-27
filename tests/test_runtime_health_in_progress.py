@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -193,6 +192,21 @@ def test_fallback_unhandled_error_default_error_when_caller_passes_none(
     assert rs.error  # populated even when caller had no error text
 
 
+def test_categorized_provider_failure_is_not_reported_as_unhandled(
+    tmp_path, monkeypatch,
+):
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+
+    Worker._mark_provider_failure_if_in_progress(
+        rs, agent_id, "provider usage limit reached", _LOG,
+    )
+
+    assert rs.health == "provider_error"
+    assert rs.error == "provider usage limit reached"
+
+
 # ── chain integration tests (PR #59 Blocker 1 + Blocker 2) ───────
 
 
@@ -222,11 +236,7 @@ def test_chain_agent_api_error_then_retry_success_resolves_to_ok(
     on_disk = RuntimeState.load(agent_id)
     assert on_disk is not None and on_disk.health == "in_progress"
 
-    # T2: consumer kicks the retry; it succeeds; on_turn_success
-    # fires the same helper pair the worker installed in this PR.
-    Worker._clear_api_error_abandoned_if_recoverable(
-        rs, agent_id, "root_x", _LOG,
-    )
+    # T2: consumer kicks the retry; process success resolves the health state.
     Worker._resolve_health_on_success(rs, agent_id, _LOG)
 
     assert rs.health == "ok"
@@ -263,9 +273,13 @@ def test_chain_non_api_error_swallow_falls_back_to_unhandled_error(
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_carries_both_status_and_health():
+async def test_heartbeat_carries_both_status_and_health(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
+    mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
     health_value = {"v": "in_progress"}
     reporter = StatusReporter(
         mock_http,
@@ -286,11 +300,15 @@ async def test_heartbeat_carries_both_status_and_health():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_without_provider_omits_health_field():
+async def test_heartbeat_without_provider_omits_health_field(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     """Back-compat: when constructed without a provider (no-op /
     tests), heartbeat carries the legacy single-stream shape."""
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
+    mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
     reporter = StatusReporter(mock_http)
     reporter._current_status = "idle"
     await reporter._send_heartbeat()
@@ -301,9 +319,13 @@ async def test_heartbeat_without_provider_omits_health_field():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_provider_exception_does_not_break_heartbeat():
+async def test_heartbeat_provider_exception_does_not_break_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
+    mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
 
     def broken_provider() -> str:
         raise RuntimeError("runtime not loaded")
@@ -338,6 +360,7 @@ def test_cli_surfaced_health_tuple_includes_new_values():
         "unhandled_error",
         "auth_failed",
         "api_error_abandoned",
+        "provider_error",
         "refresh_broken",
     ):
         assert f'"{required}"' in text, (

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _bridge_support import isolated_home  # noqa: E402
+from _portal_support import isolated_home  # noqa: E402
 
 from puffo_agent.portal.control import link as link_mod  # noqa: E402
 from puffo_agent.portal.control.link import (  # noqa: E402

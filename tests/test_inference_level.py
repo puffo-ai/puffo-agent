@@ -7,8 +7,11 @@ and drops levels Codex can't use (xhigh) at config.toml-write time.
 """
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
+
+import pytest
 
 from puffo_agent.mcp.config import (
     INFERENCE_LEVELS,
@@ -113,67 +116,68 @@ def test_legacy_yml_without_field_defaults_empty(tmp_path, monkeypatch):
 # ─── claude-code: --effort on the spawn argv ─────────────────────────
 
 
-def _local_adapter(level: str):
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
+def _local_spec(tmp_path: Path, monkeypatch, level: str):
+    from puffo_agent.agent.harness import local_runtime
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
-    a = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    a.agent_id = "t-1"
-    a.permission_mode = "bypassPermissions"
-    a.model = "claude-opus-4-8"
-    a.inference_level = level
-    return a
-
-
-def _docker_adapter(level: str):
-    from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
-
-    a = DockerCLIAdapter.__new__(DockerCLIAdapter)
-    a.agent_id = "t-1"
-    a.container_name = "puffo-t-1"
-    a.model = "claude-opus-4-8"
-    a.inference_level = level
-    return a
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    monkeypatch.setattr(local_runtime, "resolve_claude_bin", lambda: "/bin/echo")
+    cfg = AgentConfig(
+        id="t-1",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-opus-4-8",
+            inference_level=level,
+        ),
+    )
+    preparer = local_runtime.LocalRuntimePreparer(DaemonConfig(), cfg)
+    return preparer._prepare_claude_spec("")
 
 
-def test_local_claude_argv_carries_effort():
-    cmd = _local_adapter("xhigh")._build_command([])
-    assert cmd[cmd.index("--effort") + 1] == "xhigh"
+def _docker_spec(tmp_path: Path, monkeypatch, level: str):
+    from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    cfg = AgentConfig(
+        id="t-1",
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-opus-4-8",
+            inference_level=level,
+        ),
+    )
+    return DockerRuntimePreparer(DaemonConfig(), cfg)._prepare_claude_spec("")
 
 
-def test_local_claude_argv_omits_empty_level():
-    assert "--effort" not in _local_adapter("")._build_command([])
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [("xhigh", "xhigh"), ("", None), ("minimal", None)],
+)
+def test_local_claude_effort_args(tmp_path, monkeypatch, level, expected):
+    args = list(_local_spec(tmp_path, monkeypatch, level).launch_args)
+    if expected is None:
+        assert "--effort" not in args
+    else:
+        assert args[args.index("--effort") + 1] == expected
 
 
-def test_local_claude_argv_skips_yaml_only_codex_value():
-    assert "--effort" not in _local_adapter("minimal")._build_command([])
+def test_docker_claude_argv_carries_effort(tmp_path, monkeypatch):
+    args = list(_docker_spec(tmp_path, monkeypatch, "high").launch_args)
+    assert args[args.index("--effort") + 1] == "high"
 
 
-def test_docker_claude_argv_carries_effort():
-    cmd = _docker_adapter("high")._build_command([])
-    assert cmd[cmd.index("--effort") + 1] == "high"
-
-
-def test_docker_claude_argv_skips_invalid():
-    assert "--effort" not in _docker_adapter("turbo")._build_command([])
-
-
-def test_create_bundle_parses_and_validates_level():
-    """Source pin: the linked-machine create path reads
-    runtime.inference_level and rejects out-of-set values."""
-    import inspect
-
-    from puffo_agent.portal.api import handlers
-
-    src = inspect.getsource(handlers._verify_agent_bundle)
-    assert "inference_level=str(rt.get(\"inference_level\", \"\"))" in src
-    assert "INFERENCE_LEVELS" in src
+def test_docker_claude_argv_skips_invalid(tmp_path, monkeypatch):
+    args = _docker_spec(tmp_path, monkeypatch, "turbo").launch_args
+    assert "--effort" not in args
 
 
 # ─── inference_level via the self-serve refresh MCP ──────────
 
-
-import json  # noqa: E402
-import pytest  # noqa: E402
 
 from puffo_agent.mcp.config import supported_inference_levels  # noqa: E402
 from puffo_agent.mcp.puffo_core_server import (  # noqa: E402
@@ -194,15 +198,14 @@ def test_supported_levels_are_per_harness():
     assert "minimal" not in supported_inference_levels("claude-code")
 
 
-def test_supported_levels_unknown_harness_is_permissive_union():
-    levels = supported_inference_levels("")
-    assert set(levels) == set(INFERENCE_LEVELS) | set(REASONING_EFFORTS)
+def test_supported_levels_unknown_harness_is_empty():
+    assert supported_inference_levels("") == ()
 
 
 @pytest.mark.parametrize(
     "harness,level",
     [("codex", "medium"), ("codex", "minimal"), ("claude-code", "high"),
-     ("claude-code", "xhigh"), ("", "medium")],
+     ("claude-code", "xhigh")],
 )
 def test_refresh_validator_accepts_in_set(harness, level):
     _validate_refresh_inference_level(harness, level)  # no raise
@@ -210,7 +213,8 @@ def test_refresh_validator_accepts_in_set(harness, level):
 
 @pytest.mark.parametrize(
     "harness,level",
-    [("codex", "xhigh"), ("claude-code", "minimal"), ("codex", "turbo")],
+    [("codex", "xhigh"), ("claude-code", "minimal"), ("codex", "turbo"),
+     ("", "medium")],
 )
 def test_refresh_validator_rejects_out_of_set(harness, level):
     with pytest.raises(RuntimeError):
@@ -290,19 +294,6 @@ def test_daemon_marks_flag_broken_on_bad_level(tmp_path, monkeypatch):
     assert loaded.runtime.inference_level == "low"  # unchanged
     assert not flag.exists()
     assert flag.with_suffix(".flag.broken").exists()
-
-
-def test_refresh_docstring_documents_inference_level_axis():
-    """Source-pin: the refresh MCP tool advertises inference_level as an
-    orthogonal axis so agents discover it; guards a future refactor from
-    silently dropping it from the docs."""
-    import inspect
-
-    from puffo_agent.mcp import puffo_core_server
-
-    src = inspect.getsource(puffo_core_server._register_local_tools)
-    assert "Five orthogonal axes" in src
-    assert "inference_level" in src
 
 
 # ─── refresh MCP tool: inference_level orchestration ─────────────────

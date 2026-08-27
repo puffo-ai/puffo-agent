@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from _bridge_support import isolated_home, write_test_agent
+from _portal_support import isolated_home, write_test_agent
 
 from puffo_agent.portal.control import link as link_mod
 from puffo_agent.portal.control.link import migrate_owned_agents

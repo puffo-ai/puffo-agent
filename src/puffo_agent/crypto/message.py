@@ -72,6 +72,18 @@ class MessagePayload:
     recipient_slug: Optional[str] = None
     thread_root_id: Optional[str] = None
     reply_to_id: Optional[str] = None
+    # Keyless-bridge only: top-level ``AttachmentRef`` list carried on
+    # inbound plaintext ``message`` frames. NOT part of the native
+    # signed/AEAD payload — deliberately excluded from
+    # ``to_payload_dict()`` so every native seal/open produces the
+    # identical canonical bytes the Rust server expects. Native inbound
+    # keys off ``content_type`` and never reads this field, so it stays
+    # ``None`` on that path.
+    attachments: Optional[list] = None
+    # Additive bridge identity fields. They intentionally never enter the
+    # signed native payload serialization below.
+    sender_owner_slug: Optional[str] = None
+    sender_type: Optional[str] = None
 
     def to_payload_dict(self) -> dict:
         """JSON shape matching the server's ``MessagePayload``.
@@ -80,6 +92,10 @@ class MessagePayload:
         omitted): the server's verified-payload validator calls
         ``expect_null`` on the inactive route fields per envelope
         kind, so omitting them returns InvalidInput.
+
+        ``attachments`` is intentionally NOT emitted here — it's a
+        bridge-transport-only surface field, and adding it would
+        diverge the canonical signing bytes from the server's.
         """
         return {
             "type": self.payload_type,
@@ -122,12 +138,12 @@ def _build_signed_payload(
     signing_key: Ed25519KeyPair,
     now_ms: int | None,
 ) -> tuple[str, int, dict]:
-    """Shared by the E2EE and plaintext producers so the payload shape
-    and signature input can't drift between the two send modes."""
+    """Build the payload shared by encrypted and plaintext messages."""
     # EnvelopeId MUST be ``msg_<UUID>`` — server's prefix validator
     # rejects anything else before crypto runs.
     envelope_id = f"msg_{uuid.uuid4()}"
     message_nonce = base64url_encode(os.urandom(16))
+
     if now_ms is None:
         now_ms = _now_ms()
 
@@ -149,9 +165,11 @@ def _build_signed_payload(
         content=inp.content,
         is_visible_to_human=inp.is_visible_to_human,
     )
+
     payload_dict = payload.to_payload_dict()
     canonical = canonicalize_for_signing(payload_dict)
     sig = signing_key.sign(canonical)
+
     signed = {
         "payload": payload_dict,
         "signature": base64url_encode(sig),
@@ -165,8 +183,7 @@ def build_plaintext_message(
     *,
     now_ms: int | None = None,
 ) -> dict:
-    """Non-E2EE producer: the signed payload rides in the clear; no
-    recipient devices involved. ``inp.recipients`` is ignored."""
+    """Build a signed message without recipient-specific encryption."""
     envelope_id, _, signed = _build_signed_payload(inp, signing_key, now_ms)
     return {
         "type": "plaintext_message_envelope",
@@ -331,12 +348,7 @@ def read_plaintext_message(
     envelope: dict,
     sender_public_key: bytes,
 ) -> MessagePayload:
-    """Verify a non-E2EE ``plaintext_message_envelope`` and return its payload.
-
-    No HPKE/AEAD — the signature covers the canonicalized ``payload`` as in
-    the E2EE path. There's no outer envelope, so the payload's own
-    ``sender_slug`` is authoritative (no cross-check).
-    """
+    """Verify a plaintext message's signed payload."""
     envelope_id = envelope["envelope_id"]
     signed = envelope["signed_payload"]
     payload_dict = signed["payload"]
@@ -349,7 +361,10 @@ def read_plaintext_message(
     return _message_payload_from_dict(payload_dict, envelope_id)
 
 
-def _message_payload_from_dict(payload_dict: dict, envelope_id: str) -> MessagePayload:
+def _message_payload_from_dict(
+    payload_dict: dict,
+    envelope_id: str,
+) -> MessagePayload:
     return MessagePayload(
         payload_type=payload_dict["type"],
         version=payload_dict["version"],

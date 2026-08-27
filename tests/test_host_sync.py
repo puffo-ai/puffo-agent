@@ -6,6 +6,7 @@ Contract:
     into ``<agent_home>/.claude/skills/``, drop a ``host-synced.md``
     marker for provenance, prune stale host-synced dirs the host
     removed, never clobber a dir tagged ``agent-installed.md``.
+    Codex mirrors ``~/.codex/skills`` into its isolated CODEX_HOME.
   * MCPs: merge host ``~/.claude.json`` ``mcpServers`` into the
     per-agent ``.claude.json``; host wins on collision; agent-only
     entries survive; other top-level keys are left untouched.
@@ -29,6 +30,8 @@ from puffo_agent.portal.state import (
     HOST_SYNCED_MARKER,
     _host_local_token,
     _looks_host_local_command,
+    seed_claude_home,
+    sync_host_codex_skills,
     sync_host_enabled_plugins,
     sync_host_gemini_mcp_servers,
     sync_host_gemini_skills,
@@ -192,12 +195,43 @@ def test_sync_host_skills_missing_host_dir_is_noop(tmp_path):
     assert not (agent / ".claude" / "skills").exists()
 
 
+def test_sync_host_codex_skills_targets_isolated_codex_home(tmp_path):
+    host = tmp_path / "host"
+    _write_skill(host / ".codex" / "skills", "review", body="codex review")
+    agent_codex = tmp_path / "agent" / ".codex"
+
+    assert sync_host_codex_skills(host, agent_codex) == 1
+
+    installed = agent_codex / "skills" / "review"
+    assert (installed / "SKILL.md").read_text() == "codex review"
+    assert (installed / HOST_SYNCED_MARKER).exists()
+    assert not (tmp_path / "agent" / ".claude" / "skills").exists()
+
+
 # ── MCP registrations ────────────────────────────────────────────────────────
 
 
 def _write_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_seed_claude_home_writes_private_config_files(tmp_path):
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_json(host / ".claude" / "settings.json", {
+        "env": {"ANTHROPIC_API_KEY": "secret"},
+    })
+    _write_json(host / ".claude.json", {
+        "mcpServers": {"private": {"env": {"TOKEN": "secret"}}},
+    })
+
+    assert seed_claude_home(host, agent) is True
+    if os.name != "nt":
+        assert agent.stat().st_mode & 0o777 == 0o700
+        assert (agent / ".claude").stat().st_mode & 0o777 == 0o700
+        assert (agent / ".claude/settings.json").stat().st_mode & 0o777 == 0o600
+        assert (agent / ".claude.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_sync_host_mcp_merges_host_servers_into_empty_agent(tmp_path):
@@ -215,6 +249,9 @@ def test_sync_host_mcp_merges_host_servers_into_empty_agent(tmp_path):
     assert unreachable == []
     data = json.loads((agent / ".claude.json").read_text(encoding="utf-8"))
     assert data["mcpServers"]["fs"]["command"] == "npx"
+    if os.name != "nt":
+        assert agent.stat().st_mode & 0o777 == 0o700
+        assert (agent / ".claude.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_sync_host_mcp_preserves_agent_only_entries(tmp_path):
@@ -281,7 +318,9 @@ def test_sync_host_mcp_skips_host_local_and_flags_them(tmp_path):
         },
     })
 
-    merged, unreachable = sync_host_mcp_servers(host, agent)
+    merged, unreachable = sync_host_mcp_servers(
+        host, agent, containerized=True,
+    )
 
     assert merged == 3
     flagged_names = sorted(name for name, _ in unreachable)
@@ -306,7 +345,10 @@ def test_sync_host_gemini_mcp_skips_host_local_but_keeps_extra(tmp_path):
     })
 
     merged, unreachable = sync_host_gemini_mcp_servers(
-        host, project, extra_servers={"puffo": {"command": "python3"}},
+        host,
+        project,
+        extra_servers={"puffo": {"command": "python3"}},
+        containerized=True,
     )
 
     assert merged == 1  # only "ok" merged; brew-local skipped
@@ -315,6 +357,9 @@ def test_sync_host_gemini_mcp_skips_host_local_but_keeps_extra(tmp_path):
         (project / ".gemini" / "settings.json").read_text(encoding="utf-8")
     )
     assert sorted(written["mcpServers"]) == ["ok", "puffo"]  # extra always present
+    if os.name != "nt":
+        assert (project / ".gemini").stat().st_mode & 0o777 == 0o700
+        assert (project / ".gemini/settings.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_sync_host_mcp_no_host_file_is_noop(tmp_path):
@@ -342,7 +387,7 @@ def test_sync_host_mcp_empty_host_servers_is_noop(tmp_path):
 
 
 def test_sync_host_mcp_handles_empty_agent_file(tmp_path):
-    """``docker_cli.py`` touches ``.claude.json`` to a 0-byte file
+    """The Docker runtime touches ``.claude.json`` to a 0-byte file
     before ``docker run``. Merge must treat that as empty config."""
     host = tmp_path / "host"
     agent = tmp_path / "agent"
@@ -651,107 +696,6 @@ def test_looks_host_local_command_empty_is_not_flagged():
     assert not _looks_host_local_command("")
 
 
-# ── cli-local adapter integration ────────────────────────────────────────────
-
-
-def _build_local_adapter(tmp_path, monkeypatch):
-    """Construct a LocalCLIAdapter with ``Path.home()`` redirected to
-    ``tmp_path/host`` and the ``claude`` binary check mocked. Returns
-    (adapter, host, agent_home).
-    """
-    host = tmp_path / "host"
-    host.mkdir(parents=True, exist_ok=True)
-    agent_home = tmp_path / "agent" / "home"
-    # Path.home() reads HOME on POSIX, USERPROFILE on Windows.
-    monkeypatch.setenv("HOME", str(host))
-    monkeypatch.setenv("USERPROFILE", str(host))
-    from puffo_agent.agent.adapters import local_cli
-    monkeypatch.setattr(local_cli.shutil, "which", lambda _: "/fake/claude")
-    adapter = local_cli.LocalCLIAdapter(
-        agent_id="t",
-        model="",
-        workspace_dir=str(tmp_path / "ws"),
-        claude_dir=str(tmp_path / "ws" / ".claude"),
-        session_file=str(tmp_path / "sess.json"),
-        mcp_config_file=str(tmp_path / "mcp.json"),
-        agent_home_dir=str(agent_home),
-    )
-    return adapter, host, agent_home
-
-
-def test_local_cli_verify_syncs_host_skills(tmp_path, monkeypatch):
-    adapter, host, agent_home = _build_local_adapter(tmp_path, monkeypatch)
-    _write_skill(host / ".claude" / "skills", "s1", body="SKILL")
-
-    adapter._verify()
-
-    assert (agent_home / ".claude" / "skills" / "s1" / "SKILL.md").read_text() == "SKILL"
-    assert (agent_home / ".claude" / "skills" / "s1" / HOST_SYNCED_MARKER).exists()
-
-
-def test_local_cli_verify_merges_host_mcp_servers(tmp_path, monkeypatch):
-    adapter, host, agent_home = _build_local_adapter(tmp_path, monkeypatch)
-    _write_json(host / ".claude.json", {"mcpServers": {"fs": {"command": "npx"}}})
-
-    adapter._verify()
-
-    data = json.loads((agent_home / ".claude.json").read_text(encoding="utf-8"))
-    assert data["mcpServers"]["fs"]["command"] == "npx"
-
-
-def test_local_cli_verify_does_not_warn_on_host_local_mcp(
-    tmp_path, monkeypatch, caplog,
-):
-    """On cli-local the agent runs on the host, so host-local MCP
-    command paths WILL resolve. The unreachable warning is docker-only.
-    """
-    import logging
-    adapter, host, _agent_home = _build_local_adapter(tmp_path, monkeypatch)
-    _write_json(host / ".claude.json", {
-        "mcpServers": {
-            "mac-local": {"command": "/Users/alice/bin/mcp"},
-            "win-local": {"command": r"C:\Users\bob\mcp.exe"},
-        },
-    })
-
-    with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.adapters.local_cli"):
-        adapter._verify()
-
-    # No "host-local" warning. (Dangerous-mode warning at end of
-    # _verify() is expected and filtered out.)
-    offending = [
-        r for r in caplog.records
-        if r.levelno >= logging.WARNING and "host-local" in r.message
-    ]
-    assert offending == []
-
-
-def test_local_cli_verify_preserves_agent_installed_content(tmp_path, monkeypatch):
-    """Skills/MCPs the agent registered for itself in a previous
-    session survive the host sync on the next worker start."""
-    adapter, host, agent_home = _build_local_adapter(tmp_path, monkeypatch)
-    # Host has its own skill + MCP.
-    _write_skill(host / ".claude" / "skills", "from_host", body="H")
-    _write_json(host / ".claude.json", {
-        "mcpServers": {"host-mcp": {"command": "npx"}},
-    })
-    # Agent already has an agent-installed skill + MCP with marker.
-    agent_made = agent_home / ".claude" / "skills" / "agent_made"
-    agent_made.mkdir(parents=True)
-    (agent_made / "SKILL.md").write_text("A", encoding="utf-8")
-    (agent_made / AGENT_INSTALLED_MARKER).write_text("", encoding="utf-8")
-    _write_json(agent_home / ".claude.json", {
-        "mcpServers": {"agent-mcp": {"command": "python3"}},
-    })
-
-    adapter._verify()
-
-    assert (agent_made / "SKILL.md").read_text() == "A"
-    assert not (agent_made / HOST_SYNCED_MARKER).exists()
-    assert (agent_home / ".claude" / "skills" / "from_host" / "SKILL.md").read_text() == "H"
-    data = json.loads((agent_home / ".claude.json").read_text(encoding="utf-8"))
-    assert set(data["mcpServers"].keys()) == {"agent-mcp", "host-mcp"}
-
 
 # ── Gemini-side host sync ────────────────────────────────────────────────────
 
@@ -834,7 +778,9 @@ def test_sync_host_gemini_mcp_servers_merges_host_entries(tmp_path):
         "context": {"fileName": ["GEMINI.md"]},
     }), encoding="utf-8")
 
-    n, unreachable = sync_host_gemini_mcp_servers(host, agent)
+    n, unreachable = sync_host_gemini_mcp_servers(
+        host, agent, containerized=True,
+    )
     assert n == 1
     assert unreachable == []
 
@@ -895,7 +841,9 @@ def test_sync_host_gemini_mcp_servers_flags_host_local_commands(tmp_path):
     }), encoding="utf-8")
     agent = tmp_path / "agent"
 
-    n, unreachable = sync_host_gemini_mcp_servers(host, agent)
+    n, unreachable = sync_host_gemini_mcp_servers(
+        host, agent, containerized=True,
+    )
     assert n == 1  # host-local "local" skipped, only "image" merges
     assert [name for name, _ in unreachable] == ["local"]
 
@@ -907,6 +855,7 @@ def test_sync_host_mcp_corrupt_host_file_is_noop(tmp_path):
     (host / ".claude.json").write_text("{not json", encoding="utf-8")
 
     assert sync_host_mcp_servers(host, agent) == (0, [])
+    assert list(agent.glob(".claude.json*.tmp*")) == []
     assert not (agent / ".claude.json").exists()
 
 
@@ -940,6 +889,7 @@ def test_sync_host_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
     )
 
     assert sync_host_mcp_servers(host, agent) == (0, [])
+    assert list(agent.glob(".claude.json*.tmp*")) == []
 
 
 def test_sync_host_gemini_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
@@ -956,3 +906,4 @@ def test_sync_host_gemini_mcp_write_failure_returns_zero(tmp_path, monkeypatch):
     )
 
     assert sync_host_gemini_mcp_servers(host, project) == (0, [])
+    assert list((project / ".gemini").glob("*settings.json*.tmp*")) == []

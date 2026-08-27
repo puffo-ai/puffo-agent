@@ -3,7 +3,6 @@ lifecycle 4xx give-up, and /v1/info machine_id."""
 from __future__ import annotations
 
 import argparse
-import json
 import types
 
 import pytest
@@ -132,8 +131,10 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
     from puffo_agent.portal.control import link
 
     spawned = []
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: False)
+    monkeypatch.setattr(
+        bg, "spawn_headless_background", lambda **kw: spawned.append(kw) or 0
+    )
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
         return 0
@@ -143,14 +144,31 @@ def test_cmd_link_autostarts_when_daemon_down(monkeypatch):
     assert spawned == [{}]
 
 
+def test_cmd_link_stops_when_daemon_startup_fails(monkeypatch):
+    from puffo_agent.portal import background as bg
+    from puffo_agent.portal import cli
+    from puffo_agent.portal.control import link
+
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: False)
+    monkeypatch.setattr(bg, "spawn_headless_background", lambda: 1)
+
+    async def _must_not_link(*_args, **_kwargs):
+        raise AssertionError("link must not run without a ready daemon")
+
+    monkeypatch.setattr(link, "run_link", _must_not_link)
+    assert cli.cmd_link(_link_ns()) == 1
+
+
 def test_cmd_link_skips_autostart_when_daemon_running(monkeypatch):
     from puffo_agent.portal import cli
     from puffo_agent.portal import background as bg
     from puffo_agent.portal.control import link
 
     spawned = []
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
-    monkeypatch.setattr(bg, "spawn_background", lambda **kw: spawned.append(kw) or 0)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
+    monkeypatch.setattr(
+        bg, "spawn_headless_background", lambda **kw: spawned.append(kw) or 0
+    )
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
         return 0
@@ -197,21 +215,6 @@ async def test_report_lifecycle_retries_on_5xx(monkeypatch):
 
     _stub_lifecycle_http(monkeypatch, HttpError(503, "upstream down"))
     assert await daemon._report_lifecycle(_fake_cfg(), "paused") is False
-
-
-# ── /v1/info machine_id ─────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_info_includes_machine_id(monkeypatch):
-    from puffo_agent.portal.api import handlers
-
-    monkeypatch.setattr("puffo_agent.portal.control.store.current_machine_id", lambda: "mac_INFO")
-    monkeypatch.setattr(handlers, "load_pairing", lambda: None)
-    monkeypatch.setattr(handlers, "discover_agents", lambda: [])
-
-    resp = await handlers.info(None)
-    data = json.loads(resp.body)
-    assert data["machine_id"] == "mac_INFO"
 
 
 # ── machine unlink CLI wiring ───────────────────────────────────────
@@ -273,7 +276,7 @@ def test_cmd_link_passes_code_through(monkeypatch):
     from puffo_agent.portal import cli
     from puffo_agent.portal.control import link
 
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
     seen = {}
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
@@ -289,7 +292,7 @@ def test_cmd_link_defaults_code_to_none(monkeypatch):
     from puffo_agent.portal import cli
     from puffo_agent.portal.control import link
 
-    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
     seen = {}
 
     async def _fake_run_link(url, name, open_browser=True, code=None):

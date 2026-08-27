@@ -117,8 +117,8 @@ def test_view_file_is_owner_only(tmp_path):
     agent = tmp_path / "agent"
     _write_host(host)
     sync_host_claude_code_auth_view(host, agent)
-    mode = _agent_view(agent).stat().st_mode & 0o777
-    assert mode == 0o600
+    assert _agent_view(agent).parent.stat().st_mode & 0o777 == 0o700
+    assert _agent_view(agent).stat().st_mode & 0o777 == 0o600
 
 
 def test_view_idempotent(tmp_path):
@@ -131,6 +131,20 @@ def test_view_idempotent(tmp_path):
     assert sync_host_claude_code_auth_view(host, agent) == "view (fresh)"
     # No rewrite -> no mtime churn.
     assert _agent_view(agent).stat().st_mtime_ns == before
+
+
+def test_fresh_view_repairs_private_mode(tmp_path):
+    if os.name == "nt":
+        pytest.skip("posix permission bits")
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_host(host)
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
+    view = _agent_view(agent)
+    view.chmod(0o644)
+
+    assert sync_host_claude_code_auth_view(host, agent) == "view (fresh)"
+    assert view.stat().st_mode & 0o777 == 0o600
 
 
 def test_view_tracks_host_rotation(tmp_path):
@@ -224,25 +238,21 @@ def test_no_host_file(tmp_path):
     assert not _agent_view(agent).exists()
 
 
-def test_chmod_failure_is_swallowed(tmp_path, monkeypatch):
+def test_private_mode_setup_failure_is_fail_closed(tmp_path, monkeypatch):
+    if not hasattr(os, "fchmod"):
+        pytest.skip("descriptor permissions unavailable")
     host = tmp_path / "host"
     agent = tmp_path / "agent"
     _write_host(host)
 
-    real_chmod = Path.chmod
+    def _fail_fchmod(*args, **kwargs):
+        raise OSError("simulated fchmod failure")
 
-    def _fail_chmod(self, *args, **kwargs):
-        if ".credentials.json.tmp" in self.name:
-            raise OSError("simulated chmod failure")
-        return real_chmod(self, *args, **kwargs)
+    monkeypatch.setattr(os, "fchmod", _fail_fchmod)
 
-    monkeypatch.setattr(Path, "chmod", _fail_chmod)
-
-    assert sync_host_claude_code_auth_view(host, agent) == "view"
-    view = _agent_view(agent)
-    assert "refreshToken" not in json.loads(
-        view.read_text(encoding="utf-8")
-    )["claudeAiOauth"]
+    assert sync_host_claude_code_auth_view(host, agent) == "write-failed"
+    assert not _agent_view(agent).exists()
+    assert list((agent / ".claude").glob(".*.tmp")) == []
 
 
 def test_agent_read_error_falls_through_to_rewrite(tmp_path, monkeypatch):

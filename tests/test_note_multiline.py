@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from puffo_agent.mcp.puffo_core_tools import _format_note, _parse_note
+from puffo_agent.mcp.core_note_tools import _format_note, _parse_note
 
 
 def note(message: str, *, mentions: list[str] | None = None) -> str:

@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 
 from ..._proc import no_window_kwargs
+from ...agent._usage_markers import DRAINED_RUNTIME_ERROR
 from ...agent.cli_bin import resolve_claude_bin, resolve_codex_bin
 from ..state import AgentConfig, discover_agents
 
@@ -121,15 +122,134 @@ def parse_codex_rate_limits(raw: dict | None) -> dict | None:
     return out or None
 
 
-def machine_harnesses() -> set[str]:
-    """Harnesses in use by this machine's agents (drives which /usage to probe)."""
-    harnesses = set()
+def agent_harnesses() -> dict[str, str]:
+    """``{agent_id: harness}`` for this machine's agents."""
+    out: dict[str, str] = {}
     for agent_id in discover_agents():
         try:
-            harnesses.add(AgentConfig.load(agent_id).runtime.harness or "claude-code")
+            out[agent_id] = AgentConfig.load(agent_id).runtime.harness or "claude-code"
         except Exception:  # noqa: BLE001 — a broken agent.yml shouldn't block the rest
             continue
-    return harnesses
+    return out
+
+
+def machine_harnesses() -> set[str]:
+    """Harnesses in use by this machine's agents (drives which /usage to probe)."""
+    return set(agent_harnesses().values())
+
+
+def drained_harnesses(snapshot: dict) -> dict[str, int | None]:
+    """``{harness: resets_at}`` per spent harness. Reset = when EVERY
+    exhausted window clears (max); ``None`` if any is unknown. Weekly
+    spent counts even with session headroom."""
+    out: dict[str, int | None] = {}
+    for harness, budgets in (snapshot or {}).items():
+        if not isinstance(budgets, dict):
+            continue
+        resets: list[int] = []
+        spent = False
+        all_known = True
+        for window in ("session", "weekly"):
+            entry = budgets.get(window)
+            if not isinstance(entry, dict):
+                continue
+            if (entry.get("used_pct") or 0) < 100:
+                continue
+            spent = True
+            if isinstance(entry.get("resets_at"), int):
+                resets.append(entry["resets_at"])
+            else:
+                all_known = False
+        if spent:
+            out[harness] = max(resets) if resets and all_known else None
+    return out
+
+
+_live_workers_provider = None
+
+
+def set_live_workers(provider) -> None:
+    """Daemon registers ``lambda: self.workers`` — a disk-only flip is
+    heartbeat-overwritten, and the status reporter reads memory."""
+    global _live_workers_provider
+    _live_workers_provider = provider
+
+
+def _live_workers() -> dict:
+    if _live_workers_provider is None:
+        return {}
+    try:
+        return dict(_live_workers_provider())
+    except Exception:  # noqa: BLE001 — fall back to the on-disk path
+        return {}
+
+
+def _apply_to_live_worker(worker, agent_id: str, spent_reset) -> None:
+    """In-memory flip via the worker's own ENTER/CLEAR — survives the
+    heartbeat, DMs once per episode. ``spent_reset``: ``(spent, resets_at)``."""
+    is_spent, resets_at = spent_reset
+    if is_spent:
+        if worker.runtime.health in ("ok", "unknown", ""):
+            worker._enter_drained(agent_id, resets_at)
+    elif worker.runtime.health == "drained":
+        worker._clear_drained(worker.runtime, agent_id, logger)
+
+
+def apply_drained_health(snapshot: dict) -> None:
+    """Snapshot → ``runtime.health``: spent → ``drained``, recovered → ``ok``.
+    Agents with a live worker are updated in memory (worker ENTER/CLEAR);
+    the rest through the on-disk state. Other reds untouched."""
+    from ..state import RuntimeState
+
+    spent = drained_harnesses(snapshot)
+    live = _live_workers()
+    for agent_id, harness in agent_harnesses().items():
+        if harness not in (snapshot or {}):
+            continue
+        worker = live.get(agent_id)
+        if worker is not None:
+            try:
+                _apply_to_live_worker(
+                    worker, agent_id, (harness in spent, spent.get(harness)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "usage: live drained flip failed for %s: %s", agent_id, exc,
+                )
+            continue
+        try:
+            rs = RuntimeState.load(agent_id)
+        except Exception:  # noqa: BLE001
+            continue
+        if rs is None:
+            continue
+        if harness in spent:
+            if rs.health in ("ok", "unknown", ""):
+                rs.health = "drained"
+                rs.error = DRAINED_RUNTIME_ERROR
+            else:
+                continue
+        elif rs.health == "drained":
+            rs.health = "ok"
+            rs.error = ""
+        else:
+            continue
+        try:
+            rs.save(agent_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("usage: drained flip failed for %s: %s", agent_id, exc)
+
+
+async def predicted_reset_epoch(harness: str) -> int | None:
+    """Probe /usage → reset epoch for ``harness``, or ``None``. Feeds the
+    drained DM when the error body carried no time."""
+    try:
+        snapshot = await collect_usage_snapshot(Path.home())
+    except Exception:  # noqa: BLE001 — the DM matters more than its timestamp
+        return None
+    if not snapshot:
+        return None
+    return drained_harnesses(snapshot).get(harness)
 
 
 async def _run_claude_usage(claude_bin: str, host_home: Path) -> str | None:

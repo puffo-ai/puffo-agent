@@ -3,6 +3,7 @@ always tell an E2EE message from a plaintext one."""
 
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -45,9 +46,12 @@ def _env(**over):
     return puffo_core_mcp_env(**args)
 
 
-def test_mcp_env_forwards_pythonpath(monkeypatch):
-    monkeypatch.setenv("PYTHONPATH", "C:/worktree/src")
-    assert _env()["PYTHONPATH"] == "C:/worktree/src"
+def test_mcp_env_pins_package_and_forwards_pythonpath(tmp_path, monkeypatch):
+    inherited = tmp_path / "editable-src"
+    monkeypatch.setenv("PYTHONPATH", str(inherited))
+    entries = _env()["PYTHONPATH"].split(os.pathsep)
+    assert entries[-1] == str(inherited)
+    assert any(Path(entry).name == "src" for entry in entries)
 
 
 def test_mcp_env_skips_pythonpath_for_docker(monkeypatch):
@@ -55,6 +59,6 @@ def test_mcp_env_skips_pythonpath_for_docker(monkeypatch):
     assert "PYTHONPATH" not in _env(runtime_kind="cli-docker")
 
 
-def test_mcp_env_no_pythonpath_when_unset(monkeypatch):
+def test_mcp_env_pins_package_path_when_unset(monkeypatch):
     monkeypatch.delenv("PYTHONPATH", raising=False)
-    assert "PYTHONPATH" not in _env()
+    assert Path(_env()["PYTHONPATH"]).name == "src"

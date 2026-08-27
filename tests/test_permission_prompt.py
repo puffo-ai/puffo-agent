@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from _bridge_support import isolated_home
+from _portal_support import isolated_home
 from puffo_agent.agent.permission_prompt import format_permission_prompt
 
 
@@ -54,7 +54,7 @@ def test_detail_renders_as_quote_block():
 def test_reply_note_extends_instruction_line():
     text = format_permission_prompt("Accept?", reply_note="a direct `y` answers all")
     assert text.endswith(
-        "Tap Yes/No, or reply `y`/`n` in this thread — a direct `y` answers all."
+        "Tap Yes/No, or reply `y`/`n` in this thread - a direct `y` answers all."
     )
 
 

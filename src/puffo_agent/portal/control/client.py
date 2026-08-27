@@ -18,17 +18,17 @@ from ..state import (
     agent_yml_path,
     archive_flag_path,
     archived_dir,
+    derive_role_short,
     discover_agents,
     refresh_agent_flag_path,
     refresh_host_sync_flag_path,
     refresh_model_flag_path,
     refresh_session_flag_path,
-    restart_flag_path,
 )
 from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
-from .usage_snapshot import collect_usage_snapshot
+from .usage_snapshot import apply_drained_health, collect_usage_snapshot
 
 log = logging.getLogger("puffo_agent.control")
 
@@ -182,7 +182,7 @@ async def _create_agent_command(
     if isinstance(pc, dict):
         pc["server_url"] = server_url
 
-    from ..api.handlers import ProvisionError, provision_agent_from_bundle
+    from .provision import ProvisionError, provision_agent_from_bundle
 
     async def _materialize(_ctx: dict) -> None:
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
@@ -205,6 +205,11 @@ async def post_usage_snapshot(machine, base: str) -> bool:
     snapshot = await collect_usage_snapshot(Path.home())
     if not snapshot:
         return False
+    # local health first: survives a failed POST
+    try:
+        apply_drained_health(snapshot)
+    except Exception as exc:  # noqa: BLE001 — reporting must not block the POST
+        log.warning("control: drained health update failed: %s", exc)
     path = f"/v2/machines/{machine.machine_id}/usage"
     body = json.dumps({"snapshot": snapshot}).encode()
     headers = machine_auth.signed_headers(machine, "POST", path, body)
@@ -225,11 +230,13 @@ async def execute_command(
     paired_root_pubkey: str | None = None,
     command_id: str | None = None,
 ) -> dict:
-    """Apply a decrypted command to local agent state, the same way the local
-    bridge handlers do (flip ``agent.yml`` state, drop sentinel flags) so the
-    reconcile loop applies it — a single-writer model. ``create`` additionally
-    finalizes the pending identity with puffo-server (needs the operator
-    pairing context)."""
+    """Apply a decrypted command to local agent state for the reconciler.
+
+    ``create`` additionally finalizes the pending identity with puffo-server
+    and therefore needs the operator pairing context.
+    """
+    if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
+        return await _execute_runtime_command(op, agent_slug, params, command_id)
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.
@@ -257,75 +264,7 @@ async def execute_command(
     if op == "refresh":
         return _apply_refresh(agent_slug, params)
     if op == "edit":
-        cfg = AgentConfig.load(agent_slug)
-        patch: dict = {}
-        prompt_changed = False
-        runtime_changed = False
-        if isinstance(params.get("display_name"), str):
-            cfg.display_name = params["display_name"]
-            patch["display_name"] = params["display_name"]
-            prompt_changed = True
-        if isinstance(params.get("role"), str):
-            cfg.role = params["role"]
-            patch["role"] = params["role"]
-            prompt_changed = True
-        # avatar_url points to a blob the operator already uploaded; sync it to
-        # the server identity (avatars are public, so no gating needed).
-        if isinstance(params.get("avatar_url"), str):
-            cfg.avatar_url = params["avatar_url"]
-            patch["avatar_url"] = params["avatar_url"]
-        # Soul is owner-gated text on the server identity (not kept in
-        # agent.yml); the profile.md body carries it for the worker.
-        if isinstance(params.get("soul"), str):
-            patch["soul"] = params["soul"]
-            prompt_changed = True
-        # mirrors the bridge's update_runtime fields
-        rt_in = params.get("runtime")
-        if isinstance(rt_in, dict):
-            level_in = rt_in.get("inference_level")
-            if isinstance(level_in, str) and level_in:
-                from ...mcp.config import INFERENCE_LEVELS
-                if level_in not in INFERENCE_LEVELS:
-                    return {
-                        "ok": False,
-                        "error": "runtime.inference_level must be one of: "
-                        + ", ".join(INFERENCE_LEVELS),
-                    }
-            rt = cfg.runtime
-            for key in ("kind", "provider", "harness", "model", "inference_level"):
-                if isinstance(rt_in.get(key), str):
-                    setattr(rt, key, rt_in[key])
-                    runtime_changed = True
-            from ..runtime_matrix import validate_triple
-
-            result = validate_triple(rt.kind, rt.provider, rt.harness)
-            if not result.ok:
-                return {"ok": False, "error": f"runtime: {result.error}"}
-        cfg.save()
-        if isinstance(params.get("profile"), str):
-            (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
-                params["profile"], encoding="utf-8"
-            )
-            prompt_changed = True
-        if isinstance(params.get("role"), str):
-            from ..api.handlers import _update_profile_role
-
-            _update_profile_role(cfg, params["role"])
-        if patch:
-            try:
-                from ..api.handlers import _sync_agent_profile
-
-                await _sync_agent_profile(cfg, patch)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("control: edit profile sync failed: %s", exc)
-        # Prompt-only edits drop refresh_agent.flag; runtime edits
-        # ride the daemon's config-changed respawn.
-        if cfg.state == "running" and prompt_changed and not runtime_changed:
-            _write_flag_payload(
-                refresh_agent_flag_path(cfg.resolve_workspace_dir()),
-                {"requested_at": int(__import__("time").time())},
-            )
-        return {"ok": True}
+        return await _execute_edit(agent_slug, params)
     if op == "refresh_usage":
         # Machine-level (no agent_slug) — re-probe /usage and POST now instead
         # of waiting for the periodic tick.
@@ -337,16 +276,192 @@ async def execute_command(
         return {"ok": True, "posted": posted}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
-    if op == "agent_create_approved":
-        # The operator approved a machine-initiated ws-local create. command_id ==
-        # request_id ties this command to the stashed identity; finalize + pack.
-        from .agent_create import finalize_from_command
-
-        request_id = command_id or str(params.get("request_id") or "")
-        result = await finalize_from_command(request_id, params)
-        return {"ok": True, **result}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
+
+
+async def _execute_runtime_command(
+    op: str,
+    slug: str | None,
+    params: dict,
+    command_id: str | None,
+) -> dict:
+    from ...agent.harness.runtime_commands import execute_runtime_command
+
+    command = dict(params)
+    command.update(
+        command_id=str(command_id or ""),
+        agent_id=str(slug or ""),
+        op=op.removeprefix("runtime."),
+    )
+    return await execute_runtime_command(
+        command,
+        expected_agent_id=str(slug or ""),
+        manager_agent_id=str(slug or ""),
+        require_version=False,
+        permission_turn_from_active=False,
+    )
+
+
+def _set_agent_state(agent_slug: str | None, state: str) -> dict:
+    cfg = AgentConfig.load(agent_slug)
+    cfg.state = state
+    cfg.save()
+    return {"ok": True, "state": state}
+
+
+async def _execute_edit(agent_slug: str | None, params: dict) -> dict:
+    cfg = AgentConfig.load(agent_slug)
+    patch, prompt_changed = _apply_edit_profile_fields(cfg, params)
+    runtime_changed, error = _apply_edit_runtime(cfg, params)
+    if error is not None:
+        return {"ok": False, "error": error}
+    env_changed, error = _apply_edit_env_overrides(cfg, params)
+    if error is not None:
+        return {"ok": False, "error": error}
+    runtime_changed = runtime_changed or env_changed
+
+    cfg.save()
+    prompt_changed = _write_edit_profile(agent_slug, cfg, params) or prompt_changed
+    if isinstance(params.get("role"), str):
+        from ..profile_sync import update_profile_role
+
+        update_profile_role(cfg, params["role"])
+    await _sync_edit_profile(cfg, patch)
+    if cfg.state == "running" and prompt_changed and not runtime_changed:
+        _write_flag_payload(
+            refresh_agent_flag_path(cfg.resolve_workspace_dir()),
+            {"requested_at": int(__import__("time").time())},
+        )
+    return {"ok": True}
+
+
+def _apply_edit_profile_fields(cfg: AgentConfig, params: dict) -> tuple[dict, bool]:
+    patch: dict = {}
+    prompt_changed = False
+    for field in ("display_name", "role"):
+        value = params.get(field)
+        if isinstance(value, str):
+            setattr(cfg, field, value)
+            patch[field] = value
+            prompt_changed = True
+    if isinstance(params.get("role"), str):
+        cfg.role_short = derive_role_short(params["role"])
+        patch["role_short"] = cfg.role_short
+    if isinstance(params.get("avatar_url"), str):
+        cfg.avatar_url = params["avatar_url"]
+        patch["avatar_url"] = params["avatar_url"]
+    if isinstance(params.get("soul"), str):
+        patch["soul"] = params["soul"]
+        prompt_changed = True
+    return patch, prompt_changed
+
+
+def _apply_edit_runtime(cfg: AgentConfig, params: dict) -> tuple[bool, str | None]:
+    raw = params.get("runtime")
+    if not isinstance(raw, dict):
+        return False, None
+
+    rt = cfg.runtime
+    before = (rt.kind, rt.provider, rt.harness, rt.model, rt.inference_level)
+    for key in ("kind", "provider", "harness", "model"):
+        value = raw.get(key)
+        if isinstance(value, str):
+            setattr(rt, key, value)
+
+    from ..runtime_matrix import (
+        normalize_inference_level,
+        resolve_effective_harness,
+        resolve_effective_provider,
+        validate_triple,
+    )
+
+    result = validate_triple(rt.kind, rt.provider, rt.harness)
+    if not result.ok:
+        return False, f"runtime: {result.error}"
+
+    incoming_level = raw.get("inference_level")
+    if isinstance(incoming_level, str):
+        if incoming_level:
+            from ...mcp.config import supported_inference_levels
+
+            effective_harness = resolve_effective_harness(
+                rt.kind,
+                resolve_effective_provider(rt.kind, rt.provider),
+                rt.harness,
+            )
+            supported = supported_inference_levels(effective_harness)
+            if incoming_level not in supported:
+                return False, (
+                    "runtime.inference_level must be one of: "
+                    + ", ".join(supported)
+                )
+        rt.inference_level = incoming_level
+    else:
+        rt.inference_level = normalize_inference_level(
+            rt.kind,
+            rt.provider,
+            rt.harness,
+            rt.inference_level,
+        )
+
+    after = (rt.kind, rt.provider, rt.harness, rt.model, rt.inference_level)
+    return before != after, None
+
+
+def _apply_edit_env_overrides(
+    cfg: AgentConfig, params: dict
+) -> tuple[bool, str | None]:
+    if "env_overrides" not in params:
+        return False, None
+
+    from ..state import merge_env_overrides
+    from .context_telemetry import (
+        CLAUDE_COMPACT_PCT_KEY,
+        CODEX_COMPACT_PCT_KEY,
+    )
+
+    updates = params.get("env_overrides")
+    if (
+        cfg.runtime.harness == "codex"
+        and isinstance(updates, dict)
+        and CLAUDE_COMPACT_PCT_KEY in updates
+        and CODEX_COMPACT_PCT_KEY not in updates
+    ):
+        updates = dict(updates)
+        updates[CODEX_COMPACT_PCT_KEY] = updates.pop(CLAUDE_COMPACT_PCT_KEY)
+        if CLAUDE_COMPACT_PCT_KEY in cfg.env_overrides:
+            updates[CLAUDE_COMPACT_PCT_KEY] = ""
+    try:
+        merged = merge_env_overrides(cfg.env_overrides, updates)
+    except ValueError as exc:
+        return False, str(exc)
+    if merged == cfg.env_overrides:
+        return False, None
+    cfg.env_overrides = merged
+    return True, None
+
+
+def _write_edit_profile(
+    agent_slug: str | None, cfg: AgentConfig, params: dict
+) -> bool:
+    if not isinstance(params.get("profile"), str):
+        return False
+    (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
+        params["profile"], encoding="utf-8"
+    )
+    return True
+
+
+async def _sync_edit_profile(cfg: AgentConfig, patch: dict) -> None:
+    if not patch:
+        return
+    try:
+        from ..profile_sync import sync_agent_profile
+
+        await sync_agent_profile(cfg, patch)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("control: edit profile sync failed: %s", exc)
 
 
 def _ws_url(base: str) -> str:
@@ -362,18 +477,15 @@ async def _sleep_or_stop(stop: asyncio.Event, timeout: float) -> None:
 
 
 def build_capabilities() -> dict:
-    """This machine's reportable capabilities: CLI-tool auth status + provider/
-    model catalog. Mirrors the local bridge's ``info.cli_tools`` + ``/v1/
-    providers`` so the portal renders a remote machine's providers like a local
-    one. ``fetch=False`` keeps it off the network (serves cache/static)."""
+    """Return CLI authentication and model capabilities for the portal."""
     from ...agent.cli_bin import (
         claude_has_credentials,
+        cli_tool_status,
         codex_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
-    from ..api.handlers import _cli_tool_status
 
     import importlib.metadata
 
@@ -383,15 +495,19 @@ def build_capabilities() -> dict:
         daemon_version = ""
 
     cli_tools = {
-        "claude-code": _cli_tool_status(resolve_claude_bin, claude_has_credentials),
-        "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
+        "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
+        "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
     }
+    claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
             "provider": h,
             "models": [
                 {"id": o.id, "label": o.label, "alias": o.is_alias}
-                for o in provider_models(h, fetch=False)
+                for o in provider_models(
+                    h,
+                    fetch=h == "claude-code" and claude_ready,
+                )
                 if o.id
             ],
         }
@@ -519,28 +635,18 @@ class MachineControlClient:
                 decrypted["params"],
                 server_url=pairing.server_url,
                 paired_root_pubkey=pairing.operator_root_pubkey,
-                command_id=command_id,
+                command_id=str(command_id or ""),
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
-            # Publish the result so `wait-until-command --id <command_id>` returns.
-            if command_id and isinstance(result, dict):
-                from .agent_create import get_registry
-
-                get_registry().record_result(command_id, result)
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
-            if command_id:
-                from .agent_create import get_registry
-
-                get_registry().record_result(command_id, {"ok": False, "error": str(exc)})
-
         if command_id:
             try:
                 await self._send(ws, {"type": "ack", "command_id": command_id})

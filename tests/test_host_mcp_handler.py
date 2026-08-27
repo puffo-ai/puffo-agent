@@ -4,6 +4,7 @@ daemon-side handlers the rpc_service dispatches into."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -58,6 +59,78 @@ def _write_host_claude_json(host_home: Path, servers: dict[str, Any]) -> None:
     (host_home / ".claude.json").write_text(
         json.dumps({"mcpServers": servers}), encoding="utf-8",
     )
+
+
+@pytest.mark.asyncio
+async def test_send_message_structured_uses_context_coordinator(tmp_path):
+    ctx = _ctx(tmp_path)
+    requests = []
+
+    class Coordinator:
+        async def send(self, request):
+            requests.append(request)
+            return {"state": "sent", "attempted": True, "seq": 4}
+
+    ctx.send_coordinator = Coordinator()
+    result = await host_mcp_handler.send_message(
+        ctx, channel="ch_a", text="hello", send_anyway=True,
+    )
+    assert result == {"state": "sent", "attempted": True, "seq": 4}
+    assert requests[0].destination == "ch_a"
+    assert requests[0].send_anyway is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_stages_held_result_at_cli_rpc_boundary(tmp_path):
+    ctx = _ctx(tmp_path)
+
+    class Coordinator:
+        async def send(self, request):
+            return {
+                "state": "held",
+                "reconsideration": {"context_ready": True},
+            }
+
+    runtime = MagicMock()
+    runtime.stage_held_send_result = AsyncMock(return_value={
+        "state": "held",
+        "tool_result_admission": "[puffo:model-visible-read:receipt]",
+    })
+    ctx.send_coordinator = Coordinator()
+    ctx.message_client = MagicMock(global_runtime=runtime)
+
+    result = await host_mcp_handler.send_message(
+        ctx,
+        channel="ch_a",
+        text="hello",
+        root_id="root_a",
+        visibility_level="human",
+    )
+
+    assert result["tool_result_admission"].endswith("receipt]")
+    runtime.stage_held_send_result.assert_awaited_once_with(
+        {
+            "state": "held",
+            "reconsideration": {"context_ready": True},
+            "attempted": True,
+        },
+        tool_name="send_message",
+        tool_arguments={
+            "channel": "ch_a",
+            "text": "hello",
+            "root_id": "root_a",
+            "visibility_level": "human",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_message_unavailable_is_explicit_structured_failure(tmp_path):
+    result = await host_mcp_handler.send_message(
+        _ctx(tmp_path), channel="ch_a", text="hello",
+    )
+    assert result["state"] == "failed"
+    assert result["attempted"] is True
 
 
 # ── install ────────────────────────────────────────────────────────
@@ -202,7 +275,7 @@ async def test_sync_copies_host_entry_to_agent(tmp_path):
         (ctx.agent_home / ".claude.json").read_text(encoding="utf-8"),
     )
     assert agent_data["mcpServers"]["gmail-read"] == entry
-    assert "refresh()" in msg
+    assert "provider reload" in msg
 
 
 # ── codex harness path ─────────────────────────────────────────────
@@ -231,10 +304,8 @@ async def test_install_codex_appends_http_toml_block(tmp_path, monkeypatch):
     Whether codex's own CLI actually accepts http MCPs is its concern
     — our job is to write a spec-conformant block, not to gate."""
     ctx = _ctx(tmp_path, harness="codex")
-    monkeypatch.setattr(
-        host_mcp_handler, "_send_dm_to_operator",
-        AsyncMock(return_value="env_http_ok"),
-    )
+    send_dm = AsyncMock(return_value="env_http_ok")
+    monkeypatch.setattr(host_mcp_handler, "_send_dm_to_operator", send_dm)
     msg = await host_mcp_handler.install(
         ctx, name="coinbase-cdp-docs",
         spec={
@@ -252,6 +323,7 @@ async def test_install_codex_appends_http_toml_block(tmp_path, monkeypatch):
     assert "type" not in out
     assert "command" not in out
     assert "env_http_ok" in msg
+    assert "mcp_oauth_credentials_store" in send_dm.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -322,8 +394,8 @@ async def test_sync_codex_validates_host_entry_present(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sync_codex_does_not_write_agent_file(tmp_path):
-    """Codex sync verifies host has the entry and points the agent
-    at refresh() — the worker's restart code does the re-merge.
+    """Codex sync verifies the host entry and leaves re-merging to the
+    provider reload requested by the MCP tool wrapper.
     Agent-side write would just get overwritten with the same
     content on the next restart, so we skip it."""
     ctx = _ctx(tmp_path, harness="codex")
@@ -336,7 +408,114 @@ async def test_sync_codex_does_not_write_agent_file(tmp_path):
 
     msg = await host_mcp_handler.sync(ctx, template_id="gmail-read")
 
-    assert "refresh()" in msg
+    assert "provider reload" in msg
     assert "re-merges" in msg
     # No file under agent_home/.codex was touched.
     assert not (ctx.agent_home / ".codex").exists()
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_copies_only_matching_file_oauth(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    host_codex = ctx.host_home / ".codex"
+    host_codex.mkdir(parents=True)
+    (host_codex / "config.toml").write_text(
+        '[mcp_servers.linear]\nurl = "https://mcp.linear.test/mcp"\n',
+        encoding="utf-8",
+    )
+    host_credentials = {
+        "linear|hash": {
+            "server_name": "linear",
+            "server_url": "https://mcp.linear.test/mcp",
+            "client_id": "linear-client",
+            "access_token": "linear-access",
+            "refresh_token": "linear-refresh",
+            "scopes": ["read", "write"],
+        },
+        "other|hash": {
+            "server_name": "other",
+            "server_url": "https://other.test/mcp",
+            "client_id": "other-client",
+            "access_token": "other-access",
+        },
+    }
+    (host_codex / ".credentials.json").write_text(
+        json.dumps(host_credentials), encoding="utf-8",
+    )
+    agent_codex = ctx.agent_home / ".codex"
+    agent_codex.mkdir()
+    (agent_codex / ".credentials.json").write_text(
+        json.dumps({
+            "keep|hash": {
+                "server_name": "keep",
+                "server_url": "https://keep.test/mcp",
+                "access_token": "keep-access",
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    msg = await host_mcp_handler.sync(ctx, template_id="linear")
+
+    synced = json.loads(
+        (agent_codex / ".credentials.json").read_text(encoding="utf-8"),
+    )
+    assert set(synced) == {"keep|hash", "linear|hash"}
+    assert synced["linear|hash"] == host_credentials["linear|hash"]
+    assert "other-access" not in json.dumps(synced)
+    if os.name != "nt":
+        assert (agent_codex / ".credentials.json").stat().st_mode & 0o077 == 0
+    assert "Copied its OAuth credential" in msg
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_reports_encrypted_oauth_is_not_portable(tmp_path):
+    ctx = _ctx(tmp_path, harness="codex")
+    host_codex = ctx.host_home / ".codex"
+    (host_codex / "secrets").mkdir(parents=True)
+    (host_codex / "config.toml").write_text(
+        '[mcp_servers.linear]\nurl = "https://mcp.linear.test/mcp"\n',
+        encoding="utf-8",
+    )
+    (host_codex / "secrets" / "mcp_oauth.age").write_bytes(b"encrypted")
+
+    msg = await host_mcp_handler.sync(ctx, template_id="linear")
+
+    assert "OS-keyring-encrypted store" in msg
+    assert "mcp_oauth_credentials_store" in msg
+    assert not (ctx.agent_home / ".codex" / ".credentials.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_operator_dm_fails_when_operator_has_no_devices(tmp_path):
+    """The agent's own devices must not mask an operator with zero
+    encryption devices — same invariant as the coordinator and daemon
+    DM paths."""
+    device_key = "A" * 43  # base64url for 32 zero bytes
+
+    async def get(path):
+        if path.startswith("/certs/sync?slugs=op-test"):
+            return {"entries": [], "has_more": False}
+        if path.startswith("/certs/sync?slugs=bot-test"):
+            return {
+                "entries": [{
+                    "seq": 1,
+                    "kind": "device_cert",
+                    "cert": {
+                        "device_id": "dev_sender",
+                        "kem_public_key": device_key,
+                    },
+                }],
+                "has_more": False,
+            }
+        return {}
+
+    from puffo_agent.crypto.keystore import encode_secret
+
+    ctx = _ctx(tmp_path, http_get=get)
+    ctx.keystore.load_session.return_value.subkey_secret_key = encode_secret(
+        bytes(32)
+    )
+    with pytest.raises(RuntimeError, match="no recipient devices resolved"):
+        await host_mcp_handler._send_dm_to_operator(ctx, "hello operator")
+    assert ctx.http_client.post.await_count == 0

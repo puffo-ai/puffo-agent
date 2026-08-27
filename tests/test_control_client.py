@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from _bridge_support import isolated_home, write_test_agent
+from _portal_support import isolated_home, write_test_agent
 from puffo_agent.portal.control import client as cc
 from puffo_agent.portal.control.client import MachineControlClient, execute_command
 from puffo_agent.portal.state import AgentConfig
@@ -125,6 +125,35 @@ async def test_create_without_pending_token_rejected(home):
     )
     assert res["ok"] is False
     assert "pending_token" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_create_delegates_to_control_provisioner(home, monkeypatch):
+    seen = {}
+
+    async def fake_provision(params, operator_key, *, materialize):
+        seen.update(params=params, operator_key=operator_key, materialize=materialize)
+        return {"agent_id": "helper-1"}
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.provision.provision_agent_from_bundle",
+        fake_provision,
+    )
+    params = {
+        "pending_token": "pending_1",
+        "identity_bundle": {"slug_binding": {}},
+        "puffo_core": {"server_url": "browser-placeholder"},
+    }
+    result = await execute_command(
+        "create",
+        None,
+        params,
+        server_url="https://relay.example",
+        paired_root_pubkey="operator-key",
+    )
+    assert result == {"ok": True, "agent_slug": "helper-1"}
+    assert seen["operator_key"] == "operator-key"
+    assert seen["params"]["puffo_core"]["server_url"] == "https://relay.example"
 
 
 # ── usage-report snapshot loop ─────────────────────────────────────
@@ -323,3 +352,127 @@ async def test_edit_rejects_invalid_inference_level(home):
     assert res["ok"] is False
     assert "inference_level" in res["error"]
     assert AgentConfig.load("scout").runtime.inference_level == ""
+
+
+@pytest.mark.asyncio
+async def test_edit_sets_env_override_threshold(home):
+    write_test_agent(home, "scout")
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}},
+    )
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+    }
+
+
+@pytest.mark.asyncio
+async def test_edit_maps_legacy_threshold_key_to_codex(home):
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness = "codex"
+    cfg.env_overrides = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+    cfg.save()
+
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"}},
+    )
+
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").env_overrides == {
+        "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "30",
+    }
+
+
+@pytest.mark.asyncio
+async def test_edit_prefers_explicit_codex_threshold_key(home):
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness = "codex"
+    cfg.save()
+
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+            "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "30",
+        }},
+    )
+
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+        "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "30",
+    }
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_non_whitelisted_env_key(home):
+    write_test_agent(home, "scout")
+    res = await execute_command(
+        "edit", "scout", {"env_overrides": {"PATH": "/tmp/evil"}},
+    )
+    assert res["ok"] is False
+    assert "not allowed" in res["error"]
+    assert AgentConfig.load("scout").env_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_threshold_claude_code_would_ignore(home):
+    write_test_agent(home, "scout")
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "0"}},
+    )
+    assert res["ok"] is False
+    assert AgentConfig.load("scout").env_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_edit_empty_value_clears_the_override(home):
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.env_overrides = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"}
+    cfg.save()
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": ""}},
+    )
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").env_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_edit_env_overrides_preserves_untouched_fields(home):
+    write_test_agent(home, "scout")
+    await execute_command("edit", "scout", {"display_name": "Scout One"})
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}},
+    )
+    assert res["ok"] is True
+    cfg = AgentConfig.load("scout")
+    assert cfg.display_name == "Scout One"
+    assert cfg.env_overrides == {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_env_edits_are_idempotent(home):
+    import asyncio
+
+    write_test_agent(home, "scout")
+    params = {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}}
+    results = await asyncio.gather(
+        *(execute_command("edit", "scout", params) for _ in range(8))
+    )
+
+    assert all(result["ok"] is True for result in results)
+    assert AgentConfig.load("scout").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
+    }

@@ -7,20 +7,97 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from _bridge_support import isolated_home, write_test_agent  # noqa: E402
+from _portal_support import isolated_home, write_test_agent  # noqa: E402
 
 from puffo_agent.portal.profile_sync import (  # noqa: E402
     extract_soul_body,
     sync_full_profile,
+    upload_avatar,
     write_refresh_agent_flag,
 )
 from puffo_agent.portal.state import AgentConfig  # noqa: E402
+from puffo_agent.crypto.primitives import Ed25519KeyPair  # noqa: E402
+
+
+class _AvatarResponse:
+    def __init__(self, status):
+        self.status = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def text(self):
+        return "upload failed"
+
+    async def json(self):
+        return {"blob_id": "blob_1"}
+
+
+class _AvatarSession:
+    def __init__(self, status):
+        self.status = status
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _AvatarResponse(self.status)
+
+
+class _AvatarHttp:
+    status = 200
+    instances = []
+
+    def __init__(self, server_url, _keystore, _slug):
+        self.server_url = server_url
+        self.session = _AvatarSession(self.status)
+        self.signing_key = Ed25519KeyPair.generate()
+        self.closed = False
+        self.instances.append(self)
+
+    async def _ensure_subkey(self):
+        return None
+
+    def _load_signing_key(self):
+        return self.signing_key, "subkey_1"
+
+    async def _get_session(self):
+        return self.session
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("status", [200, 503])
+@pytest.mark.asyncio
+async def test_upload_avatar_success_and_failure(monkeypatch, status):
+    home = isolated_home()
+    write_test_agent(home, "avatar-bot")
+    cfg = AgentConfig.load("avatar-bot")
+    _AvatarHttp.status = status
+    _AvatarHttp.instances = []
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient", _AvatarHttp,
+    )
+    monkeypatch.setattr(
+        "puffo_agent.crypto.keystore.KeyStore.for_agent", lambda _agent_id: object(),
+    )
+    if status == 200:
+        assert await upload_avatar(cfg, b"avatar") == "http://localhost:3000/blobs/blob_1"
+    else:
+        with pytest.raises(RuntimeError, match="upload HTTP 503"):
+            await upload_avatar(cfg, b"avatar")
+    http = _AvatarHttp.instances[0]
+    assert http.closed is True
+    assert http.session.calls[0][0].endswith("/blobs/upload")
+    assert http.session.calls[0][1]["data"] == b"avatar"
 
 
 class TestExtractSoulBody:
@@ -204,6 +281,92 @@ async def test_sync_full_profile_skips_soul_when_profile_md_absent(monkeypatch):
     assert body["display_name"] == "No MD"
 
 
+# ── keyless (T23 bridge) transport: skip signed PATCH ─────────────
+#
+# A keyless bridge agent has no local signing identity — the signed
+# ``PATCH /identities/self`` would drive ``load_identity`` and raise
+# "identity not found: <slug>" on every warm/startup sync. The fake
+# below makes constructing / using the http client fail loudly, so a
+# leaked signed call surfaces instead of silently no-op'ing.
+
+
+class _ExplodingKeylessHttp:
+    """Mirrors the real keyless failure: the signed PATCH path raising
+    because ``load_identity`` can't find a keyless agent's identity file.
+    A correctly-guarded sync never constructs this client."""
+
+    def __init__(self, *a, **kw):
+        raise RuntimeError("identity not found: bridge-bot")
+
+
+@pytest.mark.asyncio
+async def test_sync_full_profile_skips_signed_patch_for_bridge_agent(monkeypatch):
+    home = isolated_home()
+    write_test_agent(home, "bridge-bot")
+    cfg = AgentConfig.load("bridge-bot")
+    cfg.display_name = "Bridge Bot"
+    # Keyless bridge transport — no local signing identity.
+    cfg.puffo_core.transport = "bridge"
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _ExplodingKeylessHttp,
+    )
+
+    # Must return cleanly WITHOUT ever building the signed client.
+    await sync_full_profile(cfg)
+
+
+@pytest.mark.asyncio
+async def test_sync_agent_profile_skips_signed_patch_for_bridge_agent(monkeypatch):
+    from puffo_agent.portal.profile_sync import sync_agent_profile
+
+    home = isolated_home()
+    write_test_agent(home, "bridge-bot2")
+    cfg = AgentConfig.load("bridge-bot2")
+    cfg.puffo_core.transport = "bridge"
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _ExplodingKeylessHttp,
+    )
+
+    await sync_agent_profile(cfg, {"display_name": "x"})
+
+
+@pytest.mark.asyncio
+async def test_native_sync_agent_profile_still_signs(monkeypatch):
+    """The guard is strictly opt-in on ``transport == 'bridge'`` — a
+    native agent (default transport) keeps issuing the signed PATCH."""
+    from puffo_agent.portal.profile_sync import sync_agent_profile
+
+    home = isolated_home()
+    write_test_agent(home, "native-bot")
+    cfg = AgentConfig.load("native-bot")
+    assert cfg.puffo_core.transport == "native"
+
+    posted: list[tuple[str, dict]] = []
+
+    class _FakeHttp:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def patch(self, path: str, body: dict) -> dict:
+            posted.append((path, body))
+            return {}
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _FakeHttp,
+    )
+    await sync_agent_profile(cfg, {"display_name": "Native"})
+
+    assert posted == [("/identities/self", {"display_name": "Native"})]
+
+
 # ── control-WS op=edit flag differentiation ──────────────────────
 
 
@@ -215,7 +378,7 @@ def _patch_sync(monkeypatch):
         sent.append(dict(patch))
 
     monkeypatch.setattr(
-        "puffo_agent.portal.api.handlers._sync_agent_profile",
+        "puffo_agent.portal.profile_sync.sync_agent_profile",
         _fake_sync,
     )
     return sent
