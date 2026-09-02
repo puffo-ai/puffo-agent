@@ -627,3 +627,132 @@ async def test_concurrent_identical_env_edits_are_idempotent(home):
     assert AgentConfig.load("scout").env_overrides == {
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
     }
+
+
+# ── PUF-431: the web "Refresh" button is a full refresh ─────────────
+#
+# The button sends the control-ws ``refresh`` op with NO params
+# (client/web AgentsPane.tsx:380 → portal-store runCommand), so these
+# defaults are the whole user-visible contract.
+
+
+def _cli_local_agent(home, agent_id: str = "scout"):
+    from puffo_agent.portal.state import refresh_agent_flag_path
+
+    write_test_agent(home, agent_id)
+    cfg = AgentConfig.load(agent_id)
+    cfg.runtime.kind = "cli-local"
+    cfg.save()
+    return cfg.resolve_workspace_dir(), refresh_agent_flag_path
+
+
+def _flags(workspace):
+    from puffo_agent.portal.state import (
+        refresh_agent_flag_path,
+        refresh_host_sync_flag_path,
+        refresh_model_flag_path,
+        refresh_session_flag_path,
+    )
+
+    return {
+        "agent": refresh_agent_flag_path(workspace).exists(),
+        "host_sync": refresh_host_sync_flag_path(workspace).exists(),
+        "session": refresh_session_flag_path(workspace).exists(),
+        "model": refresh_model_flag_path(workspace).exists(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_web_refresh_with_no_params_fires_all_three_flags(home):
+    """AC #1/#4 — a paramless refresh (what the web sends) drops the
+    session, reloads profile.md + memory, and re-syncs host MCP/skills."""
+    from puffo_agent.portal.state import restart_flag_path
+
+    workspace, _ = _cli_local_agent(home)
+
+    res = await execute_command("refresh", "scout", {})
+
+    assert res["ok"] is True
+    assert sorted(res["touched"]) == [
+        "refresh_agent",
+        "refresh_host_sync",
+        "refresh_session",
+    ]
+    flags = _flags(workspace)
+    assert flags["agent"] and flags["host_sync"] and flags["session"]
+    assert not flags["model"]
+    # The worker keeps running: no restart.flag means the reconciler
+    # never stops it, so the refresh lands at the next turn start.
+    assert not restart_flag_path("scout").exists()
+    assert AgentConfig.load("scout").state == "running"
+
+
+@pytest.mark.asyncio
+async def test_refresh_still_honors_an_explicitly_narrow_request(home):
+    """Defaults changed, the parameter contract didn't — a caller that
+    wants prompt-only still gets prompt-only."""
+    workspace, _ = _cli_local_agent(home)
+
+    res = await execute_command(
+        "refresh", "scout", {"session": False, "host_sync": False}
+    )
+
+    assert res["ok"] is True
+    assert res["touched"] == ["refresh_agent"]
+    flags = _flags(workspace)
+    assert flags["agent"]
+    assert not flags["session"]
+    assert not flags["host_sync"]
+
+
+@pytest.mark.asyncio
+async def test_harness_swap_is_unaffected_by_the_new_defaults(home):
+    """The harness/model branch writes refresh_model alone and never
+    consulted session/host_sync — flipping their defaults must not leak
+    into it."""
+    workspace, _ = _cli_local_agent(home)
+
+    res = await execute_command(
+        "refresh", "scout", {"harness": "codex", "model": "gpt-5.1-codex-max"}
+    )
+
+    assert res["ok"] is True
+    assert res["touched"] == ["refresh_model"]
+    flags = _flags(workspace)
+    assert flags["model"]
+    assert not (flags["agent"] or flags["session"] or flags["host_sync"])
+
+
+@pytest.mark.asyncio
+async def test_cli_docker_host_sync_guard_not_tripped_by_defaults(home):
+    """The cli-docker guard rejects host_sync without a session drop.
+    The new defaults set both, so a docker agent's Refresh still works —
+    a session-only default would have broken it."""
+    write_test_agent(home, "dock")
+    cfg = AgentConfig.load("dock")
+    cfg.runtime.kind = "cli-docker"
+    cfg.save()
+
+    res = await execute_command("refresh", "dock", {})
+
+    assert res["ok"] is True
+    assert sorted(res["touched"]) == [
+        "refresh_agent",
+        "refresh_host_sync",
+        "refresh_session",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_refresh_still_rejects_a_non_cli_runtime(home):
+    """Unchanged guard — ws-local has no daemon-owned worker to refresh
+    (an external tool brings its own engine)."""
+    write_test_agent(home, "external")
+    cfg = AgentConfig.load("external")
+    cfg.runtime.kind = "ws-local"
+    cfg.save()
+
+    res = await execute_command("refresh", "external", {})
+
+    assert res["ok"] is False
+    assert "cli-local" in res["error"]
