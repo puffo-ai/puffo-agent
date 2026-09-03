@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -659,12 +660,20 @@ class LocalRuntimePreparer:
                     inference,
                 )
         mcp_path = agent_dir(self.agent_id) / "mcp-config.json"
+        mcp_generation = ""
         if self._puffo_core_env:
+            # Minted per config write; the subprocess echoes it back over
+            # RPC (mcp-hello) so the worker's transport probe can tell
+            # "this spec's MCP reached us" from a stale predecessor.
+            mcp_generation = uuid.uuid4().hex
             write_cli_mcp_config(
                 mcp_path,
                 command=default_python_executable(),
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
-                env=self._puffo_core_env,
+                env={
+                    **self._puffo_core_env,
+                    "PUFFO_MCP_GENERATION": mcp_generation,
+                },
             )
             launch_args.extend(["--mcp-config", str(mcp_path)])
         else:
@@ -711,6 +720,7 @@ class LocalRuntimePreparer:
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
             auto_compact_threshold_tokens=compact_tokens,
+            mcp_generation=mcp_generation,
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:

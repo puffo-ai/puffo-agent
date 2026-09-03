@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -226,6 +227,9 @@ class RuntimeManager:
         # input reached the transcript (accepted start receipt only)
         self._input_admitted = False
         self._resume_failure_streak = 0
+        # When the current runtime process was (re)opened; the worker's
+        # MCP transport probe compares hello timestamps against it.
+        self.last_open_monotonic: float | None = None
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -241,6 +245,7 @@ class RuntimeManager:
             if resume and self.native_session_id
             else None
         )
+        self.last_open_monotonic = time.monotonic()
         try:
             opened = await self.driver.open(self.spec, native_resume)
         except BaseException as exc:
@@ -272,6 +277,7 @@ class RuntimeManager:
             )
             self._clear_native_session()
             try:
+                self.last_open_monotonic = time.monotonic()
                 opened = await self.driver.open(self.spec, None)
             except BaseException as exc:
                 errors = [exc]

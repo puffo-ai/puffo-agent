@@ -237,6 +237,8 @@ def delete_flag_path(agent_id: str) -> Path:
 # All under ``<workspace>/.puffo-agent/`` so the location is reachable
 # from both the worker and the MCP subprocess in cli-docker.
 
+PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS = 30.0
+
 
 def refresh_agent_flag_path(workspace: Path) -> Path:
     return workspace / ".puffo-agent" / "refresh_agent.flag"
@@ -256,7 +258,9 @@ def refresh_provider_auth_flag_path(workspace: Path) -> Path:
     Unlike ``refresh_session.flag``, this preserves the Puffo logical session
     and asks the harness to resume its native session with the replacement
     credential. The runtime manager falls back to a fresh native session only
-    when that saved session is explicitly unavailable.
+    when that saved session is explicitly unavailable. Daemon-authored payloads
+    include ``not_before_unix_ms`` so simultaneous fleet reloads can be spread
+    across a bounded jitter window without losing the durable request.
     """
     return workspace / ".puffo-agent" / "refresh_provider_auth.flag"
 
@@ -982,8 +986,15 @@ class RuntimeState:
     #                           cleared on next successful turn. Does
     #                           NOT overwrite the stronger downstream
     #                           signals above.
+    #   "mcp_unreachable"     — the puffo MCP subprocess never reached the
+    #                           loopback RPC service (mcp-hello handshake)
+    #                           after a runtime open AND one automatic
+    #                           recycle; tool calls are likely timing out.
+    #                           Set only from ok/unknown; cleared by the
+    #                           probe when a current-generation hello
+    #                           arrives.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | mcp_unreachable | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:

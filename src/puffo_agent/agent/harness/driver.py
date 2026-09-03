@@ -154,6 +154,10 @@ class RuntimeSpec:
     task_timeout_seconds: float = 1800.0
     auto_compact_threshold_pct: float | None = None
     auto_compact_threshold_tokens: int | None = None
+    # Identity of the MCP config this spec was prepared with; the puffo
+    # MCP subprocess echoes it back over loopback RPC so the worker can
+    # prove the transport is reachable ("" = no handshake expected).
+    mcp_generation: str = ""
 
 
 @dataclass(frozen=True, slots=True)
