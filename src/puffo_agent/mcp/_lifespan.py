@@ -12,6 +12,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
+from ..tasks import spawn
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,9 +34,9 @@ def make_lifespan(
 
     @asynccontextmanager
     async def _lifespan(_app: Any) -> AsyncIterator[None]:
-        startup_task: asyncio.Task | None = None
+        startup_task: asyncio.Future[Any] | None = None
         if startup is not None:
-            startup_task = asyncio.ensure_future(startup())
+            startup_task = spawn(startup(), name="mcp.startup")
         try:
             yield
         finally:
