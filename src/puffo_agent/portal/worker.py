@@ -114,8 +114,8 @@ logger = logging.getLogger(__name__)
 RECONNECT_BACKOFF_SECONDS = 5.0
 
 
-def _provider_auth_reload_delay_seconds(flag: Path) -> float:
-    """Return the bounded remaining delay from a credential-reload request."""
+def _refresh_flag_delay_seconds(flag: Path) -> float:
+    """Return a bounded remaining delay encoded in a refresh flag."""
     try:
         request = json.loads(flag.read_text(encoding="utf-8"))
         if not isinstance(request, dict):
@@ -129,19 +129,9 @@ def _provider_auth_reload_delay_seconds(flag: Path) -> float:
         return 0.0
 
 
-async def _wait_for_provider_auth_reload_jitter(
-    agent_id: str, flag: Path,
-) -> None:
-    delay_seconds = _provider_auth_reload_delay_seconds(flag)
-    if not delay_seconds:
-        return
-    logger.info(
-        "agent %s: delaying provider reload %.3fs to stagger "
-        "credential-refresh fan-out",
-        agent_id,
-        delay_seconds,
-    )
-    await asyncio.sleep(delay_seconds)
+def _refresh_flag_is_pending(flag: Path) -> bool:
+    """A future-dated durable request exists but is not pending yet."""
+    return flag.exists() and _refresh_flag_delay_seconds(flag) <= 0.0
 
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
@@ -819,7 +809,7 @@ class Worker:
         if self._turn_active:
             # A turn owns flag consumption; never apply mid-turn.
             return False
-        if not any(p.exists() for p in flag_paths):
+        if not any(_refresh_flag_is_pending(p) for p in flag_paths):
             # Cheap exists() check before taking the lock.
             return False
         async with self._reload_lock:
@@ -1208,17 +1198,15 @@ async def _process_refresh_flags(
     Resource and credential changes preserve session identity. Only an explicit
     session refresh starts a new logical and native provider conversation.
     """
-    host_sync_seen = refresh_host_sync_flag.exists()
-    agent_seen = refresh_agent_flag.exists()
-    session_seen = refresh_session_flag.exists()
-    provider_auth_seen = refresh_provider_auth_flag.exists()
+    host_sync_seen = _refresh_flag_is_pending(refresh_host_sync_flag)
+    agent_seen = _refresh_flag_is_pending(refresh_agent_flag)
+    session_seen = _refresh_flag_is_pending(refresh_session_flag)
+    provider_auth_exists = refresh_provider_auth_flag.exists()
+    provider_auth_seen = _refresh_flag_is_pending(refresh_provider_auth_flag)
+    if provider_auth_exists and (host_sync_seen or agent_seen or session_seen):
+        provider_auth_seen = True
     if not (host_sync_seen or agent_seen or session_seen or provider_auth_seen):
         return
-
-    if provider_auth_seen and not (host_sync_seen or agent_seen or session_seen):
-        await _wait_for_provider_auth_reload_jitter(
-            agent_id, refresh_provider_auth_flag
-        )
 
     if host_sync_seen:
         _sync_refresh_host_assets(agent_id)
