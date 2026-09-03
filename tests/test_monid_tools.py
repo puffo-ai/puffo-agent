@@ -613,10 +613,13 @@ async def test_spend_surfaces_server_error_message():
                 "endpoint": "/get_company_profile",
                 "input": {"queryParams": {"company": "x"}},
                 "max_cost_micro": 5000,
+                "idempotency_key": "operator-owned-retry",
             },
         )
     msg = str(excinfo.value)
     assert "not enabled for this agent" in msg
+    assert "automatic idempotency key was retired" not in msg
+    assert "immediate retry starts a new paid operation" not in msg
     # A spend failure also carries the label rule: if the model gives up and
     # answers from elsewhere, it must mark that non-Monid.
     assert "NOT a Monid result" in msg
