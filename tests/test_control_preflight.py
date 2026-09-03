@@ -26,11 +26,12 @@ def _runtime(
     )
 
 
-def test_pi_preflight_reports_missing_binary(monkeypatch):
+@pytest.mark.asyncio
+async def test_pi_preflight_reports_missing_binary(monkeypatch):
     monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: None)
 
     with pytest.raises(ProvisionError) as caught:
-        preflight.preflight_runtime(_runtime())
+        await preflight.preflight_runtime(_runtime())
 
     assert caught.value.reason == "Pi is not installed"
     assert caught.value.fields == {
@@ -40,7 +41,8 @@ def test_pi_preflight_reports_missing_binary(monkeypatch):
     }
 
 
-def test_pi_preflight_uses_qualified_model_as_authoritative_target(
+@pytest.mark.asyncio
+async def test_pi_preflight_uses_qualified_model_as_authoritative_target(
     tmp_path, monkeypatch,
 ):
     seen = {}
@@ -53,7 +55,7 @@ def test_pi_preflight_uses_qualified_model_as_authoritative_target(
 
     monkeypatch.setattr(preflight, "check_pi_auth", fake_check)
 
-    preflight.preflight_runtime(
+    await preflight.preflight_runtime(
         _runtime(provider="anthropic", model="openai/gpt-5.5")
     )
 
@@ -65,7 +67,10 @@ def test_pi_preflight_uses_qualified_model_as_authoritative_target(
     }
 
 
-def test_pi_preflight_returns_machine_readable_login_reason(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pi_preflight_returns_machine_readable_login_reason(
+    tmp_path, monkeypatch,
+):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: "/opt/bin/pi")
     monkeypatch.setattr(
@@ -79,7 +84,7 @@ def test_pi_preflight_returns_machine_readable_login_reason(tmp_path, monkeypatc
     )
 
     with pytest.raises(ProvisionError) as caught:
-        preflight.preflight_runtime(_runtime())
+        await preflight.preflight_runtime(_runtime())
 
     assert caught.value.reason == "Pi sign-in required"
     assert caught.value.fields == {
@@ -90,7 +95,10 @@ def test_pi_preflight_returns_machine_readable_login_reason(tmp_path, monkeypatc
     }
 
 
-def test_pi_preflight_bounds_native_reason_from_harness(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_pi_preflight_bounds_native_reason_from_harness(
+    tmp_path, monkeypatch,
+):
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: "/opt/bin/pi")
     monkeypatch.setattr(
@@ -104,12 +112,15 @@ def test_pi_preflight_bounds_native_reason_from_harness(tmp_path, monkeypatch):
     )
 
     with pytest.raises(ProvisionError) as caught:
-        preflight.preflight_runtime(_runtime())
+        await preflight.preflight_runtime(_runtime())
 
     assert caught.value.fields["native_reason"] == "x" * 200
 
 
-def test_opencode_preflight_rejects_model_missing_from_native_catalog(monkeypatch):
+@pytest.mark.asyncio
+async def test_opencode_preflight_rejects_model_missing_from_native_catalog(
+    monkeypatch,
+):
     """A stale private model choice must fail before agent files are written."""
     monkeypatch.setattr(
         preflight, "resolve_opencode_bin", lambda: "/opt/bin/opencode",
@@ -123,7 +134,7 @@ def test_opencode_preflight_rejects_model_missing_from_native_catalog(monkeypatc
     )
 
     with pytest.raises(ProvisionError) as caught:
-        preflight.preflight_runtime(
+        await preflight.preflight_runtime(
             _runtime(
                 provider="deepseek",
                 harness="opencode",
@@ -142,7 +153,8 @@ def test_opencode_preflight_rejects_model_missing_from_native_catalog(monkeypatc
     )
 
 
-def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
+@pytest.mark.asyncio
+async def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
     monkeypatch.setattr(
         preflight, "resolve_opencode_bin", lambda: "/opt/bin/opencode",
     )
@@ -152,7 +164,7 @@ def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
         lambda executable, model: "ready",
     )
 
-    preflight.preflight_runtime(
+    await preflight.preflight_runtime(
         _runtime(
             provider="deepseek",
             harness="opencode",
@@ -161,7 +173,8 @@ def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
     )
 
 
-def test_opencode_preflight_reports_missing_provider_as_login(monkeypatch):
+@pytest.mark.asyncio
+async def test_opencode_preflight_reports_missing_provider_as_login(monkeypatch):
     monkeypatch.setattr(
         preflight, "resolve_opencode_bin", lambda: "/opt/bin/opencode",
     )
@@ -172,7 +185,7 @@ def test_opencode_preflight_reports_missing_provider_as_login(monkeypatch):
     )
 
     with pytest.raises(ProvisionError) as caught:
-        preflight.preflight_runtime(
+        await preflight.preflight_runtime(
             _runtime(
                 provider="deepseek",
                 harness="opencode",
@@ -182,3 +195,55 @@ def test_opencode_preflight_reports_missing_provider_as_login(monkeypatch):
 
     assert caught.value.fields["reason"] == "need_login"
     assert str(caught.value) == "OpenCode sign-in required"
+
+
+@pytest.mark.asyncio
+async def test_docker_preflight_rejects_missing_binary(monkeypatch):
+    monkeypatch.setattr(preflight, "resolve_docker_bin", lambda: None)
+    runtime = RuntimeConfig(kind="cli-docker", harness="claude-code")
+
+    with pytest.raises(ProvisionError) as caught:
+        await preflight.preflight_runtime(runtime, agent_id="docker-agent")
+
+    assert caught.value.fields == {
+        "error_code": "runtime_not_ready",
+        "runtime_kind": "cli-docker",
+        "reason": "not_installed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_docker_preflight_rejects_unavailable_daemon(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(preflight, "resolve_docker_bin", lambda: "/opt/docker")
+
+    async def unavailable(docker_bin, container_name):
+        seen.update(docker_bin=docker_bin, container_name=container_name)
+        return None
+
+    monkeypatch.setattr(preflight, "container_state", unavailable)
+    runtime = RuntimeConfig(kind="cli-docker", harness="claude-code")
+
+    with pytest.raises(ProvisionError) as caught:
+        await preflight.preflight_runtime(runtime, agent_id="docker-agent")
+
+    assert caught.value.fields["reason"] == "daemon_unavailable"
+    assert seen == {
+        "docker_bin": "/opt/docker",
+        "container_name": "puffo-runtime-preflight-docker-agent",
+    }
+
+
+@pytest.mark.asyncio
+async def test_docker_preflight_reuses_container_probe(monkeypatch):
+    monkeypatch.setattr(preflight, "resolve_docker_bin", lambda: "/opt/docker")
+
+    async def available(_docker_bin, _container_name):
+        return ""
+
+    monkeypatch.setattr(preflight, "container_state", available)
+
+    await preflight.preflight_runtime(
+        RuntimeConfig(kind="cli-docker", harness="claude-code"),
+        agent_id="docker-agent",
+    )

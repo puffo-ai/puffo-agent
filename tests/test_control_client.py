@@ -12,7 +12,7 @@ import pytest
 from _portal_support import isolated_home, write_test_agent
 from puffo_agent.portal.control import client as cc
 from puffo_agent.portal.control.client import MachineControlClient, execute_command
-from puffo_agent.portal.state import AgentConfig
+from puffo_agent.portal.state import AgentConfig, RuntimeState
 
 
 class _FakeWS:
@@ -250,6 +250,11 @@ async def test_create_delegates_to_control_provisioner(home, monkeypatch):
         "puffo_agent.portal.control.provision.provision_agent_from_bundle",
         fake_provision,
     )
+
+    async def started(_agent_id):
+        return None
+
+    monkeypatch.setattr(cc, "_wait_for_agent_start", started)
     params = {
         "pending_token": "pending_1",
         "identity_bundle": {"slug_binding": {}},
@@ -265,6 +270,93 @@ async def test_create_delegates_to_control_provisioner(home, monkeypatch):
     assert result == {"ok": True, "agent_slug": "helper-1"}
     assert seen["operator_key"] == "operator-key"
     assert seen["params"]["puffo_core"]["server_url"] == "https://relay.example"
+
+
+@pytest.mark.asyncio
+async def test_create_reports_worker_start_failure(home, monkeypatch):
+    async def fake_provision(*args, **kwargs):
+        return {"agent_id": "helper-1"}
+
+    async def failed(_agent_id):
+        return {
+            "error_code": "agent_start_failed",
+            "error": "docker run failed",
+        }
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.provision.provision_agent_from_bundle",
+        fake_provision,
+    )
+    monkeypatch.setattr(cc, "_wait_for_agent_start", failed)
+    params = {
+        "pending_token": "pending_1",
+        "identity_bundle": {"slug_binding": {}},
+        "puffo_core": {},
+    }
+
+    result = await execute_command(
+        "create",
+        None,
+        params,
+        server_url="https://relay.example",
+        paired_root_pubkey="operator-key",
+    )
+
+    assert result == {
+        "ok": False,
+        "agent_slug": "helper-1",
+        "error_code": "agent_start_failed",
+        "error": "docker run failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_waiter_ignores_starting_then_returns_running(
+    home, monkeypatch,
+):
+    states = iter(
+        [
+            RuntimeState(status="starting"),
+            RuntimeState(status="running"),
+        ]
+    )
+    monkeypatch.setattr(
+        RuntimeState,
+        "load",
+        classmethod(lambda cls, agent_id: next(states)),
+    )
+    monkeypatch.setattr(cc, "AGENT_START_POLL_SECONDS", 0)
+
+    assert await cc._wait_for_agent_start("helper-1") is None
+
+
+@pytest.mark.asyncio
+async def test_start_waiter_returns_persisted_worker_error(home, monkeypatch):
+    monkeypatch.setattr(
+        RuntimeState,
+        "load",
+        classmethod(
+            lambda cls, agent_id: RuntimeState(
+                status="error",
+                error="Docker daemon stopped",
+            )
+        ),
+    )
+
+    assert await cc._wait_for_agent_start("helper-1") == {
+        "error_code": "agent_start_failed",
+        "error": "Docker daemon stopped",
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_waiter_returns_structured_timeout(home, monkeypatch):
+    monkeypatch.setattr(cc, "AGENT_START_TIMEOUT_SECONDS", 0)
+
+    assert await cc._wait_for_agent_start("helper-1") == {
+        "error_code": "agent_start_timeout",
+        "error": "agent worker did not finish starting within 0s",
+    }
 
 
 @pytest.mark.asyncio

@@ -376,7 +376,7 @@ class Daemon:
                     # the persisted session into Node's heap, so N
                     # parallel warms can OOM the host. Awaiting one at
                     # a time keeps peak RSS bounded.
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 elif (
                     worker.restart_required
                     or _worker_needs_restart(worker.agent_cfg, agent_cfg)
@@ -400,7 +400,7 @@ class Daemon:
                     self.workers[agent_id] = worker
                     self._register_with_refresher(agent_cfg, worker)
                     worker.start()
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 else:
                     worker.agent_cfg = agent_cfg
             elif desired_state == "paused":
@@ -418,6 +418,16 @@ class Daemon:
                         self._paused_reported.add(agent_id)
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
+
+    async def _observe_worker_start(self, agent_id: str, worker: Worker) -> None:
+        if await worker.wait_warm(timeout=self._warm_serialise_timeout):
+            return
+        logger.warning(
+            "agent %s: worker did not reach running during the startup "
+            "observation window (status=%s)",
+            agent_id,
+            worker.runtime.status,
+        )
 
     async def _stop_removed_agents(self, on_disk: set[str]) -> None:
         for stale_id in list(self._agent_cfg_cache.keys() - on_disk):

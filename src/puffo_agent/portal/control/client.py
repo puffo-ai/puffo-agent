@@ -42,6 +42,11 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
 # well under the server's HEARTBEAT_TIMEOUT (90s) or the server culls us.
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+# Remote create waits for the daemon's durable worker lifecycle instead of
+# acknowledging as soon as agent.yml exists. Docker's first image build may
+# legitimately take several minutes.
+AGENT_START_TIMEOUT_SECONDS = 10 * 60.0
+AGENT_START_POLL_SECONDS = 0.1
 
 
 class _DuplicateDelivery(ControlError):
@@ -193,8 +198,8 @@ async def _create_agent_command(
     async def _materialize(_ctx: dict) -> None:
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
 
-    def _preflight(context: dict) -> None:
-        preflight_runtime(context["runtime"], agent_id=context["agent_id"])
+    async def _preflight(context: dict) -> None:
+        await preflight_runtime(context["runtime"], agent_id=context["agent_id"])
 
     try:
         result = await provision_agent_from_bundle(
@@ -207,7 +212,45 @@ async def _create_agent_command(
         return {"ok": False, "error": exc.reason, **exc.fields}
     except ControlError as exc:
         return {"ok": False, "error": str(exc)}
+    startup = await _wait_for_agent_start(result["agent_id"])
+    if startup is not None:
+        return {
+            "ok": False,
+            "agent_slug": result["agent_id"],
+            **startup,
+        }
     return {"ok": True, "agent_slug": result["agent_id"]}
+
+
+async def _wait_for_agent_start(agent_id: str) -> dict | None:
+    """Return ``None`` once the worker is running, else a structured failure."""
+    from ..state import RuntimeState
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + AGENT_START_TIMEOUT_SECONDS
+    while loop.time() < deadline:
+        runtime = RuntimeState.load(agent_id)
+        if runtime is not None:
+            if runtime.status == "running":
+                return None
+            if runtime.status == "error":
+                return {
+                    "error_code": "agent_start_failed",
+                    "error": runtime.error or "agent worker failed to start",
+                }
+            if runtime.status == "stopped":
+                return {
+                    "error_code": "agent_start_failed",
+                    "error": "agent worker stopped before startup completed",
+                }
+        await asyncio.sleep(AGENT_START_POLL_SECONDS)
+    return {
+        "error_code": "agent_start_timeout",
+        "error": (
+            f"agent worker did not finish starting within "
+            f"{AGENT_START_TIMEOUT_SECONDS:g}s"
+        ),
+    }
 
 
 async def post_usage_snapshot(machine, base: str) -> bool:

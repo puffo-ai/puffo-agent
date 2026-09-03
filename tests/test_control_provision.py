@@ -372,7 +372,7 @@ async def test_provision_preflight_rejects_before_materialization_or_write(
     payload, operator_public = _payload()
     events = []
 
-    def preflight(context):
+    async def preflight(context):
         events.append(("preflight", context["agent_id"]))
         raise ProvisionError(
             "Pi sign-in required",

@@ -359,6 +359,8 @@ class Worker:
                 logger,
                 api_key_mode=getattr(self, "_claude_api_key_mode", False),
             )
+        self.runtime.status = "running"
+        self.runtime.save(agent_id)
         self._warm_done.set()
 
     @staticmethod
@@ -804,7 +806,7 @@ class Worker:
         )
         self._api_key_auth_recovery_pending = False
         self.runtime = RuntimeState(
-            status="running",
+            status="starting",
             started_at=int(time.time()),
             msg_count=0,
         )
@@ -903,6 +905,9 @@ class Worker:
     def start(self) -> asyncio.Task:
         if self._task is not None and not self._task.done():
             return self._task
+        self.runtime.status = "starting"
+        self.runtime.error = ""
+        self.runtime.save(self.agent_cfg.id)
         self._task = spawn(self._run(), name="run")
         return self._task
 
@@ -917,10 +922,10 @@ class Worker:
 
     async def wait_warm(self, timeout: float | None = None) -> bool:
         """Block until warm() finishes or the worker exits early.
-        Returns True on completion, False on timeout."""
+        Returns True only when startup reached ``running``."""
         try:
             await asyncio.wait_for(self._warm_done.wait(), timeout=timeout)
-            return True
+            return self.runtime.status == "running"
         except asyncio.TimeoutError:
             return False
 
