@@ -102,6 +102,29 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
         "check-update",
         help="Compare installed version against latest GitHub release",
     ).set_defaults(func=handlers["cmd_check_update"])
+    autostart = sub.add_parser(
+        "autostart",
+        help="Start the daemon automatically after login (per-user)",
+    )
+    autostart_sub = autostart.add_subparsers(dest="autostart_cmd", required=True)
+    autostart_enable = autostart_sub.add_parser(
+        "enable", help="Register the daemon to start after login"
+    )
+    autostart_enable.add_argument(
+        "--linger",
+        action="store_true",
+        help=(
+            "Linux only: also try `loginctl enable-linger` so the daemon "
+            "starts at boot, before login (best-effort)"
+        ),
+    )
+    autostart_enable.set_defaults(func=handlers["cmd_autostart"])
+    autostart_sub.add_parser(
+        "disable", help="Remove the after-login start registration"
+    ).set_defaults(func=handlers["cmd_autostart"])
+    autostart_sub.add_parser(
+        "status", help="Show what is configured and what is currently loaded"
+    ).set_defaults(func=handlers["cmd_autostart"])
 
 
 def _add_agent_create_commands(sub, handlers: CommandHandlers):
@@ -495,6 +518,11 @@ def _add_machine_commands(sub, handlers: CommandHandlers) -> None:
         "--not-open",
         action="store_true",
         help="Don't auto-open the link page in your browser.",
+    )
+    machine_link.add_argument(
+        "--no-autostart",
+        action="store_true",
+        help="Do not register the daemon to start automatically after login.",
     )
     machine_link.set_defaults(func=handlers["cmd_link"])
 

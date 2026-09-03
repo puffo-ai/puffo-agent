@@ -382,6 +382,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Register / unregister / inspect after-login daemon autostart."""
+    from . import autostart
+
+    if args.autostart_cmd == "enable":
+        result = autostart.enable(linger=getattr(args, "linger", False))
+    elif args.autostart_cmd == "disable":
+        result = autostart.disable()
+    else:
+        state = autostart.status()
+        for line in state.lines:
+            print(line)
+        return 0
+    stream = sys.stdout if result.ok else sys.stderr
+    for line in result.lines:
+        print(line, file=stream)
+    return 0 if result.ok else 1
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     """Print installed version + install mode."""
     local = get_local_version()
@@ -1270,17 +1289,41 @@ def cmd_link(args: argparse.Namespace) -> int:
     name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(
+        link_rc = asyncio.run(
             run_link(
                 server_url,
                 name,
                 open_browser=not args.not_open,
-                code=getattr(args, "code", None),
+                code=args.code,
             )
         )
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
+    if link_rc == 0 and not args.no_autostart:
+        _enable_autostart_after_link()
+    return link_rc
+
+
+def _enable_autostart_after_link() -> None:
+    from . import autostart
+
+    try:
+        result = autostart.enable()
+    except Exception as exc:  # noqa: BLE001
+        result = autostart.ActionResult(False, [str(exc)])
+    if result.ok:
+        print("link: autostart enabled.")
+        for line in result.lines:
+            print(line)
+        return
+    print("warning: link succeeded, but autostart could not be enabled.", file=sys.stderr)
+    for line in result.lines:
+        print(line, file=sys.stderr)
+    print(
+        "Run `puffo-agent autostart enable` manually to retry.",
+        file=sys.stderr,
+    )
 
 
 def cmd_unlink(args: argparse.Namespace) -> int:

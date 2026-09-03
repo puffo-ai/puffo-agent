@@ -208,14 +208,17 @@ through the **Agent Portal**, without a direct connection to the machine.
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent machine link [--server-url <url>] [--name <name>]` | Register the machine + mint a link code, then wait for an operator to approve it in the web app |
+| `puffo-agent machine link [--server-url <url>] [--name <name>] [--no-autostart]` | Register the machine + mint a link code, then wait for an operator to approve it in the web app |
 | `puffo-agent machine unlink --operator <slug> [--server-url <url>]` | Revoke a pairing + pause that operator's agents (`--server-url` refuses if the pairing is on a different server) |
 
 `machine link` registers the machine (a self-minted ed25519 identity; the
 private key never leaves disk), mints a short code, and waits for an operator to
 approve it in the web app (My Agents → Link machine). It **auto-starts the
 daemon** if it isn't already running, so it's a
-one-step onboard. The default server is `chat.puffo.ai/relay`.
+one-step onboard. After linking succeeds, it also enables per-user login-time
+autostart by default; pass `--no-autostart` to skip that registration. A
+platform registration failure is reported but does not undo the successful
+link. The default server is `chat.puffo.ai/relay`.
 
 ### 4.1 Agent Portal control plane
 
