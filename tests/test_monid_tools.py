@@ -319,6 +319,45 @@ async def test_spend_server_failure_retains_automatic_key_for_settled_replay():
 
 
 @pytest.mark.asyncio
+async def test_spend_failed_key_conflict_explains_fresh_paid_retry():
+    """An unbilled 5xx retry may self-heal through 409; the model must learn
+    that the automatic key was retired and one more retry starts a new spend."""
+    http = _FakeHttp(post_error=HttpError(502, "provider failed without billing"))
+    mcp = _tools(http)
+    args = {
+        "provider": "indeed",
+        "endpoint": "/get_company_profile",
+        "input": {"queryParams": {"company": "Google"}},
+        "max_cost_micro": 10000,
+    }
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", args)
+    first_key = http.calls[-1][2]["idempotency_key"]
+    assert "reuse idempotency key" in str(excinfo.value)
+
+    http._post_error = HttpError(
+        409,
+        json.dumps(
+            {
+                "error": "CONFLICT",
+                "message": ("a prior spend with this idempotency_key did not succeed"),
+            }
+        ),
+    )
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", args)
+    assert http.calls[-1][2]["idempotency_key"] == first_key
+    message = str(excinfo.value)
+    assert "automatic idempotency key was retired" in message
+    assert "immediate retry starts a new paid operation" in message
+
+    http._post_error = None
+    await _call(mcp, "monid_spend", args)
+    assert http.calls[-1][2]["idempotency_key"] != first_key
+
+
+@pytest.mark.asyncio
 async def test_spend_full_retry_cache_fails_closed_without_evicting(monkeypatch):
     """A burst of unresolved spends must not evict an older retry key and
     reopen the duplicate-charge window."""

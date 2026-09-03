@@ -226,7 +226,7 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
             # error carries the schema to rebuild `input` and retry, so try that
             # first. The label rule is the fallback: if you give up and answer
             # from elsewhere, it must be marked non-Monid.
-            retry_guidance = f"{_spend_retry_guidance(wire_key)}\n" if ambiguous else ""
+            retry_guidance = _http_error_guidance(ambiguous, automatic_key, wire_key)
             raise RuntimeError(
                 f"monid spend failed: {_monid_error_message(exc)}\n"
                 f"{retry_guidance}{_LABEL_NON_MONID}"
@@ -329,6 +329,17 @@ def _spend_retry_guidance(wire_key: str) -> str:
         f"{wire_key}. If the charge state remains unclear, ask your operator "
         "to reconcile that idempotency key."
     )
+
+
+def _http_error_guidance(ambiguous: bool, automatic: bool, wire_key: str) -> str:
+    if ambiguous:
+        return f"{_spend_retry_guidance(wire_key)}\n"
+    if automatic:
+        return (
+            "The automatic idempotency key was retired after this rejected "
+            "spend; an immediate retry starts a new paid operation.\n"
+        )
+    return ""
 
 
 def _is_pending_spend_response(data: dict[str, Any]) -> bool:
