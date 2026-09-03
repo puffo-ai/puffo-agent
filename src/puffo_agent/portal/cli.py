@@ -663,6 +663,7 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
             "drained",
             "unhandled_error",
             "codex_thread_wedged",
+            "server_unreachable",
         ):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.

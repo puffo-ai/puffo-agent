@@ -111,6 +111,14 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
+# Consecutive WS reconnect failures before runtime.json health flips to
+# "server_unreachable". With the WS client's 1s→30s doubling backoff the
+# fifth failure lands ~15s into an outage (~40s when each attempt burns a
+# connect timeout): a blip surviving one or two reconnects never flips,
+# while an operator checking `agent list` sees the truth within the
+# minute instead of "ok" for hours. One successful reconnect clears it.
+_WS_DEGRADE_THRESHOLD = 5
+
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     if harness_name != "claude-code":
@@ -376,6 +384,62 @@ class Worker:
             "runtime.health = auth_failed",
             agent_id,
         )
+
+    def _build_wired_client(self):
+        """Construct the core client with the worker's observers attached.
+
+        Every runtime path must obtain its client here: one built straight
+        from ``_build_puffo_core_client`` carries no transport-state
+        listener, so WS reconnect streaks reach nobody and runtime.json
+        keeps saying "ok" while the agent is offline — the 8/30 incident's
+        health symptom.
+        """
+        agent_id = self.agent_cfg.id
+        client = _build_puffo_core_client(
+            self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg
+        )
+        client.transport_state_listener = self._transport_state_listener(agent_id)
+        return client
+
+    def _transport_state_listener(self, agent_id: str):
+        """Feed WS reconnect streaks into runtime.json health.
+
+        Before this, a dead transport kept reporting health="ok" with a
+        fresh local heartbeat for hours (the 8/30 App Nap incident):
+        "process alive" was standing in for "server reachable". Only the
+        ok state is overwritten — auth_failed and the other specific
+        signals stay authoritative — and only the transport-set state is
+        cleared on recovery.
+        """
+
+        def note(healthy: bool, streak: int) -> None:
+            rt = self.runtime
+            if healthy:
+                if rt.health == "server_unreachable":
+                    rt.health = "ok"
+                    rt.error = ""
+                    rt.save(agent_id)
+                    logger.info(
+                        "agent %s: transport recovered; runtime.health "
+                        "server_unreachable → ok",
+                        agent_id,
+                    )
+                return
+            if streak < _WS_DEGRADE_THRESHOLD or rt.health != "ok":
+                return
+            rt.health = "server_unreachable"
+            rt.error = (
+                f"server unreachable: {streak} consecutive WS reconnect "
+                "failures"
+            )
+            rt.save(agent_id)
+            logger.warning(
+                "agent %s: %s; runtime.health ok → server_unreachable",
+                agent_id,
+                rt.error,
+            )
+
+        return note
 
     def _enter_auth_failed(self, agent_id: str) -> None:
         """Flip ``auth_failed`` + fire recovery (refresher kick + operator
@@ -1082,11 +1146,7 @@ class Worker:
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml is incomplete"
                 )
-            client = _build_puffo_core_client(
-                self.agent_cfg,
-                agent_id,
-                daemon_cfg=self.daemon_cfg,
-            )
+            client = self._build_wired_client()
             self._client = client
             reporter = self._build_status_reporter(client)
             identity = client.keystore.load_identity(client.slug)

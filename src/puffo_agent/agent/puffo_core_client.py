@@ -191,6 +191,9 @@ class PuffoCoreMessageClient:
                 bridge_client=bridge_client,
             )
         )
+        # Assignable post-construction (the Worker owns the health policy);
+        # picked up when ``run()`` builds the WS client.
+        self.transport_state_listener: Callable[[bool, int], None] | None = None
         bridge_connected = getattr(self._bridge, "add_connected_callback", None)
         if callable(bridge_connected):
             bridge_connected(self._notify_connected_callbacks)
@@ -283,6 +286,14 @@ class PuffoCoreMessageClient:
         self._ws.on_channel_update = self._handle_channel_update
         # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
+        # Worker-installed observer (see Worker._transport_state_listener):
+        # feeds reconnect-failure streaks into runtime.json health so a
+        # dead transport stops reporting "ok" (8/30 App Nap incident).
+        # getattr: legacy test seeds construct this client without
+        # __init__, same tolerance as the bridge callback above.
+        self._ws.on_transport_state = getattr(
+            self, "transport_state_listener", None
+        )
         await self.store.open()
         try:
             await self._ws.run()
@@ -1437,86 +1448,14 @@ class PuffoCoreMessageClient:
     _DM_NOTICE_INTERVAL_MS = 72 * 3600 * 1000
 
     async def _maybe_send_dm_notice(self, sender_slug: str) -> None:
-        """Operator FYI for every non-trusted sender (contacts included):
-        first DM immediately, then one per 72h; persisted."""
-        if not self.operator_slug:
-            return
-        try:
-            last = await self.store.get_dm_notice(sender_slug)
-        except Exception:
-            last = None
-        now_ms = int(time.time() * 1000)
-        if last is not None and now_ms - last < self._DM_NOTICE_INTERVAL_MS:
-            return
-        display = await self._fetch_display_name(sender_slug)
-        label = f"**{display}** ({sender_slug})" if display else f"@{sender_slug}"
-        try:
-            await self._send_dm(
-                self.operator_slug,
-                f"FYI, {label} is sending direct messages to me.",
-                root_id="",
-            )
-        except Exception as exc:
-            self._log.warning(
-                "dm_notice: failed to notify operator about %s: %s",
-                sender_slug,
-                exc,
-            )
-            return
-        try:
-            await self.store.set_dm_notice(sender_slug, now_ms)
-        except Exception as exc:
-            self._log.warning("dm_notice: failed to persist ts: %s", exc)
+        from . import dm_gate
+
+        await dm_gate.maybe_send_dm_notice(self, sender_slug)
 
     async def _maybe_allowlist_outbound_dm(self, recipient_slug: str) -> None:
-        """Agent DM'd a foreign peer first → allowlist them; best-effort."""
-        if not recipient_slug:
-            return
-        # Never allowlist a sender we're currently gating — the ack DM
-        # echoes back here and would pre-empt the operator's y/n.
-        if any(
-            m.get("sender_slug") == recipient_slug
-            for m in self._pending_dm_approvals.values()
-        ):
-            return
-        # Replying is not consent — only a genuinely agent-initiated
-        # first DM allowlists. A stored inbound DM means they wrote first.
-        try:
-            if await self.store.has_dm_from(recipient_slug):
-                return
-        except Exception:
-            return
-        # Trusted short-circuit before is_allowed can hit the network
-        # (the daemon DMs the operator constantly).
-        if not await self._is_foreign_dm_sender(recipient_slug):
-            return
-        if await self._contacts.is_allowed(recipient_slug):
-            return
-        try:
-            await self.http.post("/allowlists", {"slugs": [recipient_slug]})
-        except Exception as exc:
-            self._log.warning(
-                "dm_gate: outbound allowlist for %s failed: %s",
-                recipient_slug,
-                exc,
-            )
-            return
-        self._contacts.note_allowed(recipient_slug)
-        if not self.operator_slug:
-            return
-        display = await self._fetch_display_name(recipient_slug)
-        label = f"**{display}**(@{recipient_slug})" if display else f"@{recipient_slug}"
-        try:
-            await self._send_dm(
-                self.operator_slug,
-                f"Allowlisted {label} — I messaged them first, so their "
-                "replies won't need approval.",
-                root_id="",
-            )
-        except Exception:
-            self._log.exception(
-                "dm_gate: failed to notify operator of outbound allowlist",
-            )
+        from . import dm_gate
+
+        await dm_gate.maybe_allowlist_outbound_dm(self, recipient_slug)
 
     async def _maybe_gate_foreign_dm(
         self, *, sender_slug: str, text: str

@@ -444,9 +444,7 @@ class StandardWorkerRun:
                 claude_dir=paths.claude_path,
                 agent_id=agent_id,
             )
-            client = worker_module._build_puffo_core_client(
-                worker.agent_cfg, agent_id, daemon_cfg=worker.daemon_cfg
-            )
+            client = worker._build_wired_client()
             worker._client = client
             return WorkerRunContext(
                 paths=paths,
