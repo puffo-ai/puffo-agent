@@ -166,6 +166,16 @@ class DriverAuthorityServer:
             while True:
                 request = self._recv_frame(record)
                 response, child = self._handle_request(record, request)
+                # Correlation is stamped here, at the one point every response
+                # passes through on its way to the wire. A peer that matches
+                # responses to requests by call_id rejects any reply that omits
+                # it, and this server has ten leaf response paths; threading a
+                # parameter through each one means a path added later can drop
+                # the echo silently. Only a request that correlates gets a
+                # correlation key back.
+                request_call_id = request.get("call_id")
+                if isinstance(request_call_id, str):
+                    response["call_id"] = request_call_id
                 try:
                     self._send_frame(record.server_socket, response, child=child)
                 finally:
@@ -187,29 +197,32 @@ class DriverAuthorityServer:
         self, record: _EndpointRecord, request: dict[str, Any]
     ) -> tuple[dict[str, Any], socket.socket | None]:
         operation = request.get("op")
+        call_id = request.get("call_id")
+        if not isinstance(call_id, str):
+            call_id = None
         if request.get("version") != PROTOCOL_VERSION or not isinstance(operation, str):
             return self._decision(
-                record, "malformed", "indeterminate", "malformed_request"
+                record, "malformed", "indeterminate", "malformed_request", call_id=call_id
             ), None
         if operation == "hello":
-            return self._claim(record), None
+            return self._claim(record, call_id=call_id), None
         with self._lock:
             claimed = record.state is _LeaseState.CLAIMED
         if not claimed:
-            return self._mismatch(record, operation), None
+            return self._mismatch(record, operation, call_id=call_id), None
         if operation == "authorize_derived_launch":
-            return self._authorize_derived_launch(record, request)
+            return self._authorize_derived_launch(record, request, call_id=call_id)
         if operation == "authorize_provider_call":
             return self._authorize_provider_call(record, request), None
         return self._decision(
-            record, operation, "indeterminate", "unsupported_operation"
+            record, operation, "indeterminate", "unsupported_operation", call_id=call_id
         ), None
 
-    def _claim(self, record: _EndpointRecord) -> dict[str, Any]:
+    def _claim(self, record: _EndpointRecord, *, call_id: str | None = None) -> dict[str, Any]:
         with self._lock:
             if record.state is not _LeaseState.ISSUED:
                 return self._record_decision_locked(
-                    record, "hello", "denied", "endpoint_already_claimed"
+                    record, "hello", "denied", "endpoint_already_claimed", call_id=call_id
                 )
             if self._claim_probe is not None:
                 self._claim_probe()
@@ -223,7 +236,7 @@ class DriverAuthorityServer:
         }
 
     def _authorize_derived_launch(
-        self, record: _EndpointRecord, request: dict[str, Any]
+        self, record: _EndpointRecord, request: dict[str, Any], *, call_id: str | None = None
     ) -> tuple[dict[str, Any], socket.socket | None]:
         binding = record.binding
         if binding.role != "root":
@@ -232,13 +245,14 @@ class DriverAuthorityServer:
                 "authorize_derived_launch",
                 "denied",
                 "nested_derived_launch_denied",
+                call_id=call_id,
             ), None
         capability = request.get("capability")
         if request.get("launch_id") != binding.launch_id or capability not in {
             "daemon",
             "avatar",
         }:
-            return self._mismatch(record, "authorize_derived_launch"), None
+            return self._mismatch(record, "authorize_derived_launch", call_id=call_id), None
         child_binding = _EndpointBinding(
             launch_id=f"launch_{uuid.uuid4().hex}",
             role="derived",
@@ -249,7 +263,7 @@ class DriverAuthorityServer:
         child_record, child_endpoint = self._issue_endpoint(child_binding)
         self._start_record(child_record)
         response = self._decision(
-            record, "authorize_derived_launch", "granted", "allowed"
+            record, "authorize_derived_launch", "granted", "allowed", call_id=call_id
         )
         response["admission_id"] = f"admission_{uuid.uuid4().hex}"
         return response, child_endpoint
