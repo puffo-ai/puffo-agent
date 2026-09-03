@@ -792,8 +792,8 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """Override any sticky red with ``in_progress`` at batch-top."""
-        if runtime.health == "in_progress":
+        """Mark batch work without hiding an independently probed MCP wedge."""
+        if runtime.health in {"in_progress", "mcp_unreachable"}:
             return
         runtime.health = "in_progress"
         runtime.error = ""
@@ -1451,14 +1451,6 @@ async def _process_refresh_flags(
         refresh_provider_auth_flag,
     )
     return True
-
-
-def _refresh_flag_is_pending(flag: Path) -> bool:
-    """Whether a refresh flag is due for consumption. Existence-only
-    here; the credential-reload jitter branch supersedes this body with
-    the ``not_before_unix_ms``-aware variant (a flag persisted with a
-    future not-before is "recorded but not yet pending")."""
-    return flag.exists()
 
 
 def _unlink_refresh_flags(*flags: Path) -> None:
