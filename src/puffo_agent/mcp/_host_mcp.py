@@ -46,6 +46,11 @@ class PuffoRpcClient:
             await self._session.close()
             self._session = None
 
+    async def hello(self, generation: str) -> str:
+        """Startup handshake: prove this subprocess can reach the daemon's
+        RPC service, tagged with the mcp-config generation that spawned it."""
+        return await self._post("mcp-hello", {"generation": generation})
+
     async def _post(self, route: str, body: dict[str, Any]) -> str:
         """POST + return the ``message`` field. Raises on transport or non-2xx."""
         path = (

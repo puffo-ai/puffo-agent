@@ -8,6 +8,7 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from aiohttp import web
@@ -38,6 +39,47 @@ def set_rpc_resolver(fn: Optional[RpcResolver]) -> None:
     """Daemon-side hook. ``None`` clears it; routes 503 while unset."""
     global _RPC_RESOLVER
     _RPC_RESOLVER = fn
+
+
+# Per-agent (generation, monotonic-arrival) of the last MCP subprocess
+# that reached this service. The worker's transport probe compares both
+# against the generation it minted for the current spec and the runtime's
+# open time — reachability is proven by the subprocess itself (the same
+# process a real tool call would come from), not inferred from our side.
+_MCP_HELLO_SEEN: dict[str, tuple[str, float]] = {}
+
+
+def record_mcp_hello(agent_id: str, generation: str) -> None:
+    _MCP_HELLO_SEEN[agent_id] = (generation, time.monotonic())
+
+
+def mcp_hello_state(agent_id: str) -> tuple[str, float]:
+    """Last (generation, monotonic arrival); ("", 0.0) when never seen."""
+    return _MCP_HELLO_SEEN.get(agent_id, ("", 0.0))
+
+
+def clear_mcp_hello(agent_id: str) -> None:
+    _MCP_HELLO_SEEN.pop(agent_id, None)
+
+
+async def mcp_hello_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/mcp-hello — ``{generation}``.
+
+    Deliberately resolver-free: the handshake may arrive while the
+    worker is still warming, and recording it must not depend on a
+    warm ``HostMcpContext``."""
+    agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    generation = body.get("generation") if isinstance(body, dict) else None
+    if not isinstance(generation, str) or not generation:
+        return web.json_response(
+            {"error": "generation must be a non-empty string"}, status=400,
+        )
+    record_mcp_hello(agent_id, generation)
+    return web.json_response({"message": "ok"})
 
 
 async def _dispatch(
@@ -671,6 +713,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/replace-reminder",
         replace_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/mcp-hello",
+        mcp_hello_route,
     )
     return app
 
