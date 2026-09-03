@@ -7,6 +7,7 @@ into runtime.json so the CLI can read live stats without IPC.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -43,6 +44,7 @@ from ..agent.shared_content import rebuild_agent_claude_md, rebuild_agent_codex_
 from .state import (
     AgentConfig,
     DaemonConfig,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     RuntimeState,
     agent_claude_user_dir,
     agent_codex_user_dir,
@@ -119,6 +121,36 @@ _MCP_PROBE_GRACE_SECONDS = 30.0
 # Consecutive failed adapter reloads tolerated before the pending
 # refresh flags are abandoned and the failure becomes a health state.
 _REFRESH_RELOAD_FAILURE_CAP = 3
+
+
+def _provider_auth_reload_delay_seconds(flag: Path) -> float:
+    """Return the bounded remaining delay from a credential-reload request."""
+    try:
+        request = json.loads(flag.read_text(encoding="utf-8"))
+        if not isinstance(request, dict):
+            return 0.0
+        not_before_ms = request.get("not_before_unix_ms")
+        if not isinstance(not_before_ms, (int, float)):
+            return 0.0
+        remaining = (float(not_before_ms) / 1000.0) - time.time()
+        return min(max(remaining, 0.0), PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+async def _wait_for_provider_auth_reload_jitter(
+    agent_id: str, flag: Path,
+) -> None:
+    delay_seconds = _provider_auth_reload_delay_seconds(flag)
+    if not delay_seconds:
+        return
+    logger.info(
+        "agent %s: delaying provider reload %.3fs to stagger "
+        "credential-refresh fan-out",
+        agent_id,
+        delay_seconds,
+    )
+    await asyncio.sleep(delay_seconds)
 
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
@@ -1301,6 +1333,11 @@ async def _process_refresh_flags(
     provider_auth_seen = _refresh_flag_is_pending(refresh_provider_auth_flag)
     if not (host_sync_seen or agent_seen or session_seen or provider_auth_seen):
         return True
+
+    if provider_auth_seen and not (host_sync_seen or agent_seen or session_seen):
+        await _wait_for_provider_auth_reload_jitter(
+            agent_id, refresh_provider_auth_flag
+        )
 
     if host_sync_seen:
         _sync_refresh_host_assets(agent_id)

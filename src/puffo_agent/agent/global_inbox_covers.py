@@ -15,6 +15,8 @@ from .message_store import ProcessingState
 # implementation module.
 logger = logging.getLogger("puffo_agent.agent.global_inbox_runtime")
 
+MCP_SILENCE_WARNING_EVERY_TURNS = 3
+
 
 class CoversReconciliationMixin:
     """Cover reconciliation + completion for ``GlobalInboxRuntime``.
@@ -179,6 +181,7 @@ class CoversReconciliationMixin:
             # That is a normal deferred outcome, not a transport failure and
             # therefore must not create another generation for the same set.
             await self.store.finalize_empty_turn(turn_id=planned.turn_id)
+        await self._observe_mcp_read_progress()
         renotice_set = set(renotice_ids)
         for item_id in self.active.message_ids:
             row = rows_by_id.get(item_id)
@@ -209,4 +212,28 @@ class CoversReconciliationMixin:
             state=ProcessingState.PROCESSED.value,
             message_count=len(self.active.message_ids),
             duration_ms=int((time.monotonic() - process_started) * 1000),
+        )
+
+    async def _observe_mcp_read_progress(self) -> None:
+        """Warn when repeated notice turns never reach ``read_inbox``.
+
+        One empty notice turn is a supported deferral. Repeated empty turns
+        while messages remain pending are also the daemon-visible signature
+        of a provider whose MCP client is wedged, so surface that ambiguity
+        without claiming a transport root cause we cannot observe here.
+        """
+        if not self.active.notice_message_ids:
+            return
+        if self.active.message_ids or not await self.store.get_pending(limit=1):
+            self._mcp_silence_streak = 0
+            return
+        self._mcp_silence_streak += 1
+        if self._mcp_silence_streak % MCP_SILENCE_WARNING_EVERY_TURNS:
+            return
+        logger.warning(
+            "agent %s: possible MCP control-plane failure — %d consecutive "
+            "Inbox notice turns completed without read_inbox admission while "
+            "messages remain pending",
+            self.agent_id,
+            self._mcp_silence_streak,
         )

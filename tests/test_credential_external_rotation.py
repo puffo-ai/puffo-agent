@@ -277,6 +277,24 @@ def test_on_refresh_success_reloads_healthy_agent(tmp_path, monkeypatch):
     assert w.refresh_notifications == 1
 
 
+def test_on_refresh_success_persists_bounded_reload_jitter(tmp_path, monkeypatch):
+    from puffo_agent.portal import daemon as daemon_module
+
+    d, _w, flag = _daemon_harness(monkeypatch, tmp_path, "ok")
+    monkeypatch.setattr(
+        daemon_module, "_provider_auth_reload_jitter_seconds", lambda: 17.5
+    )
+    monkeypatch.setattr(daemon_module.time, "time", lambda: 100.0)
+
+    d.refresher.callback()
+
+    assert json.loads(flag.read_text(encoding="utf-8")) == {
+        "source": "credential_replaced",
+        "jitter_seconds": 17.5,
+        "not_before_unix_ms": 117500,
+    }
+
+
 # ── new message while auth_failed wakes the refresher ──────────────
 
 
