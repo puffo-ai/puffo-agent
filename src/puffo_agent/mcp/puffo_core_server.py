@@ -9,6 +9,7 @@ Entry point: ``python -m puffo_agent.mcp.puffo_core_server``
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -369,7 +370,12 @@ def build_server(
     # silencing the ``Unclosed client session`` gc warning.
     mcp = FastMCP(
         "puffo-core",
-        lifespan=make_lifespan(data, rpc_client, http),
+        lifespan=make_lifespan(
+            data,
+            rpc_client,
+            http,
+            startup=_make_hello_startup(rpc_client),
+        ),
     )
     register_core_tools(mcp, core_cfg)
     _register_local_tools(mcp, workspace, runtime_kind, harness)
@@ -385,6 +391,38 @@ def build_server(
     )
     register_memory_tools(mcp, mem_cfg)
     return mcp
+
+
+_HELLO_ATTEMPTS = 3
+_HELLO_RETRY_DELAY_SECONDS = 2.0
+
+
+def _make_hello_startup(rpc_client):
+    """Startup handshake coroutine factory. ``None`` when the handshake
+    is not applicable (no RPC client wired, or the daemon predates
+    ``PUFFO_MCP_GENERATION``) so older daemons see zero new traffic."""
+    generation = os.environ.get("PUFFO_MCP_GENERATION", "")
+    if rpc_client is None or not generation:
+        return None
+
+    async def _hello() -> None:
+        for attempt in range(1, _HELLO_ATTEMPTS + 1):
+            try:
+                await rpc_client.hello(generation)
+                return
+            except Exception as exc:  # noqa: BLE001
+                if attempt == _HELLO_ATTEMPTS:
+                    # The daemon-side probe recycles on missing hellos;
+                    # this line is the subprocess-side half of the story.
+                    logger.warning(
+                        "mcp-hello failed after %d attempts "
+                        "(generation=%s): %s",
+                        attempt, generation, exc,
+                    )
+                    return
+                await asyncio.sleep(_HELLO_RETRY_DELAY_SECONDS)
+
+    return _hello
 
 
 def _cfg_from_env() -> dict[str, str]:

@@ -111,6 +111,15 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
+# How long after a runtime open the MCP subprocess gets to say hello
+# before the probe treats the transport as wedged. Covers a slow spawn
+# plus the subprocess's own 3×2s hello retry budget.
+_MCP_PROBE_GRACE_SECONDS = 30.0
+
+# Consecutive failed adapter reloads tolerated before the pending
+# refresh flags are abandoned and the failure becomes a health state.
+_REFRESH_RELOAD_FAILURE_CAP = 3
+
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     if harness_name != "claude-code":
@@ -352,6 +361,105 @@ class Worker:
                 api_key_mode=getattr(self, "_claude_api_key_mode", False),
             )
         self._warm_done.set()
+
+    async def probe_mcp_transport(self, agent_id: str) -> None:
+        """Heartbeat-cadence transport probe: the current runtime's puffo
+        MCP subprocess must have reached the loopback RPC service
+        (``mcp-hello`` with this spec's generation, after this runtime's
+        open). One miss past the grace window recycles the runtime —
+        the respawned subprocess re-fires hello; a second miss flips
+        ``mcp_unreachable`` so the wedge is visible instead of an
+        agent that wakes turns but can never read them (8/30-class
+        incident: alive worker, dead MCP, health ok for 51 min)."""
+        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+        from . import rpc_service
+
+        mgr = get_runtime_manager(agent_id)
+        if mgr is None:
+            return
+        spec_gen = getattr(mgr.spec, "mcp_generation", "")
+        opened_at = getattr(mgr, "last_open_monotonic", None)
+        if not spec_gen or opened_at is None:
+            return
+        seen_gen, seen_at = rpc_service.mcp_hello_state(agent_id)
+        if seen_gen == spec_gen and seen_at >= opened_at:
+            if self._mcp_probe_strikes:
+                logger.info(
+                    "agent %s: puffo MCP transport recovered "
+                    "(generation=%s)", agent_id, spec_gen,
+                )
+            self._mcp_probe_strikes = 0
+            if self.runtime.health == "mcp_unreachable":
+                self.runtime.health = "ok"
+                self.runtime.error = ""
+                self.runtime.save(agent_id)
+            return
+        if time.monotonic() - opened_at < _MCP_PROBE_GRACE_SECONDS:
+            return
+        if self._turn_active:
+            # A reload would raise mid-turn; check again next beat.
+            return
+        self._mcp_probe_strikes += 1
+        if self._mcp_probe_strikes == 1:
+            logger.error(
+                "agent %s: puffo MCP subprocess has not reached the RPC "
+                "service %.0fs after runtime open (generation=%s); "
+                "recycling the provider runtime",
+                agent_id, _MCP_PROBE_GRACE_SECONDS, spec_gen,
+            )
+            try:
+                await mgr.reload_resources(preserve_session=True)
+            except Exception as exc:  # noqa: BLE001
+                # Includes a turn racing us; keep the strike for next beat.
+                self._mcp_probe_strikes -= 1
+                logger.warning(
+                    "agent %s: MCP-probe recycle failed: %s", agent_id, exc,
+                )
+            return
+        if self.runtime.health in ("ok", "unknown"):
+            self.runtime.health = "mcp_unreachable"
+            self.runtime.error = (
+                "puffo MCP subprocess never reached the daemon RPC "
+                "service after a runtime recycle; tool calls are likely "
+                "timing out. Restart this worker."
+            )
+            self.runtime.save(agent_id)
+            logger.error(
+                "agent %s: MCP transport still unreachable after recycle; "
+                "runtime.health = mcp_unreachable", agent_id,
+            )
+
+    def _note_refresh_reload(
+        self, ok: bool, flags: tuple[Path, ...], agent_id: str
+    ) -> None:
+        """Give-up policy for ``_process_refresh_flags`` failures: the
+        flags survive ``_REFRESH_RELOAD_FAILURE_CAP`` consecutive failed
+        reloads (each turn-start / watcher tick retries), then they are
+        abandoned into an explicit health state — a worker must not spin
+        on a reload that will never succeed, and it must not pretend the
+        refresh was applied either."""
+        if ok:
+            self._refresh_reload_failures = 0
+            return
+        self._refresh_reload_failures += 1
+        if self._refresh_reload_failures < _REFRESH_RELOAD_FAILURE_CAP:
+            return
+        self._refresh_reload_failures = 0
+        _unlink_refresh_flags(*flags)
+        logger.error(
+            "agent %s: adapter reload failed %d consecutive times; "
+            "abandoning pending refresh flags — the provider runtime is "
+            "still on its pre-refresh state",
+            agent_id, _REFRESH_RELOAD_FAILURE_CAP,
+        )
+        if self.runtime.health in ("ok", "unknown"):
+            self.runtime.health = "provider_error"
+            self.runtime.error = (
+                "provider runtime reload kept failing after a refresh "
+                "(credentials/profile may not be applied). Restart this "
+                "worker."
+            )
+            self.runtime.save(agent_id)
 
     @staticmethod
     def _reassert_auth_failed_after_failed_probe(
@@ -766,6 +874,11 @@ class Worker:
         self._reload_lock = asyncio.Lock()
         self._turn_active = False
         self._refresh_now = asyncio.Event()
+        # MCP transport probe state (see ``probe_mcp_transport``): missed
+        # handshakes since the last confirmed one, and how many consecutive
+        # adapter reloads failed before their flags were abandoned.
+        self._mcp_probe_strikes = 0
+        self._refresh_reload_failures = 0
 
     def notify_refresh(self) -> None:
         """Wake the proactive refresh watcher now (sub-poll latency).
@@ -1170,18 +1283,24 @@ async def _process_refresh_flags(
     role_short: str = "",
     puffo_handle: str = "",
     workspace_shared_status: str = "existing",
-) -> None:
+) -> bool:
     """Consume worker refresh flags in one idle-boundary adapter reload.
 
     Resource and credential changes preserve session identity. Only an explicit
     session refresh starts a new logical and native provider conversation.
+
+    Returns whether the reload succeeded. On failure the flag files are
+    kept byte-for-byte (their content may carry scheduling fields owned
+    by the daemon) so the next turn-start or watcher tick retries; the
+    caller owns the give-up policy (``Worker._note_refresh_reload``).
+    Everything that runs before the reload is idempotent re-run work.
     """
-    host_sync_seen = refresh_host_sync_flag.exists()
-    agent_seen = refresh_agent_flag.exists()
-    session_seen = refresh_session_flag.exists()
-    provider_auth_seen = refresh_provider_auth_flag.exists()
+    host_sync_seen = _refresh_flag_is_pending(refresh_host_sync_flag)
+    agent_seen = _refresh_flag_is_pending(refresh_agent_flag)
+    session_seen = _refresh_flag_is_pending(refresh_session_flag)
+    provider_auth_seen = _refresh_flag_is_pending(refresh_provider_auth_flag)
     if not (host_sync_seen or agent_seen or session_seen or provider_auth_seen):
-        return
+        return True
 
     if host_sync_seen:
         _sync_refresh_host_assets(agent_id)
@@ -1228,17 +1347,32 @@ async def _process_refresh_flags(
             )
     except Exception as exc:
         logger.warning(
-            "agent %s: adapter.reload after refresh failed: %s",
+            "agent %s: adapter.reload after refresh failed "
+            "(flags kept for retry): %s",
             agent_id,
             exc,
         )
+        return False
 
-    for flag in (
+    _unlink_refresh_flags(
         refresh_host_sync_flag,
         refresh_agent_flag,
         refresh_session_flag,
         refresh_provider_auth_flag,
-    ):
+    )
+    return True
+
+
+def _refresh_flag_is_pending(flag: Path) -> bool:
+    """Whether a refresh flag is due for consumption. Existence-only
+    here; the credential-reload jitter branch supersedes this body with
+    the ``not_before_unix_ms``-aware variant (a flag persisted with a
+    future not-before is "recorded but not yet pending")."""
+    return flag.exists()
+
+
+def _unlink_refresh_flags(*flags: Path) -> None:
+    for flag in flags:
         try:
             flag.unlink()
         except OSError:

@@ -982,8 +982,15 @@ class RuntimeState:
     #                           cleared on next successful turn. Does
     #                           NOT overwrite the stronger downstream
     #                           signals above.
+    #   "mcp_unreachable"     — the puffo MCP subprocess never reached the
+    #                           loopback RPC service (mcp-hello handshake)
+    #                           after a runtime open AND one automatic
+    #                           recycle; tool calls are likely timing out.
+    #                           Set only from ok/unknown; cleared by the
+    #                           probe when a current-generation hello
+    #                           arrives.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | mcp_unreachable | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:
