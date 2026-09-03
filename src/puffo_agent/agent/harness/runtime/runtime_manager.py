@@ -245,6 +245,7 @@ class RuntimeManager:
             if resume and self.native_session_id
             else None
         )
+        self.last_open_monotonic = time.monotonic()
         try:
             opened = await self.driver.open(self.spec, native_resume)
         except BaseException as exc:
@@ -276,6 +277,7 @@ class RuntimeManager:
             )
             self._clear_native_session()
             try:
+                self.last_open_monotonic = time.monotonic()
                 opened = await self.driver.open(self.spec, None)
             except BaseException as exc:
                 errors = [exc]
@@ -289,7 +291,6 @@ class RuntimeManager:
                 )
         self.native_session_id = opened.native_session_id
         self._resume_failure_streak = 0
-        self.last_open_monotonic = time.monotonic()
         # Preserve the durable Puffo logical reference independently of the
         # native provider session ID.
         self.opened = replace(opened, session_ref=self.session_ref)

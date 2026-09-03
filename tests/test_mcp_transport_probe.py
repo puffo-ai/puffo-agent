@@ -6,12 +6,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from puffo_agent.agent.harness.driver import (
+    ProtocolDiagnostics,
+    RuntimeOpened,
+    RuntimeRef,
+    RuntimeSpec,
+    SessionRef,
+)
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager
 from puffo_agent.portal import rpc_service
 from puffo_agent.portal.state import (
     AgentConfig,
@@ -56,17 +66,24 @@ def _flags_kwargs(tmp_path: Path, adapter) -> dict:
     )
 
 
-def test_failed_reload_keeps_flags_byte_for_byte(tmp_path):
+def test_failed_reload_keeps_scheduled_flag_byte_for_byte(tmp_path, monkeypatch):
     """A failed reload must not consume the refresh intent: the flag
     files survive unmodified (their content may carry daemon-owned
     scheduling fields) and the call reports failure."""
+    from puffo_agent.portal import worker as worker_mod
+
     provider_flag = tmp_path / "refresh_provider_auth.flag"
-    provider_flag.write_text('{"not_before": 123.0}', encoding="utf-8")
+    payload = (
+        '{"source":"credential_replaced",'
+        '"not_before_unix_ms":500}'
+    )
+    provider_flag.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(worker_mod.time, "time", lambda: 1.0)
 
     ok = _run(_process_refresh_flags(**_flags_kwargs(tmp_path, _FailingAdapter())))
 
     assert ok is False
-    assert provider_flag.read_text(encoding="utf-8") == '{"not_before": 123.0}'
+    assert provider_flag.read_text(encoding="utf-8") == payload
 
 
 def _seed_worker(health: str = "ok") -> Worker:
@@ -160,6 +177,53 @@ def test_probe_recycles_then_flips_health(registered_manager, saved_states):
     assert ("t", "mcp_unreachable", worker.runtime.error) in saved_states
 
 
+def test_runtime_open_watermark_precedes_current_generation_hello():
+    """A hello emitted during driver.open belongs to the runtime being opened."""
+    class _HelloDuringOpenDriver:
+        def __init__(self):
+            self.queue: asyncio.Queue = asyncio.Queue()
+
+        async def open(self, _spec, _resume=None):
+            rpc_service.record_mcp_hello("opening", "g-current")
+            return RuntimeOpened(
+                RuntimeRef("runtime"),
+                SessionRef("session"),
+                "native",
+                False,
+                CODEX_CAPABILITIES,
+                ProtocolDiagnostics(),
+            )
+
+        def events(self):
+            async def iterate():
+                while True:
+                    event = await self.queue.get()
+                    if event is None:
+                        return
+                    yield event
+            return iterate()
+
+        async def close(self):
+            await self.queue.put(None)
+
+    async def scenario():
+        rpc_service.clear_mcp_hello("opening")
+        manager = RuntimeManager(
+            _HelloDuringOpenDriver(),
+            RuntimeSpec("/tmp", mcp_generation="g-current"),
+        )
+        try:
+            await manager.open()
+            generation, seen_at = rpc_service.mcp_hello_state("opening")
+            assert generation == "g-current"
+            assert seen_at >= manager.last_open_monotonic
+        finally:
+            await manager.close()
+            rpc_service.clear_mcp_hello("opening")
+
+    _run(scenario())
+
+
 def test_probe_hello_clears_wedge_state(registered_manager, saved_states):
     opened_at = time.monotonic() - 120
     registered_manager(_FakeManager("g1", opened_at))
@@ -171,6 +235,20 @@ def test_probe_hello_clears_wedge_state(registered_manager, saved_states):
 
     assert worker._mcp_probe_strikes == 0
     assert worker.runtime.health == "ok"
+
+
+def test_empty_turn_cannot_clear_mcp_unreachable(saved_states):
+    """Only a current-generation hello proves that the MCP lane recovered."""
+    worker = _seed_worker(health="mcp_unreachable")
+    worker.runtime.error = "puffo MCP subprocess never reached the daemon RPC service"
+
+    log = logging.getLogger(__name__)
+    Worker._flip_health_in_progress(worker.runtime, "t", log)
+    Worker._resolve_health_on_success(worker.runtime, "t", log)
+
+    assert worker.runtime.health == "mcp_unreachable"
+    assert "never reached" in worker.runtime.error
+    assert saved_states == []
 
 
 def test_probe_ignores_stale_generation_hello(registered_manager):
