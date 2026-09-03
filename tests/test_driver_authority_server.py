@@ -431,3 +431,104 @@ async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds() ->
                 )
             )
         )
+
+
+def _root_client(server: DriverAuthorityServer, launch_id: str) -> socket.socket:
+    return _client(server.issue_root(launch_id=launch_id))
+
+
+def _every_answered_request(launch_id: str) -> list[dict[str, Any]]:
+    """One request per response path the server can take, hello first."""
+    return [
+        {"version": 1, "op": "hello"},
+        # Second hello: the endpoint is single-use, so this is the denied path.
+        {"version": 1, "op": "hello"},
+        {"version": 99, "op": "hello"},  # malformed_request
+        {"version": 1, "op": "no_such_operation"},  # unsupported_operation
+        {
+            "version": 1,
+            "op": "authorize_provider_call",
+            "launch_id": launch_id,
+            "provider": "llm",
+            "capability": "root",
+        },  # granted
+        {
+            "version": 1,
+            "op": "authorize_provider_call",
+            "launch_id": "not-the-binding",
+            "provider": "llm",
+            "capability": "root",
+        },  # endpoint_binding_mismatch
+        {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "launch_id": launch_id,
+            "capability": "daemon",
+        },  # granted, carries a child descriptor
+        {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "launch_id": "not-the-binding",
+            "capability": "daemon",
+        },  # mismatch
+    ]
+
+
+def test_every_response_echoes_the_request_call_id() -> None:
+    """A correlating peer rejects any response that drops its ``call_id``.
+
+    Asserted over every response path rather than the two that happened to
+    break LingTai, so a response constructor added later cannot reintroduce
+    the omission on a path nobody enumerated.
+    """
+    server = DriverAuthorityServer()
+    client = _root_client(server, "root-echo")
+    try:
+        for request in _every_answered_request("root-echo"):
+            call_id = str(uuid.uuid4())
+            response, fds = _request(client, {**request, "call_id": call_id})
+            _close_fds(fds)
+            assert response.get("call_id") == call_id, (
+                f"op={request['op']} version={request['version']} "
+                f"dropped call_id; response keys={sorted(response)}"
+            )
+    finally:
+        client.close()
+        server.close()
+
+
+def test_response_omits_call_id_when_the_request_did_not_correlate() -> None:
+    """Requests that send no ``call_id`` keep their existing response shape."""
+    server = DriverAuthorityServer()
+    client = _root_client(server, "root-uncorrelated")
+    try:
+        for request in _every_answered_request("root-uncorrelated"):
+            response, fds = _request(client, request)
+            _close_fds(fds)
+            assert "call_id" not in response, (
+                f"op={request['op']} invented a call_id the caller never sent: "
+                f"{response!r}"
+            )
+    finally:
+        client.close()
+        server.close()
+
+
+def test_lingtai_hello_correlation_is_accepted_end_to_end() -> None:
+    """The exact exchange LingTai performs before it will bind authority."""
+    server = DriverAuthorityServer()
+    client = _root_client(server, "root-lingtai")
+    try:
+        call_id = str(uuid.uuid4())
+        response, fds = _request(
+            client, {"version": 1, "op": "hello", "call_id": call_id}
+        )
+        assert fds == []
+        # LingTai's driver_authority client raises
+        # DriverAuthorityTransportError unless this comparison holds.
+        assert response.get("call_id") == call_id
+        assert response["role"] == "root"
+        assert response["launch_id"] == "root-lingtai"
+    finally:
+        client.close()
+        server.close()

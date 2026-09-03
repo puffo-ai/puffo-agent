@@ -186,6 +186,26 @@ class DriverAuthorityServer:
     def _handle_request(
         self, record: _EndpointRecord, request: dict[str, Any]
     ) -> tuple[dict[str, Any], socket.socket | None]:
+        """Answer one request and echo its ``call_id`` on the way out.
+
+        The echo is stamped here, at the single point where a request and its
+        response are both in scope, rather than threaded through every
+        response constructor. A peer that correlates responses by ``call_id``
+        rejects any reply that omits it, so a constructor added later must not
+        be able to reintroduce the omission by forgetting a parameter.
+
+        Only a request that carried a ``call_id`` gets one back: callers that
+        never correlate keep their existing response shape.
+        """
+        response, child = self._dispatch_request(record, request)
+        call_id = request.get("call_id")
+        if isinstance(call_id, str):
+            response["call_id"] = call_id
+        return response, child
+
+    def _dispatch_request(
+        self, record: _EndpointRecord, request: dict[str, Any]
+    ) -> tuple[dict[str, Any], socket.socket | None]:
         operation = request.get("op")
         if request.get("version") != PROTOCOL_VERSION or not isinstance(operation, str):
             return self._decision(
