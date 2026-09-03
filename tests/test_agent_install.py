@@ -666,6 +666,65 @@ def test_process_refresh_flags_provider_auth_preserves_session(tmp_path):
     assert not provider_flag.exists()
 
 
+def test_process_refresh_flags_honors_provider_reload_not_before(
+    tmp_path, monkeypatch,
+):
+    """Fleet credential fan-out waits for each persisted jitter deadline."""
+    from puffo_agent.portal import worker as worker_mod
+
+    adapter = _FakeAdapter()
+    provider_flag = tmp_path / "refresh_provider_auth.flag"
+    provider_flag.write_text(
+        '{"source":"credential_replaced","not_before_unix_ms":10500}',
+        encoding="utf-8",
+    )
+    delays = []
+
+    async def record_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(worker_mod.time, "time", lambda: 10.0)
+    monkeypatch.setattr(worker_mod.asyncio, "sleep", record_sleep)
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=_FakePuffo(prompt="preserved"),
+        adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=provider_flag,
+    ))
+
+    assert delays == [0.5]
+    assert adapter.reload_calls == [("preserved", False)]
+
+    # An explicit user/session refresh already spreads naturally and should
+    # not inherit the daemon's background credential jitter.
+    provider_flag.write_text(
+        '{"source":"credential_replaced","not_before_unix_ms":10500}',
+        encoding="utf-8",
+    )
+    session_flag = tmp_path / "refresh_session.flag"
+    session_flag.write_text("{}", encoding="utf-8")
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t", harness_name="claude-code",
+        shared_path=tmp_path / "shared", profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"), workspace_path=str(tmp_path),
+        puffo=_FakePuffo(prompt="preserved"), adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=session_flag,
+        refresh_provider_auth_flag=provider_flag,
+    ))
+    assert delays == [0.5]
+    assert adapter.reload_calls[-1] == ("preserved", True)
+
+
 def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypatch):
     from puffo_agent.portal import worker as worker_mod
     monkeypatch.setattr(

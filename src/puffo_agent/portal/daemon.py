@@ -10,8 +10,10 @@ by mutating the filesystem — no IPC needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import shutil
 import signal
 import threading
@@ -61,6 +63,7 @@ from .state import (
     is_daemon_ready,
     is_daemon_startup_stalled,
     is_pid_alive,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_provider_auth_flag_path,
@@ -83,6 +86,11 @@ from .worker import Worker
 from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_auth_reload_jitter_seconds() -> float:
+    """Spread fleet-wide provider reopen requests across a short window."""
+    return random.uniform(0.0, PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
 
 
 class _DaemonRuntime:
@@ -502,13 +510,23 @@ class Daemon:
                     agent_cfg.resolve_workspace_dir()
                 )
                 flag.parent.mkdir(parents=True, exist_ok=True)
+                jitter_seconds = _provider_auth_reload_jitter_seconds()
                 flag.write_text(
-                    '{"source":"credential_replaced"}', encoding="utf-8"
+                    json.dumps({
+                        "source": "credential_replaced",
+                        "jitter_seconds": jitter_seconds,
+                        "not_before_unix_ms": int(
+                            (time.time() + jitter_seconds) * 1000
+                        ),
+                    }),
+                    encoding="utf-8",
                 )
                 worker.notify_refresh()
                 logger.info(
-                    "agent %s: credential replaced — provider reload requested",
+                    "agent %s: credential replaced — provider reload requested "
+                    "with %.3fs jitter",
                     agent_id,
+                    jitter_seconds,
                 )
             except OSError as exc:
                 logger.warning(
