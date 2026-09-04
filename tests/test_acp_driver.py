@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import sys
 import time
@@ -32,6 +33,7 @@ from puffo_agent.agent.harness.drivers.acp import (
 )
 from puffo_agent.agent.harness.driver import (
     HarnessEventType,
+    McpServerSpec,
     PermissionDecision,
     PermissionRef,
     RuntimeLifecycle,
@@ -132,6 +134,14 @@ class _Harness:
             can_load=self.can_load,
         )
         return self.conn
+
+
+_PUFFO_CORE = McpServerSpec(
+    name="puffo",
+    command="/usr/bin/python3",
+    args=("-m", "puffo_agent.mcp.puffo_core_server"),
+    environment={"PUFFO_AGENT_ID": "agent_test"},
+)
 
 
 async def _collect_through(stream, type_):
@@ -342,6 +352,9 @@ async def test_launch_validator_sees_complete_immutable_plan_at_spawn_boundary()
         executable="agent",
         launch_args=("acp", "--agent-dir", "/agent"),
         environment={"ACP_TOKEN": "secret"},
+        # A spec that actually carries a server: with the default empty
+        # tuple the plan assertion above passes whatever the Driver does.
+        mcp_servers=(_PUFFO_CORE,),
     ))
 
     assert [name for name, _ in events] == ["validate", "spawn"]
@@ -547,3 +560,59 @@ async def _wait_for_path(path) -> None:
             return
         await asyncio.sleep(0.01)
     raise AssertionError(f"child did not create {path}")
+
+
+@pytest.mark.parametrize(
+    "launch_args",
+    [
+        pytest.param(
+            ("acp", "--runtime-id", "rt_x", "--profile", "puffo-v0"),
+            id="puffo-v0",
+        ),
+        pytest.param(("acp", "--agent-dir", "/agent"), id="generic-acp"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_spec_mcp_servers_never_reach_the_acp_launch_plan(launch_args):
+    """puffo-v0 rejects a non-empty ``mcpServers`` outright, so the Driver
+    drops whatever the runtime projected rather than forwarding it. Pinned
+    for the generic profile too: the drop is unconditional today, and a
+    future per-profile forward must not reintroduce it for puffo-v0."""
+    seen = []
+    driver = AcpDriver(
+        launch_validator=lambda plan: seen.append(plan.mcp_servers)
+    )
+    spec = RuntimeSpec(
+        "/workspace",
+        executable="lingtai-agent",
+        launch_args=launch_args,
+        mcp_servers=(_PUFFO_CORE,),
+    )
+    assert spec.mcp_servers == (_PUFFO_CORE,), "spec must carry the server"
+
+    with contextlib.suppress(Exception):
+        # The plan is sealed and validated before any spawn is attempted.
+        await driver.open(spec)
+
+    assert seen == [()]
+
+
+@pytest.mark.asyncio
+async def test_session_new_is_sent_an_empty_mcp_server_list():
+    """The wire value, not just the plan: an empty list is what makes
+    ``session/new`` succeed under puffo-v0."""
+    harness = _Harness(can_load=False)
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec(
+        "/workspace",
+        executable="agent",
+        launch_args=("acp", "--agent-dir", "/agent"),
+        mcp_servers=(_PUFFO_CORE,),
+    ))
+
+    calls = dict(harness.conn.calls)
+    assert calls["new_session"]["mcp_servers"] == ()
+    await driver.close()
