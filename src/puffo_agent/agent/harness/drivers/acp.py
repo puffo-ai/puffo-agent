@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -64,6 +65,10 @@ from ..driver import (
     TurnRef,
     TurnStarted,
     UnsupportedCapability,
+)
+from ..driver_authority_server import (
+    DRIVER_AUTHORITY_FD_ENV,
+    DriverAuthorityServer,
 )
 from ..support.subprocess_io import (
     drain_subprocess_stream_keeping_tail,
@@ -237,6 +242,7 @@ class AcpDriver(Driver):
         self._capabilities = acp_capabilities(session_resume=False)
         self._model_selection = ""
         self._spawn_warnings: tuple[str, ...] = ()
+        self._driver_authority: DriverAuthorityServer | None = None
         self._closed = False
 
     def current_capabilities(self) -> DriverCapabilities:
@@ -378,22 +384,66 @@ class AcpDriver(Driver):
         if not isinstance(launch, ValidatedLaunchPlan):
             raise TypeError("ACP spawn requires a ValidatedLaunchPlan")
         plan = launch.plan
+        environment = dict(plan.environment)
+        # This is a Driver-owned carrier, never caller-supplied ambient state.
+        caller_supplied_authority = environment.pop(
+            DRIVER_AUTHORITY_FD_ENV, None
+        )
+        uses_driver_authority = _uses_lingtai_driver_authority(plan.argv)
         if self.process_factory is not None:
+            if uses_driver_authority:
+                raise RuntimeError(
+                    "constrained LingTai ACP requires the POSIX local spawn path"
+                )
             # One call with the declared signature. Retrying on TypeError
             # cannot distinguish wrong arity from an internal factory failure
             # and could spawn a second child on the error path.
-            proc = self.process_factory(plan.argv, plan)
+            sanitized_plan = (
+                replace(plan, environment=MappingProxyType(environment))
+                if caller_supplied_authority is not None
+                else plan
+            )
+            proc = self.process_factory(plan.argv, sanitized_plan)
             return await proc if asyncio.iscoroutine(proc) else proc
-        return await asyncio.create_subprocess_exec(
-            *plan.argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=plan.cwd or None,
-            env=plan.environment,
-            limit=16 * 1024 * 1024,
-            **process_group_spawn_kwargs(),
-        )
+        if not uses_driver_authority:
+            return await asyncio.create_subprocess_exec(
+                *plan.argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=plan.cwd or None,
+                env=environment,
+                limit=16 * 1024 * 1024,
+                **process_group_spawn_kwargs(),
+            )
+
+        if os.name != "posix":
+            raise RuntimeError(
+                "constrained LingTai ACP requires a POSIX local spawn path"
+            )
+        authority = DriverAuthorityServer()
+        endpoint = authority.issue_root(launch_id=str(self._runtime_ref))
+        endpoint_fd = endpoint.fileno()
+        environment[DRIVER_AUTHORITY_FD_ENV] = str(endpoint_fd)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *plan.argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=plan.cwd or None,
+                env=environment,
+                limit=16 * 1024 * 1024,
+                pass_fds=(endpoint_fd,),
+                **process_group_spawn_kwargs(),
+            )
+        except BaseException:
+            authority.close()
+            raise
+        finally:
+            endpoint.close()
+        self._driver_authority = authority
+        return proc
 
     async def start_turn(self, input: TurnInput):
         if self._conn is None:
@@ -599,6 +649,9 @@ class AcpDriver(Driver):
         self._prompt_task = None
         self._watcher = None
         self._stderr_reader = None
+        authority, self._driver_authority = self._driver_authority, None
+        if authority is not None:
+            authority.close()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         await collect_cleanup_errors(
@@ -835,3 +888,22 @@ def model_launch_args(executable: str, model: str) -> tuple[str, ...]:
     if flag is None:
         return ()
     return (flag, model)
+
+
+def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
+    """Select only LingTai's constrained ACP profile, independent of argv[0]."""
+
+    try:
+        acp_index = command.index("acp")
+    except ValueError:
+        return False
+    profile_args = command[acp_index + 1 :]
+    return any(
+        (
+            arg == "--profile"
+            and index + 1 < len(profile_args)
+            and profile_args[index + 1] == "puffo-v0"
+        )
+        or arg == "--profile=puffo-v0"
+        for index, arg in enumerate(profile_args)
+    )
