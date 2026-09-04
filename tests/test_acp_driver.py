@@ -15,6 +15,7 @@ from acp.schema import (
     AgentCapabilities,
     AgentMessageChunk,
     InitializeResponse,
+    McpServerStdio,
     NewSessionResponse,
     PermissionOption,
     PromptResponse,
@@ -333,7 +334,13 @@ async def test_launch_validator_sees_complete_immutable_plan_at_spawn_boundary()
         assert plan.argv == ("agent", "acp", "--agent-dir", "/agent")
         assert plan.environment["ACP_TOKEN"] == "secret"
         assert plan.cwd == "/workspace"
-        assert plan.mcp_servers == ()
+        (server,) = plan.mcp_servers
+        assert server.name == "puffo"
+        assert server.command == "/usr/bin/python3"
+        assert server.args == ["-m", "puffo_agent.mcp.puffo_core_server"]
+        assert [(e.name, e.value) for e in server.env] == [
+            ("PUFFO_AGENT_ID", "agent_test")
+        ]
         with pytest.raises(TypeError):
             plan.environment["ACP_TOKEN"] = "changed"
 
@@ -573,11 +580,14 @@ async def _wait_for_path(path) -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_spec_mcp_servers_never_reach_the_acp_launch_plan(launch_args):
-    """puffo-v0 rejects a non-empty ``mcpServers`` outright, so the Driver
-    drops whatever the runtime projected rather than forwarding it. Pinned
-    for the generic profile too: the drop is unconditional today, and a
-    future per-profile forward must not reintroduce it for puffo-v0."""
+async def test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan(
+    launch_args,
+):
+    """The Driver is transport, not policy: whatever the runtime projected
+    into ``spec.mcp_servers`` is converted to the ACP wire shape and sealed
+    into the plan, for the constrained and the generic profile alike.
+    Keeping puffo-v0 empty is the runtime projection's job — pinned in
+    ``test_puffo_v0_projection_keeps_mcp_servers_empty``."""
     seen = []
     driver = AcpDriver(
         launch_validator=lambda plan: seen.append(plan.mcp_servers)
@@ -588,19 +598,26 @@ async def test_spec_mcp_servers_never_reach_the_acp_launch_plan(launch_args):
         launch_args=launch_args,
         mcp_servers=(_PUFFO_CORE,),
     )
-    assert spec.mcp_servers == (_PUFFO_CORE,), "spec must carry the server"
 
     with contextlib.suppress(Exception):
         # The plan is sealed and validated before any spawn is attempted.
         await driver.open(spec)
 
-    assert seen == [()]
+    assert len(seen) == 1
+    (server,) = seen[0]
+    assert server.name == "puffo"
+    assert server.command == "/usr/bin/python3"
+    assert server.args == ["-m", "puffo_agent.mcp.puffo_core_server"]
+    assert [(e.name, e.value) for e in server.env] == [
+        ("PUFFO_AGENT_ID", "agent_test")
+    ]
 
 
 @pytest.mark.asyncio
-async def test_session_new_is_sent_an_empty_mcp_server_list():
-    """The wire value, not just the plan: an empty list is what makes
-    ``session/new`` succeed under puffo-v0."""
+async def test_session_new_receives_the_projected_mcp_servers():
+    """The wire value, not just the plan: ``session/new`` carries the
+    converted server list, which is what lets an ACP agent discover
+    Puffo's tools at all."""
     harness = _Harness(can_load=False)
     driver = AcpDriver(
         harness.process_factory,
@@ -613,6 +630,14 @@ async def test_session_new_is_sent_an_empty_mcp_server_list():
         mcp_servers=(_PUFFO_CORE,),
     ))
 
-    calls = dict(harness.conn.calls)
-    assert calls["new_session"]["mcp_servers"] == ()
+    sent = dict(harness.conn.calls)["new_session"]["mcp_servers"]
+    assert isinstance(sent, list)
+    (server,) = sent
+    assert isinstance(server, McpServerStdio)
+    assert server.name == "puffo"
+    assert server.command == "/usr/bin/python3"
+    assert server.args == ["-m", "puffo_agent.mcp.puffo_core_server"]
+    assert [(e.name, e.value) for e in server.env] == [
+        ("PUFFO_AGENT_ID", "agent_test")
+    ]
     await driver.close()
