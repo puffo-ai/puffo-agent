@@ -205,7 +205,8 @@ class _PuffoAcpClient:
 class AcpDriver(Driver):
     """Persistent ACP agent process with negotiated session semantics.
 
-    This is the only trusted entrypoint for ``puffo-v0`` identity binding.
+    This is the only trusted entrypoint for constrained LingTai
+    (``puffo-v0`` / ``puffo-v1``) identity binding.
     The complete process/session launch plan is validated immediately before
     spawn; the separate OpenCode driver is explicitly outside that contract.
     """
@@ -918,26 +919,52 @@ def _to_acp_stdio_server(spec: McpServerSpec) -> McpServerStdio:
     )
 
 
-def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
-    """Select only LingTai's constrained ACP profile, independent of argv[0]."""
+_LINGTAI_CONSTRAINED_PROFILES = frozenset({"puffo-v0", "puffo-v1"})
+
+
+def _lingtai_constrained_profile(command: tuple[str, ...]) -> str:
+    """The constrained LingTai profile argv selects, or "" for none.
+
+    Independent of argv[0]; both ``--profile X`` and ``--profile=X``
+    spellings after the ``acp`` token are recognised.
+    """
 
     try:
         acp_index = command.index("acp")
     except ValueError:
-        return False
+        return ""
     profile_args = command[acp_index + 1 :]
-    return any(
-        (
-            arg == "--profile"
-            and index + 1 < len(profile_args)
-            and profile_args[index + 1] == "puffo-v0"
-        )
-        or arg == "--profile=puffo-v0"
-        for index, arg in enumerate(profile_args)
-    )
+    for index, arg in enumerate(profile_args):
+        if arg == "--profile" and index + 1 < len(profile_args):
+            candidate = profile_args[index + 1]
+        elif arg.startswith("--profile="):
+            candidate = arg.removeprefix("--profile=")
+        else:
+            continue
+        if candidate in _LINGTAI_CONSTRAINED_PROFILES:
+            return candidate
+    return ""
+
+
+def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
+    """True for every constrained LingTai profile, independent of argv[0].
+
+    Both ``puffo-v0`` and ``puffo-v1`` refuse to start without a
+    successful Driver authority handshake (LingTai #1624), so both get
+    the authority FD and the guarded POSIX spawn path. This is a wider
+    predicate than ``selects_puffo_v0_profile``, which only controls
+    the empty MCP projection.
+    """
+
+    return bool(_lingtai_constrained_profile(command))
 
 
 def selects_puffo_v0_profile(command: tuple[str, ...]) -> bool:
-    """True when argv selects LingTai's constrained ``puffo-v0`` profile."""
+    """True when argv selects LingTai's ``puffo-v0`` profile.
 
-    return _uses_lingtai_driver_authority(command)
+    v0 rejects a non-empty ``mcpServers`` at ``session/new``, so only
+    this profile keeps the MCP projection empty; ``puffo-v1`` receives
+    Puffo's server while still using the Driver authority spawn path.
+    """
+
+    return _lingtai_constrained_profile(command) == "puffo-v0"
