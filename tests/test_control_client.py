@@ -206,6 +206,75 @@ async def test_duplicate_delivery_is_debug_not_rejection_warning(
     )
 
 
+@pytest.mark.asyncio
+async def test_completed_redelivery_reacks_exact_result_without_reexecution(monkeypatch):
+    result = {"ok": False, "error_code": "agent_start_timeout"}
+    executions = 0
+
+    async def fake_exec(*args, **kwargs):
+        nonlocal executions
+        executions += 1
+        return result
+
+    monkeypatch.setattr(cc, "execute_command", fake_exec)
+    monkeypatch.setattr(
+        cc,
+        "load_pairings",
+        lambda: {
+            "op": types.SimpleNamespace(
+                operator_root_pubkey="ROOT", server_url="https://s"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cc,
+        "decrypt_command",
+        lambda *args: {"op": "create", "agent_slug": "a1", "params": {}},
+    )
+    monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+    frame = {
+        "command_id": "create-1",
+        "operator_slug": "op",
+        "envelope": {"nonce": "N1", "ts": 1_000_000},
+    }
+
+    await client._handle(ws, frame)
+    await client._handle(ws, frame)
+
+    assert executions == 1
+    assert ws.acks == [
+        {"type": "ack", "command_id": "create-1", "result": result},
+        {"type": "ack", "command_id": "create-1", "result": result},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_ack_is_warned_and_retried(monkeypatch, caplog):
+    class FailingWS:
+        async def send_json(self, obj):
+            raise ConnectionError("socket closed")
+
+    client = MachineControlClient(machine=object())
+    client._active_ws = FailingWS()
+    caplog.set_level(logging.WARNING, logger=cc.log.name)
+
+    result = {"ok": True}
+    await client._send_ack("create-1", result)
+
+    assert client._pending_acks == {"create-1": result}
+    assert "queued for reconnect" in caplog.text
+
+    recovered_ws = _FakeWS()
+    client._active_ws = recovered_ws
+    await client._flush_pending_acks(recovered_ws)
+    assert client._pending_acks == {}
+    assert recovered_ws.acks == [
+        {"type": "ack", "command_id": "create-1", "result": result}
+    ]
+
+
 @pytest.fixture
 def home(monkeypatch):
     h = isolated_home()
@@ -516,11 +585,108 @@ async def test_create_wait_does_not_block_followup_machine_command(monkeypatch):
 
     release_create.set()
     await asyncio.gather(*client._command_tasks)
-    assert ws.acks[-1] == {
+    assert [sent for sent in ws.acks if sent.get("command_id") == "create-1"] == []
+
+    # The create finished after the first socket's context exited. Its result
+    # is held and sent on the next authenticated connection, never on the stale
+    # socket captured when the command arrived.
+    reconnect_ws = _StreamingWS([{"type": "connected"}])
+    monkeypatch.setattr(
+        cc,
+        "create_remote_http_session",
+        lambda *args, **kwargs: _ControlSession(reconnect_ws),
+    )
+    await client._connect_once(asyncio.Event())
+    assert reconnect_ws.acks[-1] == {
         "type": "ack",
         "command_id": "create-1",
         "result": {"ok": True, "op": "create"},
     }
+
+
+@pytest.mark.asyncio
+async def test_create_redelivery_after_five_minutes_is_not_reexecuted(monkeypatch):
+    """A long first build remains deduped beyond the former five-minute window."""
+    clock = [1_000_000]
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+    executed = []
+
+    async def fake_exec(op, *args, **kwargs):
+        executed.append(op)
+        if op == "create":
+            create_started.set()
+            await release_create.wait()
+        return {"ok": True, "op": op}
+
+    monkeypatch.setattr(cc, "execute_command", fake_exec)
+    monkeypatch.setattr(cc, "now_ms", lambda: clock[0])
+    monkeypatch.setattr(
+        cc,
+        "load_pairings",
+        lambda: {
+            "op": types.SimpleNamespace(
+                operator_root_pubkey="ROOT", server_url="https://s"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cc,
+        "decrypt_command",
+        lambda envelope, *args: {
+            "op": envelope["op"],
+            "agent_slug": envelope.get("agent_slug"),
+            "params": {},
+        },
+    )
+    monkeypatch.setattr(cc.machine_auth, "ws_connect_frame", lambda machine: {})
+    monkeypatch.setattr(cc, "build_capabilities", lambda: {})
+
+    def frame(command_id, nonce, op):
+        return {
+            "type": "command",
+            "command_id": command_id,
+            "operator_slug": "op",
+            "envelope": {
+                "nonce": nonce,
+                "ts": 1_000_000,
+                "op": op,
+            },
+        }
+
+    client = MachineControlClient(machine=object())
+    first_ws = _StreamingWS([
+        {"type": "connected"},
+        frame("create-1", "nonce-create", "create"),
+    ])
+    monkeypatch.setattr(
+        cc,
+        "create_remote_http_session",
+        lambda *args, **kwargs: _ControlSession(first_ws),
+    )
+    await client._connect_once(asyncio.Event())
+    await asyncio.wait_for(create_started.wait(), timeout=0.5)
+
+    # A different command forces replay-cache pruning after five minutes,
+    # followed by server redelivery of the still-running create.
+    clock[0] += 5 * 60 * 1000 + 1
+    second_ws = _StreamingWS([
+        {"type": "connected"},
+        frame("pause-1", "nonce-pause", "pause"),
+        frame("create-1", "nonce-create", "create"),
+    ])
+    monkeypatch.setattr(
+        cc,
+        "create_remote_http_session",
+        lambda *args, **kwargs: _ControlSession(second_ws),
+    )
+    await client._connect_once(asyncio.Event())
+    assert executed == ["create", "pause"]
+    assert not any(sent.get("command_id") == "create-1" for sent in second_ws.acks)
+
+    release_create.set()
+    await asyncio.gather(*client._command_tasks)
+    assert cc.TS_WINDOW_MS >= cc.AGENT_START_TIMEOUT_SECONDS * 1000
 
 
 # ── usage-report snapshot loop ─────────────────────────────────────

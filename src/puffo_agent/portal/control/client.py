@@ -630,9 +630,15 @@ class MachineControlClient:
         self.machine = machine
         self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
         self._command_tasks: set[asyncio.Future] = set()
+        self._inflight_command_ids: set[str] = set()
+        self._nonce_commands: dict[str, str] = {}
+        self._completed_results: dict[str, dict] = {}
+        self._pending_acks: dict[str, dict] = {}
+        self._active_ws: aiohttp.ClientWebSocketResponse | None = None
         # Serialize WS writes — acks (receive loop) + heartbeat/capabilities
         # (sender task) share one socket; concurrent send_json would interleave.
         self._send_lock = asyncio.Lock()
+        self._ack_flush_lock = asyncio.Lock()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -686,6 +692,8 @@ class MachineControlClient:
                             continue
                         if frame.get("type") == "connected":
                             if not reporter_ready:
+                                self._active_ws = ws
+                                await self._flush_pending_acks(ws)
                                 reporter.set_sender(_report)
                                 reporter_ready = True
                                 log.info(
@@ -697,6 +705,8 @@ class MachineControlClient:
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
                 finally:
+                    if self._active_ws is ws:
+                        self._active_ws = None
                     if reporter_ready:
                         reporter.set_sender(None)
                     sender.cancel()
@@ -746,13 +756,43 @@ class MachineControlClient:
                 # Bound the replay set: a nonce older than the ts window is
                 # already rejected by decrypt_command, so it's safe to forget.
                 cutoff = now_ms() - TS_WINDOW_MS
-                self._seen_nonces = {
-                    n: t for n, t in self._seen_nonces.items() if t > cutoff
+                expired_command_ids = {
+                    command
+                    for n, t in self._seen_nonces.items()
+                    if t <= cutoff
+                    if (command := self._nonce_commands.get(n)) is not None
+                    if command not in self._inflight_command_ids
                 }
+                self._seen_nonces = {
+                    n: t
+                    for n, t in self._seen_nonces.items()
+                    if t > cutoff
+                    or self._nonce_commands.get(n) in self._inflight_command_ids
+                }
+                self._nonce_commands = {
+                    n: command
+                    for n, command in self._nonce_commands.items()
+                    if n in self._seen_nonces
+                }
+                for expired_command_id in expired_command_ids:
+                    self._completed_results.pop(expired_command_id, None)
                 self._seen_nonces[nonce] = int(envelope.get("ts", now_ms()))
+                if command_id:
+                    self._nonce_commands[nonce] = str(command_id)
         except _DuplicateDelivery:
+            cached = self._completed_results.get(str(command_id or ""))
+            if cached is not None:
+                log.info("control: re-acking completed command %s", command_id)
+                await self._send_ack(command_id, cached, ws=ws)
+                return
+            if command_id and str(command_id) in self._inflight_command_ids:
+                log.info(
+                    "control: duplicate delivery suppressed while command %s is running",
+                    command_id,
+                )
+                return
             log.debug(
-                "control: duplicate delivery suppressed for command %s",
+                "control: duplicate delivery suppressed for unknown command %s",
                 command_id,
             )
             result = {"ok": False, "error_code": "command_rejected"}
@@ -765,11 +805,18 @@ class MachineControlClient:
             result = {"ok": False, "error_code": "command_failed"}
         else:
             execution = self._execute_and_ack(
-                ws,
+                (
+                    None
+                    if background_create and command_id and decrypted["op"] == "create"
+                    else ws
+                ),
                 command_id,
                 decrypted,
                 pairing,
+                nonce=str(nonce) if nonce else None,
             )
+            if command_id:
+                self._inflight_command_ids.add(str(command_id))
             if background_create and command_id and decrypted["op"] == "create":
                 # A first Docker image build can take minutes. Keep that wait
                 # out of the one machine-control receive loop so pause/resume,
@@ -781,14 +828,16 @@ class MachineControlClient:
             await execution
             return
 
-        await self._send_ack(ws, command_id, result)
+        await self._send_ack(command_id, result, ws=ws)
 
     async def _execute_and_ack(
         self,
-        ws: aiohttp.ClientWebSocketResponse,
+        ws: aiohttp.ClientWebSocketResponse | None,
         command_id: str | None,
         decrypted: dict,
         pairing,
+        *,
+        nonce: str | None,
     ) -> None:
         result: dict = {"ok": False, "error_code": "command_failed"}
         try:
@@ -813,23 +862,60 @@ class MachineControlClient:
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
             result = {"ok": False, "error_code": "command_failed"}
-        await self._send_ack(ws, command_id, result)
+        finally:
+            if command_id:
+                command_key = str(command_id)
+                self._inflight_command_ids.discard(command_key)
+                self._completed_results[command_key] = result
+            if nonce:
+                # Retain the nonce for a full window after completion too, so
+                # an ambiguous/disconnected ack can only replay the result,
+                # never the side effect.
+                self._seen_nonces[nonce] = now_ms()
+        await self._send_ack(command_id, result, ws=ws)
 
     async def _send_ack(
         self,
-        ws: aiohttp.ClientWebSocketResponse,
         command_id: str | None,
         result: dict,
+        *,
+        ws: aiohttp.ClientWebSocketResponse | None = None,
     ) -> None:
         if not command_id:
             return
-        try:
-            await self._send(
-                ws,
-                {"type": "ack", "command_id": command_id, "result": result},
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.debug("control: ack %s failed: %s", command_id, exc)
+        command_key = str(command_id)
+        self._pending_acks[command_key] = result
+        target = self._active_ws or ws
+        if target is not None:
+            await self._flush_pending_acks(target)
+
+    async def _flush_pending_acks(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        """Send durable-in-memory results on the current authenticated socket.
+
+        A failed write leaves the result queued for the next connection. A
+        server redelivery after an ambiguous successful write is handled from
+        ``_completed_results`` and re-queues the same result.
+        """
+        async with self._ack_flush_lock:
+            if self._active_ws is not None and ws is not self._active_ws:
+                return
+            for command_id, result in list(self._pending_acks.items()):
+                try:
+                    await self._send(
+                        ws,
+                        {"type": "ack", "command_id": command_id, "result": result},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "control: ack %s failed; queued for reconnect: %s",
+                        command_id,
+                        exc,
+                    )
+                    return
+                if self._pending_acks.get(command_id) is result:
+                    self._pending_acks.pop(command_id, None)
 
 
 class ControlManager:
