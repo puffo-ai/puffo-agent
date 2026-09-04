@@ -73,7 +73,33 @@ def _run_opencode_models(
 
 
 def _is_model_id(value: str) -> bool:
-    return "/" in value and not any(char.isspace() for char in value)
+    return (
+        "/" in value
+        and not any(char.isspace() or char in '{}[],"' for char in value)
+    )
+
+
+def _next_verbose_model_offset(output: str, offset: int) -> int:
+    """Recover at the next bare model-id line after malformed metadata."""
+    length = len(output)
+    line_start = offset
+    while line_start < length:
+        line_end = output.find("\n", line_start)
+        if line_end < 0:
+            line_end = length
+        raw_line = output[line_start:line_end]
+        candidate = raw_line.strip()
+        metadata_offset = line_end + 1
+        while metadata_offset < length and output[metadata_offset].isspace():
+            metadata_offset += 1
+        if (
+            raw_line == candidate
+            and _is_model_id(candidate)
+            and (metadata_offset == length or output[metadata_offset] == "{")
+        ):
+            return line_start
+        line_start = line_end + 1
+    return length
 
 
 def _parse_verbose_models(output: str) -> tuple[OpenCodeModel, ...]:
@@ -106,6 +132,7 @@ def _parse_verbose_models(output: str) -> tuple[OpenCodeModel, ...]:
                 metadata, offset = decoder.raw_decode(output, json_offset)
             except json.JSONDecodeError:
                 metadata = {}
+                offset = _next_verbose_model_offset(output, offset)
 
         variants = metadata.get("variants") if isinstance(metadata, dict) else {}
         variant_names = tuple(
@@ -149,12 +176,22 @@ def list_opencode_model_catalog(
     timeout_seconds: float = 5.0,
 ) -> tuple[OpenCodeModel, ...]:
     """Return visible models with their model-specific native variants."""
-    stdout = _run_opencode_models(
-        executable,
-        provider=provider,
-        verbose=True,
-        timeout_seconds=timeout_seconds,
-    )
+    try:
+        stdout = _run_opencode_models(
+            executable,
+            provider=provider,
+            verbose=True,
+            timeout_seconds=timeout_seconds,
+        )
+    except OpenCodeProbeError:
+        return tuple(
+            OpenCodeModel(model_id)
+            for model_id in list_opencode_models(
+                executable,
+                provider=provider,
+                timeout_seconds=timeout_seconds,
+            )
+        )
     return _parse_verbose_models(stdout)
 
 

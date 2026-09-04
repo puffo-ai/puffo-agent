@@ -89,19 +89,51 @@ def test_verbose_model_probe_parses_native_variants(monkeypatch):
     assert "OPENAI_API_KEY" not in seen["kwargs"]["env"]
 
 
-def test_verbose_probe_keeps_model_when_metadata_is_malformed(monkeypatch):
+def test_verbose_probe_recovers_after_malformed_metadata_without_phantom_models(
+    monkeypatch,
+):
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda *args, **kwargs: _completed(
             code=0,
-            stdout="opencode/big-pickle\n{not-json}\n",
+            stdout=(
+                "opencode/big-pickle\n"
+                '{"id":"a","api":{"npm":"@ai-sdk/openai-compatible"\n'
+                "opencode/second-model\n"
+                '{"variants":{"low":{}}}\n'
+            ),
         ),
     )
 
     assert list_opencode_model_catalog("/opt/bin/opencode") == (
         OpenCodeModel("opencode/big-pickle"),
+        OpenCodeModel("opencode/second-model", ("low",)),
     )
+
+
+def test_verbose_probe_falls_back_to_non_verbose_models(monkeypatch):
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append(command)
+        if "--verbose" in command:
+            return _completed(code=1, stderr="Unknown option: --verbose")
+        return _completed(
+            code=0,
+            stdout="opencode/big-pickle\ndeepseek/deepseek-v4-pro\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert list_opencode_model_catalog("/opt/bin/opencode") == (
+        OpenCodeModel("opencode/big-pickle"),
+        OpenCodeModel("deepseek/deepseek-v4-pro"),
+    )
+    assert seen == [
+        ["/opt/bin/opencode", "models", "--verbose"],
+        ["/opt/bin/opencode", "models"],
+    ]
 
 
 def test_selected_model_uses_provider_filtered_native_catalog(monkeypatch):
