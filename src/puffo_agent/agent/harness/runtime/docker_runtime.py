@@ -568,8 +568,13 @@ class DockerRuntimePreparer:
         await run_cmd([self._docker_bin, "rm", self.container_name])
 
     async def _probe_container(self) -> tuple[bool | None, bool | None]:
+        # Import it for real: a file-existence check passes even when the
+        # mounted tree cannot actually load in-container (wrong-ABI native
+        # deps shadowing the image's), which is exactly how a mute fleet
+        # slipped through an upgrade.
         package = await self._probe_command(
-            "test -f /opt/puffoagent-pkg/puffo_agent/__init__.py"
+            "PYTHONPATH=/opt/puffoagent-pkg python3 -c "
+            "'import puffo_agent.mcp.puffo_core_server'"
         )
         harness = await self._probe_command(
             f"command -v {self._harness_executable()} >/dev/null"
@@ -657,7 +662,7 @@ class DockerRuntimePreparer:
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",
-            f"{puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
+            f"{puffo_agent_pkg_dir()}:/opt/puffoagent-pkg/puffo_agent:ro",
         ]
         default_memory = self.agent_home / "memory"
         if self.memory_dir.resolve() != default_memory.resolve():

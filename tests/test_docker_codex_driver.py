@@ -131,7 +131,12 @@ def _assert_codex_mounts(preparer, run_cmd):
     assert f"{preparer.shared_fs_dir}:/workspace/shared" in run_cmd
     assert not (preparer.workspace_dir / "shared").is_symlink()
     assert any(":/workspace/.shared" in part for part in run_cmd)
-    assert any(str(part).endswith(":/opt/puffoagent-pkg:ro") for part in run_cmd)
+    # The PACKAGE dir, not its parent: mounting site-packages would shadow the
+    # image's Linux native deps with the host's (see puffo_agent_pkg_dir).
+    assert any(
+        str(part).endswith(":/opt/puffoagent-pkg/puffo_agent:ro") for part in run_cmd
+    )
+    assert not any(str(part).endswith(":/opt/puffoagent-pkg:ro") for part in run_cmd)
     assert not any(str(Path.home() / ".codex") in str(part) for part in run_cmd)
     assert [part for part in run_cmd if str(part).endswith(":/home/agent/.codex")] == [
         f"{preparer.codex_home}:/home/agent/.codex"
