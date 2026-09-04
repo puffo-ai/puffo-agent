@@ -486,9 +486,16 @@ class LocalRuntimePreparer:
     ) -> tuple[McpServerSpec, ...]:
         """Project Puffo tools according to the selected Driver protocol.
 
-        Native OpenCode receives its inline MCP configuration. ACP-over-
-        OpenCode carries the same server through ``RuntimeSpec.mcp_servers``
-        and must not receive the native inline projection.
+        Native OpenCode receives its inline MCP configuration and must not
+        also receive the generic projection.
+
+        The ACP Driver does not honour ``RuntimeSpec.mcp_servers``: it seals
+        an empty list into every launch plan, because ``puffo-v0`` rejects a
+        non-empty ``mcpServers`` at ``session/new``. So an ACP runtime opens
+        a session but gets no Puffo tools, and the server built here is
+        dropped downstream. Carrying it to an ACP agent needs an audited
+        profile and a fixed bridge, not a forward from this tuple. See
+        ``test_spec_mcp_servers_never_reach_the_acp_launch_plan``.
         """
         mcp_servers: tuple[McpServerSpec, ...] = ()
         if self._puffo_core_env:
