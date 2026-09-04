@@ -356,7 +356,10 @@ class CodexAppServerDriver(Driver):
             "initialize",
             {
                 "clientInfo": {"name": "puffo-agent", "version": "1"},
-                "capabilities": {},
+                # Codex gates thread/resume.excludeTurns behind this client
+                # capability. Without it, supported app-server versions reject
+                # every resume request before attempting to load the thread.
+                "capabilities": {"experimentalApi": True},
             },
         )
         await self._write({"method": "initialized", "params": {}})
