@@ -44,9 +44,11 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 # Remote create waits for the daemon's durable worker lifecycle instead of
 # acknowledging as soon as agent.yml exists. Docker's first image build may
-# legitimately take several minutes.
+# legitimately take several minutes. The server's Portal machine-command TTL
+# is 24 hours; this shorter bound is a UI/operator feedback budget, not the
+# command-expiry budget used by Runtime permission/cancel commands.
 AGENT_START_TIMEOUT_SECONDS = 10 * 60.0
-AGENT_START_POLL_SECONDS = 0.1
+AGENT_START_POLL_SECONDS = 0.5
 
 
 class _DuplicateDelivery(ControlError):
@@ -229,7 +231,9 @@ async def _wait_for_agent_start(agent_id: str) -> dict | None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + AGENT_START_TIMEOUT_SECONDS
     while loop.time() < deadline:
-        runtime = RuntimeState.load(agent_id)
+        # RuntimeState.load performs filesystem I/O. Keep repeated startup
+        # observation off the single control event loop.
+        runtime = await asyncio.to_thread(RuntimeState.load, agent_id)
         if runtime is not None:
             if runtime.status == "running":
                 return None
@@ -247,8 +251,9 @@ async def _wait_for_agent_start(agent_id: str) -> dict | None:
     return {
         "error_code": "agent_start_timeout",
         "error": (
-            f"agent worker did not finish starting within "
-            f"{AGENT_START_TIMEOUT_SECONDS:g}s"
+            f"agent worker has not reached running within "
+            f"{AGENT_START_TIMEOUT_SECONDS:g}s; it remains configured and "
+            "may still finish starting, so check its status before retrying"
         ),
     }
 
@@ -624,6 +629,7 @@ class MachineControlClient:
     def __init__(self, machine) -> None:
         self.machine = machine
         self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
+        self._command_tasks: set[asyncio.Future] = set()
         # Serialize WS writes — acks (receive loop) + heartbeat/capabilities
         # (sender task) share one socket; concurrent send_json would interleave.
         self._send_lock = asyncio.Lock()
@@ -686,7 +692,7 @@ class MachineControlClient:
                                     "control: WS connected; agent.status sender ready"
                                 )
                         elif frame.get("type") == "command":
-                            await self._handle(ws, frame)
+                            await self._handle(ws, frame, background_create=True)
                         elif frame.get("type") == "error":
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
@@ -716,10 +722,15 @@ class MachineControlClient:
                 await self._send(ws, {"type": "capabilities", "capabilities": caps})
                 last_caps = caps
 
-    async def _handle(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
+    async def _handle(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        frame: dict,
+        *,
+        background_create: bool = False,
+    ) -> None:
         command_id = frame.get("command_id")
         operator_slug = frame.get("operator_slug")
-        result: dict = {"ok": False, "error_code": "command_failed"}
         try:
             pairing = load_pairings().get(operator_slug)
             if pairing is None:
@@ -739,19 +750,6 @@ class MachineControlClient:
                     n: t for n, t in self._seen_nonces.items() if t > cutoff
                 }
                 self._seen_nonces[nonce] = int(envelope.get("ts", now_ms()))
-            result = await execute_command(
-                decrypted["op"],
-                decrypted["agent_slug"],
-                decrypted["params"],
-                server_url=pairing.server_url,
-                paired_root_pubkey=pairing.operator_root_pubkey,
-                command_id=str(command_id or ""),
-            )
-            if isinstance(result, dict) and not result.get("ok", True):
-                log.warning(
-                    "control: command %s op=%s failed: %s",
-                    command_id, decrypted["op"], result.get("error"),
-                )
         except _DuplicateDelivery:
             log.debug(
                 "control: duplicate delivery suppressed for command %s",
@@ -765,14 +763,73 @@ class MachineControlClient:
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
             result = {"ok": False, "error_code": "command_failed"}
-        if command_id:
-            try:
-                await self._send(
-                    ws,
-                    {"type": "ack", "command_id": command_id, "result": result},
+        else:
+            execution = self._execute_and_ack(
+                ws,
+                command_id,
+                decrypted,
+                pairing,
+            )
+            if background_create and command_id and decrypted["op"] == "create":
+                # A first Docker image build can take minutes. Keep that wait
+                # out of the one machine-control receive loop so pause/resume,
+                # runtime decisions, and other operators remain responsive.
+                task = spawn(execution, name=f"control.create:{command_id}")
+                self._command_tasks.add(task)
+                task.add_done_callback(self._command_tasks.discard)
+                return
+            await execution
+            return
+
+        await self._send_ack(ws, command_id, result)
+
+    async def _execute_and_ack(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        command_id: str | None,
+        decrypted: dict,
+        pairing,
+    ) -> None:
+        result: dict = {"ok": False, "error_code": "command_failed"}
+        try:
+            result = await execute_command(
+                decrypted["op"],
+                decrypted["agent_slug"],
+                decrypted["params"],
+                server_url=pairing.server_url,
+                paired_root_pubkey=pairing.operator_root_pubkey,
+                command_id=str(command_id or ""),
+            )
+            if isinstance(result, dict) and not result.get("ok", True):
+                log.warning(
+                    "control: command %s op=%s failed: %s",
+                    command_id,
+                    decrypted["op"],
+                    result.get("error"),
                 )
-            except Exception as exc:  # noqa: BLE001
-                log.debug("control: ack %s failed: %s", command_id, exc)
+        except ControlError as exc:
+            log.warning("control: rejected command %s: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_rejected"}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("control: command %s failed: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_failed"}
+        await self._send_ack(ws, command_id, result)
+
+    async def _send_ack(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        command_id: str | None,
+        result: dict,
+    ) -> None:
+        if not command_id:
+            return
+        try:
+            await self._send(
+                ws,
+                {"type": "ack", "command_id": command_id, "result": result},
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("control: ack %s failed: %s", command_id, exc)
 
 
 class ControlManager:

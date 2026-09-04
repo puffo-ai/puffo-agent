@@ -23,6 +23,43 @@ class _FakeWS:
         self.acks.append(obj)
 
 
+class _StreamingWS(_FakeWS):
+    def __init__(self, frames):
+        super().__init__()
+        self.frames = frames
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.frames:
+            raise StopAsyncIteration
+        return types.SimpleNamespace(
+            type=cc.aiohttp.WSMsgType.TEXT,
+            data=json.dumps(self.frames.pop(0)),
+        )
+
+
+class _ControlSession:
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def ws_connect(self, *args, **kwargs):
+        return self.socket
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("server_frame", "connected_logged"),
@@ -355,7 +392,11 @@ async def test_start_waiter_returns_structured_timeout(home, monkeypatch):
 
     assert await cc._wait_for_agent_start("helper-1") == {
         "error_code": "agent_start_timeout",
-        "error": "agent worker did not finish starting within 0s",
+        "error": (
+            "agent worker has not reached running within 0s; it remains "
+            "configured and may still finish starting, so check its status "
+            "before retrying"
+        ),
     }
 
 
@@ -397,6 +438,89 @@ async def test_handle_ack_carries_the_exact_command_result(monkeypatch):
     assert ws.acks == [
         {"type": "ack", "command_id": "create-1", "result": result}
     ]
+
+
+@pytest.mark.asyncio
+async def test_create_wait_does_not_block_followup_machine_command(monkeypatch):
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+
+    async def fake_exec(op, *args, **kwargs):
+        if op == "create":
+            create_started.set()
+            await release_create.wait()
+        return {"ok": True, "op": op}
+
+    monkeypatch.setattr(cc, "execute_command", fake_exec)
+    monkeypatch.setattr(
+        cc,
+        "load_pairings",
+        lambda: {
+            "op": types.SimpleNamespace(
+                operator_root_pubkey="ROOT", server_url="https://s"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cc,
+        "decrypt_command",
+        lambda envelope, *args: {
+            "op": envelope["op"],
+            "agent_slug": envelope.get("agent_slug"),
+            "params": {},
+        },
+    )
+    def frame(command_id, nonce, op, agent_slug=None):
+        return {
+            "type": "command",
+            "command_id": command_id,
+            "operator_slug": "op",
+            "envelope": {
+                "nonce": nonce,
+                "ts": cc.now_ms(),
+                "op": op,
+                "agent_slug": agent_slug,
+            },
+        }
+
+    ws = _StreamingWS([
+        {"type": "connected"},
+        frame("create-1", "nonce-create", "create"),
+        frame("pause-1", "nonce-pause", "pause", "existing-agent"),
+    ])
+    monkeypatch.setattr(
+        cc,
+        "create_remote_http_session",
+        lambda *args, **kwargs: _ControlSession(ws),
+    )
+    monkeypatch.setattr(cc.machine_auth, "ws_connect_frame", lambda machine: {})
+    monkeypatch.setattr(cc, "build_capabilities", lambda: {})
+    client = MachineControlClient(machine=object())
+
+    # Exercise the real receive loop. Removing its background-create dispatch
+    # makes this wait forever on the first command and never ack the second.
+    await asyncio.wait_for(
+        client._connect_once(asyncio.Event()),
+        timeout=0.5,
+    )
+    assert len(client._command_tasks) == 1, ws.acks
+    await asyncio.wait_for(create_started.wait(), timeout=0.5)
+    acks = [sent for sent in ws.acks if sent.get("type") == "ack"]
+    assert acks == [
+        {
+            "type": "ack",
+            "command_id": "pause-1",
+            "result": {"ok": True, "op": "pause"},
+        }
+    ]
+
+    release_create.set()
+    await asyncio.gather(*client._command_tasks)
+    assert ws.acks[-1] == {
+        "type": "ack",
+        "command_id": "create-1",
+        "result": {"ok": True, "op": "create"},
+    }
 
 
 # ── usage-report snapshot loop ─────────────────────────────────────
