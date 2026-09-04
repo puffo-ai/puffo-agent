@@ -6,7 +6,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [2.0.4] - 2026-09-01
+## 2.0.4a1 - 2026-09-03
+
+> Pre-release published to TestPyPI for staging validation only. It is not the
+> stable `2.0.4` release. Because TestPyPI already contains an earlier build
+> numbered `2.0.4`, install this candidate with an explicit `==2.0.4a1` pin.
 
 ### Added
 
@@ -15,6 +19,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   exact models before provisioning identity state, and discovers standard
   per-user OpenCode installations even under a narrow daemon `PATH`. Existing
   ACP-over-OpenCode configurations continue to load unchanged. (#305)
+- **Generic Monid paid-data tools.** Native agents can prepare arbitrary
+  allowlisted provider capabilities for free, inspect their input schema and
+  quoted price, then execute a budget-gated spend without holding vendor keys
+  or funds. Results carry provenance, failures require honest fallback
+  labeling, and retry keys prevent accidental duplicate charges. (#308)
+- **Cross-platform daemon autostart.** `puffo-agent autostart
+  enable|disable|status` installs per-user launchd, systemd, or Windows startup
+  registration. Machine linking enables it by default, with an explicit
+  opt-out, safe persisted environments, and actionable status or failure
+  reporting. (#309)
 
 ### Fixed
 
@@ -24,6 +38,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 - **OpenCode tool activity reaches the UI.** Tool frames now project both
   start and completion status, and unavailable selected models are reported
   separately from missing provider authentication. (#305)
+- **Sleep/wake transport recovery.** A background daemon now heals an event
+  loop executor that died during macOS sleep before sending new traffic,
+  avoids replaying requests with ambiguous outcomes, and reports sustained
+  reconnect failure as `server_unreachable`. The tray also requests a
+  best-effort App Nap exemption. (#310)
+- **Remote creates report real startup readiness.** Docker availability is
+  checked before identity materialization, create commands wait for durable
+  runtime readiness, slow startup does not block unrelated machine commands,
+  and terminal acknowledgements survive reconnects. (#313)
+- **Large Codex sessions resume without replaying full history.** Codex resume
+  now declares the required experimental API capability and requests a
+  metadata-only response, preserving the native thread and provider-side
+  context without overflowing the Agent's stdout frame limit. (#314)
 
 ## [2.0.3] - 2026-08-27
 
@@ -5001,8 +5028,7 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.4...HEAD
-[2.0.4]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.4
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.3...HEAD
 [2.0.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.3
 [2.0.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.2
 [2.0.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.1
