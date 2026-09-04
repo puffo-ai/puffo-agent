@@ -356,7 +356,10 @@ class CodexAppServerDriver(Driver):
             "initialize",
             {
                 "clientInfo": {"name": "puffo-agent", "version": "1"},
-                "capabilities": {},
+                # Codex gates thread/resume.excludeTurns behind this client
+                # capability. Without it, supported app-server versions reject
+                # every resume request before attempting to load the thread.
+                "capabilities": {"experimentalApi": True},
             },
         )
         await self._write({"method": "initialized", "params": {}})
@@ -391,6 +394,13 @@ class CodexAppServerDriver(Driver):
                 "thread/resume",
                 {
                     "threadId": str(resume),
+                    # Puffo already persists its own visible event history and
+                    # only needs Codex to restore the provider-side context.
+                    # Returning every reconstructed turn can turn a large
+                    # rollout into one enormous JSONL response before a new
+                    # turn even starts. Codex still resumes the full thread;
+                    # this only keeps that history out of the response.
+                    "excludeTurns": True,
                     **thread_config,
                 },
             )

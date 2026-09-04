@@ -1084,7 +1084,7 @@ async def test_claude_driver_emits_compaction_boundary_and_clears_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_codex_driver_resumes_with_native_session_id_after_handshake():
+async def test_codex_driver_resumes_without_returning_full_turn_history():
     holder = {}
 
     def on_frame(frame):
@@ -1094,7 +1094,7 @@ async def test_codex_driver_resumes_with_native_session_id_after_handshake():
         elif frame.get("method") == "thread/resume":
             assert frame["params"] == {
                 "threadId": "native-thread",
-                "cwd": "/workspace",
+                "excludeTurns": True, "cwd": "/workspace",
                 "approvalPolicy": "never",
                 "sandbox": "danger-full-access",
                 "model": "gpt",
