@@ -391,6 +391,13 @@ class CodexAppServerDriver(Driver):
                 "thread/resume",
                 {
                     "threadId": str(resume),
+                    # Puffo already persists its own visible event history and
+                    # only needs Codex to restore the provider-side context.
+                    # Returning every reconstructed turn can turn a large
+                    # rollout into one enormous JSONL response before a new
+                    # turn even starts. Codex still resumes the full thread;
+                    # this only keeps that history out of the response.
+                    "excludeTurns": True,
                     **thread_config,
                 },
             )
