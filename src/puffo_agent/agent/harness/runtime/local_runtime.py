@@ -73,6 +73,7 @@ from ...runtime_event_outbox import (
 from ...runtime_events import RuntimeEventProjector, TrustedScope
 from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from ..support.child_env import build_child_environment
+from ..drivers.acp import selects_puffo_v0_profile
 from ..drivers.pi_bridge import (
     build_bridge_environment,
     install_pi_tool_bridge,
@@ -389,7 +390,7 @@ class LocalRuntimePreparer:
             executable, system_prompt
         )
         mcp_servers = self._project_protocol_mcp(
-            controlled, opencode_config
+            controlled, opencode_config, tuple(launch_args)
         )
         if opencode_config:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
@@ -483,19 +484,20 @@ class LocalRuntimePreparer:
         self,
         controlled: dict[str, str],
         opencode_config: dict[str, Any],
+        launch_args: tuple[str, ...],
     ) -> tuple[McpServerSpec, ...]:
         """Project Puffo tools according to the selected Driver protocol.
 
         Native OpenCode receives its inline MCP configuration and must not
         also receive the generic projection.
 
-        The ACP Driver does not honour ``RuntimeSpec.mcp_servers``: it seals
-        an empty list into every launch plan, because ``puffo-v0`` rejects a
-        non-empty ``mcpServers`` at ``session/new``. So an ACP runtime opens
-        a session but gets no Puffo tools, and the server built here is
-        dropped downstream. Carrying it to an ACP agent needs an audited
-        profile and a fixed bridge, not a forward from this tuple. See
-        ``test_spec_mcp_servers_never_reach_the_acp_launch_plan``.
+        The ACP Driver forwards this tuple into ``session/new`` verbatim
+        (converted to the ACP wire shape), so this method is the single
+        policy point for which tools an ACP agent can discover. LingTai's
+        constrained ``puffo-v0`` profile rejects a non-empty ``mcpServers``
+        at ``session/new`` and therefore keeps an empty projection until
+        the agent is re-provisioned under ``puffo-v1``. See
+        ``test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan``.
         """
         mcp_servers: tuple[McpServerSpec, ...] = ()
         if self._puffo_core_env:
@@ -512,6 +514,12 @@ class LocalRuntimePreparer:
                 # only Puffo's core server; keeping mcp_servers empty is part
                 # of the Driver admission contract.
                 controlled.update(self._prepare_pi_bridge(puffo_server))
+            elif self.harness_name == "acp" and selects_puffo_v0_profile(
+                launch_args
+            ):
+                # puffo-v0 fails session/new on any server list; the empty
+                # projection is a LingTai-side contract, not a default.
+                mcp_servers = ()
             else:
                 mcp_servers = (puffo_server,)
             if self.harness_name == "opencode":
