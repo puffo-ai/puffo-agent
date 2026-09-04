@@ -27,7 +27,9 @@ class ModelOption:
     id: str  # the ``--model`` value; "" means the daemon default
     label: str  # combo-box display text
     is_alias: bool = False
-    supported_inference_levels: tuple[str, ...] = ()
+    # None means the catalog makes no model-specific claim. An empty tuple is
+    # an explicit claim that this model exposes no selectable inference level.
+    supported_inference_levels: tuple[str, ...] | None = None
 
 
 _DAEMON_DEFAULT = ModelOption("", "(daemon default)")
@@ -206,18 +208,30 @@ def _opencode_models(*, fetch: bool) -> tuple[ModelOption, ...]:
     if cached is not None or not fetch:
         return cached if cached is not None else _stale_models("opencode")
     from .cli_bin import resolve_opencode_bin
-    from .opencode_auth import OpenCodeProbeError, list_opencode_models
+    from .opencode_auth import OpenCodeProbeError, list_opencode_model_catalog
 
     executable = resolve_opencode_bin()
     if not executable:
         return _store_models("opencode", ())
     try:
-        model_ids = list_opencode_models(executable)
+        models = list_opencode_model_catalog(executable)
     except OpenCodeProbeError:
         return _stale_models("opencode")
+    from ..mcp.config import OPENCODE_INFERENCE_LEVELS
+
     options = tuple(
-        ModelOption(model_id, model_id)
-        for model_id in model_ids
+        ModelOption(
+            model.id,
+            model.id,
+            supported_inference_levels=tuple(
+                level for level in OPENCODE_INFERENCE_LEVELS
+                if (
+                    level in model.variants
+                    or (level == "off" and "none" in model.variants)
+                )
+            ),
+        )
+        for model in models
     )
     return _store_models("opencode", options)
 

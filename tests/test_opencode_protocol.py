@@ -25,7 +25,6 @@ def test_run_command_resumes_by_session_and_keeps_prompt_positional():
         launch_args=("--title", "Puffo"),
         permission_mode="bypassPermissions",
     )
-
     command = build_opencode_run_command(
         spec,
         prompt="one semantic input",
@@ -48,6 +47,19 @@ def test_run_command_resumes_by_session_and_keeps_prompt_positional():
         "Puffo",
         "one semantic input",
     )
+
+
+def test_run_command_forwards_model_variant_before_prompt():
+    spec = RuntimeSpec(
+        workspace_dir="/workspace",
+        model="openai/gpt-5",
+        executable="/bin/opencode",
+        launch_args=("--variant", "high"),
+    )
+
+    command = build_opencode_run_command(spec, prompt="hello")
+
+    assert command[-3:] == ("--variant", "high", "hello")
 
 
 def test_text_frame_emits_one_completed_output_block():

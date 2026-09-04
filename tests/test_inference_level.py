@@ -15,6 +15,7 @@ import pytest
 
 from puffo_agent.mcp.config import (
     INFERENCE_LEVELS,
+    OPENCODE_INFERENCE_LEVELS,
     REASONING_EFFORTS,
     write_codex_mcp_config,
 )
@@ -196,6 +197,7 @@ def test_supported_levels_are_per_harness():
     assert supported_inference_levels("pi") == (
         "off", "minimal", "low", "medium", "high", "xhigh", "max",
     )
+    assert supported_inference_levels("opencode") == OPENCODE_INFERENCE_LEVELS
     # codex has minimal but not xhigh; claude-code the reverse.
     assert "xhigh" not in supported_inference_levels("codex")
     assert "minimal" not in supported_inference_levels("claude-code")

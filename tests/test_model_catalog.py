@@ -108,11 +108,16 @@ def test_unknown_harness_is_just_default():
 
 def test_opencode_catalog_uses_models_visible_to_native_cli(monkeypatch):
     """Authenticated OpenCode providers must not collapse to Custom model."""
+    from puffo_agent.agent.opencode_auth import OpenCodeModel
+
     monkeypatch.setattr(
-        "puffo_agent.agent.opencode_auth.list_opencode_models",
+        "puffo_agent.agent.opencode_auth.list_opencode_model_catalog",
         lambda executable: (
-            "opencode/big-pickle",
-            "deepseek/deepseek-v4-pro",
+            OpenCodeModel("opencode/big-pickle"),
+            OpenCodeModel(
+                "deepseek/deepseek-v4-pro",
+                ("none", "low", "medium", "high", "vendor-special"),
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -120,10 +125,15 @@ def test_opencode_catalog_uses_models_visible_to_native_cli(monkeypatch):
         lambda: "/opt/bin/opencode",
     )
 
-    assert _ids(provider_models("opencode", fetch=True))[1:] == [
+    options = provider_models("opencode", fetch=True)
+    assert _ids(options)[1:] == [
         "opencode/big-pickle",
         "deepseek/deepseek-v4-pro",
     ]
+    assert options[1].supported_inference_levels == ()
+    assert options[2].supported_inference_levels == (
+        "off", "low", "medium", "high",
+    )
 
 
 def test_pi_catalog_uses_models_visible_to_native_cli(monkeypatch):
@@ -156,7 +166,7 @@ def test_opencode_catalog_drops_logged_out_provider_after_short_ttl(monkeypatch)
         (ModelOption("deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-pro"),),
     )
     monkeypatch.setattr(
-        "puffo_agent.agent.opencode_auth.list_opencode_models",
+        "puffo_agent.agent.opencode_auth.list_opencode_model_catalog",
         lambda executable: (),
     )
     monkeypatch.setattr(

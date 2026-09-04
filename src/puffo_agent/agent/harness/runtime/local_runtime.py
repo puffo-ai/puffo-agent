@@ -20,6 +20,7 @@ from typing import Any, Protocol
 from ....macos.keychain import is_macos
 from ....mcp.config import (
     INFERENCE_LEVELS,
+    OPENCODE_INFERENCE_LEVELS,
     default_python_executable,
     puffo_core_mcp_env,
     write_cli_mcp_config,
@@ -454,6 +455,13 @@ class LocalRuntimePreparer:
             and "--thinking" not in launch_args
         ):
             launch_args.extend(("--thinking", inference_level))
+        if (
+            self.harness_name == "opencode"
+            and inference_level in OPENCODE_INFERENCE_LEVELS
+            and "--variant" not in launch_args
+        ):
+            native_variant = "none" if inference_level == "off" else inference_level
+            launch_args.extend(("--variant", native_variant))
         return executable, launch_args
 
     def _prepare_executable_configuration(

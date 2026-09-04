@@ -38,6 +38,13 @@ PI_INFERENCE_LEVELS = (
     "off", "minimal", "low", "medium", "high", "xhigh", "max",
 )
 
+# OpenCode ``run --variant`` values that map to Puffo's shared reasoning
+# vocabulary. Individual models publish only the subset advertised by
+# ``opencode models --verbose``.
+OPENCODE_INFERENCE_LEVELS = (
+    "off", "minimal", "low", "medium", "high", "xhigh", "max",
+)
+
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:
     """Reasoning-effort values implemented by a specific harness."""
@@ -47,6 +54,8 @@ def supported_inference_levels(harness: str) -> tuple[str, ...]:
         return INFERENCE_LEVELS
     if harness == "pi":
         return PI_INFERENCE_LEVELS
+    if harness == "opencode":
+        return OPENCODE_INFERENCE_LEVELS
     return ()
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
