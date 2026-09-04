@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode reasoning variants follow each model's native catalog.** The
+  daemon now publishes the exact selectable inference levels advertised by
+  `opencode models --verbose`, keeps models that expose no variants explicit,
+  and passes the selected level to `opencode run --variant`. Older OpenCode
+  versions fall back to their non-verbose model list. (#316)
+
 ## 2.0.4a1 - 2026-09-03
 
 > Pre-release published to TestPyPI for staging validation only. It is not the

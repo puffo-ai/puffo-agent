@@ -79,29 +79,6 @@ def _is_model_id(value: str) -> bool:
     )
 
 
-def _next_verbose_model_offset(output: str, offset: int) -> int:
-    """Recover at the next bare model-id line after malformed metadata."""
-    length = len(output)
-    line_start = offset
-    while line_start < length:
-        line_end = output.find("\n", line_start)
-        if line_end < 0:
-            line_end = length
-        raw_line = output[line_start:line_end]
-        candidate = raw_line.strip()
-        metadata_offset = line_end + 1
-        while metadata_offset < length and output[metadata_offset].isspace():
-            metadata_offset += 1
-        if (
-            raw_line == candidate
-            and _is_model_id(candidate)
-            and (metadata_offset == length or output[metadata_offset] == "{")
-        ):
-            return line_start
-        line_start = line_end + 1
-    return length
-
-
 def _parse_verbose_models(output: str) -> tuple[OpenCodeModel, ...]:
     """Parse ``models --verbose``'s repeated ``id`` + JSON blocks.
 
@@ -118,9 +95,10 @@ def _parse_verbose_models(output: str) -> tuple[OpenCodeModel, ...]:
         line_end = output.find("\n", offset)
         if line_end < 0:
             line_end = length
-        model_id = output[offset:line_end].strip()
+        raw_line = output[offset:line_end]
+        model_id = raw_line.strip()
         offset = line_end + 1
-        if not _is_model_id(model_id) or model_id in seen:
+        if raw_line != model_id or not _is_model_id(model_id) or model_id in seen:
             continue
 
         metadata: object = {}
@@ -132,7 +110,10 @@ def _parse_verbose_models(output: str) -> tuple[OpenCodeModel, ...]:
                 metadata, offset = decoder.raw_decode(output, json_offset)
             except json.JSONDecodeError:
                 metadata = {}
-                offset = _next_verbose_model_offset(output, offset)
+                # Continue line by line from the malformed block. Bare model-id
+                # lines remain authoritative even when they have no JSON block;
+                # punctuation and indentation keep JSON fragments from becoming
+                # phantom models.
 
         variants = metadata.get("variants") if isinstance(metadata, dict) else {}
         variant_names = tuple(

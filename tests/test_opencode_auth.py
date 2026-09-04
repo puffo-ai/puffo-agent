@@ -9,6 +9,7 @@ import pytest
 from puffo_agent.agent.opencode_auth import (
     OpenCodeModel,
     OpenCodeProbeError,
+    _is_model_id,
     list_opencode_model_catalog,
     list_opencode_models,
     opencode_model_is_available,
@@ -20,6 +21,21 @@ def _completed(*, code: int, stdout: str = "", stderr: str = ""):
     return subprocess.CompletedProcess(
         args=[], returncode=code, stdout=stdout, stderr=stderr,
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("opencode/gpt-5.6", True),
+        ("openrouter/qwen/qwen3-max", True),
+        ('{"id":"a/b"}', False),
+        ('"npm":"@ai-sdk/openai-compatible"', False),
+        (" opencode/indented", False),
+        ("opencode/x,y", False),
+    ],
+)
+def test_model_id_requires_a_bare_non_json_line(value, expected):
+    assert _is_model_id(value) is expected
 
 
 def test_native_model_probe_scrubs_ambient_keys(monkeypatch):
@@ -109,6 +125,31 @@ def test_verbose_probe_recovers_after_malformed_metadata_without_phantom_models(
     assert list_opencode_model_catalog("/opt/bin/opencode") == (
         OpenCodeModel("opencode/big-pickle"),
         OpenCodeModel("opencode/second-model", ("low",)),
+    )
+
+
+def test_verbose_probe_keeps_blockless_models_after_malformed_metadata(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _completed(
+            code=0,
+            stdout=(
+                "opencode/a\n"
+                '{"id":"a","api":{"npm":"x"\n'
+                "opencode/b\n"
+                "opencode/c\n"
+                '{"variants":{"low":{}}}\n'
+            ),
+        ),
+    )
+
+    assert list_opencode_model_catalog("/opt/bin/opencode") == (
+        OpenCodeModel("opencode/a"),
+        OpenCodeModel("opencode/b"),
+        OpenCodeModel("opencode/c", ("low",)),
     )
 
 

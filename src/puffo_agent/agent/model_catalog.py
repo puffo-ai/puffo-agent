@@ -27,7 +27,9 @@ class ModelOption:
     id: str  # the ``--model`` value; "" means the daemon default
     label: str  # combo-box display text
     is_alias: bool = False
-    supported_inference_levels: tuple[str, ...] = ()
+    # None means the catalog makes no model-specific claim. An empty tuple is
+    # an explicit claim that this model exposes no selectable inference level.
+    supported_inference_levels: tuple[str, ...] | None = None
 
 
 _DAEMON_DEFAULT = ModelOption("", "(daemon default)")
