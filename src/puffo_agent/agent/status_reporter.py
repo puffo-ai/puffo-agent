@@ -74,6 +74,13 @@ class StatusReporter:
         self._interval = max(10.0, heartbeat_interval_s)
         self._current_status: str = "idle"
         self._current_message_id: str | None = None
+        # Operator-facing activity refinement. ``_base_activity`` follows the
+        # turn phase ("reading_messages" from notice admission until the model
+        # admits real messages); ``_overlay_activity`` follows harness
+        # compaction and wins while set. Both are metadata-only fixed labels —
+        # never provider material.
+        self._base_activity: str | None = None
+        self._overlay_activity: str | None = None
         # None keeps the legacy single-stream wire shape.
         self._runtime_health_provider = runtime_health_provider
         # Agent Portal: reports kind/provider/harness/model so the operator's
@@ -180,6 +187,24 @@ class StatusReporter:
         """Best-effort status refresh used after bridge reconnects."""
         await self._send_heartbeat()
 
+    @property
+    def _effective_activity(self) -> str | None:
+        return self._overlay_activity or self._base_activity
+
+    async def set_activity_overlay(self, activity: str | None) -> None:
+        """Set or clear the compaction overlay and push the change now.
+
+        Called from the harness event path (compaction.started/completed), so
+        it must never raise into the runtime; heartbeat send already swallows
+        transport errors. A no-op change sends nothing.
+        """
+        if activity == self._overlay_activity:
+            return
+        before = self._effective_activity
+        self._overlay_activity = activity
+        if self._effective_activity != before:
+            await self._send_heartbeat()
+
     async def begin_notice_turn(self, message_id: str) -> None:
         """Report a provider turn before the model reads its Inbox.
 
@@ -191,6 +216,7 @@ class StatusReporter:
         self._current_message_id = (
             None if _is_local_only_envelope(message_id) else message_id
         )
+        self._base_activity = "reading_messages"
         await self._send_heartbeat()
 
     async def end_notice_turn(
@@ -205,11 +231,19 @@ class StatusReporter:
             return
         self._current_status = "idle"
         self._current_message_id = None
+        self._clear_activity()
         await self._send_heartbeat()
+
+    def _clear_activity(self) -> None:
+        self._base_activity = None
+        self._overlay_activity = None
 
     async def begin_turn(self, message_id: str, *, run_id: str | None = None) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = run_id or f"run_{uuid.uuid4().hex}"
+        # The model has admitted real messages: the reading phase is over.
+        # A live compaction overlay keeps winning until its completed event.
+        self._base_activity = None
         if self._keyless:
             # No signed /processing/* call for bridge agents (see __init__);
             # report "busy" over the bridge so the operator's Log gets the
@@ -259,6 +293,7 @@ class StatusReporter:
             # (the idle status stamps the Working row's duration + a Ready row).
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
+            self._clear_activity()
             await self._emit_keyless(
                 self._current_status, None, None if succeeded else error_text,
             )
@@ -269,6 +304,7 @@ class StatusReporter:
             # scheduled beat, so the in-progress flag clears promptly.
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
+            self._clear_activity()
             await self._send_heartbeat()
             return
         body: dict[str, Any] = {"run_id": run_id, "succeeded": succeeded}
@@ -286,6 +322,7 @@ class StatusReporter:
             )
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
+            self._clear_activity()
         except HttpError as exc:
             logger.warning("end_turn message=%s failed (%s)", message_id, exc)
         except Exception as exc:  # noqa: BLE001
@@ -310,6 +347,7 @@ class StatusReporter:
             failed = next((r for r in runs if not r["succeeded"]), None)
             self._current_status = "error" if failed is not None else "idle"
             self._current_message_id = None
+            self._clear_activity()
             error_text = None
             if failed is not None and failed.get("error_text") is not None:
                 error_text = str(failed["error_text"])[:1024]
@@ -338,6 +376,7 @@ class StatusReporter:
             any_failed = any(not r["succeeded"] for r in runs)
             self._current_status = "error" if any_failed else "idle"
             self._current_message_id = None
+            self._clear_activity()
             await self._send_heartbeat()
             return
         any_failed = any(not r["succeeded"] for r in runs)
@@ -354,6 +393,7 @@ class StatusReporter:
             # Server flips agent_status atomically — mirror locally.
             self._current_status = "error" if any_failed else "idle"
             self._current_message_id = None
+            self._clear_activity()
         except HttpError as exc:
             logger.warning(
                 "end_turn_batch (%d runs) failed (%s)", len(runs), exc,
@@ -371,6 +411,7 @@ class StatusReporter:
     ) -> None:
         self._current_status = "error" if any_failed else "idle"
         self._current_message_id = None
+        self._clear_activity()
         try:
             result = await self._processing_reports.enqueue(runs, immediate=True)
         except Exception:  # noqa: BLE001 - status must not break the turn
@@ -397,6 +438,7 @@ class StatusReporter:
             # bridge (see __init__).
             self._current_status = "error"
             self._current_message_id = None
+            self._clear_activity()
             await self._emit_keyless("error", None, error_text[:1024])
             return
         try:
@@ -406,6 +448,7 @@ class StatusReporter:
             )
             self._current_status = "error"
             self._current_message_id = None
+            self._clear_activity()
         except HttpError as exc:
             logger.warning("report_error failed (%s)", exc)
         except Exception as exc:  # noqa: BLE001
@@ -426,6 +469,11 @@ class StatusReporter:
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
+        # Fixed-label activity refinement ("compacting" / "reading_messages").
+        # Older servers ignore unknown heartbeat fields, so this is safe to
+        # send unconditionally when set.
+        if self._effective_activity is not None:
+            body["activity"] = self._effective_activity
         # Agent Portal: tag which machine this agent runs on (None if unlinked).
         from ..portal.control.store import current_machine_id
 

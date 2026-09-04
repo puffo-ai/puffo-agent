@@ -962,13 +962,17 @@ def build_local_runtime_adapter(
     logical_session_ref: str,
     driver: Driver | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
+    activity_sink: Callable[[str | None], Awaitable[None]] | None = None,
 ) -> RuntimeManagerAdapter:
     """Bind a prepared Driver runtime to the durable Runtime Manager.
 
     ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
     Docker composition injects the selected Driver with its exec transport
     factory and passes ``cleanup`` (bounded container stop), which runs after
-    the manager closes.
+    the manager closes. ``activity_sink`` receives the fixed activity label
+    ("compacting" / None) on compaction boundary events so the status
+    reporter can refine the operator-facing status; it observes only,
+    failures never reach the runtime.
     """
     if driver is None:
         driver = build_driver(prepared.harness_name)
@@ -1003,6 +1007,20 @@ def build_local_runtime_adapter(
                 type(exc).__name__,
             )
         event_type = getattr(event.type, "value", event.type)
+        if activity_sink is not None and event_type in {
+            "compaction.started", "compaction.completed",
+        }:
+            try:
+                await activity_sink(
+                    "compacting" if event_type == "compaction.started" else None
+                )
+            except Exception as exc:  # noqa: BLE001 - observation only
+                logger.warning(
+                    "agent %s: activity observation failed (%s); "
+                    "runtime continues",
+                    prepared.preparer.agent_id,
+                    type(exc).__name__,
+                )
         # Only the session and turn boundaries rewrite durable state; every
         # other event (a streamed delta above all) must reach the outbox no
         # more than once, so the state read stays inside the branch using it.
