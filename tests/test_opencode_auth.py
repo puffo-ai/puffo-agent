@@ -7,7 +7,9 @@ import subprocess
 import pytest
 
 from puffo_agent.agent.opencode_auth import (
+    OpenCodeModel,
     OpenCodeProbeError,
+    list_opencode_model_catalog,
     list_opencode_models,
     opencode_model_is_available,
     opencode_model_status,
@@ -55,6 +57,51 @@ def test_missing_provider_is_a_clean_not_ready_result(monkeypatch):
     assert list_opencode_models(
         "/opt/bin/opencode", provider="deepseek",
     ) == ()
+
+
+def test_verbose_model_probe_parses_native_variants(monkeypatch):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(command=command, kwargs=kwargs)
+        return _completed(
+            code=0,
+            stdout=(
+                "opencode/no-variants\n"
+                '{"id":"no-variants","variants":{}}\n'
+                "openai/gpt-5\n"
+                '{"id":"gpt-5","variants":{'
+                '"minimal":{"reasoningEffort":"minimal"},'
+                '"high":{"reasoningEffort":"high"}}}\n'
+            ),
+        )
+
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-probe")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert list_opencode_model_catalog("/opt/bin/opencode") == (
+        OpenCodeModel("opencode/no-variants"),
+        OpenCodeModel("openai/gpt-5", ("minimal", "high")),
+    )
+    assert seen["command"] == [
+        "/opt/bin/opencode", "models", "--verbose",
+    ]
+    assert "OPENAI_API_KEY" not in seen["kwargs"]["env"]
+
+
+def test_verbose_probe_keeps_model_when_metadata_is_malformed(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: _completed(
+            code=0,
+            stdout="opencode/big-pickle\n{not-json}\n",
+        ),
+    )
+
+    assert list_opencode_model_catalog("/opt/bin/opencode") == (
+        OpenCodeModel("opencode/big-pickle"),
+    )
 
 
 def test_selected_model_uses_provider_filtered_native_catalog(monkeypatch):
