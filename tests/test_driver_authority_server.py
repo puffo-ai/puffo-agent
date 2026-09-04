@@ -383,9 +383,10 @@ def test_malformed_frames_disconnect_without_a_decision(payload: bytes) -> None:
         server.close()
 
 
+@pytest.mark.parametrize("profile", ["puffo-v0", "puffo-v1"])
 @pytest.mark.asyncio
 async def test_constrained_lingtai_spawn_gets_only_the_issued_endpoint(
-    monkeypatch,
+    monkeypatch, profile,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -405,7 +406,7 @@ async def test_constrained_lingtai_spawn_gets_only_the_issued_endpoint(
                 launch_args=(
                     "acp",
                     "--profile",
-                    "puffo-v0",
+                    profile,
                     "--runtime-id",
                     "r1",
                 ),
@@ -422,7 +423,7 @@ async def test_constrained_lingtai_spawn_gets_only_the_issued_endpoint(
             "lingtai",
             "acp",
             "--profile",
-            "puffo-v0",
+            profile,
             "--runtime-id",
             "r1",
         )
@@ -474,8 +475,11 @@ async def test_generic_acp_spawn_cannot_inherit_a_caller_supplied_authority(
         await driver.close()
 
 
+@pytest.mark.parametrize("profile_arg", ["--profile=puffo-v0", "--profile=puffo-v1"])
 @pytest.mark.asyncio
-async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds() -> None:
+async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds(
+    profile_arg,
+) -> None:
     driver = AcpDriver(lambda _command, _spec: object())
 
     with pytest.raises(RuntimeError, match="POSIX local spawn path"):
@@ -484,7 +488,7 @@ async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds() ->
                 RuntimeSpec(
                     "/workspace",
                     executable="lingtai",
-                    launch_args=("acp", "--profile=puffo-v0"),
+                    launch_args=("acp", profile_arg),
                 )
             )
         )

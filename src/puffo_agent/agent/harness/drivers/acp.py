@@ -20,8 +20,10 @@ from acp.schema import (
     ClientCapabilities,
     CreateTerminalResponse,
     DeniedOutcome,
+    EnvVariable,
     FileSystemCapabilities,
     Implementation,
+    McpServerStdio,
     PermissionOption,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
@@ -51,6 +53,7 @@ from ..driver import (
     DriverCapabilities,
     HarnessEvent,
     HarnessEventType,
+    McpServerSpec,
     PermissionDecision,
     PermissionReceipt,
     PermissionRef,
@@ -202,7 +205,8 @@ class _PuffoAcpClient:
 class AcpDriver(Driver):
     """Persistent ACP agent process with negotiated session semantics.
 
-    This is the only trusted entrypoint for ``puffo-v0`` identity binding.
+    This is the only trusted entrypoint for constrained LingTai
+    (``puffo-v0`` / ``puffo-v1``) identity binding.
     The complete process/session launch plan is validated immediately before
     spawn; the separate OpenCode driver is explicitly outside that contract.
     """
@@ -298,14 +302,20 @@ class AcpDriver(Driver):
             await self._conn.load_session(
                 cwd=launch.plan.cwd,
                 session_id=str(resume),
-                mcp_servers=launch.plan.mcp_servers,
+                mcp_servers=[
+                    _to_acp_stdio_server(server)
+                    for server in launch.plan.mcp_servers
+                ],
             )
             native_session_id = str(resume)
             resumed = True
         else:
             session = await self._conn.new_session(
                 cwd=launch.plan.cwd,
-                mcp_servers=launch.plan.mcp_servers,
+                mcp_servers=[
+                    _to_acp_stdio_server(server)
+                    for server in launch.plan.mcp_servers
+                ],
             )
             native_session_id = session.session_id
             resumed = False
@@ -372,9 +382,24 @@ class AcpDriver(Driver):
             argv=argv,
             environment=MappingProxyType(dict(spec.environment)),
             cwd=spec.workspace_dir,
-            # puffo-v0 uses the Puffo-projected tool surface, never an
-            # independently supplied ACP MCP server list.
-            mcp_servers=(),
+            # The Driver is transport, not policy: it forwards whatever
+            # the runtime projected into ``spec.mcp_servers``. Which
+            # profiles receive Puffo's server — and that puffo-v0 stays
+            # empty, since it rejects a non-empty ``mcpServers`` at
+            # ``session/new`` — is decided by ``_project_protocol_mcp``
+            # in the runtime. The sealed plan carries deep-frozen copies;
+            # conversion to the mutable ACP wire objects happens only at
+            # the session call, so nothing validated here can change
+            # between validation and the wire.
+            mcp_servers=tuple(
+                McpServerSpec(
+                    name=server.name,
+                    command=server.command,
+                    args=tuple(server.args),
+                    environment=MappingProxyType(dict(server.environment)),
+                )
+                for server in spec.mcp_servers
+            ),
         )
         if self.launch_validator is not None:
             self.launch_validator(plan)
@@ -890,20 +915,72 @@ def model_launch_args(executable: str, model: str) -> tuple[str, ...]:
     return (flag, model)
 
 
-def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
-    """Select only LingTai's constrained ACP profile, independent of argv[0]."""
+def _to_acp_stdio_server(spec: McpServerSpec) -> McpServerStdio:
+    """Convert Puffo's provider-neutral MCP spec to the ACP wire shape.
+
+    The two shapes correspond field for field; only the container types
+    differ (tuple/mapping here, list/``EnvVariable`` rows on the wire).
+    """
+
+    return McpServerStdio(
+        name=spec.name,
+        command=spec.command,
+        args=list(spec.args),
+        env=[
+            EnvVariable(name=key, value=value)
+            for key, value in spec.environment.items()
+        ],
+    )
+
+
+_LINGTAI_CONSTRAINED_PROFILES = frozenset({"puffo-v0", "puffo-v1"})
+
+
+def _lingtai_constrained_profile(command: tuple[str, ...]) -> str:
+    """The constrained LingTai profile argv selects, or "" for none.
+
+    Independent of argv[0]; both ``--profile X`` and ``--profile=X``
+    spellings after the ``acp`` token are recognised.
+    """
 
     try:
         acp_index = command.index("acp")
     except ValueError:
-        return False
+        return ""
     profile_args = command[acp_index + 1 :]
-    return any(
-        (
-            arg == "--profile"
-            and index + 1 < len(profile_args)
-            and profile_args[index + 1] == "puffo-v0"
-        )
-        or arg == "--profile=puffo-v0"
-        for index, arg in enumerate(profile_args)
-    )
+    # argparse takes the LAST occurrence of a repeated flag; classify by
+    # the same effective value or a duplicated ``--profile`` would launch
+    # under a different profile than Puffo prepared it for.
+    candidate = ""
+    for index, arg in enumerate(profile_args):
+        if arg == "--profile" and index + 1 < len(profile_args):
+            candidate = profile_args[index + 1]
+        elif arg.startswith("--profile="):
+            candidate = arg.removeprefix("--profile=")
+    if candidate in _LINGTAI_CONSTRAINED_PROFILES:
+        return candidate
+    return ""
+
+
+def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
+    """True for every constrained LingTai profile, independent of argv[0].
+
+    Both ``puffo-v0`` and ``puffo-v1`` refuse to start without a
+    successful Driver authority handshake (LingTai #1624), so both get
+    the authority FD and the guarded POSIX spawn path. This is a wider
+    predicate than ``selects_puffo_v0_profile``, which only controls
+    the empty MCP projection.
+    """
+
+    return bool(_lingtai_constrained_profile(command))
+
+
+def selects_puffo_v0_profile(command: tuple[str, ...]) -> bool:
+    """True when argv selects LingTai's ``puffo-v0`` profile.
+
+    v0 rejects a non-empty ``mcpServers`` at ``session/new``, so only
+    this profile keeps the MCP projection empty; ``puffo-v1`` receives
+    Puffo's server while still using the Driver authority spawn path.
+    """
+
+    return _lingtai_constrained_profile(command) == "puffo-v0"
