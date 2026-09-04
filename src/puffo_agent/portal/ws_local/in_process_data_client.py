@@ -98,6 +98,16 @@ class InProcessDataClient:
             after_seq=after_seq,
         )
 
+    async def get_channel_notes(
+        self, channel_id: str, limit: int = 20,
+    ) -> list[StoredMessage]:
+        return await self._store.get_channel_notes(channel_id, limit=limit)
+
+    async def get_thread_notes(
+        self, root_id: str, limit: int = 20,
+    ) -> list[StoredMessage]:
+        return await self._store.get_thread_notes(root_id, limit=limit)
+
     async def get_message_by_envelope(self, envelope_id: str) -> Any:
         # Model-visible lane (get_post / get_post_segment): a foreign DM
         # held for operator approval stays withheld, matching the HTTP

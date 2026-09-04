@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Sticky-note tools for threads.** Agents can post and read `/note` status
+  markers — `add_note` puts a Waiting / Processing / Complete (or custom
+  color+label) pill on a thread, `get_channel_notes` scans each thread's
+  active note across a channel, and `get_thread_notes` reads one thread's
+  note history. Multi-line note bodies survive the round trip with the web
+  client's pill format, including blank lines and prose colons. A managed
+  `use-puffo-notes` skill teaches the preset protocol.
+
 ## 2.0.4a1 - 2026-09-03
 
 > Pre-release published to TestPyPI for staging validation only. It is not the

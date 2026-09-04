@@ -1456,6 +1456,67 @@ class MessageStore(
             for r in (rows if selected_oldest_first else reversed(rows))
         ]
 
+    # Stored note bodies are marker-encoded JSON strings
+    # (``\x1ePUFFO_CONTENT_JSON_V1:"/note ..."``); pre-marker legacy rows
+    # held the raw text. ``_`` is escaped so LIKE matches it literally.
+    _NOTE_LIKE = (
+        "(content LIKE ? ESCAPE '\\' OR content LIKE '/note %')"
+    )
+    _NOTE_LIKE_PARAM = (
+        _CONTENT_JSON_PREFIX.replace("_", "\\_") + '"/note %'
+    )
+
+    async def get_channel_notes(
+        self, channel_id: str, limit: int = 20,
+    ) -> list[StoredMessage]:
+        """Active sticky-notes in ``channel_id`` — one per thread (the
+        newest ``/note`` keyed by thread root), newest-first. Raises
+        ``DataNotFound`` for an unknown channel."""
+        if not await self.channel_exists(channel_id):
+            raise DataNotFound(f"channel not found: {channel_id}")
+        db = await self._ensure_db()
+        sql = (
+            "SELECT * FROM ("
+            "  SELECT m.*, ROW_NUMBER() OVER ("
+            "    PARTITION BY COALESCE(m.thread_root_id, m.envelope_id) "
+            "    ORDER BY m.sent_at DESC, m.envelope_id DESC"
+            "  ) AS rn "
+            "  FROM messages m "
+            f"  WHERE m.channel_id = ? AND {self._NOTE_LIKE}"
+            ") WHERE rn = 1 "
+            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        )
+        params = [channel_id, self._NOTE_LIKE_PARAM, max(1, min(int(limit), 200))]
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
+    async def get_thread_notes(
+        self, root_id: str, limit: int = 20,
+    ) -> list[StoredMessage]:
+        """``/note`` messages in the thread anchored at ``root_id``,
+        newest-first. ``limit=1`` returns just the note currently in
+        effect. Raises ``DataNotFound`` when the root was never stored.
+        """
+        if not root_id:
+            raise DataNotFound("thread root not found: (empty)")
+        if not await self.has_message(root_id):
+            raise DataNotFound(f"thread root not found: {root_id}")
+        db = await self._ensure_db()
+        sql = (
+            "SELECT * FROM messages "
+            "WHERE (envelope_id = ? OR thread_root_id = ?) "
+            f"AND {self._NOTE_LIKE} "
+            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        )
+        params = [
+            root_id, root_id, self._NOTE_LIKE_PARAM,
+            max(1, min(int(limit), 200)),
+        ]
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(r) for r in rows]
+
     async def has_channel_intro_been_prompted(self, channel_id: str) -> bool:
         """True iff the agent already had a self-introduction prompted
         for ``channel_id``. Used by ``_accept_invite`` to gate the

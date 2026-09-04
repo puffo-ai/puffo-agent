@@ -299,3 +299,206 @@ async def test_thread_messages_404_for_unknown_root() -> None:
         assert resp.status == 404
         body = await resp.json()
         assert body == {"error": "thread root not found"}
+
+
+async def _seed_agent_with_note(home: str, agent_id: str) -> None:
+    """Agent db with a root post + a /note reply in its thread."""
+    agent_path = Path(home) / "agents" / agent_id
+    agent_path.mkdir(parents=True, exist_ok=True)
+    store = MessageStore(agent_path / "messages.db")
+    await store.open()
+    await store.store({
+        "envelope_id": "msg_root",
+        "envelope_kind": "channel",
+        "sender_slug": "alice",
+        "channel_id": "ch_1",
+        "space_id": "sp_1",
+        "content_type": "text/plain",
+        "content": "root post",
+        "sent_at": 1700000000_000,
+    })
+    await store.store({
+        "envelope_id": "msg_note",
+        "envelope_kind": "channel",
+        "sender_slug": "alice",
+        "channel_id": "ch_1",
+        "space_id": "sp_1",
+        "content_type": "text/plain",
+        "content": "/note \ncolor: #db4cac\nlabel: Waiting\nmessage: do it\nmentions: @bob",
+        "sent_at": 1700000002_000,
+        "thread_root_id": "msg_root",
+    })
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_channel_notes_route_returns_active_notes() -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-1")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-notes-1/channels/notes?channel=ch_1"
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        ids = [m["envelope_id"] for m in body["messages"]]
+        assert ids == ["msg_note"]
+
+
+@pytest.mark.asyncio
+async def test_channel_notes_route_404_for_unknown_channel() -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-2")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-notes-2/channels/notes?channel=ch_nope"
+        )
+        assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_channel_notes_route_requires_channel() -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-3")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/v1/data/agent-notes-3/channels/notes")
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_route_returns_notes() -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-4")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-notes-4/threads/msg_root/notes"
+        )
+        assert resp.status == 200
+        body = await resp.json()
+        assert [m["envelope_id"] for m in body["messages"]] == ["msg_note"]
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_route_404_for_unknown_root() -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-5")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(
+            "/v1/data/agent-notes-5/threads/msg_missing/notes"
+        )
+        assert resp.status == 404
+
+
+@pytest.mark.asyncio
+async def test_notes_routes_reject_bad_limit() -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-6")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        for url in (
+            "/v1/data/agent-notes-6/channels/notes?channel=ch_1&limit=nope",
+            "/v1/data/agent-notes-6/threads/msg_root/notes?limit=nope",
+        ):
+            resp = await client.get(url)
+            assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_notes_routes_404_for_unknown_agent() -> None:
+    _isolated_home()
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        for url in (
+            "/v1/data/agent-none/channels/notes?channel=ch_1",
+            "/v1/data/agent-none/threads/msg_root/notes",
+        ):
+            resp = await client.get(url)
+            assert resp.status == 404
+            assert (await resp.json())["error"] == "agent db not found"
+
+
+@pytest.mark.asyncio
+async def test_notes_routes_500_on_store_failure(monkeypatch) -> None:
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-7")
+
+    async def boom(self, *args, **kwargs):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(MessageStore, "get_channel_notes", boom)
+    monkeypatch.setattr(MessageStore, "get_thread_notes", boom)
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        for url in (
+            "/v1/data/agent-notes-7/channels/notes?channel=ch_1",
+            "/v1/data/agent-notes-7/threads/msg_root/notes",
+        ):
+            resp = await client.get(url)
+            assert resp.status == 500
+
+
+@pytest.mark.asyncio
+async def test_data_client_note_round_trips() -> None:
+    """DataClient.get_channel_notes / get_thread_notes over real HTTP."""
+    from puffo_agent.mcp.data_client import DataClient, DataNotFound
+
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-8")
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        dc = DataClient(
+            str(client.server.make_url("")).rstrip("/"), "agent-notes-8",
+            issue_local_service_token("agent-notes-8"),
+        )
+        try:
+            channel_notes = await dc.get_channel_notes("ch_1", limit=5)
+            assert [m.envelope_id for m in channel_notes] == ["msg_note"]
+            thread_notes = await dc.get_thread_notes("msg_root", limit=5)
+            assert [m.envelope_id for m in thread_notes] == ["msg_note"]
+            with pytest.raises(DataNotFound):
+                await dc.get_channel_notes("ch_nope")
+            with pytest.raises(DataNotFound):
+                await dc.get_thread_notes("msg_missing")
+        finally:
+            await dc.close()
+
+
+@pytest.mark.asyncio
+async def test_data_client_notes_degrade_to_empty_on_errors(monkeypatch) -> None:
+    """Non-404 HTTP failures and transport errors read as "no notes" —
+    the tools stay usable while the data service hiccups."""
+    from puffo_agent.mcp.data_client import DataClient
+
+    home = _isolated_home()
+    await _seed_agent_with_note(home, "agent-notes-9")
+
+    async def boom(self, *args, **kwargs):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(MessageStore, "get_channel_notes", boom)
+    monkeypatch.setattr(MessageStore, "get_thread_notes", boom)
+    app = ds.build_app(ds.DataServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        dc = DataClient(
+            str(client.server.make_url("")).rstrip("/"), "agent-notes-9",
+            issue_local_service_token("agent-notes-9"),
+        )
+        try:
+            assert await dc.get_channel_notes("ch_1") == []
+            assert await dc.get_thread_notes("msg_root") == []
+        finally:
+            await dc.close()
+    dc_dead = DataClient(
+        "http://127.0.0.1:1", "agent-notes-9",
+        issue_local_service_token("agent-notes-9"),
+    )
+    try:
+        assert await dc_dead.get_channel_notes("ch_1") == []
+        assert await dc_dead.get_thread_notes("msg_root") == []
+    finally:
+        await dc_dead.close()
