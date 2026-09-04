@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -178,6 +181,26 @@ def test_real_reconcile_initializes_multiple_ws_local_workers(
             tmp_path, monkeypatch,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_daemon_observes_worker_start_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    daemon = Daemon(DaemonConfig())
+    worker = SimpleNamespace(
+        wait_warm=AsyncMock(return_value=False),
+        runtime=SimpleNamespace(status="error"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await daemon._observe_worker_start("broken-agent", worker)
+
+    worker.wait_warm.assert_awaited_once_with(
+        timeout=daemon._warm_serialise_timeout,
+    )
+    assert "broken-agent: worker did not reach running" in caplog.text
+    assert "status=error" in caplog.text
 
 
 async def _assert_reconcile_replaces_post_start_fatal_worker(

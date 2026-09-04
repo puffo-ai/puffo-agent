@@ -341,7 +341,7 @@ async def provision_agent_from_bundle(
 ) -> dict:
     context = verify_agent_bundle(payload, operator_root_key_b64)
     if preflight is not None:
-        preflight(context)
+        await preflight(context)
     if materialize is not None:
         await materialize(context)
     result = write_agent_from_context(context)

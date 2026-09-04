@@ -13,9 +13,10 @@ from unittest.mock import AsyncMock, Mock, patch
 class _Runtime:
     """Stand-in for RuntimeState — records save() calls instead of
     hitting disk."""
-    def __init__(self, health="ok", error=""):
+    def __init__(self, health="ok", error="", status="starting"):
         self.health = health
         self.error = error
+        self.status = status
         self.saved = []
 
     def save(self, agent_id):
@@ -136,13 +137,17 @@ def test_warm_done_only_flips_after_probe_completes():
         gate_task = asyncio.create_task(w._run_post_warm_gate("agent-a"))
         await started.wait()
         captured["mid_probe"] = w._warm_done.is_set()
+        captured["mid_probe_status"] = w.runtime.status
         release.set()
         await gate_task
         captured["post_gate"] = w._warm_done.is_set()
+        captured["post_gate_status"] = w.runtime.status
 
     asyncio.run(_run())
     assert captured["mid_probe"] is False
+    assert captured["mid_probe_status"] == "starting"
     assert captured["post_gate"] is True
+    assert captured["post_gate_status"] == "running"
 
 
 def test_warm_done_only_flips_after_reassert_when_probe_fails():

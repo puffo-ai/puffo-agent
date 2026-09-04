@@ -942,7 +942,7 @@ class RuntimeState:
     worker deadlocked).
     """
 
-    status: str = "stopped"  # running | paused | error | stopped
+    status: str = "stopped"  # starting | running | paused | error | stopped
     started_at: int = 0
     updated_at: int = 0
     msg_count: int = 0
