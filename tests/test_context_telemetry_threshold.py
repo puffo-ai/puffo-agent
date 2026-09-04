@@ -489,8 +489,8 @@ def test_yaml_int_value_loads_as_string():
 
 
 def test_local_driver_applies_override_under_owned_environment(tmp_path, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
     from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
@@ -537,7 +537,7 @@ def test_junk_persisted_value_falls_back_to_default_band():
 
 
 def test_docker_session_receives_overrides(tmp_path, monkeypatch):
-    from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
+    from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
     from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
@@ -604,8 +604,8 @@ async def test_remote_edit_reaches_docker_exec_command():
 
 @pytest.mark.asyncio
 async def test_local_codex_driver_receives_compact_pct(tmp_path, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
     from puffo_agent.portal.state import DaemonConfig
 
     home = isolated_home()

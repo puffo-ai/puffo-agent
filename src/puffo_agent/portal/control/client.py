@@ -29,6 +29,7 @@ from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
 from .usage_snapshot import apply_drained_health, collect_usage_snapshot
+from ...tasks import spawn
 
 log = logging.getLogger("puffo_agent.control")
 
@@ -41,6 +42,17 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # Control-WS heartbeat: liveness ping + capability re-check cadence. Must stay
 # well under the server's HEARTBEAT_TIMEOUT (90s) or the server culls us.
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+# Remote create waits for the daemon's durable worker lifecycle instead of
+# acknowledging as soon as agent.yml exists. Docker's first image build may
+# legitimately take several minutes. The server's Portal machine-command TTL
+# is 24 hours; this shorter bound is a UI/operator feedback budget, not the
+# command-expiry budget used by Runtime permission/cancel commands.
+AGENT_START_TIMEOUT_SECONDS = 10 * 60.0
+AGENT_START_POLL_SECONDS = 0.5
+
+
+class _DuplicateDelivery(ControlError):
+    pass
 
 
 def _is_already_archived(agent_slug: str) -> bool:
@@ -182,20 +194,68 @@ async def _create_agent_command(
     if isinstance(pc, dict):
         pc["server_url"] = server_url
 
+    from .preflight import preflight_runtime
     from .provision import ProvisionError, provision_agent_from_bundle
 
     async def _materialize(_ctx: dict) -> None:
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
 
+    async def _preflight(context: dict) -> None:
+        await preflight_runtime(context["runtime"], agent_id=context["agent_id"])
+
     try:
         result = await provision_agent_from_bundle(
-            params, paired_root_pubkey, materialize=_materialize
+            params,
+            paired_root_pubkey,
+            preflight=_preflight,
+            materialize=_materialize,
         )
     except ProvisionError as exc:
-        return {"ok": False, "error": exc.reason}
+        return {"ok": False, "error": exc.reason, **exc.fields}
     except ControlError as exc:
         return {"ok": False, "error": str(exc)}
+    startup = await _wait_for_agent_start(result["agent_id"])
+    if startup is not None:
+        return {
+            "ok": False,
+            "agent_slug": result["agent_id"],
+            **startup,
+        }
     return {"ok": True, "agent_slug": result["agent_id"]}
+
+
+async def _wait_for_agent_start(agent_id: str) -> dict | None:
+    """Return ``None`` once the worker is running, else a structured failure."""
+    from ..state import RuntimeState
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + AGENT_START_TIMEOUT_SECONDS
+    while loop.time() < deadline:
+        # RuntimeState.load performs filesystem I/O. Keep repeated startup
+        # observation off the single control event loop.
+        runtime = await asyncio.to_thread(RuntimeState.load, agent_id)
+        if runtime is not None:
+            if runtime.status == "running":
+                return None
+            if runtime.status == "error":
+                return {
+                    "error_code": "agent_start_failed",
+                    "error": runtime.error or "agent worker failed to start",
+                }
+            if runtime.status == "stopped":
+                return {
+                    "error_code": "agent_start_failed",
+                    "error": "agent worker stopped before startup completed",
+                }
+        await asyncio.sleep(AGENT_START_POLL_SECONDS)
+    return {
+        "error_code": "agent_start_timeout",
+        "error": (
+            f"agent worker has not reached running within "
+            f"{AGENT_START_TIMEOUT_SECONDS:g}s; it remains configured and "
+            "may still finish starting, so check its status before retrying"
+        ),
+    }
 
 
 async def post_usage_snapshot(machine, base: str) -> bool:
@@ -286,7 +346,7 @@ async def _execute_runtime_command(
     params: dict,
     command_id: str | None,
 ) -> dict:
-    from ...agent.harness.runtime_commands import execute_runtime_command
+    from ...agent.harness.runtime.runtime_commands import execute_runtime_command
 
     command = dict(params)
     command.update(
@@ -479,11 +539,16 @@ async def _sleep_or_stop(stop: asyncio.Event, timeout: float) -> None:
 def build_capabilities() -> dict:
     """Return CLI authentication and model capabilities for the portal."""
     from ...agent.cli_bin import (
+        HarnessReadiness,
         claude_has_credentials,
-        cli_tool_status,
         codex_has_credentials,
+        harness_readiness,
+        opencode_has_accessible_models,
+        pi_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
+        resolve_opencode_bin,
+        resolve_pi_bin,
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
 
@@ -494,26 +559,67 @@ def build_capabilities() -> dict:
     except Exception:  # noqa: BLE001
         daemon_version = ""
 
-    cli_tools = {
-        "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
-        "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
+    readiness = {
+        "claude-code": harness_readiness(resolve_claude_bin, claude_has_credentials),
+        "codex": harness_readiness(resolve_codex_bin, codex_has_credentials),
+        "pi": harness_readiness(resolve_pi_bin, pi_has_credentials),
+        "opencode": harness_readiness(
+            resolve_opencode_bin, opencode_has_accessible_models,
+        ),
+        # The ACP driver targets whatever executable the agent config
+        # names (gemini, kimi, opencode …), so no single binary probe can
+        # stand for it; admission is checked per-target at creation time.
+        "acp": HarnessReadiness("degraded", "target_probe_required", "ready"),
     }
+    cli_tools = {name: r.legacy for name, r in readiness.items()}
+    # Frozen wire quirks, kept byte-stable for old portal consumers:
+    # opencode historically meant binary-present (credentials unknown), and
+    # "acp" mirrored that opencode binary status. New consumers read
+    # harness_readiness and must not inherit either approximation.
+    legacy_opencode = harness_readiness(resolve_opencode_bin, None).legacy
+    cli_tools["opencode"] = legacy_opencode
+    cli_tools["acp"] = legacy_opencode
     claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
             "provider": h,
             "models": [
-                {"id": o.id, "label": o.label, "alias": o.is_alias}
+                {
+                    "id": o.id,
+                    "label": o.label,
+                    "alias": o.is_alias,
+                    **(
+                        {
+                            "supported_inference_levels": list(
+                                o.supported_inference_levels
+                            )
+                        }
+                        if o.supported_inference_levels
+                        else {}
+                    ),
+                }
                 for o in provider_models(
                     h,
-                    fetch=h == "claude-code" and claude_ready,
+                    fetch=(h == "claude-code" and claude_ready)
+                    or (
+                        h in {"pi", "opencode"}
+                        and readiness[h].state == "ready"
+                    ),
                 )
                 if o.id
             ],
         }
         for h in KNOWN_HARNESSES
     ]
-    return {"cli_tools": cli_tools, "providers": providers, "daemon_version": daemon_version}
+    return {
+        "cli_tools": cli_tools,
+        "harness_readiness": {
+            name: {"state": r.state, "reason": r.reason}
+            for name, r in readiness.items()
+        },
+        "providers": providers,
+        "daemon_version": daemon_version,
+    }
 
 
 class MachineControlClient:
@@ -523,9 +629,16 @@ class MachineControlClient:
     def __init__(self, machine) -> None:
         self.machine = machine
         self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
+        self._command_tasks: set[asyncio.Future] = set()
+        self._inflight_command_ids: set[str] = set()
+        self._nonce_commands: dict[str, str] = {}
+        self._completed_results: dict[str, dict] = {}
+        self._pending_acks: dict[str, dict] = {}
+        self._active_ws: aiohttp.ClientWebSocketResponse | None = None
         # Serialize WS writes — acks (receive loop) + heartbeat/capabilities
         # (sender task) share one socket; concurrent send_json would interleave.
         self._send_lock = asyncio.Lock()
+        self._ack_flush_lock = asyncio.Lock()
 
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
@@ -552,7 +665,7 @@ class MachineControlClient:
                 # Initial capability snapshot on connect.
                 last_caps = await asyncio.to_thread(build_capabilities)
                 await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
-                sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
+                sender = spawn(self._heartbeat_loop(ws, stop, last_caps), name="heartbeat_loop")
 
                 # Register the reverse-channel sender on this live socket.
                 from .reporter import get_reporter
@@ -563,8 +676,8 @@ class MachineControlClient:
                         {"type": "message", "operator_slug": operator_slug, "envelope": envelope},
                     )
 
-                get_reporter().set_sender(_report)
-                log.info("control: WS connected; agent.status sender ready")
+                reporter = get_reporter()
+                reporter_ready = False
                 try:
                     async for msg in ws:
                         if stop.is_set():
@@ -577,13 +690,25 @@ class MachineControlClient:
                             frame = json.loads(msg.data)
                         except ValueError:
                             continue
-                        if frame.get("type") == "command":
-                            await self._handle(ws, frame)
+                        if frame.get("type") == "connected":
+                            if not reporter_ready:
+                                self._active_ws = ws
+                                await self._flush_pending_acks(ws)
+                                reporter.set_sender(_report)
+                                reporter_ready = True
+                                log.info(
+                                    "control: WS connected; agent.status sender ready"
+                                )
+                        elif frame.get("type") == "command":
+                            await self._handle(ws, frame, background_create=True)
                         elif frame.get("type") == "error":
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
                 finally:
-                    get_reporter().set_sender(None)
+                    if self._active_ws is ws:
+                        self._active_ws = None
+                    if reporter_ready:
+                        reporter.set_sender(None)
                     sender.cancel()
                     try:
                         await sender
@@ -607,7 +732,13 @@ class MachineControlClient:
                 await self._send(ws, {"type": "capabilities", "capabilities": caps})
                 last_caps = caps
 
-    async def _handle(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
+    async def _handle(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        frame: dict,
+        *,
+        background_create: bool = False,
+    ) -> None:
         command_id = frame.get("command_id")
         operator_slug = frame.get("operator_slug")
         try:
@@ -617,7 +748,7 @@ class MachineControlClient:
             envelope = frame.get("envelope") or {}
             nonce = envelope.get("nonce")
             if nonce and nonce in self._seen_nonces:
-                raise ControlError("replayed nonce")
+                raise _DuplicateDelivery
             decrypted = decrypt_command(
                 envelope, self.machine, pairing.operator_root_pubkey, now_ms()
             )
@@ -625,10 +756,91 @@ class MachineControlClient:
                 # Bound the replay set: a nonce older than the ts window is
                 # already rejected by decrypt_command, so it's safe to forget.
                 cutoff = now_ms() - TS_WINDOW_MS
-                self._seen_nonces = {
-                    n: t for n, t in self._seen_nonces.items() if t > cutoff
+                expired_command_ids = {
+                    command
+                    for n, t in self._seen_nonces.items()
+                    if t <= cutoff
+                    if (command := self._nonce_commands.get(n)) is not None
+                    if command not in self._inflight_command_ids
                 }
+                self._seen_nonces = {
+                    n: t
+                    for n, t in self._seen_nonces.items()
+                    if t > cutoff
+                    or self._nonce_commands.get(n) in self._inflight_command_ids
+                }
+                self._nonce_commands = {
+                    n: command
+                    for n, command in self._nonce_commands.items()
+                    if n in self._seen_nonces
+                }
+                for expired_command_id in expired_command_ids:
+                    self._completed_results.pop(expired_command_id, None)
                 self._seen_nonces[nonce] = int(envelope.get("ts", now_ms()))
+                if command_id:
+                    self._nonce_commands[nonce] = str(command_id)
+        except _DuplicateDelivery:
+            cached = self._completed_results.get(str(command_id or ""))
+            if cached is not None:
+                log.info("control: re-acking completed command %s", command_id)
+                await self._send_ack(command_id, cached, ws=ws)
+                return
+            if command_id and str(command_id) in self._inflight_command_ids:
+                log.info(
+                    "control: duplicate delivery suppressed while command %s is running",
+                    command_id,
+                )
+                return
+            log.debug(
+                "control: duplicate delivery suppressed for unknown command %s",
+                command_id,
+            )
+            result = {"ok": False, "error_code": "command_rejected"}
+        except ControlError as exc:
+            # Forged / malformed → never execute, but ack so it stops redelivering.
+            log.warning("control: rejected command %s: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_rejected"}
+        except Exception as exc:  # noqa: BLE001
+            log.warning("control: command %s failed: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_failed"}
+        else:
+            execution = self._execute_and_ack(
+                (
+                    None
+                    if background_create and command_id and decrypted["op"] == "create"
+                    else ws
+                ),
+                command_id,
+                decrypted,
+                pairing,
+                nonce=str(nonce) if nonce else None,
+            )
+            if command_id:
+                self._inflight_command_ids.add(str(command_id))
+            if background_create and command_id and decrypted["op"] == "create":
+                # A first Docker image build can take minutes. Keep that wait
+                # out of the one machine-control receive loop so pause/resume,
+                # runtime decisions, and other operators remain responsive.
+                task = spawn(execution, name=f"control.create:{command_id}")
+                self._command_tasks.add(task)
+                task.add_done_callback(self._command_tasks.discard)
+                return
+            await execution
+            return
+
+        await self._send_ack(command_id, result, ws=ws)
+
+    async def _execute_and_ack(
+        self,
+        ws: aiohttp.ClientWebSocketResponse | None,
+        command_id: str | None,
+        decrypted: dict,
+        pairing,
+        *,
+        nonce: str | None,
+    ) -> None:
+        result: dict = {"ok": False, "error_code": "command_failed"}
+        try:
             result = await execute_command(
                 decrypted["op"],
                 decrypted["agent_slug"],
@@ -640,18 +852,70 @@ class MachineControlClient:
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
-                    command_id, decrypted["op"], result.get("error"),
+                    command_id,
+                    decrypted["op"],
+                    result.get("error"),
                 )
         except ControlError as exc:
-            # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_rejected"}
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
-        if command_id:
-            try:
-                await self._send(ws, {"type": "ack", "command_id": command_id})
-            except Exception as exc:  # noqa: BLE001
-                log.debug("control: ack %s failed: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_failed"}
+        finally:
+            if command_id:
+                command_key = str(command_id)
+                self._inflight_command_ids.discard(command_key)
+                self._completed_results[command_key] = result
+            if nonce:
+                # Retain the nonce for a full window after completion too, so
+                # an ambiguous/disconnected ack can only replay the result,
+                # never the side effect.
+                self._seen_nonces[nonce] = now_ms()
+        await self._send_ack(command_id, result, ws=ws)
+
+    async def _send_ack(
+        self,
+        command_id: str | None,
+        result: dict,
+        *,
+        ws: aiohttp.ClientWebSocketResponse | None = None,
+    ) -> None:
+        if not command_id:
+            return
+        command_key = str(command_id)
+        self._pending_acks[command_key] = result
+        target = self._active_ws or ws
+        if target is not None:
+            await self._flush_pending_acks(target)
+
+    async def _flush_pending_acks(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        """Send durable-in-memory results on the current authenticated socket.
+
+        A failed write leaves the result queued for the next connection. A
+        server redelivery after an ambiguous successful write is handled from
+        ``_completed_results`` and re-queues the same result.
+        """
+        async with self._ack_flush_lock:
+            if self._active_ws is not None and ws is not self._active_ws:
+                return
+            for command_id, result in list(self._pending_acks.items()):
+                try:
+                    await self._send(
+                        ws,
+                        {"type": "ack", "command_id": command_id, "result": result},
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "control: ack %s failed; queued for reconnect: %s",
+                        command_id,
+                        exc,
+                    )
+                    return
+                if self._pending_acks.get(command_id) is result:
+                    self._pending_acks.pop(command_id, None)
 
 
 class ControlManager:
@@ -678,9 +942,9 @@ class ControlManager:
                     machine = load_or_create_machine()
                 if pairings and ws_task is None:
                     client = MachineControlClient(machine)
-                    ws_task = asyncio.create_task(client.run(self._stop))
-                    me_task = asyncio.create_task(self._me_loop(machine))
-                    usage_task = asyncio.create_task(self._usage_loop(machine))
+                    ws_task = spawn(client.run(self._stop), name="client.run")
+                    me_task = spawn(self._me_loop(machine), name="me_loop")
+                    usage_task = spawn(self._usage_loop(machine), name="usage_loop")
                 if not pairings and ws_task is not None:
                     ws_task.cancel()
                     me_task.cancel()

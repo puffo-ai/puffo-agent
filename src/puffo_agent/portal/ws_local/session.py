@@ -39,6 +39,7 @@ from .protocol import (
     decode_inbound,
     encode,
 )
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -171,7 +172,7 @@ class WsLocalSession:
         rolls back any in-flight bundle on the way out."""
         self._last_rx = self._now()
         await self._pump()
-        watchdog = asyncio.ensure_future(self._watchdog())
+        watchdog = spawn(self._watchdog(), name="watchdog")
         try:
             while self._alive:
                 raw = await self._transport.recv()
@@ -210,7 +211,7 @@ class WsLocalSession:
         try:
             from ..control.reporter import get_reporter
 
-            asyncio.ensure_future(get_reporter().emit(self.slug, event, payload))
+            spawn(get_reporter().emit(self.slug, event, payload), name="reporter.emit")
         except Exception:  # noqa: BLE001
             pass
 

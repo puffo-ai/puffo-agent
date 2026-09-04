@@ -121,7 +121,8 @@ async def test_daemon_turn_queues_behind_an_in_flight_autonomous_run(tmp_path):
 @pytest.mark.asyncio
 async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
     """If a daemon turn took over, the autonomous terminal frame must not
-    clear the daemon's active state."""
+    clear the daemon's active state -- but the adopted turn's durable row must
+    still settle rather than leak in_turn."""
     store = await make_store(tmp_path)
     runtime = GlobalInboxRuntime(
         store=store,
@@ -130,11 +131,15 @@ async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
         workspace=tmp_path,
     )
     assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    orphan_id = runtime._autonomous_turn_id
     # Simulate a daemon turn replacing the adopted one.
     runtime.active.turn_id = "turn_daemon_owned"
 
-    assert await runtime.finish_autonomous_turn() is False
+    assert await runtime.finish_autonomous_turn() is True
     assert runtime.active.turn_id == "turn_daemon_owned"
+    assert runtime._autonomous_turn_id == ""
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
     await store.close()
 
 
@@ -378,4 +383,230 @@ async def test_notice_cleanup_failure_resumes_after_terminal_commit(tmp_path, ou
     row = await store.get_message_by_envelope("admitted-row")
     assert row.processing_state == ("processed" if outcome == "succeeded" else "pending")
     assert runtime._autonomous_settle_pending is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_adoption_during_notice_planning_queues_instead_of_clobbering(tmp_path):
+    """Production wedge (boris, 2026-08-24 15:31): adoption landed while a
+    notice turn was mid-planning -- context resolution stretched the window
+    between the top-of-loop autonomous guard and _start_local_turn to seconds.
+    Admission then overwrote the adopted turn's active binding, the manager
+    refused the doomed start, and the adopted row leaked in_turn forever.
+    The admission must recheck adoption under the turn-state lock and queue."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    await receipt(store, "inbound", 1)
+    started_turns: list[str] = []
+
+    async def run(planned):
+        started_turns.append(planned.turn_id)
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    original_plan = runtime.plan_pending
+
+    async def plan_with_adoption_race(*args, **kwargs):
+        planned = await original_plan(*args, **kwargs)
+        if planned is not None and not runtime._autonomous_turn_id:
+            assert await runtime.adopt_autonomous_turn(
+                provider_session_id="provider-1"
+            )
+        return planned
+
+    runtime.plan_pending = plan_with_adoption_race  # type: ignore[method-assign]
+
+    # The raced cycle must queue: no daemon turn starts, the adopted binding
+    # survives, and the inbox row stays pending for the retry.
+    assert await runtime.process_once() is False
+    adopted_id = runtime._autonomous_turn_id
+    assert adopted_id
+    assert runtime.active.turn_id == adopted_id
+    assert started_turns == []
+    row = await store.get_message_by_envelope("inbound")
+    assert row.processing_state == "pending"
+
+    # The autonomous terminal settles its row and releases the queue.
+    assert await runtime.finish_autonomous_turn() is True
+    adopted_run = await store.get_turn_run(adopted_id)
+    assert adopted_run is not None and adopted_run.state == "processed"
+
+    # Admission is unblocked: a real daemon turn starts on the retry.
+    runtime.plan_pending = original_plan  # type: ignore[method-assign]
+    assert await runtime.process_once() is True
+    assert started_turns and started_turns[0] != adopted_id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_adopted_turn_settles_its_row_on_terminal(tmp_path):
+    """Defense in depth for the same wedge: if the adopted turn ever loses its
+    active binding anyway, the terminal must still settle the durable row.
+    A row left in_turn reads as "agent busy" to the scheduler -- notices arm
+    but never come due, permanently."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert await runtime.adopt_autonomous_turn(provider_session_id="provider-1")
+    orphan_id = runtime._autonomous_turn_id
+    # Simulate the binding being lost to another writer.
+    runtime.active.clear()
+
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is True
+    assert runtime._autonomous_turn_id == ""
+    assert runtime._autonomous_settle_pending is None
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
+
+    # Admission is unblocked: a daemon turn starts on pending work afterwards.
+    await receipt(store, "inbound", 1)
+    started_turns: list[str] = []
+
+    async def run_turn(planned):
+        started_turns.append(planned.turn_id)
+        await adapter.admit()
+
+    runtime.run_turn = run_turn  # type: ignore[method-assign]
+    assert await runtime.process_once() is True
+    assert started_turns
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_settle_releases_notice_delivery_for_the_session(tmp_path):
+    """P1 of the orphan-settle review: a busy notice can mark pending rows
+    delivered against the orphan's provider session. Requeueing the turn row
+    alone leaves that evidence in place and the same session never sees the
+    rows as candidates again. The settle must release notice delivery, like
+    crash recovery does."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    await receipt(store, "starved-row", 1)
+    assert await runtime.adopt_autonomous_turn(provider_session_id="provider-1")
+    orphan_id = runtime._autonomous_turn_id
+
+    state, candidates = await store.get_notice_snapshot("provider-1")
+    assert [row.envelope_id for row in candidates] == ["starved-row"]
+    assert await store.mark_notice_delivered(
+        state.generation, "provider-1", ("starved-row",), turn_id=orphan_id
+    )
+    assert await store.get_notice_candidates("provider-1") == ()
+
+    runtime.active.clear()
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is True
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
+    # The same provider session sees the row as a candidate again.
+    candidates = await store.get_notice_candidates("provider-1")
+    assert [row.envelope_id for row in candidates] == ["starved-row"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_settle_terminates_the_status_lifecycle(tmp_path):
+    """P2 of the orphan-settle review: a mid-run read_inbox admission marks
+    worker status active for the orphan turn. The settle must emit exactly one
+    terminal from the durable ids -- never from the current active state,
+    which belongs to whichever writer took the binding."""
+    store = await make_store(tmp_path)
+    settled: list[dict] = []
+
+    class _Status:
+        async def on_turn_active(self, **kwargs):
+            settled.append({"event": "active", **kwargs})
+
+        async def on_turn_terminal(self, **kwargs):
+            settled.append({"event": "terminal", **kwargs})
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        status_lifecycle=_Status(),
+    )
+    await receipt(store, "admitted-row", 1)
+    assert await runtime.adopt_autonomous_turn(provider_session_id="provider-1")
+    orphan_id = runtime._autonomous_turn_id
+    rows = await store.get_pending()
+    await runtime._admit_inbox_page(
+        SimpleNamespace(selected=rows, remaining_count=0),
+        snapshot_generation=0,
+        requesting_turn_id=orphan_id,
+        requesting_provider_session_id="provider-1",
+        requesting_provider_turn_id=None,
+    )
+
+    runtime.active.clear()
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is True
+    terminals = [row for row in settled if row["event"] == "terminal"]
+    assert len(terminals) == 1
+    assert terminals[0]["turn_id"] == orphan_id
+    assert terminals[0]["succeeded"] is False
+    assert tuple(terminals[0]["message_ids"]) == ("admitted-row",)
+    row = await store.get_message_by_envelope("admitted-row")
+    assert row.processing_state == "pending"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_orphan_settle_keeps_the_owner_on_unexpected_row_state(tmp_path):
+    """Strictness: a missing or unexpectedly-stated row must keep the
+    autonomous owner and go to settle-pending retry -- clearing it silently
+    is the exact antipattern that produced the wedge."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert await runtime.adopt_autonomous_turn(provider_session_id="provider-1")
+    orphan_id = runtime._autonomous_turn_id
+    runtime.active.clear()
+
+    original_get = store.get_turn_run
+
+    async def missing(_turn_id):
+        return None
+
+    store.get_turn_run = missing  # type: ignore[method-assign]
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is False
+    assert runtime._autonomous_turn_id == orphan_id
+    assert runtime._autonomous_settle_pending == "succeeded"
+
+    async def unexpected(turn_id):
+        run = await original_get(turn_id)
+        assert run is not None
+        return SimpleNamespace(
+            turn_id=run.turn_id,
+            provider_session_id=run.provider_session_id,
+            state="processed",
+            message_ids=run.message_ids,
+        )
+
+    store.get_turn_run = unexpected  # type: ignore[method-assign]
+    runtime._degraded = False
+    runtime._degraded_until = None
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is False
+    assert runtime._autonomous_turn_id == orphan_id
+
+    # With the store healthy again the retry settles and releases the owner.
+    store.get_turn_run = original_get  # type: ignore[method-assign]
+    runtime._degraded = False
+    runtime._degraded_until = None
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is True
+    assert runtime._autonomous_turn_id == ""
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
     await store.close()

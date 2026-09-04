@@ -9,7 +9,6 @@ those responsibilities belong to :mod:`codex_driver`,
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -18,15 +17,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from ...macos.keychain import is_macos
-from ...mcp.config import (
+from ....macos.keychain import is_macos
+from ....mcp.config import (
     INFERENCE_LEVELS,
     default_python_executable,
     puffo_core_mcp_env,
     write_cli_mcp_config,
     write_codex_mcp_config,
 )
-from ...portal.state import (
+from ....portal.state import (
     AgentConfig,
     DaemonConfig,
     agent_claude_user_dir,
@@ -42,43 +41,57 @@ from ...portal.state import (
     sync_host_codex_auth_view,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
+    sync_host_pi_auth_view,
     sync_host_plugins,
     sync_host_skills,
     strip_claude_api_key_from_settings,
 )
-from ...portal.workspace_layout import (
+from ....portal.workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     ensure_workspace_shared_link,
 )
-from ...portal.runtime_matrix import (
+from ....portal.runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from ..adapters.base import (
+from ...adapters.base import (
     STATUS_PREVIEW_CHARS,
     anthropic_base_url_env,
     is_silent,
 )
-from ..adapters.desired_install import run_spawn_install
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin
-from ..runtime_event_outbox import (
+from ...adapters.desired_install import run_spawn_install
+from ...cli_bin import (
+    resolve_claude_bin,
+    resolve_codex_bin,
+    resolve_opencode_bin,
+    resolve_pi_bin,
+)
+from ...runtime_event_outbox import (
     RuntimeEventOutbox,
     RuntimeEventProjectingSink,
 )
-from ..runtime_events import RuntimeEventProjector, TrustedScope
-from . import UnsupportedDriver, build_driver
-from .driver import (
+from ...runtime_events import RuntimeEventProjector, TrustedScope
+from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
+from ..support.child_env import build_child_environment
+from ..drivers.pi_bridge import (
+    build_bridge_environment,
+    install_pi_tool_bridge,
+    mint_bridge_nonce,
+    ready_file_path,
+)
+from ..driver import (
     Driver,
     HarnessEvent,
     HarnessEventType,
+    McpServerSpec,
     RuntimeSpec,
     SessionRef,
 )
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
+from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_LOCAL_DRIVERS = frozenset({"codex", "claude-code"})
 VALID_PERMISSION_MODES = frozenset({"bypassPermissions"})
 VALID_SANDBOX_MODES = frozenset({
     "read-only",
@@ -246,6 +259,31 @@ class PreparedLocalRuntime:
         )
 
 
+def select_native_session(
+    *,
+    harness_name: str,
+    persisted_native_session_id: str,
+    persisted_native_session_harness: str,
+    legacy_native_session_id: str,
+) -> tuple[str, str]:
+    """Resume only native sessions created by the active harness."""
+    if (
+        persisted_native_session_id
+        and persisted_native_session_harness == harness_name
+    ):
+        return persisted_native_session_id, "runtime_event_outbox"
+    # Legacy session files predate generic Driver runtimes and belong only
+    # to the two harnesses that originally wrote them.  In particular,
+    # cli_session.json is a Claude Code file; feeding it to Pi/OpenCode/ACP
+    # would reintroduce a stale cross-harness resume after the tagged outbox
+    # correctly rejected the previous session.
+    if legacy_native_session_id and harness_name in {"codex", "claude-code"}:
+        return legacy_native_session_id, "legacy_session_file"
+    if persisted_native_session_id:
+        return "", "harness_changed"
+    return "", "fresh"
+
+
 class LocalRuntimePreparer:
     """Build refreshable RuntimeSpecs for one local Driver runtime."""
 
@@ -262,11 +300,14 @@ class LocalRuntimePreparer:
             provider,
             agent_cfg.runtime.harness,
         ).strip()
+        self.provider = provider
         if self.harness_name not in SUPPORTED_LOCAL_DRIVERS:
+            supported = ", ".join(
+                f"{name!r}" for name in sorted(SUPPORTED_LOCAL_DRIVERS)
+            )
             raise RuntimeError(
                 f"agent {self.agent_id!r}: runtime.kind='cli-local' supports "
-                "only harness='codex' or harness='claude-code' in the "
-                "Driver runtime"
+                f"only harness in ({supported}) in the Driver runtime"
             )
         self.workspace_dir = agent_cfg.resolve_workspace_dir()
         self.claude_dir = agent_cfg.resolve_claude_dir()
@@ -289,19 +330,19 @@ class LocalRuntimePreparer:
         *,
         system_prompt: str,
         persisted_native_session_id: str = "",
+        persisted_native_session_harness: str = "",
     ) -> PreparedLocalRuntime:
         spec = await self.refresh_spec(system_prompt)
         legacy_path = self._legacy_session_path()
         legacy_id = self._load_legacy_session_id(legacy_path)
-        if persisted_native_session_id:
-            native_session_id = persisted_native_session_id
-            source = "runtime_event_outbox"
-        elif legacy_id:
-            native_session_id = legacy_id
-            source = "legacy_session_file"
-        else:
-            native_session_id = ""
-            source = "fresh"
+        native_session_id, source = select_native_session(
+            harness_name=self.harness_name,
+            persisted_native_session_id=persisted_native_session_id,
+            persisted_native_session_harness=(
+                persisted_native_session_harness
+            ),
+            legacy_native_session_id=legacy_id,
+        )
         return PreparedLocalRuntime(
             harness_name=self.harness_name,
             spec=spec,
@@ -329,13 +370,178 @@ class LocalRuntimePreparer:
         await self._install_desired_once()
         if self.harness_name == "codex":
             return self._prepare_codex_spec(system_prompt)
-        return self._prepare_claude_spec(system_prompt)
+        if self.harness_name == "claude-code":
+            return self._prepare_claude_spec(system_prompt)
+        return self._prepare_generic_spec(system_prompt)
 
     def _resolve_model(self) -> str:
         runtime = self.agent_cfg.runtime
         if self.harness_name == "codex":
             return runtime.model or self.daemon_cfg.openai.model or ""
-        return runtime.model or self.daemon_cfg.anthropic.model or ""
+        if self.harness_name == "claude-code":
+            return runtime.model or self.daemon_cfg.anthropic.model or ""
+        provider_cfg = getattr(self.daemon_cfg, self.provider, None)
+        return runtime.model or getattr(provider_cfg, "model", "") or ""
+
+    def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+        executable, launch_args = self._resolve_generic_command()
+        controlled, opencode_config = self._prepare_executable_configuration(
+            executable, system_prompt
+        )
+        mcp_servers = self._project_protocol_mcp(
+            controlled, opencode_config
+        )
+        if opencode_config:
+            controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+                opencode_config
+            )
+        return RuntimeSpec(
+            workspace_dir=str(self.workspace_dir),
+            model=self.model,
+            system_prompt=system_prompt,
+            executable=executable,
+            launch_args=tuple(launch_args),
+            environment=build_child_environment(
+                overrides=self.agent_cfg.env_overrides,
+                controlled=controlled,
+            ),
+            mcp_servers=mcp_servers,
+            permission_mode=self.permission_mode,
+            sandbox=self.sandbox,
+            task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+        )
+
+    def _resolve_generic_command(self) -> tuple[str, list[str]]:
+        command = tuple(self.agent_cfg.runtime.harness_command)
+        # Older web clients persisted the bare argv ["pi"]. Normalize that at
+        # this compatibility boundary so both old configs and new commandless
+        # presets use the daemon's broad PATH / PUFFO_PI_BIN resolver.
+        if self.harness_name == "pi" and command == ("pi",):
+            command = ()
+        if command:
+            executable, *launch_args = command
+        elif self.harness_name in {"opencode", "pi"}:
+            resolver = (
+                resolve_opencode_bin
+                if self.harness_name == "opencode"
+                else resolve_pi_bin
+            )
+            executable = resolver() or ""
+            launch_args = []
+            if not executable:
+                raise RuntimeError(
+                    f"{self.harness_name} binary not found. Install "
+                    f"{self.harness_name} or set "
+                    f"PUFFO_{self.harness_name.upper()}_BIN=/absolute/path/"
+                    f"to/{self.harness_name}."
+                )
+        else:
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: harness='acp' requires "
+                "runtime.harness_command, for example "
+                "['opencode', 'acp']"
+            )
+        if (
+            self.harness_name == "pi"
+            and "/" not in self.model
+            and "--provider" not in launch_args
+        ):
+            launch_args.extend(("--provider", self.provider))
+        inference_level = self.agent_cfg.runtime.inference_level
+        if (
+            self.harness_name == "pi"
+            and inference_level
+            and "--thinking" not in launch_args
+        ):
+            launch_args.extend(("--thinking", inference_level))
+        return executable, launch_args
+
+    def _prepare_executable_configuration(
+        self, executable: str, system_prompt: str
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Project configuration selected by executable family.
+
+        ACP-over-OpenCode intentionally receives OpenCode's instructions file;
+        this axis is independent of which Driver protocol owns the process.
+        """
+        controlled: dict[str, str] = {}
+        uses_opencode_executable = Path(executable).name.lower() in {
+            "opencode",
+            "opencode.exe",
+        }
+        opencode_config: dict[str, Any] = {}
+        if uses_opencode_executable:
+            instruction_path = (
+                agent_dir(self.agent_id) / "opencode-instructions.md"
+            )
+            instruction_path.parent.mkdir(parents=True, exist_ok=True)
+            instruction_path.write_text(system_prompt, encoding="utf-8")
+            opencode_config["instructions"] = [str(instruction_path)]
+        return controlled, opencode_config
+
+    def _project_protocol_mcp(
+        self,
+        controlled: dict[str, str],
+        opencode_config: dict[str, Any],
+    ) -> tuple[McpServerSpec, ...]:
+        """Project Puffo tools according to the selected Driver protocol.
+
+        Native OpenCode receives its inline MCP configuration. ACP-over-
+        OpenCode carries the same server through ``RuntimeSpec.mcp_servers``
+        and must not receive the native inline projection.
+        """
+        mcp_servers: tuple[McpServerSpec, ...] = ()
+        if self._puffo_core_env:
+            puffo_command = default_python_executable()
+            puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
+            puffo_server = McpServerSpec(
+                name="puffo",
+                command=puffo_command,
+                args=puffo_args,
+                environment=self._puffo_core_env,
+            )
+            if self.harness_name == "pi":
+                # Pi has no MCP client. Its attested extension bridge carries
+                # only Puffo's core server; keeping mcp_servers empty is part
+                # of the Driver admission contract.
+                controlled.update(self._prepare_pi_bridge(puffo_server))
+            else:
+                mcp_servers = (puffo_server,)
+            if self.harness_name == "opencode":
+                opencode_config["mcp"] = {
+                    "puffo": {
+                        "type": "local",
+                        "command": [puffo_command, *puffo_args],
+                        "environment": self._puffo_core_env,
+                    }
+                }
+        else:
+            logger.warning(
+                "agent %s: Puffo MCP tools are unavailable because "
+                "puffo_core is incomplete",
+                self.agent_id,
+            )
+        return mcp_servers
+
+    def _prepare_pi_bridge(self, mcp: McpServerSpec) -> dict[str, str]:
+        """Install the bridge and mint fresh per-spec readiness evidence."""
+        pi_home = agent_dir(self.agent_id) / ".pi" / "agent"
+        install_pi_tool_bridge(pi_home)
+        auth_mode = sync_host_pi_auth_view(Path.home(), pi_home)
+        logger.info(
+            "agent %s: Pi credential projection mode=%s",
+            self.agent_id,
+            auth_mode,
+        )
+        controlled = {"PI_CODING_AGENT_DIR": str(pi_home)}
+        controlled.update(
+            build_bridge_environment(
+                mcp=mcp,
+                ready_file=ready_file_path(pi_home),
+                nonce=mint_bridge_nonce(),
+            )
+        )
+        return controlled
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core
@@ -428,7 +634,7 @@ class LocalRuntimePreparer:
                 "PUFFO_CLAUDE_BIN=/absolute/path/to/claude."
             )
         launch_args = ["--dangerously-skip-permissions"]
-        from ...portal.control.context_telemetry import (
+        from ....portal.control.context_telemetry import (
             claude_autocompact_tokens,
             configured_compact_pct,
         )
@@ -470,21 +676,24 @@ class LocalRuntimePreparer:
         remove_legacy_permission_hook(self.claude_dir)
         runtime = self.agent_cfg.runtime
         llm_env = anthropic_base_url_env(runtime.llm_base_url)
-        environment = dict(os.environ)
-        environment.pop("ANTHROPIC_API_KEY", None)
-        environment.update(self.agent_cfg.env_overrides)
-        environment.pop("ANTHROPIC_API_KEY", None)
         if llm_env and runtime.api_key:
             llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
         else:
             configured_key = claude_cli_api_key(self.daemon_cfg)
             if configured_key:
                 llm_env["ANTHROPIC_API_KEY"] = configured_key
-        environment.update({
-            "HOME": str(self.agent_home),
-            "USERPROFILE": str(self.agent_home),
-            **llm_env,
-        })
+        # Same guarantee the old pop-before-and-after-overrides dance gave,
+        # now from an allowlist: ambient provider keys never reach the child,
+        # an override cannot reintroduce one, and only llm_env injects the
+        # controlled key.
+        environment = build_child_environment(
+            overrides=self.agent_cfg.env_overrides,
+            controlled={
+                "HOME": str(self.agent_home),
+                "USERPROFILE": str(self.agent_home),
+                **llm_env,
+            },
+        )
         if is_macos():
             environment["CLAUDE_CONFIG_DIR"] = str(
                 agent_claude_user_dir(self.agent_id)
@@ -528,13 +737,12 @@ class LocalRuntimePreparer:
             })
         write_codex_mcp_config(codex_home / "config.toml", **config_kwargs)
 
-        environment = {
-            **os.environ,
-            **self.agent_cfg.env_overrides,
-            "CODEX_HOME": str(codex_home),
-        }
+        # Controlled injection only: an ambient OPENAI_API_KEY must not reach
+        # the child. Native OAuth uses the CODEX_HOME auth view instead, and
+        # the gateway branch supplies its own key explicitly.
+        controlled: dict[str, str] = {"CODEX_HOME": str(codex_home)}
         if gateway:
-            environment["OPENAI_API_KEY"] = self.agent_cfg.runtime.api_key
+            controlled["OPENAI_API_KEY"] = self.agent_cfg.runtime.api_key
         else:
             auth_mode = sync_host_codex_auth_view(host_home, codex_home)
             if auth_mode == "no-host-file":
@@ -555,12 +763,17 @@ class LocalRuntimePreparer:
                 "PUFFO_CODEX_BIN=/absolute/path/to/codex."
             )
         self._ensure_codex_self_invoke(executable)
+        environment = build_child_environment(
+            overrides=self.agent_cfg.env_overrides,
+            controlled=controlled,
+            extra_allowed=("CODEX_HOME",),
+        )
         environment["PATH"] = self._prepend_executable_path(
             environment.get("PATH", ""),
             executable,
         )
         self._log_host_access()
-        from ...portal.control.context_telemetry import configured_compact_pct
+        from ....portal.control.context_telemetry import configured_compact_pct
 
         compact_pct = configured_compact_pct(
             "codex", self.agent_cfg.env_overrides
@@ -671,9 +884,9 @@ def _normalized_tool_label(label: str) -> str:
 
 
 def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
-    from ...portal.control.reporter import get_reporter
+    from ....portal.control.reporter import get_reporter
 
-    asyncio.ensure_future(get_reporter().emit(agent_id, event, payload))
+    spawn(get_reporter().emit(agent_id, event, payload), name="reporter.emit")
 
 
 class _LegacyStatusProjector:
@@ -806,6 +1019,7 @@ def build_local_runtime_adapter(
                 active_turn,
                 session_ref=logical_session,
                 native_session_id=manager.native_session_id,
+                native_session_harness=prepared.harness_name,
             )
         except Exception as exc:
             logger.warning(

@@ -1,4 +1,3 @@
-import asyncio
 
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
@@ -9,6 +8,7 @@ from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
 from .errors import AgentAPIError
 from .message_projection import model_attachment_path
 from .memory import MemoryManager
+from ..tasks import spawn
 
 MAX_LOG_ENTRIES = 60
 
@@ -395,12 +395,13 @@ class PuffoAgent:
         # → turn_complete (tokens). Best-effort; no-ops if the owner isn't linked.
         from ..portal.control.reporter import get_reporter
 
-        asyncio.ensure_future(
+        spawn(
             get_reporter().emit(
                 self.agent_id,
                 "turn_start",
                 {"message": _user_message_preview(ctx.messages)},
-            )
+            ),
+            name="reporter.emit:turn_start",
         )
         result = await self.adapter.run_turn(ctx)
 
@@ -427,12 +428,13 @@ class PuffoAgent:
         context_measured_at = result.metadata.get("context_measured_at")
         if isinstance(context_measured_at, str) and context_measured_at:
             turn_complete_payload["context_measured_at"] = context_measured_at
-        asyncio.ensure_future(
+        spawn(
             get_reporter().emit(
                 self.agent_id,
                 "turn_complete",
                 turn_complete_payload,
-            )
+            ),
+            name="reporter.emit:turn_complete",
         )
 
         return self._route_turn_result(
@@ -500,12 +502,13 @@ class PuffoAgent:
             f"send_message and [SILENT] markers; posting "
             f"{len(text_parts) or 1}-frame fallback"
         )
-        asyncio.ensure_future(
+        spawn(
             get_reporter().emit(
                 self.agent_id,
                 "tool_use",
                 {"tool": "fallback", "content": fallback[:STATUS_PREVIEW_CHARS]},
-            )
+            ),
+            name="reporter.emit:tool_use",
         )
         self._append_assistant(channel_name, fallback)
         return fallback

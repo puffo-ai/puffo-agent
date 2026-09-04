@@ -382,6 +382,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Register / unregister / inspect after-login daemon autostart."""
+    from . import autostart
+
+    if args.autostart_cmd == "enable":
+        result = autostart.enable(linger=getattr(args, "linger", False))
+    elif args.autostart_cmd == "disable":
+        result = autostart.disable()
+    else:
+        state = autostart.status()
+        for line in state.lines:
+            print(line)
+        return 0
+    stream = sys.stdout if result.ok else sys.stderr
+    for line in result.lines:
+        print(line, file=stream)
+    return 0 if result.ok else 1
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     """Print installed version + install mode."""
     local = get_local_version()
@@ -500,10 +519,19 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     provider = args.provider or ""
     from .runtime_matrix import resolve_effective_harness, validate_triple
 
-    harness = resolve_effective_harness(runtime_kind, provider, "")
+    harness = getattr(args, "harness", None) or resolve_effective_harness(
+        runtime_kind, provider, ""
+    )
     validation = validate_triple(runtime_kind, provider, harness)
     if not validation.ok:
         print(f"error: {validation.error}", file=sys.stderr)
+        return 2
+    harness_command = list(getattr(args, "harness_command", None) or [])
+    if runtime_kind == "cli-local" and harness == "acp" and not harness_command:
+        print(
+            "error: --harness acp requires --harness-command EXECUTABLE [ARG ...]",
+            file=sys.stderr,
+        )
         return 2
     role = (args.role or "").strip()
     role_short_raw = getattr(args, "role_short", None)
@@ -542,6 +570,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             api_key=args.api_key or "",
             model=args.model or "",
             harness=harness,
+            harness_command=harness_command,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -634,6 +663,7 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
             "drained",
             "unhandled_error",
             "codex_thread_wedged",
+            "server_unreachable",
         ):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.
@@ -1069,6 +1099,9 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
+    if args.harness_command is not None:
+        cfg.runtime.harness_command = list(args.harness_command)
+        touched = True
     status, level_touched, inference_level_cleared = _apply_cli_inference_level(
         cfg, args
     )
@@ -1083,6 +1116,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  provider:         {cfg.runtime.provider or '(default)'}")
         print(
             f"  harness:          {cfg.runtime.harness}  (cli-local / cli-docker only)"
+        )
+        print(
+            "  harness_command:  "
+            + (" ".join(cfg.runtime.harness_command) or "(default)")
         )
         print(f"  model:            {cfg.runtime.model or '(default)'}")
         print(
@@ -1104,6 +1141,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if not result.ok:
         print(f"error: {result.error}", file=sys.stderr)
         return 2
+    command_error = _harness_command_error(cfg.runtime)
+    if command_error:
+        print(f"error: {command_error}", file=sys.stderr)
+        return 2
 
     cfg.save()
     print(f"agent {agent_id!r} runtime updated:")
@@ -1117,6 +1158,19 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if is_daemon_alive():
         print("daemon will restart the worker on the next reconcile tick.")
     return 0
+
+
+def _harness_command_error(runtime: RuntimeConfig) -> str:
+    if (
+        runtime.kind == "cli-local"
+        and runtime.harness == "acp"
+        and not runtime.harness_command
+    ):
+        return (
+            "harness='acp' requires --harness-command "
+            "EXECUTABLE [ARG ...]"
+        )
+    return ""
 
 
 def cmd_agent_archive(args: argparse.Namespace) -> int:
@@ -1236,17 +1290,41 @@ def cmd_link(args: argparse.Namespace) -> int:
     name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(
+        link_rc = asyncio.run(
             run_link(
                 server_url,
                 name,
                 open_browser=not args.not_open,
-                code=getattr(args, "code", None),
+                code=args.code,
             )
         )
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
+    if link_rc == 0 and not args.no_autostart:
+        _enable_autostart_after_link()
+    return link_rc
+
+
+def _enable_autostart_after_link() -> None:
+    from . import autostart
+
+    try:
+        result = autostart.enable()
+    except Exception as exc:  # noqa: BLE001
+        result = autostart.ActionResult(False, [str(exc)])
+    if result.ok:
+        print("link: autostart enabled.")
+        for line in result.lines:
+            print(line)
+        return
+    print("warning: link succeeded, but autostart could not be enabled.", file=sys.stderr)
+    for line in result.lines:
+        print(line, file=sys.stderr)
+    print(
+        "Run `puffo-agent autostart enable` manually to retry.",
+        file=sys.stderr,
+    )
 
 
 def cmd_unlink(args: argparse.Namespace) -> int:

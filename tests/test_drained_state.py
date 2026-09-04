@@ -678,13 +678,13 @@ def test_local_warm_still_holds_on_auth_and_on_programming_errors():
 
 
 class _StubLoop:
-    """Stand-in for asyncio.create_task that records the call but doesn't
+    """Stand-in for the spawn helper that records the call but doesn't
     schedule, so the dedup gate is observable without an event loop."""
 
     def __init__(self):
         self.calls = 0
 
-    def create_task(self, coro):
+    def spawn(self, coro, *, name=None):
         self.calls += 1
         coro.close()
         return None
@@ -696,7 +696,7 @@ def _stub_create_task(monkeypatch):
     from puffo_agent.portal import worker as worker_module
 
     stub = _StubLoop()
-    monkeypatch.setattr(worker_module.asyncio, "create_task", stub.create_task)
+    monkeypatch.setattr(worker_module, "spawn", stub.spawn)
     return stub
 
 
@@ -781,11 +781,11 @@ def test_scheduling_failure_re_arms_the_notification(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
     from puffo_agent.portal import worker as worker_module
 
-    def boom(coro):
+    def boom(coro, *, name=None):
         coro.close()
         raise RuntimeError("no running loop")
 
-    monkeypatch.setattr(worker_module.asyncio, "create_task", boom)
+    monkeypatch.setattr(worker_module, "spawn", boom)
     w = _drained_worker("agent-cb-raises")
     w._enter_drained("agent-cb-raises")
     assert w.runtime.health == "drained"

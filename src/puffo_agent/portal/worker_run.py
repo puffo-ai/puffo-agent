@@ -24,6 +24,7 @@ from .workspace_layout import (
 from ..agent.errors import ProviderFailureError
 from ..agent.processing_receipts import processing_run_id
 from ..agent._usage_markers import parse_reset_epoch
+from ..tasks import spawn
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -215,7 +216,10 @@ class StandardWorkerRun:
         context = await self._initialize()
         if context is None or not await self._warm(context):
             return
-        asyncio.ensure_future(self._sync_profile_after_warm(context.paths.agent_id))
+        spawn(
+            self._sync_profile_after_warm(context.paths.agent_id),
+            name="sync_profile_after_warm",
+        )
         services = await self._start_services(context)
         try:
             await self._listen(context, services)
@@ -320,7 +324,7 @@ class StandardWorkerRun:
                 f"agent {worker.agent_cfg.id!r}: runtime kind {kind!r} "
                 "does not use the built-in Driver runtime"
             )
-        from ..agent.harness.local_runtime import LocalRuntimePreparer
+        from ..agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         return await self._prepare_driver_runtime(
             paths,
@@ -348,6 +352,9 @@ class StandardWorkerRun:
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
+            persisted_native_session_harness=persisted.get(
+                "native_session_harness", ""
+            ),
         )
         try:
             return await self._bind_driver_runtime(
@@ -370,8 +377,8 @@ class StandardWorkerRun:
         """Bind a prepared runtime to the durable outbox and Runtime Manager."""
         worker = self.worker
         from ..agent.harness import build_driver
-        from ..agent.harness.docker_runtime import DockerRuntimePreparer
-        from ..agent.harness.local_runtime import build_local_runtime_adapter
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+        from ..agent.harness.runtime.local_runtime import build_local_runtime_adapter
 
         session_ref = (
             persisted.get("session_ref", "")
@@ -382,6 +389,7 @@ class StandardWorkerRun:
             active_turn_ref,
             session_ref=session_ref,
             native_session_id=prepared.native_session_id,
+            native_session_harness=prepared.harness_name,
         )
         driver = None
         cleanup = None
@@ -406,7 +414,7 @@ class StandardWorkerRun:
         Only the Docker owner starts a container inside ``prepare``; the
         host-local preparer has nothing to tear down.
         """
-        from ..agent.harness.docker_runtime import DockerRuntimePreparer
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
 
         if not isinstance(preparer, DockerRuntimePreparer):
             return
@@ -436,9 +444,7 @@ class StandardWorkerRun:
                 claude_dir=paths.claude_path,
                 agent_id=agent_id,
             )
-            client = worker_module._build_puffo_core_client(
-                worker.agent_cfg, agent_id, daemon_cfg=worker.daemon_cfg
-            )
+            client = worker._build_wired_client()
             worker._client = client
             return WorkerRunContext(
                 paths=paths,
@@ -497,6 +503,9 @@ class StandardWorkerRun:
                 persisted.get("active_turn_ref") or None,
                 session_ref=context.runtime_session_ref,
                 native_session_id=worker._adapter.get_provider_session_id() or "",
+                native_session_harness=(
+                    context.prepared_local_runtime.harness_name
+                ),
             )
             context.prepared_local_runtime.finalize_legacy_session_migration()
         if warm_ok:
@@ -857,21 +866,26 @@ class StandardWorkerRun:
             ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
-        global_task = asyncio.ensure_future(global_runtime.run())
+        global_task = spawn(
+            global_runtime.run(),
+            name="global_runtime.run",
+        )
         reminder_task = None
         if reminder_sync is not None:
-            reminder_task = asyncio.ensure_future(
-                reminder_sync.run(request_snapshot_on_start=False)
+            reminder_task = spawn(
+                reminder_sync.run(request_snapshot_on_start=False),
+                name="reminder_sync.run",
             )
-        heartbeat_task = asyncio.ensure_future(self._heartbeat(context.paths.agent_id))
-        status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
-        watch_task = asyncio.ensure_future(
+        heartbeat_task = spawn(self._heartbeat(context.paths.agent_id), name="heartbeat")
+        status_task = spawn(reporter.run_heartbeat_loop(), name="reporter.run_heartbeat_loop")
+        watch_task = spawn(
             worker._refresh_watcher_loop(
                 context.paths.refresh_flags,
                 lambda: self._apply_refresh(context),
-            )
+            ),
+            name="worker.refresh_watcher_loop",
         )
-        upload_task = asyncio.ensure_future(self._upload_runtime_events(uploader))
+        upload_task = spawn(self._upload_runtime_events(uploader), name="upload_runtime_events")
         return WorkerRunServices(
             global_runtime=global_runtime,
             global_runtime_task=global_task,

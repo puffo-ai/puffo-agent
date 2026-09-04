@@ -132,9 +132,9 @@ def test_stale_command_rejected(home):
     op_root = base64url_encode(operator.public_key_bytes())
     ts = store.now_ms()
     env = _command(operator, machine, "cmd_3", "pause", ts)
-    # 10 minutes later → outside the ±5min window.
+    # 20 minutes later → outside the ±15min window.
     with pytest.raises(ControlError):
-        decrypt_command(env, machine, op_root, ts + 10 * 60 * 1000)
+        decrypt_command(env, machine, op_root, ts + 20 * 60 * 1000)
 
 
 def test_pairing_persist_round_trip(home):

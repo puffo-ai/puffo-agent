@@ -26,6 +26,14 @@ def _strip_puffo_mcp_prefix_for_codex(text: str) -> str:
     return _MCP_PUFFO_PREFIX_RE.sub("", text)
 
 
+def _rewrite_puffo_mcp_prefix_for_opencode(text: str) -> str:
+    # opencode registers MCP tools as ``<server>_<tool>`` (its docs: "MCP
+    # server tools are registered with server name as prefix"), so the
+    # claude-code spelling ``mcp__puffo__send_message`` becomes
+    # ``puffo_send_message`` — rewrite, not strip.
+    return _MCP_PUFFO_PREFIX_RE.sub("puffo_", text)
+
+
 DEFAULT_SHARED_CLAUDE_MD = """\
 # Puffo.ai platform primer
 

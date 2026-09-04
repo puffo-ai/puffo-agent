@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
-from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 from puffo_agent.portal import cli, state
 from puffo_agent.portal.daemon import Daemon
 from puffo_agent.portal.state import (
@@ -27,7 +27,7 @@ def _local_preparer(
     runtime_key: str = "",
     base_url: str = "",
 ) -> LocalRuntimePreparer:
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))

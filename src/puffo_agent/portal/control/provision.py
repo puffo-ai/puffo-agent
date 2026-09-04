@@ -40,9 +40,9 @@ MAX_ROLE_SHORT_LEN = 32
 
 
 class ProvisionError(Exception):
-    def __init__(self, reason: str, **fields: Any) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    def __init__(self, message: str, **fields: Any) -> None:
+        super().__init__(message)
+        self.reason = message
         self.fields = fields
 
 
@@ -217,6 +217,13 @@ def _verify_runtime(runtime_input: dict) -> RuntimeConfig:
     provider = str(runtime_input.get("provider", ""))
     harness = str(runtime_input.get("harness", "claude-code"))
     inference_level = str(runtime_input.get("inference_level", ""))
+    harness_command = runtime_input.get("harness_command") or []
+    if not isinstance(harness_command, list) or not all(
+        isinstance(item, str) and item for item in harness_command
+    ):
+        raise ProvisionError(
+            "runtime.harness_command must be a list of non-empty strings"
+        )
     if raw_kind != kind and not validate_triple(kind, provider, harness).ok:
         harness = resolve_effective_harness(kind, provider, "")
         inference_level = normalize_inference_level(
@@ -228,6 +235,7 @@ def _verify_runtime(runtime_input: dict) -> RuntimeConfig:
         model=str(runtime_input.get("model", "")),
         api_key=str(runtime_input.get("api_key", "")),
         harness=harness,
+        harness_command=list(harness_command),
         permission_mode=str(runtime_input.get("permission_mode", "bypassPermissions")),
         inference_level=inference_level,
         max_turns=int(runtime_input.get("max_turns", 10)),
@@ -235,6 +243,10 @@ def _verify_runtime(runtime_input: dict) -> RuntimeConfig:
     validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
+    if runtime.kind == RUNTIME_CLI_LOCAL and runtime.harness == "acp" and not runtime.harness_command:
+        raise ProvisionError(
+            "runtime.harness_command is required when runtime.harness='acp'"
+        )
     effective_harness = resolve_effective_harness(
         runtime.kind,
         resolve_effective_provider(runtime.kind, runtime.provider),
@@ -321,9 +333,15 @@ def write_agent_from_context(context: dict) -> dict:
 
 
 async def provision_agent_from_bundle(
-    payload: dict, operator_root_key_b64: str, *, materialize=None,
+    payload: dict,
+    operator_root_key_b64: str,
+    *,
+    preflight=None,
+    materialize=None,
 ) -> dict:
     context = verify_agent_bundle(payload, operator_root_key_b64)
+    if preflight is not None:
+        await preflight(context)
     if materialize is not None:
         await materialize(context)
     result = write_agent_from_context(context)

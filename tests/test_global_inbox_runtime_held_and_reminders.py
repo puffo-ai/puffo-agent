@@ -974,6 +974,63 @@ async def test_runtime_surfaces_owned_reminder_scheduler_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_reports_and_settles_simultaneous_owned_failures(
+    tmp_path, caplog,
+):
+    store = await make_store(tmp_path)
+    release = asyncio.Event()
+    unhandled = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    class FailingScheduler:
+        async def run(self):
+            await release.wait()
+            raise RuntimeError("reminder failed")
+
+        def stop(self):
+            return None
+
+    async def fail_burst():
+        await release.wait()
+        raise ValueError("burst failed")
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        reminder_scheduler=FailingScheduler(),
+    )
+    runtime.coalescer.wait_for_burst = fail_burst
+    caplog.set_level(logging.ERROR, logger="puffo_agent.tasks")
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    try:
+        running = asyncio.create_task(runtime.run())
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(RuntimeError, match="reminder failed"):
+            await running
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await store.close()
+
+    failures = [
+        record
+        for record in caplog.records
+        if record.name == "puffo_agent.tasks"
+        and record.levelno == logging.ERROR
+    ]
+    assert sorted(str(record.exc_info[1]) for record in failures) == [
+        "burst failed",
+        "reminder failed",
+    ]
+    assert all(record.exc_info is not None for record in failures)
+    assert unhandled == []
+
+
+@pytest.mark.asyncio
 async def test_changed_pending_generation_replaces_accepted_notice_without_losing_unread_rows(
     tmp_path,
 ):

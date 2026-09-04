@@ -20,7 +20,11 @@ from typing import Any
 
 from ...crypto.http_client import HttpError, PuffoCoreHttpClient
 from ...skill_ids import SKILL_ID_RE
-from ..shared_content import _strip_puffo_mcp_prefix_for_codex
+from ..harness.support.assets import (
+    HarnessAssetsProfile,
+    McpProjection,
+    get_harness_assets_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +176,7 @@ def write_desired_skill_codex(
     return _write_skill_to_dir(
         workspace_dir / ".agents" / "skills" / template_id,
         template_id,
-        _strip_puffo_mcp_prefix_for_codex(body),
+        get_harness_assets_profile("codex").transform_skill_body(body),
     )
 
 
@@ -343,34 +347,56 @@ async def install_desired(
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
     Containerized installs skip stdio commands that cannot resolve there.
     """
-    # hermes has no skills / MCP surface — bail rather than write into
-    # a ``.claude/`` it never reads.
-    if harness_name == "hermes":
+    profile = get_harness_assets_profile(harness_name)
+    if not profile.supported:
         if desired_skills or desired_mcps:
             logger.info(
-                "agent %s: hermes harness — skipping %d desired_skills + "
-                "%d desired_mcps (no skills/MCP surface in hermes v1)",
-                agent_id, len(desired_skills), len(desired_mcps),
+                "agent %s: %s harness — skipping %d desired_skills + "
+                "%d desired_mcps (%s)",
+                agent_id,
+                harness_name,
+                len(desired_skills),
+                len(desired_mcps),
+                profile.unsupported_reason,
             )
         return {}
 
-    is_codex = harness_name == "codex"
-    await _install_desired_skills(
-        http=http,
-        agent_home=agent_home,
-        workspace_dir=workspace_dir,
-        agent_id=agent_id,
-        desired_skills=desired_skills,
-        is_codex=is_codex,
-    )
-    return await _install_desired_mcps(
-        http=http,
-        agent_home=agent_home,
-        agent_id=agent_id,
-        desired_mcps=desired_mcps,
-        is_codex=is_codex,
-        containerized=containerized,
-    )
+    if profile.skills_supported:
+        await _install_desired_skills(
+            http=http,
+            agent_home=agent_home,
+            workspace_dir=workspace_dir,
+            agent_id=agent_id,
+            desired_skills=desired_skills,
+            profile=profile,
+        )
+    elif desired_skills:
+        logger.info(
+            "agent %s: %s harness — skipping %d desired_skills (%s)",
+            agent_id,
+            harness_name,
+            len(desired_skills),
+            profile.unsupported_reason,
+        )
+
+    if profile.mcp_supported:
+        return await _install_desired_mcps(
+            http=http,
+            agent_home=agent_home,
+            agent_id=agent_id,
+            desired_mcps=desired_mcps,
+            profile=profile,
+            containerized=containerized,
+        )
+    if desired_mcps:
+        logger.info(
+            "agent %s: %s harness — skipping %d desired_mcps (%s)",
+            agent_id,
+            harness_name,
+            len(desired_mcps),
+            profile.unsupported_reason,
+        )
+    return {}
 
 
 async def _install_desired_skills(
@@ -380,7 +406,7 @@ async def _install_desired_skills(
     workspace_dir: Path,
     agent_id: str,
     desired_skills: list[str],
-    is_codex: bool,
+    profile: HarnessAssetsProfile,
 ) -> None:
     """Install selected skills and prune stale desired-only entries."""
 
@@ -392,9 +418,10 @@ async def _install_desired_skills(
         if not isinstance(body, str):
             logger.warning("desired skill %r: no body in template — skipping", sid)
             continue
-        result = (
-            write_desired_skill_codex(workspace_dir, sid, body) if is_codex
-            else write_desired_skill(agent_home, sid, body)
+        result = _write_skill_to_dir(
+            profile.skills_root(agent_home, workspace_dir) / sid,
+            sid,
+            profile.transform_skill_body(body),
         )
         if result == "installed":
             logger.info("agent %s: installed desired skill %r", agent_id, sid)
@@ -406,10 +433,7 @@ async def _install_desired_skills(
 
     # Sweep desired-only leftovers, after the install loop so this
     # pass's own ids aren't candidates.
-    skills_root = (
-        workspace_dir / ".agents" / "skills" if is_codex
-        else agent_home / ".claude" / "skills"
-    )
+    skills_root = profile.skills_root(agent_home, workspace_dir)
     pruned = prune_stale_desired_skills(skills_root, desired_skills)
     if pruned:
         logger.info(
@@ -424,7 +448,7 @@ async def _install_desired_mcps(
     agent_home: Path,
     agent_id: str,
     desired_mcps: list[str],
-    is_codex: bool,
+    profile: HarnessAssetsProfile,
     containerized: bool,
 ) -> dict[str, dict[str, Any]]:
     """Install selected MCPs or return their Codex config entries."""
@@ -454,13 +478,13 @@ async def _install_desired_mcps(
                     unreachable[0][1],
                 )
                 continue
-        if is_codex:
+        if profile.mcp_projection is McpProjection.RUNTIME_EXTRAS:
             codex_extras[mid] = _codex_extras_entry(spec)
             logger.info(
                 "agent %s: queued desired mcp %r (%s) for codex config.toml",
                 agent_id, mid, spec["type"],
             )
-        else:
+        elif profile.mcp_projection is McpProjection.CLAUDE_JSON:
             result = install_claude_mcp(agent_home, mid, spec)
             if result == "installed":
                 logger.info(
@@ -472,4 +496,8 @@ async def _install_desired_mcps(
                     "agent %s: desired mcp %r already present — left untouched",
                     agent_id, mid,
                 )
+        else:  # install_desired rejects unsupported profiles before this call.
+            raise RuntimeError(
+                f"harness {profile.harness_name!r} has no desired MCP projection"
+            )
     return codex_extras

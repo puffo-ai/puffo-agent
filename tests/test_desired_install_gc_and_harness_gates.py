@@ -26,9 +26,52 @@ from puffo_agent.agent.adapters.desired_install import (
     install_desired,
     prune_stale_desired_skills,
 )
+from puffo_agent.agent.harness.support.assets import (
+    McpProjection,
+    SkillBodyTransform,
+    get_harness_assets_profile,
+)
 
 
 # ─── (a) prune_stale_desired_skills ─────────────────────────────────────────
+
+
+def test_supported_harness_asset_profiles_preserve_existing_projection_paths(tmp_path):
+    """Regression: replacing the ``is_codex`` branch must not move either
+    existing harness's skills or change its MCP handoff boundary.
+    """
+    claude = get_harness_assets_profile("claude-code")
+    codex = get_harness_assets_profile("codex")
+
+    assert claude.skills_root(tmp_path / "home", tmp_path / "workspace") == (
+        tmp_path / "home" / ".claude" / "skills"
+    )
+    assert claude.skill_body_transform is SkillBodyTransform.IDENTITY
+    assert claude.mcp_projection is McpProjection.CLAUDE_JSON
+
+    assert codex.skills_root(tmp_path / "home", tmp_path / "workspace") == (
+        tmp_path / "workspace" / ".agents" / "skills"
+    )
+    assert codex.skill_body_transform is SkillBodyTransform.STRIP_PUFFO_PREFIX
+    assert codex.mcp_projection is McpProjection.RUNTIME_EXTRAS
+
+
+def test_unsupported_harness_asset_profile_is_explicit():
+    profile = get_harness_assets_profile("hermes")
+
+    assert profile.supported is False
+    assert "no skills/MCP surface" in profile.unsupported_reason
+
+
+def test_pi_asset_profile_separates_skills_from_unsupported_mcp(tmp_path):
+    profile = get_harness_assets_profile("pi")
+
+    assert profile.skills_root(tmp_path / "home", tmp_path / "workspace") == (
+        tmp_path / "home" / ".pi" / "agent" / "skills"
+    )
+    assert profile.skills_supported is True
+    assert profile.mcp_supported is False
+    assert "no built-in MCP" in profile.unsupported_reason
 
 
 def _make_skill_dir(root: Path, name: str, *markers: str) -> Path:
@@ -255,13 +298,47 @@ def test_install_desired_hermes_empty_lists_no_log(tmp_path, caplog):
     )
 
 
+def test_install_desired_pi_installs_skill_but_skips_mcp(tmp_path, caplog):
+    class _PiHttp:
+        async def get(self, path):
+            if path == "/v2/skill-templates/puffo":
+                return {"body": "Use `mcp__puffo__read_inbox`."}
+            if path == "/v2/mcp-templates/puffo":  # pragma: no cover
+                raise AssertionError("unsupported Pi MCP must not be fetched")
+            raise AssertionError(path)
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="puffo_agent.agent.adapters.desired_install",
+    ):
+        extras = asyncio.new_event_loop().run_until_complete(
+            install_desired(
+                http=_PiHttp(),
+                agent_home=tmp_path / "home",
+                workspace_dir=tmp_path / "workspace",
+                agent_id="t-pi",
+                harness_name="pi",
+                desired_skills=["puffo"],
+                desired_mcps=["puffo"],
+            ),
+        )
+
+    assert extras == {}
+    skill = tmp_path / "home" / ".pi" / "agent" / "skills" / "puffo" / "SKILL.md"
+    assert skill.read_text(encoding="utf-8") == "Use `mcp__puffo__read_inbox`."
+    assert any(
+        "pi harness" in record.message and "no built-in MCP" in record.message
+        for record in caplog.records
+    )
+
+
 @pytest.mark.asyncio
 async def test_docker_install_desired_passes_assets_once(
     monkeypatch, tmp_path,
 ):
     """The Docker owner forwards both asset classes once."""
-    import puffo_agent.agent.harness.docker_runtime as docker_runtime
-    from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
+    import puffo_agent.agent.harness.runtime.docker_runtime as docker_runtime
+    from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     calls: dict = {}

@@ -193,6 +193,37 @@ def test_hermes_resolver_uses_its_own_env(tmp_path, monkeypatch):
     assert cli_bin.resolve_hermes_bin() == str(fake_hermes)
 
 
+def test_opencode_resolver_uses_its_typed_override(tmp_path, monkeypatch):
+    fake = _make_exe(tmp_path, "fake_opencode")
+    monkeypatch.setenv("PUFFO_OPENCODE_BIN", str(fake))
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+
+    assert cli_bin.resolve_opencode_bin() == str(fake)
+
+
+def test_opencode_resolver_uses_standard_per_user_install(tmp_path, monkeypatch):
+    fake_home = tmp_path / "host-home"
+    executable_name = (
+        "opencode.exe" if cli_bin.sys.platform == "win32" else "opencode"
+    )
+    install_dir = fake_home / ".opencode" / "bin"
+    install_dir.mkdir(parents=True)
+    bundled = _make_exe(install_dir, executable_name)
+    monkeypatch.delenv("PUFFO_OPENCODE_BIN", raising=False)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+
+    assert cli_bin.resolve_opencode_bin() == str(bundled)
+
+
+def test_pi_resolver_uses_its_typed_override(tmp_path, monkeypatch):
+    fake = _make_exe(tmp_path, "fake_pi")
+    monkeypatch.setenv("PUFFO_PI_BIN", str(fake))
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+
+    assert cli_bin.resolve_pi_bin() == str(fake)
+
+
 def test_real_path_used_when_process_path_misses(monkeypatch):
     """When the process PATH misses, resolution retries against the
     reconstructed real PATH."""

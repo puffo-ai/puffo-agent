@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from ....tasks import spawn
 
 
 logger = logging.getLogger(__name__)
@@ -124,7 +125,7 @@ async def ensure_docker_image(
 
 
 async def _build_image(docker_bin: str, image: str, agent_id: str) -> None:
-    from ..._proc import no_window_kwargs
+    from ...._proc import no_window_kwargs
 
     proc = await asyncio.create_subprocess_exec(
         docker_bin,
@@ -164,7 +165,10 @@ async def communicate_with_timeout(
     timeout_seconds: float,
     operation: str,
 ) -> tuple[bytes, bytes]:
-    communicate_task = asyncio.create_task(proc.communicate(input_data))
+    communicate_task = spawn(
+        proc.communicate(input_data),
+        name="proc.communicate",
+    )
     try:
         return await asyncio.wait_for(
             asyncio.shield(communicate_task),
@@ -210,7 +214,7 @@ async def run_cmd(
     *,
     timeout_seconds: float = DOCKER_COMMAND_TIMEOUT_SECONDS,
 ) -> tuple[int, bytes, bytes]:
-    from ..._proc import no_window_kwargs
+    from ...._proc import no_window_kwargs
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,

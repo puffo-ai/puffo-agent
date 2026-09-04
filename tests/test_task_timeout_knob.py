@@ -68,8 +68,8 @@ def test_runtime_spec_default_matches_config_default():
 def test_local_runtime_spec_receives_configured_timeout(
     home, monkeypatch, provider, harness, resolver_name,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     monkeypatch.setattr(local_runtime, resolver_name, lambda: "/bin/runtime")

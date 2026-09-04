@@ -7,6 +7,7 @@ from typing import Any, Awaitable, Callable, Protocol, Sequence
 from .context_controller import AdmissionCandidate
 from .message_projection import canonical_target_parts, format_message_group
 from .message_store import MessageStore, StoredMessage
+from ..tasks import spawn
 
 OUTPUT_TOOL_RESERVE_TOKENS = 4_096
 CURRENT_TURN_VERSION = 2
@@ -24,7 +25,7 @@ async def await_listener_with_runtime(
     label: str,
 ) -> Any:
     """Stop a transport listener as soon as its Inbox consumer exits."""
-    listener_task = asyncio.ensure_future(listener)
+    listener_task = spawn(listener, name="listener")
     try:
         done, _pending = await asyncio.wait(
             {listener_task, runtime_task},

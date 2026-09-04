@@ -42,6 +42,7 @@ from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.runtime_events import RuntimeEvent
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
+from puffo_agent.tasks import spawn
 from _global_inbox_support import Adapter, ToolReturnAdapter, make_store, receipt
 
 
@@ -753,9 +754,10 @@ async def test_listener_guard_stops_transport_when_runtime_crashes():
 
 
 @pytest.mark.asyncio
-async def test_listener_guard_observes_simultaneous_listener_failure():
+async def test_listener_guard_reports_both_simultaneous_failures_once(caplog):
     release = asyncio.Event()
     listener_started = asyncio.Event()
+    loop_contexts = []
 
     async def fail_listener():
         listener_started.set()
@@ -767,22 +769,44 @@ async def test_listener_guard_observes_simultaneous_listener_failure():
         await release.wait()
         raise ValueError("runtime boom")
 
-    runtime_task = asyncio.create_task(fail_runtime())
-    guarded = asyncio.create_task(
-        await_listener_with_runtime(
-            fail_listener(),
-            runtime_task,
-            label="global inbox",
-        )
-    )
-    await listener_started.wait()
-    release.set()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    try:
+        with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+            runtime_task = spawn(fail_runtime(), name="global_runtime.run")
+            guarded = asyncio.create_task(
+                await_listener_with_runtime(
+                    fail_listener(),
+                    runtime_task,
+                    label="global inbox",
+                )
+            )
+            await listener_started.wait()
+            release.set()
 
-    with pytest.raises(
-        RuntimeError,
-        match="runtime boom; listener also failed: listener boom",
-    ):
-        await guarded
+            with pytest.raises(
+                RuntimeError,
+                match="runtime boom; listener also failed: listener boom",
+            ):
+                await guarded
+            for _ in range(3):
+                await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(records) == 2
+    assert {record.getMessage() for record in records} == {
+        "worker task died: listener",
+        "worker task died: global_runtime.run",
+    }
+    assert all(record.exc_info is not None for record in records)
+    assert {type(record.exc_info[1]) for record in records} == {
+        OSError,
+        ValueError,
+    }
+    assert loop_contexts == []
 
 
 @pytest.mark.asyncio

@@ -117,7 +117,7 @@ def test_legacy_yml_without_field_defaults_empty(tmp_path, monkeypatch):
 
 
 def _local_spec(tmp_path: Path, monkeypatch, level: str):
-    from puffo_agent.agent.harness import local_runtime
+    from puffo_agent.agent.harness.runtime import local_runtime
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
@@ -137,7 +137,7 @@ def _local_spec(tmp_path: Path, monkeypatch, level: str):
 
 
 def _docker_spec(tmp_path: Path, monkeypatch, level: str):
-    from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
+    from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
@@ -193,6 +193,9 @@ from puffo_agent.portal.state import refresh_model_flag_path  # noqa: E402
 def test_supported_levels_are_per_harness():
     assert supported_inference_levels("codex") == REASONING_EFFORTS
     assert supported_inference_levels("claude-code") == INFERENCE_LEVELS
+    assert supported_inference_levels("pi") == (
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    )
     # codex has minimal but not xhigh; claude-code the reverse.
     assert "xhigh" not in supported_inference_levels("codex")
     assert "minimal" not in supported_inference_levels("claude-code")

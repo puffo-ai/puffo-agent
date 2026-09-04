@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 from dataclasses import FrozenInstanceError
@@ -215,6 +216,24 @@ async def test_coalescer_deadline_starts_at_notify_before_delayed_waiter():
     coalescer.notify()
     await coalescer.wait_for_burst()
     assert sleeps == [pytest.approx(2.920)]
+
+
+@pytest.mark.asyncio
+async def test_coalescer_sleep_failure_is_reported_once_with_traceback(caplog):
+    async def broken_sleep(_delay):
+        raise ValueError("coalescer sleep failed")
+
+    coalescer = InboxCoalescer(sleep=broken_sleep, monotonic=lambda: 20.0)
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        assert not await coalescer._sleep_or_pull(3.0)
+        await asyncio.sleep(0)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(records) == 1
+    assert records[0].getMessage() == "worker task died: sleep"
+    assert records[0].exc_info is not None
+    assert isinstance(records[0].exc_info[1], ValueError)
 
 
 @pytest.mark.asyncio

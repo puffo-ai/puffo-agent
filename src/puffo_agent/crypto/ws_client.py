@@ -13,10 +13,11 @@ import websockets
 import websockets.exceptions  # websockets>=16 lazy-loads submodules; bare `import websockets` doesn't bind `.exceptions`
 
 from .encoding import base64url_encode, generate_nonce
-from .http_client import PuffoCoreHttpClient
+from .http_client import PuffoCoreHttpClient, heal_if_dead_executor
 from .http_session import create_remote_ssl_context
 from .keystore import KeyStore, decode_secret
 from .primitives import Ed25519KeyPair
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +86,12 @@ class PuffoCoreWsClient:
         self.on_channel_update: Callable[[dict], Coroutine[Any, Any, None]] | None = None
         # Fires after every (re)connect handshake, before catch-up.
         self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
+        # Sync observer for reconnect health: (healthy, consecutive_failures).
+        # Fired on every failed reconnect attempt and once on the reconnect
+        # that ends a failure streak. Policy (thresholds, health writes)
+        # belongs to the listener; this client only counts.
+        self.on_transport_state: Callable[[bool, int], None] | None = None
+        self._reconnect_failures = 0
         self._catchup_lock = asyncio.Lock()
 
     def _build_connect_frame(self) -> str:
@@ -345,6 +352,9 @@ class PuffoCoreWsClient:
             self._ws = ws
             self.session_id = await self._handshake(ws)
             logger.info("[%s] WS connected, session=%s", self.slug, self.session_id)
+            if self._reconnect_failures:
+                self._reconnect_failures = 0
+                self._notify_transport_state(healthy=True)
             if self.on_connect:
                 try:
                     await self.on_connect()
@@ -368,6 +378,7 @@ class PuffoCoreWsClient:
                     "retry_delay=%ds",
                     self.slug, type(exc).__name__, backoff,
                 )
+                self._note_reconnect_failure()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except asyncio.TimeoutError as exc:
@@ -378,6 +389,7 @@ class PuffoCoreWsClient:
                     "retry_delay=%ds",
                     self.slug, type(exc).__name__, backoff,
                 )
+                self._note_reconnect_failure()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except ConnectionError as exc:
@@ -388,6 +400,7 @@ class PuffoCoreWsClient:
                     "retry_delay=%ds",
                     self.slug, type(exc).__name__, backoff,
                 )
+                self._note_reconnect_failure()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except OSError as exc:
@@ -398,6 +411,25 @@ class PuffoCoreWsClient:
                     "retry_delay=%ds",
                     self.slug, type(exc).__name__, backoff,
                 )
+                self._note_reconnect_failure()
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+            except RuntimeError as exc:
+                if not self._running:
+                    break
+                # A valid subkey means connect_once() made no HTTP request
+                # before ``websockets.connect`` hit ``loop.getaddrinfo``,
+                # so the dead default executor must be healed here — the
+                # HTTP wrapper's heal never ran (8/30 incident).
+                healed = heal_if_dead_executor(exc)
+                logger.warning(
+                    "[%s] WS reconnect category=%s exception=%s "
+                    "retry_delay=%ds",
+                    self.slug,
+                    "dead_executor_healed" if healed else "unexpected",
+                    type(exc).__name__, backoff,
+                )
+                self._note_reconnect_failure()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
             except Exception as exc:
@@ -408,12 +440,25 @@ class PuffoCoreWsClient:
                     "retry_delay=%ds",
                     self.slug, type(exc).__name__, backoff,
                 )
+                self._note_reconnect_failure()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
         self._ws = None
         self.session_id = None
 
+    def _note_reconnect_failure(self) -> None:
+        self._reconnect_failures += 1
+        self._notify_transport_state(healthy=False)
+
+    def _notify_transport_state(self, *, healthy: bool) -> None:
+        if self.on_transport_state is None:
+            return
+        try:
+            self.on_transport_state(healthy, self._reconnect_failures)
+        except Exception:
+            logger.exception("on_transport_state callback failed")
+
     def stop(self) -> None:
         self._running = False
         if self._ws:
-            asyncio.ensure_future(self._ws.close())
+            spawn(self._ws.close(), name="ws.close")

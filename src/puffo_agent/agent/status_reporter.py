@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from .processing_receipts import ProcessingReportDispatcher
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ class StatusReporter:
         self._run_stop = stop
         replay_task = None
         if self._processing_reports is not None:
-            replay_task = asyncio.create_task(self._processing_reports.run())
+            replay_task = spawn(self._processing_reports.run(), name="processing_reports.run")
         try:
             await self._send_heartbeat()
             while not stop.is_set():

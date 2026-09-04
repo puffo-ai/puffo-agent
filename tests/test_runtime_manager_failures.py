@@ -7,17 +7,19 @@ import pytest
 
 from puffo_agent.agent.errors import AgentAPIError, ProviderFailureError
 from puffo_agent.agent.adapters.base import TurnContext, TurnResult
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     _provider_error,
 )
-from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
     CompactReceipt,
     ContextStatus,
     Driver,
     HarnessEvent,
+    HarnessEventType,
     RuntimeOpened,
     RuntimeRef,
     RuntimeSpec,
@@ -27,7 +29,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
@@ -1102,6 +1104,41 @@ async def test_timeout_cleanup_cannot_retire_the_next_turn_runtime():
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_timeout_still_publishes_and_retires_runtime():
+    class CloseFailingPausedCancelDriver(_PausedCancelDriver):
+        async def close(self):
+            self.close_calls += 1
+            raise RuntimeError("timeout retirement cleanup failed")
+
+    driver = CloseFailingPausedCancelDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+    await manager.open()
+    stream = manager.events()
+    started = await manager.start_turn(TurnInput("first"))
+
+    timeout = asyncio.create_task(manager.timeout_turn(started.turn_ref))
+    await asyncio.wait_for(driver.cancel_entered.wait(), timeout=1)
+    timeout.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await asyncio.wait_for(timeout, timeout=1)
+
+    terminal = await asyncio.wait_for(anext(stream), timeout=1)
+    assert terminal.type == HarnessEventType.TURN_ABANDONED
+    assert terminal.data["error_code"] == "turn_timeout"
+    assert [str(error) for error in cleanup_errors(exc_info.value)] == [
+        "timeout retirement cleanup failed"
+    ]
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+    assert driver.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
     driver = _ControllableDriver()
 
@@ -1264,6 +1301,39 @@ async def test_compaction_completes_only_on_the_event_and_never_starts_twice():
     assert "no completion event" in unobserved.diagnostic
     assert driver.compact_calls == 2
     assert (await adapter.compact_context()).completed is False
+    assert driver.compact_calls == 2
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_failed_event_fails_waiters_fast_with_the_diagnostic():
+    """COMPACTION_FAILED must release waiters immediately, not by timeout.
+
+    A provider 4xx/5xx during a driver-run compaction (e.g. OpenCode's
+    summarize) emits the event; the manager fails its outstanding future so
+    every coalesced caller returns with the diagnostic well inside the
+    bounded wait, and a later compaction can start fresh.
+    """
+    driver, manager, adapter = await _open_compacting_manager(wait_seconds=10)
+
+    first = asyncio.create_task(adapter.compact_context())
+    second = asyncio.create_task(adapter.compact_context())
+    await asyncio.sleep(0)
+    assert driver.compact_calls == 1
+
+    await driver.queue.put(HarnessEvent(
+        type="compaction.failed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        data={"diagnostic": "summarize returned HTTP 500: provider melted"},
+    ))
+    results = await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    assert [value.completed for value in results] == [False, False]
+    assert all("HTTP 500" in value.diagnostic for value in results)
+
+    # The failed operation is cleared: a retry issues a new provider pass.
+    adapter.compaction_wait_seconds = 0.01
+    await adapter.compact_context()
     assert driver.compact_calls == 2
     await manager.close()
 

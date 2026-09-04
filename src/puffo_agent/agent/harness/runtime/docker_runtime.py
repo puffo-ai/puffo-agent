@@ -14,21 +14,21 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..._proc import no_window_kwargs
-from ...mcp.config import (
+from ...._proc import no_window_kwargs
+from ....mcp.config import (
     INFERENCE_LEVELS,
     puffo_core_mcp_env,
     write_cli_mcp_config,
     write_codex_mcp_config,
 )
-from ...portal.host_assets import filter_container_mcp_servers
-from ...portal.runtime_matrix import (
+from ....portal.host_assets import filter_container_mcp_servers
+from ....portal.runtime_matrix import (
     HARNESS_CLAUDE_CODE,
     HARNESS_CODEX,
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from ...portal.state import (
+from ....portal.state import (
     AgentConfig,
     DaemonConfig,
     agent_codex_user_dir,
@@ -47,10 +47,10 @@ from ...portal.state import (
     sync_host_mcp_servers,
     sync_host_skills,
 )
-from ...portal.workspace_layout import prepare_workspace_shared_access
-from ..adapters.base import anthropic_base_url_env
-from ..adapters.desired_install import run_spawn_install
-from ..cli_bin import resolve_docker_bin
+from ....portal.workspace_layout import prepare_workspace_shared_access
+from ...adapters.base import anthropic_base_url_env
+from ...adapters.desired_install import run_spawn_install
+from ...cli_bin import resolve_docker_bin
 from .docker_support import (
     CONTAINER_LAYOUT_VERSION,
     DEFAULT_IMAGE,
@@ -60,9 +60,10 @@ from .docker_support import (
     puffo_agent_pkg_dir,
     run_cmd,
 )
-from .driver import RuntimeSpec
+from ..driver import RuntimeSpec
 from .local_runtime import (
     PreparedLocalRuntime,
+    select_native_session,
     _read_json_object,
     build_codex_gateway_provider,
     remove_legacy_permission_hook,
@@ -136,19 +137,19 @@ class DockerRuntimePreparer:
         *,
         system_prompt: str,
         persisted_native_session_id: str = "",
+        persisted_native_session_harness: str = "",
     ) -> PreparedLocalRuntime:
         spec = await self.refresh_spec(system_prompt)
         legacy_path = self._legacy_session_path()
         legacy_id = self._load_legacy_session_id(legacy_path)
-        if persisted_native_session_id:
-            native_session_id = persisted_native_session_id
-            source = "runtime_event_outbox"
-        elif legacy_id:
-            native_session_id = legacy_id
-            source = "legacy_session_file"
-        else:
-            native_session_id = ""
-            source = "fresh"
+        native_session_id, source = select_native_session(
+            harness_name=self.harness_name,
+            persisted_native_session_id=persisted_native_session_id,
+            persisted_native_session_harness=(
+                persisted_native_session_harness
+            ),
+            legacy_native_session_id=legacy_id,
+        )
         await self.ensure_container()
         return PreparedLocalRuntime(
             harness_name=self.harness_name,
@@ -250,7 +251,7 @@ class DockerRuntimePreparer:
                 strip_claude_api_key_from_settings(root / name)
 
     def _prepare_claude_spec(self, system_prompt: str) -> RuntimeSpec:
-        from ...portal.control.context_telemetry import (
+        from ....portal.control.context_telemetry import (
             claude_autocompact_tokens,
             configured_compact_pct,
         )
@@ -436,7 +437,7 @@ class DockerRuntimePreparer:
                 self.codex_home,
             )
 
-        from ...portal.control.context_telemetry import configured_compact_pct
+        from ....portal.control.context_telemetry import configured_compact_pct
 
         compact_pct = configured_compact_pct("codex", self.agent_cfg.env_overrides)
         return RuntimeSpec(

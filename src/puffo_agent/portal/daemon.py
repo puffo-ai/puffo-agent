@@ -80,6 +80,7 @@ from .workspace_layout import (
     prepare_workspace_shared_access,
 )
 from .worker import Worker
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -170,16 +171,25 @@ class Daemon:
 
     async def _start_runtime(self, runtime: _DaemonRuntime) -> None:
         runtime.startup_tasks.append(
-            asyncio.ensure_future(_log_outdated_version_warning())
+            spawn(_log_outdated_version_warning(), name="log_outdated_version_warning")
         )
         from ..agent.model_catalog import prefetch as _prefetch_model_catalog
 
         _prefetch_model_catalog()
         runtime.startup_tasks.extend(
             (
-                asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup()),
-                asyncio.ensure_future(_migrate_linked_agents_at_startup()),
-                asyncio.ensure_future(_full_sync_all_owned_agents_at_startup()),
+                spawn(
+                    _sweep_archived_pending_revokes_at_startup(),
+                    name="sweep_archived_pending_revokes_at_startup",
+                ),
+                spawn(
+                    _migrate_linked_agents_at_startup(),
+                    name="migrate_linked_agents_at_startup",
+                ),
+                spawn(
+                    _full_sync_all_owned_agents_at_startup(),
+                    name="full_sync_all_owned_agents_at_startup",
+                ),
             )
         )
         runtime.ws_local_runner = await start_ws_local_server(
@@ -199,15 +209,15 @@ class Daemon:
         )
         runtime.runtime_tasks.extend(
             (
-                asyncio.ensure_future(self.refresher.run_loop(self._stop)),
-                asyncio.ensure_future(self.codex_refresher.run_loop(self._stop)),
+                spawn(self.refresher.run_loop(self._stop), name="refresher.run_loop"),
+                spawn(self.codex_refresher.run_loop(self._stop), name="codex_refresher.run_loop"),
             )
         )
         from .control.client import ControlManager
 
         runtime.control_manager = ControlManager()
         runtime.runtime_tasks.append(
-            asyncio.ensure_future(runtime.control_manager.run())
+            spawn(runtime.control_manager.run(), name="control_manager.run")
         )
 
     def _stop_was_requested(
@@ -366,7 +376,7 @@ class Daemon:
                     # the persisted session into Node's heap, so N
                     # parallel warms can OOM the host. Awaiting one at
                     # a time keeps peak RSS bounded.
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 elif (
                     worker.restart_required
                     or _worker_needs_restart(worker.agent_cfg, agent_cfg)
@@ -390,7 +400,7 @@ class Daemon:
                     self.workers[agent_id] = worker
                     self._register_with_refresher(agent_cfg, worker)
                     worker.start()
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 else:
                     worker.agent_cfg = agent_cfg
             elif desired_state == "paused":
@@ -408,6 +418,16 @@ class Daemon:
                         self._paused_reported.add(agent_id)
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
+
+    async def _observe_worker_start(self, agent_id: str, worker: Worker) -> None:
+        if await worker.wait_warm(timeout=self._warm_serialise_timeout):
+            return
+        logger.warning(
+            "agent %s: worker did not reach running during the startup "
+            "observation window (status=%s)",
+            agent_id,
+            worker.runtime.status,
+        )
 
     async def _stop_removed_agents(self, on_disk: set[str]) -> None:
         for stale_id in list(self._agent_cfg_cache.keys() - on_disk):

@@ -50,6 +50,7 @@ from .state import (
     sync_host_codex_auth_view,
     sync_host_claude_code_auth_view,
 )
+from ..tasks import spawn
 
 
 logger = logging.getLogger(__name__)
@@ -1086,8 +1087,9 @@ class CredentialRefresher:
         # don't import the macos module up here.
         external_poll_task: asyncio.Task | None = None
         if hasattr(self.backend, "poll_external_rotation"):
-            external_poll_task = asyncio.ensure_future(
+            external_poll_task = spawn(
                 self._external_rotation_loop(stop_event),
+                name="external_rotation_loop",
             )
 
         try:
@@ -1144,8 +1146,11 @@ class CredentialRefresher:
             self._detect_external_rotation()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
-        stop_task = asyncio.create_task(stop_event.wait())
-        refresh_task = asyncio.create_task(self._refresh_request.wait())
+        stop_task = spawn(stop_event.wait(), name="stop_event.wait")
+        refresh_task = spawn(
+            self._refresh_request.wait(),
+            name="refresh_request.wait",
+        )
         try:
             await asyncio.wait(
                 {stop_task, refresh_task},
@@ -1153,8 +1158,10 @@ class CredentialRefresher:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            stop_task.cancel()
-            refresh_task.cancel()
+            for task in (stop_task, refresh_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stop_task, refresh_task, return_exceptions=True)
 
     def _current_credential_revision(self) -> CredentialRevision | None:
         fingerprint = getattr(self.backend, "fingerprint", None)
@@ -1334,7 +1341,7 @@ class CredentialRefresher:
 
         coro = _retry()
         try:
-            self._rate_limit_retry_task = asyncio.create_task(coro)
+            self._rate_limit_retry_task = spawn(coro, name="rate_limit_retry")
         except RuntimeError:
             # No running loop (sync test path) — fall back to natural poll.
             coro.close()

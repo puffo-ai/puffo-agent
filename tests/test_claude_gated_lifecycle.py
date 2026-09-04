@@ -5,12 +5,12 @@ import json
 
 import pytest
 
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     claude_capabilities,
 )
 from puffo_agent.agent.harness.driver import RuntimeSpec, TurnInput
-from puffo_agent.agent.harness.runtime_manager import RuntimeManager
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager
 
 
 class _Stdin:

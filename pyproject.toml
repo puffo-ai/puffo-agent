@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 # *same* env without colliding. CLI binary stays `puffo-agent`; home
 # dir stays `~/.puffo-agent/`.
 name = "puffo-agent"
-version = "2.0.2"
+version = "2.0.4a1"
 description = "Run AI bots on Puffo.ai — local daemon that supervises many bot accounts and handles their LLM loops."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,6 +33,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
+    "agent-client-protocol==0.10.1",
     "aiohttp>=3.9",
     "aiohttp-socks>=0.10",
     "aiosqlite>=0.20",
@@ -112,3 +113,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "puffo_agent.portal.ui.assets" = ["*.png"]
+# The Pi tool bridge is TypeScript read at runtime and copied into the agent's
+# Pi home. Without this it is absent from an installed wheel and every Pi
+# session fails to install a bridge.
+"puffo_agent.agent.harness.drivers.pi_bridge" = ["*.ts"]

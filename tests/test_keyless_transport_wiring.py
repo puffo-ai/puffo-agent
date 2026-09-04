@@ -107,7 +107,7 @@ def test_worker_forwards_bridge_transport(kind):
         puffo_core=_bridge_puffo_core(),
     )
     if kind == "cli-local":
-        from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+        from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         env = LocalRuntimePreparer(DaemonConfig(), cfg)._puffo_core_env
     else:
@@ -124,7 +124,7 @@ def test_worker_native_agent_omits_transport(kind):
         puffo_core=_native_puffo_core(),
     )
     if kind == "cli-local":
-        from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+        from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         env = LocalRuntimePreparer(DaemonConfig(), cfg)._puffo_core_env
     else:

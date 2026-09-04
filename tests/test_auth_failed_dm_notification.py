@@ -63,14 +63,14 @@ def test_oauth_copy_degrades_when_display_name_missing():
 
 
 class _StubLoop:
-    """Stand-in for asyncio.create_task that records the call but
+    """Stand-in for the spawn helper that records the call but
     doesn't actually schedule. Used to verify the dedup gate
     semantics without spinning a real event loop."""
     def __init__(self):
         self.calls = 0
         self.tasks = []
 
-    def create_task(self, coro):
+    def spawn(self, coro, *, name=None):
         self.calls += 1
         self.tasks.append(coro)
         # Close the coro so it doesn't warn "never awaited."
@@ -82,9 +82,7 @@ def test_worker_dedup_gate_fires_once(monkeypatch):
     from puffo_agent.portal import worker as worker_module
 
     stub_loop = _StubLoop()
-    monkeypatch.setattr(
-        worker_module.asyncio, "create_task", stub_loop.create_task,
-    )
+    monkeypatch.setattr(worker_module, "spawn", stub_loop.spawn)
 
     class _StubWorker:
         agent_cfg = type("A", (), {"id": "t-agent"})()
@@ -112,9 +110,7 @@ def test_worker_reset_arms_next_notify(monkeypatch):
     from puffo_agent.portal import worker as worker_module
 
     stub_loop = _StubLoop()
-    monkeypatch.setattr(
-        worker_module.asyncio, "create_task", stub_loop.create_task,
-    )
+    monkeypatch.setattr(worker_module, "spawn", stub_loop.spawn)
 
     class _StubWorker:
         agent_cfg = type("A", (), {"id": "t-agent"})()
@@ -245,7 +241,7 @@ def test_create_task_failure_broadly_caught(monkeypatch):
     arrives, masking a legitimate retry opportunity."""
     from puffo_agent.portal import worker as worker_module
 
-    def crash(_coro):
+    def crash(_coro, *, name=None):
         # close coro so it doesn't warn "never awaited"
         try:
             _coro.close()
@@ -253,7 +249,7 @@ def test_create_task_failure_broadly_caught(monkeypatch):
             pass
         raise OSError("unexpected scheduler failure")
 
-    monkeypatch.setattr(worker_module.asyncio, "create_task", crash)
+    monkeypatch.setattr(worker_module, "spawn", crash)
 
     class _StubWorker:
         agent_cfg = type("A", (), {"id": "t-agent"})()
@@ -278,9 +274,7 @@ def test_workers_have_independent_dedup_flags(monkeypatch):
     from puffo_agent.portal import worker as worker_module
 
     stub_loop = _StubLoop()
-    monkeypatch.setattr(
-        worker_module.asyncio, "create_task", stub_loop.create_task,
-    )
+    monkeypatch.setattr(worker_module, "spawn", stub_loop.spawn)
 
     class _StubWorker:
         _client = None

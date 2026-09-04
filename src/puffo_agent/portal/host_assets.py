@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -296,6 +297,77 @@ def sync_host_codex_auth_view(
     except OSError:
         return "write-failed"
     return "view (migrated-from-symlink)" if migrated else "view"
+
+
+def select_pi_auth_home(host_home: Path, agent_pi_home: Path) -> Path:
+    """Return the credential directory the next Pi launch will effectively use.
+
+    This is the read-only counterpart to :func:`sync_host_pi_auth_view`, used
+    by create preflight before any agent files may be written.
+    """
+    host_pi_home = host_home / ".pi" / "agent"
+    host_auth = host_pi_home / "auth.json"
+    target = agent_pi_home / "auth.json"
+    marker = agent_pi_home / ".puffo-host-auth.sha256"
+    try:
+        host_blob = host_auth.read_bytes()
+        host_payload = json.loads(host_blob)
+    except (OSError, TypeError, ValueError):
+        return agent_pi_home if target.exists() else host_pi_home
+    if not isinstance(host_payload, dict) or not target.exists():
+        return host_pi_home
+    try:
+        previous_digest = marker.read_text(encoding="ascii").strip()
+        target_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError:
+        return agent_pi_home
+    return host_pi_home if previous_digest == target_digest else agent_pi_home
+
+
+def sync_host_pi_auth_view(host_home: Path, agent_pi_home: Path) -> str:
+    """Project host Pi credentials without clobbering agent-owned state.
+
+    Pi may refresh OAuth credentials in its isolated config directory.  A
+    digest marker records only files this function last wrote; once Pi or an
+    operator changes the target, that file becomes operator-owned and is left
+    alone.  This avoids turning every worker refresh into a credential rollback.
+    """
+    host_auth = host_home / ".pi" / "agent" / "auth.json"
+    target = agent_pi_home / "auth.json"
+    marker = agent_pi_home / ".puffo-host-auth.sha256"
+    try:
+        host_blob = host_auth.read_bytes()
+    except OSError:
+        return "no-host-file"
+    try:
+        parsed = json.loads(host_blob)
+    except (TypeError, ValueError):
+        return "unparseable-host-file"
+    if not isinstance(parsed, dict):
+        return "unparseable-host-file"
+
+    if target.exists():
+        try:
+            previous_digest = marker.read_text(encoding="ascii").strip()
+            target_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError:
+            return "operator-owned"
+        if previous_digest != target_digest:
+            return "operator-owned"
+
+    digest = hashlib.sha256(host_blob).hexdigest()
+    try:
+        _ensure_private_directory(agent_pi_home.parent)
+        _ensure_private_directory(agent_pi_home)
+        if target.exists() and target.read_bytes() == host_blob:
+            _set_private_file_mode(target)
+            _atomic_write_private(marker, digest + "\n")
+            return "view (fresh)"
+        _atomic_write_private(target, host_blob)
+        _atomic_write_private(marker, digest + "\n")
+    except OSError:
+        return "write-failed"
+    return "view"
 
 
 def read_host_codex_mcp_servers(host_home: Path) -> dict[str, dict]:

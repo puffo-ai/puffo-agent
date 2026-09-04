@@ -58,6 +58,7 @@ from .message_projection import (
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
 from .provider_failures import operator_failure_text
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +390,10 @@ class GlobalInboxRuntime(
         )
 
     async def run(self) -> None:
-        reminder_task = asyncio.create_task(self.reminder_scheduler.run())
+        reminder_task = spawn(
+            self.reminder_scheduler.run(),
+            name="reminder_scheduler.run",
+        )
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
@@ -404,7 +408,10 @@ class GlobalInboxRuntime(
                 ):
                     self.notify()
             while not self._stopping:
-                burst_task = asyncio.create_task(self.coalescer.wait_for_burst())
+                burst_task = spawn(
+                    self.coalescer.wait_for_burst(),
+                    name="coalescer.wait_for_burst",
+                )
                 done, _pending = await asyncio.wait(
                     {burst_task, reminder_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -412,10 +419,11 @@ class GlobalInboxRuntime(
                 if reminder_task in done:
                     if not burst_task.done():
                         burst_task.cancel()
-                        try:
-                            await burst_task
-                        except asyncio.CancelledError:
-                            pass
+                    # Settle the sibling even when both tasks completed in the
+                    # same event-loop turn.  Otherwise a simultaneous burst
+                    # failure can escape inspection while the scheduler error
+                    # is propagated below.
+                    await asyncio.gather(burst_task, return_exceptions=True)
                     # A scheduler error is an owning-runtime error, never a
                     # silently disabled timer loop.
                     await reminder_task
@@ -1390,8 +1398,8 @@ class GlobalInboxRuntime(
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
-            async with self._turn_state_lock:
-                await self._start_local_turn(planned)
+            if not await self._start_notice_unless_autonomous(planned):
+                return False
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,

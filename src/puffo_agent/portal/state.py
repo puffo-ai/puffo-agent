@@ -131,6 +131,8 @@ _sync_host_skills_dir = _host_assets._sync_host_skills_dir
 sync_host_skills = _host_assets.sync_host_skills
 sync_host_codex_skills = _host_assets.sync_host_codex_skills
 sync_host_gemini_skills = _host_assets.sync_host_gemini_skills
+select_pi_auth_home = _host_assets.select_pi_auth_home
+sync_host_pi_auth_view = _host_assets.sync_host_pi_auth_view
 _looks_host_local_command = _host_assets._looks_host_local_command
 _host_local_token = _host_assets._host_local_token
 filter_container_mcp_servers = _host_assets.filter_container_mcp_servers
@@ -562,6 +564,10 @@ class RuntimeConfig:
     # ``hermes`` and ``gemini-cli`` remain named design-only values so stale
     # configs receive an explicit migration diagnostic.
     harness: str = "claude-code"
+    # cli-local generic harness argv. Required for ``acp`` so any ACP v1
+    # agent can be selected without adding a provider-specific Driver. The
+    # first item is the executable and remaining items are literal arguments.
+    harness_command: list[str] = field(default_factory=list)
     # Retained only so older agent.yml files round-trip without losing data.
     # Driver runtimes use the wall-time limit below instead.
     max_turns: int = 10
@@ -777,6 +783,24 @@ def _load_runtime_config(
             kind, resolve_effective_provider(kind, provider), harness
         )
         _validate_inference_level(agent_id, inference, effective)
+    command = raw.get("harness_command") or []
+    if not isinstance(command, list) or not all(
+        isinstance(item, str) and item for item in command
+    ):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.harness_command must be a list "
+            "of non-empty strings"
+        )
+    if (
+        kind == RUNTIME_CLI_LOCAL
+        and harness == "acp"
+        and not command
+        and not allow_invalid_runtime
+    ):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.harness='acp' requires a "
+            "non-empty runtime.harness_command argv"
+        )
     return RuntimeConfig(
         kind=kind,
         provider=provider,
@@ -791,6 +815,7 @@ def _load_runtime_config(
         permission_mode=raw.get("permission_mode", "bypassPermissions"),
         sandbox=raw.get("sandbox", "danger-full-access"),
         harness=harness,
+        harness_command=list(command),
         max_turns=int(raw.get("max_turns", 10)),
         task_timeout_seconds=float(raw.get("task_timeout_seconds", 1800.0)),
     )
@@ -917,7 +942,7 @@ class RuntimeState:
     worker deadlocked).
     """
 
-    status: str = "stopped"  # running | paused | error | stopped
+    status: str = "stopped"  # starting | running | paused | error | stopped
     started_at: int = 0
     updated_at: int = 0
     msg_count: int = 0
@@ -957,8 +982,14 @@ class RuntimeState:
     #                           cleared on next successful turn. Does
     #                           NOT overwrite the stronger downstream
     #                           signals above.
+    #   "server_unreachable"  — N consecutive WS reconnect failures; the
+    #                           process is alive but the server has not
+    #                           been reachable for minutes. Cleared by the
+    #                           next successful reconnect. Only ever
+    #                           overwrites "ok" — the specific signals
+    #                           above stay authoritative
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | server_unreachable | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:

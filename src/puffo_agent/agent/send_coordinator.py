@@ -45,6 +45,7 @@ from .send_response_validation import (
     validate_keyless_response,
 )
 from .shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 CHANNEL_SEND_PATH = "/v2/agent-runtime/messages:send"
@@ -1048,14 +1049,12 @@ class SendCoordinator:
                     "sent message but could not advance local boundary"
                 )
         if result.missing_devices:
-            asyncio.create_task(
+            spawn(
                 self._supplement_channel(
-                    envelope,
-                    content_key,
-                    resolved["recipient_slugs"],
-                    result.missing_devices,
-                    freshness,
-                )
+                    envelope, content_key, resolved["recipient_slugs"],
+                    result.missing_devices, freshness,
+                ),
+                name="supplement_channel",
             )
 
     async def _finish_held_channel_send(
@@ -1192,14 +1191,12 @@ class SendCoordinator:
             if missing:
                 from ..mcp.puffo_core_tools import _supplement_missing_devices
 
-                asyncio.create_task(
+                spawn(
                     _supplement_missing_devices(
-                        self.http_client,
-                        envelope,
-                        content_key,
-                        resolved["recipient_slugs"],
-                        list(missing),
-                    )
+                        self.http_client, envelope, content_key,
+                        resolved["recipient_slugs"], list(missing),
+                    ),
+                    name="supplement_missing_devices",
                 )
             return SendResult(
                 state="sent",

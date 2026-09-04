@@ -10,7 +10,7 @@ import pytest
 
 from puffo_agent.agent.core import AgentAPIError
 from puffo_agent.agent.errors import ProviderFailureError
-from puffo_agent.agent.harness.codex_driver import (
+from puffo_agent.agent.harness.drivers.codex import (
     CodexAppServerDriver,
     _classify_jsonrpc_error,
 )

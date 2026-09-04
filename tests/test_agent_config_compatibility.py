@@ -161,3 +161,30 @@ def test_task_timeout_seconds_round_trips(home):
     assert loaded.runtime.task_timeout_seconds == 123.5
     loaded.save()
     assert AgentConfig.load(agent_id).runtime.task_timeout_seconds == 123.5
+
+
+def test_existing_opencode_acp_config_round_trips_unchanged(home):
+    """Hiding the duplicate Web preset must not invalidate existing Agents."""
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = "legacy-opencode-acp"
+    _write_agent(agent_id, {
+        "id": agent_id,
+        "runtime": {
+            "kind": "cli-local",
+            "provider": "openai",
+            "harness": "acp",
+            "harness_command": ["opencode", "acp"],
+            "model": "deepseek/deepseek-chat",
+        },
+    })
+
+    loaded = AgentConfig.load(agent_id)
+    assert loaded.runtime.harness == "acp"
+    assert loaded.runtime.harness_command == ["opencode", "acp"]
+    loaded.save()
+
+    reloaded = AgentConfig.load(agent_id)
+    assert reloaded.runtime.harness == "acp"
+    assert reloaded.runtime.harness_command == ["opencode", "acp"]
+    assert reloaded.runtime.model == "deepseek/deepseek-chat"

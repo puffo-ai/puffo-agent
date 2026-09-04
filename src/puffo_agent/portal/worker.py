@@ -51,6 +51,7 @@ from .state import (
     claude_cli_api_key,
     docker_shared_dir as docker_shared_dir,
 )
+from ..tasks import spawn
 
 
 def _rebuild_managed_system_prompt(
@@ -110,6 +111,14 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
+# Consecutive WS reconnect failures before runtime.json health flips to
+# "server_unreachable". With the WS client's 1s→30s doubling backoff the
+# fifth failure lands ~15s into an outage (~40s when each attempt burns a
+# connect timeout): a blip surviving one or two reconnects never flips,
+# while an operator checking `agent list` sees the truth within the
+# minute instead of "ok" for hours. One successful reconnect clears it.
+_WS_DEGRADE_THRESHOLD = 5
+
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     if harness_name != "claude-code":
@@ -125,7 +134,7 @@ def build_docker_runtime(
     The returned preparer owns only container placement and host assets;
     Claude Code and Codex protocol behavior stays in the normal Drivers.
     """
-    from ..agent.harness.docker_runtime import DockerRuntimePreparer
+    from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
 
     return DockerRuntimePreparer(daemon_cfg, agent_cfg)
 
@@ -350,6 +359,8 @@ class Worker:
                 logger,
                 api_key_mode=getattr(self, "_claude_api_key_mode", False),
             )
+        self.runtime.status = "running"
+        self.runtime.save(agent_id)
         self._warm_done.set()
 
     @staticmethod
@@ -375,6 +386,62 @@ class Worker:
             "runtime.health = auth_failed",
             agent_id,
         )
+
+    def _build_wired_client(self):
+        """Construct the core client with the worker's observers attached.
+
+        Every runtime path must obtain its client here: one built straight
+        from ``_build_puffo_core_client`` carries no transport-state
+        listener, so WS reconnect streaks reach nobody and runtime.json
+        keeps saying "ok" while the agent is offline — the 8/30 incident's
+        health symptom.
+        """
+        agent_id = self.agent_cfg.id
+        client = _build_puffo_core_client(
+            self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg
+        )
+        client.transport_state_listener = self._transport_state_listener(agent_id)
+        return client
+
+    def _transport_state_listener(self, agent_id: str):
+        """Feed WS reconnect streaks into runtime.json health.
+
+        Before this, a dead transport kept reporting health="ok" with a
+        fresh local heartbeat for hours (the 8/30 App Nap incident):
+        "process alive" was standing in for "server reachable". Only the
+        ok state is overwritten — auth_failed and the other specific
+        signals stay authoritative — and only the transport-set state is
+        cleared on recovery.
+        """
+
+        def note(healthy: bool, streak: int) -> None:
+            rt = self.runtime
+            if healthy:
+                if rt.health == "server_unreachable":
+                    rt.health = "ok"
+                    rt.error = ""
+                    rt.save(agent_id)
+                    logger.info(
+                        "agent %s: transport recovered; runtime.health "
+                        "server_unreachable → ok",
+                        agent_id,
+                    )
+                return
+            if streak < _WS_DEGRADE_THRESHOLD or rt.health != "ok":
+                return
+            rt.health = "server_unreachable"
+            rt.error = (
+                f"server unreachable: {streak} consecutive WS reconnect "
+                "failures"
+            )
+            rt.save(agent_id)
+            logger.warning(
+                "agent %s: %s; runtime.health ok → server_unreachable",
+                agent_id,
+                rt.error,
+            )
+
+        return note
 
     def _enter_auth_failed(self, agent_id: str) -> None:
         """Flip ``auth_failed`` + fire recovery (refresher kick + operator
@@ -409,7 +476,10 @@ class Worker:
             self._api_key_auth_recovery_pending = True
         self._auth_failed_notification_sent = True
         try:
-            asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
+            spawn(
+                self._notify_operator_of_auth_failed_oauth(),
+                name="notify_operator_of_auth_failed_oauth",
+            )
         except Exception as exc:  # noqa: BLE001
             # Re-arm so a schedule failure retries on the next ENTER.
             self._auth_failed_notification_sent = False
@@ -510,7 +580,7 @@ class Worker:
             return
         self._drained_notification_sent = True
         try:
-            asyncio.create_task(self._notify_operator_of_drained())
+            spawn(self._notify_operator_of_drained(), name="notify_operator_of_drained")
         except Exception as exc:  # noqa: BLE001
             self._drained_notification_sent = False  # re-arm
             logger.warning(
@@ -736,7 +806,7 @@ class Worker:
         )
         self._api_key_auth_recovery_pending = False
         self.runtime = RuntimeState(
-            status="running",
+            status="starting",
             started_at=int(time.time()),
             msg_count=0,
         )
@@ -835,7 +905,10 @@ class Worker:
     def start(self) -> asyncio.Task:
         if self._task is not None and not self._task.done():
             return self._task
-        self._task = asyncio.ensure_future(self._run())
+        self.runtime.status = "starting"
+        self.runtime.error = ""
+        self.runtime.save(self.agent_cfg.id)
+        self._task = spawn(self._run(), name="run")
         return self._task
 
     @property
@@ -849,10 +922,10 @@ class Worker:
 
     async def wait_warm(self, timeout: float | None = None) -> bool:
         """Block until warm() finishes or the worker exits early.
-        Returns True on completion, False on timeout."""
+        Returns True only when startup reached ``running``."""
         try:
             await asyncio.wait_for(self._warm_done.wait(), timeout=timeout)
-            return True
+            return self.runtime.status == "running"
         except asyncio.TimeoutError:
             return False
 
@@ -1078,11 +1151,7 @@ class Worker:
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml is incomplete"
                 )
-            client = _build_puffo_core_client(
-                self.agent_cfg,
-                agent_id,
-                daemon_cfg=self.daemon_cfg,
-            )
+            client = self._build_wired_client()
             self._client = client
             reporter = self._build_status_reporter(client)
             identity = client.keystore.load_identity(client.slug)
@@ -1128,7 +1197,7 @@ class Worker:
                     "agent %s: ws-local profile sync failed: %s", agent_id, exc
                 )
 
-        asyncio.ensure_future(_ws_local_profile_sync())
+        spawn(_ws_local_profile_sync(), name="ws_local_profile_sync")
         logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
         try:
             await self._stop.wait()

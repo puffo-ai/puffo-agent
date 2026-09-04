@@ -26,6 +26,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 import aiohttp
 
 from ..limits import MAX_INBOUND_ATTACHMENT_BYTES
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ class CloudBridgeClient:
         logger.info("cloud bridge: WS connected (slug=%s)", self._slug)
         # Start the heartbeat only after a clean handshake so no failure
         # path leaves a live heartbeat task behind.
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._heartbeat_task = spawn(self._heartbeat_loop(), name="heartbeat_loop")
         for callback in tuple(self._connected_callbacks):
             try:
                 await callback()

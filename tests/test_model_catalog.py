@@ -106,6 +106,68 @@ def test_unknown_harness_is_just_default():
     assert provider_models("nope") == [mc._DAEMON_DEFAULT]
 
 
+def test_opencode_catalog_uses_models_visible_to_native_cli(monkeypatch):
+    """Authenticated OpenCode providers must not collapse to Custom model."""
+    monkeypatch.setattr(
+        "puffo_agent.agent.opencode_auth.list_opencode_models",
+        lambda executable: (
+            "opencode/big-pickle",
+            "deepseek/deepseek-v4-pro",
+        ),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_opencode_bin",
+        lambda: "/opt/bin/opencode",
+    )
+
+    assert _ids(provider_models("opencode", fetch=True))[1:] == [
+        "opencode/big-pickle",
+        "deepseek/deepseek-v4-pro",
+    ]
+
+
+def test_pi_catalog_uses_models_visible_to_native_cli(monkeypatch):
+    """A newly logged-in Pi must publish native models without a restart."""
+    monkeypatch.setattr(
+        "puffo_agent.agent.pi_auth.list_pi_models",
+        lambda executable, *, config_dir: (
+            (
+                "anthropic/claude-sonnet-4-6",
+                "claude-sonnet-4-6 (anthropic)",
+                True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_pi_bin", lambda: "/opt/bin/pi",
+    )
+
+    options = provider_models("pi", fetch=True)
+    assert _ids(options)[1:] == ["anthropic/claude-sonnet-4-6"]
+    assert options[1].label == "claude-sonnet-4-6 (anthropic)"
+    assert options[1].supported_inference_levels == (
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    )
+
+
+def test_opencode_catalog_drops_logged_out_provider_after_short_ttl(monkeypatch):
+    mc._cache["opencode"] = (
+        0,
+        (ModelOption("deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-pro"),),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.opencode_auth.list_opencode_models",
+        lambda executable: (),
+    )
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_opencode_bin",
+        lambda: "/opt/bin/opencode",
+    )
+
+    assert provider_models("opencode", fetch=True) == [mc._DAEMON_DEFAULT]
+    assert mc._cache["opencode"][1] == ()
+
+
 def test_fetch_returns_none_without_token(monkeypatch):
     monkeypatch.setattr(mc, "_anthropic_oauth_token", lambda: None)
     assert mc._fetch_anthropic_models() is None
