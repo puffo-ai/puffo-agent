@@ -12,17 +12,29 @@ logger = logging.getLogger(__name__)
 
 
 def puffo_agent_pkg_dir() -> Path:
-    """Host package root mounted read-only for the in-container MCP server."""
+    """Host ``puffo_agent`` PACKAGE dir, mounted read-only for the
+    in-container MCP server.
+
+    Deliberately the package itself, not its parent. Under a regular
+    (non-editable) install the parent IS site-packages, and mounting that
+    puts the host's platform-specific builds — ``pydantic_core``,
+    ``cryptography``, ``PIL`` … — ahead of the image's own on ``PYTHONPATH``.
+    On a macOS or Windows host those are the wrong ABI entirely, so the MCP
+    server dies at import with ``No module named
+    'pydantic_core._pydantic_core'`` and every agent silently loses
+    ``send_message``. Mounting only the package (pure Python) lets the image
+    supply every dependency, which is what it already ships.
+    """
     import puffo_agent
 
-    return Path(puffo_agent.__file__).resolve().parent.parent
+    return Path(puffo_agent.__file__).resolve().parent
 
 
 # Bump both values when the bundled image or mount layout changes. The image
 # tag makes first use build new contents; the layout marker recreates existing
 # per-Agent containers that still point at an older image or mount set.
 DEFAULT_IMAGE = "puffo/agent-runtime:v20"
-CONTAINER_LAYOUT_VERSION = "23"
+CONTAINER_LAYOUT_VERSION = "24"
 
 CLAUDE_CODE_NPM_VERSION = "2.1.224"
 CODEX_NPM_VERSION = "0.147.0"
