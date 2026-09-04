@@ -99,3 +99,15 @@ def test_non_v0_acp_projection_carries_the_puffo_server(launch_args):
     assert server.name == "puffo"
     assert server.args == ("-m", "puffo_agent.mcp.puffo_core_server")
     assert server.environment.get("PUFFO_CORE_SLUG") == "bot-0001"
+
+
+def test_duplicate_profile_flags_classify_by_the_last_occurrence():
+    """LingTai's argparse takes the LAST ``--profile``; Puffo must
+    classify by the same effective value or a duplicated flag launches
+    the child under a different profile than the one prepared for it —
+    both mismatch directions pinned."""
+    v0_then_v1 = ("acp", "--profile", "puffo-v0", "--profile", "puffo-v1")
+    v1_then_v0 = ("acp", "--profile", "puffo-v1", "--profile=puffo-v0")
+    (server,) = _project(v0_then_v1)  # effective v1 → carries the server
+    assert server.name == "puffo"
+    assert _project(v1_then_v0) == ()  # effective v0 → stays empty

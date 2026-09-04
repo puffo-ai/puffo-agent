@@ -337,10 +337,13 @@ async def test_launch_validator_sees_complete_immutable_plan_at_spawn_boundary()
         (server,) = plan.mcp_servers
         assert server.name == "puffo"
         assert server.command == "/usr/bin/python3"
-        assert server.args == ["-m", "puffo_agent.mcp.puffo_core_server"]
-        assert [(e.name, e.value) for e in server.env] == [
-            ("PUFFO_AGENT_ID", "agent_test")
-        ]
+        assert server.args == ("-m", "puffo_agent.mcp.puffo_core_server")
+        assert dict(server.environment) == {"PUFFO_AGENT_ID": "agent_test"}
+        # Sealed means sealed for the nested carriers too: what the
+        # validator saw is byte-for-byte what the wire call will convert.
+        assert isinstance(server.args, tuple)
+        with pytest.raises(TypeError):
+            server.environment["PUFFO_AGENT_ID"] = "changed"
         with pytest.raises(TypeError):
             plan.environment["ACP_TOKEN"] = "changed"
 
@@ -611,30 +614,43 @@ async def test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan(
     (server,) = seen[0]
     assert server.name == "puffo"
     assert server.command == "/usr/bin/python3"
-    assert server.args == ["-m", "puffo_agent.mcp.puffo_core_server"]
-    assert [(e.name, e.value) for e in server.env] == [
-        ("PUFFO_AGENT_ID", "agent_test")
-    ]
+    assert server.args == ("-m", "puffo_agent.mcp.puffo_core_server")
+    assert dict(server.environment) == {"PUFFO_AGENT_ID": "agent_test"}
+    assert isinstance(server.args, tuple)
+    with pytest.raises(TypeError):
+        server.environment["INJECTED"] = "value"
 
 
+@pytest.mark.parametrize(
+    "resume, expected_call",
+    [
+        pytest.param(None, "new_session", id="session-new"),
+        pytest.param(SessionRef("existing"), "load_session", id="session-load"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_session_new_receives_the_projected_mcp_servers():
-    """The wire value, not just the plan: ``session/new`` carries the
-    converted server list, which is what lets an ACP agent discover
-    Puffo's tools at all."""
-    harness = _Harness(can_load=False)
+async def test_session_calls_receive_the_projected_mcp_servers(
+    resume, expected_call
+):
+    """The wire value, not just the plan: both ``session/new`` and
+    ``session/load`` carry the converted server list — resuming an agent
+    must not silently drop its tools."""
+    harness = _Harness(can_load=True)
     driver = AcpDriver(
         harness.process_factory,
         connection_factory=harness.connection_factory,
     )
-    await driver.open(RuntimeSpec(
-        "/workspace",
-        executable="agent",
-        launch_args=("acp", "--agent-dir", "/agent"),
-        mcp_servers=(_PUFFO_CORE,),
-    ))
+    await driver.open(
+        RuntimeSpec(
+            "/workspace",
+            executable="agent",
+            launch_args=("acp", "--agent-dir", "/agent"),
+            mcp_servers=(_PUFFO_CORE,),
+        ),
+        resume,
+    )
 
-    sent = dict(harness.conn.calls)["new_session"]["mcp_servers"]
+    sent = dict(harness.conn.calls)[expected_call]["mcp_servers"]
     assert isinstance(sent, list)
     (server,) = sent
     assert isinstance(server, McpServerStdio)

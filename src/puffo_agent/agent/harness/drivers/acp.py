@@ -302,14 +302,20 @@ class AcpDriver(Driver):
             await self._conn.load_session(
                 cwd=launch.plan.cwd,
                 session_id=str(resume),
-                mcp_servers=list(launch.plan.mcp_servers),
+                mcp_servers=[
+                    _to_acp_stdio_server(server)
+                    for server in launch.plan.mcp_servers
+                ],
             )
             native_session_id = str(resume)
             resumed = True
         else:
             session = await self._conn.new_session(
                 cwd=launch.plan.cwd,
-                mcp_servers=list(launch.plan.mcp_servers),
+                mcp_servers=[
+                    _to_acp_stdio_server(server)
+                    for server in launch.plan.mcp_servers
+                ],
             )
             native_session_id = session.session_id
             resumed = False
@@ -377,13 +383,21 @@ class AcpDriver(Driver):
             environment=MappingProxyType(dict(spec.environment)),
             cwd=spec.workspace_dir,
             # The Driver is transport, not policy: it forwards whatever
-            # the runtime projected into ``spec.mcp_servers``, converted to
-            # the ACP wire shape. Which profiles receive Puffo's server —
-            # and that puffo-v0 stays empty, since it rejects a non-empty
-            # ``mcpServers`` at ``session/new`` — is decided by
-            # ``_project_protocol_mcp`` in the runtime.
+            # the runtime projected into ``spec.mcp_servers``. Which
+            # profiles receive Puffo's server — and that puffo-v0 stays
+            # empty, since it rejects a non-empty ``mcpServers`` at
+            # ``session/new`` — is decided by ``_project_protocol_mcp``
+            # in the runtime. The sealed plan carries deep-frozen copies;
+            # conversion to the mutable ACP wire objects happens only at
+            # the session call, so nothing validated here can change
+            # between validation and the wire.
             mcp_servers=tuple(
-                _to_acp_stdio_server(server)
+                McpServerSpec(
+                    name=server.name,
+                    command=server.command,
+                    args=tuple(server.args),
+                    environment=MappingProxyType(dict(server.environment)),
+                )
                 for server in spec.mcp_servers
             ),
         )
@@ -934,15 +948,17 @@ def _lingtai_constrained_profile(command: tuple[str, ...]) -> str:
     except ValueError:
         return ""
     profile_args = command[acp_index + 1 :]
+    # argparse takes the LAST occurrence of a repeated flag; classify by
+    # the same effective value or a duplicated ``--profile`` would launch
+    # under a different profile than Puffo prepared it for.
+    candidate = ""
     for index, arg in enumerate(profile_args):
         if arg == "--profile" and index + 1 < len(profile_args):
             candidate = profile_args[index + 1]
         elif arg.startswith("--profile="):
             candidate = arg.removeprefix("--profile=")
-        else:
-            continue
-        if candidate in _LINGTAI_CONSTRAINED_PROFILES:
-            return candidate
+    if candidate in _LINGTAI_CONSTRAINED_PROFILES:
+        return candidate
     return ""
 
 
