@@ -576,6 +576,10 @@ async def _wait_for_path(path) -> None:
             ("acp", "--runtime-id", "rt_x", "--profile", "puffo-v0"),
             id="puffo-v0",
         ),
+        pytest.param(
+            ("acp", "--runtime-id", "rt_x", "--profile", "puffo-v1"),
+            id="puffo-v1",
+        ),
         pytest.param(("acp", "--agent-dir", "/agent"), id="generic-acp"),
     ],
 )
