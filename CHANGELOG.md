@@ -6,7 +6,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [2.0.4a1] - 2026-09-03
+## 2.0.4a1 - 2026-09-03
 
 > Pre-release published to TestPyPI for staging validation only. It is not the
 > stable `2.0.4` release. Because TestPyPI already contains an earlier build
@@ -5028,8 +5028,7 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.4a1...HEAD
-[2.0.4a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.4a1
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.3...HEAD
 [2.0.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.3
 [2.0.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.2
 [2.0.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.1
