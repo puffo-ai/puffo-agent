@@ -367,6 +367,103 @@ async def test_native_sync_agent_profile_still_signs(monkeypatch):
     assert posted == [("/identities/self", {"display_name": "Native"})]
 
 
+# ── blank avatar_url is dropped before the signed PATCH ──────────
+
+
+class _RecordingHttp:
+    posted: list[tuple[str, dict]] = []
+
+    def __init__(self, *a, **kw):
+        pass
+
+    async def patch(self, path: str, body: dict) -> dict:
+        type(self).posted.append((path, dict(body)))
+        return {}
+
+    async def close(self) -> None:
+        pass
+
+
+def _record_http(monkeypatch) -> list[tuple[str, dict]]:
+    class _Http(_RecordingHttp):
+        posted: list[tuple[str, dict]] = []
+
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.PuffoCoreHttpClient",
+        _Http,
+    )
+    return _Http.posted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
+async def test_sync_agent_profile_drops_blank_avatar_url(monkeypatch, blank):
+    from puffo_agent.portal.profile_sync import sync_agent_profile
+
+    home = isolated_home()
+    write_test_agent(home, "blank-av-bot")
+    cfg = AgentConfig.load("blank-av-bot")
+    posted = _record_http(monkeypatch)
+
+    caller_patch = {"display_name": "Worker", "avatar_url": blank}
+    await sync_agent_profile(cfg, caller_patch)
+
+    assert posted == [("/identities/self", {"display_name": "Worker"})]
+    # caller's dict untouched
+    assert caller_patch["avatar_url"] == blank
+
+
+@pytest.mark.asyncio
+async def test_sync_agent_profile_keeps_real_avatar_url(monkeypatch):
+    from puffo_agent.portal.profile_sync import sync_agent_profile
+
+    home = isolated_home()
+    write_test_agent(home, "real-av-bot")
+    cfg = AgentConfig.load("real-av-bot")
+    posted = _record_http(monkeypatch)
+
+    await sync_agent_profile(cfg, {"avatar_url": "https://cdn.example/a.png"})
+
+    assert posted == [
+        ("/identities/self", {"avatar_url": "https://cdn.example/a.png"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_full_profile_omits_blank_avatar_url(monkeypatch):
+    home = isolated_home()
+    write_test_agent(home, "full-av-bot")
+    cfg = AgentConfig.load("full-av-bot")
+    cfg.display_name = "Full Bot"
+    cfg.avatar_url = ""
+    cfg.save()
+    posted = _record_http(monkeypatch)
+
+    await sync_full_profile(cfg)
+
+    assert len(posted) == 1
+    path, body = posted[0]
+    assert path == "/identities/self"
+    assert "avatar_url" not in body
+    assert body["display_name"] == "Full Bot"
+
+
+@pytest.mark.asyncio
+async def test_sync_full_profile_carries_real_avatar_url(monkeypatch):
+    home = isolated_home()
+    write_test_agent(home, "full-av-bot2")
+    cfg = AgentConfig.load("full-av-bot2")
+    cfg.display_name = "Full Bot 2"
+    cfg.avatar_url = "https://cdn.example/b.png"
+    cfg.save()
+    posted = _record_http(monkeypatch)
+
+    await sync_full_profile(cfg)
+
+    assert len(posted) == 1
+    assert posted[0][1]["avatar_url"] == "https://cdn.example/b.png"
+
+
 # ── control-WS op=edit flag differentiation ──────────────────────
 
 
