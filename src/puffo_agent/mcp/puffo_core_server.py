@@ -57,13 +57,12 @@ def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
             f"harness={harness!r} not installed on host — the CLI "
             "binary is missing from PATH."
         )
-    from ..agent.model_catalog import provider_models
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if (model or "") not in supported:
-        raise RuntimeError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    from ..agent.model_catalog import validate_model_id
+
+    try:
+        validate_model_id(model or "")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _validate_refresh_inference_level(harness: str, level: str) -> None:

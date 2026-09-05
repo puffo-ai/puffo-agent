@@ -23,6 +23,35 @@ def _ids(opts):
     return [o.id for o in opts]
 
 
+def _write_codex_cache(
+    root, model_ids: list[str], *, revision: str = "snapshot-1",
+):
+    cache = root / ".codex" / "models_cache.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({
+        "etag": revision,
+        "fetched_at": revision,
+        "models": [
+            {
+                "slug": model_id,
+                "display_name": model_id,
+                "visibility": "list",
+                "priority": index,
+            }
+            for index, model_id in enumerate(model_ids)
+        ],
+    }), encoding="utf-8")
+
+
+def _write_codex_auth(root, account_id: str):
+    auth = root / ".codex" / "auth.json"
+    auth.parent.mkdir(parents=True, exist_ok=True)
+    auth.write_text(json.dumps({
+        "auth_mode": "chatgpt",
+        "tokens": {"account_id": account_id},
+    }), encoding="utf-8")
+
+
 def test_claude_code_default_and_aliases_offline(monkeypatch):
     monkeypatch.setattr(mc, "_fetch_anthropic_models", lambda: None)  # offline
     opts = provider_models("claude-code", fetch=True)
@@ -78,7 +107,17 @@ def test_codex_reads_local_cache(monkeypatch, tmp_path):
     cache.parent.mkdir(parents=True)
     cache.write_text(json.dumps({"models": [
         {"slug": "gpt-5.4", "display_name": "GPT-5.4", "visibility": "list", "priority": 16},
-        {"slug": "gpt-5.5", "display_name": "GPT-5.5", "visibility": "list", "priority": 9},
+        {
+            "slug": "gpt-5.5",
+            "display_name": "GPT-5.5",
+            "visibility": "list",
+            "priority": 9,
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "vendor-special"},
+            ],
+        },
         {"slug": "codex-auto-review", "display_name": "Codex Auto Review",
          "visibility": "hide", "priority": 43},
     ]}), encoding="utf-8")
@@ -87,6 +126,9 @@ def test_codex_reads_local_cache(monkeypatch, tmp_path):
     assert ids[0] == ""  # daemon default
     # visibility=hide excluded; ordered by priority (gpt-5.5 before gpt-5.4)
     assert ids[1:] == ["gpt-5.5", "gpt-5.4"]
+    assert provider_models("codex")[1].supported_inference_levels == (
+        "low", "medium",
+    )
 
 
 def test_codex_fallback_when_cache_missing(monkeypatch, tmp_path):
@@ -100,6 +142,96 @@ def test_codex_fallback_on_bad_json(monkeypatch, tmp_path):
     cache.write_text("not json", encoding="utf-8")
     monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
     assert _ids(provider_models("codex"))[1:] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+
+
+def test_codex_catalog_keeps_models_across_alternating_snapshots(
+    monkeypatch, tmp_path,
+):
+    """A model that alternates in account discovery must not flicker out."""
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo-home"))
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, ["gpt-6-astra", "gpt-5.6-sol"], revision="a1")
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+    _write_codex_cache(tmp_path, ["gpt-5.6-sol"], revision="b1")
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+    _write_codex_cache(tmp_path, ["gpt-6-astra", "gpt-5.6-sol"], revision="a2")
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+
+def test_codex_catalog_errors_and_empty_results_keep_last_known_good(
+    monkeypatch, tmp_path,
+):
+    """Unreadable or empty provider snapshots must not clear the catalog."""
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo-home"))
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, ["gpt-6-astra"], revision="good")
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+    _write_codex_cache(tmp_path, [], revision="empty")
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+    (tmp_path / ".codex" / "models_cache.json").write_text(
+        "not json", encoding="utf-8",
+    )
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+
+def test_codex_catalog_removes_only_after_three_distinct_misses_over_window(
+    monkeypatch, tmp_path,
+):
+    """A genuinely withdrawn model needs three refreshes spanning 15 minutes."""
+    now = {"value": 1_000.0}
+    monkeypatch.setattr(mc.time, "time", lambda: now["value"])
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo-home"))
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, ["gpt-6-astra", "gpt-5.6-sol"], revision="a")
+    provider_models("codex")
+
+    for revision, elapsed in (("b1", 0), ("b2", 450)):
+        now["value"] = 1_000.0 + elapsed
+        _write_codex_cache(tmp_path, ["gpt-5.6-sol"], revision=revision)
+        assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+    now["value"] = 1_901.0
+    assert "gpt-6-astra" in _ids(provider_models("codex"))
+    _write_codex_cache(tmp_path, ["gpt-5.6-sol"], revision="b3")
+    assert "gpt-6-astra" not in _ids(provider_models("codex"))
+
+
+def test_codex_catalog_keeps_model_after_three_fast_misses(monkeypatch, tmp_path):
+    """Three misses inside the grace window must not remove a model."""
+    now = {"value": 1_000.0}
+    monkeypatch.setattr(mc.time, "time", lambda: now["value"])
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo-home"))
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, ["gpt-6-astra", "gpt-5.6-sol"], revision="a")
+    provider_models("codex")
+
+    for revision, elapsed in (("b1", 0), ("b2", 100), ("b3", 200)):
+        now["value"] = 1_000.0 + elapsed
+        _write_codex_cache(tmp_path, ["gpt-5.6-sol"], revision=revision)
+        assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+
+def test_codex_catalog_persistence_is_scoped_by_account(monkeypatch, tmp_path):
+    """Switching accounts must neither leak nor destroy another account's LKG."""
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo-home"))
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, ["account-a-model"], revision="a")
+    assert "account-a-model" in _ids(provider_models("codex"))
+
+    _write_codex_auth(tmp_path, "account-b")
+    _write_codex_cache(tmp_path, ["account-b-model"], revision="b")
+    assert "account-a-model" not in _ids(provider_models("codex"))
+
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, [], revision="a-empty")
+    assert "account-a-model" in _ids(provider_models("codex"))
 
 
 def test_unknown_harness_is_just_default():
