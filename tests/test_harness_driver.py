@@ -855,6 +855,22 @@ def _codex_protocol_driver():
     return proc, CodexAppServerDriver(lambda _spec: proc)
 
 
+@pytest.mark.asyncio
+async def test_codex_open_reports_unacknowledged_model_and_inference_level():
+    """A provider response without selection echoes must never look validated."""
+    proc, driver = _codex_protocol_driver()
+
+    opened = await driver.open(RuntimeSpec(
+        "/workspace", model="gpt-6-astra", inference_level="high",
+    ))
+
+    assert opened.diagnostics.warnings == (
+        "model_ack_unavailable",
+        "inference_level_ack_unavailable",
+    )
+    await driver.close()
+
+
 async def _open_codex_protocol_driver(proc, driver):
     opened = await driver.open(RuntimeSpec("/workspace", model="gpt"))
     assert opened.native_session_id == "th_1"

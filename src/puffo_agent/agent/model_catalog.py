@@ -65,8 +65,9 @@ _CLAUDE_STATIC: tuple[ModelOption, ...] = (
     ModelOption("claude-sonnet-4-6", "Claude Sonnet 4.6"),
 )
 
-# codex reads its own local model cache (see _codex_models); these are
-# the fallback when that cache is unreadable.
+# codex reads its own local model cache (see _codex_models); these are the
+# fallback only when the cache is unreadable and no persisted last-known-good
+# catalog exists for this account and source home.
 _CODEX_STATIC: tuple[ModelOption, ...] = (
     ModelOption("gpt-5.5", "GPT-5.5"),
     ModelOption("gpt-5.4", "GPT-5.4"),

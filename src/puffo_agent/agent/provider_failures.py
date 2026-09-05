@@ -134,7 +134,7 @@ def runtime_event_failure_code(error_code: str) -> str:
     return provider_failure(error_code).runtime_event_code
 
 
-def _looks_like_model_not_found(diagnostic: str) -> bool:
+def _diagnostic_mentions_model_not_found(diagnostic: str) -> bool:
     return (
         "model_not_found" in diagnostic
         or "model not found" in diagnostic
@@ -179,7 +179,7 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
         or re.search(r"\bquota\b", normalized) is not None
     ):
         return "quota_exhausted"
-    if _looks_like_model_not_found(normalized):
+    if _diagnostic_mentions_model_not_found(normalized):
         return "model_not_found"
     if _looks_like_model_entitlement_failure(normalized):
         return "not_entitled"

@@ -201,6 +201,22 @@ def test_codex_catalog_removes_only_after_three_distinct_misses_over_window(
     assert "gpt-6-astra" not in _ids(provider_models("codex"))
 
 
+def test_codex_catalog_keeps_model_after_three_fast_misses(monkeypatch, tmp_path):
+    """Three misses inside the grace window must not remove a model."""
+    now = {"value": 1_000.0}
+    monkeypatch.setattr(mc.time, "time", lambda: now["value"])
+    monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo-home"))
+    _write_codex_auth(tmp_path, "account-a")
+    _write_codex_cache(tmp_path, ["gpt-6-astra", "gpt-5.6-sol"], revision="a")
+    provider_models("codex")
+
+    for revision, elapsed in (("b1", 0), ("b2", 100), ("b3", 200)):
+        now["value"] = 1_000.0 + elapsed
+        _write_codex_cache(tmp_path, ["gpt-5.6-sol"], revision=revision)
+        assert "gpt-6-astra" in _ids(provider_models("codex"))
+
+
 def test_codex_catalog_persistence_is_scoped_by_account(monkeypatch, tmp_path):
     """Switching accounts must neither leak nor destroy another account's LKG."""
     monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
