@@ -100,6 +100,9 @@ class _NoopStatusReporter:
     async def report_error(self, _text):
         return None
 
+    async def set_activity_overlay(self, _activity):
+        return None
+
     async def run_heartbeat_loop(self):
         return None
 
@@ -399,12 +402,21 @@ class StandardWorkerRun:
                 process_factory=preparer.process_factory,
             )
             cleanup = preparer.aclose
+        async def emit_activity(activity: str | None) -> None:
+            # Late-bound: the status reporter is built after the adapter
+            # (in ``_start_services``); until then compaction changes are
+            # simply not reported, which matches today's behavior.
+            reporter = getattr(worker, "_status_reporter", None)
+            if reporter is not None:
+                await reporter.set_activity_overlay(activity)
+
         worker._adapter = build_local_runtime_adapter(
             prepared,
             outbox=outbox,
             logical_session_ref=session_ref,
             driver=driver,
             cleanup=cleanup,
+            activity_sink=emit_activity,
         )
         return outbox, session_ref, prepared
 
@@ -819,7 +831,12 @@ class StandardWorkerRun:
         if not hasattr(client, "http"):
             return _NoopStatusReporter()
         reporter = self.worker._build_status_reporter(client)
-        return reporter if reporter is not None else _NoopStatusReporter()
+        reporter = reporter if reporter is not None else _NoopStatusReporter()
+        # The harness activity sink (``_bind_driver_runtime``) late-binds to
+        # this attribute; cleared in teardown so a stopped reporter is never
+        # driven by a still-draining event stream.
+        self.worker._status_reporter = reporter
+        return reporter
 
     @staticmethod
     def _settle_process_health(
@@ -979,6 +996,7 @@ class StandardWorkerRun:
         except (asyncio.CancelledError, Exception):
             pass
         services.reporter.stop()
+        self.worker._status_reporter = None
         background_tasks = (
             services.heartbeat_task,
             services.status_task,

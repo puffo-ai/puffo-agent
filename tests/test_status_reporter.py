@@ -758,3 +758,61 @@ async def test_keyless_emit_failure_is_swallowed():
     run_id = await rep.begin_turn("msg_1")
     assert run_id.startswith("run_")
     assert rep._current_status == "busy"
+
+
+# ── activity refinement (compacting / reading_messages) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_notice_turn_reports_reading_messages_activity():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.begin_notice_turn("msg_1")
+
+    path, body = http.calls[-1]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "busy"
+    assert body["activity"] == "reading_messages"
+
+    # Admitting the real message ends the reading phase: the next
+    # heartbeat carries no activity.
+    await rep.begin_turn("msg_1")
+    await rep._send_heartbeat()
+    _, hb = http.calls[-1]
+    assert "activity" not in hb
+
+
+@pytest.mark.asyncio
+async def test_compaction_overlay_wins_and_restores():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("msg_1")
+
+    await rep.set_activity_overlay("compacting")
+    _, body = http.calls[-1]
+    assert body["activity"] == "compacting"
+
+    # Duplicate overlay is a no-op: nothing extra on the wire.
+    calls_before = len(http.calls)
+    await rep.set_activity_overlay("compacting")
+    assert len(http.calls) == calls_before
+
+    # Clearing the overlay restores the phase activity immediately.
+    await rep.set_activity_overlay(None)
+    _, body = http.calls[-1]
+    assert body["activity"] == "reading_messages"
+
+
+@pytest.mark.asyncio
+async def test_notice_terminal_clears_activity():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("msg_1")
+    await rep.set_activity_overlay("compacting")
+
+    await rep.end_notice_turn(succeeded=True)
+
+    _, body = http.calls[-1]
+    assert body["status"] == "idle"
+    assert "activity" not in body
