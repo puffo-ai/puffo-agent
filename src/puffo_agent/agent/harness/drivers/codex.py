@@ -174,6 +174,27 @@ def _is_invalid_resume_error(message: str) -> bool:
     return any(marker in lowered for marker in _INVALID_RESUME_MARKERS)
 
 
+def _selection_ack_warnings(
+    spec: RuntimeSpec, thread: dict[str, Any],
+) -> tuple[str, ...]:
+    warnings: list[str] = []
+    acknowledged_model = thread.get("model")
+    if spec.model and acknowledged_model != spec.model:
+        warnings.append(
+            "model_ack_unavailable"
+            if acknowledged_model is None
+            else "model_ack_mismatch"
+        )
+    acknowledged_level = thread.get("reasoningEffort")
+    if spec.inference_level and acknowledged_level != spec.inference_level:
+        warnings.append(
+            "inference_level_ack_unavailable"
+            if acknowledged_level is None
+            else "inference_level_ack_mismatch"
+        )
+    return tuple(warnings)
+
+
 def _classify_jsonrpc_error(error: Any) -> Exception:
     """Translate a Codex JSON-RPC error into Global Inbox recovery semantics."""
     error_obj = error if isinstance(error, dict) else {}
@@ -304,6 +325,12 @@ class CodexAppServerDriver(Driver):
             raise RuntimeError("Codex thread response omitted native thread id")
         self._native_session_id = native
         self._session_ref = SessionRef(native)
+        selection_warnings = _selection_ack_warnings(spec, thread)
+        if selection_warnings:
+            logger.warning(
+                "codex runtime selection not fully acknowledged: %s",
+                ", ".join(selection_warnings),
+            )
         await self._emit(
             HarnessEventType.SESSION_RESUMED
             if resumed
@@ -325,6 +352,7 @@ class CodexAppServerDriver(Driver):
                     "thread/compact/start",
                     "permission_bridge",
                 ),
+                warnings=selection_warnings,
             ),
         )
 

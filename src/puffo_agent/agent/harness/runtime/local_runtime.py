@@ -399,6 +399,7 @@ class LocalRuntimePreparer:
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             executable=executable,
             launch_args=tuple(launch_args),
@@ -789,6 +790,7 @@ class LocalRuntimePreparer:
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             executable=executable,
             environment=environment,

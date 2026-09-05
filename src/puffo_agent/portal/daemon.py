@@ -1075,14 +1075,9 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     }[harness]
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
-    from ..agent.model_catalog import provider_models
+    from ..agent.model_catalog import validate_model_id
 
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if model not in supported:
-        raise ValueError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    validate_model_id(model)
 
 
 def _validate_daemon_inference_level(harness: str, level: str) -> None:
