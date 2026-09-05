@@ -652,6 +652,8 @@ class Daemon:
         if cfg_for_revoke is None or not cfg_for_revoke.puffo_core.is_configured():
             return
         pc = cfg_for_revoke.puffo_core
+        if not await _leave_spaces_before_revoke(agent_id, dest, slug=pc.slug):
+            return
         try:
             await revoke_archived_device(dest, slug=pc.slug)
             logger.info("agent %s: device revoked server-side", agent_id)
@@ -728,6 +730,12 @@ class Daemon:
                 )
             return
         pc = cfg_for_revoke.puffo_core
+        # A deleted agent ghosts channel rosters exactly like an archived
+        # one — same fanout, same before-revoke constraint. The dir stays
+        # on disk (as the revoke-failure branch already does) so the sweep
+        # can retry; rmtree only after both have landed.
+        if not await _leave_spaces_before_revoke(agent_id, dest, slug=pc.slug):
+            return
         try:
             await revoke_archived_device(dest, slug=pc.slug)
             logger.info("agent %s: device revoked server-side", agent_id)
@@ -767,6 +775,90 @@ class Daemon:
                 exc,
                 dest,
             )
+
+
+async def _leave_spaces_before_revoke(
+    agent_id: str, dest: Path, *, slug: str
+) -> bool:
+    """Drop the archived agent out of every space it still belongs to, so
+    it stops appearing in channel rosters and the @-mention picker
+    (PUF-430). Returns whether the caller may proceed to the revoke.
+
+    On a transient failure we return ``False`` and leave BOTH markers: the
+    revoke has to wait, because it 401s the only credential that can sign
+    the outstanding leaves. Owning a space is not a failure — the server
+    won't let an owner leave, so we warn and archive anyway rather than
+    stranding the agent in a half-archived state.
+    """
+    from .import_agents import (
+        leave_all_spaces,
+        write_archived_pending_leave,
+        write_archived_pending_revoke,
+    )
+
+    failed: list[str] = []
+    try:
+        result = await leave_all_spaces(dest, slug=slug)
+    except Exception as exc:  # noqa: BLE001
+        reason = f"{type(exc).__name__}: {exc}"
+    else:
+        if result.skipped_owner:
+            logger.warning(
+                "agent %s: still owns space(s) %s — cannot leave them "
+                "(ownership must be transferred first); archiving anyway",
+                agent_id,
+                ", ".join(result.skipped_owner),
+            )
+        if result.skipped_permanent:
+            logger.warning(
+                "agent %s: space(s) %s permanently rejected the leave; "
+                "archiving anyway (a retry would never converge)",
+                agent_id,
+                ", ".join(result.skipped_permanent),
+            )
+        if not result.failed:
+            logger.info(
+                "agent %s: left %d space(s) before revoke",
+                agent_id,
+                len(result.left),
+            )
+            return True
+        failed = result.failed
+        reason = result.last_error
+
+    logger.warning(
+        "agent %s: space-leave incomplete (%s); deferring revoke so the "
+        "next startup sweep can retry the leave first",
+        agent_id,
+        reason,
+    )
+    try:
+        write_archived_pending_leave(
+            dest, slug=slug, space_ids=failed, last_error=reason
+        )
+    except OSError as exc:
+        logger.warning(
+            "agent %s: failed to write pending_leave marker: %s", agent_id, exc
+        )
+        return True
+    try:
+        from ..crypto.keystore import KeyStore
+
+        identity = KeyStore(dest / "keys").load_identity(slug)
+        write_archived_pending_revoke(
+            dest,
+            server_url=identity.server_url,
+            slug=identity.slug,
+            device_id=identity.device_id,
+            last_error=f"deferred behind pending space-leave: {reason}",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "agent %s: failed to write deferred pending_revoke marker: %s",
+            agent_id,
+            exc,
+        )
+    return False
 
 
 async def _report_lifecycle(agent_cfg: AgentConfig, status: str) -> bool:
