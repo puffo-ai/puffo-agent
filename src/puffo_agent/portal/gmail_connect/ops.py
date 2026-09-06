@@ -50,13 +50,19 @@ def _reply(reason: str, *, ok: bool, state: str = "") -> dict:
     return {"ok": ok, "state": state or load_status().state, "reason": reason}
 
 
-# Jeff 188535: the four non-confirming facts are NOT one outcome. Only a
-# provable human cancel reports as a transient user choice; the rest are
-# failures of this machine, and are persisted as such so the UI can say
-# something true and actionable instead of "cancelled".
+# Jeff 188539 (final): the non-confirming facts are NOT one outcome. Only
+# a provable human cancel reports as a transient user choice; the rest are
+# failures of this machine and are persisted, so the UI can say something
+# true and actionable instead of "cancelled".
+#
+# ``confirm_timeout`` is deliberately NOT the executor's ``timeout``:
+# nobody answering the dialog (never contacted Google, just retry) and the
+# executor going silent after start (consent page may already have opened)
+# are different facts, and one value for both is the same alias bug we
+# just removed (Boris 188538).
 _CONFIRM_REFUSALS = {
     ConfirmOutcome.CANCELLED: ("disconnected", "refused"),
-    ConfirmOutcome.TIMEOUT: ("failed", "timeout"),
+    ConfirmOutcome.TIMEOUT: ("failed", "confirm_timeout"),
     ConfirmOutcome.UNAVAILABLE: ("failed", "confirm_unavailable"),
 }
 

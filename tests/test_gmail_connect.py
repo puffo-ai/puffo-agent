@@ -566,21 +566,25 @@ def test_reply_clamps_free_text_on_its_own_leg():
 
 
 @pytest.mark.asyncio
-async def test_five_confirm_facts_each_pin_response_and_persistence(
+async def test_six_confirm_facts_each_pin_response_and_persistence(
     tmp_path, home, monkeypatch
 ):
-    """Jeff 188535's table, all five facts, both legs each.
+    """Jeff 188539's final table — six facts, both legs each.
 
-    ``refused`` is reserved for a person who provably declined. The other
-    non-confirming facts are failures of this machine and must say so —
-    collapsing them reported "cancelled" on every non-macOS host, which
-    is untrue and leaves the user nothing to act on (Boris 188533).
+    ``refused`` is reserved for a person who provably declined; the other
+    non-confirming facts are failures of this machine and must say so.
+    Collapsing them reported "cancelled" on every non-macOS host, which
+    is untrue and unactionable (Boris 188533). ``confirm_timeout`` is
+    kept distinct from the executor's ``timeout`` for the same reason:
+    nobody answering the dialog never contacted Google, while a silent
+    executor may already have opened the consent page (Boris 188538).
 
-      person clicks Cancel  -> (disconnected, refused)         NOT persisted
-      nobody answers        -> (failed, timeout)               persisted
-      no dialog backend     -> (failed, confirm_unavailable)   persisted
-      backend failed to run -> (failed, confirm_unavailable)   persisted
-      executor refuses      -> (failed, refused)               persisted
+      person clicks Cancel   -> (disconnected, refused)         NOT persisted
+      nobody answers dialog  -> (failed, confirm_timeout)       persisted
+      no dialog backend      -> (failed, confirm_unavailable)   persisted
+      backend failed to run  -> (failed, confirm_unavailable)   persisted
+      executor refuses       -> (failed, refused)               persisted
+      executor read timeout  -> (failed, timeout)               persisted
     """
     _configured(monkeypatch)
 
@@ -604,7 +608,7 @@ async def test_five_confirm_facts_each_pin_response_and_persistence(
             assert (after.state, after.reason) == ("disconnected", ""), outcome
 
     await check(ConfirmOutcome.CANCELLED, "disconnected", "refused", persisted=False)
-    await check(ConfirmOutcome.TIMEOUT, "failed", "timeout", persisted=True)
+    await check(ConfirmOutcome.TIMEOUT, "failed", "confirm_timeout", persisted=True)
     await check(
         ConfirmOutcome.UNAVAILABLE, "failed", "confirm_unavailable", persisted=True
     )
@@ -620,6 +624,21 @@ async def test_five_confirm_facts_each_pin_response_and_persistence(
     reply = await ops.gmail_connect_initiate({})
     assert reply == {"ok": False, "state": "failed", "reason": "refused"}
     assert (load_status().state, load_status().reason) == ("failed", "refused")
+
+    # sixth fact: the executor started and then went silent. Distinct
+    # from nobody answering the dialog — this one may already have
+    # opened the consent page, so the user needs a different hint.
+    async def read_timeout(*a, **k):
+        return ExecutorOutcome(status="failed", reason="timeout")
+
+    store_status(GmailConnectStatus(state="disconnected"))
+    monkeypatch.setattr(ops, "run_gmail_executor", read_timeout)
+    reply = await ops.gmail_connect_initiate({})
+    assert reply == {"ok": False, "state": "failed", "reason": "timeout"}
+    assert (load_status().state, load_status().reason) == ("failed", "timeout")
+
+    # the two timeouts are different facts, not one value wearing two hats
+    assert ops._CONFIRM_REFUSALS[ConfirmOutcome.TIMEOUT][1] == "confirm_timeout"
 
 
 @pytest.mark.parametrize(
