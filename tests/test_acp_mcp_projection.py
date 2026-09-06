@@ -99,6 +99,7 @@ def test_non_v0_acp_projection_carries_the_puffo_server(launch_args):
     assert server.name == "puffo"
     assert server.args == ("-m", "puffo_agent.mcp.puffo_core_server")
     assert server.environment.get("PUFFO_CORE_SLUG") == "bot-0001"
+    assert server.environment.get("PUFFO_LOCAL_SERVICE_TOKEN")
 
 
 def test_duplicate_profile_flags_classify_by_the_last_occurrence():
