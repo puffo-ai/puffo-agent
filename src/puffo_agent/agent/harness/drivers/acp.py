@@ -965,11 +965,12 @@ def _lingtai_constrained_profile(command: tuple[str, ...]) -> str:
 def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
     """True for every constrained LingTai profile, independent of argv[0].
 
-    Both ``puffo-v0`` and ``puffo-v1`` refuse to start without a
-    successful Driver authority handshake (LingTai #1624), so both get
-    the authority FD and the guarded POSIX spawn path. This is a wider
-    predicate than ``selects_puffo_v0_profile``, which only controls
-    the empty MCP projection.
+    Both profiles must fail closed without a successful Driver authority
+    handshake, so both get the authority FD and guarded POSIX spawn path.
+    ``puffo-v1`` enforces that contract at startup; ``puffo-v0`` starts with
+    an unavailable adapter and denies the first authority-controlled action.
+    This is a wider predicate than ``selects_puffo_v0_profile``, which only
+    controls the empty MCP projection.
     """
 
     return bool(_lingtai_constrained_profile(command))

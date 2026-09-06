@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import os
 import sys
 import time
@@ -586,8 +585,7 @@ async def _wait_for_path(path) -> None:
         pytest.param(("acp", "--agent-dir", "/agent"), id="generic-acp"),
     ],
 )
-@pytest.mark.asyncio
-async def test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan(
+def test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan(
     launch_args,
 ):
     """The Driver is transport, not policy: whatever the runtime projected
@@ -606,9 +604,10 @@ async def test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan(
         mcp_servers=(_PUFFO_CORE,),
     )
 
-    with contextlib.suppress(Exception):
-        # The plan is sealed and validated before any spawn is attempted.
-        await driver.open(spec)
+    # Inspect the final pre-spawn seam directly. Reaching into this local
+    # object is intentional: this test guards plan construction and must not
+    # start a real provider when ``lingtai-agent`` happens to be installed.
+    driver._validate_launch_plan(spec)
 
     assert len(seen) == 1
     (server,) = seen[0]
