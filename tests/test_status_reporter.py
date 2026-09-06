@@ -903,6 +903,50 @@ class _GatedHttp(FakeHttp):
 
 
 @pytest.mark.asyncio
+async def test_terminal_batch_upload_holds_the_send_lock():
+    """The dispatcher's immediate terminal upload is a status write
+    (the server flips agent_status on end:batch): it must queue
+    behind an in-flight beat. Without the lock the terminal batch
+    overtakes a slow busy/compacting beat, that stale beat lands
+    last, and a finished agent reads busy/compacting until the next
+    scheduled beat."""
+
+    class _Dispatcher:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        def set_status_refresh(self, _cb) -> None:
+            return None
+
+        async def enqueue(self, runs, *, immediate=False):
+            self.entered.set()
+            return ProcessingReportResult("uploaded", len(runs))
+
+    http = _GatedHttp()
+    disp = _Dispatcher()
+    rep = StatusReporter(http, heartbeat_interval_s=999, processing_reports=disp)
+    rep.set_activity_overlay("compacting")
+    beat = asyncio.ensure_future(rep.report_current_status())
+    await asyncio.wait_for(http.entered.wait(), 1)
+
+    finish = asyncio.ensure_future(
+        rep.end_turn_batch([
+            {"run_id": "run_1", "message_id": "m1", "succeeded": True},
+        ])
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # The terminal upload waits for the in-flight beat.
+    assert not disp.entered.is_set()
+
+    http.gate.set()
+    await asyncio.wait_for(asyncio.gather(beat, finish), 1)
+    assert disp.entered.is_set()
+    assert rep._current_status == "idle"
+    assert rep._effective_activity is None
+
+
+@pytest.mark.asyncio
 async def test_status_writes_are_serialized_and_carry_newest_state():
     """Concurrent status writes must not reorder: the next body is
     built only after the in-flight POST completes, so a label built

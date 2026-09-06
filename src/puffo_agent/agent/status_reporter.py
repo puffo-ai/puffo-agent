@@ -449,25 +449,36 @@ class StatusReporter:
         *,
         any_failed: bool,
     ) -> None:
-        self._current_status = "error" if any_failed else "idle"
-        self._current_message_id = None
-        self._clear_activity()
-        try:
-            result = await self._processing_reports.enqueue(runs, immediate=True)
-        except Exception:  # noqa: BLE001 - status must not break the turn
-            logger.warning("failed to persist processing reports", exc_info=True)
-            await self._send_heartbeat()
-            return
-        if (
-            result.state != "uploaded"
-            or result.requested_pending
-            or result.count != len(runs)
-        ):
-            # The terminal batch will eventually settle Server status. Until
-            # then, or after a mixed old/current batch, re-assert the live
-            # snapshot. Server rate-limits duplicate beats but accepts visible
-            # status/message transitions immediately.
-            await self._send_heartbeat()
+        # The dispatcher's immediate upload IS a status write (the
+        # server flips agent_status on end:batch), so it must hold the
+        # same send lock as every heartbeat: without it, the terminal
+        # batch overtakes an in-flight busy/compacting beat and that
+        # stale beat lands last, flipping a finished agent back to
+        # busy until the next scheduled beat.
+        async with self._send_lock:
+            self._current_status = "error" if any_failed else "idle"
+            self._current_message_id = None
+            self._clear_activity()
+            try:
+                result = await self._processing_reports.enqueue(
+                    runs, immediate=True
+                )
+            except Exception:  # noqa: BLE001 - status must not break the turn
+                logger.warning(
+                    "failed to persist processing reports", exc_info=True
+                )
+                await self._send_heartbeat_locked()
+                return
+            if (
+                result.state != "uploaded"
+                or result.requested_pending
+                or result.count != len(runs)
+            ):
+                # The terminal batch will eventually settle Server status.
+                # Until then, or after a mixed old/current batch, re-assert
+                # the live snapshot. Server rate-limits duplicate beats but
+                # accepts visible status/message transitions immediately.
+                await self._send_heartbeat_locked()
 
     async def report_error(self, error_text: str) -> None:
         """Catch-all for unrecoverable failures; cleared by the
