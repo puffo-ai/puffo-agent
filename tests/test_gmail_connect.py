@@ -1088,3 +1088,132 @@ def test_invalid_pin_diagnostic_never_carries_the_value(caplog):
     assert "invalid_client_bundle_sha256" in logged
     assert pin not in logged
     assert "SECRETLOOKING" not in logged
+
+
+# ---------------------------------------------------------------------------
+# Windows native confirm (Jeff 188597 / 188599, Jeremy 188600: acceptance
+# runs on Windows). This host is macOS, so what is provable here is the
+# producer path — the shipped dialog script and the classification — not
+# that a real dialog appears. That last cell needs Jeremy's machine.
+# ---------------------------------------------------------------------------
+
+
+def test_backend_dispatch_covers_exactly_the_two_supported_hosts(monkeypatch):
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    monkeypatch.setattr(nc.sys, "platform", "darwin")
+    argv, classify = nc._backend("hello")
+    assert argv[0] == "osascript" and classify is nc._classify_osascript
+
+    monkeypatch.setattr(nc.sys, "platform", "win32")
+    argv, classify = nc._backend("hello")
+    assert argv[0] == nc.sys.executable and classify is nc._classify_windows
+    # The prompt travels as an argument, never spliced into the source.
+    assert argv[2] == nc._WINDOWS_DIALOG_SOURCE
+    assert argv[3:] == ["hello", nc.DIALOG_TITLE]
+
+    for platform in ("linux", "freebsd", "cygwin"):
+        monkeypatch.setattr(nc.sys, "platform", platform)
+        assert nc._backend("hello") is None, platform
+
+
+@pytest.mark.parametrize(
+    "returncode,expected",
+    [
+        (0, ConfirmOutcome.CONFIRMED),
+        (7, ConfirmOutcome.CANCELLED),
+        (9, ConfirmOutcome.UNAVAILABLE),
+        # 1 and 2 are what a Python that failed to start exits with. If
+        # either were read as a decline we would tell the user they said
+        # no on a machine where the dialog never ran — the same failure
+        # the osascript branch avoids by matching -128 exactly.
+        (1, ConfirmOutcome.UNAVAILABLE),
+        (2, ConfirmOutcome.UNAVAILABLE),
+        (-9, ConfirmOutcome.UNAVAILABLE),
+        (127, ConfirmOutcome.UNAVAILABLE),
+    ],
+)
+def test_windows_classification_fails_closed(returncode, expected):
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    assert nc._classify_windows(returncode, b"") is expected
+
+
+def _run_dialog_script(message_box_returns: int):
+    """Execute the SHIPPED dialog source with a stubbed ``ctypes``.
+
+    Running the real string rather than a paraphrase is the point: a
+    test that re-implements the exit-code logic would stay green while
+    the shipped script drifted.
+    """
+    import subprocess
+    import sys as _sys
+
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    harness = textwrap.dedent(
+        f"""
+        import sys, types
+        calls = []
+        user32 = types.SimpleNamespace(
+            MessageBoxW=lambda *a: (calls.append(a), {message_box_returns})[1]
+        )
+        fake = types.ModuleType("ctypes")
+        fake.windll = types.SimpleNamespace(user32=user32)
+        sys.modules["ctypes"] = fake
+        try:
+            exec(compile({nc._WINDOWS_DIALOG_SOURCE!r}, "<dialog>", "exec"))
+        finally:
+            sys.stderr.write(repr(calls))
+        """
+    )
+    return subprocess.run(
+        [_sys.executable, "-c", harness, "THE PROMPT", "THE TITLE"],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "message_box_returns,exit_code",
+    [
+        (6, 0),    # IDYES  -> confirmed
+        (7, 7),    # IDNO   -> declined
+        (0, 9),    # MessageBoxW itself failed -> NOT a decline
+        (2, 9),    # IDCANCEL cannot occur on a Yes/No box; still not a decline
+        (32000, 9),
+    ],
+)
+def test_shipped_dialog_script_maps_return_codes(message_box_returns, exit_code):
+    done = _run_dialog_script(message_box_returns)
+    assert done.returncode == exit_code, done.stderr
+
+
+def test_shipped_dialog_script_passes_text_as_data_with_the_safe_flags():
+    """The prompt and title reach MessageBoxW as arguments, and the box
+    is Yes/No defaulted to No — so a dismissal that is not a deliberate
+    Yes cannot read as consent."""
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    done = _run_dialog_script(6)
+    assert "THE PROMPT" in done.stderr and "THE TITLE" in done.stderr
+    assert str(nc._WIN_DIALOG_FLAGS) in done.stderr
+    # Default button is No, and the box is Yes/No rather than OK/Cancel.
+    assert nc._WIN_DIALOG_FLAGS & 0x00000100  # MB_DEFBUTTON2
+    assert nc._WIN_DIALOG_FLAGS & 0x00000004  # MB_YESNO
+
+def test_hostile_prompt_stays_in_argv_and_out_of_the_source(monkeypatch):
+    """A prompt is data. It reaches the child as an argument, and the
+    executed source is a fixed constant — so there is no quoting to get
+    wrong, unlike the osascript branch which must escape its string."""
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    hostile = 'x"; import os; os.system("touch /tmp/pwned"); "'
+    monkeypatch.setattr(nc.sys, "platform", "win32")
+    argv, _ = nc._backend(hostile)
+
+    source = argv[2]
+    assert source == nc._WINDOWS_DIALOG_SOURCE
+    assert "pwned" not in source
+    assert hostile == argv[3]
+    assert "sys.argv[1]" in source
