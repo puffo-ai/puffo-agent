@@ -369,6 +369,32 @@ def test_hello_state_bounds_generations_per_agent():
         rpc_service.clear_mcp_hello("t")
 
 
+def test_probed_generation_survives_zombie_beacon_pressure():
+    """More live senders than slots must never evict the probed
+    generation. With four surviving zombie subprocesses beaconing
+    alongside the current one, a pure least-recently-heard trim
+    periodically dropped the current generation (whichever beaconed
+    longest ago), so the next probe read never-seen and recycled a
+    healthy runtime."""
+    rpc_service.clear_mcp_hello("t")
+    try:
+        rpc_service.record_mcp_hello("t", "g-current", 60.0)
+        # The worker probe only ever queries the generation it minted;
+        # that query pins it against the trim.
+        assert rpc_service.mcp_hello_state("t", "g-current")[0] > 0.0
+        # Four zombies beacon after the current generation, making it
+        # the least recently heard entry when the trim fires.
+        for n in range(4):
+            rpc_service.record_mcp_hello("t", f"g-zombie{n}", 60.0)
+        slots = rpc_service._MCP_HELLO_SEEN["t"]
+        assert len(slots) == rpc_service._MCP_HELLO_MAX_GENERATIONS
+        seen_at, interval = rpc_service.mcp_hello_state("t", "g-current")
+        assert seen_at > 0.0
+        assert interval == 60.0
+    finally:
+        rpc_service.clear_mcp_hello("t")
+
+
 def test_empty_turn_cannot_clear_mcp_unreachable(saved_states):
     """Only a current-generation hello proves that the MCP lane recovered."""
     worker = _seed_worker(health="mcp_unreachable")

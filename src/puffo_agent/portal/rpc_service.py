@@ -53,10 +53,16 @@ def set_rpc_resolver(fn: Optional[RpcResolver]) -> None:
 # evidence and drive false recycles. beacon-interval is the
 # subprocess's self-declared re-hello cadence (None for a startup-only
 # sender): the probe enforces freshness only where the capability was
-# declared. Per-agent generations are bounded: dead generations stop
-# re-recording, so trimming the oldest arrival keeps live ones and a
-# leaking predecessor cannot grow the map without bound.
+# declared. Per-agent generations are bounded, but surviving old
+# subprocesses keep re-recording their generations: with more live
+# senders than slots, a pure least-recently-heard trim would
+# periodically evict the current generation (whichever beaconed
+# longest ago) and fake a never-seen probe result. The probe is the
+# only reader, and it only ever asks about the generation it minted —
+# so the last-probed generation is pinned and never trimmed; zombie
+# generations are never probed and stay evictable.
 _MCP_HELLO_SEEN: dict[str, dict[str, tuple[float, float | None]]] = {}
+_MCP_HELLO_PROBED: dict[str, str] = {}
 _MCP_HELLO_MAX_GENERATIONS = 4
 
 
@@ -65,8 +71,10 @@ def record_mcp_hello(
 ) -> None:
     slots = _MCP_HELLO_SEEN.setdefault(agent_id, {})
     slots[generation] = (time.monotonic(), beacon_interval)
+    pinned = _MCP_HELLO_PROBED.get(agent_id)
     while len(slots) > _MCP_HELLO_MAX_GENERATIONS:
-        oldest = min(slots, key=lambda gen: slots[gen][0])
+        evictable = [gen for gen in slots if gen != pinned]
+        oldest = min(evictable, key=lambda gen: slots[gen][0])
         del slots[oldest]
 
 
@@ -75,6 +83,7 @@ def mcp_hello_state(
 ) -> tuple[float, float | None]:
     """Last (monotonic arrival, declared beacon interval) of a hello
     from exactly this generation; (0.0, None) when never seen."""
+    _MCP_HELLO_PROBED[agent_id] = generation
     slots = _MCP_HELLO_SEEN.get(agent_id)
     if not slots:
         return (0.0, None)
@@ -83,6 +92,7 @@ def mcp_hello_state(
 
 def clear_mcp_hello(agent_id: str) -> None:
     _MCP_HELLO_SEEN.pop(agent_id, None)
+    _MCP_HELLO_PROBED.pop(agent_id, None)
 
 
 async def mcp_hello_route(request: web.Request) -> web.Response:
