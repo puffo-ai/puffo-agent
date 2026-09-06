@@ -1,10 +1,11 @@
 """Sanitized Gmail-connector status for this machine.
 
-The OAuth executor owns the token file; the daemon stores only this
-projection. Serialization is whitelist-only via ``projection()`` so a
-new field can't reach disk, the control plane, or the local RPC without
-being added here deliberately — consumers of this file can never learn
-credential material because none is ever accepted into the type.
+Layer B of the two-layer field boundary (design v1.6 §3, frozen):
+the product projection carries ONLY the connection-state enum and the
+sanitized failure reason. Serialization is whitelist-only via
+``projection()`` so no Layer-A detail (token_db, bundle paths, scope,
+or any storage detail) can reach disk, the control plane, or the local
+RPC — none of it is even representable in this type.
 """
 
 from __future__ import annotations
@@ -27,21 +28,13 @@ STATES = ("disconnected", "pending", "connected", "failed", "revoked")
 @dataclass
 class GmailConnectStatus:
     state: str = "disconnected"
-    account_masked: str = ""
-    # RFC3339 string from the executor; opaque to the daemon.
-    expires_at: str = ""
-    # Coarse reason only (§4 coarsening); detail stays in the executor.
+    # Coarse reason only (§4 closed enum); detail stays in the executor.
     reason: str = ""
     updated_at: float = 0.0
 
     def projection(self) -> dict:
         """The only serialization: an explicit whitelist."""
-        return {
-            "state": self.state,
-            "account_masked": self.account_masked,
-            "expires_at": self.expires_at,
-            "reason": self.reason,
-        }
+        return {"state": self.state, "reason": self.reason}
 
 
 def status_path() -> Path:
@@ -62,8 +55,6 @@ def load_status() -> GmailConnectStatus:
         state = "disconnected"
     return GmailConnectStatus(
         state=state,
-        account_masked=str(raw.get("account_masked", "")),
-        expires_at=str(raw.get("expires_at", "")),
         reason=str(raw.get("reason", "")),
         updated_at=float(raw.get("updated_at", 0.0)),
     )
@@ -78,16 +69,3 @@ def store_status(status: GmailConnectStatus) -> None:
     tmp.write_text(json.dumps(data), encoding="utf-8")
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
-
-
-def mask_account(email: str) -> str:
-    """Keep at most two leading characters of the local part.
-
-    The raw address never persists: masking happens before the value
-    enters ``GmailConnectStatus``, not at display time.
-    """
-    email = email.strip()
-    if "@" not in email:
-        return "***" if email else ""
-    local, _, domain = email.partition("@")
-    return f"{local[:2]}***@{domain}"

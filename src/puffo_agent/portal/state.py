@@ -311,12 +311,19 @@ class RpcServiceConfig:
 class GmailConnectConfig:
     """Gmail token-axis connect (``portal/gmail_connect/``).
 
-    Disabled until an operator configures the executor path — the
-    entrypoint is deliberately config-only so no control-plane command
-    can choose what binary the daemon spawns."""
+    Disabled until an operator/installer configures it — the
+    entrypoint and invoke config (data_root, bundle pin) are
+    deliberately config-only so no control-plane command can choose
+    what binary the daemon spawns or which client bundle it trusts."""
 
     enabled: bool = False
     executor_path: str = ""
+    # EXECUTOR_INVOKE_SCHEMA v1 §2: where the executor keeps its sealed
+    # token DB + keystore, and the raw-bytes sha256 pin of the client
+    # bundle (fail-closed inside the executor on mismatch).
+    data_root: str = ""
+    client_bundle_sha256: str = ""
+    client_bundle: str = ""  # optional; executor defaults inside data_root
     confirm_timeout_seconds: float = 120.0
     flow_timeout_seconds: float = 300.0
 
@@ -455,6 +462,9 @@ class DaemonConfig:
         cfg.gmail_connect = GmailConnectConfig(
             enabled=g.get("enabled") is True,
             executor_path=str(g.get("executor_path", "")),
+            data_root=str(g.get("data_root", "")),
+            client_bundle_sha256=str(g.get("client_bundle_sha256", "")),
+            client_bundle=str(g.get("client_bundle", "")),
             confirm_timeout_seconds=float(
                 g.get("confirm_timeout_seconds", gc_defaults.confirm_timeout_seconds)
             ),

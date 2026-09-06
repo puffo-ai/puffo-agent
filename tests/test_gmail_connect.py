@@ -1,13 +1,16 @@
-"""Gmail connect: presence gate, loopback refusal, sanitized projection.
+"""Gmail connect: presence gate, loopback checks, Layer-B projection.
 
 The negative controls are the contract: no confirmation → the executor
-is never spawned; a non-loopback callback is refused before spawn; and
-nothing token-shaped can reach the status file or its consumers.
+is never spawned; a non-loopback callback or ready line dies before/at
+the seam; token-only disconnect never reads as ``revoked``; and no
+Layer-A detail (token_db, bundle paths, scope) can reach the Layer-B
+projection or its consumers (EXECUTOR_INVOKE_SCHEMA v1 §5.1).
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import stat
@@ -18,13 +21,13 @@ import pytest
 from puffo_agent.portal.gmail_connect import executor as executor_mod
 from puffo_agent.portal.gmail_connect import ops
 from puffo_agent.portal.gmail_connect.executor import (
+    ExecutorOutcome,
     ExecutorRefused,
     run_gmail_executor,
 )
 from puffo_agent.portal.gmail_connect.status_store import (
     GmailConnectStatus,
     load_status,
-    mask_account,
     status_path,
     store_status,
 )
@@ -40,7 +43,11 @@ def home(tmp_path, monkeypatch):
 def _configured(monkeypatch, **overrides) -> None:
     cfg = DaemonConfig()
     cfg.gmail_connect = GmailConnectConfig(
-        enabled=True, executor_path="/usr/bin/true", **overrides
+        enabled=True,
+        executor_path="/usr/bin/true",
+        data_root="/var/lib/gw",
+        client_bundle_sha256="a" * 64,
+        **overrides,
     )
     monkeypatch.setattr(ops, "_config", lambda: cfg)
 
@@ -58,7 +65,7 @@ async def test_declined_confirm_never_spawns_executor(home, monkeypatch):
 
     async def spy_executor(*a, **k):  # pragma: no cover - must not run
         calls.append({})
-        return executor_mod.ExecutorOutcome(status="connected")
+        return ExecutorOutcome(status="connected")
 
     monkeypatch.setattr(ops, "request_native_confirm", deny)
     monkeypatch.setattr(ops, "run_gmail_executor", spy_executor)
@@ -82,25 +89,24 @@ async def test_non_loopback_callback_refused_before_spawn(monkeypatch):
     with pytest.raises(ExecutorRefused):
         await run_gmail_executor(
             "/usr/bin/true",
-            {"op": "connect", "callback_host": "0.0.0.0"},
+            {"data_root": "/d", "expected_sha256": "a" * 64,
+             "callback_host": "0.0.0.0"},
             flow_timeout_s=5,
         )
     assert spawned == []
 
 
 @pytest.mark.asyncio
-async def test_confirmed_flow_persists_masked_sanitized_projection(home, monkeypatch):
+async def test_confirmed_flow_persists_layer_b_projection_only(home, monkeypatch):
     _configured(monkeypatch)
+    sent: list[dict] = []
 
     async def allow(prompt, *, timeout_s):
         return True
 
     async def fake_executor(entrypoint, request, *, flow_timeout_s):
-        return executor_mod.ExecutorOutcome(
-            status="connected",
-            account="jeremy.shen@gmail.com",
-            expires_at="2026-10-06T00:00:00Z",
-        )
+        sent.append(request)
+        return ExecutorOutcome(status="connected")
 
     monkeypatch.setattr(ops, "request_native_confirm", allow)
     monkeypatch.setattr(ops, "run_gmail_executor", fake_executor)
@@ -108,30 +114,46 @@ async def test_confirmed_flow_persists_masked_sanitized_projection(home, monkeyp
     res = await ops.gmail_connect_initiate({})
 
     assert res == {"ok": True, "state": "connected"}
-    raw = status_path().read_text(encoding="utf-8")
-    assert "jeremy.shen" not in raw
-    on_disk = json.loads(raw)
-    # Whitelist exactly: nothing token-shaped can even be represented.
-    assert set(on_disk) == {
-        "state", "account_masked", "expires_at", "reason", "updated_at",
-    }
-    assert on_disk["account_masked"] == "je***@gmail.com"
+    # Invoke config comes from local daemon config, never from params.
+    assert sent == [{
+        "data_root": "/var/lib/gw", "expected_sha256": "a" * 64, "timeout": 300.0,
+    }]
+    on_disk = json.loads(status_path().read_text(encoding="utf-8"))
+    # Layer B whitelist exactly (design v1.6 §3): state + reason.
+    assert set(on_disk) == {"state", "reason", "updated_at"}
+    assert on_disk["state"] == "connected"
     mode = stat.S_IMODE(os.stat(status_path()).st_mode)
     assert mode == 0o600
 
 
 @pytest.mark.asyncio
-async def test_disconnect_clears_locally_even_when_revoke_unconfirmed(
-    home, monkeypatch
-):
+async def test_failed_reason_reaches_projection_coarse(home, monkeypatch):
     _configured(monkeypatch)
-    store_status(GmailConnectStatus(state="connected", account_masked="je***@x"))
 
-    async def broken_executor(entrypoint, request, *, flow_timeout_s):
-        assert request["op"] == "revoke"
-        return executor_mod.ExecutorOutcome(status="failed", reason="timeout")
+    async def allow(prompt, *, timeout_s):
+        return True
 
-    monkeypatch.setattr(ops, "run_gmail_executor", broken_executor)
+    async def failing_executor(entrypoint, request, *, flow_timeout_s):
+        return ExecutorOutcome(status="failed", reason="callback_timeout")
+
+    monkeypatch.setattr(ops, "request_native_confirm", allow)
+    monkeypatch.setattr(ops, "run_gmail_executor", failing_executor)
+
+    res = await ops.gmail_connect_initiate({})
+
+    assert res == {"ok": False, "error": "callback_timeout", "state": "failed"}
+    after = load_status()
+    assert (after.state, after.reason) == ("failed", "callback_timeout")
+
+
+@pytest.mark.asyncio
+async def test_token_only_disconnect_never_yields_revoked(home, monkeypatch):
+    """Runbook v6 §7 negative control: ``revoked`` belongs to the
+    composite Disconnect (grant + token both revoked). The token-only
+    op caps the projection at ``disconnected`` and records the remote
+    revoke as unconfirmed (invoke schema v1 has no revoke axis yet)."""
+    _configured(monkeypatch)
+    store_status(GmailConnectStatus(state="connected"))
 
     res = await ops.gmail_disconnect_token({})
 
@@ -139,31 +161,8 @@ async def test_disconnect_clears_locally_even_when_revoke_unconfirmed(
     assert res["scope"] == "token_only"
     after = load_status()
     assert after.state == "disconnected"
-    assert after.account_masked == ""
+    assert after.state != "revoked"
     assert after.reason == "revoke_unconfirmed"
-
-
-@pytest.mark.asyncio
-async def test_token_only_disconnect_never_yields_revoked_projection(
-    home, monkeypatch
-):
-    """Runbook v6 §7 negative control: ``revoked`` belongs to the
-    composite Disconnect (grant + token both revoked). A token-only
-    success — even an executor *claiming* revoked — must cap the
-    projection at ``disconnected``."""
-    _configured(monkeypatch)
-    store_status(GmailConnectStatus(state="connected", account_masked="je***@x"))
-
-    async def overclaiming_executor(entrypoint, request, *, flow_timeout_s):
-        return executor_mod.ExecutorOutcome(status="revoked")
-
-    monkeypatch.setattr(ops, "run_gmail_executor", overclaiming_executor)
-
-    res = await ops.gmail_disconnect_token({})
-
-    assert res["scope"] == "token_only"
-    assert load_status().state == "disconnected"
-    assert load_status().state != "revoked"
 
 
 @pytest.mark.asyncio
@@ -197,102 +196,90 @@ def _fake_executor_script(tmp_path, body: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_executor_protocol_stdin_json_two_lines(tmp_path):
-    """Real subprocess: request travels via stdin (never argv/env), and
-    the two-line ready/result protocol parses into the outcome."""
-    script = _fake_executor_script(
-        tmp_path,
-        f'''
-        import json, sys
-        req = json.loads(sys.stdin.readline())
-        assert req["op"] == "connect"
-        assert len(sys.argv) == 1
-        print(json.dumps({{"ready": True}})); sys.stdout.flush()
-        print(json.dumps({{
-            "status": "connected",
-            "account": "a@b.c",
-            "expires_at": "e",
-        }})); sys.stdout.flush()
-        ''',
-    )
-    outcome = await run_gmail_executor(
-        script,
-        {"op": "connect", "callback_host": "127.0.0.1"},
-        flow_timeout_s=10,
-    )
-    assert outcome.status == "connected"
-    assert outcome.account == "a@b.c"
-
-
-@pytest.mark.asyncio
-async def test_executor_internal_fields_never_reach_projection(tmp_path, home):
-    """Two-layer whitelist (design §3): the child→parent result may
-    carry internal detail (token_db_path, bundle paths, scope), but the
-    outcome type and the persisted projection must drop all of it —
-    only state/account-mask/expiry/reason survive to any consumer."""
-    import dataclasses
-
+async def test_executor_schema_v1_protocol_and_layer_a_drop(tmp_path, home):
+    """Real subprocess against invoke schema v1: config travels via one
+    stdin JSON line (never argv), the ready/result event lines parse,
+    and the Layer-A ``summary`` (token_db, scope, …) is dropped by
+    construction — the outcome type carries only status + reason and
+    the persisted projection scans clean."""
     script = _fake_executor_script(
         tmp_path,
         '''
         import json, sys
-        sys.stdin.readline()
-        print(json.dumps({"ready": True})); sys.stdout.flush()
-        print(json.dumps({
-            "status": "connected",
-            "account": "a@b.c",
-            "expires_at": "e",
-            "token_db_path": "/private/secrets/tokens.db",
-            "client_bundle": "/private/secrets/bundle.json",
-            "scope": "gmail.send",
-        })); sys.stdout.flush()
+        req = json.loads(sys.stdin.readline())
+        assert req["data_root"] == "/d"
+        assert req["expected_sha256"] == "a" * 64
+        assert len(sys.argv) == 1
+        print(json.dumps({"event": "ready",
+            "redirect_uri": "http://127.0.0.1:49152/oauth2/callback"}))
+        sys.stdout.flush()
+        print(json.dumps({"event": "result", "status": "connected",
+            "summary": {"scope": "gmail.send", "expires_in": 3599,
+                        "has_refresh_token": True,
+                        "token_db": "/private/secrets/tokens.db"}}))
+        sys.stdout.flush()
         ''',
     )
     outcome = await run_gmail_executor(
         script,
-        {"op": "connect", "callback_host": "127.0.0.1"},
+        {"data_root": "/d", "expected_sha256": "a" * 64, "timeout": 5.0},
         flow_timeout_s=10,
     )
-    assert dataclasses.asdict(outcome) == {
-        "status": "connected", "account": "a@b.c", "expires_at": "e", "reason": "",
-    }
-    store_status(
-        GmailConnectStatus(
-            state="connected",
-            account_masked=mask_account(outcome.account),
-            expires_at=outcome.expires_at,
-        )
-    )
+    assert dataclasses.asdict(outcome) == {"status": "connected", "reason": ""}
+    store_status(GmailConnectStatus(state="connected"))
     raw = status_path().read_text(encoding="utf-8")
-    for leaked in ("token_db_path", "client_bundle", "scope", "/private/secrets"):
+    for leaked in ("token_db", "scope", "expires_in", "/private/secrets"):
         assert leaked not in raw
 
 
 @pytest.mark.asyncio
-async def test_executor_silent_after_ready_is_killed_as_timeout(tmp_path):
+async def test_non_loopback_ready_line_kills_the_flow(tmp_path):
+    """An executor advertising a routable redirect_uri is not the
+    contract's executor: the daemon must kill it at the ready line,
+    before any browser or consent could be in flight."""
     script = _fake_executor_script(
         tmp_path,
         '''
         import json, sys, time
         sys.stdin.readline()
-        print(json.dumps({"ready": True})); sys.stdout.flush()
+        print(json.dumps({"event": "ready",
+            "redirect_uri": "http://evil.example:80/oauth2/callback"}))
+        sys.stdout.flush()
         time.sleep(600)
         ''',
     )
     outcome = await run_gmail_executor(
         script,
-        {"op": "connect", "callback_host": "127.0.0.1"},
-        flow_timeout_s=0.5,
+        {"data_root": "/d", "expected_sha256": "a" * 64},
+        flow_timeout_s=5,
+    )
+    assert outcome.status == "failed"
+    assert outcome.reason == "non_loopback_ready"
+
+
+@pytest.mark.asyncio
+async def test_executor_silent_after_ready_is_killed_as_timeout(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(executor_mod, "RESULT_DEADLINE_MARGIN_S", 0.2)
+    script = _fake_executor_script(
+        tmp_path,
+        '''
+        import json, sys, time
+        sys.stdin.readline()
+        print(json.dumps({"event": "ready",
+            "redirect_uri": "http://127.0.0.1:49152/oauth2/callback"}))
+        sys.stdout.flush()
+        time.sleep(600)
+        ''',
+    )
+    outcome = await run_gmail_executor(
+        script,
+        {"data_root": "/d", "expected_sha256": "a" * 64},
+        flow_timeout_s=0.3,
     )
     assert outcome.status == "failed"
     assert outcome.reason == "timeout"
-
-
-def test_mask_account_never_keeps_full_local_part(home):
-    assert mask_account("jeremy.shen@gmail.com") == "je***@gmail.com"
-    assert mask_account("a@b.c") == "a***@b.c"
-    assert mask_account("not-an-email") == "***"
-    assert mask_account("") == ""
 
 
 @pytest.mark.asyncio
@@ -305,7 +292,7 @@ async def test_status_route_serves_projection_only(home):
         local_service_headers,
     )
 
-    store_status(GmailConnectStatus(state="connected", account_masked="je***@x"))
+    store_status(GmailConnectStatus(state="connected"))
     cfg = rpc_service.RpcServiceConfig(enabled=True, port=0)
     app = rpc_service.build_app(cfg)
     headers = local_service_headers(issue_local_service_token("any-agent"))
@@ -317,10 +304,6 @@ async def test_status_route_serves_projection_only(home):
         )
         assert resp.status == 200
         body = await resp.json()
-    assert body == {
-        "ok": True,
-        "state": "connected",
-        "account_masked": "je***@x",
-        "expires_at": "",
-        "reason": "",
-    }
+    # Layer B exactly: any extra key (a Layer-A path, an account, …)
+    # turns this red — the assertion is a whitelist, not a keyword scan.
+    assert body == {"ok": True, "state": "connected", "reason": ""}

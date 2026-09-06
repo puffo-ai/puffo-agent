@@ -1,17 +1,20 @@
 """Subprocess seam to the gateway OAuth executor.
 
-Invoke contract v1 (pending the gateway side's counter-proposal):
+Implements the daemon side of Bob's EXECUTOR_INVOKE_SCHEMA v1
+(sha256 b7f523cb…, msg_96b291d7): spawn the locally configured
+entrypoint with no request-derived argv/env, write exactly one line of
+non-secret JSON config to stdin, then read two JSON event lines from
+stdout with bounded deadlines — ``ready`` (must advertise a loopback
+redirect_uri) and the terminal ``result``.
 
-- The daemon spawns the locally configured entrypoint with no
-  request-derived argv and writes exactly one line of JSON to stdin.
-  Parameters never travel via env or argv — both are readable by any
-  same-UID process (``ps -E``).
-- The executor prints one JSON ready line, then one JSON terminal
-  result line, to stdout. Each read has a deadline; a silent or
-  malformed executor is killed (whole process group — executors may
-  spawn browsers/listeners) and reported as a coarse failure.
-- stderr is discarded: failure detail crosses only as the structured
-  coarse ``reason``, so token material can't reach daemon logs.
+The whole stdout stream is Layer A (daemon-internal). The daemon lifts
+ONLY status + reason into ``ExecutorOutcome``; the ``summary`` dict
+(scope / expires_in / has_refresh_token / token_db) is never read, so
+Layer-A detail cannot leak toward the Layer-B projection by
+construction. stderr is discarded — failure detail crosses only as the
+coarse ``reason``, so token material can't reach daemon logs. A silent
+or malformed executor is killed as a whole process group (executors
+spawn browsers/listeners).
 """
 
 from __future__ import annotations
@@ -22,12 +25,17 @@ import logging
 import os
 import signal
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 
 logger = logging.getLogger(__name__)
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 READY_DEADLINE_S = 15.0
+# The executor enforces its own consent timeout and reports
+# callback_timeout; our read deadline sits above it so the structured
+# reason wins over a daemon-side kill.
+RESULT_DEADLINE_MARGIN_S = 30.0
 _MAX_LINE_BYTES = 64 * 1024
 
 
@@ -37,16 +45,25 @@ class ExecutorRefused(RuntimeError):
 
 @dataclass
 class ExecutorOutcome:
-    status: str  # "connected" | "failed" | "revoked" | "disconnected"
-    account: str = ""
-    expires_at: str = ""
+    status: str  # "connected" | "failed"
     reason: str = ""
 
 
 def _validate_request(request: dict) -> None:
+    # Schema v1 carries no callback field (the executor hard-binds
+    # loopback), but if any caller ever adds one it must be loopback.
     host = str(request.get("callback_host", "127.0.0.1"))
     if host not in LOOPBACK_HOSTS:
         raise ExecutorRefused(f"non-loopback callback host {host!r}")
+
+
+def _ready_is_loopback(ready: dict) -> bool:
+    """The ready line must advertise a loopback redirect_uri — a
+    non-loopback bind means the executor is not the contract's
+    executor, and the flow must die before any browser opens."""
+    uri = str(ready.get("redirect_uri", ""))
+    host = urlsplit(uri).hostname or ""
+    return host in LOOPBACK_HOSTS
 
 
 async def _kill_group(proc: asyncio.subprocess.Process) -> None:
@@ -60,14 +77,16 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _read_json_line(proc: asyncio.subprocess.Process, deadline_s: float) -> dict:
+async def _read_event_line(
+    proc: asyncio.subprocess.Process, event: str, deadline_s: float
+) -> dict:
     assert proc.stdout is not None
     line = await asyncio.wait_for(proc.stdout.readline(), timeout=deadline_s)
     if not line or len(line) > _MAX_LINE_BYTES:
         raise ValueError("executor closed stdout or overran line budget")
     parsed = json.loads(line)
-    if not isinstance(parsed, dict):
-        raise ValueError("executor line is not a JSON object")
+    if not isinstance(parsed, dict) or parsed.get("event") != event:
+        raise ValueError(f"executor line is not a {event!r} event")
     return parsed
 
 
@@ -77,7 +96,7 @@ async def run_gmail_executor(
     *,
     flow_timeout_s: float,
 ) -> ExecutorOutcome:
-    """Run one executor operation to its terminal result.
+    """Run one connect flow to its terminal result.
 
     ``ExecutorRefused`` propagates (nothing was spawned); every failure
     after spawn degrades to ``ExecutorOutcome(status="failed")`` so
@@ -100,29 +119,31 @@ async def run_gmail_executor(
         proc.stdin.write(json.dumps(request).encode() + b"\n")
         await proc.stdin.drain()
         proc.stdin.close()
-        ready = await _read_json_line(proc, READY_DEADLINE_S)
-        if ready.get("ready") is not True:
-            raise ValueError("executor ready line missing ready=true")
-        result = await _read_json_line(proc, flow_timeout_s)
+        ready = await _read_event_line(proc, "ready", READY_DEADLINE_S)
+        if not _ready_is_loopback(ready):
+            await _kill_group(proc)
+            return ExecutorOutcome(status="failed", reason="non_loopback_ready")
+        result = await _read_event_line(
+            proc, "result", flow_timeout_s + RESULT_DEADLINE_MARGIN_S
+        )
     except asyncio.TimeoutError:
         await _kill_group(proc)
         return ExecutorOutcome(status="failed", reason="timeout")
     except (ValueError, OSError):
         await _kill_group(proc)
         return ExecutorOutcome(status="failed", reason="protocol")
-    # The result line is terminal (the executor persists the token
-    # before printing it), so a lingering process is cleanup, not work:
-    # give it a moment, then reap the whole group.
+    # The result line is terminal (the executor seals the token before
+    # printing it), so a lingering process is cleanup, not work: give
+    # it a moment, then reap the whole group.
     try:
         await asyncio.wait_for(proc.wait(), timeout=5.0)
     except asyncio.TimeoutError:
         await _kill_group(proc)
     status = str(result.get("status", ""))
-    if status not in ("connected", "failed", "revoked", "disconnected"):
-        return ExecutorOutcome(status="failed", reason="protocol")
-    return ExecutorOutcome(
-        status=status,
-        account=str(result.get("account", "")),
-        expires_at=str(result.get("expires_at", "")),
-        reason=str(result.get("reason", "")),
-    )
+    if status == "connected":
+        return ExecutorOutcome(status="connected")
+    if status == "failed":
+        return ExecutorOutcome(
+            status="failed", reason=str(result.get("reason", "")) or "internal_error"
+        )
+    return ExecutorOutcome(status="failed", reason="protocol")
