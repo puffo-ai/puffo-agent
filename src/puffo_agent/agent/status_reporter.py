@@ -81,6 +81,10 @@ class StatusReporter:
         # never provider material.
         self._base_activity: str | None = None
         self._overlay_activity: str | None = None
+        # True while the overlay alone holds the status busy (turnless
+        # compaction, e.g. session resume during warm). Any turn
+        # lifecycle call takes ownership of the status and clears it.
+        self._busy_from_overlay = False
         # None keeps the legacy single-stream wire shape.
         self._runtime_health_provider = runtime_health_provider
         # Agent Portal: reports kind/provider/harness/model so the operator's
@@ -212,6 +216,23 @@ class StatusReporter:
             return False
         before = self._effective_activity
         self._overlay_activity = activity
+        if activity is not None and self._current_status == "idle":
+            # A harness can compact outside any turn (session resume
+            # during warm): the agent is demonstrably at work, so the
+            # status dot must not read idle while the label is live.
+            # Restored below when the overlay clears with no turn
+            # having taken ownership of the status in between.
+            self._current_status = "busy"
+            self._busy_from_overlay = True
+        elif (
+            activity is None
+            and self._busy_from_overlay
+            and self._current_status == "busy"
+            and self._current_message_id is None
+        ):
+            self._current_status = "idle"
+        if activity is None:
+            self._busy_from_overlay = False
         return self._effective_activity != before
 
     async def begin_notice_turn(self, message_id: str) -> None:
@@ -222,6 +243,7 @@ class StatusReporter:
         ``read_inbox`` exposes it to the model and ``begin_turn`` is called.
         """
         self._current_status = "busy"
+        self._busy_from_overlay = False
         self._current_message_id = (
             None if _is_local_only_envelope(message_id) else message_id
         )
@@ -246,6 +268,7 @@ class StatusReporter:
     def _clear_activity(self) -> None:
         self._base_activity = None
         self._overlay_activity = None
+        self._busy_from_overlay = False
 
     async def begin_turn(self, message_id: str, *, run_id: str | None = None) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
@@ -254,6 +277,7 @@ class StatusReporter:
         # A live compaction overlay keeps winning until its completed event.
         was_showing = self._effective_activity
         self._base_activity = None
+        self._busy_from_overlay = False
         if self._keyless:
             # No signed /processing/* call for bridge agents (see __init__);
             # report "busy" over the bridge so the operator's Log gets the

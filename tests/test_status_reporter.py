@@ -903,6 +903,43 @@ class _GatedHttp(FakeHttp):
 
 
 @pytest.mark.asyncio
+async def test_turnless_compaction_reports_busy_then_restores_idle():
+    """A session-resume compaction during warm runs outside any turn:
+    the status dot must read Working while the label is live and
+    settle back to idle when it clears — no turn ever owns this
+    status transition."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    assert rep.set_activity_overlay("compacting") is True
+    await rep.report_current_status()
+    _, body = http.calls[-1]
+    assert body["status"] == "busy"
+    assert body["activity"] == "compacting"
+    assert "current_message_id" not in body
+
+    assert rep.set_activity_overlay(None) is True
+    await rep.report_current_status()
+    _, body = http.calls[-1]
+    assert body["status"] == "idle"
+    assert "activity" not in body
+
+
+@pytest.mark.asyncio
+async def test_overlay_clear_does_not_steal_busy_from_a_turn():
+    """Once a turn owns the status, clearing the overlay must not
+    flip a mid-turn agent back to idle."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep.set_activity_overlay("compacting")  # turnless busy
+    await rep.begin_notice_turn("msg_1")  # the turn takes ownership
+
+    rep.set_activity_overlay(None)
+
+    assert rep._current_status == "busy"
+
+
+@pytest.mark.asyncio
 async def test_terminal_batch_upload_holds_the_send_lock():
     """The dispatcher's immediate terminal upload is a status write
     (the server flips agent_status on end:batch): it must queue

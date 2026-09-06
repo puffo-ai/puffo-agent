@@ -118,3 +118,6 @@ async def test_warm_phase_activity_seeds_reporter_on_attach():
     assert worker._pending_activity is None
     await built.report_current_status()
     assert http.calls[-1][1]["activity"] == "compacting"
+    # Turnless compaction must also read as Working, or the operator's
+    # status dot stays idle for the whole startup compaction.
+    assert http.calls[-1][1]["status"] == "busy"
