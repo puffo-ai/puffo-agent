@@ -250,6 +250,153 @@ async def test_prompt_admission_updates_and_response_form_one_terminal():
 
 
 @pytest.mark.asyncio
+async def test_post_commit_admission_extension_is_private_and_normalized():
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallStart(
+            session_update="tool_call",
+            tool_call_id="tool_1",
+            title="mcp__puffo__read_inbox",
+            status="in_progress",
+        ),
+    )
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id="tool_1",
+            status="completed",
+        ),
+    )
+    binding = "a" * 64
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id="tool_1",
+            field_meta={
+                "puffo.admission/1": {
+                    "toolCallId": "tool_1",
+                    "binding": binding,
+                },
+            },
+        ),
+    )
+    # A duplicate fact is ignored, so one commit cannot fire twice.
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id="tool_1",
+            field_meta={
+                "puffo.admission/1": {
+                    "toolCallId": "tool_1",
+                    "binding": binding,
+                },
+            },
+        ),
+    )
+    harness.conn.prompt_result.set_result(PromptResponse(stop_reason="end_turn"))
+
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+    )
+    admissions = [
+        event for event in events
+        if isinstance(event.native_diagnostic, dict)
+        and event.native_diagnostic.get("provider_context_committed") is True
+    ]
+    assert len(admissions) == 1
+    admission = admissions[0]
+    assert admission.data == {
+        "tool_call_ref": "tool_1",
+        "label": "mcp__puffo__read_inbox",
+        "outcome": "succeeded",
+    }
+    assert binding not in repr(admission.data)
+    assert admission.native_diagnostic == {
+        "_puffo_internal": "tool_result",
+        "provider_context_committed": True,
+        "tool_call_id": "tool_1",
+        "tool_name": "mcp__puffo__read_inbox",
+        "admission_binding": binding,
+        "is_error": False,
+    }
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_post_commit_admission_requires_prior_success_and_matching_id():
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+    extension = {
+        "puffo.admission/1": {
+            "toolCallId": "tool_1",
+            "binding": "b" * 64,
+        },
+    }
+
+    # Metadata before a successful terminal cannot witness a future commit.
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id="tool_1",
+            field_meta=extension,
+        ),
+    )
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallStart(
+            session_update="tool_call",
+            tool_call_id="tool_1",
+            title="read_inbox",
+        ),
+    )
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id="tool_1",
+            status="failed",
+        ),
+    )
+    await harness.client.session_update(
+        "acp_session",
+        ToolCallProgress(
+            session_update="tool_call_update",
+            tool_call_id="tool_1",
+            field_meta=extension,
+        ),
+    )
+    harness.conn.prompt_result.set_result(PromptResponse(stop_reason="end_turn"))
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+    )
+    assert not any(
+        isinstance(event.native_diagnostic, dict)
+        and event.native_diagnostic.get("provider_context_committed") is True
+        for event in events
+    )
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_permission_request_waits_for_typed_driver_resolution():
     harness = _Harness()
     driver = AcpDriver(

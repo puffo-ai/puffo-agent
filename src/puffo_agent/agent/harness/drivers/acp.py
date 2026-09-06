@@ -242,6 +242,9 @@ class AcpDriver(Driver):
             tuple[asyncio.Future[PermissionDecision], list[PermissionOption]],
         ] = {}
         self._output_blocks: set[str] = set()
+        self._tool_names: dict[str, str] = {}
+        self._completed_tool_calls: set[str] = set()
+        self._admitted_tool_calls: set[str] = set()
         self._fallback_block_id = ""
         self._capabilities = acp_capabilities(session_resume=False)
         self._model_selection = ""
@@ -480,6 +483,9 @@ class AcpDriver(Driver):
         self._active = turn
         self._active_native_turn_id = native_turn
         self._output_blocks.clear()
+        self._tool_names.clear()
+        self._completed_tool_calls.clear()
+        self._admitted_tool_calls.clear()
         self._fallback_block_id = f"assistant_{uuid.uuid4().hex}"
         self._prompt_sent = asyncio.get_running_loop().create_future()
         prompt_sent = self._prompt_sent
@@ -592,6 +598,9 @@ class AcpDriver(Driver):
         self._prompt_sent = None
         self._prompt_task = None
         self._output_blocks.clear()
+        self._tool_names.clear()
+        self._completed_tool_calls.clear()
+        self._admitted_tool_calls.clear()
         await self._events.put(terminal)
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):
@@ -679,6 +688,9 @@ class AcpDriver(Driver):
             authority.close()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._tool_names.clear()
+        self._completed_tool_calls.clear()
+        self._admitted_tool_calls.clear()
         await collect_cleanup_errors(
             self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
         )
@@ -724,6 +736,7 @@ class AcpDriver(Driver):
             )
             return
         if isinstance(update, ToolCallStart):
+            self._tool_names[update.tool_call_id] = update.title
             await self._emit(
                 HarnessEventType.TOOL_STARTED,
                 turn=turn,
@@ -735,6 +748,20 @@ class AcpDriver(Driver):
             )
             return
         if isinstance(update, ToolCallProgress):
+            admission = self._post_commit_admission(update)
+            if admission is not None:
+                self._admitted_tool_calls.add(update.tool_call_id)
+                await self._emit(
+                    HarnessEventType.TOOL_COMPLETED,
+                    turn=turn,
+                    data={
+                        "tool_call_ref": update.tool_call_id,
+                        "label": admission["tool_name"],
+                        "outcome": "succeeded",
+                    },
+                    native_payload=admission,
+                )
+                return
             status = str(update.status or "in_progress")
             if status in {"completed", "failed"}:
                 type_ = HarnessEventType.TOOL_COMPLETED
@@ -743,6 +770,10 @@ class AcpDriver(Driver):
                     "label": update.title or "",
                     "outcome": "succeeded" if status == "completed" else "failed",
                 }
+                if status == "completed":
+                    self._completed_tool_calls.add(update.tool_call_id)
+                else:
+                    self._completed_tool_calls.discard(update.tool_call_id)
             else:
                 type_ = HarnessEventType.TOOL_UPDATED
                 data = {
@@ -769,6 +800,47 @@ class AcpDriver(Driver):
             data={"record_type": getattr(update, "session_update", "unknown")},
             native_payload=update,
         )
+
+    def _post_commit_admission(
+        self, update: ToolCallProgress
+    ) -> dict[str, Any] | None:
+        """Normalize LingTai's private, post-commit ACP extension.
+
+        Ordinary ACP ``completed`` only proves that a handler returned; it is
+        emitted before LingTai commits tool results to provider context.  The
+        namespaced extension is accepted only on a later update for a tool we
+        already saw complete successfully.  Its binding stays in the opaque
+        native diagnostic and never enters the public event projection.
+        """
+        metadata = getattr(update, "field_meta", None)
+        if not isinstance(metadata, Mapping):
+            return None
+        fact = metadata.get("puffo.admission/1")
+        if not isinstance(fact, Mapping):
+            return None
+        tool_call_id = update.tool_call_id
+        binding = fact.get("binding")
+        nested_id = fact.get("toolCallId")
+        tool_name = self._tool_names.get(tool_call_id, "")
+        if (
+            update.status is not None
+            or tool_call_id not in self._completed_tool_calls
+            or tool_call_id in self._admitted_tool_calls
+            or nested_id != tool_call_id
+            or not tool_name
+            or not isinstance(binding, str)
+            or len(binding) != 64
+            or any(char not in "0123456789abcdef" for char in binding)
+        ):
+            return None
+        return {
+            "_puffo_internal": "tool_result",
+            "provider_context_committed": True,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "admission_binding": binding,
+            "is_error": False,
+        }
 
     async def _request_permission(
         self,
