@@ -307,6 +307,11 @@ class RpcServiceConfig:
     port: int = 63385
 
 
+# Invoke schema v1 §2: the bundle pin is a raw-bytes sha256, written in
+# the single canonical form of 64 lowercase hex digits.
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+
 @dataclass
 class GmailConnectConfig:
     """Gmail token-axis connect (``portal/gmail_connect/``).
@@ -328,14 +333,34 @@ class GmailConnectConfig:
     flow_timeout_seconds: float = 300.0
 
     def __post_init__(self) -> None:
-        # Boris 188583: hex is case-insensitive, so a build that writes
-        # the pin uppercase (or with a trailing newline from
-        # ``sha256sum``) would fail closed on a bundle that is in fact
-        # correct — safe, but a false red at install time. Normalize
-        # here rather than in the loader so every construction path
-        # gets it, and the "pin is lowercase hex" invariant has exactly
-        # one place where it becomes true.
-        self.client_bundle_sha256 = self.client_bundle_sha256.strip().lower()
+        # Jeff 188586 / Boris 188585: the configured form of the pin is
+        # exactly 64 lowercase hex digits. Anything else is a build or
+        # config defect, not a second spelling of a valid pin, so it is
+        # treated as NOT CONFIGURED rather than normalized: the connect
+        # pre-flight then refuses before any native confirmation and
+        # before any spawn, and ``bundle_verify_failed`` keeps its one
+        # meaning — a valid pin that did not match the bundle's bytes.
+        #
+        # Blanking (rather than checking in ops) is what makes this
+        # structural: after construction there is no invalid pin left
+        # in the config for a future consumer to pick up.
+        #
+        # ``fullmatch``, never ``re.match(..., "…$")``: Python's ``$``
+        # also matches just before a trailing newline, so a pin ending
+        # in ``\n`` would be let through and fail later at the executor
+        # wearing the wrong reason code (Boris 188589).
+        if self.client_bundle_sha256 and not _SHA256_HEX_RE.fullmatch(
+            self.client_bundle_sha256
+        ):
+            # Fixed cause only: never the field value, a path, or bundle
+            # content (Jeff 188586). Length is a derived non-secret and
+            # is the fastest discriminator between the common defects.
+            logger.warning(
+                "gmail-connect: invalid_client_bundle_sha256 "
+                "(not 64 lowercase hex; len=%d) — treating as unconfigured",
+                len(self.client_bundle_sha256),
+            )
+            self.client_bundle_sha256 = ""
 
 
 @dataclass

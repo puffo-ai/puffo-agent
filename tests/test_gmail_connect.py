@@ -994,33 +994,97 @@ async def test_dialog_timeout_is_its_own_producer(monkeypatch):
     assert killed, "a dialog that timed out must be killed, not left running"
 
 
-def test_bundle_pin_is_normalized_at_the_config_boundary():
-    """Boris 188583: hex is case-insensitive and ``sha256sum`` output
-    carries a trailing newline, so an uppercase or untrimmed pin from
-    the build must not fail closed against a correct bundle.
+# Jeff 188586 / 188590: an ill-formed pin is a build/config defect, not a
+# security event. It is treated as "not configured" so the refusal happens
+# before the user is ever shown a dialog, and `bundle_verify_failed` keeps
+# its single meaning: a VALID pin that did not match the bundle's bytes.
+#
+# The trailing-newline case is the discriminating one — it is exactly what
+# `re.match(r"[0-9a-f]{64}$", …)` lets through and `fullmatch` rejects
+# (Boris 188589), and `sha256sum > pin` is how a build would produce it.
+_ILL_FORMED_PINS = [
+    pytest.param("A" * 64, id="uppercase"),
+    pytest.param("a" * 63 + "F", id="mixed-case"),
+    pytest.param("hello", id="not-hex"),
+    pytest.param("a" * 40, id="too-short"),
+    pytest.param("a" * 65, id="too-long"),
+    pytest.param("g" * 64, id="non-hex-letters"),
+    pytest.param("a" * 64 + "\n", id="trailing-newline"),
+    pytest.param(" " + "a" * 64, id="leading-space"),
+]
 
-    Normalization lives in ``__post_init__``, not in the loader, so it
-    holds on every construction path — including the ones tests and
-    future callers use, which a loader-only fix would leave exempt.
-    """
-    digest = "A" * 63 + "F"
-    assert GmailConnectConfig(client_bundle_sha256=f"  {digest}\n").client_bundle_sha256 == digest.lower()
-    # The empty default is still empty, so the "not configured"
-    # pre-flight check is unaffected.
-    assert GmailConnectConfig().client_bundle_sha256 == ""
+
+@pytest.mark.parametrize("pin", _ILL_FORMED_PINS)
+def test_ill_formed_pin_is_dropped_at_the_config_boundary(pin):
+    """After construction there is no invalid pin left for any consumer
+    to pick up — the value is gone, not merely unused."""
+    assert GmailConnectConfig(client_bundle_sha256=pin).client_bundle_sha256 == ""
 
 
-def test_loader_normalizes_the_pin_it_reads_from_yaml(tmp_path, monkeypatch):
-    """The path the installer actually exercises: pin written uppercase
-    into the YAML reaches ops as lowercase, so the executor's own
-    ``hexdigest()`` (always lowercase) compares equal."""
+@pytest.mark.parametrize("pin", _ILL_FORMED_PINS)
+@pytest.mark.asyncio
+async def test_ill_formed_pin_refuses_before_any_dialog_or_spawn(
+    home, monkeypatch, pin
+):
+    """The hard acceptance shape (Jeff 188590): `(failed,
+    executor_unavailable)`, zero native confirmations, zero spawns —
+    so a build defect never reaches Google and never interrupts the
+    user with a dialog it is going to fail after anyway."""
+    _configured(monkeypatch, client_bundle_sha256=pin)
+    confirms: list[str] = []
+    spawns: list[object] = []
+
+    async def spy_confirm(prompt, *, timeout_s):  # pragma: no cover - must not run
+        confirms.append(prompt)
+        return ConfirmOutcome.CONFIRMED
+
+    async def spy_executor(*a, **k):  # pragma: no cover - must not run
+        spawns.append(a)
+        return ExecutorOutcome(status="connected")
+
+    monkeypatch.setattr(ops, "request_native_confirm", spy_confirm)
+    monkeypatch.setattr(ops, "run_gmail_executor", spy_executor)
+
+    res = await ops.gmail_connect_initiate({})
+
+    assert res["reason"] == "executor_unavailable"
+    assert res["ok"] is False
+    assert confirms == [], "the user must not be prompted for a config defect"
+    assert spawns == [], "no spawn, hence no Google call and no token write"
+
+
+def test_valid_lowercase_pin_is_kept_verbatim():
+    """The positive control: without it, a validator that blanked every
+    pin would pass every test above."""
+    pin = "0123456789abcdef" * 4
+    assert GmailConnectConfig(client_bundle_sha256=pin).client_bundle_sha256 == pin
+
+
+def test_loader_applies_the_pin_gate_to_config_on_disk(tmp_path, monkeypatch):
+    """The path an installer actually exercises: a bad pin in the YAML
+    is gone by the time anything reads the config."""
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    (tmp_path / "daemon.yml").write_text(
-        "gmail_connect:\n"
-        "  enabled: true\n"
-        "  executor_path: /usr/bin/true\n"
-        "  data_root: /var/lib/gw\n"
-        "  client_bundle_sha256: " + "AB" * 32 + "\n",
-        encoding="utf-8",
-    )
-    assert DaemonConfig.load().gmail_connect.client_bundle_sha256 == "ab" * 32
+    good = "0123456789abcdef" * 4
+    for pin, expected in (("AB" * 32, ""), (good, good)):
+        (tmp_path / "daemon.yml").write_text(
+            "gmail_connect:\n"
+            "  enabled: true\n"
+            "  executor_path: /usr/bin/true\n"
+            "  data_root: /var/lib/gw\n"
+            f"  client_bundle_sha256: {pin}\n",
+            encoding="utf-8",
+        )
+        assert DaemonConfig.load().gmail_connect.client_bundle_sha256 == expected
+
+
+def test_invalid_pin_diagnostic_never_carries_the_value(caplog):
+    """Jeff 188586: a fixed cause only. A pin is not itself a secret,
+    but this field is one hop from bundle paths and credentials, and
+    the rule is that daemon diagnostics carry causes, not values."""
+    pin = "SECRETLOOKING" + "Z" * 51
+    with caplog.at_level(logging.WARNING):
+        GmailConnectConfig(client_bundle_sha256=pin)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "invalid_client_bundle_sha256" in logged
+    assert pin not in logged
+    assert "SECRETLOOKING" not in logged
