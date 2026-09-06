@@ -512,6 +512,16 @@ class Worker:
             logger.warning(
                 "agent %s: MCP-probe recycle failed: %s", agent_id, exc,
             )
+            return
+        from . import rpc_service
+
+        # Pin the freshly minted generation at the switch, not at the
+        # next probe: zombie beacon pressure inside that window could
+        # trim its hello and fake never-seen (a recycle loop on a
+        # healthy runtime).
+        new_gen = mgr.spec.mcp_generation
+        if new_gen:
+            rpc_service.pin_mcp_generation(agent_id, new_gen)
 
     def _note_refresh_reload(
         self, ok: bool, flags: tuple[Path, ...], agent_id: str
@@ -1496,13 +1506,24 @@ async def _process_refresh_flags(
         )
         return False
 
+    _pin_refreshed_generation(agent_id)
     _unlink_refresh_flags(
-        refresh_host_sync_flag,
-        refresh_agent_flag,
-        refresh_session_flag,
-        refresh_provider_auth_flag,
+        refresh_host_sync_flag, refresh_agent_flag,
+        refresh_session_flag, refresh_provider_auth_flag,
     )
     return True
+
+
+def _pin_refreshed_generation(agent_id: str) -> None:
+    """The refresh reload rebuilt the spec and minted a fresh mcp
+    generation: pin it at the switch (see
+    ``rpc_service.pin_mcp_generation``)."""
+    from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+    from . import rpc_service
+
+    mgr = get_runtime_manager(agent_id)
+    if mgr is not None and mgr.spec.mcp_generation:
+        rpc_service.pin_mcp_generation(agent_id, mgr.spec.mcp_generation)
 
 
 def _unlink_refresh_flags(*flags: Path) -> None:

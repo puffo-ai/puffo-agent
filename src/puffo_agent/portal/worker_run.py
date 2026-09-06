@@ -406,6 +406,15 @@ class StandardWorkerRun:
             driver=driver,
             cleanup=cleanup,
         )
+        # Pin the initial mcp generation at the mint, not at the first
+        # probe: zombie beacon pressure inside that window could trim
+        # its hello and fake never-seen (see rpc_service).
+        if prepared.spec.mcp_generation:
+            from . import rpc_service
+
+            rpc_service.pin_mcp_generation(
+                prepared.preparer.agent_id, prepared.spec.mcp_generation
+            )
         return outbox, session_ref, prepared
 
     async def _abort_docker_preparation(self, preparer: Any) -> None:

@@ -78,6 +78,17 @@ def record_mcp_hello(
         del slots[oldest]
 
 
+def pin_mcp_generation(agent_id: str, generation: str) -> None:
+    """Trim-protect this generation starting now.
+
+    Must be called where a generation is minted or switched (prepare,
+    recycle, refresh reload), not just from the probe: between the
+    mint and the first probe the registry would otherwise still pin
+    the predecessor, and zombie beacon pressure inside that window
+    could evict the new generation's hello and fake never-seen."""
+    _MCP_HELLO_PROBED[agent_id] = generation
+
+
 def mcp_hello_state(
     agent_id: str, generation: str,
 ) -> tuple[float, float | None]:

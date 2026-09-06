@@ -226,6 +226,62 @@ def test_recycle_mints_new_generation_and_late_old_hello_stays_red(
     assert worker.runtime.health == "mcp_unreachable"
 
 
+def test_recycled_generation_survives_zombie_pressure_before_first_probe(
+    registered_manager, saved_states,
+):
+    """The pin must move at the generation switch, not at the first
+    probe: after a recycle the registry would otherwise still pin the
+    predecessor, and zombie beacons landing inside the mint->probe
+    window would evict the new generation's hello — the next probe
+    reads never-seen and a healthy runtime gets recycle-looped."""
+    mgr = registered_manager(_FakeManager("g-old", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    # Probe 1 pins g-old (query) and recycles the silent runtime; the
+    # recycle mints a fresh generation and must re-pin at the switch.
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == [False]
+    new_gen = mgr.spec.mcp_generation
+    assert new_gen != "g-old"
+
+    # The new subprocess says hello, then zombie pressure fills the
+    # slots before any probe has asked about the new generation.
+    rpc_service.record_mcp_hello("t", new_gen, 60.0)
+    for zombie in ("g-old", "g-z1", "g-z2", "g-z3"):
+        rpc_service.record_mcp_hello("t", zombie, 60.0)
+
+    # Probe 2: with the switch-time pin the new hello survived the
+    # trim and reads healthy — strikes reset, no second reload.
+    _run(worker.probe_mcp_transport("t"))
+    assert worker._mcp_probe_strikes == 0
+    assert adapter.reload_calls == [False]
+    assert worker.runtime.health == "ok"
+    assert rpc_service.mcp_hello_state("t", new_gen)[0] > 0.0
+
+
+def test_refresh_reload_pins_the_new_generation(
+    tmp_path, registered_manager,
+):
+    """The refresh-flag reload also rebuilds the spec and mints a
+    fresh generation; the pin must move with it (same window as the
+    probe-driven recycle)."""
+    mgr = registered_manager(_FakeManager("g-before", time.monotonic()))
+    rpc_service.clear_mcp_hello("t")
+    adapter = _RecyclingAdapter(mgr)
+    (tmp_path / "refresh_session.flag").write_text("{}", encoding="utf-8")
+    try:
+        ok = _run(_process_refresh_flags(**_flags_kwargs(tmp_path, adapter)))
+        assert ok is True
+        assert mgr.spec.mcp_generation != "g-before"
+        assert (
+            rpc_service._MCP_HELLO_PROBED["t"] == mgr.spec.mcp_generation
+        )
+    finally:
+        rpc_service.clear_mcp_hello("t")
+
+
 def test_runtime_open_watermark_precedes_current_generation_hello():
     """A hello emitted during driver.open belongs to the runtime being opened."""
     class _HelloDuringOpenDriver:
