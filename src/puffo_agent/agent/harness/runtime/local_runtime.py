@@ -955,6 +955,29 @@ class _LegacyStatusProjector:
         self._emitted_tools.clear()
 
 
+async def _observe_compaction_activity(
+    activity_sink, event_type: str, agent_id: str,
+) -> None:
+    """Forward compaction boundaries ("compacting" / None on completed
+    and failed alike — a failed compaction must not strand the overlay)
+    to the status reporter's activity sink. Observation only: failures
+    never reach the runtime."""
+    if event_type not in {
+        "compaction.started", "compaction.completed", "compaction.failed",
+    }:
+        return
+    try:
+        await activity_sink(
+            "compacting" if event_type == "compaction.started" else None
+        )
+    except Exception as exc:  # noqa: BLE001 - observation only
+        logger.warning(
+            "agent %s: activity observation failed (%s); runtime continues",
+            agent_id,
+            type(exc).__name__,
+        )
+
+
 def build_local_runtime_adapter(
     prepared: PreparedLocalRuntime,
     *,
@@ -1007,20 +1030,10 @@ def build_local_runtime_adapter(
                 type(exc).__name__,
             )
         event_type = getattr(event.type, "value", event.type)
-        if activity_sink is not None and event_type in {
-            "compaction.started", "compaction.completed",
-        }:
-            try:
-                await activity_sink(
-                    "compacting" if event_type == "compaction.started" else None
-                )
-            except Exception as exc:  # noqa: BLE001 - observation only
-                logger.warning(
-                    "agent %s: activity observation failed (%s); "
-                    "runtime continues",
-                    prepared.preparer.agent_id,
-                    type(exc).__name__,
-                )
+        if activity_sink is not None:
+            await _observe_compaction_activity(
+                activity_sink, event_type, prepared.preparer.agent_id,
+            )
         # Only the session and turn boundaries rewrite durable state; every
         # other event (a streamed delta above all) must reach the outbox no
         # more than once, so the state read stays inside the branch using it.

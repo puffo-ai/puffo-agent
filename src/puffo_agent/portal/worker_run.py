@@ -406,9 +406,18 @@ class StandardWorkerRun:
             # Late-bound: the status reporter is built after the adapter
             # (in ``_start_services``); until then compaction changes are
             # simply not reported, which matches today's behavior.
+            # The overlay flips synchronously (event order preserved);
+            # the heartbeat push runs detached because this callback
+            # fires under the runtime command lock and a slow status
+            # POST must not extend the lock or stall event processing.
+            # The push reads current state at send time, so a reordered
+            # or duplicate send still carries the latest activity.
             reporter = getattr(worker, "_status_reporter", None)
-            if reporter is not None:
-                await reporter.set_activity_overlay(activity)
+            if reporter is not None and reporter.set_activity_overlay(activity):
+                spawn(
+                    reporter.report_current_status(),
+                    name="activity-heartbeat",
+                )
 
         worker._adapter = build_local_runtime_adapter(
             prepared,

@@ -191,19 +191,21 @@ class StatusReporter:
     def _effective_activity(self) -> str | None:
         return self._overlay_activity or self._base_activity
 
-    async def set_activity_overlay(self, activity: str | None) -> None:
-        """Set or clear the compaction overlay and push the change now.
+    def set_activity_overlay(self, activity: str | None) -> bool:
+        """Set or clear the compaction overlay; returns whether the
+        effective activity changed.
 
-        Called from the harness event path (compaction.started/completed), so
-        it must never raise into the runtime; heartbeat send already swallows
-        transport errors. A no-op change sends nothing.
+        State only, deliberately synchronous: the caller sits on the
+        harness event path, which runs under the runtime command lock —
+        a network push here would let a slow status POST extend the
+        lock and stall event processing. The caller pushes the change
+        (detached) when this returns True.
         """
         if activity == self._overlay_activity:
-            return
+            return False
         before = self._effective_activity
         self._overlay_activity = activity
-        if self._effective_activity != before:
-            await self._send_heartbeat()
+        return self._effective_activity != before
 
     async def begin_notice_turn(self, message_id: str) -> None:
         """Report a provider turn before the model reads its Inbox.

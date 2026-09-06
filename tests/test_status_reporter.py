@@ -785,21 +785,25 @@ async def test_notice_turn_reports_reading_messages_activity():
 
 @pytest.mark.asyncio
 async def test_compaction_overlay_wins_and_restores():
+    """``set_activity_overlay`` is state-only (the harness event path
+    holds the runtime command lock, so the network push is the
+    caller's detached job); the returned flag drives exactly one push
+    per effective change."""
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
     await rep.begin_notice_turn("msg_1")
 
-    await rep.set_activity_overlay("compacting")
+    assert rep.set_activity_overlay("compacting") is True
+    await rep.report_current_status()
     _, body = http.calls[-1]
     assert body["activity"] == "compacting"
 
-    # Duplicate overlay is a no-op: nothing extra on the wire.
-    calls_before = len(http.calls)
-    await rep.set_activity_overlay("compacting")
-    assert len(http.calls) == calls_before
+    # Duplicate overlay is a no-op: no push requested.
+    assert rep.set_activity_overlay("compacting") is False
 
-    # Clearing the overlay restores the phase activity immediately.
-    await rep.set_activity_overlay(None)
+    # Clearing the overlay restores the phase activity.
+    assert rep.set_activity_overlay(None) is True
+    await rep.report_current_status()
     _, body = http.calls[-1]
     assert body["activity"] == "reading_messages"
 
@@ -809,7 +813,7 @@ async def test_notice_terminal_clears_activity():
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
     await rep.begin_notice_turn("msg_1")
-    await rep.set_activity_overlay("compacting")
+    rep.set_activity_overlay("compacting")
 
     await rep.end_notice_turn(succeeded=True)
 
