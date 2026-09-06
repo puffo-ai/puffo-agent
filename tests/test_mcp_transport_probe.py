@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -92,6 +93,7 @@ def _seed_worker(health: str = "ok") -> Worker:
     worker._turn_active = False
     worker._mcp_probe_strikes = 0
     worker._refresh_reload_failures = 0
+    worker._adapter = None
     return worker
 
 
@@ -135,13 +137,34 @@ def test_reload_failure_cap_abandons_flags_into_health(tmp_path, saved_states):
 
 class _FakeManager:
     def __init__(self, generation: str, opened_at: float):
-        self.spec = SimpleNamespace(mcp_generation=generation)
+        self.spec = SimpleNamespace(
+            mcp_generation=generation, system_prompt="p",
+        )
         self.last_open_monotonic = opened_at
+
+
+class _RecyclingAdapter:
+    """Mimics the adapter-level reload chain the probe must use: the
+    spec_reloader rebuilds the spec (minting a fresh generation) and the
+    reopen stamps a new open watermark."""
+
+    def __init__(self, mgr: _FakeManager):
+        self.mgr = mgr
         self.reload_calls: list[bool] = []
 
-    async def reload_resources(self, *, preserve_session, spec=None):
-        self.reload_calls.append(preserve_session)
-        self.last_open_monotonic = time.monotonic()
+    async def reload(self, new_system_prompt, *, with_session=False):
+        self.reload_calls.append(with_session)
+        self.mgr.spec = SimpleNamespace(
+            mcp_generation=uuid.uuid4().hex,
+            system_prompt=new_system_prompt,
+        )
+        self.mgr.last_open_monotonic = time.monotonic()
+
+
+def _wire(worker: Worker, mgr: _FakeManager) -> _RecyclingAdapter:
+    adapter = _RecyclingAdapter(mgr)
+    worker._adapter = adapter
+    return adapter
 
 
 @pytest.fixture
@@ -161,20 +184,46 @@ def test_probe_recycles_then_flips_health(registered_manager, saved_states):
     mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
     rpc_service.clear_mcp_hello("t")
     worker = _seed_worker()
+    adapter = _wire(worker, mgr)
 
     _run(worker.probe_mcp_transport("t"))
-    assert mgr.reload_calls == [True]
+    assert adapter.reload_calls == [False]
     assert worker._mcp_probe_strikes == 1
     assert worker.runtime.health == "ok"
 
     # Freshly recycled: within grace, the probe must not double-punish.
     _run(worker.probe_mcp_transport("t"))
-    assert mgr.reload_calls == [True]
+    assert adapter.reload_calls == [False]
 
     mgr.last_open_monotonic = time.monotonic() - 120
     _run(worker.probe_mcp_transport("t"))
     assert worker.runtime.health == "mcp_unreachable"
     assert ("t", "mcp_unreachable", worker.runtime.error) in saved_states
+
+
+def test_recycle_mints_new_generation_and_late_old_hello_stays_red(
+    registered_manager, saved_states,
+):
+    """The automatic recycle must rotate the config generation: an old
+    CLI's MCP subprocess is not guaranteed to die with its parent, and
+    its late hello (same old generation, arriving after the new open
+    watermark) must never read as the new runtime's health."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+    assert adapter.reload_calls == [False]
+    assert mgr.spec.mcp_generation != "g1"
+
+    # The pre-recycle subprocess reports in late: fresh arrival, old
+    # generation. Past the new grace window this is a miss, not health.
+    rpc_service.record_mcp_hello("t", "g1")
+    mgr.last_open_monotonic = time.monotonic() - 120
+    _run(worker.probe_mcp_transport("t"))
+    assert worker._mcp_probe_strikes == 2
+    assert worker.runtime.health == "mcp_unreachable"
 
 
 def test_runtime_open_watermark_precedes_current_generation_hello():
@@ -214,7 +263,7 @@ def test_runtime_open_watermark_precedes_current_generation_hello():
         )
         try:
             await manager.open()
-            generation, seen_at = rpc_service.mcp_hello_state("opening")
+            generation, seen_at, _ = rpc_service.mcp_hello_state("opening")
             assert generation == "g-current"
             assert seen_at >= manager.last_open_monotonic
         finally:
@@ -226,15 +275,46 @@ def test_runtime_open_watermark_precedes_current_generation_hello():
 
 def test_probe_hello_clears_wedge_state(registered_manager, saved_states):
     opened_at = time.monotonic() - 120
-    registered_manager(_FakeManager("g1", opened_at))
+    mgr = registered_manager(_FakeManager("g1", opened_at))
     rpc_service.record_mcp_hello("t", "g1")
     worker = _seed_worker(health="mcp_unreachable")
+    _wire(worker, mgr)
     worker._mcp_probe_strikes = 2
 
     _run(worker.probe_mcp_transport("t"))
 
     assert worker._mcp_probe_strikes == 0
     assert worker.runtime.health == "ok"
+
+
+def test_beacon_silence_recycles(registered_manager):
+    """A subprocess that declared a re-hello cadence and then went
+    silent is a wedge (the incident's 51-min RPC silence signature),
+    even though its startup hello matched this generation."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 400))
+    rpc_service._MCP_HELLO_SEEN["t"] = ("g1", time.monotonic() - 400, 60.0)
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+
+    assert adapter.reload_calls == [False]
+    assert worker._mcp_probe_strikes == 1
+
+
+def test_startup_only_hello_never_goes_stale(registered_manager):
+    """No declared cadence (older package, e.g. a lagging Docker image)
+    keeps handshake semantics: an aged hello stays valid and the probe
+    must not recycle-loop the runtime for silence."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 5000))
+    rpc_service._MCP_HELLO_SEEN["t"] = ("g1", time.monotonic() - 4000, None)
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
 
 
 def test_empty_turn_cannot_clear_mcp_unreachable(saved_states):
@@ -257,21 +337,23 @@ def test_probe_ignores_stale_generation_hello(registered_manager):
     mgr = registered_manager(_FakeManager("g2", time.monotonic() - 120))
     rpc_service.record_mcp_hello("t", "g1")
     worker = _seed_worker()
+    adapter = _wire(worker, mgr)
 
     _run(worker.probe_mcp_transport("t"))
 
-    assert mgr.reload_calls == [True]
+    assert adapter.reload_calls == [False]
 
 
 def test_probe_defers_while_turn_active(registered_manager):
     mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
     rpc_service.clear_mcp_hello("t")
     worker = _seed_worker()
+    adapter = _wire(worker, mgr)
     worker._turn_active = True
 
     _run(worker.probe_mcp_transport("t"))
 
-    assert mgr.reload_calls == []
+    assert adapter.reload_calls == []
     assert worker._mcp_probe_strikes == 0
 
 
@@ -300,18 +382,32 @@ def test_mcp_hello_route_records_generation():
                 headers=headers,
             )
             assert resp.status == 200
+            assert rpc_service.mcp_hello_state("t")[2] is None
+            beacon = await client.post(
+                "/v1/rpc/t/mcp-hello",
+                json={"generation": "gen-42", "beacon_interval": 60},
+                headers=headers,
+            )
+            assert beacon.status == 200
             bad = await client.post(
                 "/v1/rpc/t/mcp-hello", json={}, headers=headers,
             )
             assert bad.status == 400
+            bad_interval = await client.post(
+                "/v1/rpc/t/mcp-hello",
+                json={"generation": "gen-42", "beacon_interval": 0},
+                headers=headers,
+            )
+            assert bad_interval.status == 400
         finally:
             await client.close()
 
     rpc_service.clear_mcp_hello("t")
     _run(_exercise())
-    generation, seen_at = rpc_service.mcp_hello_state("t")
+    generation, seen_at, interval = rpc_service.mcp_hello_state("t")
     assert generation == "gen-42"
     assert seen_at > 0.0
+    assert interval == 60.0
     rpc_service.clear_mcp_hello("t")
 
 
@@ -324,6 +420,19 @@ def test_hello_startup_absent_without_generation(monkeypatch):
     assert puffo_core_server._make_hello_startup(None) is None
 
 
+async def _drive_beacon(startup, calls, target: int, ticks: int = 500):
+    task = asyncio.ensure_future(startup())
+    for _ in range(ticks):
+        if len(calls) >= target:
+            break
+        await asyncio.sleep(0)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 def test_hello_startup_retries_then_succeeds(monkeypatch):
     from puffo_agent.mcp import puffo_core_server
 
@@ -331,18 +440,42 @@ def test_hello_startup_retries_then_succeeds(monkeypatch):
     monkeypatch.setattr(
         puffo_core_server, "_HELLO_RETRY_DELAY_SECONDS", 0.0,
     )
-    calls: list[str] = []
+    calls: list[tuple[str, float]] = []
 
     class _Client:
-        async def hello(self, generation):
-            calls.append(generation)
+        async def hello(self, generation, *, beacon_interval=None):
+            calls.append((generation, beacon_interval))
             if len(calls) < 3:
                 raise RuntimeError("rpc mcp-hello transport error")
             return "ok"
 
     startup = puffo_core_server._make_hello_startup(_Client())
-    _run(startup())
-    assert calls == ["g7", "g7", "g7"]
+    _run(_drive_beacon(startup, calls, target=3))
+    expected = ("g7", puffo_core_server._HELLO_BEACON_INTERVAL_SECONDS)
+    assert calls == [expected, expected, expected]
+
+
+def test_hello_beacon_refires_after_interval(monkeypatch):
+    """After the startup burst the sender keeps re-helloing on its
+    declared cadence — the daemon side reads sustained silence as a
+    wedge, so a one-shot sender would defeat mid-life detection."""
+    from puffo_agent.mcp import puffo_core_server
+
+    monkeypatch.setenv("PUFFO_MCP_GENERATION", "g8")
+    monkeypatch.setattr(
+        puffo_core_server, "_HELLO_BEACON_INTERVAL_SECONDS", 0.0,
+    )
+    calls: list[tuple[str, float]] = []
+
+    class _Client:
+        async def hello(self, generation, *, beacon_interval=None):
+            calls.append((generation, beacon_interval))
+            return "ok"
+
+    startup = puffo_core_server._make_hello_startup(_Client())
+    _run(_drive_beacon(startup, calls, target=4))
+    assert len(calls) >= 4
+    assert all(call == ("g8", 0.0) for call in calls)
 
 
 # ── per-spawn config generation ────────────────────────────────────────
@@ -374,6 +507,40 @@ def test_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
     first = preparer._prepare_claude_spec("prompt")
     config_doc = json.loads(
         (tmp_path / "puffo" / "agents" / "gen-test" / "mcp-config.json")
+        .read_text(encoding="utf-8")
+    )
+    written = config_doc["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
+    second = preparer._prepare_claude_spec("prompt")
+
+    assert first.mcp_generation and second.mcp_generation
+    assert first.mcp_generation != second.mcp_generation
+    assert written == first.mcp_generation
+
+
+def test_docker_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
+    """cli-docker Claude gets the same per-write generation as
+    cli-local — without it the transport probe exits early and Docker
+    agents have no wedge recovery at all."""
+    from puffo_agent.agent.harness.runtime.docker_runtime import (
+        DockerRuntimePreparer,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
+    config = AgentConfig(
+        id="gen-docker",
+        runtime=RuntimeConfig(
+            kind="cli-docker", provider="anthropic", harness="claude-code",
+        ),
+        puffo_core=PuffoCoreConfig(
+            slug="bot-gen-d", device_id="d1", space_id="sp1",
+        ),
+    )
+    preparer = DockerRuntimePreparer(DaemonConfig(), config)
+
+    first = preparer._prepare_claude_spec("prompt")
+    config_doc = json.loads(
+        (preparer.workspace_dir / ".puffo-agent" / "mcp-config.json")
         .read_text(encoding="utf-8")
     )
     written = config_doc["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]

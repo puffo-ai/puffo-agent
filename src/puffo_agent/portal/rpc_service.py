@@ -41,21 +41,29 @@ def set_rpc_resolver(fn: Optional[RpcResolver]) -> None:
     _RPC_RESOLVER = fn
 
 
-# Per-agent (generation, monotonic-arrival) of the last MCP subprocess
-# that reached this service. The worker's transport probe compares both
-# against the generation it minted for the current spec and the runtime's
-# open time — reachability is proven by the subprocess itself (the same
-# process a real tool call would come from), not inferred from our side.
-_MCP_HELLO_SEEN: dict[str, tuple[str, float]] = {}
+# Per-agent (generation, monotonic-arrival, beacon-interval) of the last
+# MCP subprocess that reached this service. The worker's transport probe
+# compares generation and arrival against the generation it minted for
+# the current spec and the runtime's open time — reachability is proven
+# by the subprocess itself (the same process a real tool call would come
+# from), not inferred from our side. beacon-interval is the subprocess's
+# self-declared re-hello cadence (None for a startup-only sender): the
+# probe enforces freshness only where the capability was declared.
+_MCP_HELLO_SEEN: dict[str, tuple[str, float, float | None]] = {}
 
 
-def record_mcp_hello(agent_id: str, generation: str) -> None:
-    _MCP_HELLO_SEEN[agent_id] = (generation, time.monotonic())
+def record_mcp_hello(
+    agent_id: str, generation: str, beacon_interval: float | None = None,
+) -> None:
+    _MCP_HELLO_SEEN[agent_id] = (
+        generation, time.monotonic(), beacon_interval,
+    )
 
 
-def mcp_hello_state(agent_id: str) -> tuple[str, float]:
-    """Last (generation, monotonic arrival); ("", 0.0) when never seen."""
-    return _MCP_HELLO_SEEN.get(agent_id, ("", 0.0))
+def mcp_hello_state(agent_id: str) -> tuple[str, float, float | None]:
+    """Last (generation, monotonic arrival, declared beacon interval);
+    ("", 0.0, None) when never seen."""
+    return _MCP_HELLO_SEEN.get(agent_id, ("", 0.0, None))
 
 
 def clear_mcp_hello(agent_id: str) -> None:
@@ -63,7 +71,8 @@ def clear_mcp_hello(agent_id: str) -> None:
 
 
 async def mcp_hello_route(request: web.Request) -> web.Response:
-    """POST /v1/rpc/{agent_id}/mcp-hello — ``{generation}``.
+    """POST /v1/rpc/{agent_id}/mcp-hello — ``{generation,
+    beacon_interval?}``.
 
     Deliberately resolver-free: the handshake may arrive while the
     worker is still warming, and recording it must not depend on a
@@ -78,7 +87,21 @@ async def mcp_hello_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "generation must be a non-empty string"}, status=400,
         )
-    record_mcp_hello(agent_id, generation)
+    interval = body.get("beacon_interval")
+    if interval is not None and (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or interval <= 0
+    ):
+        return web.json_response(
+            {"error": "beacon_interval must be a positive number"},
+            status=400,
+        )
+    record_mcp_hello(
+        agent_id,
+        generation,
+        float(interval) if interval is not None else None,
+    )
     return web.json_response({"message": "ok"})
 
 

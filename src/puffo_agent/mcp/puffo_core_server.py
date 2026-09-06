@@ -394,34 +394,66 @@ def build_server(
 
 _HELLO_ATTEMPTS = 3
 _HELLO_RETRY_DELAY_SECONDS = 2.0
+_HELLO_BEACON_INTERVAL_SECONDS = 60.0
 
 
 def _make_hello_startup(rpc_client):
-    """Startup handshake coroutine factory. ``None`` when the handshake
-    is not applicable (no RPC client wired, or the daemon predates
-    ``PUFFO_MCP_GENERATION``) so older daemons see zero new traffic."""
+    """Hello-beacon coroutine factory: one prompt startup burst, then a
+    steady re-hello every ``_HELLO_BEACON_INTERVAL_SECONDS``. The declared
+    interval travels in the payload, so the daemon-side probe reads
+    sustained silence from this subprocess as a wedged transport — not
+    just "never came up". ``None`` when the handshake is not applicable
+    (no RPC client wired, or the daemon predates ``PUFFO_MCP_GENERATION``)
+    so older daemons see zero new traffic."""
     generation = os.environ.get("PUFFO_MCP_GENERATION", "")
     if rpc_client is None or not generation:
         return None
 
-    async def _hello() -> None:
-        for attempt in range(1, _HELLO_ATTEMPTS + 1):
-            try:
-                await rpc_client.hello(generation)
-                return
-            except Exception as exc:  # noqa: BLE001
-                if attempt == _HELLO_ATTEMPTS:
-                    # The daemon-side probe recycles on missing hellos;
-                    # this line is the subprocess-side half of the story.
-                    logger.warning(
-                        "mcp-hello failed after %d attempts "
-                        "(generation=%s): %s",
-                        attempt, generation, exc,
-                    )
-                    return
-                await asyncio.sleep(_HELLO_RETRY_DELAY_SECONDS)
+    async def _try_hello() -> Exception | None:
+        try:
+            await rpc_client.hello(
+                generation,
+                beacon_interval=_HELLO_BEACON_INTERVAL_SECONDS,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            return exc
 
-    return _hello
+    async def _beacon() -> None:
+        failing = False
+        for attempt in range(1, _HELLO_ATTEMPTS + 1):
+            exc = await _try_hello()
+            if exc is None:
+                break
+            if attempt == _HELLO_ATTEMPTS:
+                failing = True
+                # The daemon-side probe recycles on missing hellos;
+                # this line is the subprocess-side half of the story.
+                logger.warning(
+                    "mcp-hello failed after %d attempts "
+                    "(generation=%s): %s",
+                    attempt, generation, exc,
+                )
+            else:
+                await asyncio.sleep(_HELLO_RETRY_DELAY_SECONDS)
+        while True:
+            await asyncio.sleep(_HELLO_BEACON_INTERVAL_SECONDS)
+            exc = await _try_hello()
+            if exc is None:
+                if failing:
+                    logger.info(
+                        "mcp-hello beacon recovered (generation=%s)",
+                        generation,
+                    )
+                failing = False
+            elif not failing:
+                failing = True
+                logger.warning(
+                    "mcp-hello beacon failed (generation=%s): %s",
+                    generation, exc,
+                )
+
+    return _beacon
 
 
 def _cfg_from_env() -> dict[str, str]:

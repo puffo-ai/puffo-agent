@@ -126,6 +126,11 @@ _WS_DEGRADE_THRESHOLD = 5
 # plus the subprocess's own 3×2s hello retry budget.
 _MCP_PROBE_GRACE_SECONDS = 30.0
 
+# A beacon-capable subprocess may miss this many of its own declared
+# re-hello intervals before its last hello stops counting as evidence
+# of a live transport.
+_MCP_BEACON_STALE_FACTOR = 3.0
+
 # Consecutive failed adapter reloads tolerated before the pending
 # refresh flags are abandoned and the failure becomes a health state.
 _REFRESH_RELOAD_FAILURE_CAP = 3
@@ -398,23 +403,45 @@ class Worker:
         """Heartbeat-cadence transport probe: the current runtime's puffo
         MCP subprocess must have reached the loopback RPC service
         (``mcp-hello`` with this spec's generation, after this runtime's
-        open). One miss past the grace window recycles the runtime —
-        the respawned subprocess re-fires hello; a second miss flips
-        ``mcp_unreachable`` so the wedge is visible instead of an
-        agent that wakes turns but can never read them (8/30-class
-        incident: alive worker, dead MCP, health ok for 51 min)."""
+        open) — and, when the subprocess declared a beacon cadence,
+        recently enough that the hello still stands for a live transport.
+        One miss past the grace window recycles the runtime through the
+        adapter (the rebuilt spec mints a fresh generation, so a
+        surviving pre-recycle subprocess can never impersonate the new
+        runtime's health); a second miss flips ``mcp_unreachable`` so
+        the wedge is visible instead of an agent that wakes turns but
+        can never read them (8/30-class incident: alive worker, dead
+        MCP, health ok for 51 min)."""
         from ..agent.harness.runtime.runtime_manager import get_runtime_manager
         from . import rpc_service
 
+        adapter = self._adapter
         mgr = get_runtime_manager(agent_id)
-        if mgr is None:
+        if adapter is None or mgr is None:
             return
-        spec_gen = getattr(mgr.spec, "mcp_generation", "")
-        opened_at = getattr(mgr, "last_open_monotonic", None)
+        # Direct attribute access on purpose: these are required contract
+        # fields, and producer/consumer drift must raise here instead of
+        # silently disabling recovery. Only value-level absence is
+        # legitimate (no puffo_core → empty generation; never opened →
+        # None) and returns quietly.
+        spec_gen = mgr.spec.mcp_generation
+        opened_at = mgr.last_open_monotonic
         if not spec_gen or opened_at is None:
             return
-        seen_gen, seen_at = rpc_service.mcp_hello_state(agent_id)
-        if seen_gen == spec_gen and seen_at >= opened_at:
+        now = time.monotonic()
+        seen_gen, seen_at, beacon_interval = rpc_service.mcp_hello_state(
+            agent_id
+        )
+        current = seen_gen == spec_gen and seen_at >= opened_at
+        # Freshness is only enforced against a subprocess that declared
+        # its own re-hello cadence; a startup-only predecessor (older
+        # package in a lagging Docker image) keeps handshake semantics
+        # and is never recycle-looped for going quiet.
+        stale = (
+            beacon_interval is not None
+            and now - seen_at > beacon_interval * _MCP_BEACON_STALE_FACTOR
+        )
+        if current and not stale:
             if self._mcp_probe_strikes:
                 logger.info(
                     "agent %s: puffo MCP transport recovered "
@@ -426,21 +453,33 @@ class Worker:
                 self.runtime.error = ""
                 self.runtime.save(agent_id)
             return
-        if time.monotonic() - opened_at < _MCP_PROBE_GRACE_SECONDS:
+        if now - opened_at < _MCP_PROBE_GRACE_SECONDS:
             return
         if self._turn_active:
             # A reload would raise mid-turn; check again next beat.
             return
         self._mcp_probe_strikes += 1
         if self._mcp_probe_strikes == 1:
+            if current:
+                cause = (
+                    f"hello beacon silent for {now - seen_at:.0f}s "
+                    f"(declared interval {beacon_interval:.0f}s)"
+                )
+            else:
+                cause = (
+                    "no hello from this spec's subprocess since runtime "
+                    f"open ({now - opened_at:.0f}s ago)"
+                )
             logger.error(
-                "agent %s: puffo MCP subprocess has not reached the RPC "
-                "service %.0fs after runtime open (generation=%s); "
-                "recycling the provider runtime",
-                agent_id, _MCP_PROBE_GRACE_SECONDS, spec_gen,
+                "agent %s: puffo MCP transport unhealthy — %s "
+                "(generation=%s); recycling the provider runtime with a "
+                "fresh mcp generation",
+                agent_id, cause, spec_gen,
             )
             try:
-                await mgr.reload_resources(preserve_session=True)
+                await adapter.reload(
+                    mgr.spec.system_prompt, with_session=False,
+                )
             except Exception as exc:  # noqa: BLE001
                 # Includes a turn racing us; keep the strike for next beat.
                 self._mcp_probe_strikes -= 1
