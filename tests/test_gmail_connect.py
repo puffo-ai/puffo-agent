@@ -133,13 +133,37 @@ async def test_disconnect_clears_locally_even_when_revoke_unconfirmed(
 
     monkeypatch.setattr(ops, "run_gmail_executor", broken_executor)
 
-    res = await ops.gmail_disconnect({})
+    res = await ops.gmail_disconnect_token({})
 
     assert res["ok"] is True
+    assert res["scope"] == "token_only"
     after = load_status()
     assert after.state == "disconnected"
     assert after.account_masked == ""
     assert after.reason == "revoke_unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_token_only_disconnect_never_yields_revoked_projection(
+    home, monkeypatch
+):
+    """Runbook v6 §7 negative control: ``revoked`` belongs to the
+    composite Disconnect (grant + token both revoked). A token-only
+    success — even an executor *claiming* revoked — must cap the
+    projection at ``disconnected``."""
+    _configured(monkeypatch)
+    store_status(GmailConnectStatus(state="connected", account_masked="je***@x"))
+
+    async def overclaiming_executor(entrypoint, request, *, flow_timeout_s):
+        return executor_mod.ExecutorOutcome(status="revoked")
+
+    monkeypatch.setattr(ops, "run_gmail_executor", overclaiming_executor)
+
+    res = await ops.gmail_disconnect_token({})
+
+    assert res["scope"] == "token_only"
+    assert load_status().state == "disconnected"
+    assert load_status().state != "revoked"
 
 
 @pytest.mark.asyncio
@@ -154,6 +178,13 @@ async def test_control_dispatch_routes_machine_level_gmail_ops(monkeypatch):
     monkeypatch.setattr(ops, "gmail_connect_initiate", fake_initiate)
     res = await execute_command("gmail.connect_initiate", None, {})
     assert res == {"ok": True, "state": "marker"}
+
+    async def fake_disconnect(params):
+        return {"ok": True, "scope": "token_only"}
+
+    monkeypatch.setattr(ops, "gmail_disconnect_token", fake_disconnect)
+    res = await execute_command("gmail.disconnect_token", None, {})
+    assert res == {"ok": True, "scope": "token_only"}
 
 
 def _fake_executor_script(tmp_path, body: str) -> str:

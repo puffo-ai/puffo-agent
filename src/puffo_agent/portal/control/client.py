@@ -297,14 +297,16 @@ async def execute_command(
     """
     if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
         return await _execute_runtime_command(op, agent_slug, params, command_id)
-    if op in {"gmail.connect_initiate", "gmail.disconnect"}:
+    if op in {"gmail.connect_initiate", "gmail.disconnect_token"}:
         # Machine-level (no agent_slug): the connector belongs to the
-        # operator's machine, not to any one agent.
+        # operator's machine, not to any one agent. The disconnect op is
+        # named token-only on the wire — the composite Disconnect (grant
+        # axis first, four-outcome semantics) is a different future op.
         from ..gmail_connect import ops as gmail_ops
 
         if op == "gmail.connect_initiate":
             return await gmail_ops.gmail_connect_initiate(params)
-        return await gmail_ops.gmail_disconnect(params)
+        return await gmail_ops.gmail_disconnect_token(params)
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.

@@ -64,8 +64,15 @@ async def gmail_connect_initiate(params: dict) -> dict:
     return {"ok": False, "error": outcome.reason or "failed", "state": "failed"}
 
 
-async def gmail_disconnect(params: dict) -> dict:
-    """Best-effort remote revoke, unconditional local clear.
+async def gmail_disconnect_token(params: dict) -> dict:
+    """Token-only sub-step of Disconnect: best-effort remote revoke,
+    unconditional local clear.
+
+    This op never produces the ``revoked`` projection state — whatever
+    the executor claims, the cap here is ``disconnected``. ``revoked``
+    is reserved for the composite Disconnect (grant revocation first,
+    then token; four-outcome semantics, design §2.3/§4) that only
+    exists once the grant axis is wired.
 
     Disconnect never requires presence and never blocks on Google:
     fail-open toward revocation is the safe direction, but an
@@ -73,7 +80,12 @@ async def gmail_disconnect(params: dict) -> dict:
     pretending the token is gone everywhere.
     """
     if load_status().state == "disconnected":
-        return {"ok": True, "state": "disconnected", "reason": ""}
+        return {
+            "ok": True,
+            "scope": "token_only",
+            "state": "disconnected",
+            "reason": "",
+        }
     gc = _config().gmail_connect
     reason = ""
     if gc.enabled and gc.executor_path:
@@ -89,5 +101,13 @@ async def gmail_disconnect(params: dict) -> dict:
             reason = "revoke_unconfirmed"
     else:
         reason = "revoke_unconfirmed"
+    # Cap at "disconnected" regardless of what the executor claimed:
+    # token-only success alone must never read as the composite
+    # ``revoked`` (runbook v6 §7 negative control).
     store_status(GmailConnectStatus(state="disconnected", reason=reason))
-    return {"ok": True, "state": "disconnected", "reason": reason}
+    return {
+        "ok": True,
+        "scope": "token_only",
+        "state": "disconnected",
+        "reason": reason,
+    }
