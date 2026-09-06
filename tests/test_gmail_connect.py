@@ -28,7 +28,10 @@ from puffo_agent.portal.gmail_connect.executor import (
     run_gmail_executor,
 )
 from puffo_agent.portal.gmail_connect.status_store import (
+    EXECUTOR_FAILURE_REASONS,
     EXECUTOR_REASONS,
+    PERSISTABLE_PAIRS,
+    UNTRUSTED_STATUS_PAIR,
     REASONS,
     STATES,
     GmailConnectStatus,
@@ -1433,7 +1436,7 @@ async def test_the_confirmed_side_of_the_boundary_still_persists(home, monkeypat
 # by Jeff 188618, is exactly that kind of change.
 #
 # Derivation handed over by Boris (shared/gmail-connect-pair-roster,
-# derive_reply_pairs.py sha256 dee8f87f…5591). Two of his properties are
+# derive_reply_pairs.py sha256 30de070e…7a66). Two of his properties are
 # load-bearing and kept verbatim in spirit:
 #   1. dynamic arguments are EXPANDED through a declared table keyed by the
 #      unparsed expression source — never by line number, which silently
@@ -1639,3 +1642,120 @@ def test_reply_pair_roster_has_not_drifted():
     leaving the real defect in place.
     """
     assert _derive_reply_pairs() == _EXPECTED_REPLY_PAIRS
+
+
+# ── load path: the projection value space is its own surface ──────────────
+#
+# The reply roster is derived from `_reply` call sites, so it describes
+# what a COMMAND can answer. The projection has a second producer nobody
+# had enumerated: `load_status` feeds disk bytes straight into
+# `GmailConnectStatus`, whose per-field clamping fixed an out-of-roster
+# reason but kept the state (Boris 188696). Both roster derivations
+# reasoned from reply branches, so both missed it — the failure was in the
+# choice of enumeration surface, not in the derivation, which is exactly
+# why two independent implementations agreeing on 17 could not catch it.
+
+_PRODUCERLESS_PAIRS = [
+    # reason retired in a later version (Boris 188696's version-narrowing)
+    ("connected", "reauthorized"),
+    ("disconnected", "reauthorized"),
+    # unknown state
+    ("bogus", ""),
+    ("BOGUS", "internal_error"),
+    # both fields legal, no producer emits the combination (测试姬 188700)
+    ("connected", "revoke_unconfirmed"),
+    ("disconnected", "refused"),
+    ("pending", "revoke_unconfirmed"),
+    ("connected", "confirm_timeout"),
+]
+
+
+@pytest.mark.parametrize(("state", "reason"), _PRODUCERLESS_PAIRS)
+def test_a_pair_no_producer_can_emit_fails_closed(home, state, reason):
+    """Never keep claiming `connected`/`pending` from bytes we cannot place.
+
+    Fails closed to ONE sentinel rather than to a family of new pairs, so
+    the projection roster does not grow a member per defect.
+    """
+    status_path().parent.mkdir(parents=True, exist_ok=True)
+    status_path().write_text(
+        json.dumps({"state": state, "reason": reason, "updated_at": 1.0}),
+        encoding="utf-8",
+    )
+
+    loaded = load_status()
+
+    assert (loaded.state, loaded.reason) == UNTRUSTED_STATUS_PAIR
+    assert loaded.projection() == {
+        "state": "disconnected", "reason": "internal_error",
+    }
+
+
+@pytest.mark.parametrize(("state", "reason"), sorted(PERSISTABLE_PAIRS))
+def test_every_persistable_pair_survives_a_round_trip(home, state, reason):
+    """The negative control for the test above.
+
+    A fail-closed rule that also swallowed legitimate pairs would pass
+    every producerless case while breaking the feature.
+    """
+    store_status(GmailConnectStatus(state=state, reason=reason))
+
+    loaded = load_status()
+
+    assert (loaded.state, loaded.reason) == (state, reason)
+
+
+def test_the_persistable_roster_matches_what_producers_actually_write(home):
+    """`PERSISTABLE_PAIRS` must track `store_status` call sites.
+
+    The drift alarm for the SECOND surface. Without it, adding a producer
+    without extending the roster would make the new state fail closed —
+    silently, and in the safe-looking direction.
+    """
+    import ast
+    import pathlib
+
+    package = pathlib.Path(ops.__file__).parent
+    sources = sorted(package.glob("*.py"))
+    assert sources, "no package sources — the alarm would be blind"
+
+    written, sites = set(), []
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "GmailConnectStatus"
+            ):
+                continue
+            parent_calls = [
+                outer
+                for outer in ast.walk(tree)
+                if isinstance(outer, ast.Call)
+                and isinstance(outer.func, ast.Name)
+                and outer.func.id == "store_status"
+                and node in ast.walk(outer)
+            ]
+            if not parent_calls:
+                continue
+            sites.append(f"{path.name}:{node.lineno}")
+            keywords = {k.arg: k.value for k in node.keywords}
+            state = _ast_const(keywords.get("state"))
+            assert isinstance(state, str), f"{sites[-1]}: state must be a literal"
+            if "reason" not in keywords:
+                written.add((state, ""))
+                continue
+            reason = _ast_const(keywords["reason"])
+            if reason is not None:
+                written.add((state, reason))
+                continue
+            expression = ast.unparse(keywords["reason"])
+            assert expression == "outcome.reason", (
+                f"{sites[-1]}: undeclared dynamic reason {expression!r}"
+            )
+            written |= {(state, r) for r in EXECUTOR_FAILURE_REASONS}
+
+    assert sites, "no store_status(GmailConnectStatus(...)) sites found"
+    # The missing-file default is a producer too, just not a written one.
+    assert written | {("disconnected", "")} == set(PERSISTABLE_PAIRS)

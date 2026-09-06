@@ -59,6 +59,50 @@ DAEMON_REASONS = (
 )
 REASONS = ("",) + EXECUTOR_REASONS + DAEMON_REASONS
 
+# Reasons `run_gmail_executor` can put on a failed outcome: the child's
+# closed set plus the four the wrapper mints itself. `_reply` does not
+# clamp the latter away — they are in REASONS — so they reach the caller
+# and persist (Bob 188676, Jeff 188677).
+EXECUTOR_FAILURE_REASONS = EXECUTOR_REASONS + (
+    "executor_unavailable",
+    "non_loopback_ready",
+    "timeout",
+    "protocol",
+)
+
+# Exact `(state, reason)` pairs a producer can actually write, plus the
+# default returned when no file exists. This is the PERSIST surface, and
+# it is NOT the reply surface: `(pending, "")` is never a reply, and the
+# three confirm refusals are replies that never persist.
+#
+# Validated as a pair, not field by field. Per-field clamping let
+# combinations survive that no producer can emit — `(connected,
+# 'revoke_unconfirmed')`, `(disconnected, 'refused')`, `(pending,
+# 'revoke_unconfirmed')` all passed through intact (测试姬 188700), and a
+# reason retired in a later version silently turned every existing file
+# into `(state, 'internal_error')` while keeping its old state, so a
+# clean Disconnect would read as an error against a machine still
+# claiming `connected` (Boris 188696).
+PERSISTABLE_PAIRS = frozenset(
+    {
+        ("disconnected", ""),
+        ("pending", ""),
+        ("connected", ""),
+        ("disconnected", "revoke_unconfirmed"),
+        ("failed", "refused"),
+    }
+    | {("failed", reason) for reason in EXECUTOR_FAILURE_REASONS}
+)
+
+# Anything else fails closed to exactly this, rather than to three new
+# pairs. Untrusted or stale bytes must never keep claiming `connected` or
+# `pending`: the Layer-B projection is only what the UI shows, and the
+# token's real fate lives in the executor's sealed store, so the honest
+# move is to claim nothing (Jeff 188697). The cost is explicit — a disk
+# saying `connected` displays as disconnected while a token may still
+# exist.
+UNTRUSTED_STATUS_PAIR = ("disconnected", "internal_error")
+
 
 @dataclass
 class GmailConnectStatus:
@@ -97,10 +141,27 @@ def load_status() -> GmailConnectStatus:
     except (OSError, ValueError):
         logger.warning("gmail-connect: unreadable status file; treating as disconnected")
         return GmailConnectStatus()
+    # Checked on the RAW values, before `GmailConnectStatus` clamps them.
+    # Per-field clamping destroys the evidence this check needs: an
+    # unknown state becomes `disconnected`, so `("bogus", "")` would
+    # arrive here as the perfectly legal `("disconnected", "")` and read
+    # in the UI as a clean, deliberate disconnect rather than as a file
+    # we cannot account for. Field-wise a value may be legal; as a pair
+    # no producer can emit it, so its state claim is not evidence.
+    disk_pair = (
+        str(raw.get("state", "disconnected")),
+        str(raw.get("reason", "")),
+    )
+    updated_at = float(raw.get("updated_at", 0.0))
+    if disk_pair not in PERSISTABLE_PAIRS:
+        logger.warning(
+            "gmail-connect: status pair %r has no producer; failing closed",
+            disk_pair,
+        )
+        state, reason = UNTRUSTED_STATUS_PAIR
+        return GmailConnectStatus(state=state, reason=reason, updated_at=updated_at)
     return GmailConnectStatus(
-        state=str(raw.get("state", "disconnected")),
-        reason=str(raw.get("reason", "")),
-        updated_at=float(raw.get("updated_at", 0.0)),
+        state=disk_pair[0], reason=disk_pair[1], updated_at=updated_at
     )
 
 
