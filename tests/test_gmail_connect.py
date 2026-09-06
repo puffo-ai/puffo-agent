@@ -26,6 +26,7 @@ from puffo_agent.portal.gmail_connect.executor import (
     run_gmail_executor,
 )
 from puffo_agent.portal.gmail_connect.status_store import (
+    STATES,
     GmailConnectStatus,
     load_status,
     status_path,
@@ -377,3 +378,84 @@ async def test_status_route_serves_projection_only(home):
     # Layer B exactly: any extra key (a Layer-A path, an account, …)
     # turns this red — the assertion is a whitelist, not a keyword scan.
     assert body == {"ok": True, "state": "connected", "reason": ""}
+
+
+LEAK = "token exchange failed db=/private/secrets/tokens.db client_secret=GOCSPX-abc"
+
+
+@pytest.mark.asyncio
+async def test_out_of_roster_reason_is_clamped_before_layer_b(tmp_path, home, monkeypatch):
+    """End-to-end via a real subprocess: a hostile/buggy executor must not
+    put free text into the on-disk file, the Layer-B projection, or the
+    control-plane response body.
+
+    Negative control authored by Boris (review of e926d42, patch
+    85fece2b…); kept as-is because it covers an exit the unit-level
+    clamp test does not — ``ops`` returns the reason as ``error``
+    without passing through ``projection()``.
+    """
+    script = _fake_executor_script(
+        tmp_path,
+        """
+        import json, sys
+        json.loads(sys.stdin.readline())
+        print(json.dumps({"event": "ready",
+            "redirect_uri": "http://127.0.0.1:49152/oauth2/callback"}))
+        sys.stdout.flush()
+        print(json.dumps({"event": "result", "status": "failed",
+            "reason": %r}))
+        sys.stdout.flush()
+        """ % LEAK,
+    )
+    cfg = DaemonConfig()
+    cfg.gmail_connect = GmailConnectConfig(
+        enabled=True, executor_path=script, data_root="/d",
+        client_bundle_sha256="a" * 64,
+    )
+    monkeypatch.setattr(ops, "_config", lambda: cfg)
+    async def allow(prompt, timeout_s=0.0):
+        return True
+
+    monkeypatch.setattr(ops, "request_native_confirm", allow)
+
+    res = await ops.gmail_connect_initiate({})
+    on_disk = status_path().read_text(encoding="utf-8")
+    projection = load_status().projection()
+
+    assert "client_secret" not in on_disk and "/private/secrets" not in on_disk
+    assert projection["reason"] == "internal_error"
+    assert "client_secret" not in json.dumps(res)
+
+
+def test_poisoned_status_file_cannot_leak_through_the_load_path(home):
+    """The trust-boundary clamp does not cover bytes already on disk.
+
+    A file written by an older build (or a rollback, or a hand edit)
+    is untrusted input too: ``load_status`` must clamp it, or the
+    projection faithfully serves whatever is in the file.
+    """
+    path = status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"state": "failed", "reason": LEAK}), encoding="utf-8")
+
+    projection = load_status().projection()
+
+    assert projection["reason"] == "internal_error"
+    assert "client_secret" not in json.dumps(projection)
+
+
+def test_revoked_is_structurally_absent_not_merely_unused(home):
+    """``revoked`` belongs to the composite Disconnect, which does not
+    exist yet. "No call site mints it" is an enumeration of today's code;
+    this pins the structural form — it is not constructible and not
+    loadable, so an on-disk ``revoked`` cannot be served to the UI as a
+    revocation that never happened.
+    """
+    assert "revoked" not in STATES
+
+    assert GmailConnectStatus(state="revoked").state == "disconnected"
+
+    path = status_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"state": "revoked", "reason": ""}), encoding="utf-8")
+    assert load_status().state == "disconnected"

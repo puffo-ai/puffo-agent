@@ -27,22 +27,13 @@ import signal
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from .status_store import EXECUTOR_REASONS
+
 
 logger = logging.getLogger(__name__)
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 READY_DEADLINE_S = 15.0
-# Schema §4 closed reason set (v1.1, 60adad76…). Anything else on a
-# result line is clamped to internal_error before it can ride the
-# reason field into the Layer-B projection as free text.
-SCHEMA_REASONS = frozenset({
-    "bundle_verify_failed",
-    "callback_timeout",
-    "exchange_failed",
-    "scope_mismatch",
-    "keychain_error",
-    "internal_error",
-})
 # The executor enforces its own consent timeout and reports
 # callback_timeout; our read deadline sits above it so the structured
 # reason wins over a daemon-side kill.
@@ -164,10 +155,17 @@ async def run_gmail_executor(
             return ExecutorOutcome(status="failed", reason="protocol")
         return ExecutorOutcome(status="connected")
     if status == "failed":
+        # Schema v1.1 §4 is a closed set and we do not take the
+        # executor's word for it. Clamping HERE, at the trust boundary,
+        # covers both the Layer-B projection and the control-plane
+        # response body — ops.py returns this same string as ``error``,
+        # which is a second exit that never passes through projection().
         reason = str(result.get("reason", ""))
-        if reason not in SCHEMA_REASONS:
-            # Clamp: the reason field is a closed enum; anything else
-            # could carry free text into the Layer-B projection.
+        if reason not in EXECUTOR_REASONS:
+            logger.warning(
+                "gmail-connect: executor reason outside schema v1.1 §4 (len=%d)",
+                len(reason),
+            )
             reason = "internal_error"
         return ExecutorOutcome(status="failed", reason=reason)
     return ExecutorOutcome(status="failed", reason="protocol")
