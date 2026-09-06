@@ -13,8 +13,38 @@ from puffo_agent.agent.errors import ProviderFailureError
 from puffo_agent.agent.harness.drivers.codex import (
     CodexAppServerDriver,
     _classify_jsonrpc_error,
+    _selection_ack_warnings,
 )
-from puffo_agent.agent.harness.driver import PermissionDecision, PermissionRef
+from puffo_agent.agent.harness.driver import (
+    PermissionDecision,
+    PermissionRef,
+    RuntimeSpec,
+)
+
+
+def test_unlisted_model_and_level_are_explicitly_unvalidated_without_ack():
+    """A successful thread open must not imply its requested tier took effect."""
+    spec = RuntimeSpec(
+        "/workspace", model="gpt-6-astra", inference_level="high",
+    )
+
+    assert _selection_ack_warnings(spec, {"id": "thread-1"}) == (
+        "model_ack_unavailable",
+        "inference_level_ack_unavailable",
+    )
+
+
+def test_matching_harness_ack_validates_model_and_level():
+    """An exact app-server echo is positive evidence for the selected config."""
+    spec = RuntimeSpec(
+        "/workspace", model="gpt-6-astra", inference_level="high",
+    )
+
+    assert _selection_ack_warnings(spec, {
+        "id": "thread-1",
+        "model": "gpt-6-astra",
+        "reasoningEffort": "high",
+    }) == ()
 
 
 @pytest.mark.parametrize(
@@ -55,6 +85,30 @@ def test_jsonrpc_retryable_provider_errors_requeue(error):
     assert isinstance(exc, AgentAPIError)
     assert exc.is_auth is False
     assert exc.error_code in {"rate_limit", "provider_unavailable"}
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (
+            {"code": -32000, "message": "model_not_found: gpt-future"},
+            "model_not_found",
+        ),
+        (
+            {
+                "code": 403,
+                "message": "Your account is not entitled to use model gpt-future",
+            },
+            "not_entitled",
+        ),
+    ],
+)
+def test_jsonrpc_model_selection_failures_keep_actionable_class(error, expected):
+    """A real model rejection must not collapse into generic provider failure."""
+    exc = _classify_jsonrpc_error(error)
+
+    assert isinstance(exc, ProviderFailureError)
+    assert exc.error_code == expected
 
 
 @pytest.mark.parametrize(

@@ -144,6 +144,7 @@ class McpServerSpec:
 class RuntimeSpec:
     workspace_dir: str
     model: str = ""
+    inference_level: str = ""
     system_prompt: str = ""
     executable: str = ""
     launch_args: tuple[str, ...] = ()

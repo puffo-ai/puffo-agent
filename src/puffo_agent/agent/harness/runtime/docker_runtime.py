@@ -443,6 +443,7 @@ class DockerRuntimePreparer:
         return RuntimeSpec(
             workspace_dir="/workspace",
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             environment=environment,
             permission_mode=self.permission_mode,
