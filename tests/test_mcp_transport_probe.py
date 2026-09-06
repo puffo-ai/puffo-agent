@@ -263,8 +263,8 @@ def test_runtime_open_watermark_precedes_current_generation_hello():
         )
         try:
             await manager.open()
-            generation, seen_at, _ = rpc_service.mcp_hello_state("opening")
-            assert generation == "g-current"
+            seen_at, _ = rpc_service.mcp_hello_state("opening", "g-current")
+            assert seen_at > 0.0
             assert seen_at >= manager.last_open_monotonic
         finally:
             await manager.close()
@@ -292,7 +292,7 @@ def test_beacon_silence_recycles(registered_manager):
     silent is a wedge (the incident's 51-min RPC silence signature),
     even though its startup hello matched this generation."""
     mgr = registered_manager(_FakeManager("g1", time.monotonic() - 400))
-    rpc_service._MCP_HELLO_SEEN["t"] = ("g1", time.monotonic() - 400, 60.0)
+    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (time.monotonic() - 400, 60.0)}
     worker = _seed_worker()
     adapter = _wire(worker, mgr)
 
@@ -307,7 +307,7 @@ def test_startup_only_hello_never_goes_stale(registered_manager):
     keeps handshake semantics: an aged hello stays valid and the probe
     must not recycle-loop the runtime for silence."""
     mgr = registered_manager(_FakeManager("g1", time.monotonic() - 5000))
-    rpc_service._MCP_HELLO_SEEN["t"] = ("g1", time.monotonic() - 4000, None)
+    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (time.monotonic() - 4000, None)}
     worker = _seed_worker()
     adapter = _wire(worker, mgr)
 
@@ -315,6 +315,43 @@ def test_startup_only_hello_never_goes_stale(registered_manager):
 
     assert adapter.reload_calls == []
     assert worker._mcp_probe_strikes == 0
+
+
+def test_surviving_old_beacon_cannot_evict_new_generation_health(
+    registered_manager,
+):
+    """Hello state is keyed per (agent, generation): a surviving
+    pre-recycle subprocess that keeps beaconing its old generation must
+    not overwrite the current generation's healthy evidence — a single
+    per-agent slot here recycled healthy runtimes in a loop."""
+    mgr = registered_manager(_FakeManager("g-new", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker()
+    adapter = _wire(worker, mgr)
+
+    rpc_service.record_mcp_hello("t", "g-new", 60.0)
+    rpc_service.record_mcp_hello("t", "g-old", 60.0)
+    _run(worker.probe_mcp_transport("t"))
+
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
+    assert worker.runtime.health == "ok"
+
+
+def test_hello_state_bounds_generations_per_agent():
+    """Dead generations stop re-recording, so trimming by oldest
+    arrival keeps the live ones and a leaking predecessor cannot grow
+    the per-agent map without bound."""
+    rpc_service.clear_mcp_hello("t")
+    try:
+        for n in range(rpc_service._MCP_HELLO_MAX_GENERATIONS + 1):
+            rpc_service.record_mcp_hello("t", f"g{n}", 60.0)
+        slots = rpc_service._MCP_HELLO_SEEN["t"]
+        assert len(slots) == rpc_service._MCP_HELLO_MAX_GENERATIONS
+        assert "g0" not in slots
+        assert rpc_service.mcp_hello_state("t", "g1")[0] > 0.0
+    finally:
+        rpc_service.clear_mcp_hello("t")
 
 
 def test_empty_turn_cannot_clear_mcp_unreachable(saved_states):
@@ -382,7 +419,7 @@ def test_mcp_hello_route_records_generation():
                 headers=headers,
             )
             assert resp.status == 200
-            assert rpc_service.mcp_hello_state("t")[2] is None
+            assert rpc_service.mcp_hello_state("t", "gen-42")[1] is None
             beacon = await client.post(
                 "/v1/rpc/t/mcp-hello",
                 json={"generation": "gen-42", "beacon_interval": 60},
@@ -404,8 +441,7 @@ def test_mcp_hello_route_records_generation():
 
     rpc_service.clear_mcp_hello("t")
     _run(_exercise())
-    generation, seen_at, interval = rpc_service.mcp_hello_state("t")
-    assert generation == "gen-42"
+    seen_at, interval = rpc_service.mcp_hello_state("t", "gen-42")
     assert seen_at > 0.0
     assert interval == 60.0
     rpc_service.clear_mcp_hello("t")

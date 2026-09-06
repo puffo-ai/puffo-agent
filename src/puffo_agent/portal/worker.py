@@ -429,10 +429,14 @@ class Worker:
         if not spec_gen or opened_at is None:
             return
         now = time.monotonic()
-        seen_gen, seen_at, beacon_interval = rpc_service.mcp_hello_state(
-            agent_id
+        # Query exactly this spec's generation: hello state is keyed per
+        # (agent, generation), so a surviving pre-recycle subprocess's
+        # beacon can neither impersonate this runtime nor overwrite its
+        # healthy evidence.
+        seen_at, beacon_interval = rpc_service.mcp_hello_state(
+            agent_id, spec_gen
         )
-        current = seen_gen == spec_gen and seen_at >= opened_at
+        current = seen_at > 0.0 and seen_at >= opened_at
         # Freshness is only enforced against a subprocess that declared
         # its own re-hello cadence; a startup-only predecessor (older
         # package in a lagging Docker image) keeps handshake semantics
@@ -470,22 +474,9 @@ class Worker:
                     "no hello from this spec's subprocess since runtime "
                     f"open ({now - opened_at:.0f}s ago)"
                 )
-            logger.error(
-                "agent %s: puffo MCP transport unhealthy — %s "
-                "(generation=%s); recycling the provider runtime with a "
-                "fresh mcp generation",
-                agent_id, cause, spec_gen,
+            await self._recycle_wedged_mcp(
+                agent_id, adapter, mgr, cause=cause, spec_gen=spec_gen,
             )
-            try:
-                await adapter.reload(
-                    mgr.spec.system_prompt, with_session=False,
-                )
-            except Exception as exc:  # noqa: BLE001
-                # Includes a turn racing us; keep the strike for next beat.
-                self._mcp_probe_strikes -= 1
-                logger.warning(
-                    "agent %s: MCP-probe recycle failed: %s", agent_id, exc,
-                )
             return
         if self.runtime.health in ("ok", "unknown"):
             self.runtime.health = "mcp_unreachable"
@@ -498,6 +489,28 @@ class Worker:
             logger.error(
                 "agent %s: MCP transport still unreachable after recycle; "
                 "runtime.health = mcp_unreachable", agent_id,
+            )
+
+    async def _recycle_wedged_mcp(
+        self, agent_id: str, adapter, mgr, *, cause: str, spec_gen: str,
+    ) -> None:
+        """First-strike response: recycle through the adapter-level
+        reload so the rebuilt spec mints a fresh mcp generation."""
+        logger.error(
+            "agent %s: puffo MCP transport unhealthy — %s "
+            "(generation=%s); recycling the provider runtime with a "
+            "fresh mcp generation",
+            agent_id, cause, spec_gen,
+        )
+        try:
+            await adapter.reload(
+                mgr.spec.system_prompt, with_session=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Includes a turn racing us; keep the strike for next beat.
+            self._mcp_probe_strikes -= 1
+            logger.warning(
+                "agent %s: MCP-probe recycle failed: %s", agent_id, exc,
             )
 
     def _note_refresh_reload(

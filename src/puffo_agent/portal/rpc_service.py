@@ -41,29 +41,43 @@ def set_rpc_resolver(fn: Optional[RpcResolver]) -> None:
     _RPC_RESOLVER = fn
 
 
-# Per-agent (generation, monotonic-arrival, beacon-interval) of the last
-# MCP subprocess that reached this service. The worker's transport probe
-# compares generation and arrival against the generation it minted for
-# the current spec and the runtime's open time — reachability is proven
-# by the subprocess itself (the same process a real tool call would come
-# from), not inferred from our side. beacon-interval is the subprocess's
-# self-declared re-hello cadence (None for a startup-only sender): the
-# probe enforces freshness only where the capability was declared.
-_MCP_HELLO_SEEN: dict[str, tuple[str, float, float | None]] = {}
+# Per-(agent, generation) (monotonic-arrival, beacon-interval) of the
+# last hello from that exact subprocess generation. The worker's
+# transport probe queries only the generation it minted for the current
+# spec — reachability is proven by the subprocess itself (the same
+# process a real tool call would come from), not inferred from our
+# side. Keying by generation matters: an old CLI's MCP subprocess is
+# not guaranteed to die with its parent, and a single per-agent slot
+# would let its surviving beacon overwrite the new generation's healthy
+# evidence and drive false recycles. beacon-interval is the
+# subprocess's self-declared re-hello cadence (None for a startup-only
+# sender): the probe enforces freshness only where the capability was
+# declared. Per-agent generations are bounded: dead generations stop
+# re-recording, so trimming the oldest arrival keeps live ones and a
+# leaking predecessor cannot grow the map without bound.
+_MCP_HELLO_SEEN: dict[str, dict[str, tuple[float, float | None]]] = {}
+_MCP_HELLO_MAX_GENERATIONS = 4
 
 
 def record_mcp_hello(
     agent_id: str, generation: str, beacon_interval: float | None = None,
 ) -> None:
-    _MCP_HELLO_SEEN[agent_id] = (
-        generation, time.monotonic(), beacon_interval,
-    )
+    slots = _MCP_HELLO_SEEN.setdefault(agent_id, {})
+    slots[generation] = (time.monotonic(), beacon_interval)
+    while len(slots) > _MCP_HELLO_MAX_GENERATIONS:
+        oldest = min(slots, key=lambda gen: slots[gen][0])
+        del slots[oldest]
 
 
-def mcp_hello_state(agent_id: str) -> tuple[str, float, float | None]:
-    """Last (generation, monotonic arrival, declared beacon interval);
-    ("", 0.0, None) when never seen."""
-    return _MCP_HELLO_SEEN.get(agent_id, ("", 0.0, None))
+def mcp_hello_state(
+    agent_id: str, generation: str,
+) -> tuple[float, float | None]:
+    """Last (monotonic arrival, declared beacon interval) of a hello
+    from exactly this generation; (0.0, None) when never seen."""
+    slots = _MCP_HELLO_SEEN.get(agent_id)
+    if not slots:
+        return (0.0, None)
+    return slots.get(generation, (0.0, None))
 
 
 def clear_mcp_hello(agent_id: str) -> None:
