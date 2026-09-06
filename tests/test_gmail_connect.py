@@ -691,3 +691,50 @@ def test_only_a_provable_cancel_escapes_being_recorded_as_failure():
     assert ops._CONFIRM_REFUSALS[nc.ConfirmOutcome.CANCELLED][0] == "disconnected"
     assert ops._CONFIRM_REFUSALS[nc.ConfirmOutcome.TIMEOUT][0] == "failed"
     assert ops._CONFIRM_REFUSALS[nc.ConfirmOutcome.UNAVAILABLE][0] == "failed"
+
+
+@pytest.mark.parametrize(
+    "label, body",
+    [
+        ("malformed json", 'print("{not json")'),
+        ("unknown event type",
+         'print(json.dumps({"event": "hello"}))'),
+        ("terminal status is neither connected nor failed",
+         'print(json.dumps({"event":"ready",'
+         '"redirect_uri":"http://127.0.0.1:1/oauth2/callback"}));'
+         'sys.stdout.flush();'
+         'print(json.dumps({"event":"result","status":"weird"}))'),
+        ("connected without a ready line",
+         'print(json.dumps({"event":"result","status":"connected"}))'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_protocol_is_a_deliberate_merge_not_an_accident(
+    label, body, tmp_path, home
+):
+    """Jeff 188542: ``protocol`` intentionally covers several low-level
+    faults, because they mean one actionable thing to a user — the daemon
+    cannot understand or trust this executor session — and the recovery is
+    identical (retry; if it persists, report the connector).
+
+    The rule is NOT "every low-level path needs its own reason"; it is
+    that facts with different recovery actions must not collapse, while
+    paths sharing a recovery action may be merged on purpose. So this
+    pins the merge in both directions: every representative sub-class
+    must land on exactly ``protocol``, and none may be projected into a
+    narrower, unproven explanation.
+    """
+    script = _fake_executor_script(
+        tmp_path,
+        "import json, sys\njson.loads(sys.stdin.readline())\n"
+        + body
+        + "\nsys.stdout.flush()\n",
+    )
+    outcome = await run_gmail_executor(
+        script,
+        {"data_root": "/d", "expected_sha256": "a" * 64, "timeout": 2.0},
+        flow_timeout_s=2.0,
+    )
+
+    assert outcome.status == "failed", label
+    assert outcome.reason == "protocol", label
