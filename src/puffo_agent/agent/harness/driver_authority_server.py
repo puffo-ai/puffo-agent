@@ -24,6 +24,8 @@ from typing import Any
 DRIVER_AUTHORITY_FD_ENV = "LINGTAI_DRIVER_AUTHORITY_FD"
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 64 * 1024
+MAX_ACTIVE_DERIVED_ENDPOINTS = 16
+DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,10 @@ class _LeaseState(str, Enum):
     ISSUED = "issued"
     CLAIMED = "claimed"
     CLOSED = "closed"
+
+
+class _DerivedEndpointLimitError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +116,11 @@ class DriverAuthorityServer:
             raise ValueError("root launch_id must be non-empty")
         binding = _EndpointBinding(launch_id, "root", None, 0, None)
         record, child = self._issue_endpoint(binding)
-        self._start_record(record)
+        try:
+            self._start_record(record)
+        except BaseException:
+            self._discard_endpoint(record, child)
+            raise
         return IssuedAuthorityEndpoint(child)
 
     def audit_records(self) -> tuple[AuthorityAuditRecord, ...]:
@@ -139,17 +149,41 @@ class DriverAuthorityServer:
     def _issue_endpoint(
         self, binding: _EndpointBinding
     ) -> tuple[_EndpointRecord, socket.socket]:
-        server, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        os.set_inheritable(server.fileno(), False)
-        os.set_inheritable(child.fileno(), False)
-        record = _EndpointRecord(server, binding)
         with self._lock:
             if self._closed:
+                raise RuntimeError("Driver authority server is closed")
+            if binding.role == "derived" and sum(
+                record.binding.role == "derived"
+                and record.state is not _LeaseState.CLOSED
+                for record in self._records
+            ) >= MAX_ACTIVE_DERIVED_ENDPOINTS:
+                raise _DerivedEndpointLimitError
+            server, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                os.set_inheritable(server.fileno(), False)
+                os.set_inheritable(child.fileno(), False)
+                if binding.role == "derived":
+                    server.settimeout(DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS)
+            except BaseException:
                 server.close()
                 child.close()
-                raise RuntimeError("Driver authority server is closed")
+                raise
+            record = _EndpointRecord(server, binding)
             self._records.append(record)
         return record, child
+
+    def _discard_endpoint(
+        self,
+        record: _EndpointRecord,
+        child: socket.socket | None = None,
+    ) -> None:
+        with self._lock:
+            record.state = _LeaseState.CLOSED
+            if record in self._records:
+                self._records.remove(record)
+        record.server_socket.close()
+        if child is not None:
+            child.close()
 
     def _start_record(self, record: _EndpointRecord) -> None:
         thread = threading.Thread(
@@ -181,6 +215,8 @@ class DriverAuthorityServer:
         finally:
             with self._lock:
                 record.state = _LeaseState.CLOSED
+                if record in self._records:
+                    self._records.remove(record)
             record.server_socket.close()
 
     def _handle_request(
@@ -215,6 +251,8 @@ class DriverAuthorityServer:
                 self._claim_probe()
             record.state = _LeaseState.CLAIMED
             binding = record.binding
+            if binding.role == "derived":
+                record.server_socket.settimeout(None)
         return {
             "version": PROTOCOL_VERSION,
             "role": binding.role,
@@ -246,8 +284,25 @@ class DriverAuthorityServer:
             depth=1,
             capability=capability,
         )
-        child_record, child_endpoint = self._issue_endpoint(child_binding)
-        self._start_record(child_record)
+        try:
+            child_record, child_endpoint = self._issue_endpoint(child_binding)
+        except _DerivedEndpointLimitError:
+            return self._decision(
+                record,
+                "authorize_derived_launch",
+                "denied",
+                "derived_endpoint_limit_reached",
+            ), None
+        try:
+            self._start_record(child_record)
+        except Exception:
+            self._discard_endpoint(child_record, child_endpoint)
+            return self._decision(
+                record,
+                "authorize_derived_launch",
+                "denied",
+                "derived_endpoint_start_failed",
+            ), None
         response = self._decision(
             record, "authorize_derived_launch", "granted", "allowed"
         )
@@ -413,9 +468,11 @@ def _is_uuid(value: str) -> bool:
 
 __all__ = [
     "AuthorityAuditRecord",
+    "DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS",
     "DRIVER_AUTHORITY_FD_ENV",
     "DriverAuthorityServer",
     "IssuedAuthorityEndpoint",
+    "MAX_ACTIVE_DERIVED_ENDPOINTS",
     "MAX_FRAME_BYTES",
     "PROTOCOL_VERSION",
 ]

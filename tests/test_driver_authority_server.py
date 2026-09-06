@@ -6,12 +6,16 @@ import os
 import socket
 import struct
 import threading
+import time
 import uuid
 from typing import Any
 
 import pytest
 
 from puffo_agent.agent.harness.drivers import acp as acp_driver_module
+from puffo_agent.agent.harness import (
+    driver_authority_server as authority_server_module,
+)
 from puffo_agent.agent.harness.drivers.acp import AcpDriver
 from puffo_agent.agent.harness.driver import RuntimeSpec
 from puffo_agent.agent.harness.driver_authority_server import (
@@ -301,6 +305,118 @@ def test_root_can_issue_one_hop_but_derived_cannot_issue_nested_child() -> None:
         _close_fds(child_fds if "child_fds" in locals() else [])
         if child is not None:
             child.close()
+        root.close()
+        server.close()
+
+
+def test_derived_endpoint_count_is_bounded(monkeypatch) -> None:
+    monkeypatch.setattr(
+        authority_server_module, "MAX_ACTIVE_DERIVED_ENDPOINTS", 2
+    )
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-bounded"))
+    children: list[socket.socket] = []
+    try:
+        _hello(root)
+        request = {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "launch_id": "root-bounded",
+            "capability": "daemon",
+        }
+        for _ in range(2):
+            granted, fds = _request(root, request)
+            assert granted["state"] == "granted"
+            assert len(fds) == 1
+            children.append(socket.socket(fileno=fds.pop()))
+
+        denied, fds = _request(root, request)
+        assert fds == []
+        assert denied["state"] == "denied"
+        assert denied["reason_code"] == "derived_endpoint_limit_reached"
+        assert sum(
+            record.binding.role == "derived"
+            for record in server._records
+        ) == 2
+    finally:
+        for child in children:
+            child.close()
+        root.close()
+        server.close()
+
+
+def test_unclaimed_derived_endpoint_expires_and_frees_capacity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        authority_server_module, "MAX_ACTIVE_DERIVED_ENDPOINTS", 1
+    )
+    monkeypatch.setattr(
+        authority_server_module, "DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS", 0.05
+    )
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-expiry"))
+    child: socket.socket | None = None
+    replacement: socket.socket | None = None
+    try:
+        _hello(root)
+        request = {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "launch_id": "root-expiry",
+            "capability": "avatar",
+        }
+        granted, fds = _request(root, request)
+        assert granted["state"] == "granted"
+        child = socket.socket(fileno=fds.pop())
+        child.settimeout(2)
+        assert child.recv(1) == b""
+
+        deadline = time.monotonic() + 2
+        while True:
+            retried, replacement_fds = _request(root, request)
+            if retried["state"] == "granted":
+                replacement = socket.socket(fileno=replacement_fds.pop())
+                break
+            assert retried["reason_code"] == "derived_endpoint_limit_reached"
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert len(replacement_fds) == 0
+    finally:
+        if replacement is not None:
+            replacement.close()
+        if child is not None:
+            child.close()
+        root.close()
+        server.close()
+
+
+def test_derived_thread_start_failure_releases_both_socket_ends(
+    monkeypatch,
+) -> None:
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-start-failure"))
+    try:
+        _hello(root)
+
+        def fail_start(_record) -> None:
+            raise RuntimeError("thread start unavailable")
+
+        monkeypatch.setattr(server, "_start_record", fail_start)
+        denied, fds = _request(
+            root,
+            {
+                "version": 1,
+                "op": "authorize_derived_launch",
+                "launch_id": "root-start-failure",
+                "capability": "daemon",
+            },
+        )
+        assert fds == []
+        assert denied["state"] == "denied"
+        assert denied["reason_code"] == "derived_endpoint_start_failed"
+        assert all(
+            record.binding.role != "derived" for record in server._records
+        )
+    finally:
         root.close()
         server.close()
 
