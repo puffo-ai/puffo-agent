@@ -844,26 +844,38 @@ def test_every_diagnose_call_site_names_a_known_static_cause():
     back into the sink after we closed the direct door.
     """
     import ast
-    import inspect as _inspect
+    import pathlib
 
-    tree = ast.parse(_inspect.getsource(executor_mod))
-    sites = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_diagnose"
-    ]
+    package = pathlib.Path(executor_mod.__file__).parent
+    sources = sorted(package.glob("*.py"))
+    assert sources, f"no package sources under {package} — guard would be blind"
+
+    sites = []
+    for path in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        sites += [
+            (path.name, node)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "_diagnose")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_diagnose"
+                )
+            )
+        ]
 
     assert sites, "no _diagnose call sites found — guard would vacuously pass"
-    for call in sites:
-        assert not call.args, "cause must be keyword-only, not positional"
-        assert [kw.arg for kw in call.keywords] == ["cause"], ast.dump(call)
+    for name, call in sites:
+        where = f"{name}:{call.lineno}"
+        assert not call.args, f"{where}: cause must be keyword-only, not positional"
+        assert [kw.arg for kw in call.keywords] == ["cause"], where
         value = call.keywords[0].value
         assert isinstance(value, ast.Constant) and isinstance(value.value, str), (
-            "cause must be a static string, never computed"
+            f"{where}: cause must be a static string, never computed"
         )
-        assert value.value in executor_mod.DIAGNOSTIC_CAUSES, value.value
+        assert value.value in executor_mod.DIAGNOSTIC_CAUSES, f"{where}: {value.value}"
 
 
 @pytest.mark.asyncio
@@ -980,3 +992,35 @@ async def test_dialog_timeout_is_its_own_producer(monkeypatch):
 
     assert outcome is nc.ConfirmOutcome.TIMEOUT
     assert killed, "a dialog that timed out must be killed, not left running"
+
+
+def test_bundle_pin_is_normalized_at_the_config_boundary():
+    """Boris 188583: hex is case-insensitive and ``sha256sum`` output
+    carries a trailing newline, so an uppercase or untrimmed pin from
+    the build must not fail closed against a correct bundle.
+
+    Normalization lives in ``__post_init__``, not in the loader, so it
+    holds on every construction path — including the ones tests and
+    future callers use, which a loader-only fix would leave exempt.
+    """
+    digest = "A" * 63 + "F"
+    assert GmailConnectConfig(client_bundle_sha256=f"  {digest}\n").client_bundle_sha256 == digest.lower()
+    # The empty default is still empty, so the "not configured"
+    # pre-flight check is unaffected.
+    assert GmailConnectConfig().client_bundle_sha256 == ""
+
+
+def test_loader_normalizes_the_pin_it_reads_from_yaml(tmp_path, monkeypatch):
+    """The path the installer actually exercises: pin written uppercase
+    into the YAML reaches ops as lowercase, so the executor's own
+    ``hexdigest()`` (always lowercase) compares equal."""
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    (tmp_path / "daemon.yml").write_text(
+        "gmail_connect:\n"
+        "  enabled: true\n"
+        "  executor_path: /usr/bin/true\n"
+        "  data_root: /var/lib/gw\n"
+        "  client_bundle_sha256: " + "AB" * 32 + "\n",
+        encoding="utf-8",
+    )
+    assert DaemonConfig.load().gmail_connect.client_bundle_sha256 == "ab" * 32

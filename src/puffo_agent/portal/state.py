@@ -327,6 +327,16 @@ class GmailConnectConfig:
     confirm_timeout_seconds: float = 120.0
     flow_timeout_seconds: float = 300.0
 
+    def __post_init__(self) -> None:
+        # Boris 188583: hex is case-insensitive, so a build that writes
+        # the pin uppercase (or with a trailing newline from
+        # ``sha256sum``) would fail closed on a bundle that is in fact
+        # correct — safe, but a false red at install time. Normalize
+        # here rather than in the loader so every construction path
+        # gets it, and the "pin is lowercase hex" invariant has exactly
+        # one place where it becomes true.
+        self.client_bundle_sha256 = self.client_bundle_sha256.strip().lower()
+
 
 @dataclass
 class WsLocalServiceConfig:
