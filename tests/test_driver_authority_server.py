@@ -4,10 +4,12 @@ import array
 import json
 import os
 import socket
+import stat
 import struct
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -88,6 +90,27 @@ def _hello(client: socket.socket) -> dict[str, Any]:
 def _close_fds(fds: list[int]) -> None:
     for fd in fds:
         os.close(fd)
+
+
+def _open_fds_for_file(path: Path) -> list[int]:
+    expected = path.stat()
+    fd_root = Path("/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd")
+    matches: list[int] = []
+    for entry in fd_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        fd = int(entry.name)
+        try:
+            observed = os.fstat(fd)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_dev == expected.st_dev
+            and observed.st_ino == expected.st_ino
+        ):
+            matches.append(fd)
+    return matches
 
 
 def test_endpoint_claim_is_single_use_and_reuse_is_audited() -> None:
@@ -418,6 +441,58 @@ def test_derived_thread_start_failure_releases_both_socket_ends(
         )
     finally:
         root.close()
+        server.close()
+
+
+def test_truncated_request_rights_are_closed_after_disconnect(tmp_path: Path) -> None:
+    """A truncated SCM_RIGHTS request must not leak installed descriptors."""
+
+    target = tmp_path / "attacker-controlled"
+    target.write_bytes(b"authority-fd-probe")
+    sent_fds = [os.open(target, os.O_RDONLY) for _ in range(3)]
+    server = DriverAuthorityServer()
+    client = _client(server.issue_root(launch_id="root-truncated-rights"))
+    client.settimeout(2)
+    encoded = json.dumps({"version": 1, "op": "hello"}).encode()
+    rights = array.array("i", sent_fds)
+    try:
+        client.sendmsg(
+            [struct.pack("!I", len(encoded)) + encoded],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+        )
+    finally:
+        _close_fds(sent_fds)
+    try:
+        assert client.recv(1) == b""
+    finally:
+        client.close()
+        server.close()
+
+    assert _open_fds_for_file(target) == []
+
+
+def test_authority_audit_retains_only_the_bounded_recent_window(monkeypatch) -> None:
+    """A long-lived root cannot grow the in-memory authority audit forever."""
+
+    monkeypatch.setattr(authority_server_module, "MAX_AUDIT_RECORDS", 3)
+    server = DriverAuthorityServer()
+    client = _client(server.issue_root(launch_id="root-audit-bound"))
+    try:
+        _hello(client)
+        decisions = []
+        for _ in range(4):
+            decision, fds = _request(
+                client,
+                {"version": 1, "op": "unsupported"},
+            )
+            assert fds == []
+            decisions.append(decision)
+
+        assert [record.audit_id for record in server.audit_records()] == [
+            decision["audit_id"] for decision in decisions[-3:]
+        ]
+    finally:
+        client.close()
         server.close()
 
 

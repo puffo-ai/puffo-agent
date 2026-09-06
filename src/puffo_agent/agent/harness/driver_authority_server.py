@@ -15,6 +15,7 @@ import socket
 import struct
 import threading
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -24,8 +25,12 @@ from typing import Any
 DRIVER_AUTHORITY_FD_ENV = "LINGTAI_DRIVER_AUTHORITY_FD"
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 64 * 1024
+# Receive enough bounded control data to harvest and close every descriptor
+# from a rejected request on supported POSIX SCM_RIGHTS implementations.
+MAX_REQUEST_CONTROL_BYTES = MAX_FRAME_BYTES
 MAX_ACTIVE_DERIVED_ENDPOINTS = 16
 DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS = 60.0
+MAX_AUDIT_RECORDS = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +108,7 @@ class DriverAuthorityServer:
             raise RuntimeError("Driver authority requires POSIX SCM_RIGHTS")
         self._lock = threading.Lock()
         self._records: list[_EndpointRecord] = []
-        self._audits: list[AuthorityAuditRecord] = []
+        self._audits: deque[AuthorityAuditRecord] = deque(maxlen=MAX_AUDIT_RECORDS)
         self._closed = False
         # Deterministic concurrency tests pause after observing ISSUED while
         # the state lock is still held. Production never supplies this hook.
@@ -422,18 +427,19 @@ class DriverAuthorityServer:
             while len(record.buffer) < count:
                 data, ancdata, flags, _ = record.server_socket.recvmsg(
                     MAX_FRAME_BYTES + 4,
-                    socket.CMSG_SPACE(array.array("i", [0]).itemsize),
+                    socket.CMSG_SPACE(MAX_REQUEST_CONTROL_BYTES),
                 )
                 if not data:
                     raise EOFError
-                if flags & socket.MSG_CTRUNC:
-                    raise ValueError("authority request ancillary data was truncated")
+                ancillary_truncated = bool(flags & socket.MSG_CTRUNC)
                 for level, kind, raw in ancdata:
                     if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
                         items = array.array("i")
                         usable = len(raw) - (len(raw) % items.itemsize)
                         items.frombytes(raw[:usable])
                         received_fds.extend(items.tolist())
+                if ancillary_truncated:
+                    raise ValueError("authority request ancillary data was truncated")
                 record.buffer.extend(data)
             value = bytes(record.buffer[:count])
             del record.buffer[:count]
@@ -473,6 +479,8 @@ __all__ = [
     "DriverAuthorityServer",
     "IssuedAuthorityEndpoint",
     "MAX_ACTIVE_DERIVED_ENDPOINTS",
+    "MAX_AUDIT_RECORDS",
     "MAX_FRAME_BYTES",
+    "MAX_REQUEST_CONTROL_BYTES",
     "PROTOCOL_VERSION",
 ]
