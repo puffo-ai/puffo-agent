@@ -37,17 +37,28 @@ def _connect_request(gc) -> dict:
     return request
 
 
-def _reply(reason: str, *, ok: bool, state: str = "") -> dict:
+def _reply(reason: str, *, ok: bool, state: str) -> dict:
     """The only shape a control-plane reply may take (Jeff 188515).
 
     Exactly ``{ok, state, reason}`` — ``ok`` is the transport envelope
     and ``reason`` is always a roster member, so §5.1, the roster
     control and the two clamps are one contract with no exceptions to
     explain. There is no ``error`` key: free text has nowhere to go.
+
+    ``state`` describes THIS CALL's result and is required (Jeff
+    188607). It used to default to ``load_status().state``, which
+    silently handed three early-exit branches whatever was on disk —
+    so a pre-flight refusal reported ``connected`` on a machine that
+    was already connected (Boris 188604). A required argument is why a
+    branch added later cannot inherit that mistake without saying so.
+
+    The machine's durable connection state lives in the status
+    projection, and is read separately; a command reply is never
+    written back as status.
     """
     if reason not in REASONS:
         reason = "internal_error"
-    return {"ok": ok, "state": state or load_status().state, "reason": reason}
+    return {"ok": ok, "state": state, "reason": reason}
 
 
 # Jeff 188539 (final): the non-confirming facts are NOT one outcome. Only
@@ -78,12 +89,16 @@ def _confirm_refusal(outcome: ConfirmOutcome) -> dict:
 
 async def gmail_connect_initiate(params: dict) -> dict:
     gc = _config().gmail_connect
+    # The three pre-flight refusals report THIS CALL as failed and
+    # deliberately do not persist: a broken config did not disconnect
+    # anything, so overwriting a real ``connected`` record would
+    # destroy the truth rather than report it (Jeff 188607 §3).
     if not gc.enabled or not gc.executor_path:
-        return _reply("executor_unavailable", ok=False)
+        return _reply("executor_unavailable", ok=False, state="failed")
     if not gc.data_root or not gc.client_bundle_sha256:
-        return _reply("executor_unavailable", ok=False)
+        return _reply("executor_unavailable", ok=False, state="failed")
     if load_status().state == "pending":
-        return _reply("protocol", ok=False)
+        return _reply("protocol", ok=False, state="failed")
     confirm = await request_native_confirm(
         CONNECT_PROMPT, timeout_s=gc.confirm_timeout_seconds
     )

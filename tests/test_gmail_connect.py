@@ -1047,8 +1047,10 @@ async def test_ill_formed_pin_refuses_before_any_dialog_or_spawn(
 
     res = await ops.gmail_connect_initiate({})
 
-    assert res["reason"] == "executor_unavailable"
-    assert res["ok"] is False
+    # Jeff 188607 §5: this used to assert only ``reason`` while the
+    # docstring claimed the whole pair — the green was real but did not
+    # cover the half it was quoted for (Boris 188604).
+    assert res == {"ok": False, "state": "failed", "reason": "executor_unavailable"}
     assert confirms == [], "the user must not be prompted for a config defect"
     assert spawns == [], "no spawn, hence no Google call and no token write"
 
@@ -1217,3 +1219,86 @@ def test_hostile_prompt_stays_in_argv_and_out_of_the_source(monkeypatch):
     assert "pwned" not in source
     assert hostile == argv[3]
     assert "sys.argv[1]" in source
+
+
+# Jeff 188607 §4. Two facts per cell, and they pull in opposite
+# directions: the REPLY must be fixed regardless of what is on disk,
+# and the DISK must be untouched regardless of what the reply says.
+# Before this ruling the reply inherited the stored state, so a
+# pre-flight refusal on a connected machine answered "connected".
+_PRIOR_STATES = ("disconnected", "connected", "failed", "pending")
+
+_PREFLIGHT_DEFECTS = [
+    pytest.param({"enabled": False}, id="disabled"),
+    pytest.param({"executor_path": ""}, id="no-executor-path"),
+    pytest.param({"data_root": ""}, id="no-data-root"),
+    pytest.param({"client_bundle_sha256": ""}, id="no-pin"),
+    pytest.param({"client_bundle_sha256": "A" * 64}, id="ill-formed-pin"),
+]
+
+
+@pytest.mark.parametrize("prior", _PRIOR_STATES)
+@pytest.mark.parametrize("defect", _PREFLIGHT_DEFECTS)
+@pytest.mark.asyncio
+async def test_preflight_refusal_is_fixed_and_never_rewrites_the_projection(
+    home, monkeypatch, prior, defect
+):
+    _configured(monkeypatch, **defect)
+    store_status(GmailConnectStatus(state=prior))
+    before = status_path().read_bytes()
+
+    confirms: list[str] = []
+    spawns: list[object] = []
+
+    async def spy_confirm(prompt, *, timeout_s):  # pragma: no cover - must not run
+        confirms.append(prompt)
+        return ConfirmOutcome.CONFIRMED
+
+    async def spy_executor(*a, **k):  # pragma: no cover - must not run
+        spawns.append(a)
+        return ExecutorOutcome(status="connected")
+
+    monkeypatch.setattr(ops, "request_native_confirm", spy_confirm)
+    monkeypatch.setattr(ops, "run_gmail_executor", spy_executor)
+
+    res = await ops.gmail_connect_initiate({})
+
+    # The config checks run before the re-entry guard, so a machine
+    # that is misconfigured answers for the config no matter what was
+    # in flight. `protocol` is reachable only with a valid config —
+    # the test below.
+    assert res == {"ok": False, "state": "failed", "reason": "executor_unavailable"}
+    # Byte-for-byte, not field-by-field: `updated_at` moving would mean
+    # something wrote, even if the values happened to match.
+    assert status_path().read_bytes() == before
+    assert confirms == []
+    assert spawns == []
+
+
+@pytest.mark.asyncio
+async def test_pending_reentry_reports_failed_and_stays_pending(home, monkeypatch):
+    """The connect already running is untouched: the second caller is
+    told its own call failed, and the in-flight one keeps the machine
+    in ``pending``."""
+    _configured(monkeypatch)
+    store_status(GmailConnectStatus(state="pending"))
+    before = status_path().read_bytes()
+
+    res = await ops.gmail_connect_initiate({})
+
+    assert res == {"ok": False, "state": "failed", "reason": "protocol"}
+    assert load_status().state == "pending"
+    assert status_path().read_bytes() == before
+
+
+def test_reply_state_is_required_so_no_branch_can_inherit_the_stored_state():
+    """The structural half of Jeff 188607 §1: it is not that the three
+    branches were fixed, it is that a fourth one cannot repeat them
+    silently. Restoring a default would make this the only red."""
+    import inspect
+
+    state = inspect.signature(ops._reply).parameters["state"]
+    assert state.default is inspect.Parameter.empty
+    # Names actually referenced by the compiled body, so the docstring
+    # is free to explain what it no longer does.
+    assert "load_status" not in ops._reply.__code__.co_names
