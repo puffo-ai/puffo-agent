@@ -15,7 +15,7 @@ import logging
 from ..state import DaemonConfig
 from .executor import ExecutorRefused, run_gmail_executor
 from .native_confirm import CONNECT_PROMPT, request_native_confirm
-from .status_store import GmailConnectStatus, load_status, store_status
+from .status_store import REASONS, GmailConnectStatus, load_status, store_status
 
 
 logger = logging.getLogger(__name__)
@@ -37,19 +37,32 @@ def _connect_request(gc) -> dict:
     return request
 
 
+def _reply(reason: str, *, ok: bool, state: str = "") -> dict:
+    """The only shape a control-plane reply may take (Jeff 188515).
+
+    Exactly ``{ok, state, reason}`` — ``ok`` is the transport envelope
+    and ``reason`` is always a roster member, so §5.1, the roster
+    control and the two clamps are one contract with no exceptions to
+    explain. There is no ``error`` key: free text has nowhere to go.
+    """
+    if reason not in REASONS:
+        reason = "internal_error"
+    return {"ok": ok, "state": state or load_status().state, "reason": reason}
+
+
 async def gmail_connect_initiate(params: dict) -> dict:
     gc = _config().gmail_connect
     if not gc.enabled or not gc.executor_path:
-        return {"ok": False, "error": "gmail_connect not configured"}
+        return _reply("executor_unavailable", ok=False)
     if not gc.data_root or not gc.client_bundle_sha256:
-        return {"ok": False, "error": "gmail_connect missing data_root/bundle pin"}
+        return _reply("executor_unavailable", ok=False)
     if load_status().state == "pending":
-        return {"ok": False, "error": "already pending"}
+        return _reply("protocol", ok=False)
     confirmed = await request_native_confirm(
         CONNECT_PROMPT, timeout_s=gc.confirm_timeout_seconds
     )
     if not confirmed:
-        return {"ok": False, "error": "user_declined"}
+        return _reply("refused", ok=False)
     store_status(GmailConnectStatus(state="pending"))
     try:
         outcome = await run_gmail_executor(
@@ -60,12 +73,12 @@ async def gmail_connect_initiate(params: dict) -> dict:
     except ExecutorRefused as exc:
         store_status(GmailConnectStatus(state="failed", reason="refused"))
         logger.warning("gmail-connect: refused before spawn: %s", exc)
-        return {"ok": False, "error": "refused", "state": "failed"}
+        return _reply("refused", ok=False, state="failed")
     if outcome.status == "connected":
         store_status(GmailConnectStatus(state="connected"))
-        return {"ok": True, "state": "connected"}
+        return _reply("", ok=True, state="connected")
     store_status(GmailConnectStatus(state="failed", reason=outcome.reason))
-    return {"ok": False, "error": outcome.reason or "failed", "state": "failed"}
+    return _reply(outcome.reason, ok=False, state="failed")
 
 
 async def gmail_disconnect_token(params: dict) -> dict:
@@ -73,25 +86,19 @@ async def gmail_disconnect_token(params: dict) -> dict:
 
     This op never produces the ``revoked`` projection state — that is
     reserved for the composite Disconnect (grant revocation first,
-    then token; four-outcome semantics, design §2.3/§4) once the grant
-    axis is wired. Remote token revocation is also not performed yet:
-    invoke schema v1 is connect-axis only, so until the revoke op
-    exists the honest record is ``revoke_unconfirmed`` — we never
-    pretend the token is gone everywhere.
+    then token; design §2.3/§4) once the grant axis is wired. The
+    token-only scope is carried by the op NAME, not by a returned
+    discriminator: a ``scope`` field here would both exceed the §5.1
+    whitelist and collide with Layer-A's ``scope`` (the OAuth grant
+    scope), which is a different thing entirely (Jeff 188515).
+
+    Remote token revocation is also not performed yet, so a success is
+    recorded ``revoke_unconfirmed`` — we never pretend the token died
+    everywhere.
     """
     if load_status().state == "disconnected":
-        return {
-            "ok": True,
-            "scope": "token_only",
-            "state": "disconnected",
-            "reason": "",
-        }
+        return _reply("", ok=True, state="disconnected")
     store_status(
         GmailConnectStatus(state="disconnected", reason="revoke_unconfirmed")
     )
-    return {
-        "ok": True,
-        "scope": "token_only",
-        "state": "disconnected",
-        "reason": "revoke_unconfirmed",
-    }
+    return _reply("revoke_unconfirmed", ok=True, state="disconnected")

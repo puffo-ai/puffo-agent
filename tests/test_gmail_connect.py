@@ -26,6 +26,7 @@ from puffo_agent.portal.gmail_connect.executor import (
     run_gmail_executor,
 )
 from puffo_agent.portal.gmail_connect.status_store import (
+    REASONS,
     STATES,
     GmailConnectStatus,
     load_status,
@@ -73,7 +74,7 @@ async def test_declined_confirm_never_spawns_executor(home, monkeypatch):
 
     res = await ops.gmail_connect_initiate({})
 
-    assert res == {"ok": False, "error": "user_declined"}
+    assert res == {"ok": False, "state": "disconnected", "reason": "refused"}
     assert calls == []
     assert load_status().state == "disconnected"
 
@@ -114,7 +115,7 @@ async def test_confirmed_flow_persists_layer_b_projection_only(home, monkeypatch
 
     res = await ops.gmail_connect_initiate({})
 
-    assert res == {"ok": True, "state": "connected"}
+    assert res == {"ok": True, "state": "connected", "reason": ""}
     # Invoke config comes from local daemon config, never from params.
     assert sent == [{
         "data_root": "/var/lib/gw", "expected_sha256": "a" * 64, "timeout": 300.0,
@@ -142,7 +143,7 @@ async def test_failed_reason_reaches_projection_coarse(home, monkeypatch):
 
     res = await ops.gmail_connect_initiate({})
 
-    assert res == {"ok": False, "error": "callback_timeout", "state": "failed"}
+    assert res == {"ok": False, "state": "failed", "reason": "callback_timeout"}
     after = load_status()
     assert (after.state, after.reason) == ("failed", "callback_timeout")
 
@@ -159,7 +160,10 @@ async def test_token_only_disconnect_never_yields_revoked(home, monkeypatch):
     res = await ops.gmail_disconnect_token({})
 
     assert res["ok"] is True
-    assert res["scope"] == "token_only"
+    # The token-only scope is carried by the op name, not a returned
+    # discriminator: a `scope` key would exceed the §5.1 whitelist and
+    # collide with Layer-A's `scope` (the OAuth grant scope). Jeff 188515.
+    assert "scope" not in res
     after = load_status()
     assert after.state == "disconnected"
     assert after.state != "revoked"
@@ -180,11 +184,11 @@ async def test_control_dispatch_routes_machine_level_gmail_ops(monkeypatch):
     assert res == {"ok": True, "state": "marker"}
 
     async def fake_disconnect(params):
-        return {"ok": True, "scope": "token_only"}
+        return {"ok": True, "state": "disconnected", "reason": ""}
 
     monkeypatch.setattr(ops, "gmail_disconnect_token", fake_disconnect)
     res = await execute_command("gmail.disconnect_token", None, {})
-    assert res == {"ok": True, "scope": "token_only"}
+    assert res == {"ok": True, "state": "disconnected", "reason": ""}
 
 
 def _fake_executor_script(tmp_path, body: str) -> str:
@@ -459,3 +463,102 @@ def test_revoked_is_structurally_absent_not_merely_unused(home):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"state": "revoked", "reason": ""}), encoding="utf-8")
     assert load_status().state == "disconnected"
+
+
+ALLOWED_REPLY_KEYS = {"ok", "state", "reason"}
+
+
+@pytest.mark.asyncio
+async def test_every_ops_exit_is_exactly_ok_state_reason(tmp_path, home, monkeypatch):
+    """Jeff 188515: one shape for every control-plane reply.
+
+    Walks every branch of both ops and asserts the key set never
+    exceeds {ok, state, reason} and the reason is always a roster
+    member — no ``error`` key, no ``scope`` discriminator, no
+    ``updated_at``, and no free text anywhere.
+    """
+    async def deny(prompt, timeout_s=0.0):
+        return False
+
+    async def allow(prompt, timeout_s=0.0):
+        return True
+
+    def check(reply):
+        assert set(reply) <= ALLOWED_REPLY_KEYS, reply
+        assert reply["reason"] in REASONS, reply
+        assert reply["state"] in STATES, reply
+        return reply
+
+    # not configured -> executor_unavailable
+    cfg = DaemonConfig()
+    cfg.gmail_connect = GmailConnectConfig(enabled=False)
+    monkeypatch.setattr(ops, "_config", lambda: cfg)
+    assert check(await ops.gmail_connect_initiate({}))["reason"] == "executor_unavailable"
+
+    # configured but no data_root / pin -> executor_unavailable
+    cfg.gmail_connect = GmailConnectConfig(enabled=True, executor_path="/bin/true")
+    assert check(await ops.gmail_connect_initiate({}))["reason"] == "executor_unavailable"
+
+    script = _fake_executor_script(
+        tmp_path,
+        """
+        import json, sys
+        json.loads(sys.stdin.readline())
+        print(json.dumps({"event": "ready",
+            "redirect_uri": "http://127.0.0.1:49152/oauth2/callback"}))
+        sys.stdout.flush()
+        print(json.dumps({"event": "result", "status": "failed",
+            "reason": "leak client_secret=GOCSPX-abc db=/private/secrets/x.db"}))
+        sys.stdout.flush()
+        """,
+    )
+    cfg.gmail_connect = GmailConnectConfig(
+        enabled=True, executor_path=script, data_root="/d",
+        client_bundle_sha256="a" * 64,
+    )
+
+    # user declines -> refused
+    monkeypatch.setattr(ops, "request_native_confirm", deny)
+    assert check(await ops.gmail_connect_initiate({}))["reason"] == "refused"
+
+    # executor free text -> clamped, never verbatim
+    monkeypatch.setattr(ops, "request_native_confirm", allow)
+    reply = check(await ops.gmail_connect_initiate({}))
+    assert reply["reason"] == "internal_error"
+    assert "client_secret" not in json.dumps(reply)
+
+    # already pending -> protocol
+    store_status(GmailConnectStatus(state="pending"))
+    assert check(await ops.gmail_connect_initiate({}))["reason"] == "protocol"
+
+    # disconnect: token-only, carried by the op name and no scope key
+    store_status(GmailConnectStatus(state="connected"))
+    reply = check(await ops.gmail_disconnect_token({}))
+    assert reply["reason"] == "revoke_unconfirmed"
+    assert "scope" not in reply
+    assert check(await ops.gmail_disconnect_token({}))["reason"] == ""
+
+
+def test_updated_at_stays_on_disk_and_never_leaves(home):
+    """Jeff 188515 #1: the persisted record may carry updated_at; no
+    outward-facing surface may. Guards against someone "simplifying"
+    the store by serving the file straight through."""
+    store_status(GmailConnectStatus(state="connected"))
+
+    on_disk = json.loads(status_path().read_text(encoding="utf-8"))
+    assert "updated_at" in on_disk
+
+    assert set(load_status().projection()) == {"state", "reason"}
+
+
+def test_reply_clamps_free_text_on_its_own_leg():
+    """``_reply``'s roster check is defence in depth: today the boundary
+    clamp means it never sees free text, so no end-to-end test can make
+    it fail. Exercised directly, or the leg is unobservable and a later
+    refactor could delete it silently.
+    """
+    reply = ops._reply(
+        "exchange failed client_secret=GOCSPX-abc", ok=False, state="failed"
+    )
+
+    assert reply == {"ok": False, "state": "failed", "reason": "internal_error"}
