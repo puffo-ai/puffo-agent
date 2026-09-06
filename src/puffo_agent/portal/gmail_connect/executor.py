@@ -109,7 +109,7 @@ async def _read_event_line(proc: asyncio.subprocess.Process, deadline_s: float) 
     return parsed
 
 
-def _diagnose(cause: str) -> None:
+def _diagnose(*, cause: str) -> None:
     """Record why an executor session was not trusted — locally only.
 
     The diagnostic is a NEW text sink, and this whole round began with
@@ -162,7 +162,7 @@ async def run_gmail_executor(
         else:
             if not _ready_is_loopback(first):
                 await _kill_group(proc)
-                _diagnose("non_loopback_ready")
+                _diagnose(cause="non_loopback_ready")
                 return ExecutorOutcome(status="failed", reason="non_loopback_ready")
             result = await _read_event_line(
                 proc, flow_timeout_s + RESULT_DEADLINE_MARGIN_S
@@ -174,7 +174,7 @@ async def run_gmail_executor(
         return ExecutorOutcome(status="failed", reason="timeout")
     except (ValueError, OSError):
         await _kill_group(proc)
-        _diagnose("parse_error")
+        _diagnose(cause="parse_error")
         return ExecutorOutcome(status="failed", reason="protocol")
     # The result line is terminal (the executor seals the token before
     # printing it), so a lingering process is cleanup, not work: give
@@ -188,7 +188,7 @@ async def run_gmail_executor(
         if result is first:
             # connected without a ready line is out of contract — a
             # flow that never bound loopback cannot have run consent.
-            _diagnose("connected_without_ready")
+            _diagnose(cause="connected_without_ready")
             return ExecutorOutcome(status="failed", reason="protocol")
         return ExecutorOutcome(status="connected")
     if status == "failed":
@@ -205,5 +205,5 @@ async def run_gmail_executor(
             )
             reason = "internal_error"
         return ExecutorOutcome(status="failed", reason=reason)
-    _diagnose("unknown_terminal_status")
+    _diagnose(cause="unknown_terminal_status")
     return ExecutorOutcome(status="failed", reason="protocol")

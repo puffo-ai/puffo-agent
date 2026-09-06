@@ -45,14 +45,15 @@ def home(tmp_path, monkeypatch):
 
 
 def _configured(monkeypatch, **overrides) -> None:
+    fields = {
+        "enabled": True,
+        "executor_path": "/usr/bin/true",
+        "data_root": "/var/lib/gw",
+        "client_bundle_sha256": "a" * 64,
+    }
+    fields.update(overrides)
     cfg = DaemonConfig()
-    cfg.gmail_connect = GmailConnectConfig(
-        enabled=True,
-        executor_path="/usr/bin/true",
-        data_root="/var/lib/gw",
-        client_bundle_sha256="a" * 64,
-        **overrides,
-    )
+    cfg.gmail_connect = GmailConnectConfig(**fields)
     monkeypatch.setattr(ops, "_config", lambda: cfg)
 
 
@@ -825,8 +826,157 @@ def test_diagnostic_causes_are_a_closed_set_defined_once(caplog):
         "non_loopback_ready",
     )
     with caplog.at_level(logging.WARNING, logger=executor_mod.__name__):
-        executor_mod._diagnose("client_secret=GOCSPX-leaked-through-the-cause")
+        executor_mod._diagnose(cause="client_secret=GOCSPX-leaked-through-the-cause")
 
     assert "GOCSPX" not in caplog.text
     assert "client_secret" not in caplog.text
     assert "outside the closed set" in caplog.text
+
+
+def test_every_diagnose_call_site_names_a_known_static_cause():
+    """Jeff 188561: the guard covers this PR's own diagnostic sites, so it
+    lives with the implementation and cannot drift away from it.
+
+    Enumerates every ``_diagnose`` call in the module source: each must
+    pass exactly one keyword ``cause=`` whose value is a static string in
+    ``DIAGNOSTIC_CAUSES``. Positional args, computed values and unknown
+    names are all rejected — a computed cause is how free text would get
+    back into the sink after we closed the direct door.
+    """
+    import ast
+    import inspect as _inspect
+
+    tree = ast.parse(_inspect.getsource(executor_mod))
+    sites = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_diagnose"
+    ]
+
+    assert sites, "no _diagnose call sites found — guard would vacuously pass"
+    for call in sites:
+        assert not call.args, "cause must be keyword-only, not positional"
+        assert [kw.arg for kw in call.keywords] == ["cause"], ast.dump(call)
+        value = call.keywords[0].value
+        assert isinstance(value, ast.Constant) and isinstance(value.value, str), (
+            "cause must be a static string, never computed"
+        )
+        assert value.value in executor_mod.DIAGNOSTIC_CAUSES, value.value
+
+
+@pytest.mark.asyncio
+async def test_non_loopback_ready_records_its_local_cause(tmp_path, home, caplog):
+    """Jeff 188561 #1: outward stays non_loopback_ready, and the local
+    cause is present too — the previous test only checked the outward
+    half."""
+    script = _fake_executor_script(
+        tmp_path,
+        """
+        import json, sys
+        json.loads(sys.stdin.readline())
+        print(json.dumps({"event": "ready",
+            "redirect_uri": "http://10.0.0.9:8080/oauth2/callback"}))
+        sys.stdout.flush()
+        """,
+    )
+    with caplog.at_level(logging.WARNING, logger=executor_mod.__name__):
+        outcome = await run_gmail_executor(
+            script,
+            {"data_root": "/d", "expected_sha256": "a" * 64, "timeout": 2.0},
+            flow_timeout_s=2.0,
+        )
+
+    assert (outcome.status, outcome.reason) == ("failed", "non_loopback_ready")
+    assert "cause=non_loopback_ready" in caplog.text
+
+
+@pytest.mark.parametrize("label, body", [
+    ("malformed json", 'print("{not json")'),
+    ("unknown event type", 'print(json.dumps({"event": "hello"}))'),
+    ("unknown terminal status",
+     'print(json.dumps({"event":"ready",'
+     '"redirect_uri":"http://127.0.0.1:1/oauth2/callback"}));'
+     'sys.stdout.flush();'
+     'print(json.dumps({"event":"result","status":"weird"}))'),
+    ("connected without ready",
+     'print(json.dumps({"event":"result","status":"connected"}))'),
+])
+@pytest.mark.asyncio
+async def test_protocol_subclasses_through_ops_response_and_persistence(
+    label, body, tmp_path, home, monkeypatch
+):
+    """Jeff 188561 #2: the merge test drove the executor directly, so it
+    proved the outcome but not what the control plane says or what lands
+    on disk. This drives the whole op."""
+    script = _fake_executor_script(
+        tmp_path,
+        "import json, sys\njson.loads(sys.stdin.readline())\n" + body
+        + "\nsys.stdout.flush()\n",
+    )
+    _configured(monkeypatch, executor_path=script)
+
+    async def allow(prompt, *, timeout_s):
+        return ConfirmOutcome.CONFIRMED
+
+    monkeypatch.setattr(ops, "request_native_confirm", allow)
+    store_status(GmailConnectStatus(state="disconnected"))
+
+    reply = await ops.gmail_connect_initiate({})
+
+    assert reply == {"ok": False, "state": "failed", "reason": "protocol"}, label
+    after = load_status()
+    assert (after.state, after.reason) == ("failed", "protocol"), label
+
+
+@pytest.mark.asyncio
+async def test_no_backend_and_backend_failure_are_separate_producers(monkeypatch):
+    """Jeff 188561 #3: the mapping test stubs a single UNAVAILABLE, which
+    cannot show that BOTH production paths reach it. Drive each one."""
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    # (a) no dialog backend at all — any non-macOS host
+    monkeypatch.setattr(nc.sys, "platform", "linux")
+    assert await nc.request_native_confirm("p") is nc.ConfirmOutcome.UNAVAILABLE
+
+    # (b) backend present but fails to launch
+    monkeypatch.setattr(nc.sys, "platform", "darwin")
+
+    async def boom(*a, **k):
+        raise OSError("osascript missing")
+
+    monkeypatch.setattr(nc.asyncio, "create_subprocess_exec", boom)
+    assert await nc.request_native_confirm("p") is nc.ConfirmOutcome.UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_dialog_timeout_is_its_own_producer(monkeypatch):
+    """Jeff 188561 #3: the 120s no-answer path, driven for real rather
+    than stubbed as an outcome."""
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    killed: list[bool] = []
+
+    class HangingProc:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.sleep(10)
+
+        def kill(self):
+            killed.append(True)
+
+        async def wait(self):
+            return -9
+
+    async def hang(*a, **k):
+        return HangingProc()
+
+    monkeypatch.setattr(nc.sys, "platform", "darwin")
+    monkeypatch.setattr(nc.asyncio, "create_subprocess_exec", hang)
+
+    outcome = await nc.request_native_confirm("p", timeout_s=0.05)
+
+    assert outcome is nc.ConfirmOutcome.TIMEOUT
+    assert killed, "a dialog that timed out must be killed, not left running"
