@@ -622,6 +622,16 @@ async def replace_reminder_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def gmail_connect_status_route(request: web.Request) -> web.Response:
+    """Sanitized connector status for agent-side tool gating.
+
+    Read-only and already coarse (whitelist projection, no token
+    material), so any local agent may ask whether Gmail is usable."""
+    from .gmail_connect.status_store import load_status
+
+    return web.json_response({"ok": True, **load_status().projection()})
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application(middlewares=[require_local_service_auth])
     app.router.add_post(
@@ -671,6 +681,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/replace-reminder",
         replace_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/gmail-connect-status",
+        gmail_connect_status_route,
     )
     return app
 

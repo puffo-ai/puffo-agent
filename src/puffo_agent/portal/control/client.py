@@ -297,6 +297,14 @@ async def execute_command(
     """
     if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
         return await _execute_runtime_command(op, agent_slug, params, command_id)
+    if op in {"gmail.connect_initiate", "gmail.disconnect"}:
+        # Machine-level (no agent_slug): the connector belongs to the
+        # operator's machine, not to any one agent.
+        from ..gmail_connect import ops as gmail_ops
+
+        if op == "gmail.connect_initiate":
+            return await gmail_ops.gmail_connect_initiate(params)
+        return await gmail_ops.gmail_disconnect(params)
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.
@@ -611,6 +619,8 @@ def build_capabilities() -> dict:
         }
         for h in KNOWN_HARNESSES
     ]
+    from ..gmail_connect.status_store import load_status
+
     return {
         "cli_tools": cli_tools,
         "harness_readiness": {
@@ -619,6 +629,9 @@ def build_capabilities() -> dict:
         },
         "providers": providers,
         "daemon_version": daemon_version,
+        # Sanitized whitelist projection; the change-detection re-push
+        # above makes this the web half's status feed with no new frame.
+        "gmail_connect": load_status().projection(),
     }
 
 

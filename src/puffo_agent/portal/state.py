@@ -308,6 +308,20 @@ class RpcServiceConfig:
 
 
 @dataclass
+class GmailConnectConfig:
+    """Gmail token-axis connect (``portal/gmail_connect/``).
+
+    Disabled until an operator configures the executor path — the
+    entrypoint is deliberately config-only so no control-plane command
+    can choose what binary the daemon spawns."""
+
+    enabled: bool = False
+    executor_path: str = ""
+    confirm_timeout_seconds: float = 120.0
+    flow_timeout_seconds: float = 300.0
+
+
+@dataclass
 class WsLocalServiceConfig:
     """Loopback WebSocket used by externally attached ws-local tools."""
 
@@ -367,6 +381,9 @@ class DaemonConfig:
     )
     rpc_service: RpcServiceConfig = field(
         default_factory=lambda: RpcServiceConfig(),
+    )
+    gmail_connect: GmailConnectConfig = field(
+        default_factory=lambda: GmailConnectConfig(),
     )
 
     @classmethod
@@ -433,6 +450,18 @@ class DaemonConfig:
             bind_host=str(r.get("bind_host", rs_defaults.bind_host)),
             port=int(r.get("port", rs_defaults.port)),
         )
+        g = raw.get("gmail_connect") or {}
+        gc_defaults = GmailConnectConfig()
+        cfg.gmail_connect = GmailConnectConfig(
+            enabled=g.get("enabled") is True,
+            executor_path=str(g.get("executor_path", "")),
+            confirm_timeout_seconds=float(
+                g.get("confirm_timeout_seconds", gc_defaults.confirm_timeout_seconds)
+            ),
+            flow_timeout_seconds=float(
+                g.get("flow_timeout_seconds", gc_defaults.flow_timeout_seconds)
+            ),
+        )
         return cfg
 
     def save(self) -> None:
@@ -454,6 +483,7 @@ class DaemonConfig:
             "ws_local_service": asdict(self.ws_local_service),
             "data_service": asdict(self.data_service),
             "rpc_service": asdict(self.rpc_service),
+            "gmail_connect": asdict(self.gmail_connect),
         }
         _atomic_write_yaml(path, data)
 
