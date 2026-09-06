@@ -225,6 +225,50 @@ async def test_executor_protocol_stdin_json_two_lines(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_executor_internal_fields_never_reach_projection(tmp_path, home):
+    """Two-layer whitelist (design §3): the child→parent result may
+    carry internal detail (token_db_path, bundle paths, scope), but the
+    outcome type and the persisted projection must drop all of it —
+    only state/account-mask/expiry/reason survive to any consumer."""
+    import dataclasses
+
+    script = _fake_executor_script(
+        tmp_path,
+        '''
+        import json, sys
+        sys.stdin.readline()
+        print(json.dumps({"ready": True})); sys.stdout.flush()
+        print(json.dumps({
+            "status": "connected",
+            "account": "a@b.c",
+            "expires_at": "e",
+            "token_db_path": "/private/secrets/tokens.db",
+            "client_bundle": "/private/secrets/bundle.json",
+            "scope": "gmail.send",
+        })); sys.stdout.flush()
+        ''',
+    )
+    outcome = await run_gmail_executor(
+        script,
+        {"op": "connect", "callback_host": "127.0.0.1"},
+        flow_timeout_s=10,
+    )
+    assert dataclasses.asdict(outcome) == {
+        "status": "connected", "account": "a@b.c", "expires_at": "e", "reason": "",
+    }
+    store_status(
+        GmailConnectStatus(
+            state="connected",
+            account_masked=mask_account(outcome.account),
+            expires_at=outcome.expires_at,
+        )
+    )
+    raw = status_path().read_text(encoding="utf-8")
+    for leaked in ("token_db_path", "client_bundle", "scope", "/private/secrets"):
+        assert leaked not in raw
+
+
+@pytest.mark.asyncio
 async def test_executor_silent_after_ready_is_killed_as_timeout(tmp_path):
     script = _fake_executor_script(
         tmp_path,
