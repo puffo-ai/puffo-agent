@@ -808,6 +808,21 @@ async def test_compaction_overlay_wins_and_restores():
     assert body["activity"] == "reading_messages"
 
 
+def test_noop_reporter_matches_activity_overlay_contract():
+    """emit_activity calls ``set_activity_overlay`` synchronously and
+    pushes only on True. The no-op stub must satisfy the same contract
+    as the real reporter — an async stub returns a truthy coroutine,
+    which both leaks a "never awaited" warning and sends emit_activity
+    into a ``report_current_status`` the stub does not have."""
+    import inspect
+
+    from puffo_agent.portal.worker_run import _NoopStatusReporter
+
+    for cls in (StatusReporter, _NoopStatusReporter):
+        assert not inspect.iscoroutinefunction(cls.set_activity_overlay), cls
+    assert _NoopStatusReporter().set_activity_overlay("compacting") is False
+
+
 @pytest.mark.asyncio
 async def test_begin_turn_carries_live_overlay_into_processing_start():
     """/processing/start is retried legitimately and the server writes

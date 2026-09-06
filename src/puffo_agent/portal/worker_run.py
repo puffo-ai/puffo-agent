@@ -100,8 +100,10 @@ class _NoopStatusReporter:
     async def report_error(self, _text):
         return None
 
-    async def set_activity_overlay(self, _activity):
-        return None
+    def set_activity_overlay(self, _activity) -> bool:
+        # Sync like the real reporter's state-only setter; False means
+        # "nothing changed", so emit_activity never tries to push.
+        return False
 
     async def run_heartbeat_loop(self):
         return None
