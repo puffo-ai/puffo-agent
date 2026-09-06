@@ -14,7 +14,7 @@ v1.1 lines. Nothing here contacts Google and no credential is involved —
 a real connect additionally needs Bob's module and a GCP client bundle
 placed by a human, never through an agent.
 """
-import asyncio, json, os, subprocess, sys, tempfile, pathlib
+import asyncio, json, os, sys, tempfile, pathlib
 
 sys.path.insert(0, "src")
 os.environ.setdefault("PUFFO_AGENT_HOME", tempfile.mkdtemp(prefix="gmail-demo-"))
