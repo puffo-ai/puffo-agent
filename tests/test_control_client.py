@@ -15,6 +15,28 @@ from puffo_agent.portal.control.client import MachineControlClient, execute_comm
 from puffo_agent.portal.state import AgentConfig, RuntimeState
 
 
+def _decrypt_stub(op, agent_slug="a1", params=None):
+    """A `decrypt_command` stand-in that keeps the SIGNED `command_id`.
+
+    The real function returns `{command_id, agent_slug, op, params}`, where
+    `command_id` comes from inside the signed envelope and is bound into the
+    HPKE AAD. Every stub here used to drop that key, so no test could observe
+    which of the two ids the client actually uses — the outer frame's
+    (unsigned) one or the signed one. That is the F1 blind spot: not a
+    behaviour change, an observability one.
+    """
+
+    def _stub(envelope, *_args, **_kw):
+        return {
+            "command_id": (envelope or {}).get("command_id"),
+            "agent_slug": agent_slug,
+            "op": op,
+            "params": {} if params is None else params,
+        }
+
+    return _stub
+
+
 class _FakeWS:
     def __init__(self):
         self.acks = []
@@ -138,7 +160,7 @@ async def test_handle_rejects_replayed_nonce_and_bounds_set(monkeypatch):
     })
     monkeypatch.setattr(
         cc, "decrypt_command",
-        lambda env, machine, root, now: {"op": "pause", "agent_slug": "a1", "params": {}},
+        _decrypt_stub("pause"),
     )
     monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
 
@@ -175,20 +197,26 @@ async def test_handle_rejects_replayed_nonce_and_bounds_set(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_delivery_is_debug_not_rejection_warning(
+async def test_duplicate_delivery_logs_at_shipping_level_not_as_a_warning(
     monkeypatch, caplog,
 ):
-    """Expected crash-recovery redelivery must not look like a security fault."""
+    """Expected crash-recovery redelivery must not look like a security fault.
+
+    Captured at INFO on purpose: that is what every shipping entrypoint
+    configures, and there is no debug switch anywhere in the tree. A line
+    only emitted at DEBUG is a line nobody will ever see, which is how this
+    exit came to be silent in both channels (Boris 188857).
+    """
     monkeypatch.setattr(cc, "load_pairings", lambda: {
         "op": types.SimpleNamespace(operator_root_pubkey="ROOT", server_url="https://s"),
     })
     monkeypatch.setattr(
         cc, "decrypt_command",
-        lambda *args: {"op": "pause", "agent_slug": "a1", "params": {}},
+        _decrypt_stub("pause"),
     )
     mc = MachineControlClient(machine=object())
     mc._seen_nonces["N1"] = 1
-    caplog.set_level(logging.DEBUG, logger=cc.log.name)
+    caplog.set_level(logging.INFO, logger=cc.log.name)
 
     await mc._handle(
         _FakeWS(),
@@ -229,7 +257,7 @@ async def test_completed_redelivery_reacks_exact_result_without_reexecution(monk
     monkeypatch.setattr(
         cc,
         "decrypt_command",
-        lambda *args: {"op": "create", "agent_slug": "a1", "params": {}},
+        _decrypt_stub("create"),
     )
     monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
     client = MachineControlClient(machine=object())
@@ -495,7 +523,7 @@ async def test_handle_ack_carries_the_exact_command_result(monkeypatch):
     monkeypatch.setattr(
         cc,
         "decrypt_command",
-        lambda *args: {"op": "create", "agent_slug": None, "params": {}},
+        _decrypt_stub("create", agent_slug=None),
     )
     ws = _FakeWS()
 
@@ -534,6 +562,7 @@ async def test_create_wait_does_not_block_followup_machine_command(monkeypatch):
         cc,
         "decrypt_command",
         lambda envelope, *args: {
+            "command_id": envelope.get("command_id"),
             "op": envelope["op"],
             "agent_slug": envelope.get("agent_slug"),
             "params": {},
@@ -634,6 +663,7 @@ async def test_create_redelivery_after_five_minutes_is_not_reexecuted(monkeypatc
         cc,
         "decrypt_command",
         lambda envelope, *args: {
+            "command_id": envelope.get("command_id"),
             "op": envelope["op"],
             "agent_slug": envelope.get("agent_slug"),
             "params": {},
@@ -1049,7 +1079,7 @@ def _connect_dispatch(monkeypatch, op="gmail.connect_initiate"):
     monkeypatch.setattr(
         cc,
         "decrypt_command",
-        lambda *args: {"op": op, "agent_slug": None, "params": {}},
+        _decrypt_stub(op, agent_slug=None),
     )
     monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
 
@@ -1163,9 +1193,7 @@ async def test_a_connect_in_flight_does_not_stall_other_machine_commands(
             monkeypatch.setattr(
                 cc,
                 "decrypt_command",
-                lambda *args, _op=op: {
-                    "op": _op, "agent_slug": "a1", "params": {},
-                },
+                _decrypt_stub(op),
             )
             await client._handle(
                 ws, _connect_frame(f"c{index}", f"N{index}"), background_ops=True
@@ -1367,3 +1395,45 @@ async def test_a_refused_duplicate_connect_replays_its_reply_on_redelivery(
 
     release.set()
     await asyncio.wait_for(asyncio.gather(*list(client._command_tasks)), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_the_ack_is_keyed_by_the_unsigned_outer_command_id(monkeypatch):
+    """Characterization: which of the two ids does the client actually use?
+
+    `decrypt_command` returns the `command_id` carried INSIDE the signed
+    envelope (bound into the HPKE AAD). The client acks, caches and tracks
+    in-flight work under the one from the OUTER frame, which is not signed,
+    and never compares the two. Until now every stub dropped the signed key,
+    so no test could tell them apart — the F1 blind spot was in the test
+    double, not in the production code.
+
+    This records the current behaviour so a change to it cannot pass
+    silently. It is not an endorsement: the divergence itself is the open F1
+    item, and closing it is a separate decision.
+    """
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(operator_root_pubkey="ROOT", server_url="https://s"),
+    })
+    monkeypatch.setattr(cc, "decrypt_command", _decrypt_stub("pause"))
+    monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
+
+    async def _fake_exec(op, slug, params, **kw):
+        return {"ok": True}
+
+    monkeypatch.setattr(cc, "execute_command", _fake_exec)
+
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    await client._handle(ws, {
+        "command_id": "outer-1",
+        "operator_slug": "op",
+        "envelope": {"nonce": "N1", "ts": 1_000_000, "command_id": "signed-1"},
+    })
+
+    # The two ids are genuinely different, so this test cannot pass by
+    # accident on a frame where they happen to agree.
+    assert ws.acks and ws.acks[-1]["command_id"] == "outer-1"
+    assert "outer-1" in client._completed_results
+    assert "signed-1" not in client._completed_results

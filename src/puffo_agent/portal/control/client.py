@@ -814,7 +814,13 @@ class MachineControlClient:
                     command_id,
                 )
                 return
-            log.debug(
+            # INFO, like the two branches above it: this is the only one of
+            # the three duplicate-delivery exits whose reply is byte-identical
+            # to a forged/malformed envelope's, so the log line is the only
+            # thing that tells them apart. At DEBUG it was never emitted --
+            # every shipping entrypoint configures INFO and there is no debug
+            # switch -- which left the F1 path silent in both channels.
+            log.info(
                 "control: duplicate delivery suppressed for unknown command %s",
                 command_id,
             )
