@@ -1487,6 +1487,27 @@ _EXPECTED_REPLY_PAIRS = {
 }
 
 
+def _called_name(node):
+    """Final callable name of a Call, bare or module-qualified.
+
+    `store_status(...)` and `status_store.store_status(...)` are the same
+    producer. Matching only `ast.Name` let a package sibling bypass these
+    alarms using ordinary qualified syntax — measured, not assumed: a probe
+    module calling both producers that way left every roster test green
+    (Jeff 188717). The reply scanner already matched both; the other two
+    did not, so the gap was in the shape of the matcher, not in one site.
+    """
+    import ast
+
+    if not isinstance(node, ast.Call):
+        return None
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    return None
+
+
 def _ast_const(node):
     """The literal value of an AST node, or None if it is not a literal."""
     import ast
@@ -1525,11 +1546,7 @@ def _executor_failure_reasons(trees) -> set[str]:
     sites = 0
     for path, tree in trees.items():
         for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "ExecutorOutcome"
-            ):
+            if _called_name(node) != "ExecutorOutcome":
                 continue
             keywords = {k.arg: k.value for k in node.keywords}
             if _ast_const(keywords.get("status")) != "failed":
@@ -1589,16 +1606,7 @@ def _derive_reply_pairs():
     pairs, sites = set(), []
     for path, tree in trees.items():
         for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.Call)
-                and (
-                    (isinstance(node.func, ast.Name) and node.func.id == "_reply")
-                    or (
-                        isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "_reply"
-                    )
-                )
-            ):
+            if _called_name(node) != "_reply":
                 continue
             sites.append(f"{path.name}:{node.lineno}")
             where = sites[-1]
@@ -1705,13 +1713,8 @@ def test_every_persistable_pair_survives_a_round_trip(home, state, reason):
     assert (loaded.state, loaded.reason) == (state, reason)
 
 
-def test_the_persistable_roster_matches_what_producers_actually_write(home):
-    """`PERSISTABLE_PAIRS` must track `store_status` call sites.
-
-    The drift alarm for the SECOND surface. Without it, adding a producer
-    without extending the roster would make the new state fail closed —
-    silently, and in the safe-looking direction.
-    """
+def _derive_persisted_pairs():
+    """Every `(state, reason)` a producer can persist, from source."""
     import ast
     import pathlib
 
@@ -1723,18 +1726,12 @@ def test_the_persistable_roster_matches_what_producers_actually_write(home):
     for path in sources:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "GmailConnectStatus"
-            ):
+            if _called_name(node) != "GmailConnectStatus":
                 continue
             parent_calls = [
                 outer
                 for outer in ast.walk(tree)
-                if isinstance(outer, ast.Call)
-                and isinstance(outer.func, ast.Name)
-                and outer.func.id == "store_status"
+                if _called_name(outer) == "store_status"
                 and node in ast.walk(outer)
             ]
             if not parent_calls:
@@ -1758,4 +1755,51 @@ def test_the_persistable_roster_matches_what_producers_actually_write(home):
 
     assert sites, "no store_status(GmailConnectStatus(...)) sites found"
     # The missing-file default is a producer too, just not a written one.
-    assert written | {("disconnected", "")} == set(PERSISTABLE_PAIRS)
+    return written | {("disconnected", "")}
+
+
+def test_the_persistable_roster_matches_what_producers_actually_write(home):
+    """`PERSISTABLE_PAIRS` must track `store_status` call sites.
+
+    The drift alarm for the SECOND surface. Without it, adding a producer
+    without extending the roster would make the new state fail closed —
+    silently, and in the safe-looking direction.
+    """
+    assert _derive_persisted_pairs() == set(PERSISTABLE_PAIRS)
+
+
+def test_a_qualified_producer_in_a_sibling_module_is_still_seen():
+    """The alarm must not be dodgeable by ordinary import style.
+
+    `status_store.store_status(status_store.GmailConnectStatus(...))` is
+    how a new sibling module would normally be written, and the scanner
+    used to miss it entirely — the roster test stayed green with a live
+    out-of-roster producer present (Jeff 188717).
+
+    Written into the real package because that is the surface the alarm
+    scans; anything less would be testing a copy of the problem.
+    """
+    import pathlib
+
+    package = pathlib.Path(ops.__file__).parent
+    sibling = package / "_roster_control_sibling.py"
+    sibling.write_text(
+        "from . import status_store\n"
+        "\n"
+        "\n"
+        "def new_persisted_producer():\n"
+        "    status_store.store_status(\n"
+        '        status_store.GmailConnectStatus(state="failed", reason="confirm_timeout")\n'
+        "    )\n",
+        encoding="utf-8",
+    )
+    try:
+        derived = _derive_persisted_pairs()
+    finally:
+        sibling.unlink()
+
+    # `(failed, confirm_timeout)` is a REPLY pair that no producer
+    # persists, so its appearance here is unambiguous evidence the
+    # sibling was read — and it makes the roster comparison fail.
+    assert ("failed", "confirm_timeout") in derived
+    assert derived != set(PERSISTABLE_PAIRS)
