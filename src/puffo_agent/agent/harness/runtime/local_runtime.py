@@ -982,6 +982,7 @@ def build_local_runtime_adapter(
     logical_session_ref: str,
     driver: Driver | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
+    generation_sink: Callable[[str], None] | None = None,
 ) -> RuntimeManagerAdapter:
     """Bind a prepared Driver runtime to the durable Runtime Manager.
 
@@ -1065,6 +1066,7 @@ def build_local_runtime_adapter(
         manager,
         spec_reloader=reload_spec,
         post_close=cleanup,
+        generation_sink=generation_sink,
     )
 
 

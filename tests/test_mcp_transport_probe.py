@@ -261,6 +261,46 @@ def test_recycled_generation_survives_zombie_pressure_before_first_probe(
     assert rpc_service.mcp_hello_state("t", new_gen)[0] > 0.0
 
 
+def test_reload_pins_minted_generation_before_reopen():
+    """The post-reload pins land only after ``adapter.reload``
+    returns, but the reopened subprocess hellos immediately — zombie
+    beacon pressure inside that window can evict the new hello while
+    the pin still names the predecessor. The adapter must push the
+    minted generation through its generation sink after the spec
+    reloader and BEFORE ``reload_resources`` reopens."""
+    from puffo_agent.agent.harness.runtime.runtime_manager import (
+        RuntimeManagerAdapter,
+    )
+
+    rpc_service.clear_mcp_hello("t")
+    try:
+        rpc_service.pin_mcp_generation("t", "g-old")
+        pin_at_reopen: list[str | None] = []
+
+        class _Mgr:
+            spec = SimpleNamespace(mcp_generation="g-old", system_prompt="p")
+
+            async def reload_resources(self, *, preserve_session, spec):
+                pin_at_reopen.append(rpc_service._MCP_HELLO_PROBED.get("t"))
+                self.spec = spec
+
+        async def reloader(prompt):
+            return SimpleNamespace(mcp_generation="g-new", system_prompt=prompt)
+
+        adapter = RuntimeManagerAdapter(
+            _Mgr(),
+            spec_reloader=reloader,
+            generation_sink=lambda gen: rpc_service.pin_mcp_generation(
+                "t", gen
+            ),
+        )
+        _run(adapter.reload("p2", with_session=False))
+
+        assert pin_at_reopen == ["g-new"]
+    finally:
+        rpc_service.clear_mcp_hello("t")
+
+
 def test_initial_prepare_pins_generation_before_first_probe(
     tmp_path, monkeypatch,
 ):
@@ -294,10 +334,14 @@ def test_initial_prepare_pins_generation_before_first_probe(
             legacy_session_path=tmp_path / "legacy.json",
             preparer=_StubPreparer(),
         )
+        captured_kwargs: dict = {}
+
+        def fake_builder(prepared, **kw):
+            captured_kwargs.update(kw)
+            return SimpleNamespace()
+
         monkeypatch.setattr(
-            local_runtime,
-            "build_local_runtime_adapter",
-            lambda prepared, **kw: SimpleNamespace(),
+            local_runtime, "build_local_runtime_adapter", fake_builder,
         )
         runner = StandardWorkerRun(SimpleNamespace())
         outbox = SimpleNamespace(set_active_turn=lambda *a, **kw: None)
@@ -313,6 +357,11 @@ def test_initial_prepare_pins_generation_before_first_probe(
         seen_at, interval = rpc_service.mcp_hello_state("t", "g-new")
         assert seen_at > 0.0
         assert interval == 60.0
+
+        # The bind also hands the adapter a generation sink wired to
+        # this agent, so reload-minted generations pin the same way.
+        captured_kwargs["generation_sink"]("g-reloaded")
+        assert rpc_service._MCP_HELLO_PROBED["t"] == "g-reloaded"
     finally:
         rpc_service.clear_mcp_hello("t")
 

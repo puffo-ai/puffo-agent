@@ -399,22 +399,29 @@ class StandardWorkerRun:
                 process_factory=preparer.process_factory,
             )
             cleanup = preparer.aclose
+        from . import rpc_service
+
+        agent_id = prepared.preparer.agent_id
+
+        def pin_generation(generation: str) -> None:
+            # Runs between the spec reload minting a fresh generation
+            # and the reopen: the pin must move before the new
+            # subprocess can hello, or zombie beacon pressure inside
+            # that window trims the hello and fakes never-seen.
+            rpc_service.pin_mcp_generation(agent_id, generation)
+
         worker._adapter = build_local_runtime_adapter(
             prepared,
             outbox=outbox,
             logical_session_ref=session_ref,
             driver=driver,
             cleanup=cleanup,
+            generation_sink=pin_generation,
         )
         # Pin the initial mcp generation at the mint, not at the first
-        # probe: zombie beacon pressure inside that window could trim
-        # its hello and fake never-seen (see rpc_service).
+        # probe (same window as above, prepare-time edition).
         if prepared.spec.mcp_generation:
-            from . import rpc_service
-
-            rpc_service.pin_mcp_generation(
-                prepared.preparer.agent_id, prepared.spec.mcp_generation
-            )
+            pin_generation(prepared.spec.mcp_generation)
         return outbox, session_ref, prepared
 
     async def _abort_docker_preparation(self, preparer: Any) -> None:
