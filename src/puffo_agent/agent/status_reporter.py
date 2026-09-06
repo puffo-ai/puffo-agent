@@ -269,10 +269,18 @@ class StatusReporter:
             if should_emit:
                 await self._send_heartbeat()
             return run_id
+        start_body: dict[str, str] = {"run_id": run_id}
+        # The server writes this field into agent_status and start is
+        # legitimately retried: carrying the live overlay (an in-flight
+        # compaction) keeps a duplicate start from wiping it, while an
+        # absent field clears the finished reading phase. Old servers
+        # ignore the extra field.
+        if self._overlay_activity:
+            start_body["activity"] = self._overlay_activity
         try:
             await self._http.post(
                 f"/messages/{message_id}/processing/start",
-                {"run_id": run_id},
+                start_body,
             )
             self._current_status = "busy"
             self._current_message_id = message_id

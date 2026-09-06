@@ -809,6 +809,28 @@ async def test_compaction_overlay_wins_and_restores():
 
 
 @pytest.mark.asyncio
+async def test_begin_turn_carries_live_overlay_into_processing_start():
+    """/processing/start is retried legitimately and the server writes
+    the request's activity into agent_status: a live compaction overlay
+    must travel with the start, and an absent overlay must stay absent
+    so the finished reading phase is cleared server-side."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("msg_1")
+    rep.set_activity_overlay("compacting")
+
+    await rep.begin_turn("msg_1")
+    path, body = http.calls[-1]
+    assert path == "/messages/msg_1/processing/start"
+    assert body["activity"] == "compacting"
+
+    rep.set_activity_overlay(None)
+    await rep.begin_turn("msg_1")
+    _, body = http.calls[-1]
+    assert "activity" not in body
+
+
+@pytest.mark.asyncio
 async def test_notice_terminal_clears_activity():
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
