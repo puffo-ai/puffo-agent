@@ -261,6 +261,62 @@ def test_recycled_generation_survives_zombie_pressure_before_first_probe(
     assert rpc_service.mcp_hello_state("t", new_gen)[0] > 0.0
 
 
+def test_initial_prepare_pins_generation_before_first_probe(
+    tmp_path, monkeypatch,
+):
+    """The third pin seam: binding a freshly prepared runtime must
+    re-pin its minted generation immediately. A daemon-internal
+    restart can leave the previous run's generation pinned; without
+    the bind-time pin, zombie pressure between warm and the first
+    probe evicts the new hello and the probe reads never-seen.
+    Removing only the ``worker_run`` pin turns this red."""
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.driver import RuntimeSpec
+    from puffo_agent.agent.harness.runtime.local_runtime import (
+        PreparedLocalRuntime,
+    )
+    from puffo_agent.portal.worker_run import StandardWorkerRun
+
+    rpc_service.clear_mcp_hello("t")
+    try:
+        # The previous worker run's generation is still pinned.
+        rpc_service.record_mcp_hello("t", "g-old", 60.0)
+        assert rpc_service.mcp_hello_state("t", "g-old")[0] > 0.0
+
+        class _StubPreparer:
+            agent_id = "t"
+
+        prepared = PreparedLocalRuntime(
+            harness_name="codex",
+            spec=RuntimeSpec(str(tmp_path), mcp_generation="g-new"),
+            native_session_id="",
+            migration_source="fresh",
+            legacy_session_path=tmp_path / "legacy.json",
+            preparer=_StubPreparer(),
+        )
+        monkeypatch.setattr(
+            local_runtime,
+            "build_local_runtime_adapter",
+            lambda prepared, **kw: SimpleNamespace(),
+        )
+        runner = StandardWorkerRun(SimpleNamespace())
+        outbox = SimpleNamespace(set_active_turn=lambda *a, **kw: None)
+
+        _run(runner._bind_driver_runtime(outbox, prepared, {}))
+
+        # New hello lands, then zombie pressure fills the slots before
+        # any probe has asked about the new generation.
+        rpc_service.record_mcp_hello("t", "g-new", 60.0)
+        for zombie in ("g-z1", "g-z2", "g-z3", "g-z4"):
+            rpc_service.record_mcp_hello("t", zombie, 60.0)
+
+        seen_at, interval = rpc_service.mcp_hello_state("t", "g-new")
+        assert seen_at > 0.0
+        assert interval == 60.0
+    finally:
+        rpc_service.clear_mcp_hello("t")
+
+
 def test_refresh_reload_pins_the_new_generation(
     tmp_path, registered_manager,
 ):
