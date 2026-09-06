@@ -158,7 +158,7 @@ async def run_gmail_executor(
         # Schema v1.1 §4 is a closed set and we do not take the
         # executor's word for it. Clamping HERE, at the trust boundary,
         # covers both the Layer-B projection and the control-plane
-        # response body — ops.py returns this same string as ``error``,
+        # response body — ops.py returns this same string as ``reason``,
         # which is a second exit that never passes through projection().
         reason = str(result.get("reason", ""))
         if reason not in EXECUTOR_REASONS:

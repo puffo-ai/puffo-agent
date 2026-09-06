@@ -395,8 +395,8 @@ async def test_out_of_roster_reason_is_clamped_before_layer_b(tmp_path, home, mo
 
     Negative control authored by Boris (review of e926d42, patch
     85fece2b…); kept as-is because it covers an exit the unit-level
-    clamp test does not — ``ops`` returns the reason as ``error``
-    without passing through ``projection()``.
+    clamp test does not — ``ops`` returns the reason in its own
+    ``reason`` field without passing through ``projection()``.
     """
     script = _fake_executor_script(
         tmp_path,
@@ -562,3 +562,58 @@ def test_reply_clamps_free_text_on_its_own_leg():
     )
 
     assert reply == {"ok": False, "state": "failed", "reason": "internal_error"}
+
+
+@pytest.mark.asyncio
+async def test_refused_is_disambiguated_by_the_state_it_is_paired_with(
+    tmp_path, home, monkeypatch
+):
+    """Jeff 188531: ``refused`` is deliberately not split into two values;
+    meaning is carried by the ``(state, reason)`` PAIR plus what is persisted.
+
+      user cancels the native confirm  -> (disconnected, refused), nothing persisted
+      daemon/executor refuses to spawn -> (failed,       refused), persisted
+
+    Collapsing either half (persisting the cancel, or not persisting the
+    refusal) turns this red while every single-branch test stays green.
+
+    SCOPE — this pins 2 of 4 facts, on purpose. ``request_native_confirm``
+    returns False for FOUR distinct things (its own docstring says so):
+    cancel, dialog timeout, no native backend at all (any non-macOS host),
+    and osascript failure. All four currently produce a byte-identical
+    ``(disconnected, refused)``, so on a non-macOS host every connect
+    attempt tells the user "cancelled" — untrue and unactionable
+    (Boris 188533, reproduced here). The two cells pinned above hold
+    under either remedy Boris proposed; the other two await Jeff's
+    re-ruling and must be added then. Do not read this test as evidence
+    that ``refused`` is fully discriminating — it is not.
+    """
+    _configured(monkeypatch)
+
+    async def deny(prompt, *, timeout_s):
+        return False
+
+    async def refuse(*a, **k):
+        raise ExecutorRefused("entrypoint is not executable")
+
+    # half 1 — the user said no: reported, not recorded
+    monkeypatch.setattr(ops, "request_native_confirm", deny)
+    cancel = await ops.gmail_connect_initiate({})
+    assert cancel == {"ok": False, "state": "disconnected", "reason": "refused"}
+    assert load_status().state == "disconnected"
+    assert load_status().reason == ""
+
+    # half 2 — same reason, different state, and it IS recorded
+    async def allow(prompt, *, timeout_s):
+        return True
+
+    monkeypatch.setattr(ops, "request_native_confirm", allow)
+    monkeypatch.setattr(ops, "run_gmail_executor", refuse)
+    blocked = await ops.gmail_connect_initiate({})
+    assert blocked == {"ok": False, "state": "failed", "reason": "refused"}
+    assert load_status().state == "failed"
+    assert load_status().reason == "refused"
+
+    # the pair is what carries the meaning: the reason alone does not
+    assert cancel["reason"] == blocked["reason"] == "refused"
+    assert cancel["state"] != blocked["state"]
