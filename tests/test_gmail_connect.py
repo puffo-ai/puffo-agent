@@ -233,6 +233,76 @@ async def test_executor_schema_v1_protocol_and_layer_a_drop(tmp_path, home):
 
 
 @pytest.mark.asyncio
+async def test_prebind_failure_reason_survives_missing_ready(tmp_path):
+    """Schema v1.1 §3: a pre-bind failure is 0 ready + 1 failed result.
+    The daemon must surface the executor's real reason — mapping a
+    missing ready line to timeout/protocol wholesale turns this red."""
+    script = _fake_executor_script(
+        tmp_path,
+        '''
+        import json, sys
+        sys.stdin.readline()
+        print(json.dumps({"event": "result", "status": "failed",
+                          "reason": "bundle_verify_failed"}))
+        sys.stdout.flush()
+        ''',
+    )
+    outcome = await run_gmail_executor(
+        script,
+        {"data_root": "/d", "expected_sha256": "a" * 64},
+        flow_timeout_s=5,
+    )
+    assert outcome.status == "failed"
+    assert outcome.reason == "bundle_verify_failed"
+
+
+@pytest.mark.asyncio
+async def test_out_of_enum_reason_is_clamped_to_internal_error(tmp_path):
+    """The reason field is a closed enum (schema §4, six values); a
+    free-text reason could carry secrets into the Layer-B projection,
+    so the daemon clamps anything unknown to internal_error."""
+    script = _fake_executor_script(
+        tmp_path,
+        '''
+        import json, sys
+        sys.stdin.readline()
+        print(json.dumps({"event": "result", "status": "failed",
+                          "reason": "Exception: token=SENTINEL_ya29_SECRET"}))
+        sys.stdout.flush()
+        ''',
+    )
+    outcome = await run_gmail_executor(
+        script,
+        {"data_root": "/d", "expected_sha256": "a" * 64},
+        flow_timeout_s=5,
+    )
+    assert outcome.reason == "internal_error"
+    assert "SENTINEL" not in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_connected_without_ready_is_protocol_failure(tmp_path):
+    """A connected result with no prior ready line is out of contract:
+    a flow that never bound loopback cannot have run consent."""
+    script = _fake_executor_script(
+        tmp_path,
+        '''
+        import json, sys
+        sys.stdin.readline()
+        print(json.dumps({"event": "result", "status": "connected"}))
+        sys.stdout.flush()
+        ''',
+    )
+    outcome = await run_gmail_executor(
+        script,
+        {"data_root": "/d", "expected_sha256": "a" * 64},
+        flow_timeout_s=5,
+    )
+    assert outcome.status == "failed"
+    assert outcome.reason == "protocol"
+
+
+@pytest.mark.asyncio
 async def test_non_loopback_ready_line_kills_the_flow(tmp_path):
     """An executor advertising a routable redirect_uri is not the
     contract's executor: the daemon must kill it at the ready line,

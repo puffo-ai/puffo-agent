@@ -32,6 +32,17 @@ logger = logging.getLogger(__name__)
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 READY_DEADLINE_S = 15.0
+# Schema §4 closed reason set (v1.1, 60adad76…). Anything else on a
+# result line is clamped to internal_error before it can ride the
+# reason field into the Layer-B projection as free text.
+SCHEMA_REASONS = frozenset({
+    "bundle_verify_failed",
+    "callback_timeout",
+    "exchange_failed",
+    "scope_mismatch",
+    "keychain_error",
+    "internal_error",
+})
 # The executor enforces its own consent timeout and reports
 # callback_timeout; our read deadline sits above it so the structured
 # reason wins over a daemon-side kill.
@@ -77,16 +88,14 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-async def _read_event_line(
-    proc: asyncio.subprocess.Process, event: str, deadline_s: float
-) -> dict:
+async def _read_event_line(proc: asyncio.subprocess.Process, deadline_s: float) -> dict:
     assert proc.stdout is not None
     line = await asyncio.wait_for(proc.stdout.readline(), timeout=deadline_s)
     if not line or len(line) > _MAX_LINE_BYTES:
         raise ValueError("executor closed stdout or overran line budget")
     parsed = json.loads(line)
-    if not isinstance(parsed, dict) or parsed.get("event") != event:
-        raise ValueError(f"executor line is not a {event!r} event")
+    if not isinstance(parsed, dict) or parsed.get("event") not in ("ready", "result"):
+        raise ValueError("executor line is not a ready/result event")
     return parsed
 
 
@@ -119,13 +128,21 @@ async def run_gmail_executor(
         proc.stdin.write(json.dumps(request).encode() + b"\n")
         await proc.stdin.drain()
         proc.stdin.close()
-        ready = await _read_event_line(proc, "ready", READY_DEADLINE_S)
-        if not _ready_is_loopback(ready):
-            await _kill_group(proc)
-            return ExecutorOutcome(status="failed", reason="non_loopback_ready")
-        result = await _read_event_line(
-            proc, "result", flow_timeout_s + RESULT_DEADLINE_MARGIN_S
-        )
+        first = await _read_event_line(proc, READY_DEADLINE_S)
+        if first.get("event") == "result":
+            # Pre-bind failure: 0 ready + 1 failed result. The real
+            # reason (e.g. bundle_verify_failed) must survive — a
+            # missing ready line is not a timeout (schema v1.1 §3).
+            result = first
+        else:
+            if not _ready_is_loopback(first):
+                await _kill_group(proc)
+                return ExecutorOutcome(status="failed", reason="non_loopback_ready")
+            result = await _read_event_line(
+                proc, flow_timeout_s + RESULT_DEADLINE_MARGIN_S
+            )
+            if result.get("event") != "result":
+                raise ValueError("second executor line is not a result event")
     except asyncio.TimeoutError:
         await _kill_group(proc)
         return ExecutorOutcome(status="failed", reason="timeout")
@@ -141,9 +158,16 @@ async def run_gmail_executor(
         await _kill_group(proc)
     status = str(result.get("status", ""))
     if status == "connected":
+        if result is first:
+            # connected without a ready line is out of contract — a
+            # flow that never bound loopback cannot have run consent.
+            return ExecutorOutcome(status="failed", reason="protocol")
         return ExecutorOutcome(status="connected")
     if status == "failed":
-        return ExecutorOutcome(
-            status="failed", reason=str(result.get("reason", "")) or "internal_error"
-        )
+        reason = str(result.get("reason", ""))
+        if reason not in SCHEMA_REASONS:
+            # Clamp: the reason field is a closed enum; anything else
+            # could carry free text into the Layer-B projection.
+            reason = "internal_error"
+        return ExecutorOutcome(status="failed", reason=reason)
     return ExecutorOutcome(status="failed", reason="protocol")
