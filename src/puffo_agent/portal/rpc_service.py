@@ -8,6 +8,7 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -102,13 +103,17 @@ async def mcp_hello_route(request: web.Request) -> web.Response:
             {"error": "generation must be a non-empty string"}, status=400,
         )
     interval = body.get("beacon_interval")
+    # Python's json parser admits the non-standard Infinity/NaN literals;
+    # an infinite cadence would make the staleness window infinite and
+    # silently disable mid-life wedge detection, so require finite.
     if interval is not None and (
         isinstance(interval, bool)
         or not isinstance(interval, (int, float))
+        or not math.isfinite(interval)
         or interval <= 0
     ):
         return web.json_response(
-            {"error": "beacon_interval must be a positive number"},
+            {"error": "beacon_interval must be a positive finite number"},
             status=400,
         )
     record_mcp_hello(

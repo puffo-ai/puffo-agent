@@ -287,12 +287,26 @@ def test_probe_hello_clears_wedge_state(registered_manager, saved_states):
     assert worker.runtime.health == "ok"
 
 
-def test_beacon_silence_recycles(registered_manager):
+@pytest.fixture
+def pinned_clock(monkeypatch):
+    """Fixed monotonic value for tests that fabricate large past
+    offsets: on a freshly booted CI runner ``time.monotonic()`` is
+    small, so ``monotonic() - 4000`` goes negative and reads as
+    never-seen."""
+    from puffo_agent.portal import worker as worker_mod
+
+    now = 1_000_000.0
+    monkeypatch.setattr(worker_mod.time, "monotonic", lambda: now)
+    return now
+
+
+def test_beacon_silence_recycles(registered_manager, pinned_clock):
     """A subprocess that declared a re-hello cadence and then went
     silent is a wedge (the incident's 51-min RPC silence signature),
     even though its startup hello matched this generation."""
-    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 400))
-    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (time.monotonic() - 400, 60.0)}
+    now = pinned_clock
+    mgr = registered_manager(_FakeManager("g1", now - 400))
+    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (now - 400, 60.0)}
     worker = _seed_worker()
     adapter = _wire(worker, mgr)
 
@@ -302,12 +316,13 @@ def test_beacon_silence_recycles(registered_manager):
     assert worker._mcp_probe_strikes == 1
 
 
-def test_startup_only_hello_never_goes_stale(registered_manager):
+def test_startup_only_hello_never_goes_stale(registered_manager, pinned_clock):
     """No declared cadence (older package, e.g. a lagging Docker image)
     keeps handshake semantics: an aged hello stays valid and the probe
     must not recycle-loop the runtime for silence."""
-    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 5000))
-    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (time.monotonic() - 4000, None)}
+    now = pinned_clock
+    mgr = registered_manager(_FakeManager("g1", now - 5000))
+    rpc_service._MCP_HELLO_SEEN["t"] = {"g1": (now - 4000, None)}
     worker = _seed_worker()
     adapter = _wire(worker, mgr)
 
@@ -430,12 +445,13 @@ def test_mcp_hello_route_records_generation():
                 "/v1/rpc/t/mcp-hello", json={}, headers=headers,
             )
             assert bad.status == 400
-            bad_interval = await client.post(
-                "/v1/rpc/t/mcp-hello",
-                json={"generation": "gen-42", "beacon_interval": 0},
-                headers=headers,
-            )
-            assert bad_interval.status == 400
+            for bad_value in (0, float("inf"), float("nan")):
+                bad_interval = await client.post(
+                    "/v1/rpc/t/mcp-hello",
+                    json={"generation": "gen-42", "beacon_interval": bad_value},
+                    headers=headers,
+                )
+                assert bad_interval.status == 400, bad_value
         finally:
             await client.close()
 
