@@ -28,6 +28,7 @@ from puffo_agent.portal.gmail_connect.executor import (
     run_gmail_executor,
 )
 from puffo_agent.portal.gmail_connect.status_store import (
+    EXECUTOR_REASONS,
     REASONS,
     STATES,
     GmailConnectStatus,
@@ -1419,3 +1420,222 @@ async def test_the_confirmed_side_of_the_boundary_still_persists(home, monkeypat
     assert res == {"ok": False, "state": "failed", "reason": "exchange_failed"}
     after = load_status()
     assert (after.state, after.reason) == ("failed", "exchange_failed")
+
+
+# ── (ok, state, reason) roster drift alarm ────────────────────────────────
+#
+# Jeff 188669: a CHANGE ALARM, not a runtime source of truth. The Web
+# classifier holds a hand-copied mirror of this set in another repo with no
+# automatic sync (Boris 188667). A new FAILURE pair is harmless there — it
+# falls back to `error`, which is the right display. The one thing that
+# silently hurts is a new NEUTRAL/SUCCESS pair: it would render as a red
+# error while both repos' tests stay green. Re-auth, left to a later design
+# by Jeff 188618, is exactly that kind of change.
+#
+# Derivation handed over by Boris (shared/gmail-connect-pair-roster,
+# derive_reply_pairs.py sha256 dee8f87f…5591). Two of his properties are
+# load-bearing and kept verbatim in spirit:
+#   1. dynamic arguments are EXPANDED through a declared table keyed by the
+#      unparsed expression source — never by line number, which silently
+#      re-points when code is inserted above (the LingTai #1624 lesson),
+#      and never skipped;
+#   2. finding no call sites is an error, not a pass.
+#
+# One deliberate widening (Linus): Boris's version parsed `ops.py` only. A
+# `_reply` site added in a SIBLING module of the package was invisible to
+# it — measured, not assumed: a mutant `ops_extra.py` emitting the success
+# pair `(True, "connected_readonly", "")` left the count at 15 and the
+# alarm green, which is precisely the failure mode above. This walks the
+# package, the same shape as the `_diagnose` guard, so a new module is
+# covered by default instead of being exempt until someone remembers it.
+
+_EXPECTED_REPLY_PAIRS = {
+    # ok=True — the three shapes a caller may read as success.
+    (True, "connected", ""),
+    (True, "disconnected", ""),
+    (True, "disconnected", "revoke_unconfirmed"),
+    # ok=False but NOT a machine failure: the user declined the dialog.
+    (False, "disconnected", "refused"),
+    # ok=False, daemon-minted terminal failures of this call.
+    (False, "failed", "confirm_timeout"),
+    (False, "failed", "confirm_unavailable"),
+    (False, "failed", "executor_unavailable"),
+    (False, "failed", "protocol"),
+    (False, "failed", "refused"),
+    # ok=False, minted by the executor WRAPPER itself, not reported by the
+    # child. Bob 188676 / Jeff 188677: `_reply` does not clamp these away —
+    # they are in `REASONS`, so they reach the caller verbatim and persist.
+    # An earlier version of this roster expanded `outcome.reason` to
+    # `EXECUTOR_REASONS` alone and silently lost exactly these two.
+    (False, "failed", "non_loopback_ready"),
+    (False, "failed", "timeout"),
+} | {
+    # ok=False, reason reported by the child: invoke schema v1 §4's closed
+    # set, clamped at the trust boundary in `run_gmail_executor`.
+    (False, "failed", reason)
+    for reason in (
+        "bundle_verify_failed",
+        "callback_timeout",
+        "exchange_failed",
+        "scope_mismatch",
+        "keychain_error",
+        "internal_error",
+    )
+}
+
+
+def _ast_const(node):
+    """The literal value of an AST node, or None if it is not a literal."""
+    import ast
+
+    return node.value if isinstance(node, ast.Constant) else None
+
+
+def _confirm_refusal_table(tree):
+    """`_CONFIRM_REFUSALS` read as (state, reason) tuples, from source."""
+    import ast
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and getattr(node.targets[0], "id", "") == "_CONFIRM_REFUSALS"
+        ):
+            return {
+                ast.unparse(k): tuple(e.value for e in v.elts)
+                for k, v in zip(node.value.keys, node.value.values)
+            }
+    raise AssertionError("_CONFIRM_REFUSALS not found — the table moved or was renamed")
+
+
+def _executor_failure_reasons(trees) -> set[str]:
+    """Every reason a failed ``ExecutorOutcome`` can carry, from source.
+
+    The one non-literal site is the child-reported reason, which
+    ``run_gmail_executor`` clamps to ``EXECUTOR_REASONS`` immediately
+    above it; that is declared here by expression source. Anything else
+    raises rather than being skipped — an alarm must never pass over what
+    it could not read.
+    """
+    import ast
+
+    reasons: set[str] = set()
+    sites = 0
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "ExecutorOutcome"
+            ):
+                continue
+            keywords = {k.arg: k.value for k in node.keywords}
+            if _ast_const(keywords.get("status")) != "failed":
+                continue
+            sites += 1
+            literal = _ast_const(keywords.get("reason"))
+            if literal is not None:
+                reasons.add(literal)
+                continue
+            expression = (
+                ast.unparse(keywords["reason"]) if "reason" in keywords else None
+            )
+            assert expression == "reason", (
+                f"{path.name}:{node.lineno}: failed ExecutorOutcome has an "
+                f"undeclared dynamic reason {expression!r} — expand it beside "
+                f"the change that introduced it."
+            )
+            reasons |= set(EXECUTOR_REASONS)
+    assert sites, "no failed ExecutorOutcome sites found — the scan is blind"
+    return reasons
+
+
+def _derive_reply_pairs():
+    """Every `(ok, state, reason)` the package can emit, from source."""
+    import ast
+    import pathlib
+
+    package = pathlib.Path(ops.__file__).parent
+    sources = sorted(package.glob("*.py"))
+    assert sources, f"no package sources under {package} — the alarm would be blind"
+
+    trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in sources}
+    ops_tree = trees[pathlib.Path(ops.__file__)]
+
+    # Declared expansions for non-literal arguments, keyed by expression
+    # source. Extend this ONLY together with the code introducing the new
+    # dynamic — that pairing is the whole point.
+    expansions = {
+        # ops._confirm_refusal: both values come from the table.
+        ("reason", "state"): {
+            (False, state, reason)
+            for state, reason in _confirm_refusal_table(ops_tree).values()
+        },
+        # ops.gmail_connect_initiate: executor terminal failure. DERIVED
+        # from the producer's own `ExecutorOutcome` sites — NOT assumed to
+        # be `EXECUTOR_REASONS`, which was wrong: the wrapper mints
+        # `non_loopback_ready`/`timeout`/`protocol`/`executor_unavailable`
+        # itself and `_reply` passes them through (Jeff 188677). Deriving
+        # it means a new wrapper-minted failure is picked up automatically
+        # instead of needing someone to remember this list.
+        ("outcome.reason", "failed"): {
+            (False, "failed", reason)
+            for reason in _executor_failure_reasons(trees)
+        },
+    }
+
+    pairs, sites = set(), []
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "_reply")
+                    or (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "_reply"
+                    )
+                )
+            ):
+                continue
+            sites.append(f"{path.name}:{node.lineno}")
+            where = sites[-1]
+            reason_node = node.args[0] if node.args else None
+            state_node = next(
+                (k.value for k in node.keywords if k.arg == "state"), None
+            )
+            ok_node = next((k.value for k in node.keywords if k.arg == "ok"), None)
+            ok, reason, state = (
+                _ast_const(ok_node),
+                _ast_const(reason_node),
+                _ast_const(state_node),
+            )
+            if reason is not None and state is not None and isinstance(ok, bool):
+                pairs.add((ok, state, reason))
+                continue
+
+            key = (
+                ast.unparse(reason_node) if reason_node is not None else None,
+                state if state is not None else ast.unparse(state_node),
+            )
+            assert key in expansions, (
+                f"{where}: `_reply` has a dynamic argument this alarm cannot "
+                f"expand: {key!r}. Declare its expansion beside the change that "
+                f"introduced it — the alarm must never pass over what it could "
+                f"not read."
+            )
+            pairs |= expansions[key]
+
+    assert sites, "no _reply call sites found — the alarm would vacuously pass"
+    return pairs
+
+
+def test_reply_pair_roster_has_not_drifted():
+    """The Web classifier's hand-copied table must not silently fall behind.
+
+    Adding a reply shape here turns this red BEFORE a new neutral/success
+    pair can reach the other repo's `error` fallback and be shown to a user
+    as a red failure. When it goes red, update the expected roster AND the
+    Web classifier together — updating only this one restores green while
+    leaving the real defect in place.
+    """
+    assert _derive_reply_pairs() == _EXPECTED_REPLY_PAIRS
