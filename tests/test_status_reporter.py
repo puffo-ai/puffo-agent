@@ -857,3 +857,71 @@ async def test_notice_terminal_clears_activity():
     _, body = http.calls[-1]
     assert body["status"] == "idle"
     assert "activity" not in body
+
+
+@pytest.mark.asyncio
+async def test_intro_turn_clears_reading_activity_promptly():
+    """A local-only begin_turn (intro-prompt) skips /processing/start,
+    so only an immediate heartbeat can clear the reading label. The
+    status is already busy with no message id after the notice beat, so
+    the just-ended reading phase is the only thing distinguishing this
+    beat — dropping it kept the server on "reading messages" for the
+    whole intro composition."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("intro-prompt-1")
+    assert http.calls[-1][1]["activity"] == "reading_messages"
+    http.calls.clear()
+
+    await rep.begin_turn("intro-prompt-1")
+
+    assert len(http.calls) == 1
+    path, body = http.calls[0]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "busy"
+    assert "activity" not in body
+
+
+class _GatedHttp(FakeHttp):
+    """Blocks the first POST on ``gate`` after recording it, so a test
+    can hold one status write on the wire and observe what the
+    reporter does with the next one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self._block_first = True
+
+    async def post(self, path: str, body: dict | None = None):
+        self.calls.append((path, body or {}))
+        if self._block_first:
+            self._block_first = False
+            self.entered.set()
+            await self.gate.wait()
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_status_writes_are_serialized_and_carry_newest_state():
+    """Concurrent status writes must not reorder: the next body is
+    built only after the in-flight POST completes, so a label built
+    from older state can never land after a fresher one."""
+    http = _GatedHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep.set_activity_overlay("compacting")
+    first = asyncio.ensure_future(rep.report_current_status())
+    await asyncio.wait_for(http.entered.wait(), 1)
+
+    # The overlay clears while the first POST is still on the wire.
+    rep.set_activity_overlay(None)
+    second = asyncio.ensure_future(rep.report_current_status())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert len(http.calls) == 1  # nothing else posted while blocked
+
+    http.gate.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 1)
+    assert len(http.calls) == 2
+    assert http.calls[0][1]["activity"] == "compacting"
+    assert "activity" not in http.calls[1][1]

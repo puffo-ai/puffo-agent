@@ -90,6 +90,13 @@ class StatusReporter:
         if processing_reports is not None:
             processing_reports.set_status_refresh(self.report_current_status)
         self._run_stop: asyncio.Event | None = None
+        # The periodic beat, detached activity pushes and the turn task
+        # all write status concurrently; an in-flight body built from
+        # older state could land after a fresher one and leave the
+        # server on a stale label. One lock serializes every status
+        # write, and each body is built under it, so wire order matches
+        # state order and the last write carries the newest state.
+        self._send_lock = asyncio.Lock()
 
     async def run_heartbeat_loop(self) -> None:
         # Native agents POST /agents/me/heartbeat; keyless bridge agents emit a
@@ -245,6 +252,7 @@ class StatusReporter:
         run_id = run_id or f"run_{uuid.uuid4().hex}"
         # The model has admitted real messages: the reading phase is over.
         # A live compaction overlay keeps winning until its completed event.
+        was_showing = self._effective_activity
         self._base_activity = None
         if self._keyless:
             # No signed /processing/* call for bridge agents (see __init__);
@@ -252,42 +260,54 @@ class StatusReporter:
             # Working row + the yellow dot.
             self._current_status = "busy"
             self._current_message_id = message_id
-            await self._emit_keyless("busy", message_id, None)
+            async with self._send_lock:
+                await self._emit_keyless("busy", message_id, None)
             return run_id
         if _is_local_only_envelope(message_id):
             # Daemon-minted synthetic envelope (e.g. intro-prompt): no
             # server row, so skip /processing/start — but push an
             # immediate busy heartbeat so the agent shows in-progress
             # while it composes (e.g. its intro). No current_message_id:
-            # the message doesn't exist server-side.
+            # the message doesn't exist server-side. The activity check
+            # matters: after a notice turn the status is already busy
+            # with no message id, and only the just-ended reading phase
+            # distinguishes this beat from the last one — without it the
+            # server keeps showing "reading messages" for the whole
+            # composition.
             should_emit = (
                 self._current_status != "busy"
                 or self._current_message_id is not None
+                or self._effective_activity != was_showing
             )
             self._current_status = "busy"
             self._current_message_id = None
             if should_emit:
                 await self._send_heartbeat()
             return run_id
-        start_body: dict[str, str] = {"run_id": run_id}
-        # The server writes this field into agent_status and start is
-        # legitimately retried: carrying the live overlay (an in-flight
-        # compaction) keeps a duplicate start from wiping it, while an
-        # absent field clears the finished reading phase. Old servers
-        # ignore the extra field.
-        if self._overlay_activity:
-            start_body["activity"] = self._overlay_activity
-        try:
-            await self._http.post(
-                f"/messages/{message_id}/processing/start",
-                start_body,
-            )
-            self._current_status = "busy"
-            self._current_message_id = message_id
-        except HttpError as exc:
-            logger.warning("begin_turn message=%s failed (%s)", message_id, exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("begin_turn message=%s errored (%s)", message_id, exc)
+        async with self._send_lock:
+            start_body: dict[str, str] = {"run_id": run_id}
+            # The server writes this field into agent_status and start is
+            # legitimately retried: carrying the live overlay (an in-flight
+            # compaction) keeps a duplicate start from wiping it, while an
+            # absent field clears the finished reading phase. Old servers
+            # ignore the extra field.
+            if self._overlay_activity:
+                start_body["activity"] = self._overlay_activity
+            try:
+                await self._http.post(
+                    f"/messages/{message_id}/processing/start",
+                    start_body,
+                )
+                self._current_status = "busy"
+                self._current_message_id = message_id
+            except HttpError as exc:
+                logger.warning(
+                    "begin_turn message=%s failed (%s)", message_id, exc
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "begin_turn message=%s errored (%s)", message_id, exc
+                )
         return run_id
 
     async def end_turn(
@@ -304,9 +324,12 @@ class StatusReporter:
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
             self._clear_activity()
-            await self._emit_keyless(
-                self._current_status, None, None if succeeded else error_text,
-            )
+            async with self._send_lock:
+                await self._emit_keyless(
+                    self._current_status,
+                    None,
+                    None if succeeded else error_text,
+                )
             return
         if _is_local_only_envelope(message_id):
             # Symmetric to ``begin_turn`` — no server-side row, but push
@@ -326,17 +349,22 @@ class StatusReporter:
                 any_failed=not succeeded,
             )
             return
-        try:
-            await self._http.post(
-                f"/messages/{message_id}/processing/end", body
-            )
-            self._current_status = "idle" if succeeded else "error"
-            self._current_message_id = None
-            self._clear_activity()
-        except HttpError as exc:
-            logger.warning("end_turn message=%s failed (%s)", message_id, exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("end_turn message=%s errored (%s)", message_id, exc)
+        async with self._send_lock:
+            try:
+                await self._http.post(
+                    f"/messages/{message_id}/processing/end", body
+                )
+                self._current_status = "idle" if succeeded else "error"
+                self._current_message_id = None
+                self._clear_activity()
+            except HttpError as exc:
+                logger.warning(
+                    "end_turn message=%s failed (%s)", message_id, exc
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "end_turn message=%s errored (%s)", message_id, exc
+                )
 
     async def end_turn_batch(self, runs: list[dict]) -> None:
         """Mark every message in a thread batch as processed in one
@@ -361,7 +389,8 @@ class StatusReporter:
             error_text = None
             if failed is not None and failed.get("error_text") is not None:
                 error_text = str(failed["error_text"])[:1024]
-            await self._emit_keyless(self._current_status, None, error_text)
+            async with self._send_lock:
+                await self._emit_keyless(self._current_status, None, error_text)
             return
         payload_runs: list[dict[str, Any]] = []
         for r in runs:
@@ -396,22 +425,23 @@ class StatusReporter:
                 any_failed=any_failed,
             )
             return
-        try:
-            await self._http.post(
-                "/messages/processing/end:batch", {"runs": payload_runs},
-            )
-            # Server flips agent_status atomically — mirror locally.
-            self._current_status = "error" if any_failed else "idle"
-            self._current_message_id = None
-            self._clear_activity()
-        except HttpError as exc:
-            logger.warning(
-                "end_turn_batch (%d runs) failed (%s)", len(runs), exc,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "end_turn_batch (%d runs) errored (%s)", len(runs), exc,
-            )
+        async with self._send_lock:
+            try:
+                await self._http.post(
+                    "/messages/processing/end:batch", {"runs": payload_runs},
+                )
+                # Server flips agent_status atomically — mirror locally.
+                self._current_status = "error" if any_failed else "idle"
+                self._current_message_id = None
+                self._clear_activity()
+            except HttpError as exc:
+                logger.warning(
+                    "end_turn_batch (%d runs) failed (%s)", len(runs), exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "end_turn_batch (%d runs) errored (%s)", len(runs), exc,
+                )
 
     async def _finish_processing_runs(
         self,
@@ -449,22 +479,28 @@ class StatusReporter:
             self._current_status = "error"
             self._current_message_id = None
             self._clear_activity()
-            await self._emit_keyless("error", None, error_text[:1024])
+            async with self._send_lock:
+                await self._emit_keyless("error", None, error_text[:1024])
             return
-        try:
-            await self._http.post(
-                "/agents/me/heartbeat",
-                {"status": "error", "error_text": error_text[:1024]},
-            )
-            self._current_status = "error"
-            self._current_message_id = None
-            self._clear_activity()
-        except HttpError as exc:
-            logger.warning("report_error failed (%s)", exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("report_error errored (%s)", exc)
+        async with self._send_lock:
+            try:
+                await self._http.post(
+                    "/agents/me/heartbeat",
+                    {"status": "error", "error_text": error_text[:1024]},
+                )
+                self._current_status = "error"
+                self._current_message_id = None
+                self._clear_activity()
+            except HttpError as exc:
+                logger.warning("report_error failed (%s)", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("report_error errored (%s)", exc)
 
     async def _send_heartbeat(self) -> None:
+        async with self._send_lock:
+            await self._send_heartbeat_locked()
+
+    async def _send_heartbeat_locked(self) -> None:
         if self._keyless:
             # Keyless bridge agents have no signing identity for the HTTP
             # /agents/me/heartbeat route — report the current status over the

@@ -80,3 +80,41 @@ async def test_compaction_events_drive_activity_sink(tmp_path, monkeypatch):
     assert seen == ["compacting", None, "compacting", None]
     await adapter.aclose()
     outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_warm_phase_activity_seeds_reporter_on_attach():
+    """Warm opens the driver before ``_start_services`` builds the
+    reporter; a session-resume compaction in that window parks its
+    label on ``worker._pending_activity``. ``_build_reporter`` must
+    seed the overlay from it so the heartbeat loop's immediate first
+    beat carries the label instead of dropping the whole window."""
+    from types import SimpleNamespace
+
+    from puffo_agent.agent.status_reporter import StatusReporter
+    from puffo_agent.portal.worker_run import StandardWorkerRun
+
+    class _Http:
+        keyless = False
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def post(self, path, body=None):
+            self.calls.append((path, body or {}))
+            return {}
+
+    http = _Http()
+    reporter = StatusReporter(http, heartbeat_interval_s=999)
+    worker = SimpleNamespace(
+        _build_status_reporter=lambda client: reporter,
+        _pending_activity="compacting",
+    )
+    runner = StandardWorkerRun(worker)
+
+    built = runner._build_reporter(SimpleNamespace(http=http))
+
+    assert built is reporter
+    assert worker._pending_activity is None
+    await built.report_current_status()
+    assert http.calls[-1][1]["activity"] == "compacting"

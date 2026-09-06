@@ -404,18 +404,25 @@ class StandardWorkerRun:
                 process_factory=preparer.process_factory,
             )
             cleanup = preparer.aclose
+        # Warm opens the driver before ``_start_services`` builds the
+        # reporter, and a session resume can compact right there — hold
+        # the latest label so the reporter starts from it instead of
+        # silently dropping the whole warm-phase window.
+        worker._pending_activity = None
+
         async def emit_activity(activity: str | None) -> None:
-            # Late-bound: the status reporter is built after the adapter
-            # (in ``_start_services``); until then compaction changes are
-            # simply not reported, which matches today's behavior.
             # The overlay flips synchronously (event order preserved);
             # the heartbeat push runs detached because this callback
             # fires under the runtime command lock and a slow status
             # POST must not extend the lock or stall event processing.
-            # The push reads current state at send time, so a reordered
-            # or duplicate send still carries the latest activity.
+            # The reporter serializes status writes and builds each body
+            # under its send lock, so a duplicate or delayed push still
+            # lands carrying the newest state.
             reporter = getattr(worker, "_status_reporter", None)
-            if reporter is not None and reporter.set_activity_overlay(activity):
+            if reporter is None:
+                worker._pending_activity = activity
+                return
+            if reporter.set_activity_overlay(activity):
                 spawn(
                     reporter.report_current_status(),
                     name="activity-heartbeat",
@@ -843,6 +850,14 @@ class StandardWorkerRun:
             return _NoopStatusReporter()
         reporter = self.worker._build_status_reporter(client)
         reporter = reporter if reporter is not None else _NoopStatusReporter()
+        # A warm-phase compaction fires before this reporter exists; the
+        # sink parked the latest label on the worker. Seed the overlay
+        # before the heartbeat loop starts so its immediate first beat
+        # carries it (no extra push needed).
+        pending = getattr(self.worker, "_pending_activity", None)
+        if pending is not None:
+            self.worker._pending_activity = None
+            reporter.set_activity_overlay(pending)
         # The harness activity sink (``_bind_driver_runtime``) late-binds to
         # this attribute; cleared in teardown so a stopped reporter is never
         # driven by a still-draining event stream.
