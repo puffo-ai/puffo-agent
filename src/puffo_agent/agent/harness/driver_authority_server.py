@@ -14,6 +14,7 @@ import os
 import socket
 import struct
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -77,6 +78,7 @@ class _EndpointRecord:
     state: _LeaseState = _LeaseState.ISSUED
     buffer: bytearray = field(default_factory=bytearray)
     thread: threading.Thread | None = None
+    claim_deadline_monotonic: float | None = None
 
 
 class IssuedAuthorityEndpoint:
@@ -163,13 +165,21 @@ class DriverAuthorityServer:
             try:
                 os.set_inheritable(server.fileno(), False)
                 os.set_inheritable(child.fileno(), False)
+                claim_deadline = None
                 if binding.role == "derived":
                     server.settimeout(DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS)
+                    claim_deadline = (
+                        time.monotonic() + DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS
+                    )
             except BaseException:
                 server.close()
                 child.close()
                 raise
-            record = _EndpointRecord(server, binding)
+            record = _EndpointRecord(
+                server,
+                binding,
+                claim_deadline_monotonic=claim_deadline,
+            )
             self._records.append(record)
         return record, child
 
@@ -193,8 +203,19 @@ class DriverAuthorityServer:
             name=f"puffo.driver-authority.{record.binding.launch_id}",
             daemon=True,
         )
-        record.thread = thread
-        thread.start()
+        with self._lock:
+            if (
+                self._closed
+                or record.state is _LeaseState.CLOSED
+                or record not in self._records
+            ):
+                raise RuntimeError("Driver authority server is closed")
+            record.thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                record.thread = None
+                raise
 
     def _serve(self, record: _EndpointRecord) -> None:
         try:
@@ -251,6 +272,7 @@ class DriverAuthorityServer:
             record.state = _LeaseState.CLAIMED
             binding = record.binding
             if binding.role == "derived":
+                record.claim_deadline_monotonic = None
                 record.server_socket.settimeout(None)
         return {
             "version": PROTOCOL_VERSION,
@@ -414,11 +436,22 @@ class DriverAuthorityServer:
             endpoint.sendall(frame[sent:])
 
     @staticmethod
+    def _set_claim_receive_timeout(record: _EndpointRecord) -> None:
+        deadline = record.claim_deadline_monotonic
+        if deadline is None or record.state is not _LeaseState.ISSUED:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("derived authority claim timed out")
+        record.server_socket.settimeout(remaining)
+
+    @staticmethod
     def _recv_frame(record: _EndpointRecord) -> dict[str, Any]:
         received_fds: list[int] = []
 
         def read_exact(count: int) -> bytes:
             while len(record.buffer) < count:
+                DriverAuthorityServer._set_claim_receive_timeout(record)
                 data, ancdata, flags, _ = record.server_socket.recvmsg(
                     MAX_FRAME_BYTES + 4,
                     socket.CMSG_SPACE(MAX_REQUEST_CONTROL_BYTES),
@@ -440,6 +473,7 @@ class DriverAuthorityServer:
             return value
 
         try:
+            DriverAuthorityServer._set_claim_receive_timeout(record)
             size = struct.unpack("!I", read_exact(4))[0]
             if size <= 0 or size > MAX_FRAME_BYTES:
                 raise ValueError("authority request frame is out of bounds")

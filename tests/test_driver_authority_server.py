@@ -494,6 +494,103 @@ def test_derived_thread_start_failure_releases_both_socket_ends(
         server.close()
 
 
+def test_close_cannot_finish_between_thread_publication_and_start(
+    monkeypatch,
+) -> None:
+    """Shutdown must serialize with publishing and starting an endpoint thread."""
+
+    real_thread = threading.Thread
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    close_finished = threading.Event()
+
+    class CoordinatedThread:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            start_entered.set()
+            assert release_start.wait(timeout=2)
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    server = DriverAuthorityServer()
+    binding = authority_server_module._EndpointBinding(
+        "derived-start-race", "derived", "root", 1, "daemon"
+    )
+    record, child = server._issue_endpoint(binding)
+    monkeypatch.setattr(
+        authority_server_module.threading, "Thread", CoordinatedThread
+    )
+
+    starter = real_thread(target=server._start_record, args=(record,))
+
+    def close_server() -> None:
+        server.close()
+        close_finished.set()
+
+    closer = real_thread(target=close_server)
+    starter.start()
+    try:
+        assert start_entered.wait(timeout=2)
+        closer.start()
+        assert not close_finished.wait(timeout=0.1)
+        assert record.state is authority_server_module._LeaseState.ISSUED
+    finally:
+        release_start.set()
+        starter.join(timeout=2)
+        closer.join(timeout=2)
+        child.close()
+        server.close()
+    assert not starter.is_alive()
+    assert not closer.is_alive()
+    assert close_finished.is_set()
+
+
+def test_claim_timeout_is_absolute_across_fragmented_frames(monkeypatch) -> None:
+    """A derived child cannot refresh its claim lease by trickling bytes."""
+
+    monkeypatch.setattr(
+        authority_server_module, "DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS", 1.0
+    )
+    now = [10.0]
+    monkeypatch.setattr(
+        authority_server_module.time, "monotonic", lambda: now[0]
+    )
+    encoded = json.dumps({"version": 1, "op": "hello"}).encode()
+    fragments = list(struct.pack("!I", len(encoded)) + encoded)
+
+    class FragmentSocket:
+        def __init__(self) -> None:
+            self.timeout: float | None = 1.0
+
+        def settimeout(self, value: float | None) -> None:
+            self.timeout = value
+
+        def recvmsg(self, *_args):
+            delay = 0.4
+            if self.timeout is not None and delay > self.timeout:
+                now[0] += self.timeout
+                raise socket.timeout
+            now[0] += delay
+            return bytes([fragments.pop(0)]), [], 0, None
+
+    record = authority_server_module._EndpointRecord(
+        FragmentSocket(),
+        authority_server_module._EndpointBinding(
+            "derived-fragments", "derived", "root", 1, "daemon"
+        ),
+        claim_deadline_monotonic=11.0,
+    )
+
+    with pytest.raises(socket.timeout):
+        DriverAuthorityServer._recv_frame(record)
+
+    assert now[0] == pytest.approx(11.0)
+    assert fragments
+
+
 def test_truncated_request_rights_are_closed_after_disconnect(tmp_path: Path) -> None:
     """A truncated SCM_RIGHTS request must not leak installed descriptors."""
 
