@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 READY_DEADLINE_S = 15.0
+# Daemon-local diagnostic causes (Jeff 188550, Boris 188551). The
+# outward taxonomy does NOT change: the three protocol sub-paths still
+# return and persist (failed, protocol), and a non-loopback ready line
+# still reports non_loopback_ready. This only preserves the operator's
+# troubleshooting signal — notably "something claimed it connected Gmail
+# but never bound loopback", which is the one hint that the configured
+# executor is not the contracted one, and was invisible in the audit.
+#
+# Closed set, defined once: three call sites each typing their own
+# literal would drift silently, and the acceptance leg needs an
+# authoritative list to check the cause says the RIGHT thing, not merely
+# that some diagnostic exists.
+DIAGNOSTIC_CAUSES = (
+    "parse_error",
+    "connected_without_ready",
+    "unknown_terminal_status",
+    "non_loopback_ready",
+)
+
 # The executor enforces its own consent timeout and reports
 # callback_timeout; our read deadline sits above it so the structured
 # reason wins over a daemon-side kill.
@@ -90,6 +109,21 @@ async def _read_event_line(proc: asyncio.subprocess.Process, deadline_s: float) 
     return parsed
 
 
+def _diagnose(cause: str) -> None:
+    """Record why an executor session was not trusted — locally only.
+
+    The diagnostic is a NEW text sink, and this whole round began with
+    free text reaching a sink it should not have. So it carries the
+    closed-set cause and nothing else: no raw event line, no exception
+    text, no stderr, no command or path, no OAuth material. A cause
+    outside the set is dropped rather than written through.
+    """
+    if cause not in DIAGNOSTIC_CAUSES:
+        logger.warning("gmail-connect: diagnostic cause outside the closed set; dropped")
+        return
+    logger.warning("gmail-connect: executor session not trusted (cause=%s)", cause)
+
+
 async def run_gmail_executor(
     entrypoint: str,
     request: dict,
@@ -128,6 +162,7 @@ async def run_gmail_executor(
         else:
             if not _ready_is_loopback(first):
                 await _kill_group(proc)
+                _diagnose("non_loopback_ready")
                 return ExecutorOutcome(status="failed", reason="non_loopback_ready")
             result = await _read_event_line(
                 proc, flow_timeout_s + RESULT_DEADLINE_MARGIN_S
@@ -139,6 +174,7 @@ async def run_gmail_executor(
         return ExecutorOutcome(status="failed", reason="timeout")
     except (ValueError, OSError):
         await _kill_group(proc)
+        _diagnose("parse_error")
         return ExecutorOutcome(status="failed", reason="protocol")
     # The result line is terminal (the executor seals the token before
     # printing it), so a lingering process is cleanup, not work: give
@@ -152,6 +188,7 @@ async def run_gmail_executor(
         if result is first:
             # connected without a ready line is out of contract — a
             # flow that never bound loopback cannot have run consent.
+            _diagnose("connected_without_ready")
             return ExecutorOutcome(status="failed", reason="protocol")
         return ExecutorOutcome(status="connected")
     if status == "failed":
@@ -168,4 +205,5 @@ async def run_gmail_executor(
             )
             reason = "internal_error"
         return ExecutorOutcome(status="failed", reason=reason)
+    _diagnose("unknown_terminal_status")
     return ExecutorOutcome(status="failed", reason="protocol")

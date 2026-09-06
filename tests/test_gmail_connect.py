@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 import stat
 import textwrap
@@ -738,3 +739,94 @@ async def test_protocol_is_a_deliberate_merge_not_an_accident(
 
     assert outcome.status == "failed", label
     assert outcome.reason == "protocol", label
+
+
+# Jeff 188550 / Boris 188551: the deliberate merge keeps an operator
+# signal, without giving the UI a narrower story and without opening a
+# new text sink.
+_DIAGNOSED = [
+    ("parse_error", 'print("{not json")'),
+    ("unknown_terminal_status",
+     'print(json.dumps({"event":"ready",'
+     '"redirect_uri":"http://127.0.0.1:1/oauth2/callback"}));'
+     'sys.stdout.flush();'
+     'print(json.dumps({"event":"result","status":"weird"}))'),
+    ("connected_without_ready",
+     'print(json.dumps({"event":"result","status":"connected"}))'),
+]
+
+
+@pytest.mark.parametrize("cause, body", _DIAGNOSED)
+@pytest.mark.asyncio
+async def test_protocol_subpath_records_its_local_cause(
+    cause, body, tmp_path, home, caplog
+):
+    """Leg 2: the right local cause is present — not merely 'some
+    diagnostic exists'. Leg 1 (outward + persistence unchanged) is
+    pinned by the merge test above."""
+    script = _fake_executor_script(
+        tmp_path,
+        "import json, sys\njson.loads(sys.stdin.readline())\n" + body
+        + "\nsys.stdout.flush()\n",
+    )
+    with caplog.at_level(logging.WARNING, logger=executor_mod.__name__):
+        outcome = await run_gmail_executor(
+            script,
+            {"data_root": "/d", "expected_sha256": "a" * 64, "timeout": 2.0},
+            flow_timeout_s=2.0,
+        )
+
+    assert (outcome.status, outcome.reason) == ("failed", "protocol")
+    assert f"cause={cause}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_carries_the_cause_and_nothing_else(
+    tmp_path, home, caplog
+):
+    """Leg 3: the diagnostic is a NEW text sink, and this whole round
+    began with free text reaching a sink it should not have. Nothing
+    from the executor's own output may ride along."""
+    sentinel = "SENTINEL-client_secret=GOCSPX-abc-/private/secrets/tok.db"
+    # Valid JSON with an unknown event type, on purpose: that path raises
+    # a ValueError the daemon builds itself, so a mutation that folds the
+    # offending line into the message WOULD leak. Malformed JSON cannot
+    # discriminate here — json's own error never quotes the input, so a
+    # sentinel test built on it passes no matter what the code does.
+    script = _fake_executor_script(
+        tmp_path,
+        "import json, sys\njson.loads(sys.stdin.readline())\n"
+        f'print(json.dumps({{"event": "hello", "note": "{sentinel}"}}))\n'
+        "sys.stdout.flush()\n",
+    )
+    with caplog.at_level(logging.WARNING, logger=executor_mod.__name__):
+        outcome = await run_gmail_executor(
+            script,
+            {"data_root": "/d", "expected_sha256": "a" * 64, "timeout": 2.0},
+            flow_timeout_s=2.0,
+        )
+
+    assert (outcome.status, outcome.reason) == ("failed", "protocol")
+    assert "cause=parse_error" in caplog.text
+    # neither the offending line nor any credential-shaped text
+    assert "SENTINEL" not in caplog.text
+    assert "client_secret" not in caplog.text
+    assert "/private/secrets" not in caplog.text
+
+
+def test_diagnostic_causes_are_a_closed_set_defined_once(caplog):
+    """Boris 188551: three call sites typing their own literal would
+    drift silently. A non-member must be dropped, not written through —
+    otherwise the sink accepts free text again by another door."""
+    assert executor_mod.DIAGNOSTIC_CAUSES == (
+        "parse_error",
+        "connected_without_ready",
+        "unknown_terminal_status",
+        "non_loopback_ready",
+    )
+    with caplog.at_level(logging.WARNING, logger=executor_mod.__name__):
+        executor_mod._diagnose("client_secret=GOCSPX-leaked-through-the-cause")
+
+    assert "GOCSPX" not in caplog.text
+    assert "client_secret" not in caplog.text
+    assert "outside the closed set" in caplog.text
