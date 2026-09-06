@@ -79,11 +79,16 @@ _CONFIRM_REFUSALS = {
 
 
 def _confirm_refusal(outcome: ConfirmOutcome) -> dict:
+    """None of the three persist (Jeff 188618 §1).
+
+    An explicit local Yes is the boundary at which this connect may
+    change durable state. Before it nothing has run — no executor, no
+    Google, no token — so recording ``failed`` would invent a change
+    that did not happen, and on an already-connected machine it
+    destroyed a true ``connected`` record. The reply still names which
+    of the three facts occurred; only the projection is left alone.
+    """
     state, reason = _CONFIRM_REFUSALS[outcome]
-    if state == "failed":
-        # A cancel is the user's transient choice and is not recorded as
-        # a failure; everything else is a real failure of this host.
-        store_status(GmailConnectStatus(state=state, reason=reason))
     return _reply(reason, ok=False, state=state)
 
 
@@ -97,7 +102,20 @@ async def gmail_connect_initiate(params: dict) -> dict:
         return _reply("executor_unavailable", ok=False, state="failed")
     if not gc.data_root or not gc.client_bundle_sha256:
         return _reply("executor_unavailable", ok=False, state="failed")
-    if load_status().state == "pending":
+    # Placed after the config pre-flight so a misconfigured machine
+    # still reports the config defect (Jeff 188618 §2). `connected` and
+    # `pending` are mutually exclusive, so the order of these two is
+    # immaterial — they can never both fire.
+    status = load_status()
+    if status.state == "connected":
+        # Idempotent no-op: no dialog, no spawn, no state change. This
+        # also removes the undefined `connected -> pending` transition —
+        # frozen design v1.6 §4 has only
+        # `disconnected -> pending -> connected|failed`, and reserves
+        # `connected -> failed` for a partly-failed composite Disconnect.
+        # Re-auth is deliberately not introduced here.
+        return _reply("", ok=True, state="connected")
+    if status.state == "pending":
         return _reply("protocol", ok=False, state="failed")
     confirm = await request_native_confirm(
         CONNECT_PROMPT, timeout_s=gc.confirm_timeout_seconds

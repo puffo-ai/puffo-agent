@@ -581,10 +581,15 @@ async def test_six_confirm_facts_each_pin_response_and_persistence(
     nobody answering the dialog never contacted Google, while a silent
     executor may already have opened the consent page (Boris 188538).
 
+    Jeff 188618 §1 moved the persistence boundary: an explicit local Yes
+    is where a connect may change durable state, so none of the three
+    non-confirming facts persist any more. The REPLY still tells them
+    apart — that is the half that carries the information.
+
       person clicks Cancel   -> (disconnected, refused)         NOT persisted
-      nobody answers dialog  -> (failed, confirm_timeout)       persisted
-      no dialog backend      -> (failed, confirm_unavailable)   persisted
-      backend failed to run  -> (failed, confirm_unavailable)   persisted
+      nobody answers dialog  -> (failed, confirm_timeout)       NOT persisted
+      no dialog backend      -> (failed, confirm_unavailable)   NOT persisted
+      backend failed to run  -> (failed, confirm_unavailable)   NOT persisted
       executor refuses       -> (failed, refused)               persisted
       executor read timeout  -> (failed, timeout)               persisted
     """
@@ -606,13 +611,13 @@ async def test_six_confirm_facts_each_pin_response_and_persistence(
         if persisted:
             assert (after.state, after.reason) == (expect_state, expect_reason), outcome
         else:
-            # a transient user choice must never be recorded as a failure
+            # nothing ran, so nothing about the machine changed
             assert (after.state, after.reason) == ("disconnected", ""), outcome
 
     await check(ConfirmOutcome.CANCELLED, "disconnected", "refused", persisted=False)
-    await check(ConfirmOutcome.TIMEOUT, "failed", "confirm_timeout", persisted=True)
+    await check(ConfirmOutcome.TIMEOUT, "failed", "confirm_timeout", persisted=False)
     await check(
-        ConfirmOutcome.UNAVAILABLE, "failed", "confirm_unavailable", persisted=True
+        ConfirmOutcome.UNAVAILABLE, "failed", "confirm_unavailable", persisted=False
     )
 
     # fifth fact: the executor refuses before spawn — same reason as a
@@ -1302,3 +1307,115 @@ def test_reply_state_is_required_so_no_branch_can_inherit_the_stored_state():
     # Names actually referenced by the compiled body, so the docstring
     # is free to explain what it no longer does.
     assert "load_status" not in ops._reply.__code__.co_names
+
+
+# Jeff 188618: an explicit local Yes is the boundary at which a connect
+# may change durable state. The tests below hold both sides of it — the
+# three non-confirming outcomes must leave the projection alone, and the
+# confirmed path must still record, so "fixing" one side cannot silently
+# delete the other.
+@pytest.mark.parametrize(
+    "outcome,expected",
+    [
+        (ConfirmOutcome.CANCELLED, ("disconnected", "refused")),
+        (ConfirmOutcome.TIMEOUT, ("failed", "confirm_timeout")),
+        (ConfirmOutcome.UNAVAILABLE, ("failed", "confirm_unavailable")),
+    ],
+)
+@pytest.mark.parametrize("prior", ("disconnected", "failed"))
+@pytest.mark.asyncio
+async def test_no_yes_means_no_write(home, monkeypatch, outcome, expected, prior):
+    """`connected` is not in `prior` here: an already-connected machine
+    never reaches the dialog at all (see the idempotent no-op below), so
+    asking for it in this matrix would test the guard, not the write."""
+    _configured(monkeypatch)
+    store_status(GmailConnectStatus(state=prior))
+    before = status_path().read_bytes()
+    spawns: list[object] = []
+
+    async def stub(prompt, *, timeout_s):
+        return outcome
+
+    async def spy_executor(*a, **k):  # pragma: no cover - must not run
+        spawns.append(a)
+        return ExecutorOutcome(status="connected")
+
+    monkeypatch.setattr(ops, "request_native_confirm", stub)
+    monkeypatch.setattr(ops, "run_gmail_executor", spy_executor)
+
+    res = await ops.gmail_connect_initiate({})
+
+    state, reason = expected
+    assert res == {"ok": False, "state": state, "reason": reason}
+    assert status_path().read_bytes() == before
+    assert spawns == []
+
+
+@pytest.mark.asyncio
+async def test_already_connected_is_an_idempotent_no_op(home, monkeypatch):
+    """Jeff 188618 §2. Frozen design v1.6 §4 has no `connected ->
+    pending` edge, so a second Connect on a connected machine is a
+    success that changes nothing — rather than a dialog the user did not
+    ask for and a transition the state machine does not define."""
+    _configured(monkeypatch)
+    store_status(GmailConnectStatus(state="connected"))
+    before = status_path().read_bytes()
+    confirms: list[str] = []
+    spawns: list[object] = []
+
+    async def spy_confirm(prompt, *, timeout_s):  # pragma: no cover - must not run
+        confirms.append(prompt)
+        return ConfirmOutcome.CONFIRMED
+
+    async def spy_executor(*a, **k):  # pragma: no cover - must not run
+        spawns.append(a)
+        return ExecutorOutcome(status="connected")
+
+    monkeypatch.setattr(ops, "request_native_confirm", spy_confirm)
+    monkeypatch.setattr(ops, "run_gmail_executor", spy_executor)
+
+    res = await ops.gmail_connect_initiate({})
+
+    assert res == {"ok": True, "state": "connected", "reason": ""}
+    assert status_path().read_bytes() == before
+    assert confirms == [], "a connected machine must not be prompted again"
+    assert spawns == []
+
+
+@pytest.mark.asyncio
+async def test_the_no_op_guard_does_not_mask_a_config_defect(home, monkeypatch):
+    """The guard sits AFTER the config pre-flight, so a connected machine
+    whose build is broken still reports the defect instead of a cheerful
+    no-op. Moving the guard earlier turns this red."""
+    _configured(monkeypatch, client_bundle_sha256="A" * 64)
+    store_status(GmailConnectStatus(state="connected"))
+    before = status_path().read_bytes()
+
+    res = await ops.gmail_connect_initiate({})
+
+    assert res == {"ok": False, "state": "failed", "reason": "executor_unavailable"}
+    assert status_path().read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_the_confirmed_side_of_the_boundary_still_persists(home, monkeypatch):
+    """The other half of Jeff 188618: past an explicit Yes, real work
+    happened and the outcome is recorded. Without this, deleting every
+    `store_status` would pass the tests above."""
+    _configured(monkeypatch)
+
+    async def allow(prompt, *, timeout_s):
+        return ConfirmOutcome.CONFIRMED
+
+    async def failing(entrypoint, request, *, flow_timeout_s):
+        return ExecutorOutcome(status="failed", reason="exchange_failed")
+
+    monkeypatch.setattr(ops, "request_native_confirm", allow)
+    monkeypatch.setattr(ops, "run_gmail_executor", failing)
+
+    store_status(GmailConnectStatus(state="disconnected"))
+    res = await ops.gmail_connect_initiate({})
+
+    assert res == {"ok": False, "state": "failed", "reason": "exchange_failed"}
+    after = load_status()
+    assert (after.state, after.reason) == ("failed", "exchange_failed")
