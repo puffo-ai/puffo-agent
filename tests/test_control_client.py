@@ -1009,3 +1009,299 @@ async def test_concurrent_identical_env_edits_are_idempotent(home):
     assert AgentConfig.load("scout").env_overrides == {
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
     }
+
+
+# ── gmail.connect_initiate: off the receive loop, one per machine ─────────
+#
+# `gmail_connect_initiate` waits for a native confirmation dialog (120s
+# default) and then the whole OAuth flow (300s) — up to ~420s. Executed
+# inline in the single machine-control receive loop, that stalls every
+# other machine-level command on the box (Jeff 188674 B).
+#
+# Backgrounding alone is not enough, and the reason is the interesting
+# part (Boris 188675): `ops.gmail_connect_initiate` guards re-entry by
+# reading `load_status()` and refusing when it is already `pending` — but
+# it writes `pending` only AFTER the dialog returns. Read and write are
+# separated by the entire await. That guard holds today ONLY because the
+# receive loop serialises commands; the moment execution moves to a task,
+# two dispatches both read `disconnected`, both pass, and two dialogs
+# appear. A control whose correctness rests on a property we are about to
+# remove fails silently and turns nothing red.
+#
+# So single-flight lives HERE, at the dispatch layer, where the check and
+# the set happen with no await between them.
+
+
+def _connect_frame(command_id, nonce):
+    return {
+        "command_id": command_id,
+        "operator_slug": "op",
+        "envelope": {"nonce": nonce, "ts": 1_000_000},
+    }
+
+
+def _connect_dispatch(monkeypatch, op="gmail.connect_initiate"):
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(
+            operator_root_pubkey="ROOT", server_url="https://s"
+        ),
+    })
+    monkeypatch.setattr(
+        cc,
+        "decrypt_command",
+        lambda *args: {"op": op, "agent_slug": None, "params": {}},
+    )
+    monkeypatch.setattr(cc, "now_ms", lambda: 1_000_000)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_connects_yield_one_confirm_and_one_spawn(monkeypatch):
+    """Two Connects at once must produce ONE dialog and ONE executor spawn.
+
+    The discriminating case. Sequential re-entry is already refused by the
+    status guard; only a genuinely concurrent pair can tell a dispatch-layer
+    single-flight apart from that guard, which cannot see a second caller
+    that has not written `pending` yet.
+    """
+    _connect_dispatch(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def _fake_exec(op, slug, params, **kw):
+        calls.append(op)
+        started.set()
+        await release.wait()          # stands in for the confirmation dialog
+        return {"ok": True, "state": "connected", "reason": ""}
+
+    monkeypatch.setattr(cc, "execute_command", _fake_exec)
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    first = asyncio.ensure_future(
+        client._handle(ws, _connect_frame("c1", "N1"), background_ops=True)
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    # Second Connect arrives while the first is still inside the dialog.
+    # Bounded on purpose: without dispatch-layer single-flight this call
+    # either runs a second execution or blocks behind the first, and a
+    # hanging test is a useless red.
+    await asyncio.wait_for(
+        client._handle(ws, _connect_frame("c2", "N2"), background_ops=True),
+        timeout=5,
+    )
+
+    # Give a wrongly-spawned second execution room to actually run, so the
+    # failure lands on the assertion below instead of some later symptom.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert calls == ["gmail.connect_initiate"], (
+        f"expected exactly one execution while one was in flight, got {calls}"
+    )
+    assert ws.acks[-1] == {
+        "type": "ack",
+        "command_id": "c2",
+        "result": {"ok": False, "state": "failed", "reason": "protocol"},
+    }
+
+    # Dispatch itself returned long ago — the wait lives in the task.
+    assert first.done(), "dispatch must not block on the dialog"
+    running = list(client._command_tasks)
+    assert client._connect_in_flight == "c1"
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*running), timeout=5)
+
+    # The slot is released however the connect ended, so a later Connect runs.
+    assert client._connect_in_flight is None
+    await asyncio.wait_for(
+        client._handle(ws, _connect_frame("c3", "N3"), background_ops=True),
+        timeout=5,
+    )
+    await asyncio.wait_for(
+        asyncio.gather(*list(client._command_tasks)), timeout=5
+    )
+    assert calls == ["gmail.connect_initiate", "gmail.connect_initiate"]
+
+
+@pytest.mark.asyncio
+async def test_a_connect_in_flight_does_not_stall_other_machine_commands(
+    monkeypatch,
+):
+    """Everything else on the machine stays responsive during the dialog.
+
+    Driven the way the receive loop drives it — `await _handle(...)` once
+    per frame, in order. That sequencing IS the thing under test, so an
+    earlier version of this test that started the Connect with
+    `ensure_future` proved nothing: it removed the serialisation it was
+    meant to observe and passed against the unfixed code.
+    """
+    _connect_dispatch(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    done = []
+
+    async def _fake_exec(op, slug, params, **kw):
+        if op == "gmail.connect_initiate":
+            started.set()
+            await release.wait()
+            done.append("connect")
+            return {"ok": True, "state": "connected", "reason": ""}
+        done.append(op)
+        return {"ok": True}
+
+    monkeypatch.setattr(cc, "execute_command", _fake_exec)
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    ops = ["gmail.connect_initiate", "pause"]
+
+    async def _receive_loop():
+        for index, op in enumerate(ops):
+            monkeypatch.setattr(
+                cc,
+                "decrypt_command",
+                lambda *args, _op=op: {
+                    "op": _op, "agent_slug": "a1", "params": {},
+                },
+            )
+            await client._handle(
+                ws, _connect_frame(f"c{index}", f"N{index}"), background_ops=True
+            )
+
+    # Pre-fix this times out: the loop is still inside the dialog and never
+    # reaches the `pause` frame at all.
+    loop_task = asyncio.ensure_future(_receive_loop())
+    await asyncio.wait_for(started.wait(), timeout=5)
+    await asyncio.wait_for(loop_task, timeout=5)
+
+    assert done == ["pause"], "a machine command was stalled behind the dialog"
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*client._command_tasks), timeout=5)
+    assert done == ["pause", "connect"]
+
+
+@pytest.mark.asyncio
+async def test_the_connect_slot_is_released_even_if_the_op_raises(monkeypatch):
+    """A crashed connect must not wedge Connect until the daemon restarts."""
+    _connect_dispatch(monkeypatch)
+
+    async def _boom(op, slug, params, **kw):
+        raise RuntimeError("executor blew up")
+
+    monkeypatch.setattr(cc, "execute_command", _boom)
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    await asyncio.wait_for(
+        client._handle(ws, _connect_frame("c1", "N1"), background_ops=True),
+        timeout=5,
+    )
+    await asyncio.wait_for(
+        asyncio.gather(*list(client._command_tasks), return_exceptions=True),
+        timeout=5,
+    )
+    assert client._connect_in_flight is None
+
+
+@pytest.mark.asyncio
+async def test_a_connect_outlives_its_socket_and_frees_the_slot_when_it_ends(
+    monkeypatch,
+):
+    """Session teardown must NOT cancel an in-flight connect.
+
+    Background commands are socket-independent on purpose: spawned with no
+    `ws`, result held and flushed on the next authenticated connection
+    (the same property `test_create_wait_does_not_block_followup_machine_command`
+    pins for create). An earlier version of this test asserted the
+    opposite — cancel everything on disconnect — and would have aborted a
+    dialog the user was answering while looking green.
+
+    What must hold is narrower: whenever the connect ends, the
+    single-flight slot is freed, so the next session is not wedged.
+    """
+    _connect_dispatch(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow(op, slug, params, **kw):
+        started.set()
+        await release.wait()
+        return {"ok": True, "state": "connected", "reason": ""}
+
+    monkeypatch.setattr(cc, "execute_command", _slow)
+    client = MachineControlClient(machine=object())
+
+    await asyncio.wait_for(
+        client._handle(_FakeWS(), _connect_frame("c1", "N1"), background_ops=True),
+        timeout=5,
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    running = list(client._command_tasks)
+    assert running and client._connect_in_flight == "c1"
+
+    # The socket goes away underneath it.
+    client._active_ws = None
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not any(task.done() for task in running), (
+        "losing the socket must not kill an in-flight connect"
+    )
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*running), timeout=5)
+    assert client._connect_in_flight is None
+    # The outcome is queued for the next authenticated socket, not dropped.
+    assert client._pending_acks["c1"] == {
+        "ok": True, "state": "connected", "reason": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_and_capabilities_keep_running_during_a_connect(
+    monkeypatch,
+):
+    """The status projection is the ONLY way the Web learns the outcome.
+
+    `capabilities.gmail_connect` rides the heartbeat loop, which is a
+    separate task; if a connect could starve it, the pending -> connected
+    projection would not leave the machine and the UI would stay silent.
+    """
+    _connect_dispatch(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_exec(op, slug, params, **kw):
+        started.set()
+        await release.wait()
+        return {"ok": True, "state": "connected", "reason": ""}
+
+    monkeypatch.setattr(cc, "execute_command", _fake_exec)
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    await asyncio.wait_for(
+        client._handle(ws, _connect_frame("c1", "N1"), background_ops=True),
+        timeout=5,
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    # Stand-in for the heartbeat task: it must get scheduled while the
+    # connect sits in its dialog.
+    beats = []
+
+    async def _beat():
+        for _ in range(3):
+            await asyncio.sleep(0)
+            beats.append(1)
+
+    await asyncio.wait_for(_beat(), timeout=5)
+    assert beats == [1, 1, 1]
+
+    release.set()
+    await asyncio.wait_for(
+        asyncio.gather(*list(client._command_tasks)), timeout=5
+    )

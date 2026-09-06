@@ -50,6 +50,12 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 AGENT_START_TIMEOUT_SECONDS = 10 * 60.0
 AGENT_START_POLL_SECONDS = 0.5
 
+# Ops that must not run inline in the single machine-control receive loop.
+# `create` waits on a Docker build; `gmail.connect_initiate` waits on a
+# native confirmation dialog and then the OAuth flow.
+CONNECT_OP = "gmail.connect_initiate"
+BACKGROUND_OPS = frozenset({"create", CONNECT_OP})
+
 
 class _DuplicateDelivery(ControlError):
     pass
@@ -645,6 +651,8 @@ class MachineControlClient:
         self.machine = machine
         self._seen_nonces: dict[str, int] = {}  # nonce -> ts; pruned to the ts window
         self._command_tasks: set[asyncio.Future] = set()
+        # command_id of the connect currently running, or None.
+        self._connect_in_flight: str | None = None
         self._inflight_command_ids: set[str] = set()
         self._nonce_commands: dict[str, str] = {}
         self._completed_results: dict[str, dict] = {}
@@ -715,7 +723,7 @@ class MachineControlClient:
                                     "control: WS connected; agent.status sender ready"
                                 )
                         elif frame.get("type") == "command":
-                            await self._handle(ws, frame, background_create=True)
+                            await self._handle(ws, frame, background_ops=True)
                         elif frame.get("type") == "error":
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
@@ -752,7 +760,7 @@ class MachineControlClient:
         ws: aiohttp.ClientWebSocketResponse,
         frame: dict,
         *,
-        background_create: bool = False,
+        background_ops: bool = False,
     ) -> None:
         command_id = frame.get("command_id")
         operator_slug = frame.get("operator_slug")
@@ -819,28 +827,14 @@ class MachineControlClient:
             log.warning("control: command %s failed: %s", command_id, exc)
             result = {"ok": False, "error_code": "command_failed"}
         else:
-            execution = self._execute_and_ack(
-                (
-                    None
-                    if background_create and command_id and decrypted["op"] == "create"
-                    else ws
-                ),
+            await self._dispatch_verified(
+                ws,
                 command_id,
                 decrypted,
                 pairing,
                 nonce=str(nonce) if nonce else None,
+                background_ops=background_ops,
             )
-            if command_id:
-                self._inflight_command_ids.add(str(command_id))
-            if background_create and command_id and decrypted["op"] == "create":
-                # A first Docker image build can take minutes. Keep that wait
-                # out of the one machine-control receive loop so pause/resume,
-                # runtime decisions, and other operators remain responsive.
-                task = spawn(execution, name=f"control.create:{command_id}")
-                self._command_tasks.add(task)
-                task.add_done_callback(self._command_tasks.discard)
-                return
-            await execution
             return
 
         await self._send_ack(command_id, result, ws=ws)
@@ -888,6 +882,94 @@ class MachineControlClient:
                 # never the side effect.
                 self._seen_nonces[nonce] = now_ms()
         await self._send_ack(command_id, result, ws=ws)
+
+    async def _dispatch_verified(
+        self,
+        ws,
+        command_id,
+        decrypted: dict,
+        pairing,
+        *,
+        nonce: str | None,
+        background_ops: bool,
+    ) -> None:
+        """Run an authenticated command inline, in the background, or refuse it.
+
+        Split out of ``_handle`` so the verification path and the execution
+        path stay separately readable.
+        """
+        op = str(decrypted["op"])
+        if op == CONNECT_OP and self._connect_in_flight is not None:
+            # Single-flight, at the dispatch layer and nowhere else.
+            #
+            # `ops.gmail_connect_initiate` refuses re-entry by reading
+            # `load_status()`, but it writes `pending` only AFTER the
+            # confirmation dialog returns — read and write separated by
+            # a 120s await. That guard holds today only because this
+            # receive loop runs commands one at a time; backgrounding
+            # the op removes exactly that property, and two dispatches
+            # would both read `disconnected`, both pass, and raise two
+            # dialogs. Here the check and the set below happen with no
+            # await between them, so no second caller can interleave.
+            #
+            # `(failed, protocol)` already means "a flow is running on
+            # this machine", so reusing it widens nothing. It does not
+            # persist: a duplicate click changed no durable state.
+            log.info(
+                "control: connect already in flight (%s); refusing %s",
+                self._connect_in_flight,
+                command_id,
+            )
+            await self._send_ack(
+                command_id,
+                {"ok": False, "state": "failed", "reason": "protocol"},
+                ws=ws,
+            )
+            return
+        background = bool(background_ops and command_id and op in BACKGROUND_OPS)
+        execution = self._execute_and_ack(
+            None if background else ws,
+            command_id,
+            decrypted,
+            pairing,
+            nonce=nonce,
+        )
+        if command_id:
+            self._inflight_command_ids.add(str(command_id))
+        if background:
+            # A first Docker image build can take minutes, and a Gmail
+            # connect waits on a human plus a full OAuth flow (~420s).
+            # Keep those waits out of the one machine-control receive
+            # loop so pause/resume, runtime decisions, and other
+            # operators remain responsive.
+            if op == CONNECT_OP:
+                self._connect_in_flight = str(command_id)
+            task = spawn(execution, name=f"control.{op}:{command_id}")
+            self._command_tasks.add(task)
+            task.add_done_callback(self._command_tasks.discard)
+            if op == CONNECT_OP:
+                task.add_done_callback(self._release_connect_slot)
+            return
+        await execution
+        return
+
+    def _release_connect_slot(self, _task: asyncio.Future) -> None:
+        """Free the single-flight slot however the connect ended.
+
+        A done callback, not a `finally` inside the op: the slot is owned
+        by the dispatch layer that took it, so cancellation and crashes
+        release it too. Leaking it would wedge Connect on this machine
+        until the daemon restarted.
+
+        This is also why session teardown does NOT cancel background
+        commands. They are deliberately socket-independent — spawned with
+        no `ws`, their result held in `_pending_acks` and flushed on the
+        next authenticated connection. Cancelling on disconnect would
+        abort a dialog the user is in the middle of answering and throw
+        away an outcome the protocol can still deliver; the slot is freed
+        here when the task ends, whichever session is live by then.
+        """
+        self._connect_in_flight = None
 
     async def _send_ack(
         self,
