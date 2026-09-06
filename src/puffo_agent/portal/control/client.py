@@ -920,11 +920,20 @@ class MachineControlClient:
                 self._connect_in_flight,
                 command_id,
             )
-            await self._send_ack(
-                command_id,
-                {"ok": False, "state": "failed", "reason": "protocol"},
-                ws=ws,
-            )
+            refusal = {"ok": False, "state": "failed", "reason": "protocol"}
+            if command_id:
+                # Record it like any other completed command. This branch
+                # returns before `_execute_and_ack`, so it used to skip that
+                # function's `finally` — and a redelivery of the same
+                # command_id then found nothing cached and degraded to
+                # `{ok: False, error_code: "command_rejected"}` (Boris
+                # 188728). `_flush_pending_acks` promises to "replay the
+                # result, never the side effect"; without this the
+                # side-effect half held and the result half did not, and a
+                # UI classifying on `(ok, state, reason)` got a reply with
+                # neither field.
+                self._completed_results[str(command_id)] = refusal
+            await self._send_ack(command_id, refusal, ws=ws)
             return
         background = bool(background_ops and command_id and op in BACKGROUND_OPS)
         execution = self._execute_and_ack(

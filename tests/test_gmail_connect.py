@@ -28,7 +28,6 @@ from puffo_agent.portal.gmail_connect.executor import (
     run_gmail_executor,
 )
 from puffo_agent.portal.gmail_connect.status_store import (
-    EXECUTOR_FAILURE_REASONS,
     EXECUTOR_REASONS,
     PERSISTABLE_PAIRS,
     UNTRUSTED_STATUS_PAIR,
@@ -1722,9 +1721,9 @@ def _derive_persisted_pairs():
     sources = sorted(package.glob("*.py"))
     assert sources, "no package sources — the alarm would be blind"
 
+    trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in sources}
     written, sites = set(), []
-    for path in sources:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    for path, tree in trees.items():
         for node in ast.walk(tree):
             if _called_name(node) != "GmailConnectStatus":
                 continue
@@ -1751,7 +1750,15 @@ def _derive_persisted_pairs():
             assert expression == "outcome.reason", (
                 f"{sites[-1]}: undeclared dynamic reason {expression!r}"
             )
-            written |= {(state, r) for r in EXECUTOR_FAILURE_REASONS}
+            # DERIVED, not the `EXECUTOR_FAILURE_REASONS` constant.
+            # `PERSISTABLE_PAIRS` is itself built from that constant, so
+            # using it here made the assertion `X | C == Y | C` — C cancels
+            # and the alarm goes blind to exactly the change it exists to
+            # catch. Measured on 914ed30 (Boris 188728): mint a new reason
+            # at an `ExecutorOutcome` site and the REPLY alarm goes red
+            # while this one stays green, even though the value round-trips
+            # `('failed', <new>)` -> `('disconnected', 'internal_error')`.
+            written |= {(state, r) for r in _executor_failure_reasons(trees)}
 
     assert sites, "no store_status(GmailConnectStatus(...)) sites found"
     # The missing-file default is a producer too, just not a written one.

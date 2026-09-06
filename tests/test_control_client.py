@@ -1305,3 +1305,54 @@ async def test_heartbeat_and_capabilities_keep_running_during_a_connect(
     await asyncio.wait_for(
         asyncio.gather(*list(client._command_tasks)), timeout=5
     )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_duplicate_connect_replays_its_reply_on_redelivery(
+    monkeypatch,
+):
+    """A redelivered refusal must replay `(failed, protocol)`, not degrade.
+
+    The single-flight branch returns before `_execute_and_ack`, so it skips
+    that function's `finally` and recorded nothing. A server redelivery of
+    the same command_id then found no cached result and answered
+    `{ok: False, error_code: "command_rejected"}` — no `state`, no
+    `reason`, which is precisely what the UI classifies on (Boris 188728).
+
+    `_flush_pending_acks` documents "replay the result, never the side
+    effect"; before this the side-effect half held and the result half did
+    not.
+    """
+    _connect_dispatch(monkeypatch)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _fake_exec(op, slug, params, **kw):
+        started.set()
+        await release.wait()
+        return {"ok": True, "state": "connected", "reason": ""}
+
+    monkeypatch.setattr(cc, "execute_command", _fake_exec)
+    client = MachineControlClient(machine=object())
+    ws = _FakeWS()
+
+    await asyncio.wait_for(
+        client._handle(ws, _connect_frame("c1", "N1"), background_ops=True),
+        timeout=5,
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+
+    refused = _connect_frame("c2", "N2")
+    await asyncio.wait_for(client._handle(ws, refused, background_ops=True), timeout=5)
+    first = ws.acks[-1]
+    assert first["result"] == {"ok": False, "state": "failed", "reason": "protocol"}
+
+    # The server redelivers the very same command (same id, same nonce).
+    await asyncio.wait_for(client._handle(ws, refused, background_ops=True), timeout=5)
+
+    assert ws.acks[-1] == first, (
+        f"redelivery degraded the reply: {ws.acks[-1]['result']}"
+    )
+
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*list(client._command_tasks)), timeout=5)
