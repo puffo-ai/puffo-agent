@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from enum import Enum
 
 
 logger = logging.getLogger(__name__)
@@ -28,15 +29,42 @@ _OSASCRIPT_DIALOG = (
 )
 
 
-async def request_native_confirm(prompt: str, *, timeout_s: float = 120.0) -> bool:
-    """True only on an explicit local confirmation; everything else —
-    cancel, timeout, unsupported platform, osascript failure — is False."""
+class ConfirmOutcome(Enum):
+    """Why the confirmation did or did not happen.
+
+    A bool cannot carry this: cancel, timeout, a host with no dialog
+    backend at all, and a backend that failed to run are four different
+    facts, and collapsing them told the user "cancelled" on machines
+    that can never connect (Boris 188533, ruling Jeff 188535).
+    """
+
+    CONFIRMED = "confirmed"
+    CANCELLED = "cancelled"        # provably a person declining
+    TIMEOUT = "timeout"            # nobody answered in time
+    UNAVAILABLE = "unavailable"    # no backend, or the backend failed
+
+
+# osascript reports an explicit user cancel as AppleScript error -128.
+# Matching it is what lets us tell "a person said no" from "the dialog
+# never worked"; anything else non-zero is NOT assumed to be a person.
+_USER_CANCELLED_MARKER = "(-128)"
+
+
+async def request_native_confirm(
+    prompt: str, *, timeout_s: float = 120.0
+) -> ConfirmOutcome:
+    """``CONFIRMED`` only on an explicit local confirmation.
+
+    Every other branch names itself, and unknown failures fail closed to
+    ``UNAVAILABLE`` rather than being guessed as a cancel — claiming the
+    user declined when we do not know is both untrue and unactionable.
+    """
     if sys.platform != "darwin":
         logger.warning(
             "gmail-connect: no native confirm backend on %s; refusing",
             sys.platform,
         )
-        return False
+        return ConfirmOutcome.UNAVAILABLE
     script = _OSASCRIPT_DIALOG.format(prompt=prompt.replace('"', "'"))
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -44,17 +72,27 @@ async def request_native_confirm(prompt: str, *, timeout_s: float = 120.0) -> bo
             "-e",
             script,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
     except OSError:
         logger.warning("gmail-connect: osascript unavailable; refusing")
-        return False
+        return ConfirmOutcome.UNAVAILABLE
     try:
-        code = await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         logger.info("gmail-connect: confirm dialog timed out; refusing")
-        return False
-    # osascript exits non-zero when the user cancels the dialog.
-    return code == 0
+        return ConfirmOutcome.TIMEOUT
+    if proc.returncode == 0:
+        return ConfirmOutcome.CONFIRMED
+    # Only the documented cancel signature counts as a person saying no.
+    # stderr is inspected for that marker and never propagated further —
+    # it is diagnostic text, and Layer B takes none of it.
+    if _USER_CANCELLED_MARKER in (stderr or b"").decode("utf-8", "replace"):
+        return ConfirmOutcome.CANCELLED
+    logger.warning(
+        "gmail-connect: confirm backend failed (rc=%s); refusing",
+        proc.returncode,
+    )
+    return ConfirmOutcome.UNAVAILABLE

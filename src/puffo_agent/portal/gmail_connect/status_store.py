@@ -49,6 +49,7 @@ EXECUTOR_REASONS = (
 )
 DAEMON_REASONS = (
     "refused",
+    "confirm_unavailable",
     "executor_unavailable",
     "non_loopback_ready",
     "timeout",

@@ -14,7 +14,7 @@ import logging
 
 from ..state import DaemonConfig
 from .executor import ExecutorRefused, run_gmail_executor
-from .native_confirm import CONNECT_PROMPT, request_native_confirm
+from .native_confirm import CONNECT_PROMPT, ConfirmOutcome, request_native_confirm
 from .status_store import REASONS, GmailConnectStatus, load_status, store_status
 
 
@@ -50,6 +50,26 @@ def _reply(reason: str, *, ok: bool, state: str = "") -> dict:
     return {"ok": ok, "state": state or load_status().state, "reason": reason}
 
 
+# Jeff 188535: the four non-confirming facts are NOT one outcome. Only a
+# provable human cancel reports as a transient user choice; the rest are
+# failures of this machine, and are persisted as such so the UI can say
+# something true and actionable instead of "cancelled".
+_CONFIRM_REFUSALS = {
+    ConfirmOutcome.CANCELLED: ("disconnected", "refused"),
+    ConfirmOutcome.TIMEOUT: ("failed", "timeout"),
+    ConfirmOutcome.UNAVAILABLE: ("failed", "confirm_unavailable"),
+}
+
+
+def _confirm_refusal(outcome: ConfirmOutcome) -> dict:
+    state, reason = _CONFIRM_REFUSALS[outcome]
+    if state == "failed":
+        # A cancel is the user's transient choice and is not recorded as
+        # a failure; everything else is a real failure of this host.
+        store_status(GmailConnectStatus(state=state, reason=reason))
+    return _reply(reason, ok=False, state=state)
+
+
 async def gmail_connect_initiate(params: dict) -> dict:
     gc = _config().gmail_connect
     if not gc.enabled or not gc.executor_path:
@@ -58,11 +78,11 @@ async def gmail_connect_initiate(params: dict) -> dict:
         return _reply("executor_unavailable", ok=False)
     if load_status().state == "pending":
         return _reply("protocol", ok=False)
-    confirmed = await request_native_confirm(
+    confirm = await request_native_confirm(
         CONNECT_PROMPT, timeout_s=gc.confirm_timeout_seconds
     )
-    if not confirmed:
-        return _reply("refused", ok=False)
+    if confirm is not ConfirmOutcome.CONFIRMED:
+        return _confirm_refusal(confirm)
     store_status(GmailConnectStatus(state="pending"))
     try:
         outcome = await run_gmail_executor(

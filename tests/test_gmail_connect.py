@@ -20,6 +20,7 @@ import pytest
 
 from puffo_agent.portal.gmail_connect import executor as executor_mod
 from puffo_agent.portal.gmail_connect import ops
+from puffo_agent.portal.gmail_connect.native_confirm import ConfirmOutcome
 from puffo_agent.portal.gmail_connect.executor import (
     ExecutorOutcome,
     ExecutorRefused,
@@ -63,7 +64,7 @@ async def test_declined_confirm_never_spawns_executor(home, monkeypatch):
     calls: list[dict] = []
 
     async def deny(prompt, *, timeout_s):
-        return False
+        return ConfirmOutcome.CANCELLED
 
     async def spy_executor(*a, **k):  # pragma: no cover - must not run
         calls.append({})
@@ -104,7 +105,7 @@ async def test_confirmed_flow_persists_layer_b_projection_only(home, monkeypatch
     sent: list[dict] = []
 
     async def allow(prompt, *, timeout_s):
-        return True
+        return ConfirmOutcome.CONFIRMED
 
     async def fake_executor(entrypoint, request, *, flow_timeout_s):
         sent.append(request)
@@ -133,7 +134,7 @@ async def test_failed_reason_reaches_projection_coarse(home, monkeypatch):
     _configured(monkeypatch)
 
     async def allow(prompt, *, timeout_s):
-        return True
+        return ConfirmOutcome.CONFIRMED
 
     async def failing_executor(entrypoint, request, *, flow_timeout_s):
         return ExecutorOutcome(status="failed", reason="callback_timeout")
@@ -418,7 +419,7 @@ async def test_out_of_roster_reason_is_clamped_before_layer_b(tmp_path, home, mo
     )
     monkeypatch.setattr(ops, "_config", lambda: cfg)
     async def allow(prompt, timeout_s=0.0):
-        return True
+        return ConfirmOutcome.CONFIRMED
 
     monkeypatch.setattr(ops, "request_native_confirm", allow)
 
@@ -478,10 +479,10 @@ async def test_every_ops_exit_is_exactly_ok_state_reason(tmp_path, home, monkeyp
     ``updated_at``, and no free text anywhere.
     """
     async def deny(prompt, timeout_s=0.0):
-        return False
+        return ConfirmOutcome.CANCELLED
 
     async def allow(prompt, timeout_s=0.0):
-        return True
+        return ConfirmOutcome.CONFIRMED
 
     def check(reply):
         assert set(reply) <= ALLOWED_REPLY_KEYS, reply
@@ -565,55 +566,109 @@ def test_reply_clamps_free_text_on_its_own_leg():
 
 
 @pytest.mark.asyncio
-async def test_refused_is_disambiguated_by_the_state_it_is_paired_with(
+async def test_five_confirm_facts_each_pin_response_and_persistence(
     tmp_path, home, monkeypatch
 ):
-    """Jeff 188531: ``refused`` is deliberately not split into two values;
-    meaning is carried by the ``(state, reason)`` PAIR plus what is persisted.
+    """Jeff 188535's table, all five facts, both legs each.
 
-      user cancels the native confirm  -> (disconnected, refused), nothing persisted
-      daemon/executor refuses to spawn -> (failed,       refused), persisted
+    ``refused`` is reserved for a person who provably declined. The other
+    non-confirming facts are failures of this machine and must say so —
+    collapsing them reported "cancelled" on every non-macOS host, which
+    is untrue and leaves the user nothing to act on (Boris 188533).
 
-    Collapsing either half (persisting the cancel, or not persisting the
-    refusal) turns this red while every single-branch test stays green.
-
-    SCOPE — this pins 2 of 4 facts, on purpose. ``request_native_confirm``
-    returns False for FOUR distinct things (its own docstring says so):
-    cancel, dialog timeout, no native backend at all (any non-macOS host),
-    and osascript failure. All four currently produce a byte-identical
-    ``(disconnected, refused)``, so on a non-macOS host every connect
-    attempt tells the user "cancelled" — untrue and unactionable
-    (Boris 188533, reproduced here). The two cells pinned above hold
-    under either remedy Boris proposed; the other two await Jeff's
-    re-ruling and must be added then. Do not read this test as evidence
-    that ``refused`` is fully discriminating — it is not.
+      person clicks Cancel  -> (disconnected, refused)         NOT persisted
+      nobody answers        -> (failed, timeout)               persisted
+      no dialog backend     -> (failed, confirm_unavailable)   persisted
+      backend failed to run -> (failed, confirm_unavailable)   persisted
+      executor refuses      -> (failed, refused)               persisted
     """
     _configured(monkeypatch)
 
-    async def deny(prompt, *, timeout_s):
-        return False
+    def confirm_as(outcome):
+        async def stub(prompt, *, timeout_s):
+            return outcome
+        monkeypatch.setattr(ops, "request_native_confirm", stub)
 
+    async def check(outcome, expect_state, expect_reason, *, persisted):
+        store_status(GmailConnectStatus(state="disconnected"))
+        confirm_as(outcome)
+        reply = await ops.gmail_connect_initiate({})
+        assert reply == {
+            "ok": False, "state": expect_state, "reason": expect_reason
+        }, outcome
+        after = load_status()
+        if persisted:
+            assert (after.state, after.reason) == (expect_state, expect_reason), outcome
+        else:
+            # a transient user choice must never be recorded as a failure
+            assert (after.state, after.reason) == ("disconnected", ""), outcome
+
+    await check(ConfirmOutcome.CANCELLED, "disconnected", "refused", persisted=False)
+    await check(ConfirmOutcome.TIMEOUT, "failed", "timeout", persisted=True)
+    await check(
+        ConfirmOutcome.UNAVAILABLE, "failed", "confirm_unavailable", persisted=True
+    )
+
+    # fifth fact: the executor refuses before spawn — same reason as a
+    # cancel, told apart by state and by being recorded.
     async def refuse(*a, **k):
         raise ExecutorRefused("entrypoint is not executable")
 
-    # half 1 — the user said no: reported, not recorded
-    monkeypatch.setattr(ops, "request_native_confirm", deny)
-    cancel = await ops.gmail_connect_initiate({})
-    assert cancel == {"ok": False, "state": "disconnected", "reason": "refused"}
-    assert load_status().state == "disconnected"
-    assert load_status().reason == ""
-
-    # half 2 — same reason, different state, and it IS recorded
-    async def allow(prompt, *, timeout_s):
-        return True
-
-    monkeypatch.setattr(ops, "request_native_confirm", allow)
+    store_status(GmailConnectStatus(state="disconnected"))
+    confirm_as(ConfirmOutcome.CONFIRMED)
     monkeypatch.setattr(ops, "run_gmail_executor", refuse)
-    blocked = await ops.gmail_connect_initiate({})
-    assert blocked == {"ok": False, "state": "failed", "reason": "refused"}
-    assert load_status().state == "failed"
-    assert load_status().reason == "refused"
+    reply = await ops.gmail_connect_initiate({})
+    assert reply == {"ok": False, "state": "failed", "reason": "refused"}
+    assert (load_status().state, load_status().reason) == ("failed", "refused")
 
-    # the pair is what carries the meaning: the reason alone does not
-    assert cancel["reason"] == blocked["reason"] == "refused"
-    assert cancel["state"] != blocked["state"]
+
+@pytest.mark.parametrize(
+    "returncode, stderr, expected",
+    [
+        (0, b"", "CONFIRMED"),
+        (1, b"0:17: execution error: User canceled. (-128)", "CANCELLED"),
+        # anything else non-zero: we do NOT know a person declined
+        (1, b"0:4: execution error: The variable x is not defined. (-2753)",
+         "UNAVAILABLE"),
+        (127, b"", "UNAVAILABLE"),
+        (1, b"", "UNAVAILABLE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_confirm_classification_fails_closed(
+    returncode, stderr, expected, monkeypatch
+):
+    """Fail closed: only the documented cancel signature (-128) may be
+    read as a person declining. Every other non-zero exit is UNAVAILABLE.
+
+    Drives the classification itself with a fake subprocess — the mapping
+    table test cannot see this, so flipping the fallback to CANCELLED
+    (claiming the user declined when we do not know) would otherwise stay
+    green on every platform.
+    """
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    class FakeProc:
+        def __init__(self):
+            self.returncode = returncode
+
+        async def communicate(self):
+            return b"", stderr
+
+    async def fake_exec(*a, **k):
+        return FakeProc()
+
+    monkeypatch.setattr(nc.sys, "platform", "darwin")
+    monkeypatch.setattr(nc.asyncio, "create_subprocess_exec", fake_exec)
+
+    outcome = await nc.request_native_confirm("prompt")
+
+    assert outcome.name == expected
+
+
+def test_only_a_provable_cancel_escapes_being_recorded_as_failure():
+    from puffo_agent.portal.gmail_connect import native_confirm as nc
+
+    assert ops._CONFIRM_REFUSALS[nc.ConfirmOutcome.CANCELLED][0] == "disconnected"
+    assert ops._CONFIRM_REFUSALS[nc.ConfirmOutcome.TIMEOUT][0] == "failed"
+    assert ops._CONFIRM_REFUSALS[nc.ConfirmOutcome.UNAVAILABLE][0] == "failed"
