@@ -22,6 +22,7 @@ from ...context_controller import (
     RolloverResult,
     ToolResultAdmission,
     normalize_context_snapshot,
+    normalize_tool_name,
 )
 from ...errors import AgentAPIError, ProviderFailureError
 from ...provider_failures import (
@@ -1084,6 +1085,33 @@ class RuntimeManager:
         ):
             return
         tool_name = str(fact.get("tool_name") or "")
+        tool_call_id = str(fact.get("tool_call_id") or "")
+        admission_binding = fact.get("admission_binding")
+        if fact.get("provider_context_committed") is True:
+            candidates = [
+                (index, admission)
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == event.native_turn_id
+                and admission.tool_names
+                and normalize_tool_name(tool_name) in admission.tool_names
+                and isinstance(admission_binding, str)
+                and admission.binding_for_tool_call(tool_call_id)
+                == admission_binding
+            ]
+            if not candidates:
+                return
+            index, admission = max(
+                candidates, key=lambda value: value[1].match_specificity
+            )
+            self._continuation_admissions.pop(index)
+            await admission.callback(ProviderAdmissionEvent(
+                planning_cycle_key=admission.planning_cycle_key,
+                provider_session_id=self.native_session_id,
+                provider_turn_id=event.native_turn_id,
+                tool_call_id=tool_call_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+            return
         arguments = fact.get("arguments")
         if not isinstance(arguments, dict):
             return
