@@ -1326,8 +1326,10 @@ async def test_a_refused_duplicate_connect_replays_its_reply_on_redelivery(
     _connect_dispatch(monkeypatch)
     started = asyncio.Event()
     release = asyncio.Event()
+    executions = []
 
     async def _fake_exec(op, slug, params, **kw):
+        executions.append(op)
         started.set()
         await release.wait()
         return {"ok": True, "state": "connected", "reason": ""}
@@ -1347,11 +1349,20 @@ async def test_a_refused_duplicate_connect_replays_its_reply_on_redelivery(
     first = ws.acks[-1]
     assert first["result"] == {"ok": False, "state": "failed", "reason": "protocol"}
 
+    # The mechanism, not just the reply: the shape used to change because
+    # this branch returned before `_execute_and_ack` and skipped its
+    # `finally`. Asserting only the two replies would record the cause
+    # wrong (Boris 188728).
+    assert client._completed_results["c2"] == first["result"]
+
     # The server redelivers the very same command (same id, same nonce).
     await asyncio.wait_for(client._handle(ws, refused, background_ops=True), timeout=5)
 
     assert ws.acks[-1] == first, (
         f"redelivery degraded the reply: {ws.acks[-1]['result']}"
+    )
+    assert executions == ["gmail.connect_initiate"], (
+        f"redelivery must replay the result, never the side effect: {executions}"
     )
 
     release.set()
