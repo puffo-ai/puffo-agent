@@ -6,6 +6,8 @@ import os
 import socket
 import stat
 import struct
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -144,16 +146,34 @@ def test_endpoint_claim_transition_cannot_be_interleaved() -> None:
     probe_lock = threading.Lock()
     probe_entries = 0
 
-    def claim_probe() -> None:
-        nonlocal probe_entries
-        with probe_lock:
-            probe_entries += 1
-            (first_inside if probe_entries == 1 else second_inside).set()
-        assert release.wait(timeout=2)
+    class CoordinatedRecord:
+        """Pause the first state read without adding a production test hook."""
 
-    server = DriverAuthorityServer(claim_probe=claim_probe)
-    endpoint = server.issue_root(launch_id="root-race")
-    record = server._records[0]
+        binding = authority_server_module._EndpointBinding(
+            "root-race", "root", None, 0, None
+        )
+
+        def __init__(self) -> None:
+            self._state = authority_server_module._LeaseState.ISSUED
+
+        @property
+        def state(self):
+            nonlocal probe_entries
+            with probe_lock:
+                observed = self._state
+                probe_entries += 1
+                entry = probe_entries
+                (first_inside if entry == 1 else second_inside).set()
+            if entry == 1:
+                assert release.wait(timeout=2)
+            return observed
+
+        @state.setter
+        def state(self, value) -> None:
+            self._state = value
+
+    server = DriverAuthorityServer()
+    record = CoordinatedRecord()
     responses: list[dict[str, Any]] = []
     start = threading.Barrier(3)
 
@@ -173,15 +193,45 @@ def test_endpoint_claim_transition_cannot_be_interleaved() -> None:
             claimant.join(timeout=2)
             assert not claimant.is_alive()
 
-        assert probe_entries == 1
+        assert probe_entries == 2
+        assert second_inside.is_set()
         assert sum("role" in response for response in responses) == 1
         denied = next(response for response in responses if "state" in response)
         assert denied["state"] == "denied"
         assert denied["reason_code"] == "endpoint_already_claimed"
     finally:
         release.set()
-        endpoint.close()
         server.close()
+
+
+def test_acceptance_oracle_checks_survive_python_optimization() -> None:
+    """``python -O`` must not turn the delivery oracle into a false pass."""
+
+    code = """
+from scripts.verify_lingtai_driver_authority import _validate_oracle
+
+_validate_oracle(["audit-ok"], ["audit-ok"], None)
+invalid = (
+    ([], [], None),
+    (["audit-a", "audit-b"], ["audit-a"], None),
+    (["audit-a"], ["audit-b"], None),
+    (["audit-a"], ["audit-a"], "audit-a"),
+)
+for case in invalid:
+    try:
+        _validate_oracle(*case)
+    except SystemExit:
+        continue
+    raise RuntimeError(f"optimized oracle accepted invalid case: {case!r}")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_endpoint_binding_mismatch_is_denied_and_audited() -> None:

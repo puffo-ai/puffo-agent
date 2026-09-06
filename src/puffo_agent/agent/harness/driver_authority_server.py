@@ -16,7 +16,6 @@ import struct
 import threading
 import uuid
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -103,16 +102,13 @@ class IssuedAuthorityEndpoint:
 class DriverAuthorityServer:
     """Own endpoint bindings and decide every LingTai provider/launch request."""
 
-    def __init__(self, *, claim_probe: Callable[[], None] | None = None) -> None:
+    def __init__(self) -> None:
         if os.name != "posix" or not hasattr(socket, "SCM_RIGHTS"):
             raise RuntimeError("Driver authority requires POSIX SCM_RIGHTS")
         self._lock = threading.Lock()
         self._records: list[_EndpointRecord] = []
         self._audits: deque[AuthorityAuditRecord] = deque(maxlen=MAX_AUDIT_RECORDS)
         self._closed = False
-        # Deterministic concurrency tests pause after observing ISSUED while
-        # the state lock is still held. Production never supplies this hook.
-        self._claim_probe = claim_probe
 
     def issue_root(self, *, launch_id: str) -> IssuedAuthorityEndpoint:
         """Create and start the endpoint for one root ACP process launch."""
@@ -252,8 +248,6 @@ class DriverAuthorityServer:
                 return self._record_decision_locked(
                     record, "hello", "denied", "endpoint_already_claimed"
                 )
-            if self._claim_probe is not None:
-                self._claim_probe()
             record.state = _LeaseState.CLAIMED
             binding = record.binding
             if binding.role == "derived":
