@@ -1810,3 +1810,64 @@ def test_a_qualified_producer_in_a_sibling_module_is_still_seen():
     # sibling was read — and it makes the roster comparison fail.
     assert ("failed", "confirm_timeout") in derived
     assert derived != set(PERSISTABLE_PAIRS)
+
+
+# ── the value axis, both faces ────────────────────────────────────────────
+#
+# The sibling control above moves along the SPELLING axis (bare vs
+# qualified). This registry moves along the VALUE axis: a new failure
+# reason minted at an `ExecutorOutcome` site, which reaches the projection
+# through `outcome.reason` and the reply through `_reply(outcome.reason,
+# ...)`. Sweeping the spelling axis cleanly can never surface a defect on
+# this one.
+#
+# Measured on `af08ce3` (Boris 188749), and the reason this is a registry
+# rather than one assertion: reverting EITHER face's expansion to the
+# `EXECUTOR_FAILURE_REASONS` constant left all 179 tests green. The reply
+# face was never protected here either — it was merely written correctly,
+# which is why the same hole could be introduced on the second face. A
+# derivation face that is not in this list is a face nobody is watching.
+_ROSTER_FACES = [
+    ("persisted", "_derive_persisted_pairs", "PERSISTABLE_PAIRS",
+     ("failed", "child_exited_early")),
+    ("reply", "_derive_reply_pairs", "_EXPECTED_REPLY_PAIRS",
+     (False, "failed", "child_exited_early")),
+]
+
+
+@pytest.mark.parametrize(
+    ("face", "derive_name", "frozen_name", "expected_member"), _ROSTER_FACES
+)
+def test_a_wrapper_minted_reason_reaches_every_expansion(
+    face, derive_name, frozen_name, expected_member
+):
+    """A new executor failure reason must widen every derived roster.
+
+    Pinning the expansion to a constant that the runtime roster is itself
+    built from makes the comparison `X | C == Y | C` — C cancels and the
+    alarm goes blind to exactly the change it exists to catch. This is the
+    control that goes red when someone repairs a derivation back into a
+    self-comparison.
+    """
+    import pathlib
+
+    derive = globals()[derive_name]
+    frozen = set(globals()[frozen_name])
+    package = pathlib.Path(ops.__file__).parent
+    sibling = package / "_roster_control_wrapper.py"
+    sibling.write_text(
+        "from . import executor\n"
+        "\n"
+        "\n"
+        "def new_failure_producer():\n"
+        '    return executor.ExecutorOutcome(status="failed", '
+        'reason="child_exited_early")\n',
+        encoding="utf-8",
+    )
+    try:
+        derived = derive()
+    finally:
+        sibling.unlink()
+
+    assert expected_member in derived, f"{face} face did not expand the new reason"
+    assert derived != frozen
