@@ -1856,11 +1856,11 @@ def test_a_wrapper_minted_reason_reaches_every_expansion(
     package = pathlib.Path(ops.__file__).parent
     sibling = package / "_roster_control_wrapper.py"
     sibling.write_text(
-        "from . import executor\n"
+        "from .executor import ExecutorOutcome\n"
         "\n"
         "\n"
         "def new_failure_producer():\n"
-        '    return executor.ExecutorOutcome(status="failed", '
+        '    return ExecutorOutcome(status="failed", '
         'reason="child_exited_early")\n',
         encoding="utf-8",
     )
@@ -1871,3 +1871,33 @@ def test_a_wrapper_minted_reason_reaches_every_expansion(
 
     assert expected_member in derived, f"{face} face did not expand the new reason"
     assert derived != frozen
+
+
+def test_every_derivation_face_is_registered():
+    """A new derived roster must be hooked up, not merely remembered.
+
+    Without this, adding `_derive_<something>_pairs()` and forgetting the
+    registry leaves the whole suite green — measured (Boris 188766), which
+    is why the registry's own comment does not count: a caution to the
+    reader is not a control that goes red.
+
+    Keyed on the naming convention, so a face named outside it still
+    escapes. That is a smaller hole than the one it closes, and it is the
+    reason the convention is stated in the failure message rather than
+    left to be inferred.
+    """
+    import re
+
+    faces = {
+        name
+        for name, value in globals().items()
+        if re.fullmatch(r"_derive_\w+_pairs", name) and callable(value)
+    }
+    assert len(faces) >= 2, "the scan found fewer faces than exist — it is blind"
+
+    registered = {derive_name for _, derive_name, _, _ in _ROSTER_FACES}
+    assert faces == registered, (
+        f"derivation faces not in `_ROSTER_FACES`: {sorted(faces - registered)}. "
+        f"Any `_derive_*_pairs` function must be registered there, or nothing "
+        f"goes red when its expansion is pinned to a constant."
+    )
