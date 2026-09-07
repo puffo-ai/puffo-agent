@@ -135,10 +135,19 @@ def _register_exa_search(mcp: FastMCP, cfg: Any) -> None:
 def _format_search_result(data: dict[str, Any]) -> str:
     """Render a `/v2/exa/search` response for the model.
 
-    An idempotent retry of an already-settled search returns the accounting with
-    null results (results are never stored, so they cannot be replayed) — report
-    that rather than pretending there are fresh results.
+    A 202 is not an HTTP error to the client, but it means a prior search under
+    this idempotency key is still resolving and an owner will reconcile it —
+    there is no result yet. An idempotent retry of an already-settled search
+    returns the accounting with null results (results are never stored, so they
+    cannot be replayed).
     """
+    if data.get("error") == "PENDING_RECONCILE":
+        return (
+            "This search is still resolving upstream; your operator will "
+            f"reconcile it (ledger {data.get('ledger_id', '?')}). No result yet — "
+            f"do not retry with the same idempotency key. {_LABEL_NON_EXA}"
+        )
+
     cost = data.get("cost_micro")
     status = data.get("provider_http_status")
     results = data.get("results")

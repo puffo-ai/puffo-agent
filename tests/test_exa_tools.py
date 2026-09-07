@@ -136,6 +136,29 @@ async def test_already_settled_replay_reports_no_fresh_results():
 
 
 @pytest.mark.asyncio
+async def test_pending_reconcile_202_is_reported_not_treated_as_results():
+    # A 202 (prior attempt under this key still resolving) comes back as a
+    # success body, not an HttpError — the tool reports it as pending, not as
+    # search results.
+    http = _FakeHttp(
+        response={
+            "error": "PENDING_RECONCILE",
+            "message": "still resolving",
+            "ledger_id": "led_pending",
+        }
+    )
+    mcp = _tools(http)
+    text = await _call(
+        mcp,
+        "exa_search",
+        {"query": "x", "max_cost_micro": 20000, "idempotency_key": "k1"},
+    )
+    assert "still resolving" in text
+    assert "led_pending" in text
+    assert "do not retry with the same idempotency key" in text
+
+
+@pytest.mark.asyncio
 async def test_tool_not_registered_for_keyless_agents():
     # A keyless bridge agent cannot reach the subkey-gated route, so the tool is
     # not exposed for it — not registered, no error path.
