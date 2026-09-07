@@ -708,6 +708,7 @@ def register_core_tools(
     from .core_host_tools import register_host_tools
     from .core_identity_tools import register_identity_tools
     from .core_inbox_tools import register_inbox_tools
+    from .core_exa_tools import register_exa_tools
     from .core_message_tools import register_message_tools
     from .core_monid_tools import register_monid_tools
     register_inbox_tools(mcp, cfg, result_surface=result_surface)
@@ -716,6 +717,7 @@ def register_core_tools(
     register_history_tools(mcp, cfg)
     register_host_tools(mcp, cfg)
     register_monid_tools(mcp, cfg)
+    register_exa_tools(mcp, cfg)
 
     if cfg.bridge_client is not None:
         from .lifecycle_tools import register_lifecycle_tools
