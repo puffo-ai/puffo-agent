@@ -16,6 +16,7 @@ import pytest
 
 from puffo_agent.agent.harness.driver import (
     ProtocolDiagnostics,
+    RuntimeLifecycle,
     RuntimeOpened,
     RuntimeRef,
     RuntimeSpec,
@@ -136,11 +137,32 @@ def test_reload_failure_cap_abandons_flags_into_health(tmp_path, saved_states):
 
 
 class _FakeManager:
-    def __init__(self, generation: str, opened_at: float):
+    def __init__(
+        self,
+        generation: str,
+        opened_at: float,
+        lifecycle=RuntimeLifecycle.PERSISTENT_CHILD,
+        opened: bool = True,
+    ):
         self.spec = SimpleNamespace(
             mcp_generation=generation, system_prompt="p",
         )
         self.last_open_monotonic = opened_at
+        self._lifecycle = lifecycle
+        # Mirrors ``RuntimeManager.opened``: set only after a successful
+        # ``driver.open`` and cleared by every close/reload path. It is the
+        # only "did it open" signal — see ``current_capabilities`` below.
+        self.opened = object() if opened else None
+
+    def current_capabilities(self):
+        # Deliberately answers even when ``opened`` is None: every shipped
+        # driver returns a capability object unconditionally (module
+        # constants on pi/codex, a constructor-time value on acp, a freshly
+        # built one on claude). A double that returned None here would let
+        # the probe pass a check no real manager ever fails.
+        if self._lifecycle is None:
+            return None
+        return SimpleNamespace(lifecycle=self._lifecycle)
 
 
 class _RecyclingAdapter:
@@ -159,6 +181,7 @@ class _RecyclingAdapter:
             system_prompt=new_system_prompt,
         )
         self.mgr.last_open_monotonic = time.monotonic()
+        self.mgr.opened = object()
 
 
 def _wire(worker: Worker, mgr: _FakeManager) -> _RecyclingAdapter:
@@ -199,6 +222,195 @@ def test_probe_recycles_then_flips_health(registered_manager, saved_states):
     _run(worker.probe_mcp_transport("t"))
     assert worker.runtime.health == "mcp_unreachable"
     assert ("t", "mcp_unreachable", worker.runtime.error) in saved_states
+
+
+def test_a_per_turn_harness_is_never_wedged_by_this_probe(
+    registered_manager, saved_states,
+):
+    """A generation is not a promise of a *live* subprocess everywhere.
+
+    A ``PER_TURN_CHILD`` driver takes ``open`` as a logical session and
+    spawns on ``start_turn``, so between turns nothing exists to hello with.
+    The probe also stands down during a turn, so for such a driver it would
+    run only when its premise is false — every idle opencode agent went
+    ``mcp_unreachable`` within a minute of start, with no fault injected.
+    """
+    mgr = registered_manager(
+        _FakeManager(
+            "g1", time.monotonic() - 600,
+            lifecycle=RuntimeLifecycle.PER_TURN_CHILD,
+        )
+    )
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker("ok")
+    adapter = _wire(worker, mgr)
+
+    for _ in range(3):
+        _run(worker.probe_mcp_transport("t"))
+
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
+    assert worker.runtime.health == "ok"
+    assert saved_states == []
+
+
+def test_a_failed_open_is_not_a_wedge_though_capabilities_still_answer(
+    registered_manager, saved_states,
+):
+    """Capabilities cannot stand in for "did it open".
+
+    ``last_open_monotonic`` is stamped *before* ``driver.open`` is awaited,
+    so a failed open leaves a watermark behind. Capabilities are no help
+    either: every shipped driver returns an object unconditionally, so they
+    are present even when the open raised. ``mgr.opened`` is the only fact
+    set after a successful open, and this fixture is the real shape —
+    capabilities answer, ``opened`` does not.
+    """
+    mgr = registered_manager(
+        _FakeManager("g1", time.monotonic() - 600, opened=False)
+    )
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker("ok")
+    adapter = _wire(worker, mgr)
+
+    assert mgr.current_capabilities() is not None
+
+    for _ in range(3):
+        _run(worker.probe_mcp_transport("t"))
+
+    assert adapter.reload_calls == []
+    assert worker._mcp_probe_strikes == 0
+    assert worker.runtime.health == "ok"
+
+
+def test_a_closed_runtime_holds_the_strike_count_instead_of_clearing_it(
+    registered_manager, saved_states,
+):
+    """Not-open is momentary; not-covered is standing. Only the second
+    withdraws.
+
+    A reload clears ``opened`` while it runs. If a probe landing in that
+    window reset the strike count, the escalation would restart on every
+    recycle: strike 1 -> recycle -> probe mid-reload zeroes it -> strike 1
+    again, and ``mcp_unreachable`` could never be reached however long the
+    transport stayed dead.
+    """
+    mgr = registered_manager(
+        _FakeManager("g1", time.monotonic() - 600, opened=False)
+    )
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker("mcp_unreachable")
+    worker._mcp_probe_strikes = 1
+    adapter = _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+
+    assert worker._mcp_probe_strikes == 1
+    assert worker.runtime.health == "mcp_unreachable"
+    assert adapter.reload_calls == []
+
+
+def test_no_shipped_driver_reports_capabilities_only_after_opening():
+    """The contract the probe must not lean on, read off the real drivers.
+
+    Each of these answers before any ``open`` has been attempted, so
+    ``current_capabilities() is None`` can never mean "the open failed".
+    Pinned here so the probe's reliance on ``mgr.opened`` cannot quietly
+    regress to a capabilities check.
+    """
+    from puffo_agent.agent.harness.drivers.codex import CodexDriver
+    from puffo_agent.agent.harness.drivers.opencode import OpenCodeDriver
+    from puffo_agent.agent.harness.drivers.pi import PiDriver
+
+    for driver in (
+        CodexDriver(executable_version="t"),
+        OpenCodeDriver(executable_version="t"),
+        PiDriver(executable_version="t"),
+    ):
+        assert driver.current_capabilities() is not None, type(driver).__name__
+
+
+def test_a_wedge_this_probe_stopped_covering_is_withdrawn(
+    registered_manager, saved_states,
+):
+    """Nothing else in the daemon can clear ``mcp_unreachable``.
+
+    This probe is its only writer, and the batch-top override explicitly
+    refuses to overwrite it. So narrowing what the probe covers without
+    retracting the reds it already wrote would pin every opencode agent the
+    buggy release flagged, for the life of the process. ``unknown``, not
+    ``ok``: the claim is withdrawn for want of evidence, which is not the
+    same as observing a healthy transport.
+    """
+    mgr = registered_manager(
+        _FakeManager(
+            "g1", time.monotonic() - 600,
+            lifecycle=RuntimeLifecycle.PER_TURN_CHILD,
+        )
+    )
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker("mcp_unreachable")
+    worker._mcp_probe_strikes = 2
+    adapter = _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+
+    assert worker.runtime.health == "unknown"
+    assert worker.runtime.error == ""
+    assert worker._mcp_probe_strikes == 0
+    assert adapter.reload_calls == []
+
+
+def test_withdrawal_never_touches_a_red_this_probe_did_not_write(
+    registered_manager, saved_states,
+):
+    """Only ``mcp_unreachable`` is this probe's to retract. A per-turn agent
+    that is genuinely ``auth_failed`` must keep saying so."""
+    mgr = registered_manager(
+        _FakeManager(
+            "g1", time.monotonic() - 600,
+            lifecycle=RuntimeLifecycle.PER_TURN_CHILD,
+        )
+    )
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker("auth_failed")
+
+    _run(worker.probe_mcp_transport("t"))
+
+    assert worker.runtime.health == "auth_failed"
+
+
+def test_exactly_which_shipped_drivers_this_probe_covers():
+    """The negative half of the coverage claim, read off the real drivers.
+
+    Widening the generation mint to every harness family is what put a
+    promise on a driver that cannot keep it. Pin the roster both ways: any
+    new per-turn (or in-process) driver, or a flip of an existing one, must
+    land here and force the question of what names *its* wedge — this probe
+    does not.
+    """
+    from puffo_agent.agent.harness.drivers.acp import acp_capabilities
+    from puffo_agent.agent.harness.drivers.claude_code import (
+        claude_capabilities,
+    )
+    from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
+    from puffo_agent.agent.harness.drivers.opencode import (
+        OPENCODE_CAPABILITIES,
+    )
+    from puffo_agent.agent.harness.drivers.pi import PI_CAPABILITIES
+
+    covered = {
+        "claude-code": claude_capabilities(),
+        "codex": CODEX_CAPABILITIES,
+        "pi": PI_CAPABILITIES,
+        "acp": acp_capabilities(session_resume=True),
+    }
+    for name, capabilities in covered.items():
+        assert capabilities.lifecycle == RuntimeLifecycle.PERSISTENT_CHILD, name
+
+    assert (
+        OPENCODE_CAPABILITIES.lifecycle == RuntimeLifecycle.PER_TURN_CHILD
+    ), "opencode is the one harness this probe deliberately declines"
 
 
 @pytest.mark.parametrize("starting_health", ["ok", "unknown", "in_progress", "no_progress"])
