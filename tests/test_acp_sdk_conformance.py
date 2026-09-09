@@ -122,7 +122,7 @@ async def test_official_sdk_v1_round_trip_streams_update_then_terminal():
         event for event in events
         if event.type is HarnessEventType.ASSISTANT_DELTA
     ]
-    assert delta.data["delta"] == "echo:hello"
+    assert delta.data["text"] == "echo:hello"
     assert events[-1].data["outcome"] == "succeeded"
 
     await asyncio.wait_for(driver.close(), timeout=2)

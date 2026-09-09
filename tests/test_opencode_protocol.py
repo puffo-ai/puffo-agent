@@ -79,7 +79,7 @@ def test_text_frame_emits_one_completed_output_block():
         HarnessEventType.ASSISTANT_DELTA,
         HarnessEventType.ASSISTANT_COMPLETED,
     ]
-    assert events[0].data == {"block_id": "prt_text", "delta": "hello"}
+    assert events[0].data == {"block_id": "prt_text", "text": "hello"}
     assert events[1].data == {"block_id": "prt_text"}
     assert all(event.native_session_id == "ses_123" for event in events)
 

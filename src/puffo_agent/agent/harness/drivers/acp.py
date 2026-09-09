@@ -731,7 +731,7 @@ class AcpDriver(Driver):
             await self._emit(
                 HarnessEventType.ASSISTANT_DELTA,
                 turn=turn,
-                data={"block_id": block_id, "delta": text},
+                data={"block_id": block_id, "text": text},
                 native_payload=update,
             )
             return
