@@ -106,6 +106,11 @@ async def _acp_events() -> list[HarnessEvent]:
                 content=TextContentBlock(type="text", text=chunk),
             ),
         )
+    # Close through the driver's own end-of-turn path rather than posting a
+    # completed event the driver may never send.
+    await driver._finish_turn(
+        TURN, HarnessEventType.TURN_COMPLETED, {"outcome": "succeeded"}
+    )
     events: list[HarnessEvent] = []
     while not driver._events.empty():
         events.append(driver._events.get_nowait())
@@ -232,29 +237,26 @@ async def _run_turn(harness, tmp_path, monkeypatch):
 
     task = asyncio.create_task(adapter.run_turn(ctx))
     await _wait_until(lambda: bool(adapter.manager._turn_refs))
-    # Drivers close their own blocks at different points (pi on text_end,
-    # opencode per frame, acp at end of turn); close whatever is still open so
-    # every harness reaches the projector's emit point the same way.
-    closed = {
-        event.data.get("block_id") for event in driver_events
+    # Every assistant_completed below comes from the harness itself -- pi on
+    # text_end, opencode per text part, acp from _finish_turn -- so the test
+    # cannot pass by closing a block the driver never closes. Only the turn
+    # terminal is supplied here, and only for the harnesses whose terminal is
+    # driver-side rather than part of the normalized frame.
+    assert [
+        event for event in driver_events
         if event.type is HarnessEventType.ASSISTANT_COMPLETED
-    }
-    open_blocks = [
-        block for block in dict.fromkeys(
-            event.data.get("block_id") for event in driver_events
-            if event.type is HarnessEventType.ASSISTANT_DELTA
-        )
-        if block not in closed
-    ]
+    ], f"{harness}: no assistant_completed came from the harness itself"
+    has_terminal = any(
+        event.type is HarnessEventType.TURN_COMPLETED
+        for event in driver_events
+    )
     for event in [
         _lifecycle(HarnessEventType.TURN_STARTED, {}),
         *driver_events,
-        *(
-            _lifecycle(HarnessEventType.ASSISTANT_COMPLETED,
-                       {"block_id": block})
-            for block in open_blocks
-        ),
-        _lifecycle(HarnessEventType.TURN_COMPLETED, {"outcome": "succeeded"}),
+        *([] if has_terminal else [
+            _lifecycle(HarnessEventType.TURN_COMPLETED,
+                       {"outcome": "succeeded"}),
+        ]),
     ]:
         await driver.queue.put(event)
     result = await asyncio.wait_for(task, timeout=5)
