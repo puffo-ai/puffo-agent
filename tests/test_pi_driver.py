@@ -489,6 +489,54 @@ async def test_extension_vetoed_resume_is_a_failure_not_a_success():
 
 
 @pytest.mark.asyncio
+async def test_turn_usage_accumulates_across_assistant_responses():
+    """Pi reports usage once per assistant response; a Puffo turn holds many.
+
+    Overwriting on each response would report only the final tool-loop leg's
+    tokens at turn end. Context size is a running snapshot, not a sum.
+    """
+    proc = FakePiProcess()
+    driver, _ = await _open(proc)
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await proc.answer_next()
+    await started
+
+    def usage(inp, out, reasoning, total):
+        return {
+            "input": inp,
+            "output": out,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": reasoning,
+            "totalTokens": total,
+        }
+
+    for frame in (
+        {"type": "agent_start"},
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": usage(100, 10, 4, 1000)},
+        },
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": usage(250, 30, 6, 1400)},
+        },
+        {"type": "agent_end", "willRetry": False},
+        {"type": "agent_settled"},
+    ):
+        proc.push(frame)
+
+    events = await _drain_events(driver, 7)
+    terminal = events[-1]
+    assert terminal.type == HarnessEventType.TURN_COMPLETED
+    assert terminal.data["input_tokens"] == 350
+    assert terminal.data["output_tokens"] == 40
+    assert terminal.data["reasoning_tokens"] == 10
+    assert terminal.data["context_tokens"] == 1400
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_exactly_one_terminal_arrives_at_agent_settled():
     """A full run emits its single TURN_COMPLETED only once settled."""
     proc = FakePiProcess()
