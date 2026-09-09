@@ -263,7 +263,7 @@ async def test_jsonl_reader_does_not_split_valid_unicode_line_separators():
         event for event in events
         if event.type is HarnessEventType.ASSISTANT_DELTA
     ]
-    assert delta.data["delta"] == text
+    assert delta.data["text"] == text
     await driver.close()
 
 

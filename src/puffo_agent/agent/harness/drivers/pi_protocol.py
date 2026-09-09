@@ -369,7 +369,7 @@ def _normalize_message_update(
         return (
             event(
                 HarnessEventType.ASSISTANT_DELTA,
-                {"block_id": block_id, "delta": str(delta.get("delta") or "")},
+                {"block_id": block_id, "text": str(delta.get("delta") or "")},
             ),
         )
     if delta_type == "text_end":

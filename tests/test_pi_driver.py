@@ -880,7 +880,7 @@ async def test_unicode_separator_inside_a_string_does_not_split_a_frame():
     proc.push_raw(payload.encode() + b"\n")
     events = await _drain_events(driver, 1)
     assert events[0].type == HarnessEventType.ASSISTANT_DELTA
-    assert events[0].data["delta"] == "before after"
+    assert events[0].data["text"] == "before after"
     await driver.close()
 
 
