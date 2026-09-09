@@ -424,6 +424,76 @@ class Worker:
         self.runtime.save(agent_id)
         self._warm_done.set()
 
+    def _withdraw_unsubstantiated_wedge(self, agent_id: str) -> None:
+        """Retract a red this probe can no longer stand behind.
+
+        This probe is the only writer of ``mcp_unreachable``, and the
+        batch-top override deliberately refuses to overwrite it (its evidence
+        is independent of any turn). So nothing else in the daemon can ever
+        clear it: an agent the probe has stopped applying to would stay red
+        for the life of the process. Upgrading past the release that flagged
+        idle per-turn harnesses has to release them, not freeze them.
+
+        Retracted to ``unknown`` rather than ``ok``: the claim is being
+        withdrawn for want of evidence, which is not the same as observing a
+        healthy transport.
+        """
+        self._mcp_probe_strikes = 0
+        if self.runtime.health != "mcp_unreachable":
+            return
+        self.runtime.health = "unknown"
+        self.runtime.error = ""
+        self.runtime.save(agent_id)
+        logger.info(
+            "agent %s: withdrew an MCP wedge this probe no longer covers",
+            agent_id,
+        )
+
+    def _mcp_probe_subject(self, agent_id: str):
+        """The runtime this probe can speak about, or ``None``.
+
+        Every reason the transport probe does not apply lives here, so the
+        probe body can assume its premise instead of re-deriving it:
+
+        - no adapter or no runtime manager — nothing to reload;
+        - empty generation (agent has no puffo MCP) or no open watermark —
+          no subprocess was ever promised;
+        - no capability snapshot — ``last_open_monotonic`` is stamped
+          *before* ``driver.open`` is awaited, so a failed open leaves a
+          watermark and nothing else. That is a runtime that never came up,
+          which has its own error path;
+        - a non-persistent harness lifecycle. A ``PER_TURN_CHILD`` driver
+          takes ``open`` as a logical session and spawns on ``start_turn``
+          (see ``RuntimeLifecycle``), so between turns nothing exists to
+          hello with — and the probe stands down *during* turns, so for such
+          a driver it would run exclusively when its premise is false. Every
+          idle opencode agent went ``mcp_unreachable`` within a minute of
+          start, with no fault injected. Naming a per-turn wedge needs an
+          in-turn signal, which this is not; decline rather than report a red
+          nobody can act on.
+
+        Attribute access on the contract fields is direct on purpose:
+        producer/consumer drift must raise here rather than silently disable
+        recovery. Only value-level absence is legitimate and returns quietly.
+        """
+        from ..agent.harness.driver import RuntimeLifecycle
+        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+
+        adapter = self._adapter
+        mgr = get_runtime_manager(agent_id)
+        if adapter is None or mgr is None:
+            return None
+        spec_gen = mgr.spec.mcp_generation
+        opened_at = mgr.last_open_monotonic
+        if not spec_gen or opened_at is None:
+            return None
+        capabilities = mgr.current_capabilities()
+        if capabilities is None:
+            return None
+        if capabilities.lifecycle != RuntimeLifecycle.PERSISTENT_CHILD:
+            return None
+        return adapter, mgr, spec_gen, opened_at
+
     async def probe_mcp_transport(self, agent_id: str) -> None:
         """Heartbeat-cadence transport probe: the current runtime's puffo
         MCP subprocess must have reached the loopback RPC service
@@ -436,23 +506,19 @@ class Worker:
         runtime's health); a second miss flips ``mcp_unreachable`` so
         the wedge is visible instead of an agent that wakes turns but
         can never read them (8/30-class incident: alive worker, dead
-        MCP, health ok for 51 min)."""
-        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+        MCP, health ok for 51 min).
+
+        Covers persistent-child harnesses only. A per-turn harness holds no
+        subprocess between turns, so it has nothing to hello with at exactly
+        the moments this probe runs; naming its wedge needs an in-turn
+        signal that does not exist yet."""
         from . import rpc_service
 
-        adapter = self._adapter
-        mgr = get_runtime_manager(agent_id)
-        if adapter is None or mgr is None:
+        subject = self._mcp_probe_subject(agent_id)
+        if subject is None:
+            self._withdraw_unsubstantiated_wedge(agent_id)
             return
-        # Direct attribute access on purpose: these are required contract
-        # fields, and producer/consumer drift must raise here instead of
-        # silently disabling recovery. Only value-level absence is
-        # legitimate (no puffo_core → empty generation; never opened →
-        # None) and returns quietly.
-        spec_gen = mgr.spec.mcp_generation
-        opened_at = mgr.last_open_monotonic
-        if not spec_gen or opened_at is None:
-            return
+        adapter, mgr, spec_gen, opened_at = subject
         now = time.monotonic()
         # Query exactly this spec's generation: hello state is keyed per
         # (agent, generation), so a surviving pre-recycle subprocess's
