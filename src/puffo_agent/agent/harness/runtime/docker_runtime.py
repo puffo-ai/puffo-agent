@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -277,13 +278,21 @@ class DockerRuntimePreparer:
                 inference,
             )
         mcp_env = self._container_puffo_mcp_env()
+        mcp_generation = ""
         if mcp_env:
+            # Minted per config write; the subprocess echoes it back over
+            # RPC (mcp-hello) so the worker's transport probe can tell
+            # "this spec's MCP reached us" from a stale predecessor.
+            mcp_generation = uuid.uuid4().hex
             config_host = self.workspace_dir / ".puffo-agent" / "mcp-config.json"
             write_cli_mcp_config(
                 config_host,
                 command="python3",
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
-                env=mcp_env,
+                env={
+                    **mcp_env,
+                    "PUFFO_MCP_GENERATION": mcp_generation,
+                },
             )
             launch_args.extend(
                 ["--mcp-config", "/workspace/.puffo-agent/mcp-config.json"]
@@ -331,6 +340,7 @@ class DockerRuntimePreparer:
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
             auto_compact_threshold_tokens=compact_tokens,
+            mcp_generation=mcp_generation,
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:

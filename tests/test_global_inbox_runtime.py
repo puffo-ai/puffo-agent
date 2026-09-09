@@ -1657,6 +1657,51 @@ async def test_success_without_inbox_read_leaves_messages_pending(
 
 
 @pytest.mark.asyncio
+async def test_repeated_empty_notice_turns_warn_of_possible_mcp_failure(
+    tmp_path, caplog,
+):
+    """A wedged MCP lane must not leave repeated empty turns log-silent."""
+    caplog.set_level(logging.WARNING)
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    should_read = False
+
+    async def ignore_notice(_planned):
+        if should_read:
+            await adapter.admit()
+            await runtime.read_inbox(limit=50)
+        return None
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=ignore_notice,
+        workspace=tmp_path,
+        agent_id="agent-stuck",
+    )
+
+    for seq in range(1, 4):
+        await receipt(store, f"pending-{seq}", seq)
+        assert await runtime.process_once()
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "possible MCP control-plane failure" in record.getMessage()
+    ]
+    assert warnings == [
+        "agent agent-stuck: possible MCP control-plane failure — 3 "
+        "consecutive Inbox notice turns completed without read_inbox "
+        "admission while messages remain pending"
+    ]
+    should_read = True
+    await receipt(store, "pending-4", 4)
+    assert await runtime.process_once()
+    assert runtime._mcp_silence_streak == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_admission(
     tmp_path,
 ):

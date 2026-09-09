@@ -190,6 +190,7 @@ class GlobalInboxRuntime(
         self._turn_state_lock = asyncio.Lock()
         self._stopping = False
         self._init_recovery_gates(drained_check)
+        self._mcp_silence_streak = 0
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries

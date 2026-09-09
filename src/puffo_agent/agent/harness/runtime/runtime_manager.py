@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -226,6 +227,9 @@ class RuntimeManager:
         # input reached the transcript (accepted start receipt only)
         self._input_admitted = False
         self._resume_failure_streak = 0
+        # When the current runtime process was (re)opened; the worker's
+        # MCP transport probe compares hello timestamps against it.
+        self.last_open_monotonic: float | None = None
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -241,6 +245,7 @@ class RuntimeManager:
             if resume and self.native_session_id
             else None
         )
+        self.last_open_monotonic = time.monotonic()
         try:
             opened = await self.driver.open(self.spec, native_resume)
         except BaseException as exc:
@@ -272,6 +277,7 @@ class RuntimeManager:
             )
             self._clear_native_session()
             try:
+                self.last_open_monotonic = time.monotonic()
                 opened = await self.driver.open(self.spec, None)
             except BaseException as exc:
                 errors = [exc]
@@ -1161,6 +1167,7 @@ class RuntimeManagerAdapter(Adapter):
         spec_reloader: Callable[[str], Awaitable[RuntimeSpec]] | None = None,
         compaction_wait_seconds: float = COMPACTION_WAIT_SECONDS,
         post_close: Callable[[], Awaitable[None]] | None = None,
+        generation_sink: Callable[[str], None] | None = None,
     ):
         self.manager = manager
         self.spec_reloader = spec_reloader
@@ -1169,6 +1176,11 @@ class RuntimeManagerAdapter(Adapter):
         # (and its Driver) close. Used by the Docker Codex runtime to stop
         # the per-agent container once the exec transport has terminated.
         self.post_close = post_close
+        # Observes a freshly minted mcp generation between the spec
+        # reload and the reopen (the daemon pins it against registry
+        # trimming before the new subprocess can hello). Observation
+        # only; failures never reach the runtime.
+        self.generation_sink = generation_sink
         self.assistant_text_parts: list[str] = []
         self._latest_context_limits: tuple[int | None, int | None] = (
             None,
@@ -1469,6 +1481,22 @@ class RuntimeManagerAdapter(Adapter):
             await self.spec_reloader(new_system_prompt)
             if self.spec_reloader is not None else None
         )
+        if (
+            spec is not None
+            and spec.mcp_generation
+            and self.generation_sink is not None
+        ):
+            # Pin the minted generation BEFORE the reopen: the reopened
+            # subprocess hellos immediately, and until the caller's
+            # post-reload pin lands, registry trimming under zombie
+            # beacon pressure could evict that hello and fake a
+            # never-seen probe result.
+            try:
+                self.generation_sink(spec.mcp_generation)
+            except Exception:
+                logger.exception(
+                    "generation sink failed; reload continues"
+                )
         await self.manager.reload_resources(
             preserve_session=not with_session,
             spec=spec,

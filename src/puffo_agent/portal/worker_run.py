@@ -399,13 +399,29 @@ class StandardWorkerRun:
                 process_factory=preparer.process_factory,
             )
             cleanup = preparer.aclose
+        from . import rpc_service
+
+        agent_id = prepared.preparer.agent_id
+
+        def pin_generation(generation: str) -> None:
+            # Runs between the spec reload minting a fresh generation
+            # and the reopen: the pin must move before the new
+            # subprocess can hello, or zombie beacon pressure inside
+            # that window trims the hello and fakes never-seen.
+            rpc_service.pin_mcp_generation(agent_id, generation)
+
         worker._adapter = build_local_runtime_adapter(
             prepared,
             outbox=outbox,
             logical_session_ref=session_ref,
             driver=driver,
             cleanup=cleanup,
+            generation_sink=pin_generation,
         )
+        # Pin the initial mcp generation at the mint, not at the first
+        # probe (same window as above, prepare-time edition).
+        if prepared.spec.mcp_generation:
+            pin_generation(prepared.spec.mcp_generation)
         return outbox, session_ref, prepared
 
     async def _abort_docker_preparation(self, preparer: Any) -> None:
@@ -622,7 +638,7 @@ class StandardWorkerRun:
         ) = context.paths.refresh_flags
         paths = context.paths
         worker = self.worker
-        await worker_module._process_refresh_flags(
+        ok = await worker_module._process_refresh_flags(
             agent_id=paths.agent_id,
             harness_name=paths.effective_harness,
             shared_path=paths.shared_path,
@@ -640,6 +656,11 @@ class StandardWorkerRun:
             refresh_host_sync_flag=refresh_host,
             refresh_session_flag=refresh_session,
             refresh_provider_auth_flag=refresh_provider_auth,
+        )
+        worker._note_refresh_reload(
+            ok,
+            (refresh_agent, refresh_host, refresh_session, refresh_provider_auth),
+            paths.agent_id,
         )
 
     async def _execute_global_turn(self, context: WorkerRunContext, planned):
@@ -785,6 +806,14 @@ class StandardWorkerRun:
         interval = max(1.0, worker.daemon_cfg.runtime_heartbeat_seconds)
         while not worker._stop.is_set():
             worker.runtime.save(agent_id)
+            try:
+                await worker.probe_mcp_transport(agent_id)
+            except Exception:  # noqa: BLE001
+                # The probe must never take the heartbeat down with it.
+                logger.warning(
+                    "agent %s: MCP transport probe raised", agent_id,
+                    exc_info=True,
+                )
             try:
                 await asyncio.wait_for(worker._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
