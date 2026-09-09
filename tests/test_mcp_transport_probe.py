@@ -720,7 +720,9 @@ def test_hello_beacon_refires_after_interval(monkeypatch):
 # ── per-spawn config generation ────────────────────────────────────────
 
 
-def test_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
+def _local_preparer(tmp_path, monkeypatch, *, harness, agent_id, command=()):
+    """A preparer wired for one harness family, with only the host lookups
+    that would leave the sandbox stubbed out."""
     import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
     from puffo_agent.agent.harness.runtime.local_runtime import (
         LocalRuntimePreparer,
@@ -728,32 +730,146 @@ def test_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
-    monkeypatch.setattr(
-        local_runtime, "resolve_claude_bin", lambda: "/bin/claude",
-    )
     monkeypatch.setattr(local_runtime, "is_macos", lambda: False)
+    for name, value in (
+        ("resolve_claude_bin", "/bin/claude"),
+        ("resolve_codex_bin", "/bin/codex"),
+        ("resolve_pi_bin", "/bin/pi"),
+        ("resolve_opencode_bin", "/bin/opencode"),
+    ):
+        monkeypatch.setattr(local_runtime, name, lambda _v=value: _v)
+
+    async def _no_install(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(local_runtime, "run_spawn_install", _no_install)
+    provider = {
+        "claude-code": "anthropic",
+        "codex": "openai",
+    }.get(harness, "")
+    # codex refuses to build a spec without auth; the gateway branch is the
+    # one that needs no host credential file.
+    gateway = (
+        {"llm_base_url": "http://gateway.invalid", "api_key": "k"}
+        if harness == "codex" else {}
+    )
     config = AgentConfig(
-        id="gen-test",
+        id=agent_id,
         runtime=RuntimeConfig(
-            kind="cli-local", provider="anthropic", harness="claude-code",
+            kind="cli-local",
+            provider=provider,
+            harness=harness,
+            harness_command=list(command),
+            **gateway,
         ),
         puffo_core=PuffoCoreConfig(
             slug="bot-gen", device_id="d1", space_id="sp1",
         ),
     )
-    preparer = LocalRuntimePreparer(DaemonConfig(), config)
+    return LocalRuntimePreparer(DaemonConfig(), config)
 
-    first = preparer._prepare_claude_spec("prompt")
-    config_doc = json.loads(
-        (tmp_path / "puffo" / "agents" / "gen-test" / "mcp-config.json")
-        .read_text(encoding="utf-8")
+
+# Every harness family the daemon can spawn a Puffo MCP subprocess for.
+# ``acp`` needs an explicit command; the rest resolve a binary.
+_MCP_HARNESS_FAMILIES = [
+    ("claude-code", ()),
+    ("codex", ()),
+    ("pi", ()),
+    ("opencode", ()),
+    ("acp", ("lingtai-agent", "acp")),
+]
+
+
+@pytest.mark.parametrize("harness,command", _MCP_HARNESS_FAMILIES)
+def test_every_harness_family_mints_a_generation(
+    harness, command, tmp_path, monkeypatch,
+):
+    """The probe is keyed on ``spec.mcp_generation``; an empty one makes
+    ``Worker.probe_mcp_transport`` return early, so a family that does not
+    mint has *no* wedge detection at all — and nothing logs that.
+
+    This is the assertion that was missing when the mint lived only in the
+    claude-code branch: pi, opencode, acp and codex shipped with the
+    detector silently disabled.
+    """
+    preparer = _local_preparer(
+        tmp_path, monkeypatch,
+        harness=harness, agent_id=f"gen-{harness}", command=command,
     )
-    written = config_doc["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
-    second = preparer._prepare_claude_spec("prompt")
 
-    assert first.mcp_generation and second.mcp_generation
+    first = asyncio.run(preparer.refresh_spec("prompt"))
+    second = asyncio.run(preparer.refresh_spec("prompt"))
+
+    assert first.mcp_generation, f"{harness} spec carries no mcp_generation"
+    # A recycle must not be able to accept the predecessor's hello.
     assert first.mcp_generation != second.mcp_generation
-    assert written == first.mcp_generation
+
+
+@pytest.mark.parametrize("harness,command", _MCP_HARNESS_FAMILIES)
+def test_every_harness_family_hands_the_generation_to_the_subprocess(
+    harness, command, tmp_path, monkeypatch,
+):
+    """Minting is only half of it: the subprocess must receive the value,
+    because ``_make_hello_startup`` returns ``None`` on an empty
+    ``PUFFO_MCP_GENERATION`` and then never sends a hello at all."""
+    preparer = _local_preparer(
+        tmp_path, monkeypatch,
+        harness=harness, agent_id=f"env-{harness}", command=command,
+    )
+
+    spec = asyncio.run(preparer.refresh_spec("prompt"))
+    delivered = _delivered_generations(preparer, spec, tmp_path, harness)
+
+    assert delivered, f"{harness} spawns no Puffo MCP subprocess environment"
+    for value in delivered:
+        assert value == spec.mcp_generation
+
+
+def _delivered_generations(preparer, spec, tmp_path, harness):
+    """Every PUFFO_MCP_GENERATION this spec actually hands a subprocess.
+
+    Each family carries the server differently — CLI config file, TOML,
+    protocol projection, inline JSON, or the pi bridge — so the value has
+    to be read back out of the shape that family really uses.
+    """
+    found = [
+        server.environment.get("PUFFO_MCP_GENERATION", "")
+        for server in spec.mcp_servers
+    ]
+    if harness == "claude-code":
+        document = json.loads(
+            (tmp_path / "puffo" / "agents" / f"env-{harness}"
+             / "mcp-config.json").read_text(encoding="utf-8")
+        )
+        found.append(
+            document["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
+        )
+    elif harness == "codex":
+        from puffo_agent.portal.state import agent_codex_user_dir
+
+        config = (
+            agent_codex_user_dir(preparer.agent_id) / "config.toml"
+        ).read_text(encoding="utf-8")
+        found.extend(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in config.splitlines()
+            if line.strip().startswith("PUFFO_MCP_GENERATION")
+        )
+    elif harness == "opencode":
+        inline = json.loads(spec.environment["OPENCODE_CONFIG_CONTENT"])
+        found.append(
+            inline["mcp"]["puffo"]["environment"]["PUFFO_MCP_GENERATION"]
+        )
+    elif harness == "pi":
+        # Pi has no MCP client; the attested bridge carries the whole server
+        # spec as JSON, so the generation has to survive that encoding too.
+        from puffo_agent.agent.harness.drivers.pi_bridge import (
+            BRIDGE_CONFIG_ENV,
+        )
+
+        bridge = json.loads(spec.environment[BRIDGE_CONFIG_ENV])
+        found.append(bridge["environment"]["PUFFO_MCP_GENERATION"])
+    return [value for value in found if value]
 
 
 def test_docker_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
