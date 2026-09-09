@@ -173,6 +173,14 @@ _NO_PROGRESS_TURN_THRESHOLD = 3
 # MCP failure leaves behind. Every more specific red (auth_failed,
 # provider_error, refresh_broken, drained, ...) stays authoritative: the probe
 # knows the transport is down, not that it is the only thing wrong.
+# Returned by ``_mcp_probe_subject`` when the probe covers this harness but
+# there is no open runtime at this instant. Distinct from ``None`` (not
+# covered at all): coverage is a standing property and retracts a stale red,
+# readiness is momentary and must not reset the strike count — a probe that
+# lands mid-reload would otherwise zero the strikes on every recycle and the
+# escalation to ``mcp_unreachable`` could never be reached.
+_MCP_PROBE_NOT_READY = object()
+
 _MCP_PROBE_OVERWRITABLE_HEALTH = (
     "ok",
     "unknown",
@@ -450,27 +458,34 @@ class Worker:
         )
 
     def _mcp_probe_subject(self, agent_id: str):
-        """The runtime this probe can speak about, or ``None``.
+        """The runtime this probe can speak about.
 
-        Every reason the transport probe does not apply lives here, so the
-        probe body can assume its premise instead of re-deriving it:
+        Three outcomes, and the difference between the last two is what keeps
+        a recycle from looping forever:
 
-        - no adapter or no runtime manager — nothing to reload;
-        - empty generation (agent has no puffo MCP) or no open watermark —
-          no subprocess was ever promised;
-        - no capability snapshot — ``last_open_monotonic`` is stamped
-          *before* ``driver.open`` is awaited, so a failed open leaves a
-          watermark and nothing else. That is a runtime that never came up,
-          which has its own error path;
-        - a non-persistent harness lifecycle. A ``PER_TURN_CHILD`` driver
-          takes ``open`` as a logical session and spawns on ``start_turn``
-          (see ``RuntimeLifecycle``), so between turns nothing exists to
-          hello with — and the probe stands down *during* turns, so for such
-          a driver it would run exclusively when its premise is false. Every
-          idle opencode agent went ``mcp_unreachable`` within a minute of
-          start, with no fault injected. Naming a per-turn wedge needs an
-          in-turn signal, which this is not; decline rather than report a red
-          nobody can act on.
+        - a ``(adapter, mgr, spec_gen, opened_at)`` tuple — probe it;
+        - ``_MCP_PROBE_NOT_READY`` — the probe covers this harness but there
+          is no open runtime *right now* (starting, torn down, or mid-reload).
+          Momentary: say nothing, keep the strike count, keep any red;
+        - ``None`` — the probe does not cover this agent at all. A standing
+          property, so a red it can no longer substantiate is withdrawn.
+
+        Not covered means either no puffo MCP to hello back (empty
+        generation), or a non-persistent harness lifecycle: a
+        ``PER_TURN_CHILD`` driver takes ``open`` as a logical session and
+        spawns on ``start_turn`` (see ``RuntimeLifecycle``), so between turns
+        nothing exists to hello with — and this probe stands down *during*
+        turns, so for such a driver it would run exclusively when its premise
+        is false. Every idle opencode agent went ``mcp_unreachable`` within a
+        minute of start, with no fault injected.
+
+        ``mgr.opened`` is the open fact, not ``current_capabilities()``:
+        every shipped driver returns a capability object unconditionally
+        (constants on pi/codex, a constructor-time value on acp, a freshly
+        built one on claude), so capabilities are non-None even when the open
+        failed. ``last_open_monotonic`` is no better — it is stamped *before*
+        ``driver.open`` is awaited. Only ``opened`` is set after a successful
+        open and cleared by every close/reload path.
 
         Attribute access on the contract fields is direct on purpose:
         producer/consumer drift must raise here rather than silently disable
@@ -482,17 +497,20 @@ class Worker:
         adapter = self._adapter
         mgr = get_runtime_manager(agent_id)
         if adapter is None or mgr is None:
-            return None
-        spec_gen = mgr.spec.mcp_generation
-        opened_at = mgr.last_open_monotonic
-        if not spec_gen or opened_at is None:
-            return None
+            return _MCP_PROBE_NOT_READY
         capabilities = mgr.current_capabilities()
-        if capabilities is None:
+        if capabilities is not None and (
+            capabilities.lifecycle != RuntimeLifecycle.PERSISTENT_CHILD
+        ):
             return None
-        if capabilities.lifecycle != RuntimeLifecycle.PERSISTENT_CHILD:
+        if not mgr.spec.mcp_generation:
             return None
-        return adapter, mgr, spec_gen, opened_at
+        if capabilities is None or mgr.opened is None:
+            return _MCP_PROBE_NOT_READY
+        opened_at = mgr.last_open_monotonic
+        if opened_at is None:
+            return _MCP_PROBE_NOT_READY
+        return adapter, mgr, mgr.spec.mcp_generation, opened_at
 
     async def probe_mcp_transport(self, agent_id: str) -> None:
         """Heartbeat-cadence transport probe: the current runtime's puffo
@@ -515,6 +533,8 @@ class Worker:
         from . import rpc_service
 
         subject = self._mcp_probe_subject(agent_id)
+        if subject is _MCP_PROBE_NOT_READY:
+            return
         if subject is None:
             self._withdraw_unsubstantiated_wedge(agent_id)
             return
