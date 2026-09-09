@@ -156,6 +156,38 @@ class CoversReconciliationMixin:
             )
         return renotice_ids, rows_by_id
 
+    def _health_outcome_for_turn(self, planned: PlannedTurn) -> str:
+        """``succeeded``, unless the turn made no observable progress on the
+        batch its own notice announced.
+
+        ``_mark_active_processed`` below reads an empty ``active.message_ids``
+        as "the provider received the notice but chose not to read Inbox" — a
+        normal deferred outcome. That reading is only safe when the provider
+        actually ran. A driver that maps a failed
+        provider turn onto "assistant completed" (the Pi credential-expiry
+        incident: expired token, ``stopReason: error``, zero output) produces
+        the identical shape, and the turn then settles the agent's health back
+        to ``ok`` while the announced messages stay pending — indefinitely,
+        because every later wake-up repeats it.
+
+        This check is deliberately **driver-independent**: it reads the
+        runtime's own admission bookkeeping rather than any adapter's
+        self-report, so a driver that swallows its errors cannot suppress it.
+        Fixing one adapter leaves every other adapter exempt; this does not.
+
+        Choosing not to reply still counts as progress — that decision is made
+        *after* ``read_inbox`` admits the rows, which populates
+        ``active.message_ids``. A wake-up that announced nothing (autonomous
+        turns, notice-only ticks) can never trip it, and messages that arrive
+        mid-turn cannot either: the comparison is against the ids this turn's
+        notice carried, not against the queue depth at the end.
+        """
+        if not planned.notice_message_ids:
+            return "succeeded"
+        if self.active.message_ids:
+            return "succeeded"
+        return "no_progress"
+
     async def _mark_active_processed(
         self,
         planned: PlannedTurn,
