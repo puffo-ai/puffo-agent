@@ -40,12 +40,14 @@ class DegradedRecoveryMixin:
         # wake rides the existing coalescer — no extra task/timer/thread
         self.coalescer.notify(delay_seconds=backoff)
 
-    def _park_drained(self) -> None:
+    def _park_drained(self, outcome: str = "drained") -> None:
         """Hold, don't retry — backoff can't refill a quota. Rows stay
         pending; unpark = ``drained_check`` clear + a wake."""
         self.health = RuntimeHealth(
             "degraded",
-            "provider quota exhausted; parked until the usage window resets",
+            "extra usage unavailable; parked until operator retry"
+            if outcome == "extra_usage_required"
+            else "provider quota exhausted; parked until the usage window resets",
         )
         self._parked_drained = True
 

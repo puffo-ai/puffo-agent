@@ -560,6 +560,44 @@ class Worker:
             )
         return provider_failure_message("authentication")
 
+    def _enter_extra_usage_required(self, agent_id: str) -> None:
+        """Extra usage needs operator action; subscription refresh cannot clear it."""
+        self.runtime.health = "extra_usage_required"
+        self.runtime.error = provider_failure_message("extra_usage_required")
+        self.runtime.save(agent_id)
+        if self._extra_usage_notification_sent:
+            return
+        self._extra_usage_notification_sent = True
+        coro = self._notify_operator_of_extra_usage()
+        try:
+            spawn(coro, name="notify_operator_of_extra_usage")
+        except Exception:
+            coro.close()
+            self._extra_usage_notification_sent = False
+            logger.exception("could not schedule extra-usage notification")
+
+    async def _notify_operator_of_extra_usage(self) -> None:
+        client = self._client
+        if client is None:
+            self._extra_usage_notification_sent = False
+            return
+        operator_slug = client.operator_slug or ""
+        if not operator_slug:
+            return
+        name = self.agent_cfg.display_name or self.agent_cfg.id
+        text = (
+            f"{name}: 额度不可用（额外用量）。请检查 Claude 的额外用量设置、"
+            "余额或花费上限：https://claude.ai/settings/usage 。"
+            "处理后重启此 Agent，以重试待处理消息。\n\n"
+            f"{name}: Quota unavailable (extra usage). "
+            + provider_failure_message("extra_usage_required")
+        )
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception:
+            self._extra_usage_notification_sent = False
+            logger.exception("could not send extra-usage notification")
+
     def _enter_drained(self, agent_id: str, resets_at: int | None = None) -> None:
         """``drained`` + one operator DM per episode. No refresher kick."""
         from ..agent._usage_markers import DRAINED_RUNTIME_ERROR
@@ -663,7 +701,7 @@ class Worker:
         log: logging.Logger,
     ) -> None:
         """Override any sticky red with ``in_progress`` at batch-top."""
-        if runtime.health == "in_progress":
+        if runtime.health in {"in_progress", "extra_usage_required"}:
             return
         runtime.health = "in_progress"
         runtime.error = ""
@@ -705,6 +743,12 @@ class Worker:
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
             self._auth_failed_notification_sent = False
+        # Transport readiness, refresh and cancellation are not model success.
+        if self.runtime.health == "extra_usage_required":
+            self.runtime.health = "ok"
+            self.runtime.error = ""
+            self.runtime.save(agent_id)
+        self._extra_usage_notification_sent = False
         # a completed turn is proof quota is available again
         Worker._clear_drained(self.runtime, agent_id, logger)
         self._drained_notification_sent = False
@@ -794,6 +838,7 @@ class Worker:
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
         self._drained_notification_sent = False
+        self._extra_usage_notification_sent = False
         self._drained_resets_at: int | None = None
         self._claude_api_key_mode = (
             agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
@@ -810,6 +855,11 @@ class Worker:
             started_at=int(time.time()),
             msg_count=0,
         )
+        # A restart permits a fresh attempt, but is not proof billing recovered.
+        previous = RuntimeState.load(agent_cfg.id)
+        if previous is not None and previous.health == "extra_usage_required":
+            self.runtime.health = previous.health
+            self.runtime.error = provider_failure_message("extra_usage_required")
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._restart_required = False

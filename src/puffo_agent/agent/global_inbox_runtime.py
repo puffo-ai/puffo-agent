@@ -1343,8 +1343,8 @@ class GlobalInboxRuntime(
                 planned, process_started, "provider_error"
             )
         terminal_error = operator_failure_text(exc)
-        if process_outcome == "drained":
-            self._park_drained()
+        if process_outcome in {"drained", "extra_usage_required"}:
+            self._park_drained(process_outcome)
         else:
             self._degrade(
                 "turn failed and was requeued"
@@ -1681,7 +1681,7 @@ class GlobalInboxRuntime(
                 activated=activated,
             )
         self.health = RuntimeHealth(state, diagnostic)
-        if state == "drained":
+        if state in {"drained", "extra_usage_required"}:
             # crash-resume drained: same park as the live path
             self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
@@ -1707,6 +1707,7 @@ class GlobalInboxRuntime(
                     "api_error_abandoned",
                     "provider_failed",
                     "drained",
+                    "extra_usage_required",
                 }
                 else "failed"
             )

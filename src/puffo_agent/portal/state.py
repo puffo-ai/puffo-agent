@@ -969,6 +969,7 @@ class RuntimeState:
     #                           refresh outcomes; cleared by next
     #                           REFRESHED. Does not overwrite the stronger
     #                           provider and authentication signals above.
+    #   "extra_usage_required" — extra usage refused; operator action + model success
     #   "drained"             — plan quota spent; hold-no-retry until the
     #                           usage window resets. Not a credential
     #                           failure: re-login does not recover it
@@ -989,7 +990,7 @@ class RuntimeState:
     #                           overwrites "ok" — the specific signals
     #                           above stay authoritative
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | server_unreachable | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | extra_usage_required | unhandled_error | codex_thread_wedged | server_unreachable | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:
