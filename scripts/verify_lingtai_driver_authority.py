@@ -15,6 +15,24 @@ Run it from the Puffo repository root, naming the LingTai checkout explicitly:
 
 Repeat with ``replay`` and ``fanout``.  Baseline must exit 0; both negative
 modes must exit non-zero at their respective count assertions.
+
+COVERAGE NOTE — what this oracle stopped verifying, and why
+-----------------------------------------------------------
+It once asserted that the provider call ran under *the same audit id* as the
+adjudication that admitted it, by reading ``current_provider_call_audit_id()``
+inside the provider.  LingTai removed that accessor: the audit id is no longer
+propagated to the provider call site, and ``ProviderCallDecision.audit_id`` is
+now documented as "correlation material only ... never a grant".
+
+So this oracle now checks COUNTS on both sides -- exactly one adjudication and
+exactly one provider call -- which still reddens ``replay`` (two adjudications)
+and ``fanout`` (two provider calls).  It does NOT check request-to-response
+CORRELATION, and it cannot: nothing observable from outside binds a particular
+provider call to a particular adjudication.  A provider call executing under a
+DIFFERENT adjudication's id would pass every assertion here.
+
+Do not read a green run as covering that axis.  Closing it needs either a
+LingTai-side observable or a test inside LingTai; it is not an oracle bug.
 """
 
 from __future__ import annotations
@@ -49,23 +67,21 @@ def _load_components(lingtai_src: Path) -> tuple[Any, ...]:
     # any installed copy; the explicitly named LingTai checkout is second.
     sys.path[:0] = [str(puffo_src), str(lingtai_src)]
 
-    from lingtai.adapters.acp.driver_authority import DriverAuthorityAdapter
+    from lingtai.adapters.acp.driver_authority import DriverAuthorityClient
     from lingtai.kernel.provider_admission import (
         ProviderAdmittedLLMService,
         RootProviderAdmission,
         bind_provider_admission,
         clear_provider_admission,
-        current_provider_call_audit_id,
     )
     from puffo_agent.agent.harness.driver_authority_server import DriverAuthorityServer
 
     return (
-        DriverAuthorityAdapter,
+        DriverAuthorityClient,
         ProviderAdmittedLLMService,
         RootProviderAdmission,
         bind_provider_admission,
         clear_provider_admission,
-        current_provider_call_audit_id,
         DriverAuthorityServer,
     )
 
@@ -79,9 +95,14 @@ def _require(condition: bool, message: str) -> None:
 def _validate_oracle(
     adjudications: list[str],
     provider_calls: list[str | None],
-    trace_after_call: str | None,
 ) -> str:
-    """Validate the one-adjudication/one-provider-call delivery contract."""
+    """Validate the one-adjudication/one-provider-call delivery contract.
+
+    LingTai removed the per-call audit id, so a provider call can no longer be
+    matched to its adjudication BY IDENTITY: fan-out is caught by the call
+    COUNT alone, and the post-call leak check is gone entirely. See the
+    coverage note in the module docstring for what that costs.
+    """
     _require(
         len(adjudications) == 1,
         f"expected one adjudication, observed {len(adjudications)}",
@@ -89,10 +110,9 @@ def _validate_oracle(
     audit_id = adjudications[0]
     _require(isinstance(audit_id, str), "adjudication audit ID is not a string")
     _require(
-        provider_calls == [audit_id],
-        "provider call count or audit ID does not match the adjudication",
+        len(provider_calls) == 1,
+        f"expected one provider call, observed {len(provider_calls)}",
     )
-    _require(trace_after_call is None, "provider audit context leaked after the call")
     return audit_id
 
 
@@ -103,7 +123,6 @@ def main(*, mode: str, lingtai_src: Path) -> None:
         root_provider_admission,
         bind_provider_admission,
         clear_provider_admission,
-        current_provider_call_audit_id,
         driver_authority_server,
     ) = _load_components(lingtai_src)
 
@@ -112,11 +131,14 @@ def main(*, mode: str, lingtai_src: Path) -> None:
             self.provider_calls: list[str | None] = []
             self.fanout = fanout
 
-        def generate(self, _prompt: str) -> str:
-            audit_id = current_provider_call_audit_id()
-            self.provider_calls.append(audit_id)
+        def generate(self, prompt: str) -> str:
+            # The admitting audit id is no longer observable here — LingTai
+            # deliberately stopped propagating it to the provider call site
+            # (``ProviderCallDecision.audit_id`` is documented as correlation
+            # material only).  Record the prompt so fan-out is still counted.
+            self.provider_calls.append(prompt)
             if self.fanout:
-                self.provider_calls.append(audit_id)
+                self.provider_calls.append(prompt)
             return "generated"
 
     server = driver_authority_server()
@@ -147,12 +169,10 @@ def main(*, mode: str, lingtai_src: Path) -> None:
         print(f"mode={mode}")
         print(f"adjudications={len(adjudications)} ids={adjudications}")
         print(f"provider_calls={len(inner.provider_calls)} ids={inner.provider_calls}")
-        print(f"trace_after_call={current_provider_call_audit_id()!r}")
 
         _validate_oracle(
             adjudications,
             inner.provider_calls,
-            current_provider_call_audit_id(),
         )
     finally:
         if adapter is not None:
