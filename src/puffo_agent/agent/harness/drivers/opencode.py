@@ -229,6 +229,7 @@ class OpenCodeDriver(Driver):
         self._events: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         self._terminal_reason = ""
         self._provider_failed = False
+        self._turn_usage: dict[str, int] = {}
         self._context = ContextStatus(stale=True)
         self._context_window: int | None = None
         self._compact_task: asyncio.Task[None] | None = None
@@ -290,6 +291,7 @@ class OpenCodeDriver(Driver):
         self._provider_failed = False
         self._terminal_reason = ""
         self._last_provider_error = ""
+        self._turn_usage = {}
         self._turn_generation += 1
         generation = self._turn_generation
         self._accepted = asyncio.get_running_loop().create_future()
@@ -429,7 +431,25 @@ class OpenCodeDriver(Driver):
             out.decode("utf-8", "replace"), model_id
         )
 
+    def _absorb_turn_usage(self, usage: dict[str, Any]) -> None:
+        """OpenCode reports usage once per step, and a turn runs several steps.
+
+        Token counts accumulate across steps; ``total_tokens`` is the step's
+        context occupancy rather than a running sum, so only the newest one
+        stands (see ``_usage_data``).
+        """
+        merged = dict(self._turn_usage)
+        for key, value in usage.items():
+            if not isinstance(value, int):
+                continue
+            if key == "total_tokens":
+                merged[key] = value
+            else:
+                merged[key] = merged.get(key, 0) + value
+        self._turn_usage = merged
+
     def _absorb_context_update(self, event: HarnessEvent) -> HarnessEvent:
+        self._absorb_turn_usage(event.data)
         total = event.data.get("total_tokens")
         if not isinstance(total, int) or total <= 0:
             # A step_finish without a usable total (e.g. an aborted step)
@@ -838,9 +858,10 @@ class OpenCodeDriver(Driver):
             }
             if diagnostic:
                 data["diagnostic"] = diagnostic
+            data.update(self._turn_usage)
         else:
             type_ = HarnessEventType.TURN_COMPLETED
-            data = {"outcome": "succeeded"}
+            data = {"outcome": "succeeded", **self._turn_usage}
         terminal: HarnessEvent | None = None
         if accepted is not None and accepted.done() and not accepted.cancelled():
             try:
