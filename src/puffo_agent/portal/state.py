@@ -1042,7 +1042,6 @@ class RuntimeState:
     def save(self, agent_id: str) -> None:
         import json
 
-        self._notify_health_change(agent_id)
         self.updated_at = int(time.time())
         path = runtime_json_path(agent_id)
         # CLI staleness gate is 30s; throttle pure-updated_at writes
@@ -1066,6 +1065,7 @@ class RuntimeState:
             json.dump(asdict(self), f, indent=2)
         os.replace(tmp, path)
         _RUNTIME_LAST_SAVE[key] = (sig, self.updated_at)
+        self._notify_health_change(agent_id)
 
     def _notify_health_change(self, agent_id: str) -> None:
         """Fire the registered listener when ``health`` actually changed.
@@ -1075,9 +1075,11 @@ class RuntimeState:
         same "whoever remembers" shape that left the transport probe
         unwired on three harness families.
 
-        Runs before the throttle check on purpose: an unchanged-signature
-        save is throttled, but a health change always changes the signature,
-        and a listener must never be skipped because of write throttling.
+        Called only after ``os.replace`` succeeds, so a listener that reads
+        the runtime file sees the health it is being told about, and a save
+        that fails to land tells nobody. The throttled early return above
+        cannot skip a health change: ``health`` is part of the write
+        signature, so a change always misses the unchanged-signature branch.
         """
         listener = _RUNTIME_HEALTH_LISTENERS.get(agent_id)
         previous = _RUNTIME_LAST_HEALTH.get(agent_id)
@@ -1106,6 +1108,19 @@ def set_runtime_health_listener(agent_id: str, listener: Any) -> None:
         _RUNTIME_HEALTH_LISTENERS.pop(agent_id, None)
     else:
         _RUNTIME_HEALTH_LISTENERS[agent_id] = listener
+
+
+def clear_runtime_health_listener(agent_id: str, listener: Any) -> None:
+    """Drop ``listener`` only while it is still the registered one.
+
+    A reporter's teardown can land after its successor has already claimed
+    the slot — a cancelled heartbeat loop runs its ``finally`` whenever the
+    event loop next gets to it. An unconditional pop would then silence a
+    live reporter, and health would quietly fall back to the periodic tick
+    with nothing to show that it had.
+    """
+    if _RUNTIME_HEALTH_LISTENERS.get(agent_id) is listener:
+        _RUNTIME_HEALTH_LISTENERS.pop(agent_id, None)
 
 
 # Keyed by resolved path so test tmp_path reuse doesn't collide.

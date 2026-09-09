@@ -52,6 +52,7 @@ from .state import (
     agent_home_dir,
     claude_cli_api_key,
     docker_shared_dir as docker_shared_dir,
+    clear_runtime_health_listener,
     set_runtime_health_listener,
 )
 from ..tasks import spawn
@@ -1501,18 +1502,30 @@ class Worker:
                 register_connected = getattr(client, "add_connected_callback", None)
                 if callable(register_connected):
                     register_connected(processing_reports.on_transport_connected)
+        agent_id = self.agent_cfg.id
+
+        # health only travels on heartbeats; without this a red written just
+        # after a turn settles waits out the interval before the server hears
+        # it. The periodic tick remains the fallback.
+        #
+        # One stable callable, bound and released together, so the module
+        # global is scoped to a running loop instead of outliving a stopped
+        # worker — and so neither shutdown path has to remember separately.
+        def _wake_heartbeat() -> None:
+            reporter.request_immediate_heartbeat()
+
         reporter = StatusReporter(
             client.http,
             runtime_health_provider=lambda: self.runtime.health,
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
             processing_reports=processing_reports,
-        )
-        # health only travels on heartbeats; without this a red written just
-        # after a turn settles waits out the interval before the server hears
-        # it. The periodic tick remains the fallback.
-        set_runtime_health_listener(
-            self.agent_cfg.id, reporter.request_immediate_heartbeat,
+            on_loop_start=lambda: set_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
+            on_loop_stop=lambda: clear_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
         )
         if bridge is not None:
             bridge.add_connected_callback(reporter.report_current_status)

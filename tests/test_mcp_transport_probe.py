@@ -1146,6 +1146,153 @@ def test_a_failed_publish_never_blocks_the_local_health_write(tmp_path, monkeypa
     assert written["health"] == "mcp_unreachable"
 
 
+def test_the_listener_is_told_a_health_it_can_already_read(tmp_path, monkeypatch):
+    """The listener publishes the health the daemon just decided, so it must
+    fire after the file lands, not before.
+
+    Notifying first makes the announced value and the stored value two
+    independent reads of a half-finished write, and lets a save that never
+    lands announce itself anyway.
+    """
+    from puffo_agent.portal.state import (
+        set_runtime_health_listener,
+        _RUNTIME_LAST_HEALTH,
+        runtime_json_path,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    _RUNTIME_LAST_HEALTH.pop("order", None)
+    observed: list[str] = []
+
+    def _read_the_file():
+        observed.append(
+            json.loads(
+                runtime_json_path("order").read_text(encoding="utf-8")
+            )["health"]
+        )
+
+    runtime = RuntimeState(status="running", health="ok")
+    runtime.save("order")
+    set_runtime_health_listener("order", _read_the_file)
+    try:
+        runtime.health = "mcp_unreachable"
+        runtime.save("order")
+    finally:
+        set_runtime_health_listener("order", None)
+
+    assert observed == ["mcp_unreachable"]
+
+
+def test_a_write_that_never_lands_announces_nothing_and_stays_pending(
+    tmp_path, monkeypatch
+):
+    """A failed save must not fire the listener — and must not consume the
+    change either. The next successful save still has to report it, or a
+    transient disk error would silently drop a red for good."""
+    from puffo_agent.portal import state as state_module
+    from puffo_agent.portal.state import (
+        set_runtime_health_listener,
+        _RUNTIME_LAST_HEALTH,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    _RUNTIME_LAST_HEALTH.pop("nodisk", None)
+    fired: list[str] = []
+
+    runtime = RuntimeState(status="running", health="ok")
+    runtime.save("nodisk")
+    set_runtime_health_listener("nodisk", lambda: fired.append(runtime.health))
+    real_replace = state_module.os.replace
+    try:
+        def _fail(src, dst):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(state_module.os, "replace", _fail)
+        runtime.health = "mcp_unreachable"
+        with pytest.raises(OSError):
+            runtime.save("nodisk")
+        assert fired == []
+
+        monkeypatch.setattr(state_module.os, "replace", real_replace)
+        runtime.save("nodisk")
+        assert fired == ["mcp_unreachable"]
+    finally:
+        set_runtime_health_listener("nodisk", None)
+
+
+@pytest.mark.asyncio
+async def test_the_health_listener_lives_exactly_as_long_as_the_loop():
+    """The registry is a module global, so a reporter that stops must not
+    stay reachable through it — and a reporter that starts again must be
+    reachable again.
+
+    Both halves are load-bearing. ws-local reuses one reporter across
+    attaches, spawning a fresh heartbeat loop each time and calling ``stop``
+    on every detach: binding at construction and releasing at ``stop`` would
+    unbind on the first detach and never rebind, silently retiring the
+    immediate push for the rest of the agent's life.
+    """
+    from puffo_agent.portal.state import _RUNTIME_HEALTH_LISTENERS
+
+    class _Bridge:
+        async def send_status(self, status, **kwargs):
+            return None
+
+        def add_connected_callback(self, callback):
+            return None
+
+    worker = Worker(
+        DaemonConfig(),
+        AgentConfig(
+            id="teardown-agent",
+            runtime=RuntimeConfig(kind="cli-local", harness="codex"),
+        ),
+    )
+    reporter = worker._build_status_reporter(
+        SimpleNamespace(http=SimpleNamespace(keyless=True), _bridge=_Bridge())
+    )
+    try:
+        assert "teardown-agent" not in _RUNTIME_HEALTH_LISTENERS
+
+        for _attach in range(2):
+            loop_task = spawn_task(reporter.run_heartbeat_loop())
+            await _settle()
+            assert "teardown-agent" in _RUNTIME_HEALTH_LISTENERS
+
+            reporter.stop()
+            await loop_task
+            assert "teardown-agent" not in _RUNTIME_HEALTH_LISTENERS
+    finally:
+        _RUNTIME_HEALTH_LISTENERS.pop("teardown-agent", None)
+
+
+def test_a_late_unbind_never_silences_the_reporter_that_replaced_it():
+    """A cancelled loop runs its ``finally`` whenever the event loop next
+    gets to it, which can be after a rebuilt reporter has claimed the slot.
+    Releasing by identity keeps the live one registered."""
+    from puffo_agent.portal.state import (
+        _RUNTIME_HEALTH_LISTENERS,
+        clear_runtime_health_listener,
+        set_runtime_health_listener,
+    )
+
+    def _old():
+        pass
+
+    def _new():
+        pass
+
+    try:
+        set_runtime_health_listener("succeeded-agent", _old)
+        set_runtime_health_listener("succeeded-agent", _new)
+        clear_runtime_health_listener("succeeded-agent", _old)
+        assert _RUNTIME_HEALTH_LISTENERS.get("succeeded-agent") is _new
+        clear_runtime_health_listener("succeeded-agent", _new)
+        assert "succeeded-agent" not in _RUNTIME_HEALTH_LISTENERS
+    finally:
+        _RUNTIME_HEALTH_LISTENERS.pop("succeeded-agent", None)
+
+
 def spawn_task(coro):
     return asyncio.ensure_future(coro)
 
