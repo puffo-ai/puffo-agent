@@ -1413,11 +1413,12 @@ class GlobalInboxRuntime(
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
+                    settled = self._health_outcome_for_turn(planned)
                     async with self._turn_state_lock:
                         await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
-                    process_outcome = "succeeded"
+                    process_outcome = settled
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)

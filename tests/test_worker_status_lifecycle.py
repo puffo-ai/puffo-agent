@@ -236,6 +236,12 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         "failure": "provider_failed",
         "cancelled": "cancelled",
         "retry_exhausted": "api_error_abandoned",
+        # A turn that woke on an announced batch and read none of it no longer
+        # settles health as a success: the provider may simply have deferred,
+        # but a driver mis-reporting a failed turn produces the same shape, so
+        # the health lane holds instead of clearing to ``ok``. Message
+        # bookkeeping is unchanged — see ``_health_outcome_for_turn``.
+        "no_read": "no_progress",
     }.get(case["outcome"], "succeeded")
     if case.get("error_code") == "plan_drained":
         # spent quota splits out of provider_failed: hold, don't retry
