@@ -988,8 +988,16 @@ class RuntimeState:
     #                           next successful reconnect. Only ever
     #                           overwrites "ok" — the specific signals
     #                           above stay authoritative
+    #   "no_progress"         — N consecutive turns woke on an announced
+    #                           batch and consumed none of it. Driver-
+    #                           independent: it reads the runtime's own
+    #                           admission bookkeeping, so it still fires when
+    #                           a harness driver mis-reports a failed provider
+    #                           turn as a completed one. Cleared by the next
+    #                           turn that consumes its batch. Never overwrites
+    #                           the stronger signals above
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | server_unreachable | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | unhandled_error | codex_thread_wedged | server_unreachable | no_progress | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:

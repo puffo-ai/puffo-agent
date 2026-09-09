@@ -119,6 +119,11 @@ RECONNECT_BACKOFF_SECONDS = 5.0
 # minute instead of "ok" for hours. One successful reconnect clears it.
 _WS_DEGRADE_THRESHOLD = 5
 
+# Consecutive turns that woke on an announced batch and consumed none of it
+# before the agent stops being reported healthy. One such turn is a normal
+# deferral; a run of them means the provider is not reaching the Inbox at all.
+_NO_PROGRESS_TURN_THRESHOLD = 3
+
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     if harness_name != "claude-code":
@@ -691,6 +696,52 @@ class Worker:
             "agent %s: runtime.health %s → ok", agent_id, previous_health
         )
 
+    def _note_no_progress_turn(self, agent_id: str) -> None:
+        """A turn woke on an announced batch and consumed none of it.
+
+        Deliberately *not* symmetrical with the success lane: this does not
+        clear anything and does not settle the runtime back to ``ok``. A
+        single such turn is a legitimate deferral, so the first
+        ``_NO_PROGRESS_TURN_THRESHOLD - 1`` only hold the previous health and
+        let the next wake-up retry; the streak past that is the signal.
+
+        The stronger reds stay authoritative — this only ever overwrites the
+        states that mean "nothing is known to be wrong", which is exactly the
+        gap it exists to close: a driver that mis-reports a failed turn as a
+        completed one leaves the agent sitting in ``ok`` forever.
+        """
+        streak = getattr(self, "_no_progress_turns", 0) + 1
+        self._no_progress_turns = streak
+        rt = self.runtime
+        if streak < _NO_PROGRESS_TURN_THRESHOLD:
+            logger.info(
+                "agent %s: turn made no progress on its announced batch "
+                "(%d/%d); leaving runtime.health = %s for the next wake-up",
+                agent_id, streak, _NO_PROGRESS_TURN_THRESHOLD, rt.health,
+            )
+            return
+        if rt.health not in ("ok", "in_progress", "unknown", "no_progress"):
+            logger.info(
+                "agent %s: %d consecutive no-progress turns, but "
+                "runtime.health = %s already names a cause; leaving it",
+                agent_id, streak, rt.health,
+            )
+            return
+        if rt.health != "no_progress":
+            logger.warning(
+                "agent %s: %d consecutive turns woke on pending messages and "
+                "read none; runtime.health %s → no_progress",
+                agent_id, streak, rt.health,
+            )
+        rt.health = "no_progress"
+        rt.error = (
+            "Woke for new messages but the provider read none of them "
+            f"{streak} times in a row. The turns are being reported as "
+            "completed while the messages stay unread — check the provider "
+            "credentials and the harness driver's error mapping."
+        )
+        rt.save(agent_id)
+
     def _resolve_health_after_success(self, agent_id: str) -> None:
         recovering_api_key = (
             getattr(self, "_claude_api_key_mode", False)
@@ -705,6 +756,8 @@ class Worker:
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
             self._auth_failed_notification_sent = False
+        # a turn that consumed its announced batch clears the no-progress streak
+        self._no_progress_turns = 0
         # a completed turn is proof quota is available again
         Worker._clear_drained(self.runtime, agent_id, logger)
         self._drained_notification_sent = False

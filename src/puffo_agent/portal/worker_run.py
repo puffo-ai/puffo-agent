@@ -828,6 +828,8 @@ class StandardWorkerRun:
         try:
             if outcome == "succeeded":
                 worker._resolve_health_after_success(agent_id)
+            elif outcome == "no_progress":
+                worker._note_no_progress_turn(agent_id)
             elif outcome == "cancelled":
                 worker_module.Worker._resolve_health_on_success(
                     worker.runtime, agent_id, logger
