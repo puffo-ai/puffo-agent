@@ -1066,8 +1066,8 @@ class RuntimeManager:
         if not pending:
             return
         logger.warning(
-            "continuation admissions discarded without a tool result "
-            "reason=%s count=%d native_turn=%s",
+            "puffo_admission_continuation_discarded "
+            "reason=%s count=%d provider_turn_id=%s",
             reason,
             pending,
             self.native_turn_id or "",

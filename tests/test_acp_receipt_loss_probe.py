@@ -103,7 +103,7 @@ async def test_lost_receipt_is_audible_when_the_turn_ends(caplog):
     assert admitted == []
     with caplog.at_level("WARNING"):
         manager._discard_pending_admissions("turn_completed")
-    assert "continuation admissions discarded without a tool result" in caplog.text
+    assert "puffo_admission_continuation_discarded" in caplog.text
     assert "count=1" in caplog.text
 
 
@@ -122,7 +122,7 @@ async def test_a_released_continuation_leaves_no_warning(caplog):
     assert len(admitted) == 1
     with caplog.at_level("WARNING"):
         manager._discard_pending_admissions("turn_completed")
-    assert "continuation admissions discarded" not in caplog.text
+    assert "puffo_admission_continuation_discarded" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -140,4 +140,4 @@ async def test_deliberate_cancellation_stays_silent(caplog):
     with caplog.at_level("WARNING"):
         adapter.register_continuation_callback(None)
     assert not manager._continuation_admissions
-    assert "continuation admissions discarded" not in caplog.text
+    assert "puffo_admission_continuation_discarded" not in caplog.text
