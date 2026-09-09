@@ -65,14 +65,21 @@ def _pi_events() -> list[HarnessEvent]:
 
 
 def _opencode_events() -> list[HarnessEvent]:
-    """Real ``normalize_opencode_frame`` output; each frame carries the text
-    accumulated so far, so the projector must not concatenate them blindly."""
+    """Real ``normalize_opencode_frame`` output for a multi-step answer.
+
+    ``opencode run --format json`` emits one ``text`` frame per completed text
+    part, each with its own part id and its whole text (measured against
+    the shipped binary: a tool-using turn produced ``prt_…MkS`` "START" then
+    ``prt_…USt`` "DONE 42"). Several parts is how one answer arrives in
+    pieces, so that is what the projector has to keep whole.
+    """
     events: list[HarnessEvent] = []
-    for chunk in CHUNKS:
+    for index, chunk in enumerate(CHUNKS):
         events.extend(
             normalize_opencode_frame(
                 {"type": "text", "sessionID": "ses",
-                 "part": {"id": "prt", "type": "text", "text": chunk}},
+                 "part": {"id": f"prt_{index}", "type": "text",
+                          "text": chunk}},
                 session_ref=SESSION,
                 turn_ref=TURN,
             )
@@ -273,17 +280,7 @@ async def test_driver_text_reaches_the_routed_reply(
     )
 
 
-@pytest.mark.parametrize("harness", [
-    "pi",
-    pytest.param("opencode", marks=pytest.mark.xfail(
-        strict=True,
-        reason="opencode closes a block after every text fragment while "
-               "reusing the part id, so the projector emits the first "
-               "fragment and dedupes the rest -- tracked separately from the "
-               "payload-key fix",
-    )),
-    "acp",
-])
+@pytest.mark.parametrize("harness", ["pi", "opencode", "acp"])
 @pytest.mark.asyncio
 async def test_driver_text_reaches_the_profile_log(
     harness, tmp_path, monkeypatch,
