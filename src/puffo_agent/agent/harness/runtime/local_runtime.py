@@ -95,6 +95,11 @@ from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 
+# claude-code reads this to bound its own transient-status retry loop
+# (429/529/5xx). Set only when the agent is routed through a budgeted gateway.
+GATEWAY_CLI_MAX_RETRIES_ENV = "CLAUDE_CODE_MAX_RETRIES"
+GATEWAY_CLI_MAX_RETRIES = "2"
+
 VALID_PERMISSION_MODES = frozenset({"bypassPermissions"})
 VALID_SANDBOX_MODES = frozenset({
     "read-only",
@@ -711,6 +716,11 @@ class LocalRuntimePreparer:
         llm_env = anthropic_base_url_env(runtime.llm_base_url)
         if llm_env and runtime.api_key:
             llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
+            # Behind a budgeted gateway a 429 is usually the cap, not load.
+            # The CLI treats every 429 as transient and retries with backoff;
+            # under a cap that is a storm the gateway counts against the same
+            # budget. Cap the CLI's retries; the runtime parks on the drain.
+            llm_env[GATEWAY_CLI_MAX_RETRIES_ENV] = GATEWAY_CLI_MAX_RETRIES
         else:
             configured_key = claude_cli_api_key(self.daemon_cfg)
             if configured_key:

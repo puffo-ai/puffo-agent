@@ -795,15 +795,32 @@ class Worker:
             self._extra_usage_notification_sent = False
             logger.exception("could not send extra-usage notification")
 
-    def _enter_drained(self, agent_id: str, resets_at: int | None = None) -> None:
-        """``drained`` + one operator DM per episode. No refresher kick."""
-        from ..agent._usage_markers import DRAINED_RUNTIME_ERROR
+    def _enter_drained(
+        self,
+        agent_id: str,
+        resets_at: int | None = None,
+        *,
+        budget_cap: bool = False,
+    ) -> None:
+        """``drained`` + one operator DM per episode. No refresher kick.
+
+        ``budget_cap``: a gateway spend cap, not a plan window — no reset time
+        exists and the usage snapshot must not clear it (unrelated signal).
+        The runtime holds on a timer and probes; see ``_park_drained``.
+        """
+        from ..agent._usage_markers import (
+            BUDGET_EXCEEDED_RUNTIME_ERROR,
+            DRAINED_RUNTIME_ERROR,
+        )
 
         rt = self.runtime
         was_ok = rt.health != "drained"
         rt.health = "drained"
-        rt.error = DRAINED_RUNTIME_ERROR
+        rt.error = (
+            BUDGET_EXCEEDED_RUNTIME_ERROR if budget_cap else DRAINED_RUNTIME_ERROR
+        )
         rt.save(agent_id)
+        self._drained_budget_cap = budget_cap
         if resets_at is not None:
             self._drained_resets_at = resets_at
         if was_ok:
@@ -847,19 +864,25 @@ class Worker:
         display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
-        resets_at = getattr(self, "_drained_resets_at", None)
-        if resets_at is None:
-            # error bodies rarely carry a time — predict from /usage, best-effort
-            from .control.usage_snapshot import predicted_reset_epoch
+        if getattr(self, "_drained_budget_cap", False):
+            # a gateway cap: no window, no /usage prediction — say what it is
+            from ..agent._invite_strings import format_budget_exceeded
 
-            try:
-                resets_at = await predicted_reset_epoch(harness or "claude-code")
-            except Exception:  # noqa: BLE001
-                resets_at = None
-            if resets_at is not None:
-                self._drained_resets_at = resets_at
-        formatter = format_codex_drained if harness == "codex" else format_drained
-        text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
+            text = format_budget_exceeded(self.agent_cfg.id, display_name)
+        else:
+            resets_at = getattr(self, "_drained_resets_at", None)
+            if resets_at is None:
+                # error bodies rarely carry a time — predict from /usage, best-effort
+                from .control.usage_snapshot import predicted_reset_epoch
+
+                try:
+                    resets_at = await predicted_reset_epoch(harness or "claude-code")
+                except Exception:  # noqa: BLE001
+                    resets_at = None
+                if resets_at is not None:
+                    self._drained_resets_at = resets_at
+            formatter = format_codex_drained if harness == "codex" else format_drained
+            text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:
@@ -1025,6 +1048,7 @@ class Worker:
         Worker._clear_drained(self.runtime, agent_id, logger)
         self._drained_notification_sent = False
         self._drained_resets_at = None
+        self._drained_budget_cap = False
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
@@ -1112,6 +1136,7 @@ class Worker:
         self._drained_notification_sent = False
         self._extra_usage_notification_sent = False
         self._drained_resets_at: int | None = None
+        self._drained_budget_cap = False
         self._claude_api_key_mode = (
             agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
             and bool(

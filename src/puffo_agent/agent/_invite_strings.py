@@ -256,3 +256,33 @@ def format_codex_oauth_expired(
         "3. 按浏览器提示用你的 Codex 账户登录。\n"
         "4. 登录完成后回到这里发一条消息即可恢复。"
     )
+
+
+def format_budget_exceeded(agent_id: str, agent_display_name: str = "") -> str:
+    """Bilingual gateway-budget DM. Unlike a plan window there is nothing to
+    wait for: the cap is raised or the wallet is topped up, or it stays."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name
+        else f"`{agent_id}`"
+    )
+    return (
+        f"🪫 {label} — the spending cap on the account behind my key is "
+        "exhausted, so the LLM gateway is refusing my requests. I'm holding "
+        "your messages and will re-check every 5–30 minutes; nothing is lost.\n"
+        "\n"
+        "**Your options:**\n"
+        "1. Top up the wallet or raise the cap for this account.\n"
+        "2. Switch me to a cheaper model (`/config`, or the model field on my agent card).\n"
+        "\n"
+        "**This is not a sign-in problem, and it will not reset on its own.**\n"
+        "\n"
+        f"🪫 {label} — 我这把密钥所属账户的消费上限已经用完，网关正在拒绝我的请求。"
+        "我会先把你的消息存住，每隔 5–30 分钟再试一次，不会丢。\n"
+        "\n"
+        "**你可以：**\n"
+        "1. 给这个账户充值，或提高消费上限。\n"
+        "2. 把我换成更便宜的模型（`/config`，或 agent 卡片上的 model 字段）。\n"
+        "\n"
+        "**这不是登录问题，也不会自己恢复。**"
+    )
