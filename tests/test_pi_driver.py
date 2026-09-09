@@ -333,6 +333,36 @@ def test_pi_turn_events_do_not_become_puffo_turn_boundaries():
         }
 
 
+def test_message_end_reads_usage_from_the_message_object():
+    """Captured 0.8x ``message_end`` frames carry usage only on the message.
+
+    Reading the frame top level alone left the turn's usage empty, so every
+    Pi turn reported input/output as 0/0 downstream.
+    """
+    events = normalize_pi_event(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input": 1050,
+                    "output": 5,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "reasoning": 24,
+                    "totalTokens": 1055,
+                },
+            },
+        },
+        session_ref=SessionRef("s"),
+        turn_ref=TurnRef("t"),
+    )
+    usage = {e.type: e for e in events}[HarnessEventType.CONTEXT_UPDATED].data
+    assert usage["input_tokens"] == 1050
+    assert usage["output_tokens"] == 5
+    assert usage["reasoning_tokens"] == 24
+
+
 def test_queue_update_reports_counts_not_queued_message_text():
     events = normalize_pi_event(
         {
