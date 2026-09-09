@@ -27,12 +27,32 @@ now documented as "correlation material only ... never a grant".
 So this oracle now checks COUNTS on both sides -- exactly one adjudication and
 exactly one provider call -- which still reddens ``replay`` (two adjudications)
 and ``fanout`` (two provider calls).  It does NOT check request-to-response
-CORRELATION, and it cannot: nothing observable from outside binds a particular
-provider call to a particular adjudication.  A provider call executing under a
-DIFFERENT adjudication's id would pass every assertion here.
+CORRELATION: a provider call executing under a DIFFERENT adjudication's id
+would pass every assertion here.  Do not read a green run as covering that axis.
 
-Do not read a green run as covering that axis.  Closing it needs either a
-LingTai-side observable or a test inside LingTai; it is not an oracle bug.
+An earlier version of this note claimed the correlation check "cannot" be
+restored because nothing observable binds a call to an adjudication.  That
+claim was wrong -- asserted without enumerating what is actually reachable.
+At least two candidate observables exist:
+
+* ``lingtai.kernel.provider_admission.current_provider_admission()`` is
+  exported and readable at the provider call site; ``RootProviderAdmission``
+  carries ``correlation_id``, documented as audit/routing material.  This is
+  ROOT-TURN scoped, not per-call.
+* ``AuthorityAuditRecord.call_id`` on the Puffo side is the client-supplied
+  per-call id echoed back into the audit record.
+
+Whether those two join into a genuine per-call correlation is UNVERIFIED.
+Note the granularity trap: the accessor LingTai removed
+(``current_provider_call_audit_id``) was the PER-CALL one, while the surviving
+``correlation_id`` hangs off ``RootProviderAdmission`` and is ROOT-TURN scoped.
+So restoring per-call correlation forks into either (a) a LingTai-side per-call
+observable, which first needs to establish why the old accessor was deliberately
+removed -- a design decision, not an oracle question -- or (b) threading the
+Puffo-side ``call_id`` end to end.  Neither branch has been shown to work.
+
+The honest status is therefore "not currently checked, closability unverified",
+not "impossible".
 """
 
 from __future__ import annotations
