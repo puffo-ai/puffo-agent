@@ -579,7 +579,12 @@ async def test_assistant_error_recovered_by_retry_does_not_fail_turn():
 
 
 @pytest.mark.asyncio
-async def test_unretried_provider_error_fails_once_and_resets_for_next_turn():
+@pytest.mark.parametrize("diagnostic, expected", [
+    ("unknown failure private-detail", "provider_error"),
+    ("Third-party apps now draw from your extra usage, not your plan limits. "
+     "Add more at claude.ai/settings/usage", "extra_usage_required"),
+])
+async def test_unretried_provider_error_fails_once_and_resets_for_next_turn(diagnostic, expected):
     """A non-auth error must fail the turn without contaminating later work."""
     proc = FakePiProcess()
     driver, _ = await _open(proc)
@@ -590,12 +595,12 @@ async def test_unretried_provider_error_fails_once_and_resets_for_next_turn():
         proc.push({"type": "agent_start"})
         proc.push({"type": "message_end", "message": {
             "role": "assistant", "stopReason": "error" if failed else "stop",
-            "errorMessage": "unknown failure private-detail" if failed else "",
+            "errorMessage": diagnostic if failed else "",
         }})
         proc.push({"type": "agent_settled"})
         events = await _drain_events(driver, 3)
         assert events[-1].data["outcome"] == ("failed" if failed else "succeeded")
-        assert events[-1].data.get("error_code") == ("provider_error" if failed else None)
+        assert events[-1].data.get("error_code") == (expected if failed else None)
         assert "private-detail" not in json.dumps([dict(e.data) for e in events])
     await driver.close()
 

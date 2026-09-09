@@ -661,6 +661,7 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
             "provider_error",
             "refresh_broken",
             "drained",
+            "extra_usage_required",
             "unhandled_error",
             "codex_thread_wedged",
             "server_unreachable",

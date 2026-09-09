@@ -510,7 +510,10 @@ class StandardWorkerRun:
         worker = self.worker
         logger.error("agent %s: failed to initialise: %s", agent_id, exc, exc_info=True)
         worker.runtime.status = "error"
-        worker.runtime.error = str(exc)
+        if isinstance(exc, ProviderFailureError) and exc.error_code == "extra_usage_required":
+            worker._enter_extra_usage_required(agent_id)
+        else:
+            worker.runtime.error = str(exc)
         worker.runtime.save(agent_id)
         worker._warm_done.set()
         if worker._adapter is not None:
@@ -567,7 +570,7 @@ class StandardWorkerRun:
             return not exc.is_auth and not exc.is_drained
         if isinstance(exc, ProviderFailureError):
             # plan quota arrives here, not as AgentAPIError
-            return exc.error_code != "plan_drained"
+            return exc.error_code not in {"plan_drained", "extra_usage_required"}
         return not isinstance(
             exc,
             (
@@ -618,7 +621,10 @@ class StandardWorkerRun:
             exc_info=True,
         )
         worker.runtime.status = "error"
-        worker.runtime.error = str(exc)
+        if isinstance(exc, ProviderFailureError) and exc.error_code == "extra_usage_required":
+            worker._enter_extra_usage_required(agent_id)
+        else:
+            worker.runtime.error = str(exc)
         worker.runtime.save(agent_id)
         worker._warm_done.set()
         try:
@@ -794,8 +800,11 @@ class StandardWorkerRun:
             covers_renotice_enabled=(
                 True if worker.daemon_cfg.covers_renotice else None
             ),
-            # unpark = snapshot-cleared health + a wake
-            drained_check=lambda: worker.runtime.health == "drained",
+            # Plan quota can unpark after a snapshot; extra usage requires
+            # an operator restart (new runtime) or a successful model turn.
+            drained_check=lambda: worker.runtime.health in {
+                "drained", "extra_usage_required",
+            },
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -910,6 +919,8 @@ class StandardWorkerRun:
                 worker._enter_drained(
                     agent_id, parse_reset_epoch(error_text or "")
                 )
+            elif outcome == "extra_usage_required":
+                worker._enter_extra_usage_required(agent_id)
             elif outcome == "api_error_abandoned":
                 worker_module.Worker._mark_api_error_abandoned_if_in_progress(
                     worker.runtime, agent_id, error_text, logger
