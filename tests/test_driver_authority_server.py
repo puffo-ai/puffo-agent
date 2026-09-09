@@ -4,14 +4,22 @@ import array
 import json
 import os
 import socket
+import stat
 import struct
+import subprocess
+import sys
 import threading
+import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from puffo_agent.agent.harness.drivers import acp as acp_driver_module
+from puffo_agent.agent.harness import (
+    driver_authority_server as authority_server_module,
+)
 from puffo_agent.agent.harness.drivers.acp import AcpDriver
 from puffo_agent.agent.harness.driver import RuntimeSpec
 from puffo_agent.agent.harness.driver_authority_server import (
@@ -86,6 +94,27 @@ def _close_fds(fds: list[int]) -> None:
         os.close(fd)
 
 
+def _open_fds_for_file(path: Path) -> list[int]:
+    expected = path.stat()
+    fd_root = Path("/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd")
+    matches: list[int] = []
+    for entry in fd_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        fd = int(entry.name)
+        try:
+            observed = os.fstat(fd)
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_dev == expected.st_dev
+            and observed.st_ino == expected.st_ino
+        ):
+            matches.append(fd)
+    return matches
+
+
 def test_endpoint_claim_is_single_use_and_reuse_is_audited() -> None:
     server = DriverAuthorityServer()
     client = _client(server.issue_root(launch_id="root-1"))
@@ -117,16 +146,34 @@ def test_endpoint_claim_transition_cannot_be_interleaved() -> None:
     probe_lock = threading.Lock()
     probe_entries = 0
 
-    def claim_probe() -> None:
-        nonlocal probe_entries
-        with probe_lock:
-            probe_entries += 1
-            (first_inside if probe_entries == 1 else second_inside).set()
-        assert release.wait(timeout=2)
+    class CoordinatedRecord:
+        """Pause the first state read without adding a production test hook."""
 
-    server = DriverAuthorityServer(claim_probe=claim_probe)
-    endpoint = server.issue_root(launch_id="root-race")
-    record = server._records[0]
+        binding = authority_server_module._EndpointBinding(
+            "root-race", "root", None, 0, None
+        )
+
+        def __init__(self) -> None:
+            self._state = authority_server_module._LeaseState.ISSUED
+
+        @property
+        def state(self):
+            nonlocal probe_entries
+            with probe_lock:
+                observed = self._state
+                probe_entries += 1
+                entry = probe_entries
+                (first_inside if entry == 1 else second_inside).set()
+            if entry == 1:
+                assert release.wait(timeout=2)
+            return observed
+
+        @state.setter
+        def state(self, value) -> None:
+            self._state = value
+
+    server = DriverAuthorityServer()
+    record = CoordinatedRecord()
     responses: list[dict[str, Any]] = []
     start = threading.Barrier(3)
 
@@ -146,15 +193,45 @@ def test_endpoint_claim_transition_cannot_be_interleaved() -> None:
             claimant.join(timeout=2)
             assert not claimant.is_alive()
 
-        assert probe_entries == 1
+        assert probe_entries == 2
+        assert second_inside.is_set()
         assert sum("role" in response for response in responses) == 1
         denied = next(response for response in responses if "state" in response)
         assert denied["state"] == "denied"
         assert denied["reason_code"] == "endpoint_already_claimed"
     finally:
         release.set()
-        endpoint.close()
         server.close()
+
+
+def test_acceptance_oracle_checks_survive_python_optimization() -> None:
+    """``python -O`` must not turn the delivery oracle into a false pass."""
+
+    code = """
+from scripts.verify_lingtai_driver_authority import _validate_oracle
+
+_validate_oracle(["audit-ok"], ["audit-ok"], None)
+invalid = (
+    ([], [], None),
+    (["audit-a", "audit-b"], ["audit-a"], None),
+    (["audit-a"], ["audit-b"], None),
+    (["audit-a"], ["audit-a"], "audit-a"),
+)
+for case in invalid:
+    try:
+        _validate_oracle(*case)
+    except SystemExit:
+        continue
+    raise RuntimeError(f"optimized oracle accepted invalid case: {case!r}")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_endpoint_binding_mismatch_is_denied_and_audited() -> None:
@@ -362,6 +439,267 @@ def test_root_can_issue_one_hop_but_derived_cannot_issue_nested_child() -> None:
         server.close()
 
 
+def test_derived_endpoint_count_is_bounded(monkeypatch) -> None:
+    monkeypatch.setattr(
+        authority_server_module, "MAX_ACTIVE_DERIVED_ENDPOINTS", 2
+    )
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-bounded"))
+    children: list[socket.socket] = []
+    try:
+        _hello(root)
+        request = {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "launch_id": "root-bounded",
+            "capability": "daemon",
+        }
+        for _ in range(2):
+            granted, fds = _request(root, request)
+            assert granted["state"] == "granted"
+            assert len(fds) == 1
+            children.append(socket.socket(fileno=fds.pop()))
+
+        denied, fds = _request(root, request)
+        assert fds == []
+        assert denied["state"] == "denied"
+        assert denied["reason_code"] == "derived_endpoint_limit_reached"
+        assert sum(
+            record.binding.role == "derived"
+            for record in server._records
+        ) == 2
+    finally:
+        for child in children:
+            child.close()
+        root.close()
+        server.close()
+
+
+def test_unclaimed_derived_endpoint_expires_and_frees_capacity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        authority_server_module, "MAX_ACTIVE_DERIVED_ENDPOINTS", 1
+    )
+    monkeypatch.setattr(
+        authority_server_module, "DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS", 0.05
+    )
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-expiry"))
+    child: socket.socket | None = None
+    replacement: socket.socket | None = None
+    try:
+        _hello(root)
+        request = {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "launch_id": "root-expiry",
+            "capability": "avatar",
+        }
+        granted, fds = _request(root, request)
+        assert granted["state"] == "granted"
+        child = socket.socket(fileno=fds.pop())
+        child.settimeout(2)
+        assert child.recv(1) == b""
+
+        deadline = time.monotonic() + 2
+        while True:
+            retried, replacement_fds = _request(root, request)
+            if retried["state"] == "granted":
+                replacement = socket.socket(fileno=replacement_fds.pop())
+                break
+            assert retried["reason_code"] == "derived_endpoint_limit_reached"
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        assert len(replacement_fds) == 0
+    finally:
+        if replacement is not None:
+            replacement.close()
+        if child is not None:
+            child.close()
+        root.close()
+        server.close()
+
+
+def test_derived_thread_start_failure_releases_both_socket_ends(
+    monkeypatch,
+) -> None:
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-start-failure"))
+    try:
+        _hello(root)
+
+        def fail_start(_record) -> None:
+            raise RuntimeError("thread start unavailable")
+
+        monkeypatch.setattr(server, "_start_record", fail_start)
+        denied, fds = _request(
+            root,
+            {
+                "version": 1,
+                "op": "authorize_derived_launch",
+                "launch_id": "root-start-failure",
+                "capability": "daemon",
+            },
+        )
+        assert fds == []
+        assert denied["state"] == "denied"
+        assert denied["reason_code"] == "derived_endpoint_start_failed"
+        assert all(
+            record.binding.role != "derived" for record in server._records
+        )
+    finally:
+        root.close()
+        server.close()
+
+
+def test_close_cannot_finish_between_thread_publication_and_start(
+    monkeypatch,
+) -> None:
+    """Shutdown must serialize with publishing and starting an endpoint thread."""
+
+    real_thread = threading.Thread
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    close_finished = threading.Event()
+
+    class CoordinatedThread:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            start_entered.set()
+            assert release_start.wait(timeout=2)
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    server = DriverAuthorityServer()
+    binding = authority_server_module._EndpointBinding(
+        "derived-start-race", "derived", "root", 1, "daemon"
+    )
+    record, child = server._issue_endpoint(binding)
+    monkeypatch.setattr(
+        authority_server_module.threading, "Thread", CoordinatedThread
+    )
+
+    starter = real_thread(target=server._start_record, args=(record,))
+
+    def close_server() -> None:
+        server.close()
+        close_finished.set()
+
+    closer = real_thread(target=close_server)
+    starter.start()
+    try:
+        assert start_entered.wait(timeout=2)
+        closer.start()
+        assert not close_finished.wait(timeout=0.1)
+        assert record.state is authority_server_module._LeaseState.ISSUED
+    finally:
+        release_start.set()
+        starter.join(timeout=2)
+        closer.join(timeout=2)
+        child.close()
+        server.close()
+    assert not starter.is_alive()
+    assert not closer.is_alive()
+    assert close_finished.is_set()
+
+
+def test_claim_timeout_is_absolute_across_fragmented_frames(monkeypatch) -> None:
+    """A derived child cannot refresh its claim lease by trickling bytes."""
+
+    monkeypatch.setattr(
+        authority_server_module, "DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS", 1.0
+    )
+    now = [10.0]
+    monkeypatch.setattr(
+        authority_server_module.time, "monotonic", lambda: now[0]
+    )
+    encoded = json.dumps({"version": 1, "op": "hello"}).encode()
+    fragments = list(struct.pack("!I", len(encoded)) + encoded)
+
+    class FragmentSocket:
+        def __init__(self) -> None:
+            self.timeout: float | None = 1.0
+
+        def settimeout(self, value: float | None) -> None:
+            self.timeout = value
+
+        def recvmsg(self, *_args):
+            delay = 0.4
+            if self.timeout is not None and delay > self.timeout:
+                now[0] += self.timeout
+                raise socket.timeout
+            now[0] += delay
+            return bytes([fragments.pop(0)]), [], 0, None
+
+    record = authority_server_module._EndpointRecord(
+        FragmentSocket(),
+        authority_server_module._EndpointBinding(
+            "derived-fragments", "derived", "root", 1, "daemon"
+        ),
+        claim_deadline_monotonic=11.0,
+    )
+
+    with pytest.raises(socket.timeout):
+        DriverAuthorityServer._recv_frame(record)
+
+    assert now[0] == pytest.approx(11.0)
+    assert fragments
+
+
+def test_truncated_request_rights_are_closed_after_disconnect(tmp_path: Path) -> None:
+    """A truncated SCM_RIGHTS request must not leak installed descriptors."""
+
+    target = tmp_path / "attacker-controlled"
+    target.write_bytes(b"authority-fd-probe")
+    sent_fds = [os.open(target, os.O_RDONLY) for _ in range(3)]
+    server = DriverAuthorityServer()
+    client = _client(server.issue_root(launch_id="root-truncated-rights"))
+    client.settimeout(2)
+    encoded = json.dumps({"version": 1, "op": "hello"}).encode()
+    rights = array.array("i", sent_fds)
+    try:
+        client.sendmsg(
+            [struct.pack("!I", len(encoded)) + encoded],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, rights)],
+        )
+    finally:
+        _close_fds(sent_fds)
+    try:
+        assert client.recv(1) == b""
+    finally:
+        client.close()
+        server.close()
+
+    assert _open_fds_for_file(target) == []
+
+
+def test_authority_audit_retains_only_the_bounded_recent_window(monkeypatch) -> None:
+    """A long-lived root cannot grow the in-memory authority audit forever."""
+
+    monkeypatch.setattr(authority_server_module, "MAX_AUDIT_RECORDS", 3)
+    server = DriverAuthorityServer()
+    client = _client(server.issue_root(launch_id="root-audit-bound"))
+    try:
+        _hello(client)
+        decisions = []
+        for _ in range(4):
+            decision, fds = _request(
+                client,
+                {"version": 1, "op": "unsupported"},
+            )
+            assert fds == []
+            decisions.append(decision)
+
+        assert [record.audit_id for record in server.audit_records()] == [
+            decision["audit_id"] for decision in decisions[-3:]
+        ]
+    finally:
+        client.close()
+        server.close()
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -383,9 +721,10 @@ def test_malformed_frames_disconnect_without_a_decision(payload: bytes) -> None:
         server.close()
 
 
+@pytest.mark.parametrize("profile", ["puffo-v0", "puffo-v1"])
 @pytest.mark.asyncio
 async def test_constrained_lingtai_spawn_gets_only_the_issued_endpoint(
-    monkeypatch,
+    monkeypatch, profile,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -405,7 +744,7 @@ async def test_constrained_lingtai_spawn_gets_only_the_issued_endpoint(
                 launch_args=(
                     "acp",
                     "--profile",
-                    "puffo-v0",
+                    profile,
                     "--runtime-id",
                     "r1",
                 ),
@@ -422,7 +761,7 @@ async def test_constrained_lingtai_spawn_gets_only_the_issued_endpoint(
             "lingtai",
             "acp",
             "--profile",
-            "puffo-v0",
+            profile,
             "--runtime-id",
             "r1",
         )
@@ -474,8 +813,11 @@ async def test_generic_acp_spawn_cannot_inherit_a_caller_supplied_authority(
         await driver.close()
 
 
+@pytest.mark.parametrize("profile_arg", ["--profile=puffo-v0", "--profile=puffo-v1"])
 @pytest.mark.asyncio
-async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds() -> None:
+async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds(
+    profile_arg,
+) -> None:
     driver = AcpDriver(lambda _command, _spec: object())
 
     with pytest.raises(RuntimeError, match="POSIX local spawn path"):
@@ -484,7 +826,7 @@ async def test_constrained_lingtai_rejects_spawn_paths_that_cannot_pass_fds() ->
                 RuntimeSpec(
                     "/workspace",
                     executable="lingtai",
-                    launch_args=("acp", "--profile=puffo-v0"),
+                    launch_args=("acp", profile_arg),
                 )
             )
         )

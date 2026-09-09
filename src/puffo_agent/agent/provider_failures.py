@@ -31,9 +31,22 @@ PROVIDER_FAILURES: Mapping[str, ProviderFailure] = MappingProxyType(
             "The requested operation was not permitted.",
             runtime_event_code="permission_denied",
         ),
+        "model_not_found": ProviderFailure(
+            "The selected provider model was not found; choose another model ID.",
+        ),
+        "not_entitled": ProviderFailure(
+            "This provider account is not entitled to use the selected model.",
+            runtime_event_code="permission_denied",
+        ),
         "plan_drained": ProviderFailure(
             "The provider plan's usage quota is spent; wait for the "
             "usage window to reset.",
+            runtime_event_code="provider_unavailable",
+        ),
+        "extra_usage_required": ProviderFailure(
+            "Extra usage is unavailable. Check extra usage settings, balance, "
+            "or spending limits at https://claude.ai/settings/usage, then restart "
+            "the agent to retry pending messages.",
             runtime_event_code="provider_unavailable",
         ),
         "quota_exhausted": ProviderFailure(
@@ -127,6 +140,31 @@ def runtime_event_failure_code(error_code: str) -> str:
     return provider_failure(error_code).runtime_event_code
 
 
+def _diagnostic_mentions_model_not_found(diagnostic: str) -> bool:
+    return (
+        "model_not_found" in diagnostic
+        or "model not found" in diagnostic
+        or "unknown model" in diagnostic
+        or re.search(r"\bmodel\b.*\bdoes not exist\b", diagnostic) is not None
+    )
+
+
+def _looks_like_model_entitlement_failure(diagnostic: str) -> bool:
+    if "model" not in diagnostic:
+        return False
+    return any(
+        marker in diagnostic
+        for marker in (
+            "not_entitled",
+            "not entitled",
+            "do not have access",
+            "does not have access",
+            "not available for your account",
+            "not permitted to use",
+        )
+    )
+
+
 def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     """Classify an explicit provider diagnostic into the shared vocabulary."""
     normalized = diagnostic.lower()
@@ -136,6 +174,13 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     # order: hard 401 -> plan quota -> broad quota -> auth substrings
     if status == 401:
         return "authentication"
+    # A specific provider refusal, not a general mention of usage or limits.
+    # Subscription snapshots cannot prove that this separate budget recovered.
+    if (
+        "third-party apps now draw from your extra usage" in normalized
+        and "add more at claude.ai/settings/usage" in normalized
+    ):
+        return "extra_usage_required"
     if looks_like_usage_limit(normalized):
         return "plan_drained"
     if (
@@ -147,6 +192,10 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
         or re.search(r"\bquota\b", normalized) is not None
     ):
         return "quota_exhausted"
+    if _diagnostic_mentions_model_not_found(normalized):
+        return "model_not_found"
+    if _looks_like_model_entitlement_failure(normalized):
+        return "not_entitled"
     if looks_like_provider_auth_error(normalized):
         return "authentication"
     if status == 429 or any(

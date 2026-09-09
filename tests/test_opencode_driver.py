@@ -139,6 +139,52 @@ async def test_turn_terminal_waits_for_both_process_exit_and_stream_eof(
 
 
 @pytest.mark.asyncio
+async def test_turn_usage_accumulates_across_steps():
+    """OpenCode reports usage per step_finish and a turn runs several steps.
+
+    The terminal is what the runtime reads token counts from, so a turn that
+    never carries them reports 0/0 no matter what the provider measured.
+    """
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_1",
+        "part": {"messageID": "msg_1"},
+    })
+    await asyncio.wait_for(started, timeout=1)
+    terminal = asyncio.create_task(
+        _next_matching(stream, HarnessEventType.TURN_COMPLETED)
+    )
+    for tokens in (
+        {"input": 100, "output": 10, "reasoning": 1,
+         "cache": {"read": 5, "write": 0}, "total": 1000},
+        {"input": 250, "output": 30, "reasoning": 2,
+         "cache": {"read": 7, "write": 0}, "total": 1400},
+    ):
+        proc.feed({
+            "type": "step_finish",
+            "sessionID": "ses_1",
+            "part": {"messageID": "msg_1", "tokens": tokens},
+        })
+    proc.exit()
+    proc.eof()
+
+    event = await asyncio.wait_for(terminal, timeout=1)
+    assert event.data["outcome"] == "succeeded"
+    assert event.data["input_tokens"] == 350
+    assert event.data["output_tokens"] == 40
+    assert event.data["reasoning_tokens"] == 3
+    assert event.data["cache_read_tokens"] == 12
+    # Context occupancy is the newest step's, not a sum.
+    assert event.data["total_tokens"] == 1400
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_second_turn_resumes_native_session_and_emits_one_session_boundary():
     processes = [_TurnProcess(), _TurnProcess()]
     commands = []
@@ -263,7 +309,7 @@ async def test_jsonl_reader_does_not_split_valid_unicode_line_separators():
         event for event in events
         if event.type is HarnessEventType.ASSISTANT_DELTA
     ]
-    assert delta.data["delta"] == text
+    assert delta.data["text"] == text
     await driver.close()
 
 

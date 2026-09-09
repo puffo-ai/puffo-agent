@@ -8,6 +8,8 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 from __future__ import annotations
 
 import logging
+import math
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from aiohttp import web
@@ -38,6 +40,109 @@ def set_rpc_resolver(fn: Optional[RpcResolver]) -> None:
     """Daemon-side hook. ``None`` clears it; routes 503 while unset."""
     global _RPC_RESOLVER
     _RPC_RESOLVER = fn
+
+
+# Per-(agent, generation) (monotonic-arrival, beacon-interval) of the
+# last hello from that exact subprocess generation. The worker's
+# transport probe queries only the generation it minted for the current
+# spec — reachability is proven by the subprocess itself (the same
+# process a real tool call would come from), not inferred from our
+# side. Keying by generation matters: an old CLI's MCP subprocess is
+# not guaranteed to die with its parent, and a single per-agent slot
+# would let its surviving beacon overwrite the new generation's healthy
+# evidence and drive false recycles. beacon-interval is the
+# subprocess's self-declared re-hello cadence (None for a startup-only
+# sender): the probe enforces freshness only where the capability was
+# declared. Per-agent generations are bounded, but surviving old
+# subprocesses keep re-recording their generations: with more live
+# senders than slots, a pure least-recently-heard trim would
+# periodically evict the current generation (whichever beaconed
+# longest ago) and fake a never-seen probe result. The probe is the
+# only reader, and it only ever asks about the generation it minted —
+# so the last-probed generation is pinned and never trimmed; zombie
+# generations are never probed and stay evictable.
+_MCP_HELLO_SEEN: dict[str, dict[str, tuple[float, float | None]]] = {}
+_MCP_HELLO_PROBED: dict[str, str] = {}
+_MCP_HELLO_MAX_GENERATIONS = 4
+
+
+def record_mcp_hello(
+    agent_id: str, generation: str, beacon_interval: float | None = None,
+) -> None:
+    slots = _MCP_HELLO_SEEN.setdefault(agent_id, {})
+    slots[generation] = (time.monotonic(), beacon_interval)
+    pinned = _MCP_HELLO_PROBED.get(agent_id)
+    while len(slots) > _MCP_HELLO_MAX_GENERATIONS:
+        evictable = [gen for gen in slots if gen != pinned]
+        oldest = min(evictable, key=lambda gen: slots[gen][0])
+        del slots[oldest]
+
+
+def pin_mcp_generation(agent_id: str, generation: str) -> None:
+    """Trim-protect this generation starting now.
+
+    Must be called where a generation is minted or switched (prepare,
+    recycle, refresh reload), not just from the probe: between the
+    mint and the first probe the registry would otherwise still pin
+    the predecessor, and zombie beacon pressure inside that window
+    could evict the new generation's hello and fake never-seen."""
+    _MCP_HELLO_PROBED[agent_id] = generation
+
+
+def mcp_hello_state(
+    agent_id: str, generation: str,
+) -> tuple[float, float | None]:
+    """Last (monotonic arrival, declared beacon interval) of a hello
+    from exactly this generation; (0.0, None) when never seen."""
+    _MCP_HELLO_PROBED[agent_id] = generation
+    slots = _MCP_HELLO_SEEN.get(agent_id)
+    if not slots:
+        return (0.0, None)
+    return slots.get(generation, (0.0, None))
+
+
+def clear_mcp_hello(agent_id: str) -> None:
+    _MCP_HELLO_SEEN.pop(agent_id, None)
+    _MCP_HELLO_PROBED.pop(agent_id, None)
+
+
+async def mcp_hello_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/mcp-hello — ``{generation,
+    beacon_interval?}``.
+
+    Deliberately resolver-free: the handshake may arrive while the
+    worker is still warming, and recording it must not depend on a
+    warm ``HostMcpContext``."""
+    agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    generation = body.get("generation") if isinstance(body, dict) else None
+    if not isinstance(generation, str) or not generation:
+        return web.json_response(
+            {"error": "generation must be a non-empty string"}, status=400,
+        )
+    interval = body.get("beacon_interval")
+    # Python's json parser admits the non-standard Infinity/NaN literals;
+    # an infinite cadence would make the staleness window infinite and
+    # silently disable mid-life wedge detection, so require finite.
+    if interval is not None and (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(interval)
+        or interval <= 0
+    ):
+        return web.json_response(
+            {"error": "beacon_interval must be a positive finite number"},
+            status=400,
+        )
+    record_mcp_hello(
+        agent_id,
+        generation,
+        float(interval) if interval is not None else None,
+    )
+    return web.json_response({"message": "ok"})
 
 
 async def _dispatch(
@@ -671,6 +776,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/replace-reminder",
         replace_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/mcp-hello",
+        mcp_hello_route,
     )
     return app
 

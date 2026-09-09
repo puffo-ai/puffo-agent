@@ -14,8 +14,9 @@ import os
 import socket
 import struct
 import threading
+import time
 import uuid
-from collections.abc import Callable
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -24,6 +25,12 @@ from typing import Any
 DRIVER_AUTHORITY_FD_ENV = "LINGTAI_DRIVER_AUTHORITY_FD"
 PROTOCOL_VERSION = 1
 MAX_FRAME_BYTES = 64 * 1024
+# Receive enough bounded control data to harvest and close every descriptor
+# from a rejected request on supported POSIX SCM_RIGHTS implementations.
+MAX_REQUEST_CONTROL_BYTES = MAX_FRAME_BYTES
+MAX_ACTIVE_DERIVED_ENDPOINTS = 16
+DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS = 60.0
+MAX_AUDIT_RECORDS = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +39,10 @@ class _LeaseState(str, Enum):
     ISSUED = "issued"
     CLAIMED = "claimed"
     CLOSED = "closed"
+
+
+class _DerivedEndpointLimitError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +78,7 @@ class _EndpointRecord:
     state: _LeaseState = _LeaseState.ISSUED
     buffer: bytearray = field(default_factory=bytearray)
     thread: threading.Thread | None = None
+    claim_deadline_monotonic: float | None = None
 
 
 class IssuedAuthorityEndpoint:
@@ -92,16 +104,13 @@ class IssuedAuthorityEndpoint:
 class DriverAuthorityServer:
     """Own endpoint bindings and decide every LingTai provider/launch request."""
 
-    def __init__(self, *, claim_probe: Callable[[], None] | None = None) -> None:
+    def __init__(self) -> None:
         if os.name != "posix" or not hasattr(socket, "SCM_RIGHTS"):
             raise RuntimeError("Driver authority requires POSIX SCM_RIGHTS")
         self._lock = threading.Lock()
         self._records: list[_EndpointRecord] = []
-        self._audits: list[AuthorityAuditRecord] = []
+        self._audits: deque[AuthorityAuditRecord] = deque(maxlen=MAX_AUDIT_RECORDS)
         self._closed = False
-        # Deterministic concurrency tests pause after observing ISSUED while
-        # the state lock is still held. Production never supplies this hook.
-        self._claim_probe = claim_probe
 
     def issue_root(self, *, launch_id: str) -> IssuedAuthorityEndpoint:
         """Create and start the endpoint for one root ACP process launch."""
@@ -110,7 +119,11 @@ class DriverAuthorityServer:
             raise ValueError("root launch_id must be non-empty")
         binding = _EndpointBinding(launch_id, "root", None, 0, None)
         record, child = self._issue_endpoint(binding)
-        self._start_record(record)
+        try:
+            self._start_record(record)
+        except BaseException:
+            self._discard_endpoint(record, child)
+            raise
         return IssuedAuthorityEndpoint(child)
 
     def audit_records(self) -> tuple[AuthorityAuditRecord, ...]:
@@ -139,17 +152,49 @@ class DriverAuthorityServer:
     def _issue_endpoint(
         self, binding: _EndpointBinding
     ) -> tuple[_EndpointRecord, socket.socket]:
-        server, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        os.set_inheritable(server.fileno(), False)
-        os.set_inheritable(child.fileno(), False)
-        record = _EndpointRecord(server, binding)
         with self._lock:
             if self._closed:
+                raise RuntimeError("Driver authority server is closed")
+            if binding.role == "derived" and sum(
+                record.binding.role == "derived"
+                and record.state is not _LeaseState.CLOSED
+                for record in self._records
+            ) >= MAX_ACTIVE_DERIVED_ENDPOINTS:
+                raise _DerivedEndpointLimitError
+            server, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                os.set_inheritable(server.fileno(), False)
+                os.set_inheritable(child.fileno(), False)
+                claim_deadline = None
+                if binding.role == "derived":
+                    server.settimeout(DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS)
+                    claim_deadline = (
+                        time.monotonic() + DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS
+                    )
+            except BaseException:
                 server.close()
                 child.close()
-                raise RuntimeError("Driver authority server is closed")
+                raise
+            record = _EndpointRecord(
+                server,
+                binding,
+                claim_deadline_monotonic=claim_deadline,
+            )
             self._records.append(record)
         return record, child
+
+    def _discard_endpoint(
+        self,
+        record: _EndpointRecord,
+        child: socket.socket | None = None,
+    ) -> None:
+        with self._lock:
+            record.state = _LeaseState.CLOSED
+            if record in self._records:
+                self._records.remove(record)
+        record.server_socket.close()
+        if child is not None:
+            child.close()
 
     def _start_record(self, record: _EndpointRecord) -> None:
         thread = threading.Thread(
@@ -158,8 +203,19 @@ class DriverAuthorityServer:
             name=f"puffo.driver-authority.{record.binding.launch_id}",
             daemon=True,
         )
-        record.thread = thread
-        thread.start()
+        with self._lock:
+            if (
+                self._closed
+                or record.state is _LeaseState.CLOSED
+                or record not in self._records
+            ):
+                raise RuntimeError("Driver authority server is closed")
+            record.thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                record.thread = None
+                raise
 
     def _serve(self, record: _EndpointRecord) -> None:
         try:
@@ -191,6 +247,8 @@ class DriverAuthorityServer:
         finally:
             with self._lock:
                 record.state = _LeaseState.CLOSED
+                if record in self._records:
+                    self._records.remove(record)
             record.server_socket.close()
 
     def _handle_request(
@@ -224,10 +282,11 @@ class DriverAuthorityServer:
                 return self._record_decision_locked(
                     record, "hello", "denied", "endpoint_already_claimed", call_id=call_id
                 )
-            if self._claim_probe is not None:
-                self._claim_probe()
             record.state = _LeaseState.CLAIMED
             binding = record.binding
+            if binding.role == "derived":
+                record.claim_deadline_monotonic = None
+                record.server_socket.settimeout(None)
         return {
             "version": PROTOCOL_VERSION,
             "role": binding.role,
@@ -260,8 +319,25 @@ class DriverAuthorityServer:
             depth=1,
             capability=capability,
         )
-        child_record, child_endpoint = self._issue_endpoint(child_binding)
-        self._start_record(child_record)
+        try:
+            child_record, child_endpoint = self._issue_endpoint(child_binding)
+        except _DerivedEndpointLimitError:
+            return self._decision(
+                record,
+                "authorize_derived_launch",
+                "denied",
+                "derived_endpoint_limit_reached",
+            ), None
+        try:
+            self._start_record(child_record)
+        except Exception:
+            self._discard_endpoint(child_record, child_endpoint)
+            return self._decision(
+                record,
+                "authorize_derived_launch",
+                "denied",
+                "derived_endpoint_start_failed",
+            ), None
         response = self._decision(
             record, "authorize_derived_launch", "granted", "allowed", call_id=call_id
         )
@@ -374,31 +450,44 @@ class DriverAuthorityServer:
             endpoint.sendall(frame[sent:])
 
     @staticmethod
+    def _set_claim_receive_timeout(record: _EndpointRecord) -> None:
+        deadline = record.claim_deadline_monotonic
+        if deadline is None or record.state is not _LeaseState.ISSUED:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socket.timeout("derived authority claim timed out")
+        record.server_socket.settimeout(remaining)
+
+    @staticmethod
     def _recv_frame(record: _EndpointRecord) -> dict[str, Any]:
         received_fds: list[int] = []
 
         def read_exact(count: int) -> bytes:
             while len(record.buffer) < count:
+                DriverAuthorityServer._set_claim_receive_timeout(record)
                 data, ancdata, flags, _ = record.server_socket.recvmsg(
                     MAX_FRAME_BYTES + 4,
-                    socket.CMSG_SPACE(array.array("i", [0]).itemsize),
+                    socket.CMSG_SPACE(MAX_REQUEST_CONTROL_BYTES),
                 )
                 if not data:
                     raise EOFError
-                if flags & socket.MSG_CTRUNC:
-                    raise ValueError("authority request ancillary data was truncated")
+                ancillary_truncated = bool(flags & socket.MSG_CTRUNC)
                 for level, kind, raw in ancdata:
                     if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
                         items = array.array("i")
                         usable = len(raw) - (len(raw) % items.itemsize)
                         items.frombytes(raw[:usable])
                         received_fds.extend(items.tolist())
+                if ancillary_truncated:
+                    raise ValueError("authority request ancillary data was truncated")
                 record.buffer.extend(data)
             value = bytes(record.buffer[:count])
             del record.buffer[:count]
             return value
 
         try:
+            DriverAuthorityServer._set_claim_receive_timeout(record)
             size = struct.unpack("!I", read_exact(4))[0]
             if size <= 0 or size > MAX_FRAME_BYTES:
                 raise ValueError("authority request frame is out of bounds")
@@ -427,9 +516,13 @@ def _is_uuid(value: str) -> bool:
 
 __all__ = [
     "AuthorityAuditRecord",
+    "DERIVED_ENDPOINT_CLAIM_TIMEOUT_SECONDS",
     "DRIVER_AUTHORITY_FD_ENV",
     "DriverAuthorityServer",
     "IssuedAuthorityEndpoint",
+    "MAX_ACTIVE_DERIVED_ENDPOINTS",
+    "MAX_AUDIT_RECORDS",
     "MAX_FRAME_BYTES",
+    "MAX_REQUEST_CONTROL_BYTES",
     "PROTOCOL_VERSION",
 ]

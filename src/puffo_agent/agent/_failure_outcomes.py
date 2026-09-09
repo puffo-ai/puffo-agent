@@ -10,12 +10,14 @@ from .errors import AgentAPIError, ProviderFailureError
 
 def failure_outcome(exc: Exception) -> str:
     """``drained`` | ``auth_failed`` | ``api_error_abandoned`` |
-    ``provider_failed`` | ``failed``. Quota before auth."""
+    ``extra_usage_required`` | ``provider_failed`` | ``failed``. Quota before auth."""
     if isinstance(exc, AgentAPIError):
         if exc.is_drained:
             return "drained"
         return "auth_failed" if exc.is_auth else "api_error_abandoned"
     if isinstance(exc, ProviderFailureError):
+        if exc.error_code == "extra_usage_required":
+            return "extra_usage_required"
         # plan_drained only — quota_exhausted includes per-model limits
         return (
             "drained"
@@ -34,8 +36,8 @@ def crash_resume_terminal(exc: Exception) -> tuple[str, str] | None:
             if isinstance(exc, AgentAPIError)
             else str(exc)
         ), "drained"
-    if outcome == "provider_failed":
-        return str(exc), "provider_failed"
+    if outcome in {"provider_failed", "extra_usage_required"}:
+        return str(exc), outcome
     if outcome == "auth_failed":
         return "crash resume auth failure", "auth_failed"
     if not isinstance(exc, AgentAPIError):

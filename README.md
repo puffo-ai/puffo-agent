@@ -62,7 +62,7 @@ Python:
 ```bash
 uv tool install puffo-agent
 # pin to a specific version:
-uv tool install puffo-agent==2.0.4
+uv tool install puffo-agent==2.0.3
 ```
 
 Otherwise use pip:
@@ -70,10 +70,10 @@ Otherwise use pip:
 ```bash
 pip install puffo-agent
 # pin to a specific version:
-pip install puffo-agent==2.0.4
+pip install puffo-agent==2.0.3
 ```
 
-Agent Foundation `2.0.4` is the current stable release. It upgrades supported
+Agent Foundation `2.0.3` is the current stable release. It upgrades supported
 1.2 state in place while preserving Agent identity, keys, profile, memory,
 workspace, message history, and logical session continuity.
 

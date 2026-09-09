@@ -46,6 +46,18 @@ class PuffoRpcClient:
             await self._session.close()
             self._session = None
 
+    async def hello(
+        self, generation: str, *, beacon_interval: float | None = None,
+    ) -> str:
+        """Hello beacon: prove this subprocess can reach the daemon's
+        RPC service, tagged with the mcp-config generation that spawned
+        it. ``beacon_interval`` declares the re-hello cadence so the
+        daemon may read sustained silence as a wedged transport."""
+        body: dict[str, Any] = {"generation": generation}
+        if beacon_interval is not None:
+            body["beacon_interval"] = beacon_interval
+        return await self._post("mcp-hello", body)
+
     async def _post(self, route: str, body: dict[str, Any]) -> str:
         """POST + return the ``message`` field. Raises on transport or non-2xx."""
         path = (

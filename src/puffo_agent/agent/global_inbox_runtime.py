@@ -32,6 +32,7 @@ from .context_controller import (
 )
 from .errors import AgentAPIError
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
+from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
     COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
@@ -190,6 +191,7 @@ class GlobalInboxRuntime(
         self._turn_state_lock = asyncio.Lock()
         self._stopping = False
         self._init_recovery_gates(drained_check)
+        self._mcp_silence_streak = 0
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
@@ -1343,8 +1345,18 @@ class GlobalInboxRuntime(
                 planned, process_started, "provider_error"
             )
         terminal_error = operator_failure_text(exc)
-        if process_outcome == "drained":
-            self._park_drained()
+        if process_outcome in {"drained", "extra_usage_required"}:
+            if process_outcome == "drained" and looks_like_budget_cap(terminal_error):
+                hold = self.next_budget_park_hold()
+                self._park_drained(
+                    hold_seconds=hold,
+                    diagnostic=(
+                        "gateway budget cap; holding "
+                        f"{int(hold)}s then probing once — {terminal_error[:160]}"
+                    ),
+                )
+            else:
+                self._park_drained(process_outcome)
         else:
             self._degrade(
                 "turn failed and was requeued"
@@ -1412,11 +1424,14 @@ class GlobalInboxRuntime(
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
+                    settled = self._health_outcome_for_turn(planned)
                     async with self._turn_state_lock:
                         await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
-                    process_outcome = "succeeded"
+                    process_outcome = settled
+                    if settled == "succeeded":
+                        self._clear_budget_park_backoff()
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)
@@ -1681,7 +1696,7 @@ class GlobalInboxRuntime(
                 activated=activated,
             )
         self.health = RuntimeHealth(state, diagnostic)
-        if state == "drained":
+        if state in {"drained", "extra_usage_required"}:
             # crash-resume drained: same park as the live path
             self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
@@ -1707,6 +1722,7 @@ class GlobalInboxRuntime(
                     "api_error_abandoned",
                     "provider_failed",
                     "drained",
+                    "extra_usage_required",
                 }
                 else "failed"
             )

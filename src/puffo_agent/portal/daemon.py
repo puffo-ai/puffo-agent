@@ -10,8 +10,10 @@ by mutating the filesystem — no IPC needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import shutil
 import signal
 import threading
@@ -61,6 +63,7 @@ from .state import (
     is_daemon_ready,
     is_daemon_startup_stalled,
     is_pid_alive,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_provider_auth_flag_path,
@@ -83,6 +86,11 @@ from .worker import Worker
 from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_auth_reload_jitter_seconds() -> float:
+    """Spread fleet-wide provider reopen requests across a short window."""
+    return random.uniform(0.0, PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
 
 
 class _DaemonRuntime:
@@ -512,13 +520,23 @@ class Daemon:
                     agent_cfg.resolve_workspace_dir()
                 )
                 flag.parent.mkdir(parents=True, exist_ok=True)
+                jitter_seconds = _provider_auth_reload_jitter_seconds()
                 flag.write_text(
-                    '{"source":"credential_replaced"}', encoding="utf-8"
+                    json.dumps({
+                        "source": "credential_replaced",
+                        "jitter_seconds": jitter_seconds,
+                        "not_before_unix_ms": int(
+                            (time.time() + jitter_seconds) * 1000
+                        ),
+                    }),
+                    encoding="utf-8",
                 )
                 worker.notify_refresh()
                 logger.info(
-                    "agent %s: credential replaced — provider reload requested",
+                    "agent %s: credential replaced — provider reload requested "
+                    "with %.3fs jitter",
                     agent_id,
+                    jitter_seconds,
                 )
             except OSError as exc:
                 logger.warning(
@@ -1075,14 +1093,9 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     }[harness]
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
-    from ..agent.model_catalog import provider_models
+    from ..agent.model_catalog import validate_model_id
 
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if model not in supported:
-        raise ValueError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    validate_model_id(model)
 
 
 def _validate_daemon_inference_level(harness: str, level: str) -> None:

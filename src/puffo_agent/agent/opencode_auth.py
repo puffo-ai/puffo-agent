@@ -10,8 +10,10 @@ runtime can actually launch.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+from dataclasses import dataclass
 from typing import Literal
 
 from .harness.support.child_env import build_child_environment
@@ -29,16 +31,26 @@ OpenCodeModelStatus = Literal[
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def list_opencode_models(
+@dataclass(frozen=True, slots=True)
+class OpenCodeModel:
+    """One model and the native variants advertised by OpenCode."""
+
+    id: str
+    variants: tuple[str, ...] = ()
+
+
+def _run_opencode_models(
     executable: str,
     *,
-    provider: str = "",
-    timeout_seconds: float = 5.0,
-) -> tuple[str, ...]:
-    """Return model IDs visible to OpenCode's current native credential view."""
+    provider: str,
+    verbose: bool,
+    timeout_seconds: float,
+) -> str:
     command = [executable, "models"]
     if provider:
         command.append(provider)
+    if verbose:
+        command.append("--verbose")
     try:
         completed = subprocess.run(
             command,
@@ -51,22 +63,117 @@ def list_opencode_models(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise OpenCodeProbeError("OpenCode model check could not complete") from exc
 
-    diagnostic = _ANSI_ESCAPE.sub("", completed.stdout + completed.stderr)
+    stdout = _ANSI_ESCAPE.sub("", completed.stdout)
+    diagnostic = stdout + _ANSI_ESCAPE.sub("", completed.stderr)
     if completed.returncode != 0:
         if provider and "Provider not found:" in diagnostic:
-            return ()
+            return ""
         raise OpenCodeProbeError("OpenCode model check failed")
+    return stdout
 
+
+def _is_model_id(value: str) -> bool:
+    return (
+        "/" in value
+        and not any(char.isspace() or char in '{}[],"' for char in value)
+    )
+
+
+def _parse_verbose_models(output: str) -> tuple[OpenCodeModel, ...]:
+    """Parse ``models --verbose``'s repeated ``id`` + JSON blocks.
+
+    The model-id line is the launch authority. JSON is used only for optional
+    variant metadata, so a malformed/missing block degrades to no variants
+    without inventing support or dropping a runnable model.
+    """
+    decoder = json.JSONDecoder()
+    models: list[OpenCodeModel] = []
+    seen: set[str] = set()
+    offset = 0
+    length = len(output)
+    while offset < length:
+        line_end = output.find("\n", offset)
+        if line_end < 0:
+            line_end = length
+        raw_line = output[offset:line_end]
+        model_id = raw_line.strip()
+        offset = line_end + 1
+        if raw_line != model_id or not _is_model_id(model_id) or model_id in seen:
+            continue
+
+        metadata: object = {}
+        json_offset = offset
+        while json_offset < length and output[json_offset].isspace():
+            json_offset += 1
+        if json_offset < length and output[json_offset] == "{":
+            try:
+                metadata, offset = decoder.raw_decode(output, json_offset)
+            except json.JSONDecodeError:
+                metadata = {}
+                # Continue line by line from the malformed block. Bare model-id
+                # lines remain authoritative even when they have no JSON block;
+                # punctuation and indentation keep JSON fragments from becoming
+                # phantom models.
+
+        variants = metadata.get("variants") if isinstance(metadata, dict) else {}
+        variant_names = tuple(
+            key for key in variants
+            if isinstance(key, str) and key
+        ) if isinstance(variants, dict) else ()
+        seen.add(model_id)
+        models.append(OpenCodeModel(model_id, variant_names))
+    return tuple(models)
+
+
+def list_opencode_models(
+    executable: str,
+    *,
+    provider: str = "",
+    timeout_seconds: float = 5.0,
+) -> tuple[str, ...]:
+    """Return model IDs visible to OpenCode's current native credential view."""
+    stdout = _run_opencode_models(
+        executable,
+        provider=provider,
+        verbose=False,
+        timeout_seconds=timeout_seconds,
+    )
     models: list[str] = []
     seen: set[str] = set()
-    for line in completed.stdout.splitlines():
+    for line in stdout.splitlines():
         model = line.strip()
-        if "/" not in model or any(char.isspace() for char in model):
+        if not _is_model_id(model):
             continue
         if model not in seen:
             seen.add(model)
             models.append(model)
     return tuple(models)
+
+
+def list_opencode_model_catalog(
+    executable: str,
+    *,
+    provider: str = "",
+    timeout_seconds: float = 5.0,
+) -> tuple[OpenCodeModel, ...]:
+    """Return visible models with their model-specific native variants."""
+    try:
+        stdout = _run_opencode_models(
+            executable,
+            provider=provider,
+            verbose=True,
+            timeout_seconds=timeout_seconds,
+        )
+    except OpenCodeProbeError:
+        return tuple(
+            OpenCodeModel(model_id)
+            for model_id in list_opencode_models(
+                executable,
+                provider=provider,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    return _parse_verbose_models(stdout)
 
 
 def opencode_model_status(executable: str, model: str) -> OpenCodeModelStatus:

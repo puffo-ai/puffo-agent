@@ -70,6 +70,32 @@ def _load_components(lingtai_src: Path) -> tuple[Any, ...]:
     )
 
 
+def _require(condition: bool, message: str) -> None:
+    """Fail the delivery oracle even when Python assertions are disabled."""
+    if not condition:
+        raise SystemExit(f"Driver authority verification failed: {message}")
+
+
+def _validate_oracle(
+    adjudications: list[str],
+    provider_calls: list[str | None],
+    trace_after_call: str | None,
+) -> str:
+    """Validate the one-adjudication/one-provider-call delivery contract."""
+    _require(
+        len(adjudications) == 1,
+        f"expected one adjudication, observed {len(adjudications)}",
+    )
+    audit_id = adjudications[0]
+    _require(isinstance(audit_id, str), "adjudication audit ID is not a string")
+    _require(
+        provider_calls == [audit_id],
+        "provider call count or audit ID does not match the adjudication",
+    )
+    _require(trace_after_call is None, "provider audit context leaked after the call")
+    return audit_id
+
+
 def main(*, mode: str, lingtai_src: Path) -> None:
     (
         driver_authority_adapter,
@@ -123,11 +149,11 @@ def main(*, mode: str, lingtai_src: Path) -> None:
         print(f"provider_calls={len(inner.provider_calls)} ids={inner.provider_calls}")
         print(f"trace_after_call={current_provider_call_audit_id()!r}")
 
-        assert len(adjudications) == 1
-        audit_id = adjudications[0]
-        assert isinstance(audit_id, str)
-        assert inner.provider_calls == [audit_id]
-        assert current_provider_call_audit_id() is None
+        _validate_oracle(
+            adjudications,
+            inner.provider_calls,
+            current_provider_call_audit_id(),
+        )
     finally:
         if adapter is not None:
             adapter.close()

@@ -20,8 +20,10 @@ from acp.schema import (
     ClientCapabilities,
     CreateTerminalResponse,
     DeniedOutcome,
+    EnvVariable,
     FileSystemCapabilities,
     Implementation,
+    McpServerStdio,
     PermissionOption,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
@@ -51,6 +53,7 @@ from ..driver import (
     DriverCapabilities,
     HarnessEvent,
     HarnessEventType,
+    McpServerSpec,
     PermissionDecision,
     PermissionReceipt,
     PermissionRef,
@@ -202,7 +205,8 @@ class _PuffoAcpClient:
 class AcpDriver(Driver):
     """Persistent ACP agent process with negotiated session semantics.
 
-    This is the only trusted entrypoint for ``puffo-v0`` identity binding.
+    This is the only trusted entrypoint for constrained LingTai
+    (``puffo-v0`` / ``puffo-v1``) identity binding.
     The complete process/session launch plan is validated immediately before
     spawn; the separate OpenCode driver is explicitly outside that contract.
     """
@@ -238,6 +242,9 @@ class AcpDriver(Driver):
             tuple[asyncio.Future[PermissionDecision], list[PermissionOption]],
         ] = {}
         self._output_blocks: set[str] = set()
+        self._tool_names: dict[str, str] = {}
+        self._completed_tool_calls: set[str] = set()
+        self._admitted_tool_calls: set[str] = set()
         self._fallback_block_id = ""
         self._capabilities = acp_capabilities(session_resume=False)
         self._model_selection = ""
@@ -298,14 +305,20 @@ class AcpDriver(Driver):
             await self._conn.load_session(
                 cwd=launch.plan.cwd,
                 session_id=str(resume),
-                mcp_servers=launch.plan.mcp_servers,
+                mcp_servers=[
+                    _to_acp_stdio_server(server)
+                    for server in launch.plan.mcp_servers
+                ],
             )
             native_session_id = str(resume)
             resumed = True
         else:
             session = await self._conn.new_session(
                 cwd=launch.plan.cwd,
-                mcp_servers=launch.plan.mcp_servers,
+                mcp_servers=[
+                    _to_acp_stdio_server(server)
+                    for server in launch.plan.mcp_servers
+                ],
             )
             native_session_id = session.session_id
             resumed = False
@@ -372,9 +385,24 @@ class AcpDriver(Driver):
             argv=argv,
             environment=MappingProxyType(dict(spec.environment)),
             cwd=spec.workspace_dir,
-            # puffo-v0 uses the Puffo-projected tool surface, never an
-            # independently supplied ACP MCP server list.
-            mcp_servers=(),
+            # The Driver is transport, not policy: it forwards whatever
+            # the runtime projected into ``spec.mcp_servers``. Which
+            # profiles receive Puffo's server — and that puffo-v0 stays
+            # empty, since it rejects a non-empty ``mcpServers`` at
+            # ``session/new`` — is decided by ``_project_protocol_mcp``
+            # in the runtime. The sealed plan carries deep-frozen copies;
+            # conversion to the mutable ACP wire objects happens only at
+            # the session call, so nothing validated here can change
+            # between validation and the wire.
+            mcp_servers=tuple(
+                McpServerSpec(
+                    name=server.name,
+                    command=server.command,
+                    args=tuple(server.args),
+                    environment=MappingProxyType(dict(server.environment)),
+                )
+                for server in spec.mcp_servers
+            ),
         )
         if self.launch_validator is not None:
             self.launch_validator(plan)
@@ -455,6 +483,9 @@ class AcpDriver(Driver):
         self._active = turn
         self._active_native_turn_id = native_turn
         self._output_blocks.clear()
+        self._tool_names.clear()
+        self._completed_tool_calls.clear()
+        self._admitted_tool_calls.clear()
         self._fallback_block_id = f"assistant_{uuid.uuid4().hex}"
         self._prompt_sent = asyncio.get_running_loop().create_future()
         prompt_sent = self._prompt_sent
@@ -567,6 +598,9 @@ class AcpDriver(Driver):
         self._prompt_sent = None
         self._prompt_task = None
         self._output_blocks.clear()
+        self._tool_names.clear()
+        self._completed_tool_calls.clear()
+        self._admitted_tool_calls.clear()
         await self._events.put(terminal)
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):
@@ -654,6 +688,9 @@ class AcpDriver(Driver):
             authority.close()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._tool_names.clear()
+        self._completed_tool_calls.clear()
+        self._admitted_tool_calls.clear()
         await collect_cleanup_errors(
             self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
         )
@@ -694,11 +731,12 @@ class AcpDriver(Driver):
             await self._emit(
                 HarnessEventType.ASSISTANT_DELTA,
                 turn=turn,
-                data={"block_id": block_id, "delta": text},
+                data={"block_id": block_id, "text": text},
                 native_payload=update,
             )
             return
         if isinstance(update, ToolCallStart):
+            self._tool_names[update.tool_call_id] = update.title
             await self._emit(
                 HarnessEventType.TOOL_STARTED,
                 turn=turn,
@@ -710,6 +748,20 @@ class AcpDriver(Driver):
             )
             return
         if isinstance(update, ToolCallProgress):
+            admission = self._post_commit_admission(update)
+            if admission is not None:
+                self._admitted_tool_calls.add(update.tool_call_id)
+                await self._emit(
+                    HarnessEventType.TOOL_COMPLETED,
+                    turn=turn,
+                    data={
+                        "tool_call_ref": update.tool_call_id,
+                        "label": admission["tool_name"],
+                        "outcome": "succeeded",
+                    },
+                    native_payload=admission,
+                )
+                return
             status = str(update.status or "in_progress")
             if status in {"completed", "failed"}:
                 type_ = HarnessEventType.TOOL_COMPLETED
@@ -718,6 +770,10 @@ class AcpDriver(Driver):
                     "label": update.title or "",
                     "outcome": "succeeded" if status == "completed" else "failed",
                 }
+                if status == "completed":
+                    self._completed_tool_calls.add(update.tool_call_id)
+                else:
+                    self._completed_tool_calls.discard(update.tool_call_id)
             else:
                 type_ = HarnessEventType.TOOL_UPDATED
                 data = {
@@ -744,6 +800,47 @@ class AcpDriver(Driver):
             data={"record_type": getattr(update, "session_update", "unknown")},
             native_payload=update,
         )
+
+    def _post_commit_admission(
+        self, update: ToolCallProgress
+    ) -> dict[str, Any] | None:
+        """Normalize LingTai's private, post-commit ACP extension.
+
+        Ordinary ACP ``completed`` only proves that a handler returned; it is
+        emitted before LingTai commits tool results to provider context.  The
+        namespaced extension is accepted only on a later update for a tool we
+        already saw complete successfully.  Its binding stays in the opaque
+        native diagnostic and never enters the public event projection.
+        """
+        metadata = getattr(update, "field_meta", None)
+        if not isinstance(metadata, Mapping):
+            return None
+        fact = metadata.get("puffo.admission/1")
+        if not isinstance(fact, Mapping):
+            return None
+        tool_call_id = update.tool_call_id
+        binding = fact.get("binding")
+        nested_id = fact.get("toolCallId")
+        tool_name = self._tool_names.get(tool_call_id, "")
+        if (
+            update.status is not None
+            or tool_call_id not in self._completed_tool_calls
+            or tool_call_id in self._admitted_tool_calls
+            or nested_id != tool_call_id
+            or not tool_name
+            or not isinstance(binding, str)
+            or len(binding) != 64
+            or any(char not in "0123456789abcdef" for char in binding)
+        ):
+            return None
+        return {
+            "_puffo_internal": "tool_result",
+            "provider_context_committed": True,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "admission_binding": binding,
+            "is_error": False,
+        }
 
     async def _request_permission(
         self,
@@ -890,20 +987,73 @@ def model_launch_args(executable: str, model: str) -> tuple[str, ...]:
     return (flag, model)
 
 
-def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
-    """Select only LingTai's constrained ACP profile, independent of argv[0]."""
+def _to_acp_stdio_server(spec: McpServerSpec) -> McpServerStdio:
+    """Convert Puffo's provider-neutral MCP spec to the ACP wire shape.
+
+    The two shapes correspond field for field; only the container types
+    differ (tuple/mapping here, list/``EnvVariable`` rows on the wire).
+    """
+
+    return McpServerStdio(
+        name=spec.name,
+        command=spec.command,
+        args=list(spec.args),
+        env=[
+            EnvVariable(name=key, value=value)
+            for key, value in spec.environment.items()
+        ],
+    )
+
+
+_LINGTAI_CONSTRAINED_PROFILES = frozenset({"puffo-v0", "puffo-v1"})
+
+
+def _lingtai_constrained_profile(command: tuple[str, ...]) -> str:
+    """The constrained LingTai profile argv selects, or "" for none.
+
+    Independent of argv[0]; both ``--profile X`` and ``--profile=X``
+    spellings after the ``acp`` token are recognised.
+    """
 
     try:
         acp_index = command.index("acp")
     except ValueError:
-        return False
+        return ""
     profile_args = command[acp_index + 1 :]
-    return any(
-        (
-            arg == "--profile"
-            and index + 1 < len(profile_args)
-            and profile_args[index + 1] == "puffo-v0"
-        )
-        or arg == "--profile=puffo-v0"
-        for index, arg in enumerate(profile_args)
-    )
+    # argparse takes the LAST occurrence of a repeated flag; classify by
+    # the same effective value or a duplicated ``--profile`` would launch
+    # under a different profile than Puffo prepared it for.
+    candidate = ""
+    for index, arg in enumerate(profile_args):
+        if arg == "--profile" and index + 1 < len(profile_args):
+            candidate = profile_args[index + 1]
+        elif arg.startswith("--profile="):
+            candidate = arg.removeprefix("--profile=")
+    if candidate in _LINGTAI_CONSTRAINED_PROFILES:
+        return candidate
+    return ""
+
+
+def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
+    """True for every constrained LingTai profile, independent of argv[0].
+
+    Both profiles must fail closed without a successful Driver authority
+    handshake, so both get the authority FD and guarded POSIX spawn path.
+    ``puffo-v1`` enforces that contract at startup; ``puffo-v0`` starts with
+    an unavailable adapter and denies the first authority-controlled action.
+    This is a wider predicate than ``selects_puffo_v0_profile``, which only
+    controls the empty MCP projection.
+    """
+
+    return bool(_lingtai_constrained_profile(command))
+
+
+def selects_puffo_v0_profile(command: tuple[str, ...]) -> bool:
+    """True when argv selects LingTai's ``puffo-v0`` profile.
+
+    v0 rejects a non-empty ``mcpServers`` at ``session/new``, so only
+    this profile keeps the MCP projection empty; ``puffo-v1`` receives
+    Puffo's server while still using the Driver authority spawn path.
+    """
+
+    return _lingtai_constrained_profile(command) == "puffo-v0"
