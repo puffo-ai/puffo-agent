@@ -36,6 +36,7 @@ _PROVIDER_DIAGNOSTIC_AUTH_MARKERS: tuple[str, ...] = (
     "invalid token",
     "invalid credential",
     "token revoked",
+    "authentication token is expired",
 )
 
 

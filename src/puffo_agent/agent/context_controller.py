@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
 import json
 from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
@@ -165,6 +166,25 @@ class ToolResultAdmission:
             f"[{MODEL_VISIBLE_READ_RECEIPT_PREFIX}"
             f"{self.correlation_receipt}]"
         )
+
+    def binding_for_tool_call(self, tool_call_id: str) -> str:
+        """Bind one provider call id to this result's private receipt.
+
+        ACP keeps tool arguments and results off its public wire.  A
+        post-commit producer can still prove that the exact receipt-bearing
+        result was committed by hashing its native tool-call id together with
+        the receipt.  Including the id prevents a parallel call's binding from
+        being replayed under a different call while the random receipt keeps
+        the binding unique to this staged continuation.
+        """
+        if not tool_call_id or not self.correlation_receipt:
+            return ""
+        payload = (
+            str(tool_call_id).encode("utf-8")
+            + b"\x00"
+            + self.correlation_receipt.encode("utf-8")
+        )
+        return hashlib.sha256(payload).hexdigest()
 
     def matches(self, tool_name: str, arguments: Mapping[str, Any]) -> bool:
         semantic_tool_name = normalize_tool_name(tool_name)

@@ -43,6 +43,12 @@ PROVIDER_FAILURES: Mapping[str, ProviderFailure] = MappingProxyType(
             "usage window to reset.",
             runtime_event_code="provider_unavailable",
         ),
+        "extra_usage_required": ProviderFailure(
+            "Extra usage is unavailable. Check extra usage settings, balance, "
+            "or spending limits at https://claude.ai/settings/usage, then restart "
+            "the agent to retry pending messages.",
+            runtime_event_code="provider_unavailable",
+        ),
         "quota_exhausted": ProviderFailure(
             "The selected provider model has reached its usage limit; "
             "switch models or wait for the limit to reset.",
@@ -168,6 +174,13 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     # order: hard 401 -> plan quota -> broad quota -> auth substrings
     if status == 401:
         return "authentication"
+    # A specific provider refusal, not a general mention of usage or limits.
+    # Subscription snapshots cannot prove that this separate budget recovered.
+    if (
+        "third-party apps now draw from your extra usage" in normalized
+        and "add more at claude.ai/settings/usage" in normalized
+    ):
+        return "extra_usage_required"
     if looks_like_usage_limit(normalized):
         return "plan_drained"
     if (

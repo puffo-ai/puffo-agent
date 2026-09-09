@@ -190,6 +190,7 @@ class GlobalInboxRuntime(
         self._turn_state_lock = asyncio.Lock()
         self._stopping = False
         self._init_recovery_gates(drained_check)
+        self._mcp_silence_streak = 0
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
@@ -1343,8 +1344,8 @@ class GlobalInboxRuntime(
                 planned, process_started, "provider_error"
             )
         terminal_error = operator_failure_text(exc)
-        if process_outcome == "drained":
-            self._park_drained()
+        if process_outcome in {"drained", "extra_usage_required"}:
+            self._park_drained(process_outcome)
         else:
             self._degrade(
                 "turn failed and was requeued"
@@ -1412,11 +1413,12 @@ class GlobalInboxRuntime(
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
+                    settled = self._health_outcome_for_turn(planned)
                     async with self._turn_state_lock:
                         await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
-                    process_outcome = "succeeded"
+                    process_outcome = settled
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)
@@ -1681,7 +1683,7 @@ class GlobalInboxRuntime(
                 activated=activated,
             )
         self.health = RuntimeHealth(state, diagnostic)
-        if state == "drained":
+        if state in {"drained", "extra_usage_required"}:
             # crash-resume drained: same park as the live path
             self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
@@ -1707,6 +1709,7 @@ class GlobalInboxRuntime(
                     "api_error_abandoned",
                     "provider_failed",
                     "drained",
+                    "extra_usage_required",
                 }
                 else "failed"
             )

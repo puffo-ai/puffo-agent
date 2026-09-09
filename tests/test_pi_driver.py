@@ -518,6 +518,94 @@ async def test_final_retry_failure_marks_the_settled_turn_failed():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("diagnostic", [
+    "OAuth refresh failed for anthropic: invalid_grant / Refresh token not found or invalid",
+    "Provided authentication token is expired",
+])
+async def test_assistant_auth_error_reaches_runtime_adapter(diagnostic):
+    """A Pi message error must raise auth failure, never return an empty success."""
+    from puffo_agent.agent.errors import AgentAPIError
+
+    proc = FakePiProcess()
+    driver = PiDriver(process_factory=_attesting_factory(proc))
+    manager = RuntimeManager(driver, _spec(task_timeout_seconds=2))
+    adapter = RuntimeManagerAdapter(manager)
+    opening = asyncio.create_task(manager.open())
+    await proc.answer_next()
+    await opening
+    task = asyncio.create_task(adapter.run_turn(TurnContext(
+        system_prompt="contract", messages=[{"role": "user", "content": "hello"}],
+    )))
+    await proc.answer_next()
+    proc.push({"type": "agent_start"})
+    proc.push({"type": "message_end", "message": {
+        "role": "assistant", "stopReason": "error", "content": [],
+        "errorMessage": diagnostic + " private-provider-detail",
+    }})
+    proc.push({"type": "agent_settled"})
+    try:
+        with pytest.raises(AgentAPIError) as caught:
+            await asyncio.wait_for(task, 2)
+        assert caught.value.is_auth
+        assert caught.value.error_code == "authentication"
+        assert "private-provider-detail" not in str(caught.value)
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_assistant_error_recovered_by_retry_does_not_fail_turn():
+    """Intermediate failed attempts must not poison a successful retry."""
+    proc = FakePiProcess()
+    driver, _ = await _open(proc)
+    task = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await proc.answer_next()
+    await task
+    for frame in (
+        {"type": "agent_start"},
+        {"type": "message_end", "message": {"role": "assistant",
+         "stopReason": "error", "errorMessage": "529 overloaded private-detail"}},
+        {"type": "auto_retry_end", "success": True, "attempt": 1},
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "stop"}},
+        {"type": "agent_settled"},
+    ):
+        proc.push(frame)
+    events = await _drain_events(driver, 5)
+    assert events[-1].data["outcome"] == "succeeded"
+    assert "error_code" not in events[-1].data
+    assert "private-detail" not in json.dumps([dict(e.data) for e in events])
+    assert events[1].type != HarnessEventType.ASSISTANT_COMPLETED
+    await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("diagnostic, expected", [
+    ("unknown failure private-detail", "provider_error"),
+    ("Third-party apps now draw from your extra usage, not your plan limits. "
+     "Add more at claude.ai/settings/usage", "extra_usage_required"),
+])
+async def test_unretried_provider_error_fails_once_and_resets_for_next_turn(diagnostic, expected):
+    """A non-auth error must fail the turn without contaminating later work."""
+    proc = FakePiProcess()
+    driver, _ = await _open(proc)
+    for failed in (True, False):
+        task = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+        await proc.answer_next()
+        await task
+        proc.push({"type": "agent_start"})
+        proc.push({"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "error" if failed else "stop",
+            "errorMessage": diagnostic if failed else "",
+        }})
+        proc.push({"type": "agent_settled"})
+        events = await _drain_events(driver, 3)
+        assert events[-1].data["outcome"] == ("failed" if failed else "succeeded")
+        assert events[-1].data.get("error_code") == (expected if failed else None)
+        assert "private-detail" not in json.dumps([dict(e.data) for e in events])
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_settled_run_without_an_active_turn_is_reported_autonomous():
     """A model wake the daemon did not start must not be dropped."""
     proc = FakePiProcess()

@@ -1368,3 +1368,90 @@ def test_codex_dm_names_codex_not_claude():
     text = format_codex_drained("agent-1", "Testy")
     assert "Codex usage limit" in text
     assert "Claude Code usage limit" not in text
+
+
+EXTRA_USAGE_DIAGNOSTIC = (
+    '400 {"type":"error","error":{"type":"invalid_request_error",'
+    '"message":"Third-party apps now draw from your extra usage, not your '
+    'plan limits. Add more at claude.ai/settings/usage"}}'
+)
+
+
+def test_extra_usage_is_distinct_from_plan_quota_and_holds_warm():
+    """The reported Pi 400 must not become a generic retry or a plan reset."""
+    code = classify_provider_failure(status=None, diagnostic=EXTRA_USAGE_DIAGNOSTIC)
+    assert code == "extra_usage_required"
+    exc = ProviderFailureError("extra usage unavailable", error_code=code)
+    assert failure_outcome(exc) == "extra_usage_required"
+    assert crash_resume_terminal(exc) == (str(exc), "extra_usage_required")
+    assert not StandardWorkerRun._retryable_local_warm_error(exc)
+    assert classify_provider_failure(
+        status=400, diagnostic=EXTRA_USAGE_DIAGNOSTIC + " usage limit reached"
+    ) == code
+    assert classify_provider_failure(status=429, diagnostic="Too Many Requests") == "rate_limit"
+    assert classify_provider_failure(status=400, diagnostic="extra usage documentation") == "provider_error"
+
+
+def test_extra_usage_survives_snapshots_and_refresh_until_success(tmp_path, monkeypatch):
+    """Only a successful model turn can clear the extra-usage failure."""
+    from puffo_agent.portal.credential_refresh import CredentialRefresher, RefreshOutcome
+
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    loop = _stub_create_task(monkeypatch)
+    w = _drained_worker("extra")
+    w._extra_usage_notification_sent = False
+    StandardWorkerRun._settle_process_health(w, "extra", "extra_usage_required", "raw private text")
+    assert w.runtime.health == "extra_usage_required"
+    assert "raw private text" not in w.runtime.error
+    assert loop.calls == 1
+    StandardWorkerRun._settle_process_health(w, "extra", "extra_usage_required", None)
+    assert loop.calls == 1
+    _stub_agents(monkeypatch, {"extra": "pi"})
+    for workers in ({"extra": w}, {}):
+        _stub_live_workers(monkeypatch, workers)
+        for used in (0, 100):
+            apply_drained_health({"pi": {"session": {"used_pct": used}}})
+            assert RuntimeState.load("extra").health == "extra_usage_required"
+    refresher = CredentialRefresher(host_home=tmp_path)
+    refresher._agent_homes = {str(tmp_path / "extra")}
+    refresher._flip_refresh_broken(RefreshOutcome.FAILED)
+    refresher._flip_auth_failed()
+    refresher._clear_refresh_broken()
+    assert RuntimeState.load("extra").health == "extra_usage_required"
+    Worker._clear_auth_failed_if_recoverable(w.runtime, "extra", logging.getLogger())
+    Worker._flip_health_in_progress(w.runtime, "extra", logging.getLogger())
+    assert w.runtime.health == "extra_usage_required"
+    StandardWorkerRun._settle_process_health(w, "extra", "cancelled", None)
+    assert w.runtime.health == "extra_usage_required"
+    w._resolve_health_after_success("extra")
+    assert w.runtime.health == "ok"
+    assert not w._extra_usage_notification_sent
+
+
+@pytest.mark.asyncio
+async def test_extra_usage_notifies_operator_with_recovery_action():
+    """Extra-usage alerts must not direct the operator to re-login or wait."""
+    client = _StubClient()
+    w = _drained_worker(client=client)
+    w._extra_usage_notification_sent = True
+    await w._notify_operator_of_extra_usage()
+    assert len(client.sent) == 1
+    text = client.sent[0][1]
+    assert "https://claude.ai/settings/usage" in text
+    assert "restart" in text.lower()
+    assert "login" not in text.lower()
+    assert "window resets" not in text.lower()
+
+
+def test_restart_preserves_extra_usage_until_a_real_turn_succeeds(tmp_path, monkeypatch):
+    """A new Worker may retry, but a process restart must not erase the red state."""
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig
+
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    RuntimeState(status="running", health="extra_usage_required", error="extra usage").save("extra")
+    w = Worker(DaemonConfig(), AgentConfig(id="extra"))
+    assert w.runtime.health == "extra_usage_required"
+    Worker._reassert_auth_failed_after_failed_probe(w.runtime, "extra", logging.getLogger())
+    assert w.runtime.health == "extra_usage_required"
+    w._resolve_health_after_success("extra")
+    assert RuntimeState.load("extra").health == "ok"

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -74,6 +75,7 @@ from ...runtime_event_outbox import (
 from ...runtime_events import RuntimeEventProjector, TrustedScope
 from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from ..support.child_env import build_child_environment
+from ..drivers.acp import selects_puffo_v0_profile
 from ..drivers.pi_bridge import (
     build_bridge_environment,
     install_pi_tool_bridge,
@@ -390,7 +392,7 @@ class LocalRuntimePreparer:
             executable, system_prompt
         )
         mcp_servers = self._project_protocol_mcp(
-            controlled, opencode_config
+            controlled, opencode_config, tuple(launch_args)
         )
         if opencode_config:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
@@ -492,12 +494,20 @@ class LocalRuntimePreparer:
         self,
         controlled: dict[str, str],
         opencode_config: dict[str, Any],
+        launch_args: tuple[str, ...],
     ) -> tuple[McpServerSpec, ...]:
         """Project Puffo tools according to the selected Driver protocol.
 
-        Native OpenCode receives its inline MCP configuration. ACP-over-
-        OpenCode carries the same server through ``RuntimeSpec.mcp_servers``
-        and must not receive the native inline projection.
+        Native OpenCode receives its inline MCP configuration and must not
+        also receive the generic projection.
+
+        The ACP Driver forwards this tuple into ``session/new`` verbatim
+        (converted to the ACP wire shape), so this method is the single
+        policy point for which tools an ACP agent can discover. LingTai's
+        constrained ``puffo-v0`` profile rejects a non-empty ``mcpServers``
+        at ``session/new`` and therefore keeps an empty projection until
+        the agent is re-provisioned under ``puffo-v1``. See
+        ``test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan``.
         """
         mcp_servers: tuple[McpServerSpec, ...] = ()
         if self._puffo_core_env:
@@ -514,6 +524,12 @@ class LocalRuntimePreparer:
                 # only Puffo's core server; keeping mcp_servers empty is part
                 # of the Driver admission contract.
                 controlled.update(self._prepare_pi_bridge(puffo_server))
+            elif self.harness_name == "acp" and selects_puffo_v0_profile(
+                launch_args
+            ):
+                # puffo-v0 fails session/new on any server list; the empty
+                # projection is a LingTai-side contract, not a default.
+                mcp_servers = ()
             else:
                 mcp_servers = (puffo_server,)
             if self.harness_name == "opencode":
@@ -668,12 +684,20 @@ class LocalRuntimePreparer:
                     inference,
                 )
         mcp_path = agent_dir(self.agent_id) / "mcp-config.json"
+        mcp_generation = ""
         if self._puffo_core_env:
+            # Minted per config write; the subprocess echoes it back over
+            # RPC (mcp-hello) so the worker's transport probe can tell
+            # "this spec's MCP reached us" from a stale predecessor.
+            mcp_generation = uuid.uuid4().hex
             write_cli_mcp_config(
                 mcp_path,
                 command=default_python_executable(),
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
-                env=self._puffo_core_env,
+                env={
+                    **self._puffo_core_env,
+                    "PUFFO_MCP_GENERATION": mcp_generation,
+                },
             )
             launch_args.extend(["--mcp-config", str(mcp_path)])
         else:
@@ -720,6 +744,7 @@ class LocalRuntimePreparer:
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
             auto_compact_threshold_tokens=compact_tokens,
+            mcp_generation=mcp_generation,
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
@@ -965,6 +990,29 @@ class _LegacyStatusProjector:
         self._emitted_tools.clear()
 
 
+async def _observe_compaction_activity(
+    activity_sink, event_type: str, agent_id: str,
+) -> None:
+    """Forward compaction boundaries ("compacting" / None on completed
+    and failed alike — a failed compaction must not strand the overlay)
+    to the status reporter's activity sink. Observation only: failures
+    never reach the runtime."""
+    if event_type not in {
+        "compaction.started", "compaction.completed", "compaction.failed",
+    }:
+        return
+    try:
+        await activity_sink(
+            "compacting" if event_type == "compaction.started" else None
+        )
+    except Exception as exc:  # noqa: BLE001 - observation only
+        logger.warning(
+            "agent %s: activity observation failed (%s); runtime continues",
+            agent_id,
+            type(exc).__name__,
+        )
+
+
 def build_local_runtime_adapter(
     prepared: PreparedLocalRuntime,
     *,
@@ -972,16 +1020,20 @@ def build_local_runtime_adapter(
     logical_session_ref: str,
     driver: Driver | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
+    generation_sink: Callable[[str], None] | None = None,
+    activity_sink: Callable[[str | None], Awaitable[None]] | None = None,
 ) -> RuntimeManagerAdapter:
     """Bind a prepared Driver runtime to the durable Runtime Manager.
 
     ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
     Docker composition injects the selected Driver with its exec transport
     factory and passes ``cleanup`` (bounded container stop), which runs after
-    the manager closes.
+    the manager closes. ``activity_sink`` receives the fixed activity label
+    ("compacting" / None) on compaction boundary events so the status
+    reporter can refine the operator-facing status; it observes only,
+    failures never reach the runtime.
     """
-    if driver is None:
-        driver = build_driver(prepared.harness_name)
+    driver = build_driver(prepared.harness_name) if driver is None else driver
     if isinstance(driver, UnsupportedDriver):
         raise RuntimeError(driver.diagnostic)
     projector = RuntimeEventProjector(
@@ -1013,6 +1065,10 @@ def build_local_runtime_adapter(
                 type(exc).__name__,
             )
         event_type = getattr(event.type, "value", event.type)
+        if activity_sink is not None:
+            await _observe_compaction_activity(
+                activity_sink, event_type, prepared.preparer.agent_id,
+            )
         # Only the session and turn boundaries rewrite durable state; every
         # other event (a streamed delta above all) must reach the outbox no
         # more than once, so the state read stays inside the branch using it.
@@ -1055,6 +1111,7 @@ def build_local_runtime_adapter(
         manager,
         spec_reloader=reload_spec,
         post_close=cleanup,
+        generation_sink=generation_sink,
     )
 
 

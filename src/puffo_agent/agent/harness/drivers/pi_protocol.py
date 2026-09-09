@@ -187,6 +187,13 @@ def _normalize_pi_lifecycle(
     if type_ == "message_update":
         return _normalize_message_update(frame, event)
     if type_ == "message_end":
+        message = frame.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            if message.get("stopReason") == "error":
+                return (event(HarnessEventType.RUNTIME_WARNING, {
+                    "code": "assistant_error",
+                    "failure_code": _failure_code(message.get("errorMessage")),
+                }),)
         events: list[HarnessEvent] = [
             event(HarnessEventType.ASSISTANT_COMPLETED, {"block_id": ""})
         ]

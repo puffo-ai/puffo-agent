@@ -100,6 +100,11 @@ class _NoopStatusReporter:
     async def report_error(self, _text):
         return None
 
+    def set_activity_overlay(self, _activity) -> bool:
+        # Sync like the real reporter's state-only setter; False means
+        # "nothing changed", so emit_activity never tries to push.
+        return False
+
     async def run_heartbeat_loop(self):
         return None
 
@@ -399,13 +404,54 @@ class StandardWorkerRun:
                 process_factory=preparer.process_factory,
             )
             cleanup = preparer.aclose
+        from . import rpc_service
+
+        agent_id = prepared.preparer.agent_id
+
+        def pin_generation(generation: str) -> None:
+            # Runs between the spec reload minting a fresh generation
+            # and the reopen: the pin must move before the new
+            # subprocess can hello, or zombie beacon pressure inside
+            # that window trims the hello and fakes never-seen.
+            rpc_service.pin_mcp_generation(agent_id, generation)
+
+        # Warm opens the driver before ``_start_services`` builds the
+        # reporter, and a session resume can compact right there — hold
+        # the latest label so the reporter starts from it instead of
+        # silently dropping the whole warm-phase window.
+        worker._pending_activity = None
+
+        async def emit_activity(activity: str | None) -> None:
+            # The overlay flips synchronously (event order preserved);
+            # the heartbeat push runs detached because this callback
+            # fires under the runtime command lock and a slow status
+            # POST must not extend the lock or stall event processing.
+            # The reporter serializes status writes and builds each body
+            # under its send lock, so a duplicate or delayed push still
+            # lands carrying the newest state.
+            reporter = getattr(worker, "_status_reporter", None)
+            if reporter is None:
+                worker._pending_activity = activity
+                return
+            if reporter.set_activity_overlay(activity):
+                spawn(
+                    reporter.report_current_status(),
+                    name="activity-heartbeat",
+                )
+
         worker._adapter = build_local_runtime_adapter(
             prepared,
             outbox=outbox,
             logical_session_ref=session_ref,
             driver=driver,
             cleanup=cleanup,
+            generation_sink=pin_generation,
+            activity_sink=emit_activity,
         )
+        # Pin the initial mcp generation at the mint, not at the first
+        # probe (same window as above, prepare-time edition).
+        if prepared.spec.mcp_generation:
+            pin_generation(prepared.spec.mcp_generation)
         return outbox, session_ref, prepared
 
     async def _abort_docker_preparation(self, preparer: Any) -> None:
@@ -464,7 +510,10 @@ class StandardWorkerRun:
         worker = self.worker
         logger.error("agent %s: failed to initialise: %s", agent_id, exc, exc_info=True)
         worker.runtime.status = "error"
-        worker.runtime.error = str(exc)
+        if isinstance(exc, ProviderFailureError) and exc.error_code == "extra_usage_required":
+            worker._enter_extra_usage_required(agent_id)
+        else:
+            worker.runtime.error = str(exc)
         worker.runtime.save(agent_id)
         worker._warm_done.set()
         if worker._adapter is not None:
@@ -521,7 +570,7 @@ class StandardWorkerRun:
             return not exc.is_auth and not exc.is_drained
         if isinstance(exc, ProviderFailureError):
             # plan quota arrives here, not as AgentAPIError
-            return exc.error_code != "plan_drained"
+            return exc.error_code not in {"plan_drained", "extra_usage_required"}
         return not isinstance(
             exc,
             (
@@ -572,7 +621,10 @@ class StandardWorkerRun:
             exc_info=True,
         )
         worker.runtime.status = "error"
-        worker.runtime.error = str(exc)
+        if isinstance(exc, ProviderFailureError) and exc.error_code == "extra_usage_required":
+            worker._enter_extra_usage_required(agent_id)
+        else:
+            worker.runtime.error = str(exc)
         worker.runtime.save(agent_id)
         worker._warm_done.set()
         try:
@@ -622,7 +674,7 @@ class StandardWorkerRun:
         ) = context.paths.refresh_flags
         paths = context.paths
         worker = self.worker
-        await worker_module._process_refresh_flags(
+        ok = await worker_module._process_refresh_flags(
             agent_id=paths.agent_id,
             harness_name=paths.effective_harness,
             shared_path=paths.shared_path,
@@ -640,6 +692,11 @@ class StandardWorkerRun:
             refresh_host_sync_flag=refresh_host,
             refresh_session_flag=refresh_session,
             refresh_provider_auth_flag=refresh_provider_auth,
+        )
+        worker._note_refresh_reload(
+            ok,
+            (refresh_agent, refresh_host, refresh_session, refresh_provider_auth),
+            paths.agent_id,
         )
 
     async def _execute_global_turn(self, context: WorkerRunContext, planned):
@@ -743,8 +800,11 @@ class StandardWorkerRun:
             covers_renotice_enabled=(
                 True if worker.daemon_cfg.covers_renotice else None
             ),
-            # unpark = snapshot-cleared health + a wake
-            drained_check=lambda: worker.runtime.health == "drained",
+            # Plan quota can unpark after a snapshot; extra usage requires
+            # an operator restart (new runtime) or a successful model turn.
+            drained_check=lambda: worker.runtime.health in {
+                "drained", "extra_usage_required",
+            },
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -786,6 +846,14 @@ class StandardWorkerRun:
         while not worker._stop.is_set():
             worker.runtime.save(agent_id)
             try:
+                await worker.probe_mcp_transport(agent_id)
+            except Exception:  # noqa: BLE001
+                # The probe must never take the heartbeat down with it.
+                logger.warning(
+                    "agent %s: MCP transport probe raised", agent_id,
+                    exc_info=True,
+                )
+            try:
                 await asyncio.wait_for(worker._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
                 pass
@@ -819,7 +887,20 @@ class StandardWorkerRun:
         if not hasattr(client, "http"):
             return _NoopStatusReporter()
         reporter = self.worker._build_status_reporter(client)
-        return reporter if reporter is not None else _NoopStatusReporter()
+        reporter = reporter if reporter is not None else _NoopStatusReporter()
+        # A warm-phase compaction fires before this reporter exists; the
+        # sink parked the latest label on the worker. Seed the overlay
+        # before the heartbeat loop starts so its immediate first beat
+        # carries it (no extra push needed).
+        pending = getattr(self.worker, "_pending_activity", None)
+        if pending is not None:
+            self.worker._pending_activity = None
+            reporter.set_activity_overlay(pending)
+        # The harness activity sink (``_bind_driver_runtime``) late-binds to
+        # this attribute; cleared in teardown so a stopped reporter is never
+        # driven by a still-draining event stream.
+        self.worker._status_reporter = reporter
+        return reporter
 
     @staticmethod
     def _settle_process_health(
@@ -828,9 +909,12 @@ class StandardWorkerRun:
         try:
             if outcome == "succeeded":
                 worker._resolve_health_after_success(agent_id)
+            elif outcome == "no_progress":
+                worker._note_no_progress_turn(agent_id)
             elif outcome == "cancelled":
-                worker_module.Worker._resolve_health_on_success(
-                    worker.runtime, agent_id, logger
+                # not recovery evidence: a live no-progress streak stays red
+                worker_module.Worker._reassert_no_progress_after_cancel(
+                    worker, agent_id
                 )
             elif outcome == "auth_failed":
                 worker._enter_auth_failed(agent_id)
@@ -838,6 +922,8 @@ class StandardWorkerRun:
                 worker._enter_drained(
                     agent_id, parse_reset_epoch(error_text or "")
                 )
+            elif outcome == "extra_usage_required":
+                worker._enter_extra_usage_required(agent_id)
             elif outcome == "api_error_abandoned":
                 worker_module.Worker._mark_api_error_abandoned_if_in_progress(
                     worker.runtime, agent_id, error_text, logger
@@ -979,6 +1065,7 @@ class StandardWorkerRun:
         except (asyncio.CancelledError, Exception):
             pass
         services.reporter.stop()
+        self.worker._status_reporter = None
         background_tasks = (
             services.heartbeat_task,
             services.status_task,

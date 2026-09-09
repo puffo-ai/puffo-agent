@@ -277,3 +277,47 @@ async def test_turn_session_transfer_store_contract(tmp_path, case):
     else:
         await _assert_transfer_rejected(store, case)
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_extra_usage_parks_pending_messages_across_new_wakes(tmp_path):
+    """New inbound messages must not turn a billing hold into repeated API calls."""
+    from puffo_agent.agent.errors import ProviderFailureError
+    from puffo_agent.agent.provider_failures import provider_failure_message
+
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    calls = 0
+    blocked = False
+
+    async def run(planned):
+        nonlocal calls
+        calls += 1
+        await adapter.admit()
+        raise ProviderFailureError(
+            provider_failure_message("extra_usage_required"),
+            error_code="extra_usage_required",
+        )
+
+    def settle(outcome, error):
+        nonlocal blocked
+        assert outcome == "extra_usage_required"
+        blocked = True
+
+    runtime = GlobalInboxRuntime(
+        agent_id="extra", store=store, adapter=adapter, run_turn=run,
+        workspace=tmp_path, drained_check=lambda: blocked, process_outcome=settle,
+    )
+    try:
+        await receipt(store, "extra-1", 1)
+        await runtime.process_once()
+        assert calls == 1
+        assert blocked
+        assert runtime._parked_drained
+        await receipt(store, "extra-2", 2)
+        runtime.notify()
+        assert not await runtime.process_once()
+        assert calls == 1
+        assert len(await store.get_pending(limit=10)) == 2
+    finally:
+        await store.close()
