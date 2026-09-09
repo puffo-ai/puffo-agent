@@ -364,7 +364,7 @@ class RuntimeManager:
         self.native_turn_id = ""
         self._terminal.pop(logical, None)
         self._permission_refs.clear()
-        self._continuation_admissions.clear()
+        self._discard_pending_admissions("turn_abandoned")
         if not retire:
             return
         # Keep session: close prevents overlap; dead -> invalid_resume.
@@ -1044,7 +1044,34 @@ class RuntimeManager:
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._permission_refs.clear()
+        self._discard_pending_admissions("turn_completed")
+
+    def _discard_pending_admissions(self, reason: str) -> None:
+        """Drop staged continuations at a turn boundary, audibly.
+
+        A continuation is retired here only when no tool result ever released
+        it.  On the ACP path that is the visible end of a lost post-commit
+        receipt: the argument-correlation fallback is unreachable (those facts
+        carry no ``arguments``), so nothing else can admit it, and the
+        mismatch warning below is never reached either.  Dropping silently
+        left the symptom -- a continuation that never fires -- with no trace
+        on the side that actually experiences it.
+
+        Deliberate cancellation (``register_continuation_callback(None)``)
+        clears the list directly and is NOT routed here: a signal that also
+        fires on the intended case stops being read.
+        """
+        pending = len(self._continuation_admissions)
         self._continuation_admissions.clear()
+        if not pending:
+            return
+        logger.warning(
+            "continuation admissions discarded without a tool result "
+            "reason=%s count=%d native_turn=%s",
+            reason,
+            pending,
+            self.native_turn_id or "",
+        )
 
     def register_continuation(
         self,
