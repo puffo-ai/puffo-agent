@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 
+import pytest
+
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.portal.worker import Worker
 
@@ -196,3 +198,38 @@ def test_ok_and_unknown_stay_unannotated(monkeypatch, capsys):
     for health in ("ok", "unknown", ""):
         row = _agent_list_output(monkeypatch, capsys, health)
         assert "[" not in row, health
+
+
+# ── cancel is not recovery evidence (found by Peter on cdf9a8c) ─────────────
+
+
+def test_cancel_after_flip_reasserts_a_live_no_progress_streak(tmp_path, monkeypatch):
+    """no_progress → _flip_health_in_progress → cancelled must land back on
+    no_progress, not launder through the success resolver into ok."""
+    from puffo_agent.portal.worker_run import StandardWorkerRun
+
+    rt = _Runtime(health="no_progress", error="red")
+    w = SimpleNamespace(runtime=rt, _no_progress_turns=3)
+    Worker._flip_health_in_progress(rt, "agent-a", logging.getLogger("t"))
+    assert rt.health == "in_progress"  # the batch-top override Peter traced
+    StandardWorkerRun._settle_process_health(w, "agent-a", "cancelled", None)
+    assert rt.health == "no_progress"
+    assert "read none of them" in rt.error
+
+
+@pytest.mark.parametrize(
+    "streak, health_after_turn, expected",
+    [
+        # below threshold: the pre-existing cancel resolution stands
+        (1, "in_progress", "ok"),
+        # a cause named during the turn stays authoritative
+        (3, "auth_failed", "auth_failed"),
+    ],
+)
+def test_cancel_leaves_other_resolutions_alone(streak, health_after_turn, expected):
+    from puffo_agent.portal.worker_run import StandardWorkerRun
+
+    rt = _Runtime(health=health_after_turn, error="")
+    w = SimpleNamespace(runtime=rt, _no_progress_turns=streak)
+    StandardWorkerRun._settle_process_health(w, "agent-b", "cancelled", None)
+    assert rt.health == expected

@@ -727,6 +727,10 @@ class Worker:
                 agent_id, streak, rt.health,
             )
             return
+        Worker._write_no_progress_red(self, agent_id, streak)
+
+    def _write_no_progress_red(self, agent_id: str, streak: int) -> None:
+        rt = self.runtime
         if rt.health != "no_progress":
             logger.warning(
                 "agent %s: %d consecutive turns woke on pending messages and "
@@ -741,6 +745,25 @@ class Worker:
             "credentials and the harness driver's error mapping."
         )
         rt.save(agent_id)
+
+    def _reassert_no_progress_after_cancel(self, agent_id: str) -> None:
+        """A cancelled turn is not recovery evidence.
+
+        ``_flip_health_in_progress`` overrides the ``no_progress`` red at
+        batch-top; settling the cancelled turn through the success resolver
+        would launder that into ``ok`` with zero ``read_inbox`` admissions in
+        between. While the streak that earned the red is still live, put the
+        red back instead. Below threshold — or when the turn set a health
+        value that names a cause — the ordinary resolution stands (the
+        resolver only ever touches ``in_progress``).
+        """
+        streak = getattr(self, "_no_progress_turns", 0)
+        if streak >= _NO_PROGRESS_TURN_THRESHOLD and self.runtime.health in (
+            "ok", "in_progress", "unknown", "no_progress",
+        ):
+            Worker._write_no_progress_red(self, agent_id, streak)
+            return
+        Worker._resolve_health_on_success(self.runtime, agent_id, logger)
 
     def _resolve_health_after_success(self, agent_id: str) -> None:
         recovering_api_key = (

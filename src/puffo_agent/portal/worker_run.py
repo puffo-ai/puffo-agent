@@ -831,8 +831,9 @@ class StandardWorkerRun:
             elif outcome == "no_progress":
                 worker._note_no_progress_turn(agent_id)
             elif outcome == "cancelled":
-                worker_module.Worker._resolve_health_on_success(
-                    worker.runtime, agent_id, logger
+                # not recovery evidence: a live no-progress streak stays red
+                worker_module.Worker._reassert_no_progress_after_cancel(
+                    worker, agent_id
                 )
             elif outcome == "auth_failed":
                 worker._enter_auth_failed(agent_id)
