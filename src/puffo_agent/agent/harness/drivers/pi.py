@@ -194,6 +194,8 @@ class PiDriver(Driver):
         # agent_settled. Pi reports failures as separate events that do not end
         # the run, so the terminal outcome is only known when the run settles.
         self._turn_outcome = "succeeded"
+        self._assistant_failure = ""
+        self._turn_error_code = ""
         self._turn_usage: dict[str, int] = {}
         self._closed = False
 
@@ -558,8 +560,15 @@ class PiDriver(Driver):
         ):
             if event.type == HarnessEventType.CONTEXT_UPDATED:
                 self._turn_usage = dict(event.data)
+            if event.type == HarnessEventType.RUNTIME_WARNING:
+                code = event.data.get("code")
+                if code == "assistant_error":
+                    self._assistant_failure = str(event.data["failure_code"])
+                elif code == "auto_retry_end" and event.data.get("succeeded"):
+                    self._assistant_failure = ""
             if _is_failure_signal(event):
                 self._turn_outcome = "failed"
+                self._turn_error_code = str(event.data["failure_code"])
             await self._events.put(event)
 
     async def _resolve_response(self, frame: dict[str, Any]) -> None:
@@ -640,6 +649,11 @@ class PiDriver(Driver):
             )
             return
         data: dict[str, Any] = {"outcome": self._turn_outcome}
+        # An assistant error may still recover through Pi's automatic retry.
+        # Report it only at agent_settled, preserving explicit cancellation.
+        error_code = self._turn_error_code or self._assistant_failure
+        if error_code and self._turn_outcome != "cancelled":
+            data.update(outcome="failed", error_code=error_code)
         data.update(self._turn_usage)
         turn = self._active
         self._active = TurnRef("")
@@ -674,6 +688,8 @@ class PiDriver(Driver):
 
     def _reset_turn(self) -> None:
         self._turn_outcome = "succeeded"
+        self._assistant_failure = ""
+        self._turn_error_code = ""
         self._turn_usage = {}
 
     def _require_active(self, turn: TurnRef) -> None:
