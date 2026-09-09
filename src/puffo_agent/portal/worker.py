@@ -52,6 +52,8 @@ from .state import (
     agent_home_dir,
     claude_cli_api_key,
     docker_shared_dir as docker_shared_dir,
+    clear_runtime_health_listener,
+    set_runtime_health_listener,
 )
 from ..tasks import spawn
 
@@ -159,6 +161,24 @@ def _refresh_flag_is_pending(flag: Path) -> bool:
 # before the agent stops being reported healthy. One such turn is a normal
 # deferral; a run of them means the provider is not reaching the Inbox at all.
 _NO_PROGRESS_TURN_THRESHOLD = 3
+
+# Health values the MCP transport probe may replace with ``mcp_unreachable``.
+# "ok"/"unknown" mean nothing is known to be wrong. The other two are the
+# states a wedged transport actually produces, and both are *symptoms* this
+# probe can name the cause of:
+#   in_progress  — a turn was admitted and never settled;
+#   no_progress  — turns keep waking and consuming none of their batch,
+#                  whose remediation text points at provider credentials.
+# Excluding them meant the diagnosis was skipped in exactly the states a real
+# MCP failure leaves behind. Every more specific red (auth_failed,
+# provider_error, refresh_broken, drained, ...) stays authoritative: the probe
+# knows the transport is down, not that it is the only thing wrong.
+_MCP_PROBE_OVERWRITABLE_HEALTH = (
+    "ok",
+    "unknown",
+    "in_progress",
+    "no_progress",
+)
 
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
@@ -483,7 +503,7 @@ class Worker:
                 agent_id, adapter, mgr, cause=cause, spec_gen=spec_gen,
             )
             return
-        if self.runtime.health in ("ok", "unknown"):
+        if self.runtime.health in _MCP_PROBE_OVERWRITABLE_HEALTH:
             self.runtime.health = "mcp_unreachable"
             self.runtime.error = (
                 "puffo MCP subprocess never reached the daemon RPC "
@@ -1482,12 +1502,30 @@ class Worker:
                 register_connected = getattr(client, "add_connected_callback", None)
                 if callable(register_connected):
                     register_connected(processing_reports.on_transport_connected)
+        agent_id = self.agent_cfg.id
+
+        # health only travels on heartbeats; without this a red written just
+        # after a turn settles waits out the interval before the server hears
+        # it. The periodic tick remains the fallback.
+        #
+        # One stable callable, bound and released together, so the module
+        # global is scoped to a running loop instead of outliving a stopped
+        # worker — and so neither shutdown path has to remember separately.
+        def _wake_heartbeat() -> None:
+            reporter.request_immediate_heartbeat()
+
         reporter = StatusReporter(
             client.http,
             runtime_health_provider=lambda: self.runtime.health,
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
             processing_reports=processing_reports,
+            on_loop_start=lambda: set_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
+            on_loop_stop=lambda: clear_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
         )
         if bridge is not None:
             bridge.add_connected_callback(reporter.report_current_status)

@@ -51,6 +51,8 @@ class StatusReporter:
         runtime_provider: Optional[Callable[[], dict[str, Any]]] = None,
         status_sender: Optional[Callable[..., Awaitable[None]]] = None,
         processing_reports: ProcessingReportDispatcher | None = None,
+        on_loop_start: Optional[Callable[[], None]] = None,
+        on_loop_stop: Optional[Callable[[], None]] = None,
     ) -> None:
         self._http = http
         # Keyless (bridge) agents can't sign the HTTP status routes, so the
@@ -101,6 +103,28 @@ class StatusReporter:
         # write, and each body is built under it, so wire order matches
         # state order and the last write carries the newest state.
         self._send_lock = asyncio.Lock()
+        # Set by ``request_immediate_heartbeat`` so a health change does not
+        # have to wait out the remaining interval.
+        self._wake = asyncio.Event()
+        # An external wake registry is bound for exactly as long as the
+        # heartbeat loop runs: waking a loop that is not running does nothing,
+        # and ws-local reuses one reporter across attaches, spawning a fresh
+        # loop each time. Binding at construction and releasing at ``stop``
+        # would unbind on the first detach and never rebind.
+        self._on_loop_start = on_loop_start
+        self._on_loop_stop = on_loop_stop
+
+    def request_immediate_heartbeat(self) -> None:
+        """Ask the loop to send the next heartbeat now.
+
+        ``runtime.health`` only travels on heartbeats, so without this a red
+        written just after a turn settles waits up to a full interval before
+        the server hears about it — long enough to be read as "never
+        reported". Deliberately fire-and-forget: the caller has already
+        persisted the health locally, and a heartbeat that fails must not
+        undo or delay that. The periodic tick stays as the fallback.
+        """
+        self._wake.set()
 
     async def run_heartbeat_loop(self) -> None:
         # Native agents POST /agents/me/heartbeat; keyless bridge agents emit a
@@ -114,13 +138,22 @@ class StatusReporter:
         replay_task = None
         if self._processing_reports is not None:
             replay_task = spawn(self._processing_reports.run(), name="processing_reports.run")
+        if self._on_loop_start is not None:
+            self._on_loop_start()
         try:
             await self._send_heartbeat()
             while not stop.is_set():
+                # One event carries both wake-ups: an early tick requested by
+                # a health change, and shutdown (``stop`` sets it too). Waiting
+                # on a single event keeps this a plain wait instead of a pair
+                # of racing tasks.
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=self._interval)
+                    await asyncio.wait_for(
+                        self._wake.wait(), timeout=self._interval,
+                    )
                 except asyncio.TimeoutError:
                     pass
+                self._wake.clear()
                 if stop.is_set():
                     break
                 await self._send_heartbeat()
@@ -137,10 +170,18 @@ class StatusReporter:
                     logger.warning("processing report replay stopped", exc_info=True)
             if self._run_stop is stop:
                 self._run_stop = None
+            if self._on_loop_stop is not None:
+                try:
+                    self._on_loop_stop()
+                except Exception:  # noqa: BLE001 - teardown must not raise
+                    logger.warning("status reporter unbind failed", exc_info=True)
 
     def stop(self) -> None:
         if self._run_stop is not None:
             self._run_stop.set()
+            # The loop waits on ``_wake``; without this, shutdown would sit
+            # out the rest of the interval before noticing.
+            self._wake.set()
         if self._processing_reports is not None:
             self._processing_reports.stop()
 

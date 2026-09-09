@@ -201,6 +201,78 @@ def test_probe_recycles_then_flips_health(registered_manager, saved_states):
     assert ("t", "mcp_unreachable", worker.runtime.error) in saved_states
 
 
+@pytest.mark.parametrize("starting_health", ["ok", "unknown", "in_progress", "no_progress"])
+def test_wedge_is_named_from_the_states_a_wedge_actually_leaves_behind(
+    starting_health, registered_manager, saved_states,
+):
+    """A real MCP failure rarely leaves health at ``ok``.
+
+    The turn it breaks is admitted (``in_progress``) or keeps waking and
+    consuming nothing (``no_progress``), so gating the flip on ok/unknown
+    skipped the diagnosis in exactly the states the fault produces — the
+    generic symptom stayed, and its remediation text points at provider
+    credentials.
+    """
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker(starting_health)
+    _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+    mgr.last_open_monotonic = time.monotonic() - 120
+    _run(worker.probe_mcp_transport("t"))
+
+    assert worker._mcp_probe_strikes == 2
+    assert worker.runtime.health == "mcp_unreachable"
+
+
+@pytest.mark.parametrize(
+    "specific_red",
+    ["auth_failed", "provider_error", "refresh_broken", "drained",
+     "extra_usage_required", "unhandled_error"],
+)
+def test_wedge_never_overwrites_a_more_specific_cause(
+    specific_red, registered_manager, saved_states,
+):
+    """The probe knows the transport is down, not that it is the only
+    thing wrong. Widening the overwrite set must not turn into "the last
+    writer wins" — a credential failure outranks it."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker(specific_red)
+    _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+    mgr.last_open_monotonic = time.monotonic() - 120
+    _run(worker.probe_mcp_transport("t"))
+
+    assert worker.runtime.health == specific_red
+
+
+@pytest.mark.parametrize("starting_health", ["in_progress", "no_progress"])
+def test_recovery_clears_the_wedge_from_the_widened_states(
+    starting_health, registered_manager, saved_states,
+):
+    """Only checking that it turns red would miss a red that cannot come
+    down: once the subprocess hellos back, health must return to ok."""
+    mgr = registered_manager(_FakeManager("g1", time.monotonic() - 120))
+    rpc_service.clear_mcp_hello("t")
+    worker = _seed_worker(starting_health)
+    _wire(worker, mgr)
+
+    _run(worker.probe_mcp_transport("t"))
+    mgr.last_open_monotonic = time.monotonic() - 120
+    _run(worker.probe_mcp_transport("t"))
+    assert worker.runtime.health == "mcp_unreachable"
+
+    rpc_service.record_mcp_hello("t", mgr.spec.mcp_generation)
+    _run(worker.probe_mcp_transport("t"))
+
+    assert worker.runtime.health == "ok"
+    assert worker.runtime.error == ""
+    assert worker._mcp_probe_strikes == 0
+
+
 def test_recycle_mints_new_generation_and_late_old_hello_stays_red(
     registered_manager, saved_states,
 ):
@@ -720,7 +792,9 @@ def test_hello_beacon_refires_after_interval(monkeypatch):
 # ── per-spawn config generation ────────────────────────────────────────
 
 
-def test_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
+def _local_preparer(tmp_path, monkeypatch, *, harness, agent_id, command=()):
+    """A preparer wired for one harness family, with only the host lookups
+    that would leave the sandbox stubbed out."""
     import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
     from puffo_agent.agent.harness.runtime.local_runtime import (
         LocalRuntimePreparer,
@@ -728,38 +802,233 @@ def test_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
-    monkeypatch.setattr(
-        local_runtime, "resolve_claude_bin", lambda: "/bin/claude",
-    )
     monkeypatch.setattr(local_runtime, "is_macos", lambda: False)
+    for name, value in (
+        ("resolve_claude_bin", "/bin/claude"),
+        ("resolve_codex_bin", "/bin/codex"),
+        ("resolve_pi_bin", "/bin/pi"),
+        ("resolve_opencode_bin", "/bin/opencode"),
+    ):
+        monkeypatch.setattr(local_runtime, name, lambda _v=value: _v)
+
+    async def _no_install(**_kwargs):
+        return {}
+
+    monkeypatch.setattr(local_runtime, "run_spawn_install", _no_install)
+    provider = {
+        "claude-code": "anthropic",
+        "codex": "openai",
+    }.get(harness, "")
+    # codex refuses to build a spec without auth; the gateway branch is the
+    # one that needs no host credential file.
+    gateway = (
+        {"llm_base_url": "http://gateway.invalid", "api_key": "k"}
+        if harness == "codex" else {}
+    )
     config = AgentConfig(
-        id="gen-test",
+        id=agent_id,
         runtime=RuntimeConfig(
-            kind="cli-local", provider="anthropic", harness="claude-code",
+            kind="cli-local",
+            provider=provider,
+            harness=harness,
+            harness_command=list(command),
+            **gateway,
         ),
         puffo_core=PuffoCoreConfig(
             slug="bot-gen", device_id="d1", space_id="sp1",
         ),
     )
-    preparer = LocalRuntimePreparer(DaemonConfig(), config)
+    return LocalRuntimePreparer(DaemonConfig(), config)
 
-    first = preparer._prepare_claude_spec("prompt")
-    config_doc = json.loads(
-        (tmp_path / "puffo" / "agents" / "gen-test" / "mcp-config.json")
-        .read_text(encoding="utf-8")
+
+# Every harness family the daemon can spawn a Puffo MCP subprocess for.
+# ``acp`` needs an explicit command; the rest resolve a binary.
+_MCP_HARNESS_FAMILIES = [
+    ("claude-code", ()),
+    ("codex", ()),
+    ("pi", ()),
+    ("opencode", ()),
+    ("acp", ("lingtai-agent", "acp")),
+]
+
+
+@pytest.mark.parametrize("harness,command", _MCP_HARNESS_FAMILIES)
+def test_every_harness_family_mints_a_generation(
+    harness, command, tmp_path, monkeypatch,
+):
+    """The probe is keyed on ``spec.mcp_generation``; an empty one makes
+    ``Worker.probe_mcp_transport`` return early, so a family that does not
+    mint has *no* wedge detection at all — and nothing logs that.
+
+    This is the assertion that was missing when the mint lived only in the
+    claude-code branch: pi, opencode, acp and codex shipped with the
+    detector silently disabled.
+    """
+    preparer = _local_preparer(
+        tmp_path, monkeypatch,
+        harness=harness, agent_id=f"gen-{harness}", command=command,
     )
-    written = config_doc["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
-    second = preparer._prepare_claude_spec("prompt")
 
-    assert first.mcp_generation and second.mcp_generation
+    first = asyncio.run(preparer.refresh_spec("prompt"))
+    second = asyncio.run(preparer.refresh_spec("prompt"))
+
+    assert first.mcp_generation, f"{harness} spec carries no mcp_generation"
+    # A recycle must not be able to accept the predecessor's hello.
     assert first.mcp_generation != second.mcp_generation
-    assert written == first.mcp_generation
 
 
-def test_docker_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
-    """cli-docker Claude gets the same per-write generation as
-    cli-local — without it the transport probe exits early and Docker
-    agents have no wedge recovery at all."""
+@pytest.mark.parametrize("harness,command", _MCP_HARNESS_FAMILIES)
+def test_every_harness_family_hands_the_generation_to_the_subprocess(
+    harness, command, tmp_path, monkeypatch,
+):
+    """Minting is only half of it: the subprocess must receive the value,
+    because ``_make_hello_startup`` returns ``None`` on an empty
+    ``PUFFO_MCP_GENERATION`` and then never sends a hello at all."""
+    preparer = _local_preparer(
+        tmp_path, monkeypatch,
+        harness=harness, agent_id=f"env-{harness}", command=command,
+    )
+
+    spec = asyncio.run(preparer.refresh_spec("prompt"))
+    delivered = _delivered_generations(preparer, spec, tmp_path, harness)
+
+    assert delivered, f"{harness} spawns no Puffo MCP subprocess environment"
+    for value in delivered:
+        assert value == spec.mcp_generation
+
+
+def _delivered_generations(preparer, spec, tmp_path, harness):
+    """Every PUFFO_MCP_GENERATION this spec actually hands a subprocess.
+
+    Each family carries the server differently — CLI config file, TOML,
+    protocol projection, inline JSON, or the pi bridge — so the value has
+    to be read back out of the shape that family really uses.
+    """
+    found = [
+        server.environment.get("PUFFO_MCP_GENERATION", "")
+        for server in spec.mcp_servers
+    ]
+    if harness == "claude-code":
+        document = json.loads(
+            (tmp_path / "puffo" / "agents" / f"env-{harness}"
+             / "mcp-config.json").read_text(encoding="utf-8")
+        )
+        found.append(
+            document["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
+        )
+    elif harness == "codex":
+        from puffo_agent.portal.state import agent_codex_user_dir
+
+        config = (
+            agent_codex_user_dir(preparer.agent_id) / "config.toml"
+        ).read_text(encoding="utf-8")
+        found.extend(
+            line.split("=", 1)[1].strip().strip('"')
+            for line in config.splitlines()
+            if line.strip().startswith("PUFFO_MCP_GENERATION")
+        )
+    elif harness == "opencode":
+        inline = json.loads(spec.environment["OPENCODE_CONFIG_CONTENT"])
+        found.append(
+            inline["mcp"]["puffo"]["environment"]["PUFFO_MCP_GENERATION"]
+        )
+    elif harness == "pi":
+        # Pi has no MCP client; the attested bridge carries the whole server
+        # spec as JSON, so the generation has to survive that encoding too.
+        from puffo_agent.agent.harness.drivers.pi_bridge import (
+            BRIDGE_CONFIG_ENV,
+        )
+
+        bridge = json.loads(spec.environment[BRIDGE_CONFIG_ENV])
+        found.append(bridge["environment"]["PUFFO_MCP_GENERATION"])
+    return [value for value in found if value]
+
+
+def _docker_preparer(tmp_path, monkeypatch, *, harness, agent_id):
+    from puffo_agent.agent.harness.runtime.docker_runtime import (
+        DockerRuntimePreparer,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
+    gateway = (
+        {"llm_base_url": "http://gateway.invalid", "api_key": "k"}
+        if harness == "codex" else {}
+    )
+    config = AgentConfig(
+        id=agent_id,
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="anthropic" if harness == "claude-code" else "openai",
+            harness=harness,
+            **gateway,
+        ),
+        puffo_core=PuffoCoreConfig(
+            slug="bot-gen-d", device_id="d1", space_id="sp1",
+        ),
+    )
+    return DockerRuntimePreparer(DaemonConfig(), config)
+
+
+@pytest.mark.parametrize("harness", ["claude-code", "codex"])
+def test_docker_spec_mints_fresh_generation(harness, tmp_path, monkeypatch):
+    """Both container harnesses need the per-build generation: without it
+    the transport probe exits early and the agent has no wedge recovery.
+
+    codex shipped without one while claude had it — the same per-harness
+    mint that left cli-local pi/opencode/acp unwired.
+    """
+    preparer = _docker_preparer(
+        tmp_path, monkeypatch, harness=harness, agent_id=f"gen-docker-{harness}",
+    )
+
+    first = asyncio.run(preparer.refresh_spec("prompt"))
+    second = asyncio.run(preparer.refresh_spec("prompt"))
+
+    assert first.mcp_generation, f"docker {harness} carries no mcp_generation"
+    assert first.mcp_generation != second.mcp_generation
+
+
+@pytest.mark.parametrize("harness", ["claude-code", "codex"])
+def test_docker_hands_the_generation_to_the_subprocess(
+    harness, tmp_path, monkeypatch,
+):
+    preparer = _docker_preparer(
+        tmp_path, monkeypatch, harness=harness, agent_id=f"env-docker-{harness}",
+    )
+
+    spec = asyncio.run(preparer.refresh_spec("prompt"))
+
+    if harness == "claude-code":
+        document = json.loads(
+            (preparer.workspace_dir / ".puffo-agent" / "mcp-config.json")
+            .read_text(encoding="utf-8")
+        )
+        delivered = [
+            document["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
+        ]
+    else:
+        config = (preparer.codex_home / "config.toml").read_text(
+            encoding="utf-8"
+        )
+        delivered = [
+            line.split("=", 1)[1].strip().strip('"')
+            for line in config.splitlines()
+            if line.strip().startswith("PUFFO_MCP_GENERATION")
+        ]
+
+    assert delivered, f"docker {harness} hands the subprocess no generation"
+    for value in delivered:
+        assert value == spec.mcp_generation
+
+
+def test_no_puffo_core_means_no_generation_to_wait_for(tmp_path, monkeypatch):
+    """A generation is a promise that some subprocess will hello back.
+
+    An agent with no Puffo MCP configured has nobody to make that promise,
+    so it must stay empty — otherwise the probe would recycle it forever
+    waiting for a hello that cannot come.
+    """
     from puffo_agent.agent.harness.runtime.docker_runtime import (
         DockerRuntimePreparer,
     )
@@ -767,24 +1036,267 @@ def test_docker_claude_spec_mints_fresh_generation(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
     config = AgentConfig(
-        id="gen-docker",
+        id="no-core-docker",
         runtime=RuntimeConfig(
             kind="cli-docker", provider="anthropic", harness="claude-code",
-        ),
-        puffo_core=PuffoCoreConfig(
-            slug="bot-gen-d", device_id="d1", space_id="sp1",
         ),
     )
     preparer = DockerRuntimePreparer(DaemonConfig(), config)
 
-    first = preparer._prepare_claude_spec("prompt")
-    config_doc = json.loads(
-        (preparer.workspace_dir / ".puffo-agent" / "mcp-config.json")
-        .read_text(encoding="utf-8")
-    )
-    written = config_doc["mcpServers"]["puffo"]["env"]["PUFFO_MCP_GENERATION"]
-    second = preparer._prepare_claude_spec("prompt")
+    spec = asyncio.run(preparer.refresh_spec("prompt"))
 
-    assert first.mcp_generation and second.mcp_generation
-    assert first.mcp_generation != second.mcp_generation
-    assert written == first.mcp_generation
+    assert spec.mcp_generation == ""
+
+
+# ── health reaches the server without waiting out the heartbeat ─────────
+
+
+def test_health_change_wakes_the_heartbeat(tmp_path, monkeypatch):
+    """``runtime.health`` only travels on heartbeats, so a red written
+    just after a turn settles used to wait out the whole interval before
+    the server heard about it — long enough to read as "never reported".
+
+    The periodic tick stays: this only shortens the wait.
+    """
+    from puffo_agent.agent.status_reporter import StatusReporter
+    from puffo_agent.portal.state import (
+        set_runtime_health_listener,
+        _RUNTIME_LAST_HEALTH,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    _RUNTIME_LAST_HEALTH.pop("hb", None)
+    sent: list[str] = []
+
+    class _Http:
+        keyless = False
+
+        async def post(self, path, body):
+            sent.append(body.get("health", ""))
+            return {}
+
+    async def _drive():
+        reporter = StatusReporter(
+            _Http(),
+            heartbeat_interval_s=3600.0,  # never fires on its own in this test
+            runtime_health_provider=lambda: runtime.health,
+        )
+        set_runtime_health_listener("hb", reporter.request_immediate_heartbeat)
+        loop_task = spawn_task(reporter.run_heartbeat_loop())
+        try:
+            await _settle()
+            assert sent == ["ok"], sent
+
+            runtime.health = "mcp_unreachable"
+            runtime.save("hb")
+            await _settle()
+            assert sent == ["ok", "mcp_unreachable"], sent
+
+            # An unchanged health must not add wire traffic.
+            runtime.save("hb")
+            await _settle()
+            assert sent == ["ok", "mcp_unreachable"], sent
+
+            # Recovery travels on the same path, not just the failure.
+            runtime.health = "ok"
+            runtime.save("hb")
+            await _settle()
+            assert sent == ["ok", "mcp_unreachable", "ok"], sent
+        finally:
+            set_runtime_health_listener("hb", None)
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+
+    runtime = RuntimeState(status="running", health="ok")
+    runtime.save("hb")  # seed the baseline; no listener registered yet
+    asyncio.run(_drive())
+
+
+def test_a_failed_publish_never_blocks_the_local_health_write(tmp_path, monkeypatch):
+    """The local file is authoritative. If the listener raises, health must
+    still be persisted — the daemon cannot lose its own diagnosis because
+    the server was unreachable."""
+    from puffo_agent.portal.state import (
+        set_runtime_health_listener,
+        _RUNTIME_LAST_HEALTH,
+        runtime_json_path,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    _RUNTIME_LAST_HEALTH.pop("boom", None)
+
+    def _explode():
+        raise RuntimeError("transport is down")
+
+    runtime = RuntimeState(status="running", health="ok")
+    runtime.save("boom")
+    set_runtime_health_listener("boom", _explode)
+    try:
+        runtime.health = "mcp_unreachable"
+        runtime.save("boom")
+    finally:
+        set_runtime_health_listener("boom", None)
+
+    written = json.loads(
+        runtime_json_path("boom").read_text(encoding="utf-8")
+    )
+    assert written["health"] == "mcp_unreachable"
+
+
+def test_the_listener_is_told_a_health_it_can_already_read(tmp_path, monkeypatch):
+    """The listener publishes the health the daemon just decided, so it must
+    fire after the file lands, not before.
+
+    Notifying first makes the announced value and the stored value two
+    independent reads of a half-finished write, and lets a save that never
+    lands announce itself anyway.
+    """
+    from puffo_agent.portal.state import (
+        set_runtime_health_listener,
+        _RUNTIME_LAST_HEALTH,
+        runtime_json_path,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    _RUNTIME_LAST_HEALTH.pop("order", None)
+    observed: list[str] = []
+
+    def _read_the_file():
+        observed.append(
+            json.loads(
+                runtime_json_path("order").read_text(encoding="utf-8")
+            )["health"]
+        )
+
+    runtime = RuntimeState(status="running", health="ok")
+    runtime.save("order")
+    set_runtime_health_listener("order", _read_the_file)
+    try:
+        runtime.health = "mcp_unreachable"
+        runtime.save("order")
+    finally:
+        set_runtime_health_listener("order", None)
+
+    assert observed == ["mcp_unreachable"]
+
+
+def test_a_write_that_never_lands_announces_nothing_and_stays_pending(
+    tmp_path, monkeypatch
+):
+    """A failed save must not fire the listener — and must not consume the
+    change either. The next successful save still has to report it, or a
+    transient disk error would silently drop a red for good."""
+    from puffo_agent.portal import state as state_module
+    from puffo_agent.portal.state import (
+        set_runtime_health_listener,
+        _RUNTIME_LAST_HEALTH,
+    )
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    _RUNTIME_LAST_HEALTH.pop("nodisk", None)
+    fired: list[str] = []
+
+    runtime = RuntimeState(status="running", health="ok")
+    runtime.save("nodisk")
+    set_runtime_health_listener("nodisk", lambda: fired.append(runtime.health))
+    real_replace = state_module.os.replace
+    try:
+        def _fail(src, dst):
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(state_module.os, "replace", _fail)
+        runtime.health = "mcp_unreachable"
+        with pytest.raises(OSError):
+            runtime.save("nodisk")
+        assert fired == []
+
+        monkeypatch.setattr(state_module.os, "replace", real_replace)
+        runtime.save("nodisk")
+        assert fired == ["mcp_unreachable"]
+    finally:
+        set_runtime_health_listener("nodisk", None)
+
+
+@pytest.mark.asyncio
+async def test_the_health_listener_lives_exactly_as_long_as_the_loop():
+    """The registry is a module global, so a reporter that stops must not
+    stay reachable through it — and a reporter that starts again must be
+    reachable again.
+
+    Both halves are load-bearing. ws-local reuses one reporter across
+    attaches, spawning a fresh heartbeat loop each time and calling ``stop``
+    on every detach: binding at construction and releasing at ``stop`` would
+    unbind on the first detach and never rebind, silently retiring the
+    immediate push for the rest of the agent's life.
+    """
+    from puffo_agent.portal.state import _RUNTIME_HEALTH_LISTENERS
+
+    class _Bridge:
+        async def send_status(self, status, **kwargs):
+            return None
+
+        def add_connected_callback(self, callback):
+            return None
+
+    worker = Worker(
+        DaemonConfig(),
+        AgentConfig(
+            id="teardown-agent",
+            runtime=RuntimeConfig(kind="cli-local", harness="codex"),
+        ),
+    )
+    reporter = worker._build_status_reporter(
+        SimpleNamespace(http=SimpleNamespace(keyless=True), _bridge=_Bridge())
+    )
+    try:
+        assert "teardown-agent" not in _RUNTIME_HEALTH_LISTENERS
+
+        for _attach in range(2):
+            loop_task = spawn_task(reporter.run_heartbeat_loop())
+            await _settle()
+            assert "teardown-agent" in _RUNTIME_HEALTH_LISTENERS
+
+            reporter.stop()
+            await loop_task
+            assert "teardown-agent" not in _RUNTIME_HEALTH_LISTENERS
+    finally:
+        _RUNTIME_HEALTH_LISTENERS.pop("teardown-agent", None)
+
+
+def test_a_late_unbind_never_silences_the_reporter_that_replaced_it():
+    """A cancelled loop runs its ``finally`` whenever the event loop next
+    gets to it, which can be after a rebuilt reporter has claimed the slot.
+    Releasing by identity keeps the live one registered."""
+    from puffo_agent.portal.state import (
+        _RUNTIME_HEALTH_LISTENERS,
+        clear_runtime_health_listener,
+        set_runtime_health_listener,
+    )
+
+    def _old():
+        pass
+
+    def _new():
+        pass
+
+    try:
+        set_runtime_health_listener("succeeded-agent", _old)
+        set_runtime_health_listener("succeeded-agent", _new)
+        clear_runtime_health_listener("succeeded-agent", _old)
+        assert _RUNTIME_HEALTH_LISTENERS.get("succeeded-agent") is _new
+        clear_runtime_health_listener("succeeded-agent", _new)
+        assert "succeeded-agent" not in _RUNTIME_HEALTH_LISTENERS
+    finally:
+        _RUNTIME_HEALTH_LISTENERS.pop("succeeded-agent", None)
+
+
+def spawn_task(coro):
+    return asyncio.ensure_future(coro)
+
+
+async def _settle():
+    for _ in range(10):
+        await asyncio.sleep(0)

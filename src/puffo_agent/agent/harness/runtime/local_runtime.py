@@ -332,6 +332,9 @@ class LocalRuntimePreparer:
         self._desired_installed = False
         self._desired_codex_extras: dict[str, dict] = {}
         self._puffo_core_env = self._build_puffo_core_env()
+        # Minted per spec build in ``refresh_spec`` — see
+        # ``_puffo_core_child_env``.
+        self._mcp_generation = ""
 
     async def prepare(
         self,
@@ -376,6 +379,12 @@ class LocalRuntimePreparer:
         if self.harness_name == "claude-code":
             self._sync_claude_host_state()
         await self._install_desired_once()
+        # One mint for every harness family. The daemon-side transport probe
+        # is keyed on this value, and a per-harness mint is exactly how three
+        # families ended up with the probe silently disabled: the value must
+        # be born at the single point every spec build passes through, not at
+        # each spawn site that happens to remember it.
+        self._mcp_generation = uuid.uuid4().hex if self._puffo_core_env else ""
         if self.harness_name == "codex":
             return self._prepare_codex_spec(system_prompt)
         if self.harness_name == "claude-code":
@@ -418,6 +427,7 @@ class LocalRuntimePreparer:
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+            mcp_generation=self._mcp_generation,
         )
 
     def _resolve_generic_command(self) -> tuple[str, list[str]]:
@@ -515,14 +525,15 @@ class LocalRuntimePreparer:
         ``test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan``.
         """
         mcp_servers: tuple[McpServerSpec, ...] = ()
-        if self._puffo_core_env:
+        puffo_core_env = self._puffo_core_child_env()
+        if puffo_core_env:
             puffo_command = default_python_executable()
             puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
             puffo_server = McpServerSpec(
                 name="puffo",
                 command=puffo_command,
                 args=puffo_args,
-                environment=self._puffo_core_env,
+                environment=puffo_core_env,
             )
             if self.harness_name == "pi":
                 # Pi has no MCP client. Its attested extension bridge carries
@@ -542,7 +553,7 @@ class LocalRuntimePreparer:
                     "puffo": {
                         "type": "local",
                         "command": [puffo_command, *puffo_args],
-                        "environment": self._puffo_core_env,
+                        "environment": puffo_core_env,
                     }
                 }
         else:
@@ -572,6 +583,23 @@ class LocalRuntimePreparer:
             )
         )
         return controlled
+
+    def _puffo_core_child_env(self) -> dict[str, str] | None:
+        """The MCP subprocess environment, generation included.
+
+        Every spawn site goes through here so the subprocess can echo the
+        generation back over ``mcp-hello``; without it
+        ``_make_hello_startup`` returns ``None``, no hello is ever sent, and
+        ``Worker.probe_mcp_transport`` returns early on the empty spec
+        generation — a dead transport with no recycle and no
+        ``mcp_unreachable``.
+        """
+        if not self._puffo_core_env:
+            return None
+        return {
+            **self._puffo_core_env,
+            "PUFFO_MCP_GENERATION": self._mcp_generation,
+        }
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core
@@ -689,20 +717,16 @@ class LocalRuntimePreparer:
                     inference,
                 )
         mcp_path = agent_dir(self.agent_id) / "mcp-config.json"
-        mcp_generation = ""
-        if self._puffo_core_env:
-            # Minted per config write; the subprocess echoes it back over
-            # RPC (mcp-hello) so the worker's transport probe can tell
-            # "this spec's MCP reached us" from a stale predecessor.
-            mcp_generation = uuid.uuid4().hex
+        puffo_core_env = self._puffo_core_child_env()
+        if puffo_core_env:
+            # The subprocess echoes the generation back over RPC (mcp-hello)
+            # so the worker's transport probe can tell "this spec's MCP
+            # reached us" from a stale predecessor.
             write_cli_mcp_config(
                 mcp_path,
                 command=default_python_executable(),
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
-                env={
-                    **self._puffo_core_env,
-                    "PUFFO_MCP_GENERATION": mcp_generation,
-                },
+                env=puffo_core_env,
             )
             launch_args.extend(["--mcp-config", str(mcp_path)])
         else:
@@ -754,7 +778,7 @@ class LocalRuntimePreparer:
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
             auto_compact_threshold_tokens=compact_tokens,
-            mcp_generation=mcp_generation,
+            mcp_generation=self._mcp_generation,
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
@@ -773,11 +797,12 @@ class LocalRuntimePreparer:
             "inference_level": self.agent_cfg.runtime.inference_level,
             "provider": gateway,
         }
-        if self._puffo_core_env:
+        puffo_core_env = self._puffo_core_child_env()
+        if puffo_core_env:
             config_kwargs.update({
                 "command": default_python_executable(),
                 "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
-                "env": self._puffo_core_env,
+                "env": puffo_core_env,
             })
         write_codex_mcp_config(codex_home / "config.toml", **config_kwargs)
 
@@ -833,6 +858,7 @@ class LocalRuntimePreparer:
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
+            mcp_generation=self._mcp_generation,
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
