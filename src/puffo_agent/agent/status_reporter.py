@@ -101,6 +101,21 @@ class StatusReporter:
         # write, and each body is built under it, so wire order matches
         # state order and the last write carries the newest state.
         self._send_lock = asyncio.Lock()
+        # Set by ``request_immediate_heartbeat`` so a health change does not
+        # have to wait out the remaining interval.
+        self._wake = asyncio.Event()
+
+    def request_immediate_heartbeat(self) -> None:
+        """Ask the loop to send the next heartbeat now.
+
+        ``runtime.health`` only travels on heartbeats, so without this a red
+        written just after a turn settles waits up to a full interval before
+        the server hears about it — long enough to be read as "never
+        reported". Deliberately fire-and-forget: the caller has already
+        persisted the health locally, and a heartbeat that fails must not
+        undo or delay that. The periodic tick stays as the fallback.
+        """
+        self._wake.set()
 
     async def run_heartbeat_loop(self) -> None:
         # Native agents POST /agents/me/heartbeat; keyless bridge agents emit a
@@ -117,10 +132,17 @@ class StatusReporter:
         try:
             await self._send_heartbeat()
             while not stop.is_set():
+                # One event carries both wake-ups: an early tick requested by
+                # a health change, and shutdown (``stop`` sets it too). Waiting
+                # on a single event keeps this a plain wait instead of a pair
+                # of racing tasks.
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=self._interval)
+                    await asyncio.wait_for(
+                        self._wake.wait(), timeout=self._interval,
+                    )
                 except asyncio.TimeoutError:
                     pass
+                self._wake.clear()
                 if stop.is_set():
                     break
                 await self._send_heartbeat()
@@ -141,6 +163,9 @@ class StatusReporter:
     def stop(self) -> None:
         if self._run_stop is not None:
             self._run_stop.set()
+            # The loop waits on ``_wake``; without this, shutdown would sit
+            # out the rest of the interval before noticing.
+            self._wake.set()
         if self._processing_reports is not None:
             self._processing_reports.stop()
 

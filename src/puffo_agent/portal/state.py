@@ -1042,6 +1042,7 @@ class RuntimeState:
     def save(self, agent_id: str) -> None:
         import json
 
+        self._notify_health_change(agent_id)
         self.updated_at = int(time.time())
         path = runtime_json_path(agent_id)
         # CLI staleness gate is 30s; throttle pure-updated_at writes
@@ -1065,6 +1066,46 @@ class RuntimeState:
             json.dump(asdict(self), f, indent=2)
         os.replace(tmp, path)
         _RUNTIME_LAST_SAVE[key] = (sig, self.updated_at)
+
+    def _notify_health_change(self, agent_id: str) -> None:
+        """Fire the registered listener when ``health`` actually changed.
+
+        Every health writer already funnels through ``save``, so this is the
+        one place that cannot be forgotten — a per-writer notification is the
+        same "whoever remembers" shape that left the transport probe
+        unwired on three harness families.
+
+        Runs before the throttle check on purpose: an unchanged-signature
+        save is throttled, but a health change always changes the signature,
+        and a listener must never be skipped because of write throttling.
+        """
+        listener = _RUNTIME_HEALTH_LISTENERS.get(agent_id)
+        previous = _RUNTIME_LAST_HEALTH.get(agent_id)
+        _RUNTIME_LAST_HEALTH[agent_id] = self.health
+        if listener is None or previous is None or previous == self.health:
+            return
+        try:
+            listener()
+        except Exception:  # noqa: BLE001
+            # Publishing is best-effort; the local write is authoritative and
+            # must complete even if nobody can be told about it.
+            logger.debug(
+                "runtime health listener for %s raised", agent_id, exc_info=True,
+            )
+
+
+# Fires when an agent's runtime health changes; the daemon registers the
+# status reporter here so a red reaches the server without waiting out the
+# heartbeat interval. The periodic heartbeat stays as the fallback.
+_RUNTIME_HEALTH_LISTENERS: dict[str, Any] = {}
+_RUNTIME_LAST_HEALTH: dict[str, str] = {}
+
+
+def set_runtime_health_listener(agent_id: str, listener: Any) -> None:
+    if listener is None:
+        _RUNTIME_HEALTH_LISTENERS.pop(agent_id, None)
+    else:
+        _RUNTIME_HEALTH_LISTENERS[agent_id] = listener
 
 
 # Keyed by resolved path so test tmp_path reuse doesn't collide.
