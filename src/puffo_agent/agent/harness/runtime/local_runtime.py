@@ -975,6 +975,29 @@ class _LegacyStatusProjector:
         self._emitted_tools.clear()
 
 
+async def _observe_compaction_activity(
+    activity_sink, event_type: str, agent_id: str,
+) -> None:
+    """Forward compaction boundaries ("compacting" / None on completed
+    and failed alike — a failed compaction must not strand the overlay)
+    to the status reporter's activity sink. Observation only: failures
+    never reach the runtime."""
+    if event_type not in {
+        "compaction.started", "compaction.completed", "compaction.failed",
+    }:
+        return
+    try:
+        await activity_sink(
+            "compacting" if event_type == "compaction.started" else None
+        )
+    except Exception as exc:  # noqa: BLE001 - observation only
+        logger.warning(
+            "agent %s: activity observation failed (%s); runtime continues",
+            agent_id,
+            type(exc).__name__,
+        )
+
+
 def build_local_runtime_adapter(
     prepared: PreparedLocalRuntime,
     *,
@@ -983,13 +1006,17 @@ def build_local_runtime_adapter(
     driver: Driver | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
     generation_sink: Callable[[str], None] | None = None,
+    activity_sink: Callable[[str | None], Awaitable[None]] | None = None,
 ) -> RuntimeManagerAdapter:
     """Bind a prepared Driver runtime to the durable Runtime Manager.
 
     ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
     Docker composition injects the selected Driver with its exec transport
     factory and passes ``cleanup`` (bounded container stop), which runs after
-    the manager closes.
+    the manager closes. ``activity_sink`` receives the fixed activity label
+    ("compacting" / None) on compaction boundary events so the status
+    reporter can refine the operator-facing status; it observes only,
+    failures never reach the runtime.
     """
     if driver is None:
         driver = build_driver(prepared.harness_name)
@@ -1024,6 +1051,10 @@ def build_local_runtime_adapter(
                 type(exc).__name__,
             )
         event_type = getattr(event.type, "value", event.type)
+        if activity_sink is not None:
+            await _observe_compaction_activity(
+                activity_sink, event_type, prepared.preparer.agent_id,
+            )
         # Only the session and turn boundaries rewrite durable state; every
         # other event (a streamed delta above all) must reach the outbox no
         # more than once, so the state read stays inside the branch using it.

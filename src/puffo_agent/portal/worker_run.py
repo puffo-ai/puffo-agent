@@ -100,6 +100,11 @@ class _NoopStatusReporter:
     async def report_error(self, _text):
         return None
 
+    def set_activity_overlay(self, _activity) -> bool:
+        # Sync like the real reporter's state-only setter; False means
+        # "nothing changed", so emit_activity never tries to push.
+        return False
+
     async def run_heartbeat_loop(self):
         return None
 
@@ -410,6 +415,30 @@ class StandardWorkerRun:
             # that window trims the hello and fakes never-seen.
             rpc_service.pin_mcp_generation(agent_id, generation)
 
+        # Warm opens the driver before ``_start_services`` builds the
+        # reporter, and a session resume can compact right there — hold
+        # the latest label so the reporter starts from it instead of
+        # silently dropping the whole warm-phase window.
+        worker._pending_activity = None
+
+        async def emit_activity(activity: str | None) -> None:
+            # The overlay flips synchronously (event order preserved);
+            # the heartbeat push runs detached because this callback
+            # fires under the runtime command lock and a slow status
+            # POST must not extend the lock or stall event processing.
+            # The reporter serializes status writes and builds each body
+            # under its send lock, so a duplicate or delayed push still
+            # lands carrying the newest state.
+            reporter = getattr(worker, "_status_reporter", None)
+            if reporter is None:
+                worker._pending_activity = activity
+                return
+            if reporter.set_activity_overlay(activity):
+                spawn(
+                    reporter.report_current_status(),
+                    name="activity-heartbeat",
+                )
+
         worker._adapter = build_local_runtime_adapter(
             prepared,
             outbox=outbox,
@@ -417,6 +446,7 @@ class StandardWorkerRun:
             driver=driver,
             cleanup=cleanup,
             generation_sink=pin_generation,
+            activity_sink=emit_activity,
         )
         # Pin the initial mcp generation at the mint, not at the first
         # probe (same window as above, prepare-time edition).
@@ -848,7 +878,20 @@ class StandardWorkerRun:
         if not hasattr(client, "http"):
             return _NoopStatusReporter()
         reporter = self.worker._build_status_reporter(client)
-        return reporter if reporter is not None else _NoopStatusReporter()
+        reporter = reporter if reporter is not None else _NoopStatusReporter()
+        # A warm-phase compaction fires before this reporter exists; the
+        # sink parked the latest label on the worker. Seed the overlay
+        # before the heartbeat loop starts so its immediate first beat
+        # carries it (no extra push needed).
+        pending = getattr(self.worker, "_pending_activity", None)
+        if pending is not None:
+            self.worker._pending_activity = None
+            reporter.set_activity_overlay(pending)
+        # The harness activity sink (``_bind_driver_runtime``) late-binds to
+        # this attribute; cleared in teardown so a stopped reporter is never
+        # driven by a still-draining event stream.
+        self.worker._status_reporter = reporter
+        return reporter
 
     @staticmethod
     def _settle_process_health(
@@ -1008,6 +1051,7 @@ class StandardWorkerRun:
         except (asyncio.CancelledError, Exception):
             pass
         services.reporter.stop()
+        self.worker._status_reporter = None
         background_tasks = (
             services.heartbeat_task,
             services.status_task,
