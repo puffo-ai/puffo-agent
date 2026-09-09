@@ -32,6 +32,7 @@ from .context_controller import (
 )
 from .errors import AgentAPIError
 from ._failure_outcomes import crash_resume_terminal, failure_outcome
+from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
     COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
@@ -1345,7 +1346,17 @@ class GlobalInboxRuntime(
             )
         terminal_error = operator_failure_text(exc)
         if process_outcome in {"drained", "extra_usage_required"}:
-            self._park_drained(process_outcome)
+            if process_outcome == "drained" and looks_like_budget_cap(terminal_error):
+                hold = self.next_budget_park_hold()
+                self._park_drained(
+                    hold_seconds=hold,
+                    diagnostic=(
+                        "gateway budget cap; holding "
+                        f"{int(hold)}s then probing once — {terminal_error[:160]}"
+                    ),
+                )
+            else:
+                self._park_drained(process_outcome)
         else:
             self._degrade(
                 "turn failed and was requeued"
@@ -1419,6 +1430,8 @@ class GlobalInboxRuntime(
                     terminal = True
                     terminal_succeeded = True
                     process_outcome = settled
+                    if settled == "succeeded":
+                        self._clear_budget_park_backoff()
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)

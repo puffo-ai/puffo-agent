@@ -23,7 +23,7 @@ from .workspace_layout import (
 )
 from ..agent.errors import ProviderFailureError
 from ..agent.processing_receipts import processing_run_id
-from ..agent._usage_markers import parse_reset_epoch
+from ..agent._usage_markers import looks_like_budget_cap, parse_reset_epoch
 from ..tasks import spawn
 
 if TYPE_CHECKING:
@@ -920,7 +920,9 @@ class StandardWorkerRun:
                 worker._enter_auth_failed(agent_id)
             elif outcome == "drained":
                 worker._enter_drained(
-                    agent_id, parse_reset_epoch(error_text or "")
+                    agent_id,
+                    parse_reset_epoch(error_text or ""),
+                    budget_cap=looks_like_budget_cap(error_text or ""),
                 )
             elif outcome == "extra_usage_required":
                 worker._enter_extra_usage_required(agent_id)

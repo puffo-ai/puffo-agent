@@ -9,6 +9,16 @@ from __future__ import annotations
 import re
 
 # shipped plan-budget spellings; stable cores — full sentences drift per release
+# A gateway (LiteLLM) refusing on a spend cap. Unambiguous: nothing else says
+# "budget". Unlike a plan window it has no reset time — it clears when someone
+# raises the cap or tops up the wallet — so callers pair it with a timed hold
+# rather than a reset epoch (see ``looks_like_budget_cap``).
+BUDGET_CAP_MARKERS: tuple[str, ...] = (
+    "budget has been exceeded",
+    "max budget limit reached",
+    "max budget:",
+)
+
 PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "usage limit reached",
     "hour limit reached",
@@ -16,6 +26,7 @@ PLAN_LIMIT_MARKERS: tuple[str, ...] = (
     "limit will reset at",
     "you've hit your usage limit",
     "you have hit your usage limit",
+    *BUDGET_CAP_MARKERS,
 )
 
 # ambiguous alone: also fired for per-model / per-project ceilings
@@ -54,6 +65,27 @@ DRAINED_RUNTIME_ERROR = (
     "Usage limit reached — the plan's quota for this account is spent. "
     "Holding messages until the window resets. Not a sign-in problem."
 )
+
+
+BUDGET_EXCEEDED_RUNTIME_ERROR = (
+    "Budget exceeded at the LLM gateway — the wallet or team cap behind this "
+    "agent's key is spent. Holding messages and re-checking on a timer; "
+    "raise the cap or top up to release it. Not a sign-in problem."
+)
+
+
+def looks_like_budget_cap(text: str) -> bool:
+    """A gateway spend-cap refusal (LiteLLM ``Budget has been exceeded!``).
+
+    Subset of ``looks_like_usage_limit`` — every budget-cap text is also a
+    drain — split out because the recovery differs: no window resets, so
+    the runtime holds on a timer and probes, instead of waiting for a
+    usage snapshot that a gateway-routed agent can never produce.
+    """
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in BUDGET_CAP_MARKERS)
 
 
 def looks_like_usage_limit(text: str) -> bool:

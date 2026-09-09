@@ -192,6 +192,10 @@ def _apply_to_live_worker(worker, agent_id: str, spent_reset) -> None:
         if worker.runtime.health in ("ok", "unknown", ""):
             worker._enter_drained(agent_id, resets_at)
     elif worker.runtime.health == "drained":
+        if getattr(worker, "_drained_budget_cap", False):
+            # plan headroom says nothing about a gateway cap; the runtime's
+            # timed probe owns that exit
+            return
         worker._clear_drained(worker.runtime, agent_id, logger)
 
 

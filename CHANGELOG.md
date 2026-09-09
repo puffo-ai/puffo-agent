@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A gateway budget cap no longer turns into a retry storm.** LiteLLM's
+  `Budget has been exceeded!` 429 was classified as a transient rate limit and
+  retried — by the harness and by the `claude` CLI's own backoff loop — at up
+  to ~180 requests a minute per fleet, which the gateway counted against the
+  same budget. The wording is now a drain: the runtime parks on a timed hold
+  (5 → 30 min, reset by a completed turn) and probes once when it expires,
+  the operator gets a DM that names the cap rather than a quota window that
+  will "reset", the host's usage snapshot no longer clears it, and agents
+  routed through a gateway launch the CLI with `CLAUDE_CODE_MAX_RETRIES=2`.
+  (PUF-382)
+
 ### Added
 
 - **OpenCode reasoning variants follow each model's native catalog.** The
