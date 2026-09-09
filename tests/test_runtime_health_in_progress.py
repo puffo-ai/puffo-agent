@@ -8,9 +8,9 @@ Tests the two new static helpers on Worker:
   other state alone.
 
 Also covers the StatusReporter heartbeat shape extension (carries
-both per-turn ``status`` AND persistent ``health``) and the
-``cli.cmd_agent_list`` surfaced-health tuple includes
-``in_progress``.
+both per-turn ``status`` AND persistent ``health``). CLI surfacing of
+non-ok health moved to ``tests/test_no_progress_turn_guard.py`` — see the
+note further down.
 """
 
 from __future__ import annotations
@@ -344,25 +344,15 @@ async def test_heartbeat_provider_exception_does_not_break_heartbeat(monkeypatch
     assert body == {"status": "idle"}
 
 
-# ── CLI surfaced-health includes new values ──────────────────────
-
-
-def test_cli_surfaced_health_tuple_includes_new_values():
-    """Source-string check on cli.py's cmd_agent_list tuple (running
-    the CLI does heavy daemon init). Pins the new PUF-270 values."""
-    cli_path = (
-        Path(__file__).parent.parent
-        / "src" / "puffo_agent" / "portal" / "cli.py"
-    )
-    text = cli_path.read_text(encoding="utf-8")
-    for required in (
-        "in_progress",
-        "unhandled_error",
-        "auth_failed",
-        "api_error_abandoned",
-        "provider_error",
-        "refresh_broken",
-    ):
-        assert f'"{required}"' in text, (
-            f"surfaced-health tuple missing {required!r}"
-        )
+# ── CLI surfaced-health ──────────────────────────────────────────
+#
+# The former ``test_cli_surfaced_health_tuple_includes_new_values`` grepped
+# cli.py for each health literal, because "running the CLI does heavy daemon
+# init". That rationale had expired: ``cmd_agent_list`` runs under three
+# monkeypatches. It also pinned the wrong thing — the *shape* of a
+# hand-maintained roster rather than the property that a non-ok health value
+# reaches the operator, so it went green on values nobody had added to the
+# roster. Replaced by the behavioural checks in
+# ``tests/test_no_progress_turn_guard.py`` (``..._is_visible_in_agent_list``,
+# ``test_every_non_ok_health_value_is_visible``), which drive the command and
+# read its output.

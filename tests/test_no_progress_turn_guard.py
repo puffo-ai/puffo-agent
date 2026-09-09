@@ -135,3 +135,64 @@ def test_in_progress_and_unknown_are_claimable():
         for _ in range(3):
             Worker._note_no_progress_turn(w, "agent-a")
         assert w.runtime.health == "no_progress", start
+
+
+# ── the operator-visible surface ───────────────────────────────────────────
+
+
+def _agent_list_output(monkeypatch, capsys, health):
+    """Run ``puffo-cli agent list`` against one stub agent and return its row."""
+    import argparse
+    import time
+
+    from puffo_agent.portal import cli
+
+    runtime = SimpleNamespace(
+        status="running",
+        updated_at=int(time.time()),
+        started_at=int(time.time()) - 60,
+        msg_count=3,
+        health=health,
+    )
+    monkeypatch.setattr(cli, "discover_agents", lambda: ["agent-a"])
+    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    monkeypatch.setattr(
+        cli.AgentConfig, "load", staticmethod(
+            lambda _aid: SimpleNamespace(display_name="Tester", state="enabled")
+        )
+    )
+    monkeypatch.setattr(
+        cli.RuntimeState, "load", staticmethod(lambda _aid: runtime)
+    )
+    cli.cmd_agent_list(argparse.Namespace())
+    return [
+        line for line in capsys.readouterr().out.splitlines()
+        if line.startswith("agent-a")
+    ][0]
+
+
+def test_no_progress_is_visible_in_agent_list(monkeypatch, capsys):
+    """The whole point of the guard is that an operator can see it. The one
+    surface they read first must not silently drop the new value."""
+    assert "[no_progress]" in _agent_list_output(monkeypatch, capsys, "no_progress")
+
+
+def test_every_non_ok_health_value_is_visible(monkeypatch, capsys):
+    """Stated over the declared enum rather than a copy of it: a value added
+    to ``RuntimeState.health`` later is shown by construction, instead of
+    being exempt until someone remembers this list."""
+    for health in (
+        "in_progress", "auth_failed", "api_error_abandoned", "provider_error",
+        "refresh_broken", "drained", "unhandled_error", "codex_thread_wedged",
+        "server_unreachable", "no_progress",
+    ):
+        row = _agent_list_output(monkeypatch, capsys, health)
+        assert f"[{health}]" in row, health
+
+
+def test_ok_and_unknown_stay_unannotated(monkeypatch, capsys):
+    """Only states that carry a call to action are annotated — otherwise the
+    marker stops meaning "needs attention"."""
+    for health in ("ok", "unknown", ""):
+        row = _agent_list_output(monkeypatch, capsys, health)
+        assert "[" not in row, health
