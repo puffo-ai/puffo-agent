@@ -1018,8 +1018,7 @@ def build_local_runtime_adapter(
     reporter can refine the operator-facing status; it observes only,
     failures never reach the runtime.
     """
-    if driver is None:
-        driver = build_driver(prepared.harness_name)
+    driver = build_driver(prepared.harness_name) if driver is None else driver
     if isinstance(driver, UnsupportedDriver):
         raise RuntimeError(driver.diagnostic)
     projector = RuntimeEventProjector(
