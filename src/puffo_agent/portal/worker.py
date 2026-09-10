@@ -818,13 +818,17 @@ class Worker:
         from ..agent._invite_strings import (
             format_anthropic_api_key_rejected,
             format_codex_oauth_expired,
+            format_generic_oauth_expired,
             format_oauth_expired,
         )
 
         display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
-        # Codex agents need the Codex recovery command, not the Claude
-        # one; otherwise the operator runs the wrong CLI and assumes
-        # the alert is broken. Harness is the cheapest signal we have.
+        # Each provider needs its own recovery command; running the wrong
+        # CLI's login leaves the agent broken and makes the alert look
+        # false. Harness is the cheapest signal we have. Anything we have
+        # not verified a command for gets the generic copy rather than
+        # inheriting Claude's — a Pi agent told to run `claude auth login`
+        # is worse than one told to re-authenticate Pi.
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
         if getattr(self, "_claude_api_key_mode", False):
@@ -833,8 +837,12 @@ class Worker:
             )
         elif harness == "codex":
             text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
-        else:
+        elif harness in ("", "claude-code"):
             text = format_oauth_expired(self.agent_cfg.id, display_name)
+        else:
+            text = format_generic_oauth_expired(
+                self.agent_cfg.id, display_name, harness
+            )
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:

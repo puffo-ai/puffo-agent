@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent._invite_strings import format_oauth_expired
@@ -517,17 +519,57 @@ def test_missing_runtime_falls_back_to_claude_copy():
     assert "Claude Code sign-in has expired" in captured["text"]
 
 
-def test_unknown_harness_falls_back_to_claude_copy():
-    """Forward-compat: a harness name we don't recognise yet (hermes,
-    gemini-cli, future provider) defaults to the Claude copy. Better
-    than silent no-DM until we add the specific copy."""
+def test_unknown_harness_gets_the_generic_copy_not_the_claude_one():
+    """A harness we have no verified re-login command for must not
+    inherit Claude's.
+
+    This replaces an earlier pin that defaulted every unknown harness to
+    the Claude copy on the grounds that it beat sending no DM at all.
+    That reasoning had only two options in view; the generic copy is a
+    third, and it is strictly better — the operator still gets a DM, and
+    it no longer tells a Pi or OpenCode operator to run `claude auth
+    login` for a CLI that may not be installed and would not fix this
+    agent even if it were.
+    """
     from puffo_agent.portal import worker as worker_module
 
     w, captured = _make_dispatch_stub("hermes")
     coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
     asyncio.new_event_loop().run_until_complete(coro)
 
-    assert "Claude Code sign-in has expired" in captured["text"]
+    assert "claude auth login" not in captured["text"]
+    assert "Claude Code sign-in" not in captured["text"]
+    # Still a real, actionable DM rather than silence.
+    assert "hermes sign-in was rejected" in captured["text"]
+    assert "send me a message" in captured["text"]
+
+
+@pytest.mark.parametrize("harness,label", [
+    ("pi", "Pi"),
+    ("opencode", "OpenCode"),
+])
+def test_pi_and_opencode_are_never_told_to_run_claude_login(harness, label):
+    """The case that made this necessary.
+
+    A QA Pi agent (running an openai-codex model) had its credential
+    rejected. Once classification was fixed it would have reached this
+    DM path and been handed Claude's recovery steps.
+    """
+    from puffo_agent.portal import worker as worker_module
+
+    w, captured = _make_dispatch_stub(harness)
+    coro = worker_module.Worker._notify_operator_of_auth_failed_oauth(w)
+    asyncio.new_event_loop().run_until_complete(coro)
+
+    text = captured["text"]
+    assert "claude auth login" not in text
+    assert "Claude Code" not in text
+    assert "codex login" not in text
+    assert f"{label} sign-in was rejected" in text
+    assert f"{label} 登录被拒绝" in text
+    # No invented command: `pi auth` has print-api-key / print-bearer-token
+    # / check and no `login`, so a plausible-looking one would be wrong.
+    assert "auth login" not in text
 
 
 # ── PUF-310: format_codex_oauth_expired bilingual copy ─────────────

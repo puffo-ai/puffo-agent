@@ -134,6 +134,57 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
     )
 
 
+_HARNESS_LABELS = {
+    "pi": "Pi",
+    "opencode": "OpenCode",
+    "gemini": "Gemini",
+}
+
+
+def format_generic_oauth_expired(
+    agent_id: str, agent_display_name: str = "", harness: str = "",
+) -> str:
+    """Operator DM for a harness with no verified re-login command.
+
+    Deliberately names the harness but *not* a command. The Claude copy
+    used to be the fallback for every non-Codex harness, which told Pi
+    and OpenCode operators to run `claude auth login` for a CLI they may
+    not even have installed. Guessing a replacement is the same mistake:
+    `pi auth` exposes `print-api-key` / `print-bearer-token` / `check`
+    and no `login` at all, so a plausible-looking `pi auth login` would
+    be just as wrong. Naming the harness and leaving the how to the
+    operator is the honest form until a command is verified per harness.
+    """
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    name = _HARNESS_LABELS.get(harness, harness) or "provider"
+    return (
+        f"⚠️ {label} — my {name} sign-in was rejected, so I can't answer "
+        "you until it's renewed.\n"
+        "\n"
+        "**On the computer where puffo-agent is running:**\n"
+        f"1. Re-authenticate {name} the same way you first signed it in.\n"
+        "2. Come back here and send me a message — I'll pick up where I "
+        "left off.\n"
+        "\n"
+        f"(No command is given because {name} has no single verified "
+        "re-login command; running the wrong CLI's login would not fix "
+        "this agent.)\n"
+        "\n"
+        f"⚠️ {label} — 我的 {name} 登录被拒绝，需要重新授权后才能"
+        "继续回复。\n"
+        "\n"
+        "**在运行 puffo-agent 的电脑上：**\n"
+        f"1. 用你当初登录 {name} 的方式重新授权。\n"
+        "2. 回到这里发一条消息即可恢复。\n"
+        "\n"
+        f"（这里不给具体命令：{name} 没有单一且已核实的重新登录命令，"
+        "跑错 CLI 的登录并不能修好这只 Agent。）"
+    )
+
+
 def format_anthropic_api_key_rejected(
     agent_id: str, agent_display_name: str = "",
 ) -> str:
