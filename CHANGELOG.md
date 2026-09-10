@@ -8,6 +8,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A turn that cannot make progress no longer re-runs at full speed.**
+  `_wake_remaining_pending` re-arms the runtime whenever rows stay pending, and
+  it did so at *zero* delay, so a turn that admits none of its announced batch
+  re-ran as fast as it could fail — roughly one turn a second, three gateway
+  calls each. That is the amplifier that turned one unreadable provider failure
+  into ~180 requests a minute against a capped LLM gateway (staging
+  2026-09-09), and it is independent of *why* the turn failed: any driver gap,
+  present or future, reaches it. The first re-arm after a no-progress turn stays
+  immediate, since a single deferral is legitimate; consecutive ones now back
+  off 5 → 300 s and reset on any turn that admits its batch. Real ingress still
+  cuts through, because the coalescer only ever lets a deadline move earlier.
+  (PUF-382)
 - **A gateway budget cap no longer turns into a retry storm.** LiteLLM's
   `Budget has been exceeded!` 429 was classified as a transient rate limit and
   retried — by the harness and by the `claude` CLI's own backoff loop — at up

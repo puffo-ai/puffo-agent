@@ -1334,7 +1334,15 @@ class GlobalInboxRuntime(
         if await self.store.get_notice_candidates(
             self.adapter.get_provider_session_id()
         ):
-            self.notify()
+            delay = self.next_no_progress_rearm_delay()
+            if delay <= 0.0:
+                self.notify()
+                return
+            # Backed-off self re-arm. Deliberately NOT self.notify(): that
+            # clears the degraded backoff and pins the delay to 0 whenever no
+            # turn is active, which is exactly the spin being bounded here.
+            # Real ingress still calls notify() and still cuts through.
+            self.coalescer.notify(delay_seconds=delay)
 
     async def _handle_process_failure(
         self, planned: PlannedTurn, process_started: float, exc: Exception
@@ -1432,6 +1440,9 @@ class GlobalInboxRuntime(
                     process_outcome = settled
                     if settled == "succeeded":
                         self._clear_budget_park_backoff()
+                        self._clear_no_progress_rearm_backoff()
+                    elif settled == "no_progress":
+                        self.note_no_progress_turn()
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)

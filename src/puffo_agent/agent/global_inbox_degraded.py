@@ -16,6 +16,16 @@ DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 BUDGET_PARK_BASE_SECONDS = 300.0
 BUDGET_PARK_MAX_SECONDS = 1800.0
 
+# no-progress re-arm: a turn that consumed none of its announced batch leaves
+# the rows pending, and ``_wake_remaining_pending`` re-arms at ZERO delay. One
+# such turn is a legitimate deferral, so the first re-arm stays immediate; a
+# repeat is a turn that cannot make progress, and re-running it at full speed
+# is how a single unreadable provider failure became ~180 gateway requests a
+# minute (PUF-382). An externally-triggered notify() still cuts through: the
+# coalescer only ever lets a deadline move EARLIER.
+NO_PROGRESS_REARM_BASE_SECONDS = 5.0
+NO_PROGRESS_REARM_MAX_SECONDS = 300.0
+
 
 class DegradedRecoveryMixin:
     """State owner for ``GlobalInboxRuntime``'s failure gates."""
@@ -30,6 +40,8 @@ class DegradedRecoveryMixin:
         # timed hold for a budget-cap park; None = wait for drained_check
         self._drained_park_until: float | None = None
         self._budget_park_attempts = 0
+        # consecutive turns that admitted none of their announced batch
+        self._no_progress_rearm_attempts = 0
 
     def _clear_degraded_backoff(self) -> None:
         self._degraded = False
@@ -91,6 +103,28 @@ class DegradedRecoveryMixin:
 
     def _clear_budget_park_backoff(self) -> None:
         self._budget_park_attempts = 0
+
+    def note_no_progress_turn(self) -> None:
+        """Count a turn that admitted none of its announced batch."""
+        self._no_progress_rearm_attempts += 1
+
+    def _clear_no_progress_rearm_backoff(self) -> None:
+        self._no_progress_rearm_attempts = 0
+
+    def next_no_progress_rearm_delay(self) -> float:
+        """Delay before re-arming after a no-progress turn (0 → 5 → 300 s).
+
+        Zero for the first, so a single deferral keeps today's immediate
+        follow-up; doubling after that, so a turn that cannot progress stops
+        spinning. Reset by any turn that admits its batch.
+        """
+        if self._no_progress_rearm_attempts <= 1:
+            return 0.0
+        return min(
+            NO_PROGRESS_REARM_BASE_SECONDS
+            * 2 ** (self._no_progress_rearm_attempts - 2),
+            NO_PROGRESS_REARM_MAX_SECONDS,
+        )
 
     def _drained_park_allows_processing(self) -> bool:
         if self._parked_drained:
