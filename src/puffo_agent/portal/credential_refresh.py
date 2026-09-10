@@ -56,6 +56,34 @@ from ..tasks import spawn
 logger = logging.getLogger(__name__)
 
 
+def _login_home() -> Path:
+    """The login account's real home, ignoring ``$HOME``.
+
+    ``KeychainBackend``'s canonical store is the system Keychain, whose
+    ACL is keyed on **UID + signing identity, not HOME**. Its host lock
+    and disk fallthrough must therefore be anchored the same way the
+    resource itself is keyed, or two daemons running as one user reach
+    the same Keychain entry through two different lock files and stop
+    excluding each other.
+
+    ``Path.home()`` follows ``$HOME``, and giving a second daemon its own
+    ``HOME`` is exactly how a staging instance is normally set up — so
+    the host lock lost its meaning precisely in the configuration it was
+    written for. Read the passwd record instead.
+
+    ``FileBackend`` deliberately keeps using ``$HOME``: there the
+    canonical store *is* ``~/.claude/.credentials.json``, so a distinct
+    ``HOME`` is a genuinely distinct credential that should not share a
+    lock.
+    """
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:  # noqa: BLE001 - non-POSIX or unreadable passwd
+        return Path.home()
+
+
 REFRESH_POLL_SECONDS = 120
 REFRESH_SAFETY_MARGIN_SECONDS = 10 * 60
 REFRESH_ONESHOT_TIMEOUT_SECONDS = 120
@@ -656,7 +684,7 @@ class KeychainBackend:
     def refresh_lock_path(self) -> Path:
         # Anchor outside PUFFO_AGENT_HOME so production and staging daemons
         # coordinate access to the same login Keychain credential.
-        return Path.home() / ".claude" / ".puffo-refresh.lock"
+        return _login_home() / ".claude" / ".puffo-refresh.lock"
 
     def expires_in_seconds(self) -> int | None:
         """Cache → Keychain → disk file. The disk fallthrough handles
@@ -691,7 +719,7 @@ class KeychainBackend:
                 return secs
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
-        disk_blob = _read_disk_credentials_blob(Path.home())
+        disk_blob = _read_disk_credentials_blob(_login_home())
         if disk_blob is not None:
             logger.warning(
                 "keychain-backend expires_in read: falling through to disk "
@@ -708,7 +736,7 @@ class KeychainBackend:
                 "nor disk file readable",
                 kr.error if not kr.ok else "unparseable-blob",
             )
-        secs = _disk_expires_in_seconds(Path.home())
+        secs = _disk_expires_in_seconds(_login_home())
         if secs is not None:
             logger.debug(
                 "keychain-backend expires_in read: source=disk secs=%d", secs,
@@ -717,7 +745,7 @@ class KeychainBackend:
 
     async def refresh(self) -> RefreshOutcome:
         from ..macos.keychain import read_keychain_blob
-        host_home = Path.home()
+        host_home = _login_home()
         kr_before = read_keychain_blob()
         before_blob = kr_before.blob if kr_before.ok else None
         disk_before = _read_disk_credentials_blob(host_home)
@@ -824,7 +852,7 @@ class KeychainBackend:
         the target already matches, so fan-out from concurrent
         ``ensure_fresh`` callers stays cheap."""
         cache_blob = self.cache.read()
-        blob = cache_blob or _read_disk_credentials_blob(Path.home())
+        blob = cache_blob or _read_disk_credentials_blob(_login_home())
         if not blob:
             return False
         if cache_blob is None:
@@ -892,7 +920,7 @@ class KeychainBackend:
         # Keychain bootstrap failed — fall through to disk file so the
         # daemon can still serve agents on hosts where Claude Code's
         # Keychain write silently fails (launchd session-context).
-        disk_blob = _read_disk_credentials_blob(Path.home())
+        disk_blob = _read_disk_credentials_blob(_login_home())
         if disk_blob is None:
             logger.warning(
                 "keychain-backend bootstrap: no Keychain (%s) and no "
@@ -920,7 +948,7 @@ class KeychainBackend:
         kr = read_keychain_blob()
         blob: Optional[str] = kr.blob if kr.ok and kr.blob else None
         if blob is None:
-            blob = _read_disk_credentials_blob(Path.home())
+            blob = _read_disk_credentials_blob(_login_home())
         if blob is None:
             logger.debug(
                 "keychain poll: neither Keychain (%s) nor disk file "
