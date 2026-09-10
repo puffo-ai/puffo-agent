@@ -6,6 +6,41 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.4] - 2026-09-09
+
+The first PyPI release since `2.0.3`; 103 commits. The `2.0.4a1` pre-release
+below went to TestPyPI only, so everything in it reaches PyPI users here for
+the first time. `Generic Monid paid-data tools`, announced in `2.0.4a1`, was
+reverted before this release (#322) and is **not** included.
+
+### Added
+
+- **OpenCode reasoning variants follow each model's native catalog.** The
+  daemon now publishes the exact selectable inference levels advertised by
+  `opencode models --verbose`, keeps models that expose no variants explicit,
+  and passes the selected level to `opencode run --variant`. Older OpenCode
+  versions fall back to their non-verbose model list. (#316)
+- **Live activity in the agent status line.** Heartbeats report what a turn is
+  actually doing — compacting, reading messages — instead of a flat "working",
+  including during the warm phase and across compaction failures. (#317)
+- **`extra_usage_required` health state.** A provider refusal that names extra
+  usage is now distinguished from a spent plan quota, so the operator is
+  pointed at spending settings rather than told to wait for a window that will
+  never reset. (#326)
+- **Cross-platform daemon autostart.** `puffo-agent autostart
+  enable|disable|status` installs per-user launchd, systemd, or Windows startup
+  registration. Machine linking enables it by default, with an explicit
+  opt-out, safe persisted environments, and actionable status or failure
+  reporting. (#309)
+- **Truthful Pi and OpenCode creation preflight.** The daemon reports native
+  harness readiness and live model catalogs, rejects unavailable providers or
+  exact models before provisioning identity state, and discovers standard
+  per-user OpenCode installations even under a narrow daemon `PATH`. Existing
+  ACP-over-OpenCode configurations continue to load unchanged. (#305)
+- **ACP driver-owned authority endpoint lifecycle.** The ACP driver owns its
+  authority server's lifetime and forwards the projected Puffo MCP server into
+  `session/new`. (#304)
+
 ### Fixed
 
 - **A rejected Pi credential is now an authentication failure.** Pi answers a
@@ -32,7 +67,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   their own provider, regardless of their own credential health, and marked
   them red with Claude's recovery steps. A refresher now speaks only for the
   harnesses it has a backend for. (#337, #338)
-
 - **A gateway budget cap no longer turns into a retry storm.** LiteLLM's
   `Budget has been exceeded!` 429 was classified as a transient rate limit and
   retried — by the harness and by the `claude` CLI's own backoff loop — at up
@@ -43,14 +77,48 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   will "reset", the host's usage snapshot no longer clears it, and agents
   routed through a gateway launch the CLI with `CLAUDE_CODE_MAX_RETRIES=2`.
   (PUF-382)
+- **A wedged MCP transport is detected and recycled.** The daemon probes the
+  MCP child's liveness with a generation-keyed beacon, recycles a silent
+  transport instead of leaving the agent mute, and retries a refresh reload
+  rather than dropping it. The generation is now minted for every harness
+  family, not only Claude Code. (#312, #333, #334)
+- **A cancelled turn no longer launders a no-progress streak into `ok`.** A
+  turn that wakes on an announced batch and consumes none of it is tracked as
+  a streak, and cancellation is not counted as recovery evidence. (#325)
+- **Pi assistant errors surface as turn failures** instead of completing
+  silently. (#324)
+- **Per-turn token usage and assistant text reach the UI for Pi, OpenCode and
+  ACP.** Usage is read from each harness's own terminal message shape, and
+  assistant text is delivered under the key the consumer actually reads.
+  (#329, #331, #332)
+- **The provider model catalog is advisory.** A catalog that omits a model no
+  longer blocks using it. (#320)
+- **Health state is unified across the runtime.** The health lanes were
+  consolidated so one red cannot silently clear another. (#328)
+- **Pi concurrent replies keep their admission identity across sub-turns.**
+  Stable native turn IDs now survive `agent_end` / `agent_start` boundaries so
+  competing held replies are not silently dropped. (#305)
+- **OpenCode tool activity reaches the UI.** Tool frames now project both
+  start and completion status, and unavailable selected models are reported
+  separately from missing provider authentication. (#305)
+- **Sleep/wake transport recovery.** A background daemon now heals an event
+  loop executor that died during macOS sleep before sending new traffic,
+  avoids replaying requests with ambiguous outcomes, and reports sustained
+  reconnect failure as `server_unreachable`. The tray also requests a
+  best-effort App Nap exemption. (#310)
+- **Remote creates report real startup readiness.** Docker availability is
+  checked before identity materialization, create commands wait for durable
+  runtime readiness, slow startup does not block unrelated machine commands,
+  and terminal acknowledgements survive reconnects. (#313)
+- **Large Codex sessions resume without replaying full history.** Codex resume
+  now declares the required experimental API capability and requests a
+  metadata-only response, preserving the native thread and provider-side
+  context without overflowing the Agent's stdout frame limit. (#314)
 
-### Added
+### Removed
 
-- **OpenCode reasoning variants follow each model's native catalog.** The
-  daemon now publishes the exact selectable inference levels advertised by
-  `opencode models --verbose`, keeps models that expose no variants explicit,
-  and passes the selected level to `opencode run --variant`. Older OpenCode
-  versions fall back to their non-verbose model list. (#316)
+- **Generic Monid paid-data tools** (#308) were reverted before release
+  (#322). The `2.0.4a1` notes below still list them; they are not in `2.0.4`.
 
 ## 2.0.4a1 - 2026-09-03
 
@@ -65,11 +133,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   exact models before provisioning identity state, and discovers standard
   per-user OpenCode installations even under a narrow daemon `PATH`. Existing
   ACP-over-OpenCode configurations continue to load unchanged. (#305)
-- **Generic Monid paid-data tools.** Native agents can prepare arbitrary
-  allowlisted provider capabilities for free, inspect their input schema and
-  quoted price, then execute a budget-gated spend without holding vendor keys
-  or funds. Results carry provenance, failures require honest fallback
-  labeling, and retry keys prevent accidental duplicate charges. (#308)
 - **Cross-platform daemon autostart.** `puffo-agent autostart
   enable|disable|status` installs per-user launchd, systemd, or Windows startup
   registration. Machine linking enables it by default, with an explicit
