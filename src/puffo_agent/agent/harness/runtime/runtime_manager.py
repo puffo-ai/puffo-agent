@@ -358,13 +358,14 @@ class RuntimeManager:
         self, logical: TurnRef, *, retire: bool
     ) -> None:
         # admission unknown -> retry must replay the durable payload
+        provider_turn_id = self.native_turn_id
         self._input_admitted = False
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._terminal.pop(logical, None)
         self._permission_refs.clear()
-        self._continuation_admissions.clear()
+        self._discard_pending_admissions("turn_abandoned", provider_turn_id)
         if not retire:
             return
         # Keep session: close prevents overlap; dead -> invalid_resume.
@@ -1040,11 +1041,46 @@ class RuntimeManager:
             future.set_result(event)
         if self._active_driver_turn_ref is not None:
             self._turn_refs.pop(self._active_driver_turn_ref, None)
+        provider_turn_id = self.native_turn_id
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._permission_refs.clear()
+        self._discard_pending_admissions("turn_completed", provider_turn_id)
+
+    def _discard_pending_admissions(
+        self, reason: str, provider_turn_id: str
+    ) -> None:
+        """Drop staged continuations at a turn boundary, audibly.
+
+        A continuation is retired here only when no tool result ever released
+        it.  On the ACP path that is the visible end of a lost post-commit
+        receipt: the argument-correlation fallback is unreachable (those facts
+        carry no ``arguments``), so nothing else can admit it, and the
+        mismatch warning below is never reached either.  Dropping silently
+        left the symptom -- a continuation that never fires -- with no trace
+        on the side that actually experiences it.
+
+        Deliberate cancellation (``register_continuation_callback(None)``)
+        clears the list directly and is NOT routed here: a signal that also
+        fires on the intended case stops being read.
+
+        ``provider_turn_id`` is passed in, not read off ``self``: every call
+        site resets ``native_turn_id`` as part of the same teardown, so
+        reading it here would have logged an empty field on every single
+        discard -- an attribution slot that looks populated and never is.
+        """
+        pending = len(self._continuation_admissions)
         self._continuation_admissions.clear()
+        if not pending:
+            return
+        logger.warning(
+            "puffo_admission_continuation_discarded "
+            "reason=%s count=%d provider_turn_id=%s",
+            reason,
+            pending,
+            provider_turn_id or "",
+        )
 
     def register_continuation(
         self,

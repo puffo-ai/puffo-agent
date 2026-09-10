@@ -210,12 +210,12 @@ def test_acceptance_oracle_checks_survive_python_optimization() -> None:
     code = """
 from scripts.verify_lingtai_driver_authority import _validate_oracle
 
-_validate_oracle(["audit-ok"], ["audit-ok"], None)
+_validate_oracle(["audit-ok"], ["prompt"])
 invalid = (
-    ([], [], None),
-    (["audit-a", "audit-b"], ["audit-a"], None),
-    (["audit-a"], ["audit-b"], None),
-    (["audit-a"], ["audit-a"], "audit-a"),
+    ([], []),
+    (["audit-a", "audit-b"], ["prompt"]),
+    (["audit-a"], ["prompt", "prompt"]),
+    (["audit-a"], []),
 )
 for case in invalid:
     try:
@@ -223,6 +223,15 @@ for case in invalid:
     except SystemExit:
         continue
     raise RuntimeError(f"optimized oracle accepted invalid case: {case!r}")
+
+# Pin the COVERAGE LOSS rather than deleting the cases that no longer fail.
+# LingTai stopped propagating the per-call audit id, so the oracle can no
+# longer tell an adjudication from the call it supposedly authorized, and the
+# post-call leak check is gone.  Both of these once raised; asserting that
+# they now pass keeps the loss visible, and turns any future restoration of
+# identity checking into a red test rather than a silent divergence from the
+# coverage note in the script's docstring.
+_validate_oracle(["audit-a"], ["a-prompt-from-some-other-adjudication"])
 """
     completed = subprocess.run(
         [sys.executable, "-O", "-c", code],
