@@ -8,7 +8,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from ._auth_markers import looks_like_provider_auth_error
-from ._usage_markers import looks_like_usage_limit
+from ._usage_markers import looks_like_usage_limit, looks_like_budget_cap
 from .errors import AgentAPIError, ProviderFailureError
 
 
@@ -37,6 +37,15 @@ PROVIDER_FAILURES: Mapping[str, ProviderFailure] = MappingProxyType(
         "not_entitled": ProviderFailure(
             "This provider account is not entitled to use the selected model.",
             runtime_event_code="permission_denied",
+        ),
+        # A gateway spend cap (LiteLLM Team/key budget). Distinct from a plan
+        # window: no reset time exists and the host usage snapshot cannot clear
+        # it. The message deliberately repeats the gateway's own wording so the
+        # text-keyed paths (`looks_like_budget_cap`) agree with the code.
+        "budget_exceeded": ProviderFailure(
+            "Budget has been exceeded at the LLM gateway — the account's "
+            "spending cap is exhausted; top up or raise the cap.",
+            runtime_event_code="provider_unavailable",
         ),
         "plan_drained": ProviderFailure(
             "The provider plan's usage quota is spent; wait for the "
@@ -181,6 +190,8 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
         and "add more at claude.ai/settings/usage" in normalized
     ):
         return "extra_usage_required"
+    if looks_like_budget_cap(normalized):
+        return "budget_exceeded"
     if looks_like_usage_limit(normalized):
         return "plan_drained"
     if (

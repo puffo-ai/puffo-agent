@@ -77,6 +77,19 @@ reverted before this release (#322) and is **not** included.
   their own provider, regardless of their own credential health, and marked
   them red with Claude's recovery steps. A refresher now speaks only for the
   harnesses it has a backend for. (#337, #338)
+- **Claude Code 2.1.x API-error frames were read as successful turns.** The
+  CLI now spells the synthetic-error flag `is_api_error_message` (was
+  `isApiErrorMessage`) and reports the failure as a `subtype: success` result
+  with `is_error: true`, the provider text in `result` and the status in
+  `api_error_status`. The driver recognised neither, so a gateway budget
+  rejection settled as a clean turn with no output; the runtime's no-progress
+  check then re-ran the wake immediately — ~3 gateway requests per second per
+  agent until the guard cancelled it — and the drain handling from the entry
+  below never saw the text. The driver now accepts both spellings and treats
+  an `is_error` result as the provider failure it is. A gateway spend cap is
+  its own failure code, `budget_exceeded`, so the timed hold, the operator DM
+  and crash-resume all follow the code rather than the message text. Tests
+  replay the real frames captured from claude-code@2.1.224. (PUF-382)
 - **A gateway budget cap no longer turns into a retry storm.** LiteLLM's
   `Budget has been exceeded!` 429 was classified as a transient rate limit and
   retried — by the harness and by the `claude` CLI's own backoff loop — at up

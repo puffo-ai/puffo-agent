@@ -1348,7 +1348,10 @@ class GlobalInboxRuntime(
             )
         terminal_error = operator_failure_text(exc)
         if process_outcome in {"drained", "extra_usage_required"}:
-            if process_outcome == "drained" and looks_like_budget_cap(terminal_error):
+            if process_outcome == "drained" and (
+                getattr(exc, "error_code", "") == "budget_exceeded"
+                or looks_like_budget_cap(terminal_error)
+            ):
                 hold = self.next_budget_park_hold()
                 self._park_drained(
                     hold_seconds=hold,

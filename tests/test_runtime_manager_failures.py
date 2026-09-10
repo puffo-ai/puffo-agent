@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 from types import SimpleNamespace
 
+import json
+from pathlib import Path
 import pytest
 
 from puffo_agent.agent.errors import AgentAPIError, ProviderFailureError
@@ -1821,3 +1823,104 @@ async def test_silent_autonomous_turn_has_a_runtime_supervisor(monkeypatch, tmp_
         assert manager.driver.close_calls == 1
     finally:
         await manager.close()
+
+
+# ── Claude Code 2.1.x wire shapes (captured from claude-code@2.1.224) ──
+# The fixture is the CLI's actual stream-json output against a stub gateway
+# answering LiteLLM's budget 429: two `api_retry` system frames, a synthetic
+# assistant frame with SNAKE_CASE `is_api_error_message`, and a result frame
+# that is `subtype: success` + `is_error: true` with the text in `result`.
+
+_CLI_2_1_224_BUDGET_429 = Path(__file__).parent / "fixtures" / "claude_cli_2_1_224_budget_429.jsonl"
+
+
+def _cli_frames(status: int = 429) -> list[dict]:
+    frames = [json.loads(line) for line in _CLI_2_1_224_BUDGET_429.read_text().splitlines() if line.strip()]
+    if status != 429:
+        for f in frames:
+            if f.get("type") == "result":
+                f["api_error_status"] = status
+                f["result"] = str(f["result"]).replace("(429)", f"({status})")
+            if f.get("type") == "assistant":
+                for block in f["message"]["content"]:
+                    block["text"] = block["text"].replace("(429)", f"({status})")
+    return frames
+
+
+def _replay_driver() -> ClaudeCodeCliDriver:
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    driver._active = TurnRef("turn-1")
+    driver._active_native_turn_id = "native-turn"
+    if hasattr(driver, "_message_lifecycle_v1"):
+        driver._message_lifecycle_v1 = False
+    return driver
+
+
+def _drain(driver: ClaudeCodeCliDriver) -> list:
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    return events
+
+
+@pytest.mark.parametrize("status", [429, 402, 403])
+@pytest.mark.asyncio
+async def test_claude_2_1_budget_cap_is_a_failed_turn_with_the_budget_code(status):
+    """Replay of the real CLI frames. Before this the snake_case error flag and
+    the `subtype: success` result were both unrecognised, so a capped gateway
+    produced a *succeeded* turn with no output — which the runtime re-ran at
+    once, ~3 gateway requests per second, until the no-progress guard fired
+    (staging, 2026-09-09: 354 rejected requests from one agent in two minutes)."""
+    driver = _replay_driver()
+    for frame in _cli_frames(status):
+        await driver._handle(frame)
+    completed = [e for e in _drain(driver) if e.type == HarnessEventType.TURN_COMPLETED]
+    assert len(completed) == 1, [getattr(e.type, "value", e.type) for e in _drain(driver)]
+    data = completed[0].data
+    assert data["outcome"] == "failed"
+    assert data["error_code"] == "budget_exceeded"
+    assert driver._active == TurnRef("")
+
+
+@pytest.mark.asyncio
+async def test_claude_2_1_snake_case_api_error_frame_is_recognised():
+    """The assistant-shaped frame alone (before any result) must already be
+    remembered as a provider error, exactly as the camelCase shape is."""
+    driver = _replay_driver()
+    assistant = next(f for f in _cli_frames() if f["type"] == "assistant")
+    assert assistant.get("is_api_error_message") is True
+    assert "isApiErrorMessage" not in assistant
+    await driver._handle(assistant)
+    assert driver._active_provider_error == {"error_code": "budget_exceeded"}
+    assert driver._active == TurnRef("turn-1")
+
+
+@pytest.mark.asyncio
+async def test_claude_2_1_success_result_without_is_error_is_still_a_success():
+    """The new result-frame path must key on `is_error`, not on the presence
+    of `result` text — an ordinary completed turn is unchanged."""
+    driver = _replay_driver()
+    await driver._handle({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "hello", "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+    completed = [e for e in _drain(driver) if e.type == HarnessEventType.TURN_COMPLETED]
+    assert completed and completed[0].data["outcome"] == "succeeded"
+    assert "error_code" not in completed[0].data
+
+
+@pytest.mark.asyncio
+async def test_claude_2_1_result_frame_alone_carries_the_failure():
+    """A `subtype: success` + `is_error` result with no preceding synthetic
+    assistant frame (a future CLI may drop it) must still end the turn as a
+    classified failure, not a success with no output."""
+    driver = _replay_driver()
+    result = next(f for f in _cli_frames() if f["type"] == "result")
+    assert result["subtype"] == "success" and result["is_error"] is True
+    await driver._handle(result)
+    completed = [e for e in _drain(driver) if e.type == HarnessEventType.TURN_COMPLETED]
+    assert len(completed) == 1
+    assert completed[0].data["outcome"] == "failed"
+    assert completed[0].data["error_code"] == "budget_exceeded"
