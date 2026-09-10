@@ -355,6 +355,10 @@ async def _rollback_lingtai(launch: LingtaiLaunch) -> None:
         try:
             await asyncio.shield(cleanup)
         except asyncio.CancelledError:
+            # Finish bounded cleanup and let the caller re-raise its original
+            # failure, even if that failure was not a cancellation. Later
+            # cancellations do not replace it; reconsider this policy before
+            # using this helper under structured cancellation (e.g. TaskGroup).
             continue
         except Exception:
             break
