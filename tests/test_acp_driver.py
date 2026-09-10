@@ -42,6 +42,13 @@ from puffo_agent.agent.harness.driver import (
     TurnInput,
 )
 from puffo_agent.agent.harness.support.subprocess_io import ProcessTreeShutdownError
+from puffo_agent.agent.harness.runtime.docker_runtime import (
+    _sanitise_permission_mode as _docker_sanitise_permission_mode,
+)
+from puffo_agent.agent.harness.runtime.local_runtime import (
+    VALID_PERMISSION_MODES,
+    _sanitise_permission_mode as _local_sanitise_permission_mode,
+)
 
 
 class _FakeProcess:
@@ -914,3 +921,46 @@ async def test_bypass_permissions_will_not_allow_with_a_reject_only_option_set()
     assert response.outcome.outcome == "cancelled"
     harness.conn.prompt_result.set_result(PromptResponse(stop_reason="cancelled"))
     await driver.close()
+
+
+def test_widening_permission_modes_needs_an_operator_answer_path():
+    """Tripwire: nothing in production can currently ask a human.
+
+    Both runtimes coerce every configured ``permission_mode`` to
+    ``bypassPermissions``, and every RuntimeSpec is built from that sanitised
+    value — so the waiting branch of ``_request_permission`` is reachable only
+    from tests. The docstring above
+    (``test_bypass_permissions_answers_without_a_human``) states that as prose;
+    this binds it.
+
+    Widening this set is a one-line change that silently activates the wait.
+    Before doing so, confirm something presents ``turn.permission_requested``
+    to an operator and calls ``runtime.resolve_permission``. Puffo sets no
+    timeout of its own, so without that path every tool call runs out the ACP
+    peer's timeout and is then DENIED.
+    """
+
+    assert VALID_PERMISSION_MODES == frozenset({"bypassPermissions"}), (
+        "permission_mode gained a reachable value, so the ask-a-human branch "
+        "is now live. Verify an operator-facing answer path exists "
+        "(turn.permission_requested -> runtime.resolve_permission) before "
+        "shipping this, or every tool call becomes a timeout-then-deny."
+    )
+
+
+def test_both_runtimes_agree_on_which_permission_modes_exist():
+    """The docker sanitiser hardcodes its own set instead of importing one.
+
+    Two copies of the same guard drift silently: widening the local constant
+    would leave docker still coercing, so the same agent config would ask a
+    human on one runtime and not the other. Compare behaviour, not the
+    literals, so this keeps working if either side is refactored.
+    """
+
+    probes = ["bypassPermissions", "ask", "acceptEdits", "plan", "", "default"]
+    local = {mode: _local_sanitise_permission_mode(mode, "agent") for mode in probes}
+    docker = {mode: _docker_sanitise_permission_mode(mode, "agent") for mode in probes}
+    assert local == docker, (
+        "local_runtime and docker_runtime disagree about permission modes; "
+        "they hold separate copies of the same allow-list."
+    )
