@@ -333,6 +333,36 @@ def test_pi_turn_events_do_not_become_puffo_turn_boundaries():
         }
 
 
+def test_message_end_reads_usage_from_the_message_object():
+    """Captured 0.8x ``message_end`` frames carry usage only on the message.
+
+    Reading the frame top level alone left the turn's usage empty, so every
+    Pi turn reported input/output as 0/0 downstream.
+    """
+    events = normalize_pi_event(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input": 1050,
+                    "output": 5,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "reasoning": 24,
+                    "totalTokens": 1055,
+                },
+            },
+        },
+        session_ref=SessionRef("s"),
+        turn_ref=TurnRef("t"),
+    )
+    usage = {e.type: e for e in events}[HarnessEventType.CONTEXT_UPDATED].data
+    assert usage["input_tokens"] == 1050
+    assert usage["output_tokens"] == 5
+    assert usage["reasoning_tokens"] == 24
+
+
 def test_queue_update_reports_counts_not_queued_message_text():
     events = normalize_pi_event(
         {
@@ -455,6 +485,54 @@ async def test_extension_vetoed_resume_is_a_failure_not_a_success():
     with pytest.raises(Exception) as excinfo:
         await task
     assert getattr(excinfo.value, "error_code", "") == "invalid_resume"
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_usage_accumulates_across_assistant_responses():
+    """Pi reports usage once per assistant response; a Puffo turn holds many.
+
+    Overwriting on each response would report only the final tool-loop leg's
+    tokens at turn end. Context size is a running snapshot, not a sum.
+    """
+    proc = FakePiProcess()
+    driver, _ = await _open(proc)
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await proc.answer_next()
+    await started
+
+    def usage(inp, out, reasoning, total):
+        return {
+            "input": inp,
+            "output": out,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "reasoning": reasoning,
+            "totalTokens": total,
+        }
+
+    for frame in (
+        {"type": "agent_start"},
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": usage(100, 10, 4, 1000)},
+        },
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": usage(250, 30, 6, 1400)},
+        },
+        {"type": "agent_end", "willRetry": False},
+        {"type": "agent_settled"},
+    ):
+        proc.push(frame)
+
+    events = await _drain_events(driver, 7)
+    terminal = events[-1]
+    assert terminal.type == HarnessEventType.TURN_COMPLETED
+    assert terminal.data["input_tokens"] == 350
+    assert terminal.data["output_tokens"] == 40
+    assert terminal.data["reasoning_tokens"] == 10
+    assert terminal.data["context_tokens"] == 1400
     await driver.close()
 
 
@@ -802,7 +880,7 @@ async def test_unicode_separator_inside_a_string_does_not_split_a_frame():
     proc.push_raw(payload.encode() + b"\n")
     events = await _drain_events(driver, 1)
     assert events[0].type == HarnessEventType.ASSISTANT_DELTA
-    assert events[0].data["delta"] == "before after"
+    assert events[0].data["text"] == "before after"
     await driver.close()
 
 

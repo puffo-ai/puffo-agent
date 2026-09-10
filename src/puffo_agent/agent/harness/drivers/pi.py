@@ -559,7 +559,7 @@ class PiDriver(Driver):
             native_turn_id=self._active.value,
         ):
             if event.type == HarnessEventType.CONTEXT_UPDATED:
-                self._turn_usage = dict(event.data)
+                self._absorb_turn_usage(event.data)
             if event.type == HarnessEventType.RUNTIME_WARNING:
                 code = event.data.get("code")
                 if code == "assistant_error":
@@ -685,6 +685,19 @@ class PiDriver(Driver):
                 native_payload=native_payload,
             )
         )
+
+    def _absorb_turn_usage(self, usage: dict[str, Any]) -> None:
+        """Pi reports usage once per assistant response, and one Puffo turn
+        holds several response/tool cycles. Token counts accumulate across
+        responses; ``context_tokens`` is a running context size, so only the
+        newest snapshot stands."""
+        merged = dict(self._turn_usage)
+        for key, value in usage.items():
+            if key == "context_tokens":
+                merged[key] = value
+            else:
+                merged[key] = merged.get(key, 0) + value
+        self._turn_usage = merged
 
     def _reset_turn(self) -> None:
         self._turn_outcome = "succeeded"

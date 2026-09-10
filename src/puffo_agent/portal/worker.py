@@ -52,6 +52,8 @@ from .state import (
     agent_home_dir,
     claude_cli_api_key,
     docker_shared_dir as docker_shared_dir,
+    clear_runtime_health_listener,
+    set_runtime_health_listener,
 )
 from ..tasks import spawn
 
@@ -159,6 +161,32 @@ def _refresh_flag_is_pending(flag: Path) -> bool:
 # before the agent stops being reported healthy. One such turn is a normal
 # deferral; a run of them means the provider is not reaching the Inbox at all.
 _NO_PROGRESS_TURN_THRESHOLD = 3
+
+# Health values the MCP transport probe may replace with ``mcp_unreachable``.
+# "ok"/"unknown" mean nothing is known to be wrong. The other two are the
+# states a wedged transport actually produces, and both are *symptoms* this
+# probe can name the cause of:
+#   in_progress  — a turn was admitted and never settled;
+#   no_progress  — turns keep waking and consuming none of their batch,
+#                  whose remediation text points at provider credentials.
+# Excluding them meant the diagnosis was skipped in exactly the states a real
+# MCP failure leaves behind. Every more specific red (auth_failed,
+# provider_error, refresh_broken, drained, ...) stays authoritative: the probe
+# knows the transport is down, not that it is the only thing wrong.
+# Returned by ``_mcp_probe_subject`` when the probe covers this harness but
+# there is no open runtime at this instant. Distinct from ``None`` (not
+# covered at all): coverage is a standing property and retracts a stale red,
+# readiness is momentary and must not reset the strike count — a probe that
+# lands mid-reload would otherwise zero the strikes on every recycle and the
+# escalation to ``mcp_unreachable`` could never be reached.
+_MCP_PROBE_NOT_READY = object()
+
+_MCP_PROBE_OVERWRITABLE_HEALTH = (
+    "ok",
+    "unknown",
+    "in_progress",
+    "no_progress",
+)
 
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
@@ -404,6 +432,86 @@ class Worker:
         self.runtime.save(agent_id)
         self._warm_done.set()
 
+    def _withdraw_unsubstantiated_wedge(self, agent_id: str) -> None:
+        """Retract a red this probe can no longer stand behind.
+
+        This probe is the only writer of ``mcp_unreachable``, and the
+        batch-top override deliberately refuses to overwrite it (its evidence
+        is independent of any turn). So nothing else in the daemon can ever
+        clear it: an agent the probe has stopped applying to would stay red
+        for the life of the process. Upgrading past the release that flagged
+        idle per-turn harnesses has to release them, not freeze them.
+
+        Retracted to ``unknown`` rather than ``ok``: the claim is being
+        withdrawn for want of evidence, which is not the same as observing a
+        healthy transport.
+        """
+        self._mcp_probe_strikes = 0
+        if self.runtime.health != "mcp_unreachable":
+            return
+        self.runtime.health = "unknown"
+        self.runtime.error = ""
+        self.runtime.save(agent_id)
+        logger.info(
+            "agent %s: withdrew an MCP wedge this probe no longer covers",
+            agent_id,
+        )
+
+    def _mcp_probe_subject(self, agent_id: str):
+        """The runtime this probe can speak about.
+
+        Three outcomes, and the difference between the last two is what keeps
+        a recycle from looping forever:
+
+        - a ``(adapter, mgr, spec_gen, opened_at)`` tuple — probe it;
+        - ``_MCP_PROBE_NOT_READY`` — the probe covers this harness but there
+          is no open runtime *right now* (starting, torn down, or mid-reload).
+          Momentary: say nothing, keep the strike count, keep any red;
+        - ``None`` — the probe does not cover this agent at all. A standing
+          property, so a red it can no longer substantiate is withdrawn.
+
+        Not covered means either no puffo MCP to hello back (empty
+        generation), or a non-persistent harness lifecycle: a
+        ``PER_TURN_CHILD`` driver takes ``open`` as a logical session and
+        spawns on ``start_turn`` (see ``RuntimeLifecycle``), so between turns
+        nothing exists to hello with — and this probe stands down *during*
+        turns, so for such a driver it would run exclusively when its premise
+        is false. Every idle opencode agent went ``mcp_unreachable`` within a
+        minute of start, with no fault injected.
+
+        ``mgr.opened`` is the open fact, not ``current_capabilities()``:
+        every shipped driver returns a capability object unconditionally
+        (constants on pi/codex, a constructor-time value on acp, a freshly
+        built one on claude), so capabilities are non-None even when the open
+        failed. ``last_open_monotonic`` is no better — it is stamped *before*
+        ``driver.open`` is awaited. Only ``opened`` is set after a successful
+        open and cleared by every close/reload path.
+
+        Attribute access on the contract fields is direct on purpose:
+        producer/consumer drift must raise here rather than silently disable
+        recovery. Only value-level absence is legitimate and returns quietly.
+        """
+        from ..agent.harness.driver import RuntimeLifecycle
+        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+
+        adapter = self._adapter
+        mgr = get_runtime_manager(agent_id)
+        if adapter is None or mgr is None:
+            return _MCP_PROBE_NOT_READY
+        capabilities = mgr.current_capabilities()
+        if capabilities is not None and (
+            capabilities.lifecycle != RuntimeLifecycle.PERSISTENT_CHILD
+        ):
+            return None
+        if not mgr.spec.mcp_generation:
+            return None
+        if capabilities is None or mgr.opened is None:
+            return _MCP_PROBE_NOT_READY
+        opened_at = mgr.last_open_monotonic
+        if opened_at is None:
+            return _MCP_PROBE_NOT_READY
+        return adapter, mgr, mgr.spec.mcp_generation, opened_at
+
     async def probe_mcp_transport(self, agent_id: str) -> None:
         """Heartbeat-cadence transport probe: the current runtime's puffo
         MCP subprocess must have reached the loopback RPC service
@@ -416,23 +524,21 @@ class Worker:
         runtime's health); a second miss flips ``mcp_unreachable`` so
         the wedge is visible instead of an agent that wakes turns but
         can never read them (8/30-class incident: alive worker, dead
-        MCP, health ok for 51 min)."""
-        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+        MCP, health ok for 51 min).
+
+        Covers persistent-child harnesses only. A per-turn harness holds no
+        subprocess between turns, so it has nothing to hello with at exactly
+        the moments this probe runs; naming its wedge needs an in-turn
+        signal that does not exist yet."""
         from . import rpc_service
 
-        adapter = self._adapter
-        mgr = get_runtime_manager(agent_id)
-        if adapter is None or mgr is None:
+        subject = self._mcp_probe_subject(agent_id)
+        if subject is _MCP_PROBE_NOT_READY:
             return
-        # Direct attribute access on purpose: these are required contract
-        # fields, and producer/consumer drift must raise here instead of
-        # silently disabling recovery. Only value-level absence is
-        # legitimate (no puffo_core → empty generation; never opened →
-        # None) and returns quietly.
-        spec_gen = mgr.spec.mcp_generation
-        opened_at = mgr.last_open_monotonic
-        if not spec_gen or opened_at is None:
+        if subject is None:
+            self._withdraw_unsubstantiated_wedge(agent_id)
             return
+        adapter, mgr, spec_gen, opened_at = subject
         now = time.monotonic()
         # Query exactly this spec's generation: hello state is keyed per
         # (agent, generation), so a surviving pre-recycle subprocess's
@@ -483,7 +589,7 @@ class Worker:
                 agent_id, adapter, mgr, cause=cause, spec_gen=spec_gen,
             )
             return
-        if self.runtime.health in ("ok", "unknown"):
+        if self.runtime.health in _MCP_PROBE_OVERWRITABLE_HEALTH:
             self.runtime.health = "mcp_unreachable"
             self.runtime.error = (
                 "puffo MCP subprocess never reached the daemon RPC "
@@ -712,13 +818,17 @@ class Worker:
         from ..agent._invite_strings import (
             format_anthropic_api_key_rejected,
             format_codex_oauth_expired,
+            format_generic_oauth_expired,
             format_oauth_expired,
         )
 
         display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
-        # Codex agents need the Codex recovery command, not the Claude
-        # one; otherwise the operator runs the wrong CLI and assumes
-        # the alert is broken. Harness is the cheapest signal we have.
+        # Each provider needs its own recovery command; running the wrong
+        # CLI's login leaves the agent broken and makes the alert look
+        # false. Harness is the cheapest signal we have. Anything we have
+        # not verified a command for gets the generic copy rather than
+        # inheriting Claude's — a Pi agent told to run `claude auth login`
+        # is worse than one told to re-authenticate Pi.
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
         if getattr(self, "_claude_api_key_mode", False):
@@ -727,8 +837,12 @@ class Worker:
             )
         elif harness == "codex":
             text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
-        else:
+        elif harness in ("", "claude-code"):
             text = format_oauth_expired(self.agent_cfg.id, display_name)
+        else:
+            text = format_generic_oauth_expired(
+                self.agent_cfg.id, display_name, harness
+            )
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:
@@ -1482,12 +1596,30 @@ class Worker:
                 register_connected = getattr(client, "add_connected_callback", None)
                 if callable(register_connected):
                     register_connected(processing_reports.on_transport_connected)
+        agent_id = self.agent_cfg.id
+
+        # health only travels on heartbeats; without this a red written just
+        # after a turn settles waits out the interval before the server hears
+        # it. The periodic tick remains the fallback.
+        #
+        # One stable callable, bound and released together, so the module
+        # global is scoped to a running loop instead of outliving a stopped
+        # worker — and so neither shutdown path has to remember separately.
+        def _wake_heartbeat() -> None:
+            reporter.request_immediate_heartbeat()
+
         reporter = StatusReporter(
             client.http,
             runtime_health_provider=lambda: self.runtime.health,
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
             processing_reports=processing_reports,
+            on_loop_start=lambda: set_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
+            on_loop_stop=lambda: clear_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
         )
         if bridge is not None:
             bridge.add_connected_callback(reporter.report_current_status)

@@ -197,7 +197,12 @@ def _normalize_pi_lifecycle(
         events: list[HarnessEvent] = [
             event(HarnessEventType.ASSISTANT_COMPLETED, {"block_id": ""})
         ]
-        usage = _usage_data(frame.get("usage"))
+        # Pi puts per-turn usage on the message object, not the frame:
+        # a captured 0.8x ``message_end`` frame has only {message, type} at
+        # the top level. The frame-level read is kept first for older
+        # emitters that did report it there.
+        message_usage = message.get("usage") if isinstance(message, dict) else None
+        usage = _usage_data(frame.get("usage") or message_usage)
         if usage:
             events.append(event(HarnessEventType.CONTEXT_UPDATED, usage))
         return tuple(events)
@@ -364,7 +369,7 @@ def _normalize_message_update(
         return (
             event(
                 HarnessEventType.ASSISTANT_DELTA,
-                {"block_id": block_id, "delta": str(delta.get("delta") or "")},
+                {"block_id": block_id, "text": str(delta.get("delta") or "")},
             ),
         )
     if delta_type == "text_end":
@@ -461,6 +466,7 @@ def _usage_data(usage: Any) -> dict[str, int]:
         "output_tokens": _nonnegative_int(usage.get("output")),
         "cache_read_tokens": _nonnegative_int(usage.get("cacheRead")),
         "cache_write_tokens": _nonnegative_int(usage.get("cacheWrite")),
+        "reasoning_tokens": _nonnegative_int(usage.get("reasoning")),
         "context_tokens": _nonnegative_int(usage.get("totalTokens")),
     }
 

@@ -91,7 +91,7 @@ def normalize_opencode_frame(
         return (
             event(
                 HarnessEventType.ASSISTANT_DELTA,
-                {"block_id": block_id, "delta": text},
+                {"block_id": block_id, "text": text},
             ),
             event(HarnessEventType.ASSISTANT_COMPLETED, {"block_id": block_id}),
         )

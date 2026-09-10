@@ -240,7 +240,7 @@ async def test_prompt_admission_updates_and_response_form_one_terminal():
         event for event in events
         if event.type is HarnessEventType.ASSISTANT_DELTA
     )
-    assert delta.data == {"block_id": "message_1", "delta": "answer"}
+    assert delta.data == {"block_id": "message_1", "text": "answer"}
     tool = next(
         event for event in events
         if event.type is HarnessEventType.TOOL_COMPLETED
