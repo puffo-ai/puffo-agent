@@ -133,6 +133,12 @@ reverted before this release (#322) and is **not** included.
   exact models before provisioning identity state, and discovers standard
   per-user OpenCode installations even under a narrow daemon `PATH`. Existing
   ACP-over-OpenCode configurations continue to load unchanged. (#305)
+- **Generic Monid paid-data tools.** Native agents can prepare arbitrary
+  allowlisted provider capabilities for free, inspect their input schema and
+  quoted price, then execute a budget-gated spend without holding vendor keys
+  or funds. Results carry provenance, failures require honest fallback
+  labeling, and retry keys prevent accidental duplicate charges. (#308)
+  *Reverted by #322 and not present in `2.0.4`.*
 - **Cross-platform daemon autostart.** `puffo-agent autostart
   enable|disable|status` installs per-user launchd, systemd, or Windows startup
   registration. Machine linking enables it by default, with an explicit
