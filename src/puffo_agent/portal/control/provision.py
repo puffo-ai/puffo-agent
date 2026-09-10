@@ -13,6 +13,7 @@ from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.encoding import base64url_decode
 from ...crypto.primitives import ed25519_verify
 from ...mcp.config import supported_inference_levels
+from ...tasks import spawn
 from ..host_assets import _atomic_write_private, _ensure_private_directory
 from ..runtime_matrix import (
     RUNTIME_CLI_LOCAL,
@@ -33,7 +34,7 @@ from ..state import (
     is_valid_agent_id,
 )
 from .certs import CertError, verify_device_cert, verify_identity_cert, verify_slug_binding
-from .lingtai import parse_lingtai_launch, provision_lingtai, revoke_lingtai
+from .lingtai import LingtaiLaunch, parse_lingtai_launch, provision_lingtai, revoke_lingtai
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +345,25 @@ def write_agent_from_context(context: dict) -> dict:
     return {"agent_id": agent_id, "agent_dir": str(target)}
 
 
+async def _rollback_lingtai(launch: LingtaiLaunch) -> None:
+    # Own and join the cleanup task: shielding alone would leave it detached
+    # when the request receives another cancellation during daemon shutdown.
+    cleanup = spawn(
+        asyncio.wait_for(revoke_lingtai(launch), timeout=30), name="lingtai.rollback",
+    )
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    try:
+        cleanup.result()
+    except (Exception, asyncio.CancelledError):
+        logger.warning("LingTai rollback failed for runtime %s", launch.runtime_id)
+
+
 async def provision_agent_from_bundle(
     payload: dict,
     operator_root_key_b64: str,
@@ -366,10 +386,7 @@ async def provision_agent_from_bundle(
         result = write_agent_from_context(context)
     except BaseException:
         if launch is not None:
-            try:
-                await revoke_lingtai(launch)
-            except Exception:
-                logger.warning("LingTai rollback failed for runtime %s", launch.runtime_id)
+            await _rollback_lingtai(launch)
         raise
     result.update(
         device_id=context["device_id"],

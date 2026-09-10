@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import sys
 
 import pytest
 
@@ -505,3 +507,98 @@ async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path
         await provision_agent_from_bundle(payload, operator, materialize=materialize)
     assert materialized == []
     assert not (tmp_path / "daemon/agents/helper-1234/agent.yml").exists()
+
+
+@pytest.fixture
+def lingtai_creation(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "init.json").write_text("{}")
+    payload, operator = _payload()
+    payload["runtime"] = {
+        "kind": "cli-local", "harness": "acp", "provider": "openai",
+        "lingtai": {"executable": sys.executable, "agent_dir": str(source), "workspace": str(source)},
+    }
+    associations = set()
+
+    async def register(launch):
+        associations.add((launch.runtime_id, launch.registry))
+
+    async def revoke(launch):
+        associations.remove((launch.runtime_id, launch.registry))
+
+    monkeypatch.setattr(provision, "provision_lingtai", register)
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+    return payload, operator, associations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["materialize", "write"])
+async def test_lingtai_creation_failure_revokes_association(lingtai_creation, monkeypatch, stage):
+    """Either post-registration failure must revoke the same registry entry."""
+    payload, operator, associations = lingtai_creation
+    original = RuntimeError("creation failed")
+
+    async def materialize(context):
+        assert associations
+        if stage == "materialize":
+            raise original
+
+    def write(context):
+        raise original
+
+    monkeypatch.setattr(provision, "write_agent_from_context", write)
+    with pytest.raises(RuntimeError) as caught:
+        await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    assert caught.value is original
+    assert not associations
+
+
+@pytest.mark.asyncio
+async def test_lingtai_rollback_failure_preserves_original_error(lingtai_creation, monkeypatch, caplog):
+    """Cleanup failure must be logged without replacing the creation error."""
+    payload, operator, _ = lingtai_creation
+    original = RuntimeError("materialize failed")
+
+    async def materialize(context):
+        raise original
+
+    async def revoke(launch):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+    with pytest.raises(RuntimeError) as caught:
+        await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    assert caught.value is original
+    assert "LingTai rollback failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lingtai_repeated_cancellation_finishes_rollback(lingtai_creation, monkeypatch):
+    """A second shutdown cancellation must not interrupt revoke or replace the first."""
+    payload, operator, associations = lingtai_creation
+    materializing = asyncio.Event()
+    revoking = asyncio.Event()
+    release = asyncio.Event()
+
+    async def materialize(context):
+        materializing.set()
+        await asyncio.Event().wait()
+
+    async def revoke(launch):
+        revoking.set()
+        await release.wait()
+        associations.remove((launch.runtime_id, launch.registry))
+
+    monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+    task = asyncio.create_task(provision_agent_from_bundle(payload, operator, materialize=materialize))
+    await asyncio.wait_for(materializing.wait(), 2)
+    task.cancel("first cancellation")
+    await asyncio.wait_for(revoking.wait(), 2)
+    task.cancel("second cancellation")
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert not associations
+    assert caught.value.args == ("first cancellation",)
