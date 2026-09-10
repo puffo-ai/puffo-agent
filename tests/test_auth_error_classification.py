@@ -272,7 +272,11 @@ def test_the_prose_tier_is_not_widened_by_this_fix():
 
     assert looks_like_provider_auth_error(PI_REJECTED_CREDENTIAL) is True
     assert looks_like_auth_error(PI_REJECTED_CREDENTIAL) is False
-    # Prose that merely mentions signing in stays clean on both tiers.
+    # Prose that merely mentions signing in stays clean on the *prose*
+    # tier.  It does match the diagnostic tier — "signing in again" is a
+    # marker there now — which is exactly why the split matters:
+    # `looks_like_provider_auth_error` is only ever handed provider
+    # diagnostics, never agent output.
     assert looks_like_auth_error(
         "I can walk you through how signing in again works"
     ) is False

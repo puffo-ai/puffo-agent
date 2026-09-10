@@ -41,9 +41,9 @@ _PROVIDER_DIAGNOSTIC_AUTH_MARKERS: tuple[str, ...] = (
     # "Could not parse your authentication token. Please try signing in
     # again."  Pi flattens the provider error to `error.message` before we
     # see it (no code, no HTTP status), so this text is the only signal
-    # this hop gets.  Both markers below name authentication or signing in
-    # explicitly, so a generic tokenizer failure ("unexpected token in
-    # JSON") stays a plain provider error.
+    # this hop gets.  All three markers below name authentication or
+    # signing in explicitly, so a generic tokenizer failure ("unexpected
+    # token in JSON") stays a plain provider error.
     "authentication token",
     "sign in again",
     "signing in again",
