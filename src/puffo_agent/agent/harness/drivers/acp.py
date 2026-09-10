@@ -267,9 +267,8 @@ class AcpDriver(Driver):
             self._closed = False
             self._events = asyncio.Queue()
         launch = self._validate_launch_plan(spec)
-        # Captured per run, not per request: launch configuration, not a
-        # remembered decision. Nothing derived from it outlives a single
-        # request, so the peer's turn-scoped permission contract holds.
+        # Run configuration, not a remembered decision: derived permission
+        # decisions last one request, preserving the peer's turn scope.
         self._permission_mode = spec.permission_mode
         self._proc = await self._spawn(launch)
         if self._proc.stdin is None or self._proc.stdout is None:
