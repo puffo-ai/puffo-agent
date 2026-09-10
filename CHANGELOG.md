@@ -8,6 +8,31 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A rejected Pi credential is now an authentication failure.** Pi answers a
+  rejected credential with `Could not parse your authentication token. Please
+  try signing in again.`, which matched none of the auth markers, so the turn
+  landed on `provider_error`: no operator DM, no re-login direction in the UI,
+  and a backoff retry against a fault retrying cannot fix. Pi flattens the
+  provider error to a message string before it reaches the daemon, so the
+  classification is a text marker by necessity; the three added markers are
+  scoped to provider diagnostics and leave free-form agent output untouched.
+  (#336)
+- **Pi and OpenCode operators are no longer sent to Claude's login.** The
+  auth-failed DM picked the Codex copy for `harness == "codex"` and the Claude
+  copy for everything else, so a Pi agent running an openai-codex model told
+  its operator to run `claude auth login` — a CLI they may not have installed,
+  and one that would not fix the agent. Harnesses with no verified re-login
+  command now get a copy that names the harness and gives no command, because
+  `pi auth` has no `login` subcommand and a plausible-looking one would be
+  equally wrong. (#336)
+- **An unrelated Claude credential no longer blocks Pi and OpenCode turns.**
+  Every non-codex harness was routed to the Claude refresher, whose
+  `ensure_fresh` is the worker's pre-delivery gate. An expired, unrefreshable
+  host Claude token therefore stopped Pi and OpenCode turns from ever reaching
+  their own provider, regardless of their own credential health, and marked
+  them red with Claude's recovery steps. A refresher now speaks only for the
+  harnesses it has a backend for. (#337, #338)
+
 - **A gateway budget cap no longer turns into a retry storm.** LiteLLM's
   `Budget has been exceeded!` 429 was classified as a transient rate limit and
   retried — by the harness and by the `claude` CLI's own backoff loop — at up
