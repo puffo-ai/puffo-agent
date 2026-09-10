@@ -570,8 +570,11 @@ def build_capabilities() -> dict:
         # names (gemini, kimi, opencode …), so no single binary probe can
         # stand for it; admission is checked per-target at creation time.
         "acp": HarnessReadiness("degraded", "target_probe_required", "ready"),
+        # Presence advertises the directory-association creation contract.
+        # The operator supplies the executable, so check that target at create.
+        "lingtai": HarnessReadiness("degraded", "target_probe_required", "ready"),
     }
-    cli_tools = {name: r.legacy for name, r in readiness.items()}
+    cli_tools = {name: r.legacy for name, r in readiness.items() if name != "lingtai"}
     # Frozen wire quirks, kept byte-stable for old portal consumers:
     # opencode historically meant binary-present (credentials unknown), and
     # "acp" mirrored that opencode binary status. New consumers read

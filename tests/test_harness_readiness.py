@@ -87,6 +87,7 @@ def test_capabilities_report_truth_beside_frozen_legacy(monkeypatch):
         "pi": {"state": "unavailable", "reason": "need_login"},
         "opencode": {"state": "ready", "reason": ""},
         "acp": {"state": "degraded", "reason": "target_probe_required"},
+        "lingtai": {"state": "degraded", "reason": "target_probe_required"},
     }
 
 

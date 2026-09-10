@@ -437,3 +437,71 @@ def test_partial_write_is_cleaned_up(tmp_path, monkeypatch):
     with pytest.raises(KeyError):
         write_agent_from_context(context)
     assert not (tmp_path / "agents/helper-1234").exists()
+
+
+@pytest.mark.asyncio
+async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path, monkeypatch):
+    """Browser-selected folders must survive provision into the driver argv/cwd."""
+    import json
+    import sys
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
+    source = tmp_path / "existing-lingtai"
+    workspace = tmp_path / "existing-workspace"
+    source.mkdir()
+    workspace.mkdir()
+    (source / "init.json").write_text("{}")
+    marker = tmp_path / "cli-args.json"
+    executable = tmp_path / "lingtai-agent"
+    executable.write_text(
+        f"#!{sys.executable}\nimport json,sys\n"
+        f"open({str(marker)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
+    )
+    executable.chmod(0o700)
+    payload, operator = _payload()
+    payload["runtime"] = {
+        "kind": "cli-local", "harness": "acp", "provider": "openai",
+        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(workspace)},
+    }
+
+    async def materialize(context):
+        assert marker.exists(), "runtime must be provisioned before remote identity materializes"
+
+    await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    cfg = AgentConfig.load("helper-1234")
+    argv = cfg.runtime.harness_command
+    provision_args = json.loads(marker.read_text())
+    assert cfg.resolve_workspace_dir() == workspace
+    assert argv[:4] == [str(executable), "acp", "--profile", "puffo-v1"]
+    for field in ["--runtime-id", "--registry"]:
+        assert argv[argv.index(field) + 1] == provision_args[provision_args.index(field) + 1]
+    assert provision_args[provision_args.index("--agent-dir") + 1] == str(source)
+    assert (source / "init.json").read_text() == "{}"
+
+
+@pytest.mark.asyncio
+async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path, monkeypatch):
+    """An unusable LingTai runtime must not leave a running Puffo agent behind."""
+    import sys
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "init.json").write_text("{}")
+    executable = tmp_path / "lingtai-agent"
+    executable.write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
+    executable.chmod(0o700)
+    payload, operator = _payload()
+    payload["runtime"] = {
+        "kind": "cli-local", "harness": "acp", "provider": "openai",
+        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(source)},
+    }
+    materialized = []
+
+    async def materialize(context):
+        materialized.append(context)
+
+    with pytest.raises(ProvisionError, match="LingTai runtime provisioning failed"):
+        await provision_agent_from_bundle(payload, operator, materialize=materialize)
+    assert materialized == []
+    assert not (tmp_path / "daemon/agents/helper-1234/agent.yml").exists()
