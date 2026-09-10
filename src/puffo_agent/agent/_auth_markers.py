@@ -37,6 +37,16 @@ _PROVIDER_DIAGNOSTIC_AUTH_MARKERS: tuple[str, ...] = (
     "invalid credential",
     "token revoked",
     "authentication token is expired",
+    # Observed from Pi/openai-codex with a rejected credential:
+    # "Could not parse your authentication token. Please try signing in
+    # again."  Pi flattens the provider error to `error.message` before we
+    # see it (no code, no HTTP status), so this text is the only signal
+    # this hop gets.  Both markers below name authentication or signing in
+    # explicitly, so a generic tokenizer failure ("unexpected token in
+    # JSON") stays a plain provider error.
+    "authentication token",
+    "sign in again",
+    "signing in again",
 )
 
 

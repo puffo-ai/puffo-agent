@@ -164,3 +164,115 @@ def test_enter_auth_failed_survives_refresh_kick_raising():
     Worker._enter_auth_failed(w, "t-agent")   # no crash
     assert w.runtime.health == "auth_failed"
     assert w.dm_fired == [1]
+
+
+# ── provider diagnostics: Pi / openai-codex rejected credential ────
+#
+# Observed on a QA agent whose credential was deliberately invalidated
+# (2026-09-09).  Pi answered with this exact sentence and the daemon
+# classified it `provider_error`: the operator saw "The provider could
+# not complete the turn.", `_enter_auth_failed` never fired, so no
+# operator DM was sent and the UI gave no hint that a re-login was
+# needed.  The turn just requeued behind an exponential backoff.
+#
+# Pi builds this message with `createErrorMessage()`, which flattens the
+# provider error to `error.message` — no code, no HTTP status survives.
+# The text really is all this hop gets, so the fix has to live in the
+# marker list rather than in a structured field.
+
+PI_REJECTED_CREDENTIAL = (
+    "Could not parse your authentication token. Please try signing in again."
+)
+
+
+def test_pi_rejected_credential_text_is_classified_as_authentication():
+    from puffo_agent.agent.provider_failures import (
+        classify_provider_failure, provider_failure,
+    )
+
+    code = classify_provider_failure(
+        status=None, diagnostic=PI_REJECTED_CREDENTIAL
+    )
+    assert code == "authentication"
+    # The whole point of the classification: is_auth is what makes the
+    # worker flip auth_failed and DM the operator.
+    assert provider_failure(code).is_auth is True
+
+
+def test_pi_message_end_frame_reports_an_auth_failure_code():
+    """The real failing hop, not just the matcher underneath it.
+
+    This is the frame Pi actually emitted; classifying the string
+    correctly is worthless if this translation still reports
+    `provider_error`.
+    """
+    from puffo_agent.agent.harness.driver import SessionRef, TurnRef
+    from puffo_agent.agent.harness.drivers.pi_protocol import (
+        normalize_pi_event,
+    )
+
+    events = normalize_pi_event(
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "api": "openai-codex-responses",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+                "usage": {"input": 0, "output": 0},
+                "stopReason": "error",
+                "errorMessage": PI_REJECTED_CREDENTIAL,
+                "timestamp": 1789002329865,
+            },
+        },
+        session_ref=SessionRef("s"),
+        turn_ref=TurnRef("t"),
+    )
+    codes = [
+        e.data.get("failure_code") for e in events
+        if e.data.get("code") == "assistant_error"
+    ]
+    assert codes == ["authentication"]
+
+
+@pytest.mark.parametrize("diagnostic", [
+    # Ordinary parse failures must stay generic: an operator told to
+    # "sign in again" over a malformed JSON body would chase the wrong
+    # problem, and the agent would be parked in auth_failed for a fault
+    # that re-logging in cannot fix.
+    "Unexpected token < in JSON at position 0",
+    "Could not parse the response body",
+    "SyntaxError: Unexpected token } in JSON",
+    "Failed to parse token stream from provider",
+    # NOTE: "Tokenizer error: invalid token sequence in prompt" also belongs
+    # here, but it already classifies as `authentication` on unmodified main
+    # via the pre-existing "invalid token" marker.  That false positive
+    # predates this fix and narrowing that marker is a behaviour change
+    # outside this PR's scope, so it is reported separately rather than
+    # asserted here.
+])
+def test_ordinary_parse_failures_are_not_called_auth(diagnostic):
+    from puffo_agent.agent.provider_failures import classify_provider_failure
+
+    assert classify_provider_failure(
+        status=None, diagnostic=diagnostic
+    ) != "authentication"
+
+
+def test_the_prose_tier_is_not_widened_by_this_fix():
+    """`looks_like_auth_error` runs against free-form agent prose, where
+    a substring hit is far more likely to be someone *talking* about
+    signing in.  The new markers belong to the provider-diagnostic tier
+    only; this pins that split so a later edit cannot quietly move them.
+    """
+    from puffo_agent.agent._auth_markers import (
+        looks_like_auth_error, looks_like_provider_auth_error,
+    )
+
+    assert looks_like_provider_auth_error(PI_REJECTED_CREDENTIAL) is True
+    assert looks_like_auth_error(PI_REJECTED_CREDENTIAL) is False
+    # Prose that merely mentions signing in stays clean on both tiers.
+    assert looks_like_auth_error(
+        "I can walk you through how signing in again works"
+    ) is False
