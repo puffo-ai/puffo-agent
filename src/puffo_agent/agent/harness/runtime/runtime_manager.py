@@ -358,13 +358,14 @@ class RuntimeManager:
         self, logical: TurnRef, *, retire: bool
     ) -> None:
         # admission unknown -> retry must replay the durable payload
+        provider_turn_id = self.native_turn_id
         self._input_admitted = False
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._terminal.pop(logical, None)
         self._permission_refs.clear()
-        self._discard_pending_admissions("turn_abandoned")
+        self._discard_pending_admissions("turn_abandoned", provider_turn_id)
         if not retire:
             return
         # Keep session: close prevents overlap; dead -> invalid_resume.
@@ -1040,13 +1041,16 @@ class RuntimeManager:
             future.set_result(event)
         if self._active_driver_turn_ref is not None:
             self._turn_refs.pop(self._active_driver_turn_ref, None)
+        provider_turn_id = self.native_turn_id
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._permission_refs.clear()
-        self._discard_pending_admissions("turn_completed")
+        self._discard_pending_admissions("turn_completed", provider_turn_id)
 
-    def _discard_pending_admissions(self, reason: str) -> None:
+    def _discard_pending_admissions(
+        self, reason: str, provider_turn_id: str
+    ) -> None:
         """Drop staged continuations at a turn boundary, audibly.
 
         A continuation is retired here only when no tool result ever released
@@ -1060,6 +1064,11 @@ class RuntimeManager:
         Deliberate cancellation (``register_continuation_callback(None)``)
         clears the list directly and is NOT routed here: a signal that also
         fires on the intended case stops being read.
+
+        ``provider_turn_id`` is passed in, not read off ``self``: every call
+        site resets ``native_turn_id`` as part of the same teardown, so
+        reading it here would have logged an empty field on every single
+        discard -- an attribution slot that looks populated and never is.
         """
         pending = len(self._continuation_admissions)
         self._continuation_admissions.clear()
@@ -1070,7 +1079,7 @@ class RuntimeManager:
             "reason=%s count=%d provider_turn_id=%s",
             reason,
             pending,
-            self.native_turn_id or "",
+            provider_turn_id or "",
         )
 
     def register_continuation(
