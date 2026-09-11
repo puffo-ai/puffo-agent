@@ -704,6 +704,10 @@ class AgentConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     profile: str = "profile.md"  # path relative to agent dir, or absolute
     memory_dir: str = "memory"  # path relative to agent dir, or absolute
+    # Git remote holding this fleet's memory, one directory per agent name.
+    # Cloned ONCE, on a boot where the memory tree is still empty — see
+    # agent/memory_seed.py. Empty disables it; an agent with memory ignores it.
+    memory_remote: str = ""
     workspace_dir: str = "workspace"  # path relative to agent dir, or absolute
     # Per-agent .claude/ lives inside workspace_dir so Claude Code's
     # project-level convention (.claude/CLAUDE.md, .claude/skills/) is
@@ -768,6 +772,7 @@ class AgentConfig:
             runtime=runtime,
             profile=raw.get("profile", "profile.md"),
             memory_dir=raw.get("memory_dir", "memory"),
+            memory_remote=raw.get("memory_remote", ""),
             workspace_dir=raw.get("workspace_dir", "workspace"),
             triggers=TriggerRules(
                 on_mention=bool(triggers.get("on_mention", True)),
@@ -982,6 +987,7 @@ def _agent_config_save(self: AgentConfig) -> None:
             "runtime": asdict(self.runtime),
             "profile": self.profile,
             "memory_dir": self.memory_dir,
+            "memory_remote": self.memory_remote,
             "workspace_dir": self.workspace_dir,
             "triggers": asdict(self.triggers),
             "desired_skills": list(self.desired_skills),

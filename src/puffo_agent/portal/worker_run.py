@@ -22,6 +22,7 @@ from .workspace_layout import (
     prepare_workspace_shared_access,
 )
 from ..agent.errors import ProviderFailureError
+from ..agent.memory_seed import memory_seed_name, seed_from_remote
 from ..agent.processing_receipts import processing_run_id
 from ..agent._usage_markers import looks_like_budget_cap, parse_reset_epoch
 from ..tasks import spawn
@@ -238,6 +239,19 @@ class StandardWorkerRun:
         effective_harness = worker._runtime_info()["harness"]
         profile_path = str(agent_cfg.resolve_profile_path())
         memory_path = str(agent_cfg.resolve_memory_dir())
+        # A cloud agent is created with an identity but an empty brain. Seed its
+        # MEMORY from the fleet remote on the first boot that finds none — never
+        # after, so this can never overwrite something the agent wrote. The
+        # profile is not ours to seed: the agent store owns it and restores its
+        # copy on resume (see memory_seed's docstring).
+        if agent_cfg.memory_remote:
+            outcome = seed_from_remote(
+                memory_root=Path(memory_path),
+                remote=agent_cfg.memory_remote,
+                name=memory_seed_name(agent_id),
+            )
+            log = logger.info if not outcome.startswith("failed") else logger.warning
+            log("agent %s: memory seed -> %s", agent_id, outcome)
         workspace_path = str(agent_cfg.resolve_workspace_dir())
         claude_path = str(agent_cfg.resolve_claude_dir())
         shared_path = worker_module.docker_shared_dir()
