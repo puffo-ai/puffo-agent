@@ -75,6 +75,12 @@ from ...runtime_event_outbox import (
 from ...runtime_events import RuntimeEventProjector, TrustedScope
 from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from ..support.child_env import build_child_environment
+from ....portal.host_assets import _atomic_write_private
+from ....portal.state import subscription_token
+from ..support.subscription_credentials import (
+    AUTH_MODE_SUBSCRIPTION,
+    resolve_subscription_credentials,
+)
 from ..drivers.acp import selects_puffo_v0_profile
 from ..drivers.pi_bridge import (
     build_bridge_environment,
@@ -737,6 +743,15 @@ class LocalRuntimePreparer:
             )
         remove_legacy_permission_hook(self.claude_dir)
         runtime = self.agent_cfg.runtime
+        subscription = (
+            resolve_subscription_credentials(
+                runtime.harness,
+                agent_home=self.agent_home,
+                token=subscription_token(self.daemon_cfg, runtime.harness),
+            )
+            if runtime.auth_mode == AUTH_MODE_SUBSCRIPTION
+            else None
+        )
         llm_env = anthropic_base_url_env(runtime.llm_base_url)
         if llm_env and runtime.api_key:
             llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
@@ -753,6 +768,16 @@ class LocalRuntimePreparer:
         # now from an allowlist: ambient provider keys never reach the child,
         # an override cannot reintroduce one, and only llm_env injects the
         # controlled key.
+        extra_allowed: tuple[str, ...] = ()
+        if subscription is not None:
+            # Subscription supersedes the gateway env entirely: the CLI talks
+            # to the vendor directly, so a leftover ANTHROPIC_BASE_URL would
+            # silently win (it outranks the plan token in the CLI's own
+            # credential precedence) and bill the metered account.
+            llm_env = dict(subscription.env)
+            extra_allowed = subscription.extra_allowed
+            for path, content in subscription.files.items():
+                _atomic_write_private(path, content)
         environment = build_child_environment(
             overrides=self.agent_cfg.env_overrides,
             controlled={
@@ -760,6 +785,7 @@ class LocalRuntimePreparer:
                 "USERPROFILE": str(self.agent_home),
                 **llm_env,
             },
+            extra_allowed=extra_allowed,
         )
         if is_macos():
             environment["CLAUDE_CONFIG_DIR"] = str(
