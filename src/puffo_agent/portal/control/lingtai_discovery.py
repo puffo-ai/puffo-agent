@@ -22,16 +22,21 @@ def _absolute(value: object, field: str) -> Path:
     return Path(value).resolve(strict=True)
 
 
-def _known_paths(operator: str) -> tuple[list[Path], list[Path]]:
+def _known_paths(operator: str) -> tuple[list[Path], list[Path], list[str]]:
     executables: list[Path] = []
     roots = [Path.home() / ".lingtai"]
+    warnings: list[str] = []
     registry = _registry_entries()
     # Reuse only this operator's existing associations; do not expose another
     # paired operator's agent configuration through the automatic inventory.
     for agent_id in discover_agents():
         if not is_owner(agent_id, operator):
             continue
-        cfg = AgentConfig.load(agent_id)
+        try:
+            cfg = AgentConfig.load(agent_id, allow_invalid_runtime=True)
+        except (OSError, ValueError, RuntimeError):
+            warnings.append("invalid_candidate")
+            continue
         argv = cfg.runtime.harness_command
         if len(argv) < 4 or argv[1:4] != ["acp", "--profile", "puffo-v1"]:
             continue
@@ -45,7 +50,7 @@ def _known_paths(operator: str) -> tuple[list[Path], list[Path]]:
                 directory = Path(entry["agent_dir"])
                 if directory.is_absolute():
                     roots.append(directory)
-    return executables, roots
+    return executables, roots, warnings
 
 
 
@@ -82,7 +87,7 @@ def _executable_paths(known: list[Path]) -> list[str]:
                 result.append(path)
         except OSError:
             continue
-    return result[:8]
+    return result
 
 
 async def _query(executable: str, root: Path, registry: Path) -> list[dict]:
@@ -143,7 +148,14 @@ def _normalize(row: object, root: Path) -> dict:
 async def discover_lingtai(params: dict, *, operator: str | None) -> dict:
     if not operator:
         return {"ok": False, "error": "LingTai discovery requires a paired operator"}
-    known, default_roots = await asyncio.to_thread(_known_paths, operator)
+    try:
+        return await _discover(params, operator)
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+async def _discover(params: dict, operator: str) -> dict:
+    known, default_roots, warnings = await asyncio.to_thread(_known_paths, operator)
     executables = await asyncio.to_thread(_executable_paths, known)
     if params.get("executable"):
         explicit = _absolute(params["executable"], "executable")
@@ -157,10 +169,13 @@ async def discover_lingtai(params: dict, *, operator: str | None) -> dict:
     if params.get("root"):
         selected = _absolute(params["root"], "root")
         roots = [selected, selected / ".lingtai"]
-    roots = list(dict.fromkeys(path.resolve() for path in roots if path.is_dir()))[:_MAX_ROOTS]
+    roots = list(dict.fromkeys(path.resolve() for path in roots if path.is_dir()))
+    if len(roots) > _MAX_ROOTS or len(executables) > 8:
+        warnings.append("results_truncated")
+    roots, executables = roots[:_MAX_ROOTS], executables[:8]
     result = {
         "ok": True, "executables": executables, "executable": executable,
-        "roots": [str(root) for root in roots], "agents": [], "warnings": [],
+        "roots": [str(root) for root in roots], "agents": [], "warnings": warnings,
     }
     if not executable:
         return _bounded_result(result)
@@ -191,7 +206,7 @@ def _bounded_result(result: dict) -> dict:
     # budget so a large inventory is partial rather than replaced by a marker.
     result["warnings"] = list(dict.fromkeys(result["warnings"]))
     result["partial"] = bool(result["warnings"])
-    result["truncated"] = False
+    result["truncated"] = "results_truncated" in result["warnings"]
     for field in ("agents", "roots", "executables"):
         while len(json.dumps(result).encode()) > 12 * 1024 and result[field]:
             result[field].pop()

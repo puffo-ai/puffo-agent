@@ -28,7 +28,7 @@ async def test_discovery_cli_contract_and_hidden_root(tmp_path, monkeypatch):
         "print(json.dumps({'runtimes': rows}))\n"
     )
     executable.chmod(0o700)
-    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], []))
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
     monkeypatch.setattr(discovery, "_executable_paths", lambda known: [])
     result = await discovery.discover_lingtai(
         {"executable": str(executable), "root": str(root)}, operator="owner",
@@ -48,7 +48,8 @@ def test_default_inventory_uses_only_owned_associations(tmp_path, monkeypatch):
         "runtime-mine": {"agent_dir": str(owned)},
         "runtime-other": {"agent_dir": str(other)},
     })
-    def config(agent_id):
+    def config(agent_id, *, allow_invalid_runtime):
+        assert allow_invalid_runtime
         assert agent_id == "mine"
         return SimpleNamespace(
             runtime=SimpleNamespace(harness_command=[
@@ -56,7 +57,7 @@ def test_default_inventory_uses_only_owned_associations(tmp_path, monkeypatch):
             ]), resolve_workspace_dir=lambda: owned,
         )
     monkeypatch.setattr(discovery.AgentConfig, "load", config)
-    executables, roots = discovery._known_paths("operator")
+    executables, roots, warnings = discovery._known_paths("operator")
     assert str(executables[0]) == "/mine/lingtai-agent"
     assert owned in roots and owned / ".lingtai" in roots
     assert other not in roots
@@ -96,3 +97,45 @@ def test_inventory_fits_server_result_budget():
     assert result["agents"]
     assert "results_truncated" in result["warnings"]
     assert result["partial"] and result["truncated"]
+
+
+def test_invalid_owned_config_does_not_abort_inventory(monkeypatch):
+    monkeypatch.setattr(discovery, "discover_agents", lambda: ["broken", "unfinished"])
+    monkeypatch.setattr(discovery, "is_owner", lambda *args: True)
+    monkeypatch.setattr(discovery, "_registry_entries", lambda: {})
+    def config(agent_id, *, allow_invalid_runtime):
+        assert allow_invalid_runtime
+        if agent_id == "broken":
+            raise RuntimeError("malformed harness_command")
+        return SimpleNamespace(runtime=SimpleNamespace(harness_command=[]))
+    monkeypatch.setattr(discovery.AgentConfig, "load", config)
+    executables, roots, warnings = discovery._known_paths("owner")
+    assert executables == []
+    assert warnings == ["invalid_candidate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_count, executable_count", [(17, 1), (1, 9)])
+async def test_search_scope_limits_are_explicit(tmp_path, monkeypatch, root_count, executable_count):
+    roots = [tmp_path / str(i) for i in range(root_count)]
+    for root in roots:
+        root.mkdir()
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], roots, []))
+    monkeypatch.setattr(discovery, "_executable_paths", lambda known: [f"/bin/cli{i}" for i in range(executable_count)])
+    async def query(*args):
+        return []
+    monkeypatch.setattr(discovery, "_query", query)
+    result = await discovery.discover_lingtai({}, operator="owner")
+    assert result["ok"] and result["partial"] and result["truncated"]
+    assert result["warnings"] == ["results_truncated"]
+    assert len(result["roots"]) <= 16 and len(result["executables"]) <= 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root", ["relative", "/missing-lingtai-discovery-test-folder"])
+async def test_invalid_explicit_root_returns_actionable_error(monkeypatch, root):
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
+    monkeypatch.setattr(discovery, "_executable_paths", lambda known: [])
+    result = await discovery.discover_lingtai({"root": root}, operator="owner")
+    assert result["ok"] is False
+    assert result["error"]

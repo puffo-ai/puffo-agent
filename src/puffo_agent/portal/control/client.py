@@ -33,6 +33,7 @@ from ...tasks import spawn
 
 log = logging.getLogger("puffo_agent.control")
 
+BACKGROUND_OPS = frozenset({"create", "discover_lingtai"})
 RECONNECT_BACKOFF_SECONDS = 3.0
 ME_INTERVAL_SECONDS = 30.0
 # Codex's probe costs a real (tiny) turn — slow cadence; refresh_usage is on-demand.
@@ -814,7 +815,7 @@ class MachineControlClient:
             execution = self._execute_and_ack(
                 (
                     None
-                    if background_create and command_id and decrypted["op"] == "create"
+                    if background_create and command_id and decrypted["op"] in BACKGROUND_OPS
                     else ws
                 ),
                 command_id,
@@ -824,7 +825,7 @@ class MachineControlClient:
             )
             if command_id:
                 self._inflight_command_ids.add(str(command_id))
-            if background_create and command_id and decrypted["op"] in {"create", "discover_lingtai"}:
+            if background_create and command_id and decrypted["op"] in BACKGROUND_OPS:
                 # A first Docker image build can take minutes. Keep that wait
                 # out of the one machine-control receive loop so pause/resume,
                 # runtime decisions, and other operators remain responsive.
