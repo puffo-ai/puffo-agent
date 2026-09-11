@@ -60,6 +60,17 @@ def supported_inference_levels(harness: str) -> tuple[str, ...]:
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
+#: Opt-in gate for the monid paid-data tools. Default off, fail closed (exact
+#: "true"): a stock agent registers no spend tool; an operator enables it per
+#: deployment. The money gates (server billing flag + per-agent budget) apply
+#: regardless — this only controls whether the tools are advertised at all.
+MONID_TOOLS_ENABLED_ENV = "PUFFO_MONID_TOOLS_ENABLED"
+
+
+def monid_tools_enabled() -> bool:
+    """Whether the monid paid-data MCP tools should be registered (see the env above)."""
+    return os.environ.get(MONID_TOOLS_ENABLED_ENV, "") == "true"
+
 
 PUFFO_CORE_TOOL_NAMES = (
     "send_message",
@@ -90,6 +101,9 @@ PUFFO_CORE_TOOL_NAMES = (
     "add_dm_allowlist",
     "update_dm_blocklist",
     "refresh",
+    # Monid paid-data tools (registered by mcp.core_monid_tools, default-off gate).
+    "monid_prepare",
+    "monid_spend",
     # M3 memory tools (registered by mcp.memory_tools).
     "create_note",
     "patch_note",

@@ -352,6 +352,8 @@ def build_server(
         PuffoRpcClient(rpc_url, agent_id, local_service_token) if rpc_url else None
     )
 
+    from .config import monid_tools_enabled
+
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
         agent_id=agent_id,
@@ -363,6 +365,7 @@ def build_server(
         workspace=workspace,
         shared_workspace=shared_workspace or None,
         rpc_client=rpc_client,
+        monid_tools_enabled=monid_tools_enabled(),
     )
 
     # Lifespan closes adapter sessions while the loop is alive,

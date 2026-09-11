@@ -294,6 +294,10 @@ class PuffoCoreToolsConfig:
     bridge_client: Any = None
     # Live Inbox runtime for in-process tools. Subprocess tools use rpc_client.
     inbox_runtime: Any = None
+    # Default-off gate for the monid paid-data tools (PUFFO_MONID_TOOLS_ENABLED).
+    # Off leaves them unregistered so a stock agent advertises no spend tool; the
+    # server-side billing flag + per-agent budget are the money gates when it is on.
+    monid_tools_enabled: bool = False
 
     @property
     def keyless(self) -> bool:
@@ -709,11 +713,13 @@ def register_core_tools(
     from .core_identity_tools import register_identity_tools
     from .core_inbox_tools import register_inbox_tools
     from .core_message_tools import register_message_tools
+    from .core_monid_tools import register_monid_tools
     register_inbox_tools(mcp, cfg, result_surface=result_surface)
     register_identity_tools(mcp, cfg)
     register_message_tools(mcp, cfg, result_surface=result_surface)
     register_history_tools(mcp, cfg)
     register_host_tools(mcp, cfg)
+    register_monid_tools(mcp, cfg)
 
     if cfg.bridge_client is not None:
         from .lifecycle_tools import register_lifecycle_tools
