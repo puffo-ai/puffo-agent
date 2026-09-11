@@ -26,7 +26,7 @@ HEALTHY = {
     "profile_has_soul": True,
     "memory_files": 3,
     "log_errors": {},
-    "bridge_connected": True,
+    "conns_relay": 2,
     "bad_frame_count": 31,
 }
 
@@ -134,3 +134,69 @@ class TestUnknownIsNotPass:
 def test_every_check_explains_what_it_catches(check):
     """A red box that does not teach the failure mode is a worse tool."""
     assert check.catches and len(check.catches) > 15
+
+
+class TestTheChecksThatUsedToLieWhenFactsWereMissing:
+    """The module's own rule: "I could not look" must never read as "it is fine".
+    Two checks broke it by treating an UNKNOWN auth_mode as "not subscription"
+    — and an unread agent.yml is exactly the state where auth_mode went
+    silently absent for two whole builds."""
+
+    def test_unknown_mode_makes_the_key_check_unanswerable(self):
+        facts = {k: v for k, v in HEALTHY.items() if k != "auth_mode"}
+        assert by_name(evaluate(facts), "no virtual key").ok is None
+
+    def test_unknown_mode_makes_the_credential_check_unanswerable(self):
+        facts = {k: v for k, v in HEALTHY.items() if k != "auth_mode"}
+        assert by_name(evaluate(facts), "credential reaches the CLI").ok is None
+
+    def test_unknown_mode_makes_the_upstream_check_unanswerable(self):
+        facts = {k: v for k, v in HEALTHY.items() if k != "auth_mode"}
+        assert by_name(evaluate(facts), "talks to the right upstream").ok is None
+
+
+class TestTheBridgeCheckJudgesTheRelayNotAnySocket:
+    """Counting every ESTAB reported "connected" for an agent with a live LLM
+    connection and a dead bridge — the failure this check exists to catch."""
+
+    def test_llm_sockets_alone_do_not_count_as_a_live_bridge(self):
+        facts = {**HEALTHY, "conns_relay": 0, "conns_anthropic": 24}
+        r = by_name(evaluate(facts), "bridge connected")
+        assert r.ok is False
+        assert "no relay socket" in r.detail
+
+    def test_an_unresolvable_relay_is_undetermined_not_failed(self):
+        assert by_name(evaluate({**HEALTHY, "conns_relay": -1}), "bridge connected").ok is None
+
+
+def test_an_unresolvable_upstream_is_undetermined_not_a_verdict():
+    """-1 is the probe saying the host would not resolve, not "zero sockets"."""
+    facts = {**HEALTHY, "conns_anthropic": -1}
+    assert by_name(evaluate(facts), "talks to the right upstream").ok is None
+
+
+class TestAnIdleAgentIsNotAFailedAgent:
+    """A live `--verify` run failed a healthy agent that had simply been
+    resumed and not yet spoken: it held no upstream socket at all, and the
+    check read "no anthropic traffic" as "wrong upstream". Absence of traffic
+    is absence of evidence — this check can only convict traffic it can see."""
+
+    def test_no_sockets_at_all_is_undetermined_on_a_subscription(self):
+        facts = {**HEALTHY, "conns_anthropic": 0, "conns_gateway": 0}
+        r = by_name(evaluate(facts), "talks to the right upstream")
+        assert r.ok is None
+        assert "idle" in r.detail
+
+    def test_no_sockets_at_all_is_undetermined_on_the_gateway(self):
+        facts = {**HEALTHY, "auth_mode": "api-gateway", "expected_auth_mode": "api-gateway",
+                 "api_key": "<present>", "child_has_base_url": True, "child_has_api_key": True,
+                 "child_has_token": False, "conns_anthropic": 0, "conns_gateway": 0}
+        assert by_name(evaluate(facts), "talks to the right upstream").ok is None
+
+    def test_a_subscription_agent_reaching_the_gateway_still_fails(self):
+        """The verdict this check exists for survives the idle carve-out."""
+        facts = {**HEALTHY, "conns_anthropic": 24, "conns_gateway": 3}
+        assert by_name(evaluate(facts), "talks to the right upstream").ok is False
+
+    def test_traffic_to_anthropic_alone_still_passes(self):
+        assert by_name(evaluate(HEALTHY), "talks to the right upstream").ok is True

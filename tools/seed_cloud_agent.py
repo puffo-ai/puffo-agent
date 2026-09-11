@@ -196,8 +196,10 @@ _PROBE = r"""
 A=$(ls -d /home/user/.puffo-agent/agents/*/ 2>/dev/null | head -1)
 [ -z "$A" ] && { echo "no-agent-dir"; exit 0; }
 echo "slug=$(basename $A)"
-echo "auth_mode=$(awk -F': *' '/^ *auth_mode:/{v=$2; gsub(/[\"'\'' ]/,"",v); print v; exit}' $A/agent.yml 2>/dev/null)"
-echo "api_key=$(awk -F': *' '/^ *api_key:/{v=$2; gsub(/[\"'\'' ]/,"",v); print v; exit}' $A/agent.yml 2>/dev/null)"
+echo "auth_mode=$(awk -F': *' '/^ *auth_mode:/{v=$2; gsub(/["'"'"' ]/,"",v); print v; exit}' $A/agent.yml 2>/dev/null)"
+# Presence, never the value: this travels back over the command channel, and a
+# debug print of the collected facts would otherwise dump a live gateway key.
+echo "api_key_present=$(awk '/^ *api_key:/{v=$0; sub(/.*: */,"",v); gsub(/["'"'"' ]/,"",v); print (v==""?0:1); exit}' $A/agent.yml 2>/dev/null)"
 echo "profile_bytes=$(wc -c < $A/profile.md 2>/dev/null || echo 0)"
 echo "profile_has_soul=$(grep -ciE '^#{1,6} +(soul|description|about|summary) *$' $A/profile.md 2>/dev/null || echo 0)"
 echo "memory_files=$(find $A/memory -type f -not -path '*/.git/*' 2>/dev/null | wc -l | tr -d ' ')"
@@ -207,15 +209,24 @@ if [ -n "$C" ]; then
     tr '\0' '\n' < /proc/$C/environ 2>/dev/null | grep -q "^$V=" && echo "child_$V=1" || echo "child_$V=0"
   done
 else echo "child_absent=1"; fi
-echo "conns_anthropic=$(ss -tn 2>/dev/null | grep -c '160.79.104')"
-G=$(getent hosts litellm-staging.puffo.ai 2>/dev/null | awk '{print $1}' | head -1)
-echo "conns_gateway=$([ -n "$G" ] && ss -tn 2>/dev/null | grep -c "$G" || echo 0)"
+# Resolve each host and count sockets against ITS addresses. A hardcoded IPv4
+# prefix reported zero for a healthy agent: api.anthropic.com answers on IPv6.
+count_conns() {
+  ips=$(getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u)
+  if [ -z "$ips" ]; then echo -1; else ss -tn 2>/dev/null | grep -cFf <(echo "$ips"); fi
+}
+echo "conns_anthropic=$(count_conns api.anthropic.com)"
+echo "conns_gateway=$(count_conns litellm-staging.puffo.ai)"
+# The relay specifically — counting every ESTAB socket reported "connected" for
+# an agent with a live LLM connection and a dead bridge, which is the exact
+# failure this is here to catch.
+RELAY=$(sed -n 's|.*server_url:.*//\([^/"'"'"' ]*\).*|\1|p' $A/agent.yml 2>/dev/null | head -1)
+echo "conns_relay=$([ -n "$RELAY" ] && count_conns "$RELAY" || echo -1)"
 for E in 'credential view-sync incomplete' 'CLI exited' 'provider_error'; do
-  N=$(grep -hc "$E" /home/user/.aim/logs/*.log 2>/dev/null | paste -sd+ - | sed 's/+/ /g' | awk '{s=0;for(i=1;i<=NF;i++)s+=$i;print s}')
+  N=$(grep -hc "$E" /home/user/.aim/logs/*.log 2>/dev/null | awk '{s+=$1} END{print s+0}')
   [ "${N:-0}" -gt 0 ] && echo "log_error=$E|$N"
 done
-echo "bad_frame_count=$(grep -hc BAD_FRAME /home/user/.aim/logs/*.log 2>/dev/null | paste -sd+ - | sed 's/+/ /g' | awk '{s=0;for(i=1;i<=NF;i++)s+=$i;print s}')"
-echo "bridge_connected=$(ss -tn 2>/dev/null | grep -cE 'ESTAB' )"
+echo "bad_frame_count=$(grep -hc BAD_FRAME /home/user/.aim/logs/*.log 2>/dev/null | awk '{s+=$1} END{print s+0}')"
 """
 
 
@@ -241,7 +252,8 @@ def collect(sandbox, *, expected_template="", expected_auth_mode="") -> dict:
         if k == "log_error":
             name, _, n = v.partition("|")
             errors[name] = int(n or 0)
-        elif k in ("profile_bytes", "memory_files", "conns_anthropic", "conns_gateway", "bad_frame_count"):
+        elif k in ("profile_bytes", "memory_files", "conns_anthropic", "conns_gateway",
+                   "conns_relay", "bad_frame_count"):
             facts[k] = int(v or 0)
         elif k == "profile_has_soul":
             facts[k] = int(v or 0) > 0
@@ -251,9 +263,10 @@ def collect(sandbox, *, expected_template="", expected_auth_mode="") -> dict:
             facts["child_has_base_url"] = v == "1"
         elif k.startswith("child_ANTHROPIC_API_KEY"):
             facts["child_has_api_key"] = v == "1"
-        elif k == "bridge_connected":
-            facts[k] = int(v or 0) > 0
-        elif k in ("auth_mode", "api_key", "slug"):
+        elif k == "api_key_present":
+            # Presence only — the value never leaves the sandbox.
+            facts["api_key"] = "<present>" if v == "1" else ""
+        elif k in ("auth_mode", "slug"):
             facts[k] = v.strip()
     facts["log_errors"] = errors
     return {k: v for k, v in facts.items() if v is not UNSET}

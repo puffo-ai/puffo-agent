@@ -73,7 +73,13 @@ def _auth_mode_matches(f):
 
 
 def _no_virtual_key(f):
-    if _fact(f, "auth_mode") != "subscription":
+    mode = _fact(f, "auth_mode")
+    if mode is UNKNOWN:
+        # The mode decides what a key *means* here, so not knowing it makes this
+        # unanswerable. Reporting ok would be worst-case wrong: an unread
+        # agent.yml is exactly the state where auth_mode was silently absent.
+        return None, "agent.yml not read — cannot judge whether a key is correct"
+    if mode != "subscription":
         return True, "not a subscription agent — a key is correct here"
     key = _fact(f, "api_key")
     if key is UNKNOWN:
@@ -86,6 +92,8 @@ def _credential_reaches_the_cli(f):
     tok, base, api = (_fact(f, k) for k in ("child_has_token", "child_has_base_url", "child_has_api_key"))
     if tok is UNKNOWN:
         return None, "child process env not read (agent may be idle)"
+    if mode is UNKNOWN:
+        return None, "agent.yml not read — cannot judge which credential is correct"
     if mode == "subscription":
         ok = tok and not base and not api
         return ok, f"token={bool(tok)} base_url={bool(base)} api_key={bool(api)}"
@@ -96,11 +104,21 @@ def _credential_reaches_the_cli(f):
 def _talks_to_the_right_upstream(f):
     mode = _fact(f, "auth_mode")
     anth, gw = _fact(f, "conns_anthropic"), _fact(f, "conns_gateway")
-    if anth is UNKNOWN:
-        return None, "no connection sample"
+    if anth is UNKNOWN or mode is UNKNOWN:
+        return None, "no connection sample" if anth is UNKNOWN else "agent.yml not read"
+    if anth < 0 or gw < 0:
+        # -1 is the probe saying a host would not resolve, not "zero sockets".
+        return None, "upstream host did not resolve in the sandbox"
+    where = f"anthropic={anth} gateway={gw}"
+    if anth == 0 and gw == 0:
+        # An agent between turns holds no upstream socket at all. That is the
+        # normal resting state, not evidence of anything -- reporting it as a
+        # failure made a freshly-resumed healthy agent look misconfigured.
+        # This check can only ever convict traffic it can see.
+        return None, where + " — no upstream sockets; agent idle, nothing to judge"
     if mode == "subscription":
-        return (anth > 0 and gw == 0), f"anthropic={anth} gateway={gw}"
-    return (gw > 0 or anth == 0), f"anthropic={anth} gateway={gw}"
+        return gw == 0, where
+    return gw > 0, where
 
 
 def _profile_is_not_a_stub(f):
@@ -128,12 +146,20 @@ def _no_startup_errors(f):
 
 
 def _bridge_connected(f):
-    v = _fact(f, "bridge_connected")
-    if v is UNKNOWN:
+    """Sockets to the RELAY specifically.
+
+    Counting every established connection reported "connected" for an agent
+    with a live LLM connection and a dead bridge — the exact shape of the
+    failure this check exists to catch.
+    """
+    n = _fact(f, "conns_relay")
+    if n is UNKNOWN:
         return None, "bridge state not determined"
+    if n < 0:
+        return None, "relay host not resolvable from agent.yml"
     noise = _fact(f, "bad_frame_count")
     extra = "" if noise in (UNKNOWN, 0) else f" ({noise}× BAD_FRAME — known list_invites noise)"
-    return bool(v), ("connected" if v else "not connected") + extra
+    return n > 0, (f"{n} socket(s) to the relay" if n else "no relay socket") + extra
 
 
 CHECKS: tuple[Check, ...] = (
