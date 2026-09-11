@@ -129,8 +129,8 @@ def _normalize(row: object, root: Path) -> dict:
     directory = _absolute(row.get("agent_dir"), "agent_dir")
     if not directory.is_relative_to(root) or not (directory / "init.json").is_file():
         raise ValueError("LingTai discovery returned an agent outside the search folder")
-    name, status = row.get("display_name"), row.get("status")
-    if not isinstance(name, str) or not isinstance(status, str):
+    status = row.get("status")
+    if not isinstance(status, str):
         raise ValueError("LingTai discovery returned an invalid agent state")
     workspace = row.get("workspace")
     if workspace is None:
@@ -142,7 +142,7 @@ def _normalize(row: object, root: Path) -> dict:
     if status == "available" and not workspace_path.is_dir():
         raise ValueError("LingTai discovery returned a missing working folder")
     return {
-        "display_name": name[:200], "agent_dir": str(directory),
+        "source_dir_name": directory.name, "agent_dir": str(directory),
         **asdict(read_source_profile(directory)),
         "description": None, "profile_source": "lingtai",
         "workspace": str(workspace_path), "status": status,

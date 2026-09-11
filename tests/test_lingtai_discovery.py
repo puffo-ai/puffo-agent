@@ -158,10 +158,11 @@ def test_candidate_metadata_never_substitutes_directory_label(tmp_path, document
     assert row["agent_name"] == expected
     assert row["profile_read_error"] == error
     assert row["profile_name_source"] == "init.json"
-    assert row["import_display_name"] == (None if error else expected or "Unnamed Agent")
+    assert row["import_display_name"] == (None if error else expected or "")
     assert row["description"] is None
     assert row["profile_source"] == "lingtai"
-    assert row["display_name"] == "CLI Label"
+    assert row["source_dir_name"] == "misleading-name"
+    assert "display_name" not in row
 
 
 @pytest.mark.parametrize("source, expected, error", [
@@ -182,7 +183,7 @@ def test_existing_agent_metadata_is_exclusive_even_when_unnamed(tmp_path, source
     assert row["agent_name"] == expected
     assert row["profile_read_error"] == error
     assert row["profile_name_source"] == ".agent.json"
-    assert row["import_display_name"] == (None if error else expected or "Unnamed Agent")
+    assert row["import_display_name"] == (None if error else expected or "")
 
 
 def test_agent_metadata_permission_error_is_not_absence(tmp_path, monkeypatch):

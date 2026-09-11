@@ -89,7 +89,6 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
         operator_root_key_b64,
     )
     core_fields = _verify_core(core, bound_slug, device_cert)
-    profile_fields = _verify_profile(payload, bound_slug)
     try:
         lingtai = parse_lingtai_launch(runtime_input.get("lingtai"))
     except (ValueError, OSError) as exc:
@@ -101,8 +100,11 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
             validate_import_profile(payload, lingtai.agent_dir)
         except ValueError as exc:
             raise ProvisionError(str(exc)) from exc
-        profile_fields = (payload["display_name"], *profile_fields[1:])
+        profile_fields = (payload["display_name"], str(payload.get("avatar_url") or "").strip(),
+                          "", "", payload["profile"])
         runtime_input = {**runtime_input, "harness_command": lingtai.argv()}
+    else:
+        profile_fields = _verify_profile(payload, bound_slug)
     runtime = _verify_runtime(runtime_input)
     desired_skills, desired_mcps = _verify_desired(payload)
     server_url, slug, device_id, space_id, operator_slug = core_fields

@@ -61,7 +61,7 @@ def read_source_profile(directory: Path) -> SourceProfile:
                 raise ValueError("agent_name is not a safe display name")
             if not name.strip():
                 name = None
-        return SourceProfile(name, source, None, name or "Unnamed Agent")
+        return SourceProfile(name, source, None, name or "")
     except FileNotFoundError:
         return SourceProfile(None, None, "source_unreadable", None)
     except (OSError, ValueError, RecursionError):
@@ -86,7 +86,8 @@ def validate_import_profile(payload: dict, directory: Path) -> None:
         raise ValueError("LingTai source name changed or does not match; refresh discovery")
     if any(payload.get(key) not in (None, "") for key in ("role", "role_short", "soul")):
         raise ValueError("LingTai owns its role and description; persona overrides are not allowed")
-    if payload.get("profile") != f"# {name}\n":
+    expected_profile = f"# {name}\n" if name else ""
+    if payload.get("profile") != expected_profile:
         raise ValueError("LingTai import requires the generated technical bridge profile")
 
 

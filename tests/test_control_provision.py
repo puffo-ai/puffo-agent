@@ -638,8 +638,8 @@ async def test_lingtai_source_drift_during_preflight_cannot_register(lingtai_cre
 
 
 @pytest.mark.parametrize("name", [None, ""])
-def test_unnamed_lingtai_import_uses_fixed_placeholder_not_init_name(lingtai_creation, name):
-    """Readable unnamed sources can import without exposing an operator rename bypass."""
+def test_unnamed_lingtai_import_preserves_empty_profile_without_name(lingtai_creation, name):
+    """Unnamed sources persist empty facts, with no invented name or slug fallback."""
     import json
     from pathlib import Path
 
@@ -647,8 +647,14 @@ def test_unnamed_lingtai_import_uses_fixed_placeholder_not_init_name(lingtai_cre
     source = Path(payload["runtime"]["lingtai"]["agent_dir"])
     (source / ".agent.json").write_text(json.dumps({"agent_name": name}))
     payload["runtime"]["lingtai"]["agent_name"] = None
-    payload.update(display_name="Unnamed Agent", profile="# Unnamed Agent\n")
-    assert verify_agent_bundle(payload, operator)["display_name"] == "Unnamed Agent"
+    payload.update(display_name="", profile="")
+    context = verify_agent_bundle(payload, operator)
+    assert context["display_name"] == ""
+    assert context["profile_text"] == ""
+    write_agent_from_context(context)
+    cfg = AgentConfig.load(context["agent_id"])
+    assert cfg.display_name == ""
+    assert cfg.resolve_profile_path().read_text() == ""
     payload.update(display_name="Helper", profile="# Helper\n")
     with pytest.raises(ProvisionError, match="source name changed"):
         verify_agent_bundle(payload, operator)
