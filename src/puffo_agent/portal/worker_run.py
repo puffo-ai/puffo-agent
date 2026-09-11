@@ -239,13 +239,14 @@ class StandardWorkerRun:
         effective_harness = worker._runtime_info()["harness"]
         profile_path = str(agent_cfg.resolve_profile_path())
         memory_path = str(agent_cfg.resolve_memory_dir())
-        # A cloud agent is created with an identity but an empty brain. Seed it
-        # from the fleet remote on the first boot that finds no memory — never
-        # after, so this can never overwrite something the agent wrote.
+        # A cloud agent is created with an identity but an empty brain. Seed its
+        # MEMORY from the fleet remote on the first boot that finds none — never
+        # after, so this can never overwrite something the agent wrote. The
+        # profile is not ours to seed: the agent store owns it and restores its
+        # copy on resume (see memory_seed's docstring).
         if agent_cfg.memory_remote:
             outcome = seed_from_remote(
                 memory_root=Path(memory_path),
-                profile_path=Path(profile_path),
                 remote=agent_cfg.memory_remote,
                 name=memory_seed_name(agent_id),
             )

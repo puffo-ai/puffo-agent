@@ -64,11 +64,8 @@ class TestSeeding:
         mem.mkdir(parents=True)
         prof.write_text("# Desk-cloud\n\n**Role:** agent\n\n# Soul\n\n")  # the Hub stub
 
-        assert seed_from_remote(
-            memory_root=mem, profile_path=prof, remote=remote, name="desk"
-        ) == "seeded"
+        assert seed_from_remote(memory_root=mem, remote=remote, name="desk") == "seeded"
         assert (mem / "notes" / "lesson.md").read_text() == "CRDO forward-EPS"
-        assert "front of house" in prof.read_text()
 
     def test_never_overwrites_an_agent_that_has_written(self, tmp_path):
         """The guard that makes this safe on every boot."""
@@ -81,35 +78,38 @@ class TestSeeding:
         prof.write_text("# Desk-cloud\n")
 
         out = seed_from_remote(
-            memory_root=mem.parent, profile_path=prof, remote=remote, name="desk"
+            memory_root=mem.parent, remote=remote, name="desk"
         )
         assert out == "skip:has-memory"
         assert mine.read_text() == "something the agent learned"
         assert not (mem.parent / "notes" / "lesson.md").exists()
 
-    def test_a_real_profile_is_not_replaced(self, tmp_path):
-        """Only the Hub's stub is overwritten; anything longer is the operator's."""
+    def test_profile_is_never_touched(self, tmp_path):
+        """The agent store owns profile.md and restores its copy on resume, so
+        writing one here is reverted the first time the agent idles. Found by
+        --verify on a live agent whose hand-seeded 12,797-byte profile came back
+        as the 71-byte stub."""
         remote = _fleet_repo(tmp_path)
         mem = tmp_path / "agent" / "memory"
         mem.mkdir(parents=True)
         prof = tmp_path / "agent" / "profile.md"
-        prof.write_text("# Mine\n\n# Soul\n\n" + "x" * 600)
+        prof.write_text("# Stub\n")
 
-        seed_from_remote(memory_root=mem, profile_path=prof, remote=remote, name="desk")
-        assert prof.read_text().endswith("x" * 600)
+        seed_from_remote(memory_root=mem, remote=remote, name="desk")
+        assert prof.read_text() == "# Stub\n"
 
     def test_unknown_agent_in_the_remote_is_a_skip_not_a_failure(self, tmp_path):
         remote = _fleet_repo(tmp_path)
         mem = tmp_path / "a" / "memory"
         mem.mkdir(parents=True)
         assert seed_from_remote(
-            memory_root=mem, profile_path=tmp_path / "a" / "p.md",
+            memory_root=mem,
             remote=remote, name="ghost",
         ) == "skip:no-such-agent"
 
     def test_no_remote_configured_is_inert(self, tmp_path):
         assert seed_from_remote(
-            memory_root=tmp_path, profile_path=tmp_path / "p.md", remote="", name="x"
+            memory_root=tmp_path, remote="", name="x"
         ) == "skip:no-remote"
 
     def test_an_unreachable_remote_degrades_rather_than_raising(self, tmp_path):
@@ -117,7 +117,7 @@ class TestSeeding:
         mem = tmp_path / "memory"
         mem.mkdir()
         out = seed_from_remote(
-            memory_root=mem, profile_path=tmp_path / "p.md",
+            memory_root=mem,
             remote=str(tmp_path / "definitely-not-a-repo"), name="desk",
         )
         assert out.startswith("failed:")

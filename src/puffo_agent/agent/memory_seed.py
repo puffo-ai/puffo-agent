@@ -13,9 +13,16 @@ remember to unset.
 The remote is expected to hold one directory per agent::
 
     <repo>/<name>/memory/…      ← copied into the agent's memory tree
-    <repo>/<name>/profile.md    ← copied when the local profile is still a stub
 
 so one repo serves a fleet, and `tools/seed_cloud_agent.py` publishes into it.
+
+**Memory only — `profile.md` is deliberately not seeded here.** The agent store
+owns it: `lifecycle._deliver_pending_config` byte-compares `profile.md` against
+the stored config and materialises the stored copy on resume, so anything
+written into the sandbox is reverted the first time the agent idles. A profile
+must be set where the store will keep it — the create dialog's PROFILE field, or
+`PUT /agents/{slug}`. Memory has no such competing writer, which is why this
+works for memory and would not for a profile.
 
 Failure is never fatal. An unreachable remote, a missing directory, or a broken
 key leaves the agent running with an empty memory and a warning — degraded, not
@@ -52,11 +59,6 @@ def memory_seed_name(agent_id: str) -> str:
 #: unconditionally by `ensure_memory_tree` and says nothing about content.
 _NOT_CONTENT = {".git", ".gitkeep", ".DS_Store"}
 
-#: A profile this size or smaller is the created-but-never-filled stub the Hub
-#: writes (name, role, operator, empty Soul). Seeding replaces it; anything
-#: larger is treated as the operator's own writing and left alone.
-_STUB_PROFILE_BYTES = 512
-
 _CLONE_TIMEOUT_S = 120
 
 
@@ -85,11 +87,10 @@ def _clone(remote: str, into: Path) -> None:
 def seed_from_remote(
     *,
     memory_root: Path,
-    profile_path: Path,
     remote: str,
     name: str,
 ) -> str:
-    """Seed this agent's memory (and stub profile) from ``remote``, once.
+    """Seed this agent's memory from ``remote``, once.
 
     Returns a short status for the caller's log — ``"seeded"``,
     ``"skip:has-memory"``, ``"skip:no-such-agent"``, ``"skip:no-remote"``, or
@@ -132,15 +133,6 @@ def seed_from_remote(
                     shutil.copy2(item, dest)
                 copied += 1
 
-        src_profile = src / "profile.md"
-        profile_path = Path(profile_path)
-        if src_profile.is_file():
-            existing = profile_path.stat().st_size if profile_path.is_file() else 0
-            if existing <= _STUB_PROFILE_BYTES:
-                profile_path.write_text(
-                    src_profile.read_text(encoding="utf-8"), encoding="utf-8"
-                )
-                copied += 1
         return "seeded" if copied else "skip:nothing-to-copy"
     except OSError as exc:
         return f"failed:{type(exc).__name__}"

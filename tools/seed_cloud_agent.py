@@ -12,8 +12,15 @@ fleet memory repo, under the name a human uses::
     <repo>/<name>/profile.md
     <repo>/<name>/memory/…
 
-A cloud agent whose config carries ``memory_remote`` clones that on its first
-boot (see ``agent/memory_seed.py``), so the usual flow is:
+A cloud agent whose config carries ``memory_remote`` clones the **memory** on
+its first boot (see ``agent/memory_seed.py``). `profile.md` is published here
+too, but the agent does **not** pick it up from the remote: the agent store owns
+the profile and restores its copy on resume. Set a profile where the store keeps
+it — the create dialog's PROFILE field (it takes an uploaded ``.md``), or
+``PUT /agents/{slug}``. The copy in the remote is the record of what a local
+agent's persona was, and what to paste when creating its cloud counterpart.
+
+The usual flow is:
 
     1. create the cloud agent in the Hub, choosing its billing mode
     2. ./tools/seed_cloud_agent.py --from desk --repo <fleet> --push
