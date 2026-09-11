@@ -594,7 +594,7 @@ def build_capabilities() -> dict:
                                 o.supported_inference_levels
                             )
                         }
-                        if o.supported_inference_levels
+                        if o.supported_inference_levels is not None
                         else {}
                     ),
                 }

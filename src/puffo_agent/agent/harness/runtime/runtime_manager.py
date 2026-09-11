@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -21,6 +22,7 @@ from ...context_controller import (
     RolloverResult,
     ToolResultAdmission,
     normalize_context_snapshot,
+    normalize_tool_name,
 )
 from ...errors import AgentAPIError, ProviderFailureError
 from ...provider_failures import (
@@ -226,6 +228,9 @@ class RuntimeManager:
         # input reached the transcript (accepted start receipt only)
         self._input_admitted = False
         self._resume_failure_streak = 0
+        # When the current runtime process was (re)opened; the worker's
+        # MCP transport probe compares hello timestamps against it.
+        self.last_open_monotonic: float | None = None
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -241,6 +246,7 @@ class RuntimeManager:
             if resume and self.native_session_id
             else None
         )
+        self.last_open_monotonic = time.monotonic()
         try:
             opened = await self.driver.open(self.spec, native_resume)
         except BaseException as exc:
@@ -272,6 +278,7 @@ class RuntimeManager:
             )
             self._clear_native_session()
             try:
+                self.last_open_monotonic = time.monotonic()
                 opened = await self.driver.open(self.spec, None)
             except BaseException as exc:
                 errors = [exc]
@@ -351,13 +358,14 @@ class RuntimeManager:
         self, logical: TurnRef, *, retire: bool
     ) -> None:
         # admission unknown -> retry must replay the durable payload
+        provider_turn_id = self.native_turn_id
         self._input_admitted = False
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._terminal.pop(logical, None)
         self._permission_refs.clear()
-        self._continuation_admissions.clear()
+        self._discard_pending_admissions("turn_abandoned", provider_turn_id)
         if not retire:
             return
         # Keep session: close prevents overlap; dead -> invalid_resume.
@@ -1033,11 +1041,46 @@ class RuntimeManager:
             future.set_result(event)
         if self._active_driver_turn_ref is not None:
             self._turn_refs.pop(self._active_driver_turn_ref, None)
+        provider_turn_id = self.native_turn_id
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._permission_refs.clear()
+        self._discard_pending_admissions("turn_completed", provider_turn_id)
+
+    def _discard_pending_admissions(
+        self, reason: str, provider_turn_id: str
+    ) -> None:
+        """Drop staged continuations at a turn boundary, audibly.
+
+        A continuation is retired here only when no tool result ever released
+        it.  On the ACP path that is the visible end of a lost post-commit
+        receipt: the argument-correlation fallback is unreachable (those facts
+        carry no ``arguments``), so nothing else can admit it, and the
+        mismatch warning below is never reached either.  Dropping silently
+        left the symptom -- a continuation that never fires -- with no trace
+        on the side that actually experiences it.
+
+        Deliberate cancellation (``register_continuation_callback(None)``)
+        clears the list directly and is NOT routed here: a signal that also
+        fires on the intended case stops being read.
+
+        ``provider_turn_id`` is passed in, not read off ``self``: every call
+        site resets ``native_turn_id`` as part of the same teardown, so
+        reading it here would have logged an empty field on every single
+        discard -- an attribution slot that looks populated and never is.
+        """
+        pending = len(self._continuation_admissions)
         self._continuation_admissions.clear()
+        if not pending:
+            return
+        logger.warning(
+            "puffo_admission_continuation_discarded "
+            "reason=%s count=%d provider_turn_id=%s",
+            reason,
+            pending,
+            provider_turn_id or "",
+        )
 
     def register_continuation(
         self,
@@ -1078,6 +1121,33 @@ class RuntimeManager:
         ):
             return
         tool_name = str(fact.get("tool_name") or "")
+        tool_call_id = str(fact.get("tool_call_id") or "")
+        admission_binding = fact.get("admission_binding")
+        if fact.get("provider_context_committed") is True:
+            candidates = [
+                (index, admission)
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == event.native_turn_id
+                and admission.tool_names
+                and normalize_tool_name(tool_name) in admission.tool_names
+                and isinstance(admission_binding, str)
+                and admission.binding_for_tool_call(tool_call_id)
+                == admission_binding
+            ]
+            if not candidates:
+                return
+            index, admission = max(
+                candidates, key=lambda value: value[1].match_specificity
+            )
+            self._continuation_admissions.pop(index)
+            await admission.callback(ProviderAdmissionEvent(
+                planning_cycle_key=admission.planning_cycle_key,
+                provider_session_id=self.native_session_id,
+                provider_turn_id=event.native_turn_id,
+                tool_call_id=tool_call_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+            return
         arguments = fact.get("arguments")
         if not isinstance(arguments, dict):
             return
@@ -1161,6 +1231,7 @@ class RuntimeManagerAdapter(Adapter):
         spec_reloader: Callable[[str], Awaitable[RuntimeSpec]] | None = None,
         compaction_wait_seconds: float = COMPACTION_WAIT_SECONDS,
         post_close: Callable[[], Awaitable[None]] | None = None,
+        generation_sink: Callable[[str], None] | None = None,
     ):
         self.manager = manager
         self.spec_reloader = spec_reloader
@@ -1169,6 +1240,11 @@ class RuntimeManagerAdapter(Adapter):
         # (and its Driver) close. Used by the Docker Codex runtime to stop
         # the per-agent container once the exec transport has terminated.
         self.post_close = post_close
+        # Observes a freshly minted mcp generation between the spec
+        # reload and the reopen (the daemon pins it against registry
+        # trimming before the new subprocess can hello). Observation
+        # only; failures never reach the runtime.
+        self.generation_sink = generation_sink
         self.assistant_text_parts: list[str] = []
         self._latest_context_limits: tuple[int | None, int | None] = (
             None,
@@ -1469,6 +1545,22 @@ class RuntimeManagerAdapter(Adapter):
             await self.spec_reloader(new_system_prompt)
             if self.spec_reloader is not None else None
         )
+        if (
+            spec is not None
+            and spec.mcp_generation
+            and self.generation_sink is not None
+        ):
+            # Pin the minted generation BEFORE the reopen: the reopened
+            # subprocess hellos immediately, and until the caller's
+            # post-reload pin lands, registry trimming under zombie
+            # beacon pressure could evict that hello and fake a
+            # never-seen probe result.
+            try:
+                self.generation_sink(spec.mcp_generation)
+            except Exception:
+                logger.exception(
+                    "generation sink failed; reload continues"
+                )
         await self.manager.reload_resources(
             preserve_session=not with_session,
             spec=spec,

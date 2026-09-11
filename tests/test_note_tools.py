@@ -248,6 +248,37 @@ async def test_get_thread_notes_tool_limit_one():
     assert "msg_note_0" not in out
 
 
+@pytest.mark.asyncio
+async def test_thread_notes_withhold_foreign_dm_awaiting_approval():
+    """A note read must not bypass the foreign-DM admission gate."""
+    from puffo_agent.agent.message_store import ReceiptDisposition
+
+    cfg, http, ms = _setup()
+    await ms.store({
+        "envelope_id": "dm_root", "envelope_kind": "dm",
+        "sender_slug": cfg.slug, "recipient_slug": "mallory-0009",
+        "content_type": "text/plain", "content": "visible root",
+        "sent_at": _now_ms(),
+    })
+    await ms.store_receipt(
+        {
+            "envelope_id": "dm_note", "envelope_kind": "dm",
+            "sender_slug": "mallory-0009", "recipient_slug": cfg.slug,
+            "content_type": "text/plain",
+            "content": _format_note(
+                "#db4cac", "Waiting",
+                "held-note-the-operator-has-not-approved", [],
+            ),
+            "sent_at": _now_ms() + 1, "thread_root_id": "dm_root",
+        },
+        server_seq=12,
+        disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+        reason="foreign dm awaiting approval",
+    )
+
+    assert await ms.get_thread_notes("dm_root") == []
+
+
 # ---- read-tool edge branches ----------------------------------------------
 
 

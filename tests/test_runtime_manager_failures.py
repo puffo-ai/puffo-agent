@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -1470,6 +1471,92 @@ async def test_context_rollover_preserves_logical_session_and_opens_fresh_native
     assert manager.session_ref == SessionRef("logical-session")
     assert manager.opened is not None and manager.opened.resumed is False
     assert adapter.get_context_capabilities().rollover is True
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_acp_post_commit_binding_admits_exact_call_and_rejects_wrong_id():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(driver, RuntimeSpec("/tmp"), driver_name="acp")
+    await manager.open()
+    await manager.start_turn(TurnInput("notice"))
+    admitted = []
+
+    async def admit(event):
+        admitted.append(event)
+
+    def event(call_id, receipt, *, bound_id=None, tool_name="read_inbox"):
+        binding = hashlib.sha256(
+            f"{bound_id or call_id}\x00{receipt}".encode("utf-8")
+        ).hexdigest()
+        return HarnessEvent.normalized(
+            type="turn.tool_completed",
+            driver="acp",
+            session_ref=SessionRef(manager.native_session_id),
+            turn_ref=driver.turn,
+            native_session_id=manager.native_session_id,
+            native_turn_id=manager.native_turn_id,
+            data={
+                "tool_call_ref": call_id,
+                "label": tool_name,
+                "outcome": "succeeded",
+            },
+            native_payload={
+                "_puffo_internal": "tool_result",
+                "provider_context_committed": True,
+                "tool_call_id": call_id,
+                "tool_name": tool_name,
+                "admission_binding": binding,
+                "is_error": False,
+            },
+        )
+
+    manager.register_continuation(
+        admit,
+        "exact",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 1},
+        correlation_receipt="receipt-exact",
+    )
+    await manager._admit_matching_tool_result(
+        event("call-exact", "receipt-exact")
+    )
+    assert len(admitted) == 1
+    assert admitted[0].planning_cycle_key == "exact"
+    assert admitted[0].tool_call_id == "call-exact"
+
+    admitted.clear()
+    manager.register_continuation(
+        admit,
+        "wrong-id",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 2},
+        correlation_receipt="receipt-wrong-id",
+    )
+    await manager._admit_matching_tool_result(
+        event(
+            "call-tampered",
+            "receipt-wrong-id",
+            bound_id="call-actually-committed",
+        )
+    )
+    assert admitted == []
+
+    manager.register_continuation(
+        admit,
+        "wrong-tool",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 3},
+        correlation_receipt="receipt-wrong-tool",
+    )
+    await manager._admit_matching_tool_result(
+        event(
+            "call-wrong-tool",
+            "receipt-wrong-tool",
+            tool_name="send_message",
+        )
+    )
+    assert admitted == []
     await manager.close()
 
 

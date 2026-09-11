@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any, Protocol
 from ....macos.keychain import is_macos
 from ....mcp.config import (
     INFERENCE_LEVELS,
+    OPENCODE_INFERENCE_LEVELS,
     default_python_executable,
     puffo_core_mcp_env,
     write_cli_mcp_config,
@@ -73,6 +75,7 @@ from ...runtime_event_outbox import (
 from ...runtime_events import RuntimeEventProjector, TrustedScope
 from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from ..support.child_env import build_child_environment
+from ..drivers.acp import selects_puffo_v0_profile
 from ..drivers.pi_bridge import (
     build_bridge_environment,
     install_pi_tool_bridge,
@@ -91,6 +94,11 @@ from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
 from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
+
+# claude-code reads this to bound its own transient-status retry loop
+# (429/529/5xx). Set only when the agent is routed through a budgeted gateway.
+GATEWAY_CLI_MAX_RETRIES_ENV = "CLAUDE_CODE_MAX_RETRIES"
+GATEWAY_CLI_MAX_RETRIES = "2"
 
 VALID_PERMISSION_MODES = frozenset({"bypassPermissions"})
 VALID_SANDBOX_MODES = frozenset({
@@ -324,6 +332,9 @@ class LocalRuntimePreparer:
         self._desired_installed = False
         self._desired_codex_extras: dict[str, dict] = {}
         self._puffo_core_env = self._build_puffo_core_env()
+        # Minted per spec build in ``refresh_spec`` — see
+        # ``_puffo_core_child_env``.
+        self._mcp_generation = ""
 
     async def prepare(
         self,
@@ -368,6 +379,12 @@ class LocalRuntimePreparer:
         if self.harness_name == "claude-code":
             self._sync_claude_host_state()
         await self._install_desired_once()
+        # One mint for every harness family. The daemon-side transport probe
+        # is keyed on this value, and a per-harness mint is exactly how three
+        # families ended up with the probe silently disabled: the value must
+        # be born at the single point every spec build passes through, not at
+        # each spawn site that happens to remember it.
+        self._mcp_generation = uuid.uuid4().hex if self._puffo_core_env else ""
         if self.harness_name == "codex":
             return self._prepare_codex_spec(system_prompt)
         if self.harness_name == "claude-code":
@@ -389,7 +406,7 @@ class LocalRuntimePreparer:
             executable, system_prompt
         )
         mcp_servers = self._project_protocol_mcp(
-            controlled, opencode_config
+            controlled, opencode_config, tuple(launch_args)
         )
         if opencode_config:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
@@ -398,6 +415,7 @@ class LocalRuntimePreparer:
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             executable=executable,
             launch_args=tuple(launch_args),
@@ -409,6 +427,7 @@ class LocalRuntimePreparer:
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+            mcp_generation=self._mcp_generation,
         )
 
     def _resolve_generic_command(self) -> tuple[str, list[str]]:
@@ -454,6 +473,13 @@ class LocalRuntimePreparer:
             and "--thinking" not in launch_args
         ):
             launch_args.extend(("--thinking", inference_level))
+        if (
+            self.harness_name == "opencode"
+            and inference_level in OPENCODE_INFERENCE_LEVELS
+            and "--variant" not in launch_args
+        ):
+            native_variant = "none" if inference_level == "off" else inference_level
+            launch_args.extend(("--variant", native_variant))
         return executable, launch_args
 
     def _prepare_executable_configuration(
@@ -483,28 +509,43 @@ class LocalRuntimePreparer:
         self,
         controlled: dict[str, str],
         opencode_config: dict[str, Any],
+        launch_args: tuple[str, ...],
     ) -> tuple[McpServerSpec, ...]:
         """Project Puffo tools according to the selected Driver protocol.
 
-        Native OpenCode receives its inline MCP configuration. ACP-over-
-        OpenCode carries the same server through ``RuntimeSpec.mcp_servers``
-        and must not receive the native inline projection.
+        Native OpenCode receives its inline MCP configuration and must not
+        also receive the generic projection.
+
+        The ACP Driver forwards this tuple into ``session/new`` verbatim
+        (converted to the ACP wire shape), so this method is the single
+        policy point for which tools an ACP agent can discover. LingTai's
+        constrained ``puffo-v0`` profile rejects a non-empty ``mcpServers``
+        at ``session/new`` and therefore keeps an empty projection until
+        the agent is re-provisioned under ``puffo-v1``. See
+        ``test_spec_mcp_servers_are_forwarded_into_the_acp_launch_plan``.
         """
         mcp_servers: tuple[McpServerSpec, ...] = ()
-        if self._puffo_core_env:
+        puffo_core_env = self._puffo_core_child_env()
+        if puffo_core_env:
             puffo_command = default_python_executable()
             puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
             puffo_server = McpServerSpec(
                 name="puffo",
                 command=puffo_command,
                 args=puffo_args,
-                environment=self._puffo_core_env,
+                environment=puffo_core_env,
             )
             if self.harness_name == "pi":
                 # Pi has no MCP client. Its attested extension bridge carries
                 # only Puffo's core server; keeping mcp_servers empty is part
                 # of the Driver admission contract.
                 controlled.update(self._prepare_pi_bridge(puffo_server))
+            elif self.harness_name == "acp" and selects_puffo_v0_profile(
+                launch_args
+            ):
+                # puffo-v0 fails session/new on any server list; the empty
+                # projection is a LingTai-side contract, not a default.
+                mcp_servers = ()
             else:
                 mcp_servers = (puffo_server,)
             if self.harness_name == "opencode":
@@ -512,7 +553,7 @@ class LocalRuntimePreparer:
                     "puffo": {
                         "type": "local",
                         "command": [puffo_command, *puffo_args],
-                        "environment": self._puffo_core_env,
+                        "environment": puffo_core_env,
                     }
                 }
         else:
@@ -542,6 +583,23 @@ class LocalRuntimePreparer:
             )
         )
         return controlled
+
+    def _puffo_core_child_env(self) -> dict[str, str] | None:
+        """The MCP subprocess environment, generation included.
+
+        Every spawn site goes through here so the subprocess can echo the
+        generation back over ``mcp-hello``; without it
+        ``_make_hello_startup`` returns ``None``, no hello is ever sent, and
+        ``Worker.probe_mcp_transport`` returns early on the empty spec
+        generation — a dead transport with no recycle and no
+        ``mcp_unreachable``.
+        """
+        if not self._puffo_core_env:
+            return None
+        return {
+            **self._puffo_core_env,
+            "PUFFO_MCP_GENERATION": self._mcp_generation,
+        }
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core
@@ -659,12 +717,16 @@ class LocalRuntimePreparer:
                     inference,
                 )
         mcp_path = agent_dir(self.agent_id) / "mcp-config.json"
-        if self._puffo_core_env:
+        puffo_core_env = self._puffo_core_child_env()
+        if puffo_core_env:
+            # The subprocess echoes the generation back over RPC (mcp-hello)
+            # so the worker's transport probe can tell "this spec's MCP
+            # reached us" from a stale predecessor.
             write_cli_mcp_config(
                 mcp_path,
                 command=default_python_executable(),
                 args=["-m", "puffo_agent.mcp.puffo_core_server"],
-                env=self._puffo_core_env,
+                env=puffo_core_env,
             )
             launch_args.extend(["--mcp-config", str(mcp_path)])
         else:
@@ -678,6 +740,11 @@ class LocalRuntimePreparer:
         llm_env = anthropic_base_url_env(runtime.llm_base_url)
         if llm_env and runtime.api_key:
             llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
+            # Behind a budgeted gateway a 429 is usually the cap, not load.
+            # The CLI treats every 429 as transient and retries with backoff;
+            # under a cap that is a storm the gateway counts against the same
+            # budget. Cap the CLI's retries; the runtime parks on the drain.
+            llm_env[GATEWAY_CLI_MAX_RETRIES_ENV] = GATEWAY_CLI_MAX_RETRIES
         else:
             configured_key = claude_cli_api_key(self.daemon_cfg)
             if configured_key:
@@ -711,6 +778,7 @@ class LocalRuntimePreparer:
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
             auto_compact_threshold_tokens=compact_tokens,
+            mcp_generation=self._mcp_generation,
         )
 
     def _prepare_codex_spec(self, system_prompt: str) -> RuntimeSpec:
@@ -729,11 +797,12 @@ class LocalRuntimePreparer:
             "inference_level": self.agent_cfg.runtime.inference_level,
             "provider": gateway,
         }
-        if self._puffo_core_env:
+        puffo_core_env = self._puffo_core_child_env()
+        if puffo_core_env:
             config_kwargs.update({
                 "command": default_python_executable(),
                 "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
-                "env": self._puffo_core_env,
+                "env": puffo_core_env,
             })
         write_codex_mcp_config(codex_home / "config.toml", **config_kwargs)
 
@@ -781,6 +850,7 @@ class LocalRuntimePreparer:
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             executable=executable,
             environment=environment,
@@ -788,6 +858,7 @@ class LocalRuntimePreparer:
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
+            mcp_generation=self._mcp_generation,
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
@@ -955,6 +1026,29 @@ class _LegacyStatusProjector:
         self._emitted_tools.clear()
 
 
+async def _observe_compaction_activity(
+    activity_sink, event_type: str, agent_id: str,
+) -> None:
+    """Forward compaction boundaries ("compacting" / None on completed
+    and failed alike — a failed compaction must not strand the overlay)
+    to the status reporter's activity sink. Observation only: failures
+    never reach the runtime."""
+    if event_type not in {
+        "compaction.started", "compaction.completed", "compaction.failed",
+    }:
+        return
+    try:
+        await activity_sink(
+            "compacting" if event_type == "compaction.started" else None
+        )
+    except Exception as exc:  # noqa: BLE001 - observation only
+        logger.warning(
+            "agent %s: activity observation failed (%s); runtime continues",
+            agent_id,
+            type(exc).__name__,
+        )
+
+
 def build_local_runtime_adapter(
     prepared: PreparedLocalRuntime,
     *,
@@ -962,16 +1056,20 @@ def build_local_runtime_adapter(
     logical_session_ref: str,
     driver: Driver | None = None,
     cleanup: Callable[[], Awaitable[None]] | None = None,
+    generation_sink: Callable[[str], None] | None = None,
+    activity_sink: Callable[[str | None], Awaitable[None]] | None = None,
 ) -> RuntimeManagerAdapter:
     """Bind a prepared Driver runtime to the durable Runtime Manager.
 
     ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
     Docker composition injects the selected Driver with its exec transport
     factory and passes ``cleanup`` (bounded container stop), which runs after
-    the manager closes.
+    the manager closes. ``activity_sink`` receives the fixed activity label
+    ("compacting" / None) on compaction boundary events so the status
+    reporter can refine the operator-facing status; it observes only,
+    failures never reach the runtime.
     """
-    if driver is None:
-        driver = build_driver(prepared.harness_name)
+    driver = build_driver(prepared.harness_name) if driver is None else driver
     if isinstance(driver, UnsupportedDriver):
         raise RuntimeError(driver.diagnostic)
     projector = RuntimeEventProjector(
@@ -1003,6 +1101,10 @@ def build_local_runtime_adapter(
                 type(exc).__name__,
             )
         event_type = getattr(event.type, "value", event.type)
+        if activity_sink is not None:
+            await _observe_compaction_activity(
+                activity_sink, event_type, prepared.preparer.agent_id,
+            )
         # Only the session and turn boundaries rewrite durable state; every
         # other event (a streamed delta above all) must reach the outbox no
         # more than once, so the state read stays inside the branch using it.
@@ -1045,6 +1147,7 @@ def build_local_runtime_adapter(
         manager,
         spec_reloader=reload_spec,
         post_close=cleanup,
+        generation_sink=generation_sink,
     )
 
 

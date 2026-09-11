@@ -136,3 +136,32 @@ def test_capabilities_publish_model_specific_pi_thinking_levels(monkeypatch):
             "supported_inference_levels": ["off", "low", "high"],
         }],
     }]
+
+
+def test_capabilities_publish_an_explicit_empty_opencode_variant_list(monkeypatch):
+    """No variants must not be mistaken for missing model-level metadata."""
+    _patch_hosts(monkeypatch, opencode_path="/bin/opencode")
+    monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ("opencode",))
+    monkeypatch.setattr(
+        model_catalog,
+        "provider_models",
+        lambda harness, *, fetch=False: [
+            model_catalog.ModelOption(
+                "opencode/no-variants",
+                "opencode/no-variants",
+                supported_inference_levels=(),
+            )
+        ],
+    )
+
+    caps = build_capabilities()
+
+    assert caps["providers"] == [{
+        "provider": "opencode",
+        "models": [{
+            "id": "opencode/no-variants",
+            "label": "opencode/no-variants",
+            "alias": False,
+            "supported_inference_levels": [],
+        }],
+    }]

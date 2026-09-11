@@ -237,3 +237,28 @@ def test_successful_key_retry_clears_auth_failure(tmp_path, monkeypatch):
     assert worker.runtime.health == "ok"
     assert worker._api_key_auth_recovery_pending is False
     assert worker._auth_failed_notification_sent is False
+
+
+def test_local_gateway_caps_the_cli_retry_loop(tmp_path, monkeypatch):
+    """Behind a budgeted gateway a 429 is the cap, not load. The CLI retries
+    every 429 as transient; capping it keeps a cap hit to a handful of
+    requests instead of a storm the gateway bills against the same budget."""
+    preparer = _local_preparer(
+        tmp_path,
+        monkeypatch,
+        runtime_key="gateway-key",
+        base_url="https://gateway.example/v1",
+    )
+    spec = preparer._prepare_claude_spec("prompt")
+    assert spec.environment["CLAUDE_CODE_MAX_RETRIES"] == "2"
+
+
+def test_local_direct_provider_leaves_cli_retries_alone(tmp_path, monkeypatch):
+    preparer = _local_preparer(
+        tmp_path,
+        monkeypatch,
+        daemon_key="daemon-key",
+        key_enabled=True,
+    )
+    spec = preparer._prepare_claude_spec("prompt")
+    assert "CLAUDE_CODE_MAX_RETRIES" not in spec.environment

@@ -10,8 +10,10 @@ by mutating the filesystem — no IPC needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import shutil
 import signal
 import threading
@@ -61,6 +63,7 @@ from .state import (
     is_daemon_ready,
     is_daemon_startup_stalled,
     is_pid_alive,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_provider_auth_flag_path,
@@ -83,6 +86,11 @@ from .worker import Worker
 from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_auth_reload_jitter_seconds() -> float:
+    """Spread fleet-wide provider reopen requests across a short window."""
+    return random.uniform(0.0, PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
 
 
 class _DaemonRuntime:
@@ -467,13 +475,31 @@ class Daemon:
         except OSError as exc:
             logger.warning("agent %s: couldn't remove restart.flag: %s", agent_id, exc)
 
-    def _refresher_for(self, agent_cfg: AgentConfig) -> CredentialRefresher:
-        """Pick the right refresher for an agent's harness. Codex
-        agents only need their own auth.json refresh; claude-code +
-        every other harness routes through the Claude refresher."""
-        if (agent_cfg.runtime.harness or "claude-code") == "codex":
+    def _refresher_for(
+        self, agent_cfg: AgentConfig
+    ) -> CredentialRefresher | None:
+        """The refresher that actually owns this agent's credentials, or
+        ``None`` when no daemon refresher does.
+
+        Only the harnesses in ``_DAEMON_REFRESH_HARNESSES`` have a backend
+        here: claude-code via ``FileBackend``/``KeychainBackend``, codex via
+        ``CodexFileBackend``. Pi projects its own ``auth.json`` through
+        ``sync_host_pi_auth_view`` and OpenCode carries its own credentials;
+        neither has anything for a refresher to refresh.
+
+        This used to fall through to the Claude refresher for every
+        non-codex harness, which put Pi and OpenCode agents on a refresher
+        that could not help them and could block them: the pre-delivery
+        gate (``_ensure_fresh_for``) then failed on an expired *Claude*
+        token, so a Pi agent with a perfectly valid credential never
+        reached its own provider (#337).
+        """
+        harness = agent_cfg.runtime.harness or "claude-code"
+        if harness == "codex":
             return self.codex_refresher
-        return self.refresher
+        if harness == "claude-code":
+            return self.refresher
+        return None
 
     def _register_with_refresher(
         self,
@@ -491,6 +517,13 @@ class Daemon:
         ):
             return
         refresher = self._refresher_for(agent_cfg)
+        if refresher is None:
+            # No daemon refresher owns this harness's credentials. Registering
+            # anyway would subscribe the agent to another provider's failure
+            # fan-out (`_flip_refresh_broken` / `_flip_auth_failed`) and to an
+            # `on_refresh_success` that would clear its reds for an unrelated
+            # reason.
+            return
         refresher.register_agent(agent_home_dir(agent_cfg.id))
         agent_id = agent_cfg.id
 
@@ -512,13 +545,23 @@ class Daemon:
                     agent_cfg.resolve_workspace_dir()
                 )
                 flag.parent.mkdir(parents=True, exist_ok=True)
+                jitter_seconds = _provider_auth_reload_jitter_seconds()
                 flag.write_text(
-                    '{"source":"credential_replaced"}', encoding="utf-8"
+                    json.dumps({
+                        "source": "credential_replaced",
+                        "jitter_seconds": jitter_seconds,
+                        "not_before_unix_ms": int(
+                            (time.time() + jitter_seconds) * 1000
+                        ),
+                    }),
+                    encoding="utf-8",
                 )
                 worker.notify_refresh()
                 logger.info(
-                    "agent %s: credential replaced — provider reload requested",
+                    "agent %s: credential replaced — provider reload requested "
+                    "with %.3fs jitter",
                     agent_id,
+                    jitter_seconds,
                 )
             except OSError as exc:
                 logger.warning(
@@ -535,7 +578,13 @@ class Daemon:
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         if Daemon._uses_claude_api_key(self, agent_cfg):
             return None
-        return self._refresher_for(agent_cfg).notify_refresh_needed
+        refresher = self._refresher_for(agent_cfg)
+        # None for harnesses no refresher owns: there is nothing to wake, and
+        # waking the Claude refresher on a Pi 401 only re-probes an unrelated
+        # provider. The worker already null-checks this.
+        return (
+            refresher.notify_refresh_needed if refresher is not None else None
+        )
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
         # Gateway/VK mode (runtime.llm_base_url set): the LLM key is a static
@@ -549,7 +598,10 @@ class Daemon:
             or Daemon._uses_claude_api_key(self, agent_cfg)
         ):
             return None
-        return self._refresher_for(agent_cfg).ensure_fresh
+        refresher = self._refresher_for(agent_cfg)
+        # No owning refresher -> no pre-delivery gate. The worker already
+        # treats None as "skip the gate" (same path gateway/VK mode uses).
+        return refresher.ensure_fresh if refresher is not None else None
 
     def _uses_claude_api_key(self, agent_cfg: AgentConfig) -> bool:
         runtime = agent_cfg.runtime
@@ -1075,14 +1127,9 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     }[harness]
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
-    from ..agent.model_catalog import provider_models
+    from ..agent.model_catalog import validate_model_id
 
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if model not in supported:
-        raise ValueError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    validate_model_id(model)
 
 
 def _validate_daemon_inference_level(harness: str, level: str) -> None:

@@ -7,6 +7,7 @@ into runtime.json so the CLI can read live stats without IPC.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -43,6 +44,7 @@ from ..agent.shared_content import rebuild_agent_claude_md, rebuild_agent_codex_
 from .state import (
     AgentConfig,
     DaemonConfig,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     RuntimeState,
     agent_claude_user_dir,
     agent_codex_user_dir,
@@ -50,6 +52,8 @@ from .state import (
     agent_home_dir,
     claude_cli_api_key,
     docker_shared_dir as docker_shared_dir,
+    clear_runtime_health_listener,
+    set_runtime_health_listener,
 )
 from ..tasks import spawn
 
@@ -118,6 +122,71 @@ RECONNECT_BACKOFF_SECONDS = 5.0
 # while an operator checking `agent list` sees the truth within the
 # minute instead of "ok" for hours. One successful reconnect clears it.
 _WS_DEGRADE_THRESHOLD = 5
+
+# How long after a runtime open the MCP subprocess gets to say hello
+# before the probe treats the transport as wedged. Covers a slow spawn
+# plus the subprocess's own 3×2s hello retry budget.
+_MCP_PROBE_GRACE_SECONDS = 30.0
+
+# A beacon-capable subprocess may miss this many of its own declared
+# re-hello intervals before its last hello stops counting as evidence
+# of a live transport.
+_MCP_BEACON_STALE_FACTOR = 3.0
+
+# Consecutive failed adapter reloads tolerated before the pending
+# refresh flags are abandoned and the failure becomes a health state.
+_REFRESH_RELOAD_FAILURE_CAP = 3
+
+
+def _refresh_flag_delay_seconds(flag: Path) -> float:
+    """Return a bounded remaining delay encoded in a refresh flag."""
+    try:
+        request = json.loads(flag.read_text(encoding="utf-8"))
+        if not isinstance(request, dict):
+            return 0.0
+        not_before_ms = request.get("not_before_unix_ms")
+        if not isinstance(not_before_ms, (int, float)):
+            return 0.0
+        remaining = (float(not_before_ms) / 1000.0) - time.time()
+        return min(max(remaining, 0.0), PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
+    except (OSError, ValueError, TypeError):
+        return 0.0
+
+
+def _refresh_flag_is_pending(flag: Path) -> bool:
+    """A future-dated durable request exists but is not pending yet."""
+    return flag.exists() and _refresh_flag_delay_seconds(flag) <= 0.0
+
+# Consecutive turns that woke on an announced batch and consumed none of it
+# before the agent stops being reported healthy. One such turn is a normal
+# deferral; a run of them means the provider is not reaching the Inbox at all.
+_NO_PROGRESS_TURN_THRESHOLD = 3
+
+# Health values the MCP transport probe may replace with ``mcp_unreachable``.
+# "ok"/"unknown" mean nothing is known to be wrong. The other two are the
+# states a wedged transport actually produces, and both are *symptoms* this
+# probe can name the cause of:
+#   in_progress  — a turn was admitted and never settled;
+#   no_progress  — turns keep waking and consuming none of their batch,
+#                  whose remediation text points at provider credentials.
+# Excluding them meant the diagnosis was skipped in exactly the states a real
+# MCP failure leaves behind. Every more specific red (auth_failed,
+# provider_error, refresh_broken, drained, ...) stays authoritative: the probe
+# knows the transport is down, not that it is the only thing wrong.
+# Returned by ``_mcp_probe_subject`` when the probe covers this harness but
+# there is no open runtime at this instant. Distinct from ``None`` (not
+# covered at all): coverage is a standing property and retracts a stale red,
+# readiness is momentary and must not reset the strike count — a probe that
+# lands mid-reload would otherwise zero the strikes on every recycle and the
+# escalation to ``mcp_unreachable`` could never be reached.
+_MCP_PROBE_NOT_READY = object()
+
+_MCP_PROBE_OVERWRITABLE_HEALTH = (
+    "ok",
+    "unknown",
+    "in_progress",
+    "no_progress",
+)
 
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
@@ -363,6 +432,240 @@ class Worker:
         self.runtime.save(agent_id)
         self._warm_done.set()
 
+    def _withdraw_unsubstantiated_wedge(self, agent_id: str) -> None:
+        """Retract a red this probe can no longer stand behind.
+
+        This probe is the only writer of ``mcp_unreachable``, and the
+        batch-top override deliberately refuses to overwrite it (its evidence
+        is independent of any turn). So nothing else in the daemon can ever
+        clear it: an agent the probe has stopped applying to would stay red
+        for the life of the process. Upgrading past the release that flagged
+        idle per-turn harnesses has to release them, not freeze them.
+
+        Retracted to ``unknown`` rather than ``ok``: the claim is being
+        withdrawn for want of evidence, which is not the same as observing a
+        healthy transport.
+        """
+        self._mcp_probe_strikes = 0
+        if self.runtime.health != "mcp_unreachable":
+            return
+        self.runtime.health = "unknown"
+        self.runtime.error = ""
+        self.runtime.save(agent_id)
+        logger.info(
+            "agent %s: withdrew an MCP wedge this probe no longer covers",
+            agent_id,
+        )
+
+    def _mcp_probe_subject(self, agent_id: str):
+        """The runtime this probe can speak about.
+
+        Three outcomes, and the difference between the last two is what keeps
+        a recycle from looping forever:
+
+        - a ``(adapter, mgr, spec_gen, opened_at)`` tuple — probe it;
+        - ``_MCP_PROBE_NOT_READY`` — the probe covers this harness but there
+          is no open runtime *right now* (starting, torn down, or mid-reload).
+          Momentary: say nothing, keep the strike count, keep any red;
+        - ``None`` — the probe does not cover this agent at all. A standing
+          property, so a red it can no longer substantiate is withdrawn.
+
+        Not covered means either no puffo MCP to hello back (empty
+        generation), or a non-persistent harness lifecycle: a
+        ``PER_TURN_CHILD`` driver takes ``open`` as a logical session and
+        spawns on ``start_turn`` (see ``RuntimeLifecycle``), so between turns
+        nothing exists to hello with — and this probe stands down *during*
+        turns, so for such a driver it would run exclusively when its premise
+        is false. Every idle opencode agent went ``mcp_unreachable`` within a
+        minute of start, with no fault injected.
+
+        ``mgr.opened`` is the open fact, not ``current_capabilities()``:
+        every shipped driver returns a capability object unconditionally
+        (constants on pi/codex, a constructor-time value on acp, a freshly
+        built one on claude), so capabilities are non-None even when the open
+        failed. ``last_open_monotonic`` is no better — it is stamped *before*
+        ``driver.open`` is awaited. Only ``opened`` is set after a successful
+        open and cleared by every close/reload path.
+
+        Attribute access on the contract fields is direct on purpose:
+        producer/consumer drift must raise here rather than silently disable
+        recovery. Only value-level absence is legitimate and returns quietly.
+        """
+        from ..agent.harness.driver import RuntimeLifecycle
+        from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+
+        adapter = self._adapter
+        mgr = get_runtime_manager(agent_id)
+        if adapter is None or mgr is None:
+            return _MCP_PROBE_NOT_READY
+        capabilities = mgr.current_capabilities()
+        if capabilities is not None and (
+            capabilities.lifecycle != RuntimeLifecycle.PERSISTENT_CHILD
+        ):
+            return None
+        if not mgr.spec.mcp_generation:
+            return None
+        if capabilities is None or mgr.opened is None:
+            return _MCP_PROBE_NOT_READY
+        opened_at = mgr.last_open_monotonic
+        if opened_at is None:
+            return _MCP_PROBE_NOT_READY
+        return adapter, mgr, mgr.spec.mcp_generation, opened_at
+
+    async def probe_mcp_transport(self, agent_id: str) -> None:
+        """Heartbeat-cadence transport probe: the current runtime's puffo
+        MCP subprocess must have reached the loopback RPC service
+        (``mcp-hello`` with this spec's generation, after this runtime's
+        open) — and, when the subprocess declared a beacon cadence,
+        recently enough that the hello still stands for a live transport.
+        One miss past the grace window recycles the runtime through the
+        adapter (the rebuilt spec mints a fresh generation, so a
+        surviving pre-recycle subprocess can never impersonate the new
+        runtime's health); a second miss flips ``mcp_unreachable`` so
+        the wedge is visible instead of an agent that wakes turns but
+        can never read them (8/30-class incident: alive worker, dead
+        MCP, health ok for 51 min).
+
+        Covers persistent-child harnesses only. A per-turn harness holds no
+        subprocess between turns, so it has nothing to hello with at exactly
+        the moments this probe runs; naming its wedge needs an in-turn
+        signal that does not exist yet."""
+        from . import rpc_service
+
+        subject = self._mcp_probe_subject(agent_id)
+        if subject is _MCP_PROBE_NOT_READY:
+            return
+        if subject is None:
+            self._withdraw_unsubstantiated_wedge(agent_id)
+            return
+        adapter, mgr, spec_gen, opened_at = subject
+        now = time.monotonic()
+        # Query exactly this spec's generation: hello state is keyed per
+        # (agent, generation), so a surviving pre-recycle subprocess's
+        # beacon can neither impersonate this runtime nor overwrite its
+        # healthy evidence.
+        seen_at, beacon_interval = rpc_service.mcp_hello_state(
+            agent_id, spec_gen
+        )
+        current = seen_at > 0.0 and seen_at >= opened_at
+        # Freshness is only enforced against a subprocess that declared
+        # its own re-hello cadence; a startup-only predecessor (older
+        # package in a lagging Docker image) keeps handshake semantics
+        # and is never recycle-looped for going quiet.
+        stale = (
+            beacon_interval is not None
+            and now - seen_at > beacon_interval * _MCP_BEACON_STALE_FACTOR
+        )
+        if current and not stale:
+            if self._mcp_probe_strikes:
+                logger.info(
+                    "agent %s: puffo MCP transport recovered "
+                    "(generation=%s)", agent_id, spec_gen,
+                )
+            self._mcp_probe_strikes = 0
+            if self.runtime.health == "mcp_unreachable":
+                self.runtime.health = "ok"
+                self.runtime.error = ""
+                self.runtime.save(agent_id)
+            return
+        if now - opened_at < _MCP_PROBE_GRACE_SECONDS:
+            return
+        if self._turn_active:
+            # A reload would raise mid-turn; check again next beat.
+            return
+        self._mcp_probe_strikes += 1
+        if self._mcp_probe_strikes == 1:
+            if current:
+                cause = (
+                    f"hello beacon silent for {now - seen_at:.0f}s "
+                    f"(declared interval {beacon_interval:.0f}s)"
+                )
+            else:
+                cause = (
+                    "no hello from this spec's subprocess since runtime "
+                    f"open ({now - opened_at:.0f}s ago)"
+                )
+            await self._recycle_wedged_mcp(
+                agent_id, adapter, mgr, cause=cause, spec_gen=spec_gen,
+            )
+            return
+        if self.runtime.health in _MCP_PROBE_OVERWRITABLE_HEALTH:
+            self.runtime.health = "mcp_unreachable"
+            self.runtime.error = (
+                "puffo MCP subprocess never reached the daemon RPC "
+                "service after a runtime recycle; tool calls are likely "
+                "timing out. Restart this worker."
+            )
+            self.runtime.save(agent_id)
+            logger.error(
+                "agent %s: MCP transport still unreachable after recycle; "
+                "runtime.health = mcp_unreachable", agent_id,
+            )
+
+    async def _recycle_wedged_mcp(
+        self, agent_id: str, adapter, mgr, *, cause: str, spec_gen: str,
+    ) -> None:
+        """First-strike response: recycle through the adapter-level
+        reload so the rebuilt spec mints a fresh mcp generation."""
+        logger.error(
+            "agent %s: puffo MCP transport unhealthy — %s "
+            "(generation=%s); recycling the provider runtime with a "
+            "fresh mcp generation",
+            agent_id, cause, spec_gen,
+        )
+        try:
+            await adapter.reload(
+                mgr.spec.system_prompt, with_session=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Includes a turn racing us; keep the strike for next beat.
+            self._mcp_probe_strikes -= 1
+            logger.warning(
+                "agent %s: MCP-probe recycle failed: %s", agent_id, exc,
+            )
+            return
+        from . import rpc_service
+
+        # Pin the freshly minted generation at the switch, not at the
+        # next probe: zombie beacon pressure inside that window could
+        # trim its hello and fake never-seen (a recycle loop on a
+        # healthy runtime).
+        new_gen = mgr.spec.mcp_generation
+        if new_gen:
+            rpc_service.pin_mcp_generation(agent_id, new_gen)
+
+    def _note_refresh_reload(
+        self, ok: bool, flags: tuple[Path, ...], agent_id: str
+    ) -> None:
+        """Give-up policy for ``_process_refresh_flags`` failures: the
+        flags survive ``_REFRESH_RELOAD_FAILURE_CAP`` consecutive failed
+        reloads (each turn-start / watcher tick retries), then they are
+        abandoned into an explicit health state — a worker must not spin
+        on a reload that will never succeed, and it must not pretend the
+        refresh was applied either."""
+        if ok:
+            self._refresh_reload_failures = 0
+            return
+        self._refresh_reload_failures += 1
+        if self._refresh_reload_failures < _REFRESH_RELOAD_FAILURE_CAP:
+            return
+        self._refresh_reload_failures = 0
+        _unlink_refresh_flags(*flags)
+        logger.error(
+            "agent %s: adapter reload failed %d consecutive times; "
+            "abandoning pending refresh flags — the provider runtime is "
+            "still on its pre-refresh state",
+            agent_id, _REFRESH_RELOAD_FAILURE_CAP,
+        )
+        if self.runtime.health in ("ok", "unknown"):
+            self.runtime.health = "provider_error"
+            self.runtime.error = (
+                "provider runtime reload kept failing after a refresh "
+                "(credentials/profile may not be applied). Restart this "
+                "worker."
+            )
+            self.runtime.save(agent_id)
+
     @staticmethod
     def _reassert_auth_failed_after_failed_probe(
         runtime: RuntimeState,
@@ -515,13 +818,17 @@ class Worker:
         from ..agent._invite_strings import (
             format_anthropic_api_key_rejected,
             format_codex_oauth_expired,
+            format_generic_oauth_expired,
             format_oauth_expired,
         )
 
         display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
-        # Codex agents need the Codex recovery command, not the Claude
-        # one; otherwise the operator runs the wrong CLI and assumes
-        # the alert is broken. Harness is the cheapest signal we have.
+        # Each provider needs its own recovery command; running the wrong
+        # CLI's login leaves the agent broken and makes the alert look
+        # false. Harness is the cheapest signal we have. Anything we have
+        # not verified a command for gets the generic copy rather than
+        # inheriting Claude's — a Pi agent told to run `claude auth login`
+        # is worse than one told to re-authenticate Pi.
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
         if getattr(self, "_claude_api_key_mode", False):
@@ -530,8 +837,12 @@ class Worker:
             )
         elif harness == "codex":
             text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
-        else:
+        elif harness in ("", "claude-code"):
             text = format_oauth_expired(self.agent_cfg.id, display_name)
+        else:
+            text = format_generic_oauth_expired(
+                self.agent_cfg.id, display_name, harness
+            )
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:
@@ -560,15 +871,70 @@ class Worker:
             )
         return provider_failure_message("authentication")
 
-    def _enter_drained(self, agent_id: str, resets_at: int | None = None) -> None:
-        """``drained`` + one operator DM per episode. No refresher kick."""
-        from ..agent._usage_markers import DRAINED_RUNTIME_ERROR
+    def _enter_extra_usage_required(self, agent_id: str) -> None:
+        """Extra usage needs operator action; subscription refresh cannot clear it."""
+        self.runtime.health = "extra_usage_required"
+        self.runtime.error = provider_failure_message("extra_usage_required")
+        self.runtime.save(agent_id)
+        if self._extra_usage_notification_sent:
+            return
+        self._extra_usage_notification_sent = True
+        coro = self._notify_operator_of_extra_usage()
+        try:
+            spawn(coro, name="notify_operator_of_extra_usage")
+        except Exception:
+            coro.close()
+            self._extra_usage_notification_sent = False
+            logger.exception("could not schedule extra-usage notification")
+
+    async def _notify_operator_of_extra_usage(self) -> None:
+        client = self._client
+        if client is None:
+            self._extra_usage_notification_sent = False
+            return
+        operator_slug = client.operator_slug or ""
+        if not operator_slug:
+            return
+        name = self.agent_cfg.display_name or self.agent_cfg.id
+        text = (
+            f"{name}: 额度不可用（额外用量）。请检查 Claude 的额外用量设置、"
+            "余额或花费上限：https://claude.ai/settings/usage 。"
+            "处理后重启此 Agent，以重试待处理消息。\n\n"
+            f"{name}: Quota unavailable (extra usage). "
+            + provider_failure_message("extra_usage_required")
+        )
+        try:
+            await client._send_dm(operator_slug, text, root_id="")
+        except Exception:
+            self._extra_usage_notification_sent = False
+            logger.exception("could not send extra-usage notification")
+
+    def _enter_drained(
+        self,
+        agent_id: str,
+        resets_at: int | None = None,
+        *,
+        budget_cap: bool = False,
+    ) -> None:
+        """``drained`` + one operator DM per episode. No refresher kick.
+
+        ``budget_cap``: a gateway spend cap, not a plan window — no reset time
+        exists and the usage snapshot must not clear it (unrelated signal).
+        The runtime holds on a timer and probes; see ``_park_drained``.
+        """
+        from ..agent._usage_markers import (
+            BUDGET_EXCEEDED_RUNTIME_ERROR,
+            DRAINED_RUNTIME_ERROR,
+        )
 
         rt = self.runtime
         was_ok = rt.health != "drained"
         rt.health = "drained"
-        rt.error = DRAINED_RUNTIME_ERROR
+        rt.error = (
+            BUDGET_EXCEEDED_RUNTIME_ERROR if budget_cap else DRAINED_RUNTIME_ERROR
+        )
         rt.save(agent_id)
+        self._drained_budget_cap = budget_cap
         if resets_at is not None:
             self._drained_resets_at = resets_at
         if was_ok:
@@ -612,19 +978,25 @@ class Worker:
         display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
-        resets_at = getattr(self, "_drained_resets_at", None)
-        if resets_at is None:
-            # error bodies rarely carry a time — predict from /usage, best-effort
-            from .control.usage_snapshot import predicted_reset_epoch
+        if getattr(self, "_drained_budget_cap", False):
+            # a gateway cap: no window, no /usage prediction — say what it is
+            from ..agent._invite_strings import format_budget_exceeded
 
-            try:
-                resets_at = await predicted_reset_epoch(harness or "claude-code")
-            except Exception:  # noqa: BLE001
-                resets_at = None
-            if resets_at is not None:
-                self._drained_resets_at = resets_at
-        formatter = format_codex_drained if harness == "codex" else format_drained
-        text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
+            text = format_budget_exceeded(self.agent_cfg.id, display_name)
+        else:
+            resets_at = getattr(self, "_drained_resets_at", None)
+            if resets_at is None:
+                # error bodies rarely carry a time — predict from /usage, best-effort
+                from .control.usage_snapshot import predicted_reset_epoch
+
+                try:
+                    resets_at = await predicted_reset_epoch(harness or "claude-code")
+                except Exception:  # noqa: BLE001
+                    resets_at = None
+                if resets_at is not None:
+                    self._drained_resets_at = resets_at
+            formatter = format_codex_drained if harness == "codex" else format_drained
+            text = formatter(self.agent_cfg.id, display_name, resets_at=resets_at)
         try:
             await client._send_dm(operator_slug, text, root_id="")
         except Exception as exc:
@@ -662,8 +1034,12 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        """Override any sticky red with ``in_progress`` at batch-top."""
-        if runtime.health == "in_progress":
+        """Override a stale red with ``in_progress`` at batch-top — except
+        causes whose evidence is independent of this turn: an independently
+        probed MCP wedge (#312) and a parked extra-usage red (#326)."""
+        if runtime.health in {
+            "in_progress", "mcp_unreachable", "extra_usage_required",
+        }:
             return
         runtime.health = "in_progress"
         runtime.error = ""
@@ -691,6 +1067,75 @@ class Worker:
             "agent %s: runtime.health %s → ok", agent_id, previous_health
         )
 
+    def _note_no_progress_turn(self, agent_id: str) -> None:
+        """A turn woke on an announced batch and consumed none of it.
+
+        Deliberately *not* symmetrical with the success lane: this does not
+        clear anything and does not settle the runtime back to ``ok``. A
+        single such turn is a legitimate deferral, so the first
+        ``_NO_PROGRESS_TURN_THRESHOLD - 1`` only hold the previous health and
+        let the next wake-up retry; the streak past that is the signal.
+
+        The stronger reds stay authoritative — this only ever overwrites the
+        states that mean "nothing is known to be wrong", which is exactly the
+        gap it exists to close: a driver that mis-reports a failed turn as a
+        completed one leaves the agent sitting in ``ok`` forever.
+        """
+        streak = getattr(self, "_no_progress_turns", 0) + 1
+        self._no_progress_turns = streak
+        rt = self.runtime
+        if streak < _NO_PROGRESS_TURN_THRESHOLD:
+            logger.info(
+                "agent %s: turn made no progress on its announced batch "
+                "(%d/%d); leaving runtime.health = %s for the next wake-up",
+                agent_id, streak, _NO_PROGRESS_TURN_THRESHOLD, rt.health,
+            )
+            return
+        if rt.health not in ("ok", "in_progress", "unknown", "no_progress"):
+            logger.info(
+                "agent %s: %d consecutive no-progress turns, but "
+                "runtime.health = %s already names a cause; leaving it",
+                agent_id, streak, rt.health,
+            )
+            return
+        Worker._write_no_progress_red(self, agent_id, streak)
+
+    def _write_no_progress_red(self, agent_id: str, streak: int) -> None:
+        rt = self.runtime
+        if rt.health != "no_progress":
+            logger.warning(
+                "agent %s: %d consecutive turns woke on pending messages and "
+                "read none; runtime.health %s → no_progress",
+                agent_id, streak, rt.health,
+            )
+        rt.health = "no_progress"
+        rt.error = (
+            "Woke for new messages but the provider read none of them "
+            f"{streak} times in a row. The turns are being reported as "
+            "completed while the messages stay unread — check the provider "
+            "credentials and the harness driver's error mapping."
+        )
+        rt.save(agent_id)
+
+    def _reassert_no_progress_after_cancel(self, agent_id: str) -> None:
+        """A cancelled turn is not recovery evidence.
+
+        ``_flip_health_in_progress`` overrides the ``no_progress`` red at
+        batch-top; settling the cancelled turn through the success resolver
+        would launder that into ``ok`` with zero ``read_inbox`` admissions in
+        between. While the streak that earned the red is still live, put the
+        red back instead. Below threshold — or when the turn set a health
+        value that names a cause — the ordinary resolution stands (the
+        resolver only ever touches ``in_progress``).
+        """
+        streak = getattr(self, "_no_progress_turns", 0)
+        if streak >= _NO_PROGRESS_TURN_THRESHOLD and self.runtime.health in (
+            "ok", "in_progress", "unknown", "no_progress",
+        ):
+            Worker._write_no_progress_red(self, agent_id, streak)
+            return
+        Worker._resolve_health_on_success(self.runtime, agent_id, logger)
+
     def _resolve_health_after_success(self, agent_id: str) -> None:
         recovering_api_key = (
             getattr(self, "_claude_api_key_mode", False)
@@ -705,10 +1150,19 @@ class Worker:
         if recovering_api_key:
             self._api_key_auth_recovery_pending = False
             self._auth_failed_notification_sent = False
+        # Transport readiness, refresh and cancellation are not model success.
+        if self.runtime.health == "extra_usage_required":
+            self.runtime.health = "ok"
+            self.runtime.error = ""
+            self.runtime.save(agent_id)
+        self._extra_usage_notification_sent = False
+        # a turn that consumed its announced batch clears the no-progress streak
+        self._no_progress_turns = 0
         # a completed turn is proof quota is available again
         Worker._clear_drained(self.runtime, agent_id, logger)
         self._drained_notification_sent = False
         self._drained_resets_at = None
+        self._drained_budget_cap = False
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
@@ -794,7 +1248,9 @@ class Worker:
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
         self._drained_notification_sent = False
+        self._extra_usage_notification_sent = False
         self._drained_resets_at: int | None = None
+        self._drained_budget_cap = False
         self._claude_api_key_mode = (
             agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
             and bool(
@@ -810,6 +1266,11 @@ class Worker:
             started_at=int(time.time()),
             msg_count=0,
         )
+        # A restart permits a fresh attempt, but is not proof billing recovered.
+        previous = RuntimeState.load(agent_cfg.id)
+        if previous is not None and previous.health == "extra_usage_required":
+            self.runtime.health = previous.health
+            self.runtime.error = provider_failure_message("extra_usage_required")
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._restart_required = False
@@ -832,6 +1293,11 @@ class Worker:
         self._reload_lock = asyncio.Lock()
         self._turn_active = False
         self._refresh_now = asyncio.Event()
+        # MCP transport probe state (see ``probe_mcp_transport``): missed
+        # handshakes since the last confirmed one, and how many consecutive
+        # adapter reloads failed before their flags were abandoned.
+        self._mcp_probe_strikes = 0
+        self._refresh_reload_failures = 0
 
     def notify_refresh(self) -> None:
         """Wake the proactive refresh watcher now (sub-poll latency).
@@ -853,7 +1319,7 @@ class Worker:
         if self._turn_active:
             # A turn owns flag consumption; never apply mid-turn.
             return False
-        if not any(p.exists() for p in flag_paths):
+        if not any(_refresh_flag_is_pending(p) for p in flag_paths):
             # Cheap exists() check before taking the lock.
             return False
         async with self._reload_lock:
@@ -1130,12 +1596,30 @@ class Worker:
                 register_connected = getattr(client, "add_connected_callback", None)
                 if callable(register_connected):
                     register_connected(processing_reports.on_transport_connected)
+        agent_id = self.agent_cfg.id
+
+        # health only travels on heartbeats; without this a red written just
+        # after a turn settles waits out the interval before the server hears
+        # it. The periodic tick remains the fallback.
+        #
+        # One stable callable, bound and released together, so the module
+        # global is scoped to a running loop instead of outliving a stopped
+        # worker — and so neither shutdown path has to remember separately.
+        def _wake_heartbeat() -> None:
+            reporter.request_immediate_heartbeat()
+
         reporter = StatusReporter(
             client.http,
             runtime_health_provider=lambda: self.runtime.health,
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
             processing_reports=processing_reports,
+            on_loop_start=lambda: set_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
+            on_loop_stop=lambda: clear_runtime_health_listener(
+                agent_id, _wake_heartbeat
+            ),
         )
         if bridge is not None:
             bridge.add_connected_callback(reporter.report_current_status)
@@ -1235,18 +1719,27 @@ async def _process_refresh_flags(
     role_short: str = "",
     puffo_handle: str = "",
     workspace_shared_status: str = "existing",
-) -> None:
+) -> bool:
     """Consume worker refresh flags in one idle-boundary adapter reload.
 
     Resource and credential changes preserve session identity. Only an explicit
     session refresh starts a new logical and native provider conversation.
+
+    Returns whether the reload succeeded. On failure the flag files are
+    kept byte-for-byte (their content may carry scheduling fields owned
+    by the daemon) so the next turn-start or watcher tick retries; the
+    caller owns the give-up policy (``Worker._note_refresh_reload``).
+    Everything that runs before the reload is idempotent re-run work.
     """
-    host_sync_seen = refresh_host_sync_flag.exists()
-    agent_seen = refresh_agent_flag.exists()
-    session_seen = refresh_session_flag.exists()
-    provider_auth_seen = refresh_provider_auth_flag.exists()
+    host_sync_seen = _refresh_flag_is_pending(refresh_host_sync_flag)
+    agent_seen = _refresh_flag_is_pending(refresh_agent_flag)
+    session_seen = _refresh_flag_is_pending(refresh_session_flag)
+    provider_auth_exists = refresh_provider_auth_flag.exists()
+    provider_auth_seen = _refresh_flag_is_pending(refresh_provider_auth_flag)
+    if provider_auth_exists and (host_sync_seen or agent_seen or session_seen):
+        provider_auth_seen = True
     if not (host_sync_seen or agent_seen or session_seen or provider_auth_seen):
-        return
+        return True
 
     if host_sync_seen:
         _sync_refresh_host_assets(agent_id)
@@ -1293,17 +1786,35 @@ async def _process_refresh_flags(
             )
     except Exception as exc:
         logger.warning(
-            "agent %s: adapter.reload after refresh failed: %s",
+            "agent %s: adapter.reload after refresh failed "
+            "(flags kept for retry): %s",
             agent_id,
             exc,
         )
+        return False
 
-    for flag in (
-        refresh_host_sync_flag,
-        refresh_agent_flag,
-        refresh_session_flag,
-        refresh_provider_auth_flag,
-    ):
+    _pin_refreshed_generation(agent_id)
+    _unlink_refresh_flags(
+        refresh_host_sync_flag, refresh_agent_flag,
+        refresh_session_flag, refresh_provider_auth_flag,
+    )
+    return True
+
+
+def _pin_refreshed_generation(agent_id: str) -> None:
+    """The refresh reload rebuilt the spec and minted a fresh mcp
+    generation: pin it at the switch (see
+    ``rpc_service.pin_mcp_generation``)."""
+    from ..agent.harness.runtime.runtime_manager import get_runtime_manager
+    from . import rpc_service
+
+    mgr = get_runtime_manager(agent_id)
+    if mgr is not None and mgr.spec.mcp_generation:
+        rpc_service.pin_mcp_generation(agent_id, mgr.spec.mcp_generation)
+
+
+def _unlink_refresh_flags(*flags: Path) -> None:
+    for flag in flags:
         try:
             flag.unlink()
         except OSError:

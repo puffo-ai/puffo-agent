@@ -1506,7 +1506,7 @@ class MessageStore(
         sql = (
             "SELECT * FROM messages "
             "WHERE (envelope_id = ? OR thread_root_id = ?) "
-            f"AND {self._NOTE_LIKE} "
+            f"AND {_NOT_GATED} AND {self._NOTE_LIKE} "
             "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
         )
         params = [

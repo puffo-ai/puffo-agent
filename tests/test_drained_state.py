@@ -565,8 +565,9 @@ def test_settle_routes_drained_into_enter_drained_with_the_epoch():
     entered = []
 
     class _EnterRecorder:
-        def _enter_drained(self, agent_id, resets_at=None):
+        def _enter_drained(self, agent_id, resets_at=None, *, budget_cap=False):
             entered.append((agent_id, resets_at))
+            assert budget_cap is False, "a plan window is not a gateway cap"
 
     StandardWorkerRun._settle_process_health(
         _EnterRecorder(), "agent-1", "drained",
@@ -1368,3 +1369,377 @@ def test_codex_dm_names_codex_not_claude():
     text = format_codex_drained("agent-1", "Testy")
     assert "Codex usage limit" in text
     assert "Claude Code usage limit" not in text
+
+
+EXTRA_USAGE_DIAGNOSTIC = (
+    '400 {"type":"error","error":{"type":"invalid_request_error",'
+    '"message":"Third-party apps now draw from your extra usage, not your '
+    'plan limits. Add more at claude.ai/settings/usage"}}'
+)
+
+
+def test_extra_usage_is_distinct_from_plan_quota_and_holds_warm():
+    """The reported Pi 400 must not become a generic retry or a plan reset."""
+    code = classify_provider_failure(status=None, diagnostic=EXTRA_USAGE_DIAGNOSTIC)
+    assert code == "extra_usage_required"
+    exc = ProviderFailureError("extra usage unavailable", error_code=code)
+    assert failure_outcome(exc) == "extra_usage_required"
+    assert crash_resume_terminal(exc) == (str(exc), "extra_usage_required")
+    assert not StandardWorkerRun._retryable_local_warm_error(exc)
+    assert classify_provider_failure(
+        status=400, diagnostic=EXTRA_USAGE_DIAGNOSTIC + " usage limit reached"
+    ) == code
+    assert classify_provider_failure(status=429, diagnostic="Too Many Requests") == "rate_limit"
+    assert classify_provider_failure(status=400, diagnostic="extra usage documentation") == "provider_error"
+
+
+def test_extra_usage_survives_snapshots_and_refresh_until_success(tmp_path, monkeypatch):
+    """Only a successful model turn can clear the extra-usage failure."""
+    from puffo_agent.portal.credential_refresh import CredentialRefresher, RefreshOutcome
+
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    loop = _stub_create_task(monkeypatch)
+    w = _drained_worker("extra")
+    w._extra_usage_notification_sent = False
+    StandardWorkerRun._settle_process_health(w, "extra", "extra_usage_required", "raw private text")
+    assert w.runtime.health == "extra_usage_required"
+    assert "raw private text" not in w.runtime.error
+    assert loop.calls == 1
+    StandardWorkerRun._settle_process_health(w, "extra", "extra_usage_required", None)
+    assert loop.calls == 1
+    _stub_agents(monkeypatch, {"extra": "pi"})
+    for workers in ({"extra": w}, {}):
+        _stub_live_workers(monkeypatch, workers)
+        for used in (0, 100):
+            apply_drained_health({"pi": {"session": {"used_pct": used}}})
+            assert RuntimeState.load("extra").health == "extra_usage_required"
+    refresher = CredentialRefresher(host_home=tmp_path)
+    refresher._agent_homes = {str(tmp_path / "extra")}
+    refresher._flip_refresh_broken(RefreshOutcome.FAILED)
+    refresher._flip_auth_failed()
+    refresher._clear_refresh_broken()
+    assert RuntimeState.load("extra").health == "extra_usage_required"
+    Worker._clear_auth_failed_if_recoverable(w.runtime, "extra", logging.getLogger())
+    Worker._flip_health_in_progress(w.runtime, "extra", logging.getLogger())
+    assert w.runtime.health == "extra_usage_required"
+    StandardWorkerRun._settle_process_health(w, "extra", "cancelled", None)
+    assert w.runtime.health == "extra_usage_required"
+    w._resolve_health_after_success("extra")
+    assert w.runtime.health == "ok"
+    assert not w._extra_usage_notification_sent
+
+
+@pytest.mark.asyncio
+async def test_extra_usage_notifies_operator_with_recovery_action():
+    """Extra-usage alerts must not direct the operator to re-login or wait."""
+    client = _StubClient()
+    w = _drained_worker(client=client)
+    w._extra_usage_notification_sent = True
+    await w._notify_operator_of_extra_usage()
+    assert len(client.sent) == 1
+    text = client.sent[0][1]
+    assert "https://claude.ai/settings/usage" in text
+    assert "restart" in text.lower()
+    assert "login" not in text.lower()
+    assert "window resets" not in text.lower()
+
+
+def test_restart_preserves_extra_usage_until_a_real_turn_succeeds(tmp_path, monkeypatch):
+    """A new Worker may retry, but a process restart must not erase the red state."""
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig
+
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    RuntimeState(status="running", health="extra_usage_required", error="extra usage").save("extra")
+    w = Worker(DaemonConfig(), AgentConfig(id="extra"))
+    assert w.runtime.health == "extra_usage_required"
+    Worker._reassert_auth_failed_after_failed_probe(w.runtime, "extra", logging.getLogger())
+    assert w.runtime.health == "extra_usage_required"
+    w._resolve_health_after_success("extra")
+    assert RuntimeState.load("extra").health == "ok"
+
+
+def _worker_for_health_tests(tmp_path, monkeypatch):
+    """A Worker with a saveable RuntimeState; nothing else wired."""
+    from puffo_agent.portal.state import AgentConfig, RuntimeConfig, RuntimeState
+    from puffo_agent.portal.worker import Worker
+
+    cfg = AgentConfig(
+        id="agent-1",
+        runtime=RuntimeConfig(
+            kind="cli-local", provider="anthropic", harness="claude-code"
+        ),
+    )
+    worker = Worker.__new__(Worker)
+    worker.agent_cfg = cfg
+    worker.runtime = RuntimeState()
+    worker._drained_notification_sent = True  # no DM task in tests
+    worker._drained_resets_at = None
+    worker._drained_budget_cap = False
+    worker._client = None
+    return worker
+
+
+# ── Gateway budget caps (LiteLLM) ─────────────────────────────────────
+# Wording LiteLLM 1.93 actually emits: the team check, the key check, and the
+# user-level pre-call limiter. None carries a reset time.
+
+LITELLM_TEAM_CAP = (
+    "API Error: Request rejected (429) · Budget has been exceeded! "
+    "Team=team-5a46ddd9dc5a4febbe154487fa1b8048 "
+    "Current cost: 44.46579, Max budget: 43.86"
+)
+LITELLM_KEY_CAP = (
+    "Budget has been exceeded! Key=agent-finagle-4306-d55f080d-e4d8f1dc "
+    "(sk-...nWoA) Current cost: 10.0, Max budget: 10.0"
+)
+LITELLM_USER_CAP = "429 Max budget limit reached."
+
+
+def test_litellm_budget_caps_are_drained_not_rate_limited():
+    """A gateway spend cap is terminal for the turn: retrying cannot refill
+    a wallet, and every retry is a request the gateway counts. Before this,
+    the text matched nothing and fell through to ``rate_limit`` (retryable),
+    which is how four agents produced 1,359 rejections in a day."""
+    from puffo_agent.agent._usage_markers import looks_like_budget_cap
+    from puffo_agent.agent.provider_failures import classify_provider_failure
+
+    for text in (LITELLM_TEAM_CAP, LITELLM_KEY_CAP, LITELLM_USER_CAP):
+        assert looks_like_budget_cap(text) is True, text
+        assert looks_like_usage_limit(text) is True, text
+        is_auth, is_drained, _label = _classify_api_error(text)
+        assert (is_auth, is_drained) == (False, True), text
+        assert classify_provider_failure(status=429, diagnostic=text) == "plan_drained"
+        assert failure_outcome(AgentAPIError(text, is_drained=True)) == "drained"
+
+
+def test_budget_cap_is_a_strict_subset_of_drained():
+    """A plan window is drained but not a cap — the two recover differently
+    (snapshot-cleared vs timed probe), so the narrower predicate must not
+    swallow the wider one."""
+    from puffo_agent.agent._usage_markers import looks_like_budget_cap
+
+    assert looks_like_budget_cap("Claude AI usage limit reached|1780000000") is False
+    assert looks_like_budget_cap("API Error: Request rejected (429)") is False
+    assert looks_like_budget_cap("rate limit reached — please retry") is False
+
+
+def test_settle_routes_a_budget_cap_into_enter_drained_as_a_cap():
+    entered = []
+
+    class _EnterRecorder:
+        def _enter_drained(self, agent_id, resets_at=None, *, budget_cap=False):
+            entered.append((agent_id, resets_at, budget_cap))
+
+    StandardWorkerRun._settle_process_health(
+        _EnterRecorder(),
+        "agent-1",
+        "drained",
+        LITELLM_TEAM_CAP,
+    )
+    assert entered == [("agent-1", None, True)]
+
+
+def test_enter_drained_as_a_cap_says_so_and_marks_the_episode(tmp_path, monkeypatch):
+    """The status line must name the gateway cap, not a plan window that
+    will 'reset' — an operator reading the old text would wait for nothing."""
+    from puffo_agent.agent._usage_markers import (
+        BUDGET_EXCEEDED_RUNTIME_ERROR,
+        DRAINED_RUNTIME_ERROR,
+    )
+
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    worker = _worker_for_health_tests(tmp_path, monkeypatch)
+    worker._enter_drained("agent-1", None, budget_cap=True)
+    assert worker.runtime.health == "drained"
+    assert worker.runtime.error == BUDGET_EXCEEDED_RUNTIME_ERROR
+    assert worker._drained_budget_cap is True
+
+    worker.runtime.health = "ok"
+    worker._enter_drained("agent-1", 1780000000)
+    assert worker.runtime.error == DRAINED_RUNTIME_ERROR
+    assert worker._drained_budget_cap is False
+
+
+def test_usage_snapshot_does_not_clear_a_budget_cap():
+    """Plan headroom on the host says nothing about a gateway cap. A
+    recovered snapshot used to flip every drained worker back to ok; for a
+    cap that just re-probes a wall every snapshot cycle."""
+    from puffo_agent.portal.control.usage_snapshot import _apply_to_live_worker
+
+    cleared = []
+
+    class _Worker:
+        _drained_budget_cap = True
+        runtime = type("RT", (), {"health": "drained"})()
+
+        @staticmethod
+        def _clear_drained(runtime, agent_id, log):
+            cleared.append(agent_id)
+
+    _apply_to_live_worker(_Worker(), "agent-1", (False, None))
+    assert cleared == []
+
+    class _PlanWorker(_Worker):
+        _drained_budget_cap = False
+
+    _apply_to_live_worker(_PlanWorker(), "agent-2", (False, None))
+    assert cleared == ["agent-2"]
+
+
+# ── Timed hold on the runtime ──────────────────────────────────────────
+
+
+class _Coalescer:
+    def __init__(self):
+        self.delays: list[float] = []
+
+    def notify(self, delay_seconds=0.0):
+        self.delays.append(delay_seconds)
+
+
+def _gated_runtime(drained_check=None):
+    from puffo_agent.agent.global_inbox_degraded import DegradedRecoveryMixin
+
+    class _Gated(DegradedRecoveryMixin):
+        pass
+
+    rt = _Gated()
+    rt.coalescer = _Coalescer()
+    rt._init_recovery_gates(drained_check)
+    return rt
+
+
+def test_budget_park_holds_through_wakes_then_probes_once(monkeypatch):
+    """A cap has no window to wait for and no snapshot will clear it on a
+    sandbox, so the hold IS the exit: swallow wakes until it expires, then
+    let exactly one turn through regardless of the snapshot's opinion."""
+    from puffo_agent.agent import global_inbox_degraded as mod
+
+    now = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+    rt = _gated_runtime(drained_check=lambda: True)  # snapshot still says spent
+
+    rt._park_drained(hold_seconds=300.0, diagnostic="gateway budget cap")
+    assert rt.health.state == "degraded"
+    assert "budget cap" in rt.health.diagnostic
+    assert rt.coalescer.delays == [300.0]
+
+    now[0] += 120.0
+    assert rt._drained_park_allows_processing() is False
+    assert rt.coalescer.delays[-1] == 180.0  # re-armed for the remainder
+
+    now[0] += 200.0
+    assert rt._drained_park_allows_processing() is True  # the probe
+    assert rt._parked_drained is False
+    assert rt._drained_park_until is None
+
+
+def test_plan_park_still_waits_for_the_snapshot():
+    """The untimed park is unchanged: a plan drain is cleared by the host's
+    usage snapshot, not a timer."""
+    rt = _gated_runtime(drained_check=lambda: True)
+    rt._park_drained()
+    assert rt._drained_park_until is None
+    assert rt._drained_park_allows_processing() is False
+    rt.drained_check = lambda: False
+    assert rt._drained_park_allows_processing() is True
+
+
+def test_budget_hold_escalates_and_resets_on_success():
+    rt = _gated_runtime()
+    assert [rt.next_budget_park_hold() for _ in range(5)] == [
+        300.0,
+        600.0,
+        1200.0,
+        1800.0,
+        1800.0,
+    ]
+    rt._clear_budget_park_backoff()
+    assert rt.next_budget_park_hold() == 300.0
+
+
+def test_notify_does_not_release_a_budget_hold(monkeypatch):
+    """``notify()`` clears the degraded backoff on every wake — an inbound
+    message must not turn into a probe while the hold is running."""
+    from puffo_agent.agent import global_inbox_degraded as mod
+
+    now = [5000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+    rt = _gated_runtime()
+    rt._park_drained(hold_seconds=300.0)
+    rt._clear_degraded_backoff()  # what notify() does
+    assert rt._parked_drained is True
+    assert rt._drained_park_allows_processing() is False
+
+
+def _failure_runtime(monkeypatch, now):
+    """A GlobalInboxRuntime with just enough wired for the failure path."""
+    from puffo_agent.agent import global_inbox_degraded as mod
+    from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
+
+    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+    rt = GlobalInboxRuntime.__new__(GlobalInboxRuntime)
+    rt.agent_id = "agent-1"
+    rt.coalescer = _Coalescer()
+    rt._turn_state_lock = asyncio.Lock()
+    rt.active = type(
+        "Active", (), {"provider_session_id": "s", "provider_turn_id": "t"}
+    )()
+    rt._init_recovery_gates(None)
+
+    async def _requeue(planned, started, category):
+        return True
+
+    rt._requeue_active_turn = _requeue
+    return rt
+
+
+def _planned():
+    return type(
+        "Planned", (), {"turn_id": "turn-1", "notice_generation": 0, "targets": ()}
+    )()
+
+
+def test_budget_cap_failure_parks_on_an_escalating_hold(monkeypatch):
+    """The failure handler is where the two drains fork: a cap gets the
+    timed hold (5 → 10 min across consecutive hits), a plan window gets
+    the untimed park the usage snapshot clears."""
+    now = [100.0]
+    rt = _failure_runtime(monkeypatch, now)
+
+    terminal, outcome, text = asyncio.run(
+        rt._handle_process_failure(
+            _planned(), 0.0, AgentAPIError(LITELLM_TEAM_CAP, is_drained=True)
+        )
+    )
+    assert (terminal, outcome) == (True, "drained")
+    assert rt._parked_drained is True
+    assert rt._drained_park_until == 400.0
+    assert "gateway budget cap" in rt.health.diagnostic
+    assert rt.coalescer.delays == [300.0]
+
+    now[0] = 400.0
+    assert rt._drained_park_allows_processing() is True  # the probe
+    asyncio.run(
+        rt._handle_process_failure(
+            _planned(), 0.0, AgentAPIError(LITELLM_KEY_CAP, is_drained=True)
+        )
+    )
+    assert rt._drained_park_until == 1000.0  # 600s: it escalated
+
+    rt._clear_budget_park_backoff()  # what a completed turn does
+    assert rt.next_budget_park_hold() == 300.0
+
+
+def test_plan_drain_failure_keeps_the_untimed_park(monkeypatch):
+    rt = _failure_runtime(monkeypatch, [100.0])
+    asyncio.run(
+        rt._handle_process_failure(
+            _planned(),
+            0.0,
+            AgentAPIError("Claude AI usage limit reached|1780000000", is_drained=True),
+        )
+    )
+    assert rt._parked_drained is True
+    assert rt._drained_park_until is None
+    assert rt.coalescer.delays == []

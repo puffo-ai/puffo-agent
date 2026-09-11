@@ -166,7 +166,7 @@ async def test_real_opencode_driver_loads_skill_and_reports_context(tmp_path: Pa
             for event in events
         ), events
         assert "".join(
-            str(event.data.get("delta") or "")
+            str(event.data.get("text") or "")
             for event in events
             if event.type is HarnessEventType.ASSISTANT_DELTA
         ) == "SENTINEL-OPENCODE-SKILL"
@@ -204,7 +204,7 @@ async def test_real_opencode_driver_loads_skill_and_reports_context(tmp_path: Pa
                 break
         assert driver._native_session_id == native_session_id
         assert "SENTINEL-OPENCODE-SKILL" in "".join(
-            str(event.data.get("delta") or "")
+            str(event.data.get("text") or "")
             for event in continued
             if event.type is HarnessEventType.ASSISTANT_DELTA
         )

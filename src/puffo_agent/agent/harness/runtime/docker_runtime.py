@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -127,6 +128,8 @@ class DockerRuntimePreparer:
             agent_cfg.runtime.docker_memory_reservation
             or daemon_cfg.docker_memory_reservation
         )
+        # Minted per spec build in ``refresh_spec``.
+        self._mcp_generation = ""
         self._docker_bin = "docker"
         self._desired_extras: dict[str, dict] = {}
         self._desired_installed = False
@@ -164,6 +167,15 @@ class DockerRuntimePreparer:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.agent_home.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+        # One mint for both container harnesses — see the cli-local twin in
+        # ``LocalRuntimePreparer.refresh_spec``. A per-harness mint is how
+        # codex ended up with the transport probe silently disabled.
+        # Empty when there is no Puffo MCP to hello back: the probe treats a
+        # generation as a promise that a subprocess will report in, and an
+        # agent without MCP must not be recycled waiting for one.
+        self._mcp_generation = (
+            uuid.uuid4().hex if self._container_puffo_mcp_env() else ""
+        )
         if self.harness_name == HARNESS_CLAUDE_CODE:
             await self._sync_claude_host_assets()
             return self._prepare_claude_spec(system_prompt)
@@ -276,8 +288,11 @@ class DockerRuntimePreparer:
                 self.agent_id,
                 inference,
             )
-        mcp_env = self._container_puffo_mcp_env()
+        mcp_env = self._container_puffo_mcp_env_with_generation()
         if mcp_env:
+            # The subprocess echoes the generation back over RPC (mcp-hello)
+            # so the worker's transport probe can tell "this spec's MCP
+            # reached us" from a stale predecessor.
             config_host = self.workspace_dir / ".puffo-agent" / "mcp-config.json"
             write_cli_mcp_config(
                 config_host,
@@ -331,6 +346,7 @@ class DockerRuntimePreparer:
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
             auto_compact_threshold_tokens=compact_tokens,
+            mcp_generation=self._mcp_generation,
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
@@ -339,6 +355,19 @@ class DockerRuntimePreparer:
             llm_base_url=self.agent_cfg.runtime.llm_base_url,
             api_key=self.agent_cfg.runtime.api_key,
         )
+
+    def _container_puffo_mcp_env_with_generation(self) -> dict[str, str] | None:
+        """The container MCP environment, generation included.
+
+        Both harnesses go through here so the subprocess can echo the
+        generation back over ``mcp-hello``; without it the daemon-side
+        probe returns early on an empty spec generation and a wedged
+        transport is never detected.
+        """
+        env = self._container_puffo_mcp_env()
+        if not env:
+            return None
+        return {**env, "PUFFO_MCP_GENERATION": self._mcp_generation}
 
     def _container_puffo_mcp_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core
@@ -389,7 +418,7 @@ class DockerRuntimePreparer:
             "inference_level": self.agent_cfg.runtime.inference_level,
             "provider": gateway,
         }
-        puffo_env = self._container_puffo_mcp_env()
+        puffo_env = self._container_puffo_mcp_env_with_generation()
         if puffo_env:
             config_kwargs.update(
                 {
@@ -443,12 +472,14 @@ class DockerRuntimePreparer:
         return RuntimeSpec(
             workspace_dir="/workspace",
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             environment=environment,
             permission_mode=self.permission_mode,
             sandbox=CONTAINER_SANDBOX,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
+            mcp_generation=self._mcp_generation,
         )
 
     def _legacy_session_path(self) -> Path:

@@ -319,6 +319,37 @@ async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("level", "native_variant"), [("high", "high"), ("off", "none")],
+)
+async def test_opencode_runtime_forwards_selected_variant(
+    puffo_home, monkeypatch, level, native_variant,
+):
+    """A model-advertised reasoning level must reach ``opencode run``."""
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id="opencode-variant",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="opencode",
+            model="openai/gpt-5",
+            inference_level=level,
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.spec.launch_args == ("--variant", native_variant)
+
+
+@pytest.mark.asyncio
 async def test_pi_uses_shared_binary_resolver(puffo_home, monkeypatch):
     import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
