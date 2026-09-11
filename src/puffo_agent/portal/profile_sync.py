@@ -180,6 +180,11 @@ async def sync_agent_profile(cfg: AgentConfig, patch: dict[str, Any]) -> None:
     is the single choke point every profile-sync caller reaches
     (sync_full_profile, cli, api handlers, control link), so the guard
     belongs here."""
+    # blank avatar_url: server 400 INVALID_AVATAR_URL, whole patch lost
+    av = patch.get("avatar_url")
+    if isinstance(av, str) and not av.strip():
+        patch = {k: v for k, v in patch.items() if k != "avatar_url"}
+
     pc = cfg.puffo_core
     if pc.transport == "bridge":
         logger.debug(
