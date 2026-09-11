@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .lingtai_profile import source_agent_name
+
 import asyncio
 import json
 import os
@@ -139,6 +141,8 @@ def _normalize(row: object, root: Path) -> dict:
         raise ValueError("LingTai discovery returned a missing working folder")
     return {
         "display_name": name[:200], "agent_dir": str(directory),
+        "agent_name": source_agent_name(directory),
+        "description": None, "profile_source": "lingtai",
         "workspace": str(workspace_path), "status": status,
         "runtime_id": row.get("runtime_id"),
         "formerly_bound_runtime_id": row.get("formerly_bound_runtime_id"),

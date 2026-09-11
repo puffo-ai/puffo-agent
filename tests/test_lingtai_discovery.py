@@ -139,3 +139,23 @@ async def test_invalid_explicit_root_returns_actionable_error(monkeypatch, root)
     result = await discovery.discover_lingtai({"root": root}, operator="owner")
     assert result["ok"] is False
     assert result["error"]
+
+
+@pytest.mark.parametrize("document, expected", [
+    ('{"manifest":{"agent_name":"Source Name"}}', "Source Name"),
+    ('{"manifest":{}}', None),
+    ('not json', None),
+    ('{"manifest":{"agent_name":""}}', None),
+    (' ' * (1024 * 1024 + 1), None),
+], ids=['valid', 'missing', 'malformed', 'empty', 'oversize'])
+def test_candidate_metadata_never_substitutes_directory_label(tmp_path, document, expected):
+    """Missing/invalid source identity stays visible but cannot become a basename import."""
+    directory = tmp_path / "misleading-name"
+    directory.mkdir()
+    (directory / "init.json").write_text(document)
+    row = discovery._normalize({"agent_dir": str(directory), "display_name": "CLI Label",
+                                "status": "available"}, tmp_path)
+    assert row["agent_name"] == expected
+    assert row["description"] is None
+    assert row["profile_source"] == "lingtai"
+    assert row["display_name"] == "CLI Label"

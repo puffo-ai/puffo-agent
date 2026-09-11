@@ -34,6 +34,7 @@ from ..state import (
     is_valid_agent_id,
 )
 from .certs import CertError, verify_device_cert, verify_identity_cert, verify_slug_binding
+from .lingtai_profile import validate_import_profile
 from .lingtai import LingtaiLaunch, parse_lingtai_launch, provision_lingtai, revoke_lingtai
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,11 @@ def verify_agent_bundle(payload: dict, operator_root_key_b64: str) -> dict:
     if lingtai is not None:
         if runtime_input.get("kind") != RUNTIME_CLI_LOCAL or runtime_input.get("harness") != "acp":
             raise ProvisionError("LingTai requires the cli-local ACP runtime")
+        try:
+            validate_import_profile(payload, lingtai.agent_dir)
+        except ValueError as exc:
+            raise ProvisionError(str(exc)) from exc
+        profile_fields = (payload["display_name"], *profile_fields[1:])
         runtime_input = {**runtime_input, "harness_command": lingtai.argv()}
     runtime = _verify_runtime(runtime_input)
     desired_skills, desired_mcps = _verify_desired(payload)
@@ -381,6 +387,7 @@ async def provision_agent_from_bundle(
     launch = context["lingtai"]
     if launch is not None:
         try:
+            validate_import_profile(payload, launch.agent_dir)
             await provision_lingtai(launch)
         except (ValueError, OSError, asyncio.TimeoutError) as exc:
             raise ProvisionError(f"LingTai runtime provisioning failed: {exc}") from exc

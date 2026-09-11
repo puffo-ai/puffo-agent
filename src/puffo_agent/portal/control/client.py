@@ -377,6 +377,12 @@ def _set_agent_state(agent_slug: str | None, state: str) -> dict:
 
 async def _execute_edit(agent_slug: str | None, params: dict) -> dict:
     cfg = AgentConfig.load(agent_slug)
+    from .lingtai_profile import guarded_edit_params
+
+    try:
+        params = guarded_edit_params(cfg, params)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     patch, prompt_changed = _apply_edit_profile_fields(cfg, params)
     runtime_changed, error = _apply_edit_runtime(cfg, params)
     if error is not None:

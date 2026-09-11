@@ -1009,3 +1009,44 @@ async def test_concurrent_identical_env_edits_are_idempotent(home):
     assert AgentConfig.load("scout").env_overrides == {
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["display_name", "role", "role_short", "soul", "profile", "runtime"])
+async def test_lingtai_edit_rejected_atomically_for_legacy_import(home, change):
+    """Legacy argv-derived ownership must prevent partial config/profile writes."""
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.harness = "acp"
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness_command = ["/tmp/renamed-cli", "acp", "--profile=puffo-v1", "--runtime-id", "stable"]
+    cfg.save()
+    from puffo_agent.portal.state import agent_yml_path
+    config_before = agent_yml_path("scout").read_bytes()
+    profile = cfg.resolve_profile_path()
+    profile_before = profile.read_bytes() if profile.exists() else None
+    value = {"harness": "codex"} if change == "runtime" else "Override"
+    result = await execute_command("edit", "scout", {change: value, "avatar_url": "changed"})
+    assert result["ok"] is False
+    assert agent_yml_path("scout").read_bytes() == config_before
+    assert (profile.read_bytes() if profile.exists() else None) == profile_before
+
+
+@pytest.mark.asyncio
+async def test_lingtai_edit_allows_unchanged_name_without_profile_sync(home, monkeypatch):
+    """General edit clients may include read-only unchanged values without failing avatar edits."""
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.harness = "acp"
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness_command = ["/tmp/lingtai", "acp", "--profile", "puffo-v0"]
+    cfg.save()
+    patches = []
+    async def sync(cfg, patch):
+        patches.append(patch)
+    monkeypatch.setattr(cc, "_sync_edit_profile", sync)
+    result = await execute_command("edit", "scout", {"display_name": cfg.display_name, "avatar_url": "avatar"})
+    assert result["ok"] is True
+    assert patches == [{"avatar_url": "avatar"}]

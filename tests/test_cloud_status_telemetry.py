@@ -149,3 +149,12 @@ async def test_worker_registers_reconnect_status_callback():
             "health": "unknown",
         },
     )]
+
+
+def test_runtime_inventory_exposes_legacy_lingtai_profile_ownership():
+    """Portal locks must work for imports created before metadata fields existed."""
+    agent = AgentConfig(id="imported", runtime=RuntimeConfig(
+        kind="cli-local", provider="openai", harness="acp",
+        harness_command=["/tmp/custom-wrapper", "acp", "--profile=puffo-v1", "--runtime-id", "stable"],
+    ))
+    assert Worker(DaemonConfig(), agent)._runtime_info()["profile_source"] == "lingtai"

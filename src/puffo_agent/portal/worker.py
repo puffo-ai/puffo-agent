@@ -1535,6 +1535,11 @@ class Worker:
             "model": model,
             "inference_level": getattr(rt, "inference_level", ""),
         }
+        if harness == "acp":
+            from .control.lingtai_profile import is_lingtai_runtime
+
+            if is_lingtai_runtime(rt):
+                info["profile_source"] = "lingtai"
         adapter = getattr(self, "_adapter", None)
         context_limits = getattr(adapter, "context_limits", None)
         limits = context_limits() if callable(context_limits) else (None, None)

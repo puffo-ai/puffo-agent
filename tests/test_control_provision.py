@@ -452,7 +452,7 @@ async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path,
     workspace = tmp_path / "existing-workspace"
     source.mkdir()
     workspace.mkdir()
-    (source / "init.json").write_text("{}")
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Helper"}}')
     marker = tmp_path / "cli-args.json"
     executable = tmp_path / "lingtai-agent"
     executable.write_text(
@@ -461,6 +461,7 @@ async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path,
     )
     executable.chmod(0o700)
     payload, operator = _payload()
+    payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
         "kind": "cli-local", "harness": "acp", "provider": "openai",
         "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(workspace)},
@@ -478,7 +479,7 @@ async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path,
     for field in ["--runtime-id", "--registry"]:
         assert argv[argv.index(field) + 1] == provision_args[provision_args.index(field) + 1]
     assert provision_args[provision_args.index("--agent-dir") + 1] == str(source)
-    assert (source / "init.json").read_text() == "{}"
+    assert (source / "init.json").read_text() == '{"manifest":{"agent_name":"Helper"}}'
 
 
 @pytest.mark.asyncio
@@ -489,11 +490,12 @@ async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
     source = tmp_path / "source"
     source.mkdir()
-    (source / "init.json").write_text("{}")
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Helper"}}')
     executable = tmp_path / "lingtai-agent"
     executable.write_text(f"#!{sys.executable}\nimport sys\nprint('error: puffo-v0 runtime registry parent directory is owned by another user', file=sys.stderr)\nraise SystemExit(1)\n")
     executable.chmod(0o700)
     payload, operator = _payload()
+    payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
         "kind": "cli-local", "harness": "acp", "provider": "openai",
         "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(source)},
@@ -514,8 +516,9 @@ def lingtai_creation(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "daemon"))
     source = tmp_path / "source"
     source.mkdir()
-    (source / "init.json").write_text("{}")
+    (source / "init.json").write_text('{"manifest":{"agent_name":"Helper"}}')
     payload, operator = _payload()
+    payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
         "kind": "cli-local", "harness": "acp", "provider": "openai",
         "lingtai": {"executable": sys.executable, "agent_dir": str(source), "workspace": str(source)},
@@ -602,3 +605,33 @@ async def test_lingtai_repeated_cancellation_finishes_rollback(lingtai_creation,
         await task
     assert not associations
     assert caught.value.args == ("first cancellation",)
+
+
+@pytest.mark.parametrize("change", ["display_name", "role", "soul", "profile", "source", "missing_source"])
+def test_lingtai_import_rejects_source_profile_drift_before_creation(lingtai_creation, change):
+    """A stale browser choice or persona payload must never materialize identity."""
+    from pathlib import Path
+
+    payload, operator, associations = lingtai_creation
+    if change in ("source", "missing_source"):
+        source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+        (source / "init.json").write_text('{"manifest":{"agent_name":"Changed"}}' if change == "source" else "{}")
+    else:
+        payload[change] = "Override"
+    with pytest.raises(ProvisionError, match="LingTai"):
+        verify_agent_bundle(payload, operator)
+    assert not associations
+
+
+@pytest.mark.asyncio
+async def test_lingtai_source_drift_during_preflight_cannot_register(lingtai_creation):
+    """An async preflight must not turn source validation into a stale snapshot."""
+    from pathlib import Path
+
+    payload, operator, associations = lingtai_creation
+    async def preflight(context):
+        source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+        (source / "init.json").write_text('{"manifest":{"agent_name":"Changed"}}')
+    with pytest.raises(ProvisionError, match="source name changed"):
+        await provision_agent_from_bundle(payload, operator, preflight=preflight)
+    assert not associations
