@@ -16,7 +16,7 @@ _PROFILE_FIELDS = frozenset({"display_name", "role", "role_short", "soul", "prof
 @dataclass(frozen=True)
 class SourceProfile:
     agent_name: str | None
-    profile_name_source: str | None
+    name_source_file: str | None
     profile_read_error: str | None
     import_display_name: str | None
 

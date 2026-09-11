@@ -157,7 +157,7 @@ def test_candidate_metadata_never_substitutes_directory_label(tmp_path, document
                                 "status": "available"}, tmp_path)
     assert row["agent_name"] == expected
     assert row["profile_read_error"] == error
-    assert row["profile_name_source"] == "init.json"
+    assert row["name_source_file"] == "init.json"
     assert row["import_display_name"] == (None if error else expected or "")
     assert row["description"] is None
     assert row["profile_source"] == "lingtai"
@@ -182,7 +182,7 @@ def test_existing_agent_metadata_is_exclusive_even_when_unnamed(tmp_path, source
                                 "status": "available"}, tmp_path)
     assert row["agent_name"] == expected
     assert row["profile_read_error"] == error
-    assert row["profile_name_source"] == ".agent.json"
+    assert row["name_source_file"] == ".agent.json"
     assert row["import_display_name"] == (None if error else expected or "")
 
 
