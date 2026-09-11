@@ -105,6 +105,29 @@ class _DaemonRuntime:
         self.control_manager = None
 
 
+def _is_subscription(agent_cfg) -> bool:
+    """A subscription agent has nothing for the refresher to refresh.
+
+    Its credential is a self-contained, year-long plan token supplied by the
+    provisioner -- there is no host keychain to re-read and no gateway key to
+    rotate. Without this, an agent whose ``llm_base_url`` is empty (which a
+    subscription agent's is, deliberately) falls through to the OAuth refresh
+    path, which then hunts for an operator credential view that does not exist
+    inside a sandbox, declares auth-failed, and blocks the turn.
+
+    Checked *before* ``llm_base_url`` so the mode decides, not a side effect of
+    which fields happen to be set.
+    """
+    from ..agent.harness.support.subscription_credentials import (
+        AUTH_MODE_SUBSCRIPTION,
+    )
+
+    return (
+        getattr(getattr(agent_cfg, "runtime", None), "auth_mode", "")
+        == AUTH_MODE_SUBSCRIPTION
+    )
+
+
 class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
@@ -512,7 +535,8 @@ class Daemon:
         # getattr: a runtime without the field is simply not in gateway mode —
         # never let a missing optional field crash worker startup.
         if (
-            (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip()
+            _is_subscription(agent_cfg)
+            or (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip()
             or Daemon._uses_claude_api_key(self, agent_cfg)
         ):
             return
@@ -594,7 +618,8 @@ class Daemon:
         # api.openai.com probe that 401s. Native-auth harnesses keep the refresh.
         # getattr: see _register_with_refresher — a missing field means OAuth mode.
         if (
-            (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip()
+            _is_subscription(agent_cfg)
+            or (getattr(agent_cfg.runtime, "llm_base_url", "") or "").strip()
             or Daemon._uses_claude_api_key(self, agent_cfg)
         ):
             return None

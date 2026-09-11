@@ -470,6 +470,32 @@ def claude_cli_api_key(daemon_cfg: DaemonConfig | None) -> str:
     return getattr(anthropic, "api_key", "")
 
 
+def subscription_token(daemon_cfg: DaemonConfig | None, harness: str) -> str:
+    """The operator's plan credential for ``harness``, or "".
+
+    Read from the environment the agent process was started with -- which is how
+    a cloud sandbox receives it: the provisioner sets it at sandbox creation and
+    it is never written to agent.yml. ``daemon_cfg`` is accepted for symmetry
+    with :func:`claude_cli_api_key` and as the seam for a future configured
+    source; nothing reads it yet.
+
+    This lives in ``portal`` rather than the harness tree on purpose. The harness
+    boundary is forbidden from reading ambient environment (see
+    ``tests/test_child_env_allowlist.py``); resolution belongs on this side of it,
+    and the value is handed down as an argument.
+    """
+    import os
+
+    from ..agent.harness.support.subscription_credentials import (
+        CLAUDE_SUBSCRIPTION_ENV,
+        CODEX_SUBSCRIPTION_ENV,
+    )
+
+    del daemon_cfg  # reserved; see docstring
+    name = CODEX_SUBSCRIPTION_ENV if harness == "codex" else CLAUDE_SUBSCRIPTION_ENV
+    return (os.environ.get(name, "") or "").strip()
+
+
 @dataclass
 class TriggerRules:
     on_mention: bool = True
@@ -547,6 +573,13 @@ class RuntimeConfig:
     # harness's normal OAuth endpoint. The matching gateway secret rides on
     # ``api_key`` (the VK), so no separate field is needed.
     llm_base_url: str = ""
+    # Which credential the harness authenticates with. "api-gateway" (the
+    # default) uses ``llm_base_url`` + ``api_key`` -- the metered LiteLLM
+    # path, and the only correct mode for an agent someone else pays for.
+    # "subscription" bills the operator's own Claude/ChatGPT plan instead;
+    # the secret then comes from the agent process environment, never from
+    # this file. See agent/harness/support/subscription_credentials.py.
+    auth_mode: str = "api-gateway"
     # Tool allowlist patterns (cli-local | cli-docker). Each
     # entry is a bare tool name ("Read") or tool-name-plus-arg glob
     # ("Bash(git *)", "Read(**/*.py)"). Empty = no tools allowed.
@@ -812,6 +845,7 @@ def _load_runtime_config(
         inference_level=inference,
         api_key=raw.get("api_key", ""),
         llm_base_url=raw.get("llm_base_url", ""),
+        auth_mode=_validate_auth_mode(agent_id, raw.get("auth_mode")),
         allowed_tools=list(raw.get("allowed_tools") or []),
         docker_image=raw.get("docker_image", ""),
         docker_memory_limit=raw.get("docker_memory_limit", ""),
@@ -823,6 +857,30 @@ def _load_runtime_config(
         max_turns=int(raw.get("max_turns", 10)),
         task_timeout_seconds=float(raw.get("task_timeout_seconds", 1800.0)),
     )
+
+
+def _validate_auth_mode(agent_id: str, raw: object) -> str:
+    """Normalize ``runtime.auth_mode``; absent or empty means api-gateway.
+
+    Defaulting to the metered path is deliberate: this package is vendored
+    into sandbox images that may be promoted to production, where agents must
+    stay on the gateway. An agent opts *into* subscription billing explicitly.
+    """
+    from ..agent.harness.support.subscription_credentials import (
+        AUTH_MODE_API_GATEWAY,
+        AUTH_MODES,
+    )
+
+    if raw is None or raw == "":
+        return AUTH_MODE_API_GATEWAY
+    mode = str(raw).strip()
+    if mode not in AUTH_MODES:
+        allowed = ", ".join(sorted(AUTH_MODES))
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.auth_mode must be one of "
+            f"{allowed}; got {mode!r}"
+        )
+    return mode
 
 
 def _migrate_local_harness(

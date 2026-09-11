@@ -50,6 +50,10 @@ from ....portal.state import (
 )
 from ....portal.workspace_layout import prepare_workspace_shared_access
 from ...adapters.base import anthropic_base_url_env
+from ..support.subscription_credentials import (
+    AUTH_MODE_SUBSCRIPTION,
+    SubscriptionUnsupported,
+)
 from ...adapters.desired_install import run_spawn_install
 from ...cli_bin import resolve_docker_bin
 from .docker_support import (
@@ -308,6 +312,17 @@ class DockerRuntimePreparer:
                 "agent %s: Docker Claude Puffo MCP tools are unavailable "
                 "because puffo_core is incomplete",
                 self.agent_id,
+            )
+        if self.agent_cfg.runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            # cli-docker hands provider credentials to the container by name via
+            # `docker exec -e` -- a different mechanism from the cli-local path
+            # that implements subscription. Falling through to the api-gateway
+            # path would silently meter an agent the operator asked to bill their
+            # own plan, so refuse until this runtime implements it. Cloud agents
+            # are unaffected: they boot kind=cli-local.
+            raise SubscriptionUnsupported(
+                f"runtime.auth_mode={AUTH_MODE_SUBSCRIPTION!r} is not supported by "
+                "the cli-docker runtime yet; cloud agents run cli-local."
             )
         remove_legacy_permission_hook(self.agent_home / ".claude")
         environment = {
