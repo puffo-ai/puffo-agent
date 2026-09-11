@@ -464,7 +464,7 @@ async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path,
     payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
         "kind": "cli-local", "harness": "acp", "provider": "openai",
-        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(workspace)},
+        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(workspace), "agent_name": "Helper"},
     }
 
     async def materialize(context):
@@ -498,7 +498,7 @@ async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path
     payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
         "kind": "cli-local", "harness": "acp", "provider": "openai",
-        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(source)},
+        "lingtai": {"executable": str(executable), "agent_dir": str(source), "workspace": str(source), "agent_name": "Helper"},
     }
     materialized = []
 
@@ -521,7 +521,7 @@ def lingtai_creation(tmp_path, monkeypatch):
     payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
         "kind": "cli-local", "harness": "acp", "provider": "openai",
-        "lingtai": {"executable": sys.executable, "agent_dir": str(source), "workspace": str(source)},
+        "lingtai": {"executable": sys.executable, "agent_dir": str(source), "workspace": str(source), "agent_name": "Helper"},
     }
     associations = set()
 
@@ -635,3 +635,40 @@ async def test_lingtai_source_drift_during_preflight_cannot_register(lingtai_cre
     with pytest.raises(ProvisionError, match="source name changed"):
         await provision_agent_from_bundle(payload, operator, preflight=preflight)
     assert not associations
+
+
+@pytest.mark.parametrize("name", [None, ""])
+def test_unnamed_lingtai_import_uses_fixed_placeholder_not_init_name(lingtai_creation, name):
+    """Readable unnamed sources can import without exposing an operator rename bypass."""
+    import json
+    from pathlib import Path
+
+    payload, operator, _ = lingtai_creation
+    source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+    (source / ".agent.json").write_text(json.dumps({"agent_name": name}))
+    payload["runtime"]["lingtai"]["agent_name"] = None
+    payload.update(display_name="Unnamed Agent", profile="# Unnamed Agent\n")
+    assert verify_agent_bundle(payload, operator)["display_name"] == "Unnamed Agent"
+    payload.update(display_name="Helper", profile="# Helper\n")
+    with pytest.raises(ProvisionError, match="source name changed"):
+        verify_agent_bundle(payload, operator)
+
+
+@pytest.mark.parametrize("selection", ["missing", "named-placeholder", "unnamed-to-named"])
+def test_lingtai_import_requires_exact_nullable_name_snapshot(lingtai_creation, selection):
+    """Placeholder display equality must not mask named/unnamed source drift."""
+    from pathlib import Path
+
+    payload, operator, _ = lingtai_creation
+    source = Path(payload["runtime"]["lingtai"]["agent_dir"])
+    if selection == "missing":
+        del payload["runtime"]["lingtai"]["agent_name"]
+    else:
+        payload.update(display_name="Unnamed Agent", profile="# Unnamed Agent\n")
+        selected_name = "Unnamed Agent" if selection == "named-placeholder" else None
+        payload["runtime"]["lingtai"]["agent_name"] = selected_name
+        (source / ".agent.json").write_text(
+            '{"agent_name":null}' if selected_name else '{"agent_name":"Unnamed Agent"}'
+        )
+    with pytest.raises(ProvisionError, match="source name changed"):
+        verify_agent_bundle(payload, operator)

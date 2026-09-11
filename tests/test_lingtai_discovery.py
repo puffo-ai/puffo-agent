@@ -141,14 +141,14 @@ async def test_invalid_explicit_root_returns_actionable_error(monkeypatch, root)
     assert result["error"]
 
 
-@pytest.mark.parametrize("document, expected", [
-    ('{"manifest":{"agent_name":"Source Name"}}', "Source Name"),
-    ('{"manifest":{}}', None),
-    ('not json', None),
-    ('{"manifest":{"agent_name":""}}', None),
-    (' ' * (1024 * 1024 + 1), None),
+@pytest.mark.parametrize("document, expected, error", [
+    ('{"manifest":{"agent_name":"Source Name"}}', "Source Name", None),
+    ('{"manifest":{}}', None, None),
+    ('not json', None, "source_unreadable"),
+    ('{"manifest":{"agent_name":""}}', None, None),
+    (' ' * (1024 * 1024 + 1), None, "source_unreadable"),
 ], ids=['valid', 'missing', 'malformed', 'empty', 'oversize'])
-def test_candidate_metadata_never_substitutes_directory_label(tmp_path, document, expected):
+def test_candidate_metadata_never_substitutes_directory_label(tmp_path, document, expected, error):
     """Missing/invalid source identity stays visible but cannot become a basename import."""
     directory = tmp_path / "misleading-name"
     directory.mkdir()
@@ -156,6 +156,73 @@ def test_candidate_metadata_never_substitutes_directory_label(tmp_path, document
     row = discovery._normalize({"agent_dir": str(directory), "display_name": "CLI Label",
                                 "status": "available"}, tmp_path)
     assert row["agent_name"] == expected
+    assert row["profile_read_error"] == error
+    assert row["profile_name_source"] == "init.json"
+    assert row["import_display_name"] == (None if error else expected or "Unnamed Agent")
     assert row["description"] is None
     assert row["profile_source"] == "lingtai"
     assert row["display_name"] == "CLI Label"
+
+
+@pytest.mark.parametrize("source, expected, error", [
+    ('{"agent_name":"Current"}', "Current", None),
+    ('{"agent_name":null}', None, None),
+    ('{"agent_name":""}', None, None),
+    ('{}', None, None),
+    ('bad json', None, "source_unreadable"),
+    ('{"agent_name":42}', None, "source_unreadable"),
+    (' ' * (1024 * 1024 + 1), None, "source_unreadable"),
+], ids=['named', 'null', 'empty', 'missing-name', 'malformed', 'invalid-type', 'oversize'])
+def test_existing_agent_metadata_is_exclusive_even_when_unnamed(tmp_path, source, expected, error):
+    """Existing .agent.json must never silently fall back to stale init identity."""
+    (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')
+    (tmp_path / ".agent.json").write_text(source)
+    row = discovery._normalize({"agent_dir": str(tmp_path), "display_name": "Directory Label",
+                                "status": "available"}, tmp_path)
+    assert row["agent_name"] == expected
+    assert row["profile_read_error"] == error
+    assert row["profile_name_source"] == ".agent.json"
+    assert row["import_display_name"] == (None if error else expected or "Unnamed Agent")
+
+
+def test_agent_metadata_permission_error_is_not_absence(tmp_path, monkeypatch):
+    """Unreadable current metadata cannot be replaced with a stale readable init name."""
+    from puffo_agent.portal.control import lingtai_profile
+
+    (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')
+    original_open = lingtai_profile.os.open
+    def deny_source(path, flags):
+        if path.name == ".agent.json":
+            raise PermissionError("blocked")
+        return original_open(path, flags)
+    monkeypatch.setattr(lingtai_profile.os, "open", deny_source)
+    row = discovery._normalize({"agent_dir": str(tmp_path), "display_name": "Label",
+                                "status": "available"}, tmp_path)
+    assert row["agent_name"] is None
+    assert row["profile_read_error"] == "source_unreadable"
+    assert row["import_display_name"] is None
+
+
+def test_agent_metadata_symlink_is_not_a_fallback(tmp_path):
+    """Unsafe source indirection must not import a different identity or use init fallback."""
+    (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')
+    (tmp_path / ".agent.json").symlink_to(tmp_path / "missing")
+    row = discovery._normalize({"agent_dir": str(tmp_path), "display_name": "Label",
+                                "status": "available"}, tmp_path)
+    assert row["profile_read_error"] == "source_unreadable"
+    assert row["import_display_name"] is None
+
+
+@pytest.mark.parametrize("primary_present", [False, True])
+def test_corrupt_marker_prevents_only_absent_primary_fallback(tmp_path, primary_present):
+    """LingTai quarantine must not turn a corrupt source into a stale init import."""
+    (tmp_path / "init.json").write_text('{"manifest":{"agent_name":"Stale Init"}}')
+    (tmp_path / ".agent.json.corrupt").write_text("corrupt previous metadata")
+    if primary_present:
+        (tmp_path / ".agent.json").write_text('{"agent_name":"Recovered"}')
+    row = discovery._normalize({"agent_dir": str(tmp_path), "display_name": "Label",
+                                "status": "available", "workspace": None}, tmp_path)
+    assert row["workspace"] == str(tmp_path)
+    assert row["agent_name"] == ("Recovered" if primary_present else None)
+    assert row["profile_read_error"] == (None if primary_present else "source_unreadable")
+    assert row["import_display_name"] == ("Recovered" if primary_present else None)

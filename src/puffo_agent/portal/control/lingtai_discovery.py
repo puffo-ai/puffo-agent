@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from .lingtai_profile import source_agent_name
+from dataclasses import asdict
+
+from .lingtai_profile import read_source_profile
 
 import asyncio
 import json
@@ -141,7 +143,7 @@ def _normalize(row: object, root: Path) -> dict:
         raise ValueError("LingTai discovery returned a missing working folder")
     return {
         "display_name": name[:200], "agent_dir": str(directory),
-        "agent_name": source_agent_name(directory),
+        **asdict(read_source_profile(directory)),
         "description": None, "profile_source": "lingtai",
         "workspace": str(workspace_path), "status": status,
         "runtime_id": row.get("runtime_id"),
