@@ -699,6 +699,42 @@ class LocalRuntimePreparer:
         ):
             strip_claude_api_key_from_settings(settings_path)
 
+    def _claude_llm_credentials(self) -> tuple[dict[str, str], tuple[str, ...]]:
+        """The claude child's LLM credential env, plus any extra allowances.
+
+        Two modes, and subscription **supersedes** the gateway env rather than
+        merging with it: a leftover ``ANTHROPIC_BASE_URL`` outranks the plan
+        token in the CLI's own credential precedence, so merging would route a
+        subscription agent back through the metered gateway in silence.
+
+        Any credential file the mode needs is written here, at ``0600``, before
+        the child is spawned.
+        """
+        runtime = self.agent_cfg.runtime
+        if runtime.auth_mode == AUTH_MODE_SUBSCRIPTION:
+            creds = resolve_subscription_credentials(
+                runtime.harness,
+                agent_home=self.agent_home,
+                token=subscription_token(self.daemon_cfg, runtime.harness),
+            )
+            for path, content in creds.files.items():
+                atomic_write_private(path, content)
+            return dict(creds.env), creds.extra_allowed
+
+        llm_env = anthropic_base_url_env(runtime.llm_base_url)
+        if llm_env and runtime.api_key:
+            llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
+            # Behind a budgeted gateway a 429 is usually the cap, not load.
+            # The CLI treats every 429 as transient and retries with backoff;
+            # under a cap that is a storm the gateway counts against the same
+            # budget. Cap the CLI's retries; the runtime parks on the drain.
+            llm_env[GATEWAY_CLI_MAX_RETRIES_ENV] = GATEWAY_CLI_MAX_RETRIES
+        else:
+            configured_key = claude_cli_api_key(self.daemon_cfg)
+            if configured_key:
+                llm_env["ANTHROPIC_API_KEY"] = configured_key
+        return llm_env, ()
+
     def _prepare_claude_spec(self, system_prompt: str) -> RuntimeSpec:
         executable = resolve_claude_bin()
         if executable is None:
@@ -751,42 +787,11 @@ class LocalRuntimePreparer:
                 self.agent_id,
             )
         remove_legacy_permission_hook(self.claude_dir)
-        runtime = self.agent_cfg.runtime
-        subscription = (
-            resolve_subscription_credentials(
-                runtime.harness,
-                agent_home=self.agent_home,
-                token=subscription_token(self.daemon_cfg, runtime.harness),
-            )
-            if runtime.auth_mode == AUTH_MODE_SUBSCRIPTION
-            else None
-        )
-        llm_env = anthropic_base_url_env(runtime.llm_base_url)
-        if llm_env and runtime.api_key:
-            llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
-            # Behind a budgeted gateway a 429 is usually the cap, not load.
-            # The CLI treats every 429 as transient and retries with backoff;
-            # under a cap that is a storm the gateway counts against the same
-            # budget. Cap the CLI's retries; the runtime parks on the drain.
-            llm_env[GATEWAY_CLI_MAX_RETRIES_ENV] = GATEWAY_CLI_MAX_RETRIES
-        else:
-            configured_key = claude_cli_api_key(self.daemon_cfg)
-            if configured_key:
-                llm_env["ANTHROPIC_API_KEY"] = configured_key
+        llm_env, extra_allowed = self._claude_llm_credentials()
         # Same guarantee the old pop-before-and-after-overrides dance gave,
         # now from an allowlist: ambient provider keys never reach the child,
         # an override cannot reintroduce one, and only llm_env injects the
         # controlled key.
-        extra_allowed: tuple[str, ...] = ()
-        if subscription is not None:
-            # Subscription supersedes the gateway env entirely: the CLI talks
-            # to the vendor directly, so a leftover ANTHROPIC_BASE_URL would
-            # silently win (it outranks the plan token in the CLI's own
-            # credential precedence) and bill the metered account.
-            llm_env = dict(subscription.env)
-            extra_allowed = subscription.extra_allowed
-            for path, content in subscription.files.items():
-                atomic_write_private(path, content)
         environment = build_child_environment(
             overrides=self.agent_cfg.env_overrides,
             controlled={
