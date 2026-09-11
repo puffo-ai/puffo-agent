@@ -71,17 +71,23 @@ async def revoke_lingtai(launch: LingtaiLaunch) -> None:
 async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
     process = await asyncio.create_subprocess_exec(
         str(launch.executable), *args, cwd=launch.workspace,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        limit=8193,
     )
     try:
-        code = await asyncio.wait_for(process.wait(), timeout=30)
+        async with asyncio.timeout(30):
+            assert process.stderr is not None
+            try:
+                error = await process.stderr.readexactly(8193)
+                raise ValueError("LingTai error output exceeded the size limit")
+            except asyncio.IncompleteReadError as exc:
+                error = exc.partial
+            code = await process.wait()
     except BaseException:
         if process.returncode is None:
             process.kill()
         await process.wait()
         raise
     if code:
-        raise ValueError(
-            "LingTai runtime provisioning failed; check the initialized folders "
-            "and install a LingTai version supporting --registry"
-        )
+        detail = error.decode("utf-8", errors="replace").strip()
+        raise ValueError(detail or f"LingTai command failed with exit code {code}")

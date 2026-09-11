@@ -297,6 +297,10 @@ async def execute_command(
     """
     if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
         return await _execute_runtime_command(op, agent_slug, params, command_id)
+    if op == "discover_lingtai":
+        from .lingtai_discovery import discover_lingtai
+
+        return await discover_lingtai(params, operator=paired_root_pubkey)
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.
@@ -820,7 +824,7 @@ class MachineControlClient:
             )
             if command_id:
                 self._inflight_command_ids.add(str(command_id))
-            if background_create and command_id and decrypted["op"] == "create":
+            if background_create and command_id and decrypted["op"] in {"create", "discover_lingtai"}:
                 # A first Docker image build can take minutes. Keep that wait
                 # out of the one machine-control receive loop so pause/resume,
                 # runtime decisions, and other operators remain responsive.

@@ -491,7 +491,7 @@ async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path
     source.mkdir()
     (source / "init.json").write_text("{}")
     executable = tmp_path / "lingtai-agent"
-    executable.write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
+    executable.write_text(f"#!{sys.executable}\nimport sys\nprint('error: puffo-v0 runtime registry parent directory is owned by another user', file=sys.stderr)\nraise SystemExit(1)\n")
     executable.chmod(0o700)
     payload, operator = _payload()
     payload["runtime"] = {
@@ -503,7 +503,7 @@ async def test_lingtai_provision_failure_leaves_identity_unmaterialized(tmp_path
     async def materialize(context):
         materialized.append(context)
 
-    with pytest.raises(ProvisionError, match="LingTai runtime provisioning failed"):
+    with pytest.raises(ProvisionError, match="registry parent directory is owned by another user"):
         await provision_agent_from_bundle(payload, operator, materialize=materialize)
     assert materialized == []
     assert not (tmp_path / "daemon/agents/helper-1234/agent.yml").exists()
