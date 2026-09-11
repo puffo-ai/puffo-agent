@@ -603,8 +603,8 @@ def test_install_desired_skill_404_and_mcp_500_both_log_and_keep_going(tmp_path,
 def test_local_runtime_installs_once_and_retains_codex_extras(
     tmp_path, monkeypatch,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     calls: list[dict[str, Any]] = []

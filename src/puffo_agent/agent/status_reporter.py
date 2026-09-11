@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
 from .processing_receipts import ProcessingReportDispatcher
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,8 @@ class StatusReporter:
         runtime_provider: Optional[Callable[[], dict[str, Any]]] = None,
         status_sender: Optional[Callable[..., Awaitable[None]]] = None,
         processing_reports: ProcessingReportDispatcher | None = None,
+        on_loop_start: Optional[Callable[[], None]] = None,
+        on_loop_stop: Optional[Callable[[], None]] = None,
     ) -> None:
         self._http = http
         # Keyless (bridge) agents can't sign the HTTP status routes, so the
@@ -73,6 +76,17 @@ class StatusReporter:
         self._interval = max(10.0, heartbeat_interval_s)
         self._current_status: str = "idle"
         self._current_message_id: str | None = None
+        # Operator-facing activity refinement. ``_base_activity`` follows the
+        # turn phase ("reading_messages" from notice admission until the model
+        # admits real messages); ``_overlay_activity`` follows harness
+        # compaction and wins while set. Both are metadata-only fixed labels —
+        # never provider material.
+        self._base_activity: str | None = None
+        self._overlay_activity: str | None = None
+        # True while the overlay alone holds the status busy (turnless
+        # compaction, e.g. session resume during warm). Any turn
+        # lifecycle call takes ownership of the status and clears it.
+        self._busy_from_overlay = False
         # None keeps the legacy single-stream wire shape.
         self._runtime_health_provider = runtime_health_provider
         # Agent Portal: reports kind/provider/harness/model so the operator's
@@ -82,6 +96,35 @@ class StatusReporter:
         if processing_reports is not None:
             processing_reports.set_status_refresh(self.report_current_status)
         self._run_stop: asyncio.Event | None = None
+        # The periodic beat, detached activity pushes and the turn task
+        # all write status concurrently; an in-flight body built from
+        # older state could land after a fresher one and leave the
+        # server on a stale label. One lock serializes every status
+        # write, and each body is built under it, so wire order matches
+        # state order and the last write carries the newest state.
+        self._send_lock = asyncio.Lock()
+        # Set by ``request_immediate_heartbeat`` so a health change does not
+        # have to wait out the remaining interval.
+        self._wake = asyncio.Event()
+        # An external wake registry is bound for exactly as long as the
+        # heartbeat loop runs: waking a loop that is not running does nothing,
+        # and ws-local reuses one reporter across attaches, spawning a fresh
+        # loop each time. Binding at construction and releasing at ``stop``
+        # would unbind on the first detach and never rebind.
+        self._on_loop_start = on_loop_start
+        self._on_loop_stop = on_loop_stop
+
+    def request_immediate_heartbeat(self) -> None:
+        """Ask the loop to send the next heartbeat now.
+
+        ``runtime.health`` only travels on heartbeats, so without this a red
+        written just after a turn settles waits up to a full interval before
+        the server hears about it — long enough to be read as "never
+        reported". Deliberately fire-and-forget: the caller has already
+        persisted the health locally, and a heartbeat that fails must not
+        undo or delay that. The periodic tick stays as the fallback.
+        """
+        self._wake.set()
 
     async def run_heartbeat_loop(self) -> None:
         # Native agents POST /agents/me/heartbeat; keyless bridge agents emit a
@@ -94,14 +137,23 @@ class StatusReporter:
         self._run_stop = stop
         replay_task = None
         if self._processing_reports is not None:
-            replay_task = asyncio.create_task(self._processing_reports.run())
+            replay_task = spawn(self._processing_reports.run(), name="processing_reports.run")
+        if self._on_loop_start is not None:
+            self._on_loop_start()
         try:
             await self._send_heartbeat()
             while not stop.is_set():
+                # One event carries both wake-ups: an early tick requested by
+                # a health change, and shutdown (``stop`` sets it too). Waiting
+                # on a single event keeps this a plain wait instead of a pair
+                # of racing tasks.
                 try:
-                    await asyncio.wait_for(stop.wait(), timeout=self._interval)
+                    await asyncio.wait_for(
+                        self._wake.wait(), timeout=self._interval,
+                    )
                 except asyncio.TimeoutError:
                     pass
+                self._wake.clear()
                 if stop.is_set():
                     break
                 await self._send_heartbeat()
@@ -118,10 +170,18 @@ class StatusReporter:
                     logger.warning("processing report replay stopped", exc_info=True)
             if self._run_stop is stop:
                 self._run_stop = None
+            if self._on_loop_stop is not None:
+                try:
+                    self._on_loop_stop()
+                except Exception:  # noqa: BLE001 - teardown must not raise
+                    logger.warning("status reporter unbind failed", exc_info=True)
 
     def stop(self) -> None:
         if self._run_stop is not None:
             self._run_stop.set()
+            # The loop waits on ``_wake``; without this, shutdown would sit
+            # out the rest of the interval before noticing.
+            self._wake.set()
         if self._processing_reports is not None:
             self._processing_reports.stop()
 
@@ -136,12 +196,19 @@ class StatusReporter:
         exception-swallowing)."""
         if self._status_sender is None:
             return
+        health: str | None = None
+        if self._runtime_health_provider is not None:
+            try:
+                health = self._runtime_health_provider()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("runtime_health_provider raised (%s)", exc)
         try:
             await self._status_sender(
                 status,
                 current_message_id=current_message_id,
                 error_text=error_text,
                 runtime=self._runtime_payload(),
+                health=health,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("keyless status emit (%s) failed (%s)", status, exc)
@@ -172,6 +239,43 @@ class StatusReporter:
         """Best-effort status refresh used after bridge reconnects."""
         await self._send_heartbeat()
 
+    @property
+    def _effective_activity(self) -> str | None:
+        return self._overlay_activity or self._base_activity
+
+    def set_activity_overlay(self, activity: str | None) -> bool:
+        """Set or clear the compaction overlay; returns whether the
+        effective activity changed.
+
+        State only, deliberately synchronous: the caller sits on the
+        harness event path, which runs under the runtime command lock —
+        a network push here would let a slow status POST extend the
+        lock and stall event processing. The caller pushes the change
+        (detached) when this returns True.
+        """
+        if activity == self._overlay_activity:
+            return False
+        before = self._effective_activity
+        self._overlay_activity = activity
+        if activity is not None and self._current_status == "idle":
+            # A harness can compact outside any turn (session resume
+            # during warm): the agent is demonstrably at work, so the
+            # status dot must not read idle while the label is live.
+            # Restored below when the overlay clears with no turn
+            # having taken ownership of the status in between.
+            self._current_status = "busy"
+            self._busy_from_overlay = True
+        elif (
+            activity is None
+            and self._busy_from_overlay
+            and self._current_status == "busy"
+            and self._current_message_id is None
+        ):
+            self._current_status = "idle"
+        if activity is None:
+            self._busy_from_overlay = False
+        return self._effective_activity != before
+
     async def begin_notice_turn(self, message_id: str) -> None:
         """Report a provider turn before the model reads its Inbox.
 
@@ -180,9 +284,11 @@ class StatusReporter:
         ``read_inbox`` exposes it to the model and ``begin_turn`` is called.
         """
         self._current_status = "busy"
+        self._busy_from_overlay = False
         self._current_message_id = (
             None if _is_local_only_envelope(message_id) else message_id
         )
+        self._base_activity = "reading_messages"
         await self._send_heartbeat()
 
     async def end_notice_turn(
@@ -197,45 +303,76 @@ class StatusReporter:
             return
         self._current_status = "idle"
         self._current_message_id = None
+        self._clear_activity()
         await self._send_heartbeat()
+
+    def _clear_activity(self) -> None:
+        self._base_activity = None
+        self._overlay_activity = None
+        self._busy_from_overlay = False
 
     async def begin_turn(self, message_id: str, *, run_id: str | None = None) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
         run_id = run_id or f"run_{uuid.uuid4().hex}"
+        # The model has admitted real messages: the reading phase is over.
+        # A live compaction overlay keeps winning until its completed event.
+        was_showing = self._effective_activity
+        self._base_activity = None
+        self._busy_from_overlay = False
         if self._keyless:
             # No signed /processing/* call for bridge agents (see __init__);
             # report "busy" over the bridge so the operator's Log gets the
             # Working row + the yellow dot.
             self._current_status = "busy"
             self._current_message_id = message_id
-            await self._emit_keyless("busy", message_id, None)
+            async with self._send_lock:
+                await self._emit_keyless("busy", message_id, None)
             return run_id
         if _is_local_only_envelope(message_id):
             # Daemon-minted synthetic envelope (e.g. intro-prompt): no
             # server row, so skip /processing/start — but push an
             # immediate busy heartbeat so the agent shows in-progress
             # while it composes (e.g. its intro). No current_message_id:
-            # the message doesn't exist server-side.
+            # the message doesn't exist server-side. The activity check
+            # matters: after a notice turn the status is already busy
+            # with no message id, and only the just-ended reading phase
+            # distinguishes this beat from the last one — without it the
+            # server keeps showing "reading messages" for the whole
+            # composition.
             should_emit = (
                 self._current_status != "busy"
                 or self._current_message_id is not None
+                or self._effective_activity != was_showing
             )
             self._current_status = "busy"
             self._current_message_id = None
             if should_emit:
                 await self._send_heartbeat()
             return run_id
-        try:
-            await self._http.post(
-                f"/messages/{message_id}/processing/start",
-                {"run_id": run_id},
-            )
-            self._current_status = "busy"
-            self._current_message_id = message_id
-        except HttpError as exc:
-            logger.warning("begin_turn message=%s failed (%s)", message_id, exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("begin_turn message=%s errored (%s)", message_id, exc)
+        async with self._send_lock:
+            start_body: dict[str, str] = {"run_id": run_id}
+            # The server writes this field into agent_status and start is
+            # legitimately retried: carrying the live overlay (an in-flight
+            # compaction) keeps a duplicate start from wiping it, while an
+            # absent field clears the finished reading phase. Old servers
+            # ignore the extra field.
+            if self._overlay_activity:
+                start_body["activity"] = self._overlay_activity
+            try:
+                await self._http.post(
+                    f"/messages/{message_id}/processing/start",
+                    start_body,
+                )
+                self._current_status = "busy"
+                self._current_message_id = message_id
+            except HttpError as exc:
+                logger.warning(
+                    "begin_turn message=%s failed (%s)", message_id, exc
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "begin_turn message=%s errored (%s)", message_id, exc
+                )
         return run_id
 
     async def end_turn(
@@ -251,9 +388,13 @@ class StatusReporter:
             # (the idle status stamps the Working row's duration + a Ready row).
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
-            await self._emit_keyless(
-                self._current_status, None, None if succeeded else error_text,
-            )
+            self._clear_activity()
+            async with self._send_lock:
+                await self._emit_keyless(
+                    self._current_status,
+                    None,
+                    None if succeeded else error_text,
+                )
             return
         if _is_local_only_envelope(message_id):
             # Symmetric to ``begin_turn`` — no server-side row, but push
@@ -261,6 +402,7 @@ class StatusReporter:
             # scheduled beat, so the in-progress flag clears promptly.
             self._current_status = "idle" if succeeded else "error"
             self._current_message_id = None
+            self._clear_activity()
             await self._send_heartbeat()
             return
         body: dict[str, Any] = {"run_id": run_id, "succeeded": succeeded}
@@ -272,16 +414,22 @@ class StatusReporter:
                 any_failed=not succeeded,
             )
             return
-        try:
-            await self._http.post(
-                f"/messages/{message_id}/processing/end", body
-            )
-            self._current_status = "idle" if succeeded else "error"
-            self._current_message_id = None
-        except HttpError as exc:
-            logger.warning("end_turn message=%s failed (%s)", message_id, exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("end_turn message=%s errored (%s)", message_id, exc)
+        async with self._send_lock:
+            try:
+                await self._http.post(
+                    f"/messages/{message_id}/processing/end", body
+                )
+                self._current_status = "idle" if succeeded else "error"
+                self._current_message_id = None
+                self._clear_activity()
+            except HttpError as exc:
+                logger.warning(
+                    "end_turn message=%s failed (%s)", message_id, exc
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "end_turn message=%s errored (%s)", message_id, exc
+                )
 
     async def end_turn_batch(self, runs: list[dict]) -> None:
         """Mark every message in a thread batch as processed in one
@@ -302,10 +450,12 @@ class StatusReporter:
             failed = next((r for r in runs if not r["succeeded"]), None)
             self._current_status = "error" if failed is not None else "idle"
             self._current_message_id = None
+            self._clear_activity()
             error_text = None
             if failed is not None and failed.get("error_text") is not None:
                 error_text = str(failed["error_text"])[:1024]
-            await self._emit_keyless(self._current_status, None, error_text)
+            async with self._send_lock:
+                await self._emit_keyless(self._current_status, None, error_text)
             return
         payload_runs: list[dict[str, Any]] = []
         for r in runs:
@@ -330,6 +480,7 @@ class StatusReporter:
             any_failed = any(not r["succeeded"] for r in runs)
             self._current_status = "error" if any_failed else "idle"
             self._current_message_id = None
+            self._clear_activity()
             await self._send_heartbeat()
             return
         any_failed = any(not r["succeeded"] for r in runs)
@@ -339,21 +490,23 @@ class StatusReporter:
                 any_failed=any_failed,
             )
             return
-        try:
-            await self._http.post(
-                "/messages/processing/end:batch", {"runs": payload_runs},
-            )
-            # Server flips agent_status atomically — mirror locally.
-            self._current_status = "error" if any_failed else "idle"
-            self._current_message_id = None
-        except HttpError as exc:
-            logger.warning(
-                "end_turn_batch (%d runs) failed (%s)", len(runs), exc,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "end_turn_batch (%d runs) errored (%s)", len(runs), exc,
-            )
+        async with self._send_lock:
+            try:
+                await self._http.post(
+                    "/messages/processing/end:batch", {"runs": payload_runs},
+                )
+                # Server flips agent_status atomically — mirror locally.
+                self._current_status = "error" if any_failed else "idle"
+                self._current_message_id = None
+                self._clear_activity()
+            except HttpError as exc:
+                logger.warning(
+                    "end_turn_batch (%d runs) failed (%s)", len(runs), exc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "end_turn_batch (%d runs) errored (%s)", len(runs), exc,
+                )
 
     async def _finish_processing_runs(
         self,
@@ -361,24 +514,36 @@ class StatusReporter:
         *,
         any_failed: bool,
     ) -> None:
-        self._current_status = "error" if any_failed else "idle"
-        self._current_message_id = None
-        try:
-            result = await self._processing_reports.enqueue(runs, immediate=True)
-        except Exception:  # noqa: BLE001 - status must not break the turn
-            logger.warning("failed to persist processing reports", exc_info=True)
-            await self._send_heartbeat()
-            return
-        if (
-            result.state != "uploaded"
-            or result.requested_pending
-            or result.count != len(runs)
-        ):
-            # The terminal batch will eventually settle Server status. Until
-            # then, or after a mixed old/current batch, re-assert the live
-            # snapshot. Server rate-limits duplicate beats but accepts visible
-            # status/message transitions immediately.
-            await self._send_heartbeat()
+        # The dispatcher's immediate upload IS a status write (the
+        # server flips agent_status on end:batch), so it must hold the
+        # same send lock as every heartbeat: without it, the terminal
+        # batch overtakes an in-flight busy/compacting beat and that
+        # stale beat lands last, flipping a finished agent back to
+        # busy until the next scheduled beat.
+        async with self._send_lock:
+            self._current_status = "error" if any_failed else "idle"
+            self._current_message_id = None
+            self._clear_activity()
+            try:
+                result = await self._processing_reports.enqueue(
+                    runs, immediate=True
+                )
+            except Exception:  # noqa: BLE001 - status must not break the turn
+                logger.warning(
+                    "failed to persist processing reports", exc_info=True
+                )
+                await self._send_heartbeat_locked()
+                return
+            if (
+                result.state != "uploaded"
+                or result.requested_pending
+                or result.count != len(runs)
+            ):
+                # The terminal batch will eventually settle Server status.
+                # Until then, or after a mixed old/current batch, re-assert
+                # the live snapshot. Server rate-limits duplicate beats but
+                # accepts visible status/message transitions immediately.
+                await self._send_heartbeat_locked()
 
     async def report_error(self, error_text: str) -> None:
         """Catch-all for unrecoverable failures; cleared by the
@@ -389,21 +554,29 @@ class StatusReporter:
             # bridge (see __init__).
             self._current_status = "error"
             self._current_message_id = None
-            await self._emit_keyless("error", None, error_text[:1024])
+            self._clear_activity()
+            async with self._send_lock:
+                await self._emit_keyless("error", None, error_text[:1024])
             return
-        try:
-            await self._http.post(
-                "/agents/me/heartbeat",
-                {"status": "error", "error_text": error_text[:1024]},
-            )
-            self._current_status = "error"
-            self._current_message_id = None
-        except HttpError as exc:
-            logger.warning("report_error failed (%s)", exc)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("report_error errored (%s)", exc)
+        async with self._send_lock:
+            try:
+                await self._http.post(
+                    "/agents/me/heartbeat",
+                    {"status": "error", "error_text": error_text[:1024]},
+                )
+                self._current_status = "error"
+                self._current_message_id = None
+                self._clear_activity()
+            except HttpError as exc:
+                logger.warning("report_error failed (%s)", exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("report_error errored (%s)", exc)
 
     async def _send_heartbeat(self) -> None:
+        async with self._send_lock:
+            await self._send_heartbeat_locked()
+
+    async def _send_heartbeat_locked(self) -> None:
         if self._keyless:
             # Keyless bridge agents have no signing identity for the HTTP
             # /agents/me/heartbeat route — report the current status over the
@@ -418,6 +591,11 @@ class StatusReporter:
         body: dict[str, Any] = {"status": self._current_status}
         if self._current_status == "busy" and self._current_message_id is not None:
             body["current_message_id"] = self._current_message_id
+        # Fixed-label activity refinement ("compacting" / "reading_messages").
+        # Older servers ignore unknown heartbeat fields, so this is safe to
+        # send unconditionally when set.
+        if self._effective_activity is not None:
+            body["activity"] = self._effective_activity
         # Agent Portal: tag which machine this agent runs on (None if unlinked).
         from ..portal.control.store import current_machine_id
 

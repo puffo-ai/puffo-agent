@@ -31,6 +31,17 @@ BlobFetcher = Callable[[PuffoCoreHttpClient, str], Awaitable[bytes | None]]
 ImageScaler = Callable[[Path, Path | None, int], bool]
 Log = logging.Logger | logging.LoggerAdapter
 
+_RASTER_IMAGE_SIGNATURES = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"BM",
+    b"II*\x00",
+    b"MM\x00*",
+    b"\x00\x00\x01\x00",
+)
+
 
 async def fetch_blob_with_retry(
     http: PuffoCoreHttpClient,
@@ -102,6 +113,16 @@ def max_image_edge_px(model: str | None) -> int:
     if any(marker in normalized for marker in _HIGH_RES_MODEL_MARKERS):
         return _HIGH_RES_IMAGE_EDGE_PX
     return _DEFAULT_IMAGE_EDGE_PX
+
+
+def is_image_attachment(mime_type: str, data: bytes) -> bool:
+    """Whether one attachment warrants raster safety and scaling checks."""
+    normalized_mime = mime_type.partition(";")[0].strip().lower()
+    if normalized_mime.startswith("image/"):
+        return True
+    if data.startswith(_RASTER_IMAGE_SIGNATURES):
+        return True
+    return len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP"
 
 
 def downscale_oversized_image(
@@ -326,12 +347,14 @@ async def _save_one_attachment(
     except OSError as exc:
         log.warning("attachment save failed (%s): %s", target, exc)
         return None
-    normalized = await normalize_saved_image(
-        target=target,
-        image_edge_px=image_edge_px,
-        log=log,
-        scale_image=scale_image,
-    )
+    normalized = target
+    if is_image_attachment(meta.mime_type, plaintext):
+        normalized = await normalize_saved_image(
+            target=target,
+            image_edge_px=image_edge_px,
+            log=log,
+            scale_image=scale_image,
+        )
     return (normalized, plaintext_size) if normalized is not None else None
 
 

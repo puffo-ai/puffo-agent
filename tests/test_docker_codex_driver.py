@@ -20,11 +20,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from puffo_agent.agent.harness.codex_driver import CodexAppServerDriver
-from puffo_agent.agent.harness.claude_code_driver import ClaudeCodeCliDriver
-from puffo_agent.agent.harness import docker_support
-from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
-from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
+from puffo_agent.agent.harness.drivers.codex import CodexAppServerDriver
+from puffo_agent.agent.harness.drivers.claude_code import ClaudeCodeCliDriver
+from puffo_agent.agent.harness.runtime import docker_support
+from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManagerAdapter
 from puffo_agent.portal.state import (
     AgentConfig,
     DaemonConfig,
@@ -77,16 +77,16 @@ def _capture_run():
 def _docker_patches(fake_run):
     return (
         patch(
-            "puffo_agent.agent.harness.docker_runtime.resolve_docker_bin",
+            "puffo_agent.agent.harness.runtime.docker_runtime.resolve_docker_bin",
             lambda: "/fake/docker",
         ),
-        patch("puffo_agent.agent.harness.docker_runtime.run_cmd", new=fake_run),
+        patch("puffo_agent.agent.harness.runtime.docker_runtime.run_cmd", new=fake_run),
         patch(
-            "puffo_agent.agent.harness.docker_runtime.container_state",
+            "puffo_agent.agent.harness.runtime.docker_runtime.container_state",
             new=AsyncMock(return_value="running"),
         ),
         patch(
-            "puffo_agent.agent.harness.docker_runtime.ensure_docker_image",
+            "puffo_agent.agent.harness.runtime.docker_runtime.ensure_docker_image",
             new=AsyncMock(),
         ),
     )
@@ -266,7 +266,7 @@ def test_docker_claude_uses_the_shared_driver_boundary(tmp_path, monkeypatch):
         stack.enter_context(patch.object(preparer, "ensure_container", new=AsyncMock()))
         stack.enter_context(
             patch(
-                "puffo_agent.agent.harness.docker_runtime.run_cmd",
+                "puffo_agent.agent.harness.runtime.docker_runtime.run_cmd",
                 new=fake_run,
             )
         )

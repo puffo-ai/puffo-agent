@@ -224,6 +224,25 @@ def test_location_is_daemon_agent_state_beside_messages_not_workspace(tmp_path):
     outbox.close()
 
 
+def test_native_session_harness_survives_unrelated_state_updates(tmp_path):
+    """Recovery bookkeeping must not erase the resume harness label."""
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    outbox.set_active_turn(
+        "turn-1",
+        session_ref="session-1",
+        native_session_id="native-1",
+        native_session_harness="opencode",
+    )
+    outbox.set_active_turn(
+        None,
+        session_ref="session-1",
+        native_session_id="native-1",
+    )
+
+    assert outbox.state()["native_session_harness"] == "opencode"
+    outbox.close()
+
+
 def test_open_migrates_legacy_outbox_to_metadata_only(tmp_path):
     path = tmp_path / "runtime_events.db"
     outbox = RuntimeEventOutbox(path)

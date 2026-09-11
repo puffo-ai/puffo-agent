@@ -11,9 +11,10 @@ import pytest
 
 from puffo_agent import _proc
 from puffo_agent.agent import memory_git
-from puffo_agent.agent.harness import claude_code_driver, codex_driver
-from puffo_agent.agent.harness.claude_code_driver import ClaudeCodeCliDriver
-from puffo_agent.agent.harness.codex_driver import CodexAppServerDriver
+from puffo_agent.agent.harness.drivers import claude_code as claude_code_driver
+from puffo_agent.agent.harness.drivers import codex as codex_driver
+from puffo_agent.agent.harness.drivers.claude_code import ClaudeCodeCliDriver
+from puffo_agent.agent.harness.drivers.codex import CodexAppServerDriver
 from puffo_agent.agent.harness.driver import RuntimeSpec
 
 

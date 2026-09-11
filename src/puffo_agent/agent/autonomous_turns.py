@@ -145,6 +145,19 @@ class AutonomousTurnLifecycleMixin:
             )
             return True
 
+    async def _start_notice_unless_autonomous(self, planned: PlannedTurn) -> bool:
+        """Start a notice unless adoption won while its context was resolved.
+
+        Context resolution stretches the race window past the top-of-loop
+        guard. Queue behind the autonomous run instead of clobbering its
+        active binding; the run's terminal ``notify()`` re-enters processing.
+        """
+        async with self._turn_state_lock:
+            if self._autonomous_turn_id:
+                return False
+            await self._start_local_turn(planned)
+            return True
+
     def _activate_autonomous_turn(
         self,
         *,
@@ -201,9 +214,19 @@ class AutonomousTurnLifecycleMixin:
         """Settle and release the turn opened for an autonomous provider run."""
         async with self._turn_state_lock:
             turn_id = self._autonomous_turn_id
-            if not turn_id or self.active.turn_id != turn_id:
-                self._autonomous_turn_id = ""
+            if not turn_id:
                 return False
+            if self.active.turn_id != turn_id:
+                # The adopted turn lost its active binding to another writer.
+                # Its durable row must still settle: a row left in_turn reads
+                # as "agent busy" to the scheduler, so notices arm but never
+                # come due, permanently.
+                if not await self._settle_orphaned_autonomous_row(
+                    turn_id, outcome=outcome
+                ):
+                    return False
+                self.notify()
+                return True
             self._autonomous_turn_id = ""
             self._autonomous_settle_pending = None
             planned = self._autonomous_planned or self._empty_autonomous_plan(turn_id)
@@ -221,6 +244,78 @@ class AutonomousTurnLifecycleMixin:
                 succeeded=succeeded,
             )
         self.notify()
+        return True
+
+    async def _settle_orphaned_autonomous_row(
+        self, turn_id: str, *, outcome: str
+    ) -> bool:
+        """Settle the durable row of an adopted turn that lost its binding.
+
+        Requeued semantics: once the binding is gone the run's outcome can no
+        longer be attributed to this row, the same convention crash recovery
+        uses for stale in_turn accounting. Rows admitted into the turn go back
+        to pending, the provider session's notice-delivery evidence is
+        released (a busy notice may have marked the rows delivered against
+        this session, which would starve them from future candidates), and a
+        mid-run status admission gets its terminal. Only the known idempotent
+        terminal (``requeued``) counts as already-settled; anything else keeps
+        the owner and retries via settle-pending -- never clear silently.
+        """
+        try:
+            run = await self.store.get_turn_run(turn_id)
+            if run is None:
+                raise RuntimeError("orphaned autonomous turn disappeared")
+            if run.state == "in_turn":
+                if run.message_ids:
+                    await self.store.requeue_messages(
+                        run.message_ids, turn_id=turn_id
+                    )
+                else:
+                    await self.store.finalize_empty_turn(
+                        turn_id=turn_id, state="requeued"
+                    )
+                await self.store.release_notice_delivery(run.provider_session_id)
+                # Durable ids, never the current ``active`` -- that state
+                # belongs to whichever writer took the binding.
+                await self._settle_recovered_status(
+                    turn_id=turn_id,
+                    message_ids=run.message_ids,
+                    succeeded=False,
+                    error_text="orphaned autonomous turn requeued",
+                )
+            elif run.state == "requeued":
+                # A prior attempt (or crash recovery) committed the row
+                # transition; the notice release may still be outstanding
+                # from that partial attempt. Continue from the durable phase.
+                await self.store.release_notice_delivery(run.provider_session_id)
+            else:
+                raise RuntimeError(
+                    f"orphaned autonomous turn in unexpected state {run.state}"
+                )
+        except Exception as exc:  # noqa: BLE001 - retained for bounded retry
+            self._autonomous_settle_pending = outcome
+            self._degrade(f"orphaned autonomous turn settle failed: {exc}")
+            log_runtime_event(
+                logger,
+                "turn.autonomous_finalized",
+                level=logging.ERROR,
+                agent_id=self.agent_id,
+                turn_id=turn_id,
+                outcome="failed",
+                error_category=type(exc).__name__,
+            )
+            return False
+        self._autonomous_turn_id = ""
+        self._autonomous_planned = None
+        self._autonomous_settle_pending = None
+        log_runtime_event(
+            logger,
+            "turn.autonomous_finalized",
+            agent_id=self.agent_id,
+            turn_id=turn_id,
+            state="requeued",
+            outcome="orphaned",
+        )
         return True
 
     async def _settle_autonomous_turn(

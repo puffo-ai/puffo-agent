@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
+
+import pytest
 
 
 from puffo_agent.portal import credential_refresh
@@ -267,6 +270,36 @@ def test_run_loop_wakes_early_on_refresh_request(tmp_path, monkeypatch):
     wake_latency = refreshes[0] - started
     # Conservative bound: should wake within 1s of the event.
     assert wake_latency < 1.0, f"wake_latency={wake_latency:.3f}s — event didn't short-circuit poll"
+
+
+@pytest.mark.asyncio
+async def test_tick_wait_failures_are_reported_once_each_with_tracebacks(
+    tmp_path, caplog,
+):
+    class BrokenEvent:
+        def __init__(self, message):
+            self._message = message
+
+        async def wait(self):
+            raise ValueError(self._message)
+
+    refresher = CredentialRefresher(host_home=tmp_path)
+    refresher._refresh_request = BrokenEvent("refresh wait failed")
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        await refresher._sleep_until_next_tick(BrokenEvent("stop wait failed"))
+        await asyncio.sleep(0)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert sorted(record.getMessage() for record in records) == [
+        "worker task died: refresh_request.wait",
+        "worker task died: stop_event.wait",
+    ]
+    assert all(record.exc_info is not None for record in records)
+    assert {str(record.exc_info[1]) for record in records} == {
+        "stop wait failed",
+        "refresh wait failed",
+    }
 
 
 # ── refresh-token flag round-trip (CLI ↔ daemon sentinel) ──────

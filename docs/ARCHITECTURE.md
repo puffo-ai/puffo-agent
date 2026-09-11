@@ -62,7 +62,7 @@ context, Driver, MCP, coordination, memory, and reminder contracts.
 | Transport facade | `agent/puffo_core_client.py` | Present one receive/send-support surface over native and keyless bridge strategies. |
 | Durable message state | `agent/message_store.py`, `agent/inbox_store.py`, `agent/reminder_store.py` | Persist accepted messages, processing state, frontiers, turn membership, notice state, and reminders. |
 | Provider boundary | `agent/global_inbox_runtime.py`, `agent/context_controller.py` | Serialize model turns, group pending targets, control context admission, steering, retries, and held recovery. |
-| Model runtime | `agent/harness/driver.py`, `agent/harness/runtime_manager.py` | Normalize sessions, turns, streamed events, cancellation, compaction, permissions, and shutdown. |
+| Model runtime | `agent/harness/driver.py`, `agent/harness/runtime/runtime_manager.py` | Normalize sessions, turns, streamed events, cancellation, compaction, permissions, and shutdown. |
 | Model tools | `mcp/` | Expose Inbox/history, sends, membership, files, memory, reminders, and host integration. |
 | Durable control planes | `agent/runtime_event_outbox.py`, `agent/reminder_sync.py` | Upload bounded Runtime events and synchronize encrypted Reminder state with the Server. |
 
@@ -354,8 +354,8 @@ Use these entry points when tracing a change:
 | Concern | Start here |
 | --- | --- |
 | Daemon lifecycle | `portal/daemon.py`, `portal/worker_run.py` |
-| Runtime selection | `portal/runtime_matrix.py`, `agent/harness/local_runtime.py` |
-| Driver protocol | `agent/harness/driver.py`, `agent/harness/runtime_manager.py` |
+| Runtime selection | `portal/runtime_matrix.py`, `agent/harness/runtime/local_runtime.py` |
+| Driver protocol | `agent/harness/driver.py`, `agent/harness/runtime/runtime_manager.py` |
 | Native/bridge receive | `agent/puffo_core_client.py`, `agent/inbound_receipts.py`, `agent/bridge_transport.py` |
 | Durable Inbox | `agent/message_store.py`, `agent/inbox_store.py`, `agent/global_inbox_runtime.py` |
 | Context rendering | `agent/message_projection.py`, `mcp/tool_result_projection.py`, `agent/context_controller.py` |

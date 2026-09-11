@@ -17,7 +17,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.adapters.base import anthropic_base_url_env
-from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
 VK = "https://vk.shan.example/litellm"
@@ -38,7 +38,7 @@ def _daemon_cfg() -> DaemonConfig:
 
 
 def _local_claude_spec(cfg, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_claude_bin", lambda: "/opt/bin/claude"

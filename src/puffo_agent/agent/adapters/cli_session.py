@@ -48,6 +48,7 @@ from ..context_controller import (
     ToolResultAdmission,
     normalize_context_snapshot,
 )
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -899,13 +900,14 @@ class ClaudeSession:
                 self.agent_id,
                 INIT_TIMEOUT_SECONDS,
             )
-            self._stderr_drain_task = asyncio.ensure_future(
-                self._drain_stderr(self._proc)
+            self._stderr_drain_task = spawn(
+                self._drain_stderr(self._proc),
+                name="drain_stderr",
             )
             return
         if sid and sid != self._session_id:
             self._save_session_id(sid)
-        self._stderr_drain_task = asyncio.ensure_future(self._drain_stderr(self._proc))
+        self._stderr_drain_task = spawn(self._drain_stderr(self._proc), name="drain_stderr")
 
     async def _read_init(self, proc: asyncio.subprocess.Process) -> str:
         while True:
@@ -1347,8 +1349,9 @@ class ClaudeSession:
             text = block.get("text", "") or ""
             state.reply_parts.append(text)
             if text and not is_silent(text):
-                asyncio.ensure_future(
-                    reporter.emit(self.agent_id, "assistant_text", {"text": text})
+                spawn(
+                    reporter.emit(self.agent_id, "assistant_text", {"text": text}),
+                    name="reporter.emit:assistant_text",
                 )
             if self.audit is not None and text:
                 self.audit.write("assistant.text", text=text)
@@ -1368,7 +1371,10 @@ class ClaudeSession:
         tool_event = {"tool": name}
         if "send_message" in name and isinstance(tool_input.get("text"), str):
             tool_event["content"] = tool_input["text"][:STATUS_PREVIEW_CHARS]
-        asyncio.ensure_future(reporter.emit(self.agent_id, "tool_use", tool_event))
+        spawn(
+            reporter.emit(self.agent_id, "tool_use", tool_event),
+            name="reporter.emit:tool_use",
+        )
         if name == "mcp__puffo__send_message":
             state.send_message_targets.append(
                 {

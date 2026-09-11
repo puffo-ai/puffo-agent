@@ -38,6 +38,7 @@ from typing import AsyncIterator, Callable, Optional, Protocol
 
 from .._proc import no_window_kwargs
 from ..agent._auth_markers import looks_like_auth_error
+from ..agent._usage_markers import looks_like_usage_limit
 from ..agent._logging import diagnostic_category
 from .host_assets import (
     _atomic_write_private,
@@ -49,6 +50,7 @@ from .state import (
     sync_host_codex_auth_view,
     sync_host_claude_code_auth_view,
 )
+from ..tasks import spawn
 
 
 logger = logging.getLogger(__name__)
@@ -201,6 +203,14 @@ def _classify_failed_refresh(
     # Model-not-found latches per-daemon-life, so it wins even when
     # the response also looks rate-limit-shaped.
     _maybe_disable_probe_model(out_tail, err_tail)
+    # quota before auth: a spent-quota body carries auth-adjacent wording
+    if looks_like_usage_limit(out_tail) or looks_like_usage_limit(err_tail):
+        logger.warning(
+            "%s usage limit reached rc=%d in %.1fs — quota exhausted, not "
+            "an auth failure | stdout: %s | stderr: %s",
+            log_prefix, rc, elapsed, out_tail, err_tail,
+        )
+        return RefreshOutcome.QUOTA_EXHAUSTED
     # Auth-failed before rate-limit: Anthropic sometimes wraps a 401
     # on a revoked RT in rate-limit-adjacent wording; only operator
     # re-login recovers, so DM now rather than after the 2-tick streak.
@@ -292,6 +302,9 @@ class RefreshOutcome(enum.Enum):
     # ``auth_failed`` immediately (no 2-tick streak, no fast retry) so
     # the worker's operator-DM path fires — the loop can't self-recover.
     AUTH_FAILED = "auth_failed"
+    # spent plan quota — not a broken loop: no streak, no fast retry;
+    # only the window reset recovers it
+    QUOTA_EXHAUSTED = "quota_exhausted"
 
 
 class CredentialBackend(Protocol):
@@ -1074,8 +1087,9 @@ class CredentialRefresher:
         # don't import the macos module up here.
         external_poll_task: asyncio.Task | None = None
         if hasattr(self.backend, "poll_external_rotation"):
-            external_poll_task = asyncio.ensure_future(
+            external_poll_task = spawn(
                 self._external_rotation_loop(stop_event),
+                name="external_rotation_loop",
             )
 
         try:
@@ -1132,8 +1146,11 @@ class CredentialRefresher:
             self._detect_external_rotation()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
-        stop_task = asyncio.create_task(stop_event.wait())
-        refresh_task = asyncio.create_task(self._refresh_request.wait())
+        stop_task = spawn(stop_event.wait(), name="stop_event.wait")
+        refresh_task = spawn(
+            self._refresh_request.wait(),
+            name="refresh_request.wait",
+        )
         try:
             await asyncio.wait(
                 {stop_task, refresh_task},
@@ -1141,8 +1158,10 @@ class CredentialRefresher:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            stop_task.cancel()
-            refresh_task.cancel()
+            for task in (stop_task, refresh_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stop_task, refresh_task, return_exceptions=True)
 
     def _current_credential_revision(self) -> CredentialRevision | None:
         fingerprint = getattr(self.backend, "fingerprint", None)
@@ -1290,6 +1309,8 @@ class CredentialRefresher:
             # operator.
             self._flip_auth_failed()
             return
+        if outcome is RefreshOutcome.QUOTA_EXHAUSTED:
+            return
         self._consecutive_non_success += 1
         if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
             self._flip_refresh_broken(outcome)
@@ -1320,7 +1341,7 @@ class CredentialRefresher:
 
         coro = _retry()
         try:
-            self._rate_limit_retry_task = asyncio.create_task(coro)
+            self._rate_limit_retry_task = spawn(coro, name="rate_limit_retry")
         except RuntimeError:
             # No running loop (sync test path) — fall back to natural poll.
             coro.close()
@@ -1351,7 +1372,7 @@ class CredentialRefresher:
                 continue
             if rs.health in (
                 "auth_failed", "api_error_abandoned", "provider_error",
-                "refresh_broken", "in_progress", "unhandled_error",
+                "refresh_broken", "drained", "extra_usage_required", "in_progress", "unhandled_error",
             ):
                 continue
             rs.health = "refresh_broken"
@@ -1411,7 +1432,9 @@ class CredentialRefresher:
                 continue
             if rs is None:
                 continue
-            if rs.health in ("auth_failed", "api_error_abandoned", "in_progress"):
+            if rs.health in (
+                "auth_failed", "api_error_abandoned", "drained", "extra_usage_required", "in_progress",
+            ):
                 continue
             rs.health = "auth_failed"
             rs.error = msg

@@ -1,13 +1,14 @@
-import asyncio
 
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
+from ._usage_markers import looks_like_usage_limit
 from .adapters import Adapter, TurnContext
 from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
 from .errors import AgentAPIError
 from .message_projection import model_attachment_path
 from .memory import MemoryManager
+from ..tasks import spawn
 
 MAX_LOG_ENTRIES = 60
 
@@ -23,6 +24,16 @@ def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:
     if len(cleaned) == 1:
         return cleaned[0]
     return "\n".join(f"- {p}" for p in cleaned)
+
+
+def _classify_api_error(joined: str) -> tuple[bool, bool, str]:
+    """``(is_auth, is_drained, label)`` for an ``API Error`` body.
+    Quota first: auth markers are substrings and match quota bodies."""
+    if looks_like_usage_limit(joined):
+        return False, True, "quota-drained"
+    if looks_like_auth_error(joined):
+        return True, False, "auth-failed"
+    return False, False, "rate-limited"
 
 
 def _user_message_preview(messages: list[dict]) -> str:
@@ -246,10 +257,11 @@ class PuffoAgent:
         if is_silent(joined):
             return None
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, _label = _classify_api_error(joined)
             raise AgentAPIError(
                 "agent adapter output contained 'API Error' on global retry",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
         if not text_parts and not result.reply:
             return None
@@ -342,15 +354,16 @@ class PuffoAgent:
         if is_silent(joined):
             return None
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, label = _classify_api_error(joined)
             self.logger.warning(
                 "[api-error-retry] adapter still %s; raising for "
                 "consumer-side handling",
-                "auth-failed" if is_auth else "rate-limited",
+                label,
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error' on retry",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
         if not text_parts and not result.reply:
             return None
@@ -382,12 +395,13 @@ class PuffoAgent:
         # → turn_complete (tokens). Best-effort; no-ops if the owner isn't linked.
         from ..portal.control.reporter import get_reporter
 
-        asyncio.ensure_future(
+        spawn(
             get_reporter().emit(
                 self.agent_id,
                 "turn_start",
                 {"message": _user_message_preview(ctx.messages)},
-            )
+            ),
+            name="reporter.emit:turn_start",
         )
         result = await self.adapter.run_turn(ctx)
 
@@ -414,12 +428,13 @@ class PuffoAgent:
         context_measured_at = result.metadata.get("context_measured_at")
         if isinstance(context_measured_at, str) and context_measured_at:
             turn_complete_payload["context_measured_at"] = context_measured_at
-        asyncio.ensure_future(
+        spawn(
             get_reporter().emit(
                 self.agent_id,
                 "turn_complete",
                 turn_complete_payload,
-            )
+            ),
+            name="reporter.emit:turn_complete",
         )
 
         return self._route_turn_result(
@@ -459,15 +474,16 @@ class PuffoAgent:
             return None
 
         if "API Error" in joined:
-            is_auth = looks_like_auth_error(joined)
+            is_auth, is_drained, label = _classify_api_error(joined)
             self.logger.warning(
                 f"[api-error] [{channel_name}] @{sender}: adapter output "
                 "contained 'API Error' (%s); suppressing post",
-                "auth-failed" if is_auth else "rate-limited",
+                label,
             )
             raise AgentAPIError(
                 "agent adapter output contained 'API Error'",
                 is_auth=is_auth,
+                is_drained=is_drained,
             )
 
         if not text_parts and not result.reply:
@@ -486,12 +502,13 @@ class PuffoAgent:
             f"send_message and [SILENT] markers; posting "
             f"{len(text_parts) or 1}-frame fallback"
         )
-        asyncio.ensure_future(
+        spawn(
             get_reporter().emit(
                 self.agent_id,
                 "tool_use",
                 {"tool": "fallback", "content": fallback[:STATUS_PREVIEW_CHARS]},
-            )
+            ),
+            name="reporter.emit:tool_use",
         )
         self._append_assistant(channel_name, fallback)
         return fallback

@@ -27,8 +27,11 @@ from ...crypto.primitives import ed25519_verify, hpke_open
 from .store import MachineControlIdentity
 
 PORTAL_CMD_INFO = b"puffo/portal-cmd/v1"
-# Commands older than this (or this far in the future) are rejected.
-TS_WINDOW_MS = 5 * 60 * 1000
+# Commands older than this (or this far in the future) are rejected. Keep a
+# margin above the control client's ten-minute create budget: a valid command
+# must remain recognizable while its first Docker build is still running and
+# while its result is being re-acked after an ordinary reconnect.
+TS_WINDOW_MS = 15 * 60 * 1000
 
 
 class ControlError(Exception):

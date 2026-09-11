@@ -5,9 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from puffo_agent.agent.harness.claude_code_driver import ClaudeCodeCliDriver
+from puffo_agent.agent.harness.drivers.claude_code import ClaudeCodeCliDriver
 from puffo_agent.agent.harness.driver import RuntimeSpec, SessionRef, TurnRef
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
 )

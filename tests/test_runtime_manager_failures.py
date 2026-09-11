@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 
 from puffo_agent.agent.errors import AgentAPIError, ProviderFailureError
 from puffo_agent.agent.adapters.base import TurnContext, TurnResult
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     _provider_error,
 )
-from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
     CompactReceipt,
     ContextStatus,
     Driver,
     HarnessEvent,
+    HarnessEventType,
     RuntimeOpened,
     RuntimeRef,
     RuntimeSpec,
@@ -27,7 +30,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
@@ -1102,6 +1105,41 @@ async def test_timeout_cleanup_cannot_retire_the_next_turn_runtime():
 
 
 @pytest.mark.asyncio
+async def test_cancel_during_timeout_still_publishes_and_retires_runtime():
+    class CloseFailingPausedCancelDriver(_PausedCancelDriver):
+        async def close(self):
+            self.close_calls += 1
+            raise RuntimeError("timeout retirement cleanup failed")
+
+    driver = CloseFailingPausedCancelDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+    await manager.open()
+    stream = manager.events()
+    started = await manager.start_turn(TurnInput("first"))
+
+    timeout = asyncio.create_task(manager.timeout_turn(started.turn_ref))
+    await asyncio.wait_for(driver.cancel_entered.wait(), timeout=1)
+    timeout.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await asyncio.wait_for(timeout, timeout=1)
+
+    terminal = await asyncio.wait_for(anext(stream), timeout=1)
+    assert terminal.type == HarnessEventType.TURN_ABANDONED
+    assert terminal.data["error_code"] == "turn_timeout"
+    assert [str(error) for error in cleanup_errors(exc_info.value)] == [
+        "timeout retirement cleanup failed"
+    ]
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+    assert driver.close_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
     driver = _ControllableDriver()
 
@@ -1269,6 +1307,39 @@ async def test_compaction_completes_only_on_the_event_and_never_starts_twice():
 
 
 @pytest.mark.asyncio
+async def test_compaction_failed_event_fails_waiters_fast_with_the_diagnostic():
+    """COMPACTION_FAILED must release waiters immediately, not by timeout.
+
+    A provider 4xx/5xx during a driver-run compaction (e.g. OpenCode's
+    summarize) emits the event; the manager fails its outstanding future so
+    every coalesced caller returns with the diagnostic well inside the
+    bounded wait, and a later compaction can start fresh.
+    """
+    driver, manager, adapter = await _open_compacting_manager(wait_seconds=10)
+
+    first = asyncio.create_task(adapter.compact_context())
+    second = asyncio.create_task(adapter.compact_context())
+    await asyncio.sleep(0)
+    assert driver.compact_calls == 1
+
+    await driver.queue.put(HarnessEvent(
+        type="compaction.failed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        data={"diagnostic": "summarize returned HTTP 500: provider melted"},
+    ))
+    results = await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    assert [value.completed for value in results] == [False, False]
+    assert all("HTTP 500" in value.diagnostic for value in results)
+
+    # The failed operation is cleared: a retry issues a new provider pass.
+    adapter.compaction_wait_seconds = 0.01
+    await adapter.compact_context()
+    assert driver.compact_calls == 2
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_context_commands_are_locked_and_fail_closed_after_close():
     driver = _CompactingDriver()
     manager = RuntimeManager(
@@ -1400,6 +1471,92 @@ async def test_context_rollover_preserves_logical_session_and_opens_fresh_native
     assert manager.session_ref == SessionRef("logical-session")
     assert manager.opened is not None and manager.opened.resumed is False
     assert adapter.get_context_capabilities().rollover is True
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_acp_post_commit_binding_admits_exact_call_and_rejects_wrong_id():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(driver, RuntimeSpec("/tmp"), driver_name="acp")
+    await manager.open()
+    await manager.start_turn(TurnInput("notice"))
+    admitted = []
+
+    async def admit(event):
+        admitted.append(event)
+
+    def event(call_id, receipt, *, bound_id=None, tool_name="read_inbox"):
+        binding = hashlib.sha256(
+            f"{bound_id or call_id}\x00{receipt}".encode("utf-8")
+        ).hexdigest()
+        return HarnessEvent.normalized(
+            type="turn.tool_completed",
+            driver="acp",
+            session_ref=SessionRef(manager.native_session_id),
+            turn_ref=driver.turn,
+            native_session_id=manager.native_session_id,
+            native_turn_id=manager.native_turn_id,
+            data={
+                "tool_call_ref": call_id,
+                "label": tool_name,
+                "outcome": "succeeded",
+            },
+            native_payload={
+                "_puffo_internal": "tool_result",
+                "provider_context_committed": True,
+                "tool_call_id": call_id,
+                "tool_name": tool_name,
+                "admission_binding": binding,
+                "is_error": False,
+            },
+        )
+
+    manager.register_continuation(
+        admit,
+        "exact",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 1},
+        correlation_receipt="receipt-exact",
+    )
+    await manager._admit_matching_tool_result(
+        event("call-exact", "receipt-exact")
+    )
+    assert len(admitted) == 1
+    assert admitted[0].planning_cycle_key == "exact"
+    assert admitted[0].tool_call_id == "call-exact"
+
+    admitted.clear()
+    manager.register_continuation(
+        admit,
+        "wrong-id",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 2},
+        correlation_receipt="receipt-wrong-id",
+    )
+    await manager._admit_matching_tool_result(
+        event(
+            "call-tampered",
+            "receipt-wrong-id",
+            bound_id="call-actually-committed",
+        )
+    )
+    assert admitted == []
+
+    manager.register_continuation(
+        admit,
+        "wrong-tool",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 3},
+        correlation_receipt="receipt-wrong-tool",
+    )
+    await manager._admit_matching_tool_result(
+        event(
+            "call-wrong-tool",
+            "receipt-wrong-tool",
+            tool_name="send_message",
+        )
+    )
+    assert admitted == []
     await manager.close()
 
 

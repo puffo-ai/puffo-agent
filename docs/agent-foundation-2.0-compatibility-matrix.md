@@ -456,15 +456,15 @@ retained current-context usage; the old `core.py` added `current_context` to
   `turn_complete_payload` additionally included `current_context`
   (`0d9f44d^:src/puffo_agent/agent/core.py:325-330`).
 - The Codex Driver maps only cumulative context totals and drops per-turn token
-  deltas: `src/puffo_agent/agent/harness/codex_driver.py:643-659`
+  deltas: `src/puffo_agent/agent/harness/drivers/codex.py:643-659`
   (`thread/tokenUsage/updated` → `ContextStatus` with `totalTokens` +
   `modelContextWindow`); its terminal event carries only `outcome`
   (`codex_driver.py:827-831`).
-- `src/puffo_agent/agent/harness/runtime_manager.py:800-812` copies token fields
+- `src/puffo_agent/agent/harness/runtime/runtime_manager.py:800-812` copies token fields
   onto `TurnResult` only if the terminal event contains them, otherwise both
   default to `0` — hence Codex `0/0`.
 - Claude Code still supplies terminal tokens:
-  `src/puffo_agent/agent/harness/claude_code_driver.py:618-627`
+  `src/puffo_agent/agent/harness/drivers/claude_code.py:618-627`
   (`input_tokens`/`output_tokens` from `usage`).
 - The old Claude session path still projects rich events into the legacy
   reporter (`src/puffo_agent/agent/adapters/cli_session.py:1351-1372`,
@@ -603,10 +603,10 @@ single internal source of truth.
 - Context usage reaches the Profile surface through one documented contract.
 - No raw chain-of-thought, native frames, or provider-native payloads may be
   projected (metadata-only vocabulary is retained).
-- Implicated files (Agent): `src/puffo_agent/agent/harness/codex_driver.py`,
-  `src/puffo_agent/agent/harness/claude_code_driver.py`,
-  `src/puffo_agent/agent/harness/runtime_manager.py`,
-  `src/puffo_agent/agent/harness/local_runtime.py`,
+- Implicated files (Agent): `src/puffo_agent/agent/harness/drivers/codex.py`,
+  `src/puffo_agent/agent/harness/drivers/claude_code.py`,
+  `src/puffo_agent/agent/harness/runtime/runtime_manager.py`,
+  `src/puffo_agent/agent/harness/runtime/local_runtime.py`,
   `src/puffo_agent/agent/core.py` (legacy `turn_complete` emission),
   `src/puffo_agent/agent/adapters/cli_session.py` (existing projection pattern),
   `src/puffo_agent/portal/control/reporter.py`.
@@ -683,9 +683,9 @@ Pre-repair Agent diagnosis (at
 - `src/puffo_agent/agent/send_response_validation.py:138-186` (F001 response echo)
 - `src/puffo_agent/agent/membership_actions.py:178-235` (F001 intro nudge)
 - `src/puffo_agent/agent/global_inbox_types.py:221-228` (F001 baseline adapter)
-- `src/puffo_agent/agent/harness/codex_driver.py:643-659,827-831` (F005)
-- `src/puffo_agent/agent/harness/claude_code_driver.py:618-627` (F005)
-- `src/puffo_agent/agent/harness/runtime_manager.py:800-812` (F005)
+- `src/puffo_agent/agent/harness/drivers/codex.py:643-659,827-831` (F005)
+- `src/puffo_agent/agent/harness/drivers/claude_code.py:618-627` (F005)
+- `src/puffo_agent/agent/harness/runtime/runtime_manager.py:800-812` (F005)
 - `src/puffo_agent/agent/adapters/cli_session.py:1351-1372` (F005 projection)
 
 Pre-repair Server diagnosis (at

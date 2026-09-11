@@ -10,8 +10,10 @@ by mutating the filesystem — no IPC needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import shutil
 import signal
 import threading
@@ -36,6 +38,7 @@ from .data_service import (
 )
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
+from .control.usage_snapshot import set_live_workers
 from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
     DAEMON_STARTUP_OBSERVATION_SECONDS,
@@ -60,6 +63,7 @@ from .state import (
     is_daemon_ready,
     is_daemon_startup_stalled,
     is_pid_alive,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     read_daemon_pid,
     refresh_model_flag_path,
     refresh_provider_auth_flag_path,
@@ -79,8 +83,14 @@ from .workspace_layout import (
     prepare_workspace_shared_access,
 )
 from .worker import Worker
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_auth_reload_jitter_seconds() -> float:
+    """Spread fleet-wide provider reopen requests across a short window."""
+    return random.uniform(0.0, PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
 
 
 class _DaemonRuntime:
@@ -99,6 +109,8 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
+        # snapshot drained flips must reach worker memory, not just disk
+        set_live_workers(lambda: self.workers)
         self._paused_reported: set[str] = set()
         # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
@@ -167,16 +179,25 @@ class Daemon:
 
     async def _start_runtime(self, runtime: _DaemonRuntime) -> None:
         runtime.startup_tasks.append(
-            asyncio.ensure_future(_log_outdated_version_warning())
+            spawn(_log_outdated_version_warning(), name="log_outdated_version_warning")
         )
         from ..agent.model_catalog import prefetch as _prefetch_model_catalog
 
         _prefetch_model_catalog()
         runtime.startup_tasks.extend(
             (
-                asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup()),
-                asyncio.ensure_future(_migrate_linked_agents_at_startup()),
-                asyncio.ensure_future(_full_sync_all_owned_agents_at_startup()),
+                spawn(
+                    _sweep_archived_pending_revokes_at_startup(),
+                    name="sweep_archived_pending_revokes_at_startup",
+                ),
+                spawn(
+                    _migrate_linked_agents_at_startup(),
+                    name="migrate_linked_agents_at_startup",
+                ),
+                spawn(
+                    _full_sync_all_owned_agents_at_startup(),
+                    name="full_sync_all_owned_agents_at_startup",
+                ),
             )
         )
         runtime.ws_local_runner = await start_ws_local_server(
@@ -196,15 +217,15 @@ class Daemon:
         )
         runtime.runtime_tasks.extend(
             (
-                asyncio.ensure_future(self.refresher.run_loop(self._stop)),
-                asyncio.ensure_future(self.codex_refresher.run_loop(self._stop)),
+                spawn(self.refresher.run_loop(self._stop), name="refresher.run_loop"),
+                spawn(self.codex_refresher.run_loop(self._stop), name="codex_refresher.run_loop"),
             )
         )
         from .control.client import ControlManager
 
         runtime.control_manager = ControlManager()
         runtime.runtime_tasks.append(
-            asyncio.ensure_future(runtime.control_manager.run())
+            spawn(runtime.control_manager.run(), name="control_manager.run")
         )
 
     def _stop_was_requested(
@@ -363,7 +384,7 @@ class Daemon:
                     # the persisted session into Node's heap, so N
                     # parallel warms can OOM the host. Awaiting one at
                     # a time keeps peak RSS bounded.
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 elif (
                     worker.restart_required
                     or _worker_needs_restart(worker.agent_cfg, agent_cfg)
@@ -387,7 +408,7 @@ class Daemon:
                     self.workers[agent_id] = worker
                     self._register_with_refresher(agent_cfg, worker)
                     worker.start()
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 else:
                     worker.agent_cfg = agent_cfg
             elif desired_state == "paused":
@@ -405,6 +426,16 @@ class Daemon:
                         self._paused_reported.add(agent_id)
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
+
+    async def _observe_worker_start(self, agent_id: str, worker: Worker) -> None:
+        if await worker.wait_warm(timeout=self._warm_serialise_timeout):
+            return
+        logger.warning(
+            "agent %s: worker did not reach running during the startup "
+            "observation window (status=%s)",
+            agent_id,
+            worker.runtime.status,
+        )
 
     async def _stop_removed_agents(self, on_disk: set[str]) -> None:
         for stale_id in list(self._agent_cfg_cache.keys() - on_disk):
@@ -444,13 +475,31 @@ class Daemon:
         except OSError as exc:
             logger.warning("agent %s: couldn't remove restart.flag: %s", agent_id, exc)
 
-    def _refresher_for(self, agent_cfg: AgentConfig) -> CredentialRefresher:
-        """Pick the right refresher for an agent's harness. Codex
-        agents only need their own auth.json refresh; claude-code +
-        every other harness routes through the Claude refresher."""
-        if (agent_cfg.runtime.harness or "claude-code") == "codex":
+    def _refresher_for(
+        self, agent_cfg: AgentConfig
+    ) -> CredentialRefresher | None:
+        """The refresher that actually owns this agent's credentials, or
+        ``None`` when no daemon refresher does.
+
+        Only the harnesses in ``_DAEMON_REFRESH_HARNESSES`` have a backend
+        here: claude-code via ``FileBackend``/``KeychainBackend``, codex via
+        ``CodexFileBackend``. Pi projects its own ``auth.json`` through
+        ``sync_host_pi_auth_view`` and OpenCode carries its own credentials;
+        neither has anything for a refresher to refresh.
+
+        This used to fall through to the Claude refresher for every
+        non-codex harness, which put Pi and OpenCode agents on a refresher
+        that could not help them and could block them: the pre-delivery
+        gate (``_ensure_fresh_for``) then failed on an expired *Claude*
+        token, so a Pi agent with a perfectly valid credential never
+        reached its own provider (#337).
+        """
+        harness = agent_cfg.runtime.harness or "claude-code"
+        if harness == "codex":
             return self.codex_refresher
-        return self.refresher
+        if harness == "claude-code":
+            return self.refresher
+        return None
 
     def _register_with_refresher(
         self,
@@ -468,6 +517,13 @@ class Daemon:
         ):
             return
         refresher = self._refresher_for(agent_cfg)
+        if refresher is None:
+            # No daemon refresher owns this harness's credentials. Registering
+            # anyway would subscribe the agent to another provider's failure
+            # fan-out (`_flip_refresh_broken` / `_flip_auth_failed`) and to an
+            # `on_refresh_success` that would clear its reds for an unrelated
+            # reason.
+            return
         refresher.register_agent(agent_home_dir(agent_cfg.id))
         agent_id = agent_cfg.id
 
@@ -489,13 +545,23 @@ class Daemon:
                     agent_cfg.resolve_workspace_dir()
                 )
                 flag.parent.mkdir(parents=True, exist_ok=True)
+                jitter_seconds = _provider_auth_reload_jitter_seconds()
                 flag.write_text(
-                    '{"source":"credential_replaced"}', encoding="utf-8"
+                    json.dumps({
+                        "source": "credential_replaced",
+                        "jitter_seconds": jitter_seconds,
+                        "not_before_unix_ms": int(
+                            (time.time() + jitter_seconds) * 1000
+                        ),
+                    }),
+                    encoding="utf-8",
                 )
                 worker.notify_refresh()
                 logger.info(
-                    "agent %s: credential replaced — provider reload requested",
+                    "agent %s: credential replaced — provider reload requested "
+                    "with %.3fs jitter",
                     agent_id,
+                    jitter_seconds,
                 )
             except OSError as exc:
                 logger.warning(
@@ -512,7 +578,13 @@ class Daemon:
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         if Daemon._uses_claude_api_key(self, agent_cfg):
             return None
-        return self._refresher_for(agent_cfg).notify_refresh_needed
+        refresher = self._refresher_for(agent_cfg)
+        # None for harnesses no refresher owns: there is nothing to wake, and
+        # waking the Claude refresher on a Pi 401 only re-probes an unrelated
+        # provider. The worker already null-checks this.
+        return (
+            refresher.notify_refresh_needed if refresher is not None else None
+        )
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
         # Gateway/VK mode (runtime.llm_base_url set): the LLM key is a static
@@ -526,7 +598,10 @@ class Daemon:
             or Daemon._uses_claude_api_key(self, agent_cfg)
         ):
             return None
-        return self._refresher_for(agent_cfg).ensure_fresh
+        refresher = self._refresher_for(agent_cfg)
+        # No owning refresher -> no pre-delivery gate. The worker already
+        # treats None as "skip the gate" (same path gateway/VK mode uses).
+        return refresher.ensure_fresh if refresher is not None else None
 
     def _uses_claude_api_key(self, agent_cfg: AgentConfig) -> bool:
         runtime = agent_cfg.runtime
@@ -1052,14 +1127,9 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     }[harness]
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
-    from ..agent.model_catalog import provider_models
+    from ..agent.model_catalog import validate_model_id
 
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if model not in supported:
-        raise ValueError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    validate_model_id(model)
 
 
 def _validate_daemon_inference_level(harness: str, level: str) -> None:

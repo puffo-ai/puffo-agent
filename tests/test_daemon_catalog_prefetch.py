@@ -103,6 +103,8 @@ def test_capabilities_fetch_claude_catalog_after_late_login(monkeypatch):
     monkeypatch.setattr(cli_bin, "resolve_claude_bin", lambda: "/bin/claude")
     monkeypatch.setattr(cli_bin, "claude_has_credentials", lambda: True)
     monkeypatch.setattr(cli_bin, "resolve_codex_bin", lambda: None)
+    monkeypatch.setattr(cli_bin, "resolve_opencode_bin", lambda: None)
+    monkeypatch.setattr(cli_bin, "resolve_pi_bin", lambda: None)
     monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ("claude-code", "codex"))
     monkeypatch.setattr(
         model_catalog,

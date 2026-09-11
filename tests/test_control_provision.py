@@ -360,7 +360,40 @@ async def test_provision_materializes_then_writes(tmp_path, monkeypatch):
     if os.name != "nt":
         assert agent_root.stat().st_mode & 0o777 == 0o700
         assert key_path.parent.stat().st_mode & 0o777 == 0o700
-        assert key_path.stat().st_mode & 0o777 == 0o600
+    assert key_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_provision_preflight_rejects_before_materialization_or_write(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    monkeypatch.setenv("PUFFO_HOME", str(tmp_path))
+    payload, operator_public = _payload()
+    events = []
+
+    async def preflight(context):
+        events.append(("preflight", context["agent_id"]))
+        raise ProvisionError(
+            "Pi sign-in required",
+            error_code="harness_not_ready",
+            harness="pi",
+            reason="need_login",
+        )
+
+    async def materialize(context):
+        events.append(("materialize", context["agent_id"]))
+
+    with pytest.raises(ProvisionError, match="Pi sign-in required"):
+        await provision_agent_from_bundle(
+            payload,
+            operator_public,
+            preflight=preflight,
+            materialize=materialize,
+        )
+
+    assert events == [("preflight", "helper-1234")]
+    assert not (tmp_path / "agents" / "helper-1234").exists()
 
 
 @pytest.mark.asyncio

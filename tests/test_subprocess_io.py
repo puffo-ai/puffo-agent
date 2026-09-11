@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from puffo_agent.agent.harness.subprocess_io import drain_subprocess_stream_keeping_tail
+from puffo_agent.agent.harness.support.subprocess_io import drain_subprocess_stream_keeping_tail
 
 
 class _FakeStream:

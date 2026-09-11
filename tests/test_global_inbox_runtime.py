@@ -42,6 +42,7 @@ from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.runtime_events import RuntimeEvent
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
+from puffo_agent.tasks import spawn
 from _global_inbox_support import Adapter, ToolReturnAdapter, make_store, receipt
 
 
@@ -753,9 +754,10 @@ async def test_listener_guard_stops_transport_when_runtime_crashes():
 
 
 @pytest.mark.asyncio
-async def test_listener_guard_observes_simultaneous_listener_failure():
+async def test_listener_guard_reports_both_simultaneous_failures_once(caplog):
     release = asyncio.Event()
     listener_started = asyncio.Event()
+    loop_contexts = []
 
     async def fail_listener():
         listener_started.set()
@@ -767,22 +769,44 @@ async def test_listener_guard_observes_simultaneous_listener_failure():
         await release.wait()
         raise ValueError("runtime boom")
 
-    runtime_task = asyncio.create_task(fail_runtime())
-    guarded = asyncio.create_task(
-        await_listener_with_runtime(
-            fail_listener(),
-            runtime_task,
-            label="global inbox",
-        )
-    )
-    await listener_started.wait()
-    release.set()
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_contexts.append(context))
+    try:
+        with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+            runtime_task = spawn(fail_runtime(), name="global_runtime.run")
+            guarded = asyncio.create_task(
+                await_listener_with_runtime(
+                    fail_listener(),
+                    runtime_task,
+                    label="global inbox",
+                )
+            )
+            await listener_started.wait()
+            release.set()
 
-    with pytest.raises(
-        RuntimeError,
-        match="runtime boom; listener also failed: listener boom",
-    ):
-        await guarded
+            with pytest.raises(
+                RuntimeError,
+                match="runtime boom; listener also failed: listener boom",
+            ):
+                await guarded
+            for _ in range(3):
+                await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(records) == 2
+    assert {record.getMessage() for record in records} == {
+        "worker task died: listener",
+        "worker task died: global_runtime.run",
+    }
+    assert all(record.exc_info is not None for record in records)
+    assert {type(record.exc_info[1]) for record in records} == {
+        OSError,
+        ValueError,
+    }
+    assert loop_contexts == []
 
 
 @pytest.mark.asyncio
@@ -1629,6 +1653,51 @@ async def test_success_without_inbox_read_leaves_messages_pending(
     assert [row.envelope_id for row in await store.get_pending()] == ["silent"]
     assert calls == 1
     assert not runtime.current_turn_path.exists()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_empty_notice_turns_warn_of_possible_mcp_failure(
+    tmp_path, caplog,
+):
+    """A wedged MCP lane must not leave repeated empty turns log-silent."""
+    caplog.set_level(logging.WARNING)
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    should_read = False
+
+    async def ignore_notice(_planned):
+        if should_read:
+            await adapter.admit()
+            await runtime.read_inbox(limit=50)
+        return None
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=ignore_notice,
+        workspace=tmp_path,
+        agent_id="agent-stuck",
+    )
+
+    for seq in range(1, 4):
+        await receipt(store, f"pending-{seq}", seq)
+        assert await runtime.process_once()
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "possible MCP control-plane failure" in record.getMessage()
+    ]
+    assert warnings == [
+        "agent agent-stuck: possible MCP control-plane failure — 3 "
+        "consecutive Inbox notice turns completed without read_inbox "
+        "admission while messages remain pending"
+    ]
+    should_read = True
+    await receipt(store, "pending-4", 4)
+    assert await runtime.process_once()
+    assert runtime._mcp_silence_streak == 0
     await store.close()
 
 

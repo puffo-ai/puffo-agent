@@ -30,7 +30,9 @@ from .context_controller import (
     ProviderAdmissionEvent,
     ToolResultAdmission,
 )
-from .errors import AgentAPIError, ProviderFailureError
+from .errors import AgentAPIError
+from ._failure_outcomes import crash_resume_terminal, failure_outcome
+from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
     COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
@@ -57,20 +59,17 @@ from .message_projection import (
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
 from .provider_failures import operator_failure_text
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
 
-# A degrade is a transient provider incident, never a durable verdict about
-# pending Inbox work.  Recovery is a bounded backoff window the runtime re-arms
-# itself, so requeued rows stay retryable without depending on unrelated ingress.
-DEGRADED_RECOVERY_BASE_SECONDS = 5.0
-DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_covers import CoversReconciliationMixin
+from .global_inbox_degraded import DegradedRecoveryMixin
 from .autonomous_turns import AutonomousTurnLifecycleMixin
 from .global_inbox_types import (
     opt_str,
@@ -130,6 +129,7 @@ class GlobalInboxRuntime(
     AutonomousTurnLifecycleMixin,
     InboxAdmissionMixin,
     CoversReconciliationMixin,
+    DegradedRecoveryMixin,
 ):
     """One serial provider boundary over the durable global Inbox."""
 
@@ -160,6 +160,7 @@ class GlobalInboxRuntime(
         process_outcome: ProcessOutcomeCallback | None = None,
         channel_audience_loader: ChannelAudienceLoader | None = None,
         covers_renotice_enabled: bool | None = None,
+        drained_check: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -189,9 +190,8 @@ class GlobalInboxRuntime(
         # turn owner and in-memory exact union, so they share one short lock.
         self._turn_state_lock = asyncio.Lock()
         self._stopping = False
-        self._degraded = False
-        self._degraded_until: float | None = None
-        self._degraded_attempts = 0
+        self._init_recovery_gates(drained_check)
+        self._mcp_silence_streak = 0
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
@@ -257,9 +257,7 @@ class GlobalInboxRuntime(
         return self.workspace / ".puffo-agent" / "current_turn.json"
 
     def notify(self) -> None:
-        self._degraded = False
-        self._degraded_until = None
-        self._degraded_attempts = 0
+        self._clear_degraded_backoff()
         delay = self._busy_notice_delay_seconds if self.active.turn_id else 0.0
         self.coalescer.notify(delay_seconds=delay)
         self._schedule_busy_notice()
@@ -394,7 +392,10 @@ class GlobalInboxRuntime(
         )
 
     async def run(self) -> None:
-        reminder_task = asyncio.create_task(self.reminder_scheduler.run())
+        reminder_task = spawn(
+            self.reminder_scheduler.run(),
+            name="reminder_scheduler.run",
+        )
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
@@ -409,7 +410,10 @@ class GlobalInboxRuntime(
                 ):
                     self.notify()
             while not self._stopping:
-                burst_task = asyncio.create_task(self.coalescer.wait_for_burst())
+                burst_task = spawn(
+                    self.coalescer.wait_for_burst(),
+                    name="coalescer.wait_for_burst",
+                )
                 done, _pending = await asyncio.wait(
                     {burst_task, reminder_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -417,10 +421,11 @@ class GlobalInboxRuntime(
                 if reminder_task in done:
                     if not burst_task.done():
                         burst_task.cancel()
-                        try:
-                            await burst_task
-                        except asyncio.CancelledError:
-                            pass
+                    # Settle the sibling even when both tasks completed in the
+                    # same event-loop turn.  Otherwise a simultaneous burst
+                    # failure can escape inspection while the scheduler error
+                    # is propagated below.
+                    await asyncio.gather(burst_task, return_exceptions=True)
                     # A scheduler error is an owning-runtime error, never a
                     # silently disabled timer loop.
                     await reminder_task
@@ -1109,37 +1114,6 @@ class GlobalInboxRuntime(
             except FileNotFoundError:
                 pass
 
-    def _degrade(self, diagnostic: str) -> None:
-        self.health = RuntimeHealth("degraded", diagnostic)
-        self._degraded = True
-        self._degraded_attempts += 1
-        backoff = min(
-            DEGRADED_RECOVERY_BASE_SECONDS * 2 ** (self._degraded_attempts - 1),
-            DEGRADED_RECOVERY_MAX_SECONDS,
-        )
-        self._degraded_until = time.monotonic() + backoff
-        # Arm the autonomous recovery wake through the existing coalescer only:
-        # no extra task, timer, or thread, so shutdown behaviour is unchanged.
-        self.coalescer.notify(delay_seconds=backoff)
-
-    def _try_degraded_recovery(self) -> bool:
-        """Return whether a degraded runtime may retry its durable work now."""
-        if not self._degraded:
-            return True
-        remaining = (
-            0.0
-            if self._degraded_until is None
-            else self._degraded_until - time.monotonic()
-        )
-        if remaining > 0:
-            # An earlier coalescer deadline may have fired ahead of the degrade
-            # wake and consumed it; re-arm so the window still ends in a retry.
-            self.coalescer.notify(delay_seconds=remaining)
-            return False
-        self._degraded = False
-        self._degraded_until = None
-        return True
-
     async def _resolve_context_plan(self, planned: PlannedTurn) -> PlannedTurn | None:
         rollover_seen = False
         for _ in range(self.max_context_decisions):
@@ -1231,6 +1205,7 @@ class GlobalInboxRuntime(
                 can_retry = (
                     isinstance(exc, AgentAPIError)
                     and not exc.is_auth
+                    and not exc.is_drained
                     and self.active.turn_id == planned.turn_id
                     and retries < self.max_api_retries
                     and hasattr(self.run_turn, "handle_global_inbox_retry")
@@ -1364,21 +1339,30 @@ class GlobalInboxRuntime(
     async def _handle_process_failure(
         self, planned: PlannedTurn, process_started: float, exc: Exception
     ) -> tuple[bool, str, str]:
-        process_outcome = "failed"
-        if isinstance(exc, AgentAPIError):
-            process_outcome = "auth_failed" if exc.is_auth else "api_error_abandoned"
-        elif isinstance(exc, ProviderFailureError):
-            process_outcome = "provider_failed"
+        process_outcome = failure_outcome(exc)
         async with self._turn_state_lock:
             terminal = await self._requeue_active_turn(
                 planned, process_started, "provider_error"
             )
         terminal_error = operator_failure_text(exc)
-        self._degrade(
-            "turn failed and was requeued"
-            if terminal
-            else "turn failed outside the active durable turn"
-        )
+        if process_outcome in {"drained", "extra_usage_required"}:
+            if process_outcome == "drained" and looks_like_budget_cap(terminal_error):
+                hold = self.next_budget_park_hold()
+                self._park_drained(
+                    hold_seconds=hold,
+                    diagnostic=(
+                        "gateway budget cap; holding "
+                        f"{int(hold)}s then probing once — {terminal_error[:160]}"
+                    ),
+                )
+            else:
+                self._park_drained(process_outcome)
+        else:
+            self._degrade(
+                "turn failed and was requeued"
+                if terminal
+                else "turn failed outside the active durable turn"
+            )
         log_runtime_event(
             logger,
             "turn.failed",
@@ -1397,6 +1381,8 @@ class GlobalInboxRuntime(
         return terminal, process_outcome, terminal_error
 
     async def process_once(self) -> bool:
+        if not self._drained_park_allows_processing():
+            return False
         if not self._try_degraded_recovery():
             return False
         if self._autonomous_settle_pending is not None:
@@ -1424,8 +1410,8 @@ class GlobalInboxRuntime(
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
-            async with self._turn_state_lock:
-                await self._start_local_turn(planned)
+            if not await self._start_notice_unless_autonomous(planned):
+                return False
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,
@@ -1438,11 +1424,14 @@ class GlobalInboxRuntime(
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
+                    settled = self._health_outcome_for_turn(planned)
                     async with self._turn_state_lock:
                         await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
-                    process_outcome = "succeeded"
+                    process_outcome = settled
+                    if settled == "succeeded":
+                        self._clear_budget_park_backoff()
                 else:
                     terminal_error = "provider returned without correlated admission"
                     self._degrade(terminal_error)
@@ -1707,6 +1696,9 @@ class GlobalInboxRuntime(
                 activated=activated,
             )
         self.health = RuntimeHealth(state, diagnostic)
+        if state in {"drained", "extra_usage_required"}:
+            # crash-resume drained: same park as the live path
+            self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
         if activated:
             await self._notify_status_terminal(
@@ -1729,6 +1721,8 @@ class GlobalInboxRuntime(
                     "auth_failed",
                     "api_error_abandoned",
                     "provider_failed",
+                    "drained",
+                    "extra_usage_required",
                 }
                 else "failed"
             )
@@ -1821,15 +1815,9 @@ class GlobalInboxRuntime(
                 await self._run_retry(planned)
                 return None
             except Exception as exc:
-                if isinstance(exc, AgentAPIError) and exc.is_auth:
-                    return "crash resume auth failure", "auth_failed"
-                if isinstance(exc, ProviderFailureError):
-                    return str(exc), "provider_failed"
-                if not isinstance(exc, AgentAPIError):
-                    return (
-                        f"crash resume unsafe failure: {type(exc).__name__}",
-                        "degraded",
-                    )
+                terminal = crash_resume_terminal(exc)
+                if terminal is not None:
+                    return terminal
                 if retries >= self.max_api_retries:
                     return "crash resume retry budget exhausted", "api_error_abandoned"
                 retries += 1

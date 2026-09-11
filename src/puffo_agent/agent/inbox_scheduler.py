@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, Iterable
 
 from .message_projection import canonical_target_parts
 from .message_store import StoredMessage
+from ..tasks import spawn
 
 MAX_MESSAGES = 50
 MAX_ESTIMATED_TOKENS = 32_000
@@ -247,8 +248,8 @@ class InboxCoalescer:
 
     async def _sleep_or_pull(self, remaining: float) -> bool:
         """Sleep ``remaining``; report whether a pulled deadline cut it short."""
-        sleeper = asyncio.ensure_future(self._sleep(remaining))
-        pull = asyncio.ensure_future(self._pulled.wait())
+        sleeper = spawn(self._sleep(remaining), name="sleep")
+        pull = spawn(self._pulled.wait(), name="pulled.wait")
         try:
             done, _pending = await asyncio.wait(
                 {sleeper, pull}, return_when=asyncio.FIRST_COMPLETED,
@@ -257,10 +258,7 @@ class InboxCoalescer:
             for task in (sleeper, pull):
                 if not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+            await asyncio.gather(sleeper, pull, return_exceptions=True)
         return sleeper not in done
 
     async def wait_for_burst(self) -> None:

@@ -5,17 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from ..._proc import no_window_kwargs
-from ..cli_bin import normalize_launch_argv
-from ..provider_failures import classify_provider_failure
-from .driver import (
+from ...._proc import no_window_kwargs
+from ...cli_bin import normalize_launch_argv
+from ...provider_failures import classify_provider_failure
+from ..driver import (
+    BusyDelivery,
+    RuntimeLifecycle,
     CancelCapability,
     CompactCapability,
     CompactReceipt,
@@ -40,7 +41,8 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from .subprocess_io import drain_subprocess_stream_keeping_tail
+from ..support.subprocess_io import drain_subprocess_stream_keeping_tail
+from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +84,14 @@ def claude_capabilities(
             else CompactCapability.NONE
         ),
         permission_bridge=False,
+        lifecycle=RuntimeLifecycle.PERSISTENT_CHILD,
+        # Mirrors ``steer`` above: without msg_lifecycle_v1 there is no
+        # mid-turn delivery path at all, so the caller keeps the input.
+        busy_delivery=(
+            BusyDelivery.STEER
+            if message_lifecycle_v1
+            else BusyDelivery.REJECT
+        ),
     )
 
 
@@ -189,8 +199,7 @@ class ClaudeCodeCliDriver(Driver):
             # establish the durable session without inventing a probe turn.
             args.extend(["--session-id", native])
         if self.process_factory is None:
-            env = os.environ.copy()
-            env.update(spec.environment)
+            env = dict(spec.environment)
             self._proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,
@@ -209,9 +218,10 @@ class ClaudeCodeCliDriver(Driver):
             if asyncio.iscoroutine(self._proc):
                 self._proc = await self._proc
         self._init = asyncio.get_running_loop().create_future()
-        self._reader = asyncio.create_task(self._read_loop())
-        self._stderr_reader = asyncio.create_task(
-            drain_subprocess_stream_keeping_tail(getattr(self._proc, "stderr", None))
+        self._reader = spawn(self._read_loop(), name="read_loop")
+        self._stderr_reader = spawn(
+            drain_subprocess_stream_keeping_tail(getattr(self._proc, "stderr", None)),
+            name="drain_subprocess_stream_keeping_tail",
         )
         # Older CLI builds and test doubles may emit init eagerly.  Give the
         # reader one scheduling opportunity while keeping current CLI startup

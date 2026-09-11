@@ -31,6 +31,7 @@ from .protocol import Error, encode
 from .session import Transport, WsLocalSession
 from .tool_dispatch import build_dispatch as _build_dispatch
 from ..state import shared_fs_dir
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -421,7 +422,7 @@ async def _start_ws_consumer(
 
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
     owned = connection.get("owned_runtime")
-    heartbeat = asyncio.ensure_future(point.reporter.run_heartbeat_loop())
+    heartbeat = spawn(point.reporter.run_heartbeat_loop(), name="reporter.run_heartbeat_loop")
     reminder_sync = None
     reminder_task = None
     runtime_task = None
@@ -430,10 +431,11 @@ async def _start_ws_consumer(
             # First statement of the scope whose ``finally`` unwinds it.
             _install_owned_runtime(client, owned)
             reminder_sync = await _prepare_owned_reminder_sync(point, client, owned)
-            reminder_task = asyncio.ensure_future(
-                reminder_sync.run(request_snapshot_on_start=False)
+            reminder_task = spawn(
+                reminder_sync.run(request_snapshot_on_start=False),
+                name="reminder_sync.run",
             )
-            runtime_task = asyncio.ensure_future(owned.run())
+            runtime_task = spawn(owned.run(), name="owned.run")
             await await_listener_with_runtime(
                 client.listen(on_message),
                 runtime_task,

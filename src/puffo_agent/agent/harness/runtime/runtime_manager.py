@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -12,8 +13,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from ..adapters.base import Adapter, TurnContext, TurnResult
-from ..context_controller import (
+from ...adapters.base import Adapter, TurnContext, TurnResult
+from ...context_controller import (
     CompactionResult,
     ContextCapabilities,
     ContextSnapshot,
@@ -21,15 +22,22 @@ from ..context_controller import (
     RolloverResult,
     ToolResultAdmission,
     normalize_context_snapshot,
+    normalize_tool_name,
 )
-from ..errors import AgentAPIError, ProviderFailureError
-from ..provider_failures import (
+from ...errors import AgentAPIError, ProviderFailureError
+from ...provider_failures import (
     is_provider_failure_code,
     provider_failure,
     provider_failure_message,
     provider_failure_retryable,
 )
-from .driver import (
+from ..support.cleanup_errors import (
+    CLEANUP_TIMEOUT_SECONDS,
+    collect_cleanup_errors,
+    mark_cleanup_checked,
+    raise_collected_errors,
+)
+from ..driver import (
     CompactRequest,
     ContextStatus,
     Driver,
@@ -46,6 +54,7 @@ from .driver import (
     TurnRef,
     UnsupportedCapability,
 )
+from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +76,7 @@ def _resolve_claude_autocompact_tokens(
     *, model: str, pct: float, environment: Mapping[str, str]
 ) -> int | None:
     """Resolve a missing threshold from the runtime's launch environment."""
-    from ...portal.control.context_telemetry import claude_autocompact_tokens
+    from ....portal.control.context_telemetry import claude_autocompact_tokens
 
     return claude_autocompact_tokens(
         model=model,
@@ -219,6 +228,9 @@ class RuntimeManager:
         # input reached the transcript (accepted start receipt only)
         self._input_admitted = False
         self._resume_failure_streak = 0
+        # When the current runtime process was (re)opened; the worker's
+        # MCP transport probe compares hello timestamps against it.
+        self.last_open_monotonic: float | None = None
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -234,13 +246,19 @@ class RuntimeManager:
             if resume and self.native_session_id
             else None
         )
+        self.last_open_monotonic = time.monotonic()
         try:
             opened = await self.driver.open(self.spec, native_resume)
-        except Exception as exc:
-            try:
-                await self.driver.close()
-            except Exception:
-                logger.exception("failed to close runtime after open failure")
+        except BaseException as exc:
+            errors: list[BaseException] = [exc]
+            await collect_cleanup_errors(
+                self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
+            if len(errors) > 1:
+                raise_collected_errors("runtime open cleanup failed", errors)
+            mark_cleanup_checked(exc)
+            if not isinstance(exc, Exception):
+                raise_collected_errors("runtime open cancelled", errors)
             # transient -> retry same session; invalid -> fresh at once;
             # unclassified -> fresh after a bounded streak (no forever-wedge)
             if native_resume is None:
@@ -260,15 +278,18 @@ class RuntimeManager:
             )
             self._clear_native_session()
             try:
+                self.last_open_monotonic = time.monotonic()
                 opened = await self.driver.open(self.spec, None)
-            except Exception:
-                try:
-                    await self.driver.close()
-                except Exception:
-                    logger.exception(
-                        "failed to close runtime after fresh open failure"
-                    )
-                raise
+            except BaseException as exc:
+                errors = [exc]
+                await collect_cleanup_errors(
+                    self.driver.close(),
+                    errors,
+                    timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
+                raise_collected_errors(
+                    "fresh runtime open cleanup failed", errors
+                )
         self.native_session_id = opened.native_session_id
         self._resume_failure_streak = 0
         # Preserve the durable Puffo logical reference independently of the
@@ -278,7 +299,7 @@ class RuntimeManager:
             opened.resumed
             and opened.native_session_id != self._confirmed_native_session_id
         )
-        self._reader = asyncio.create_task(self._consume_events())
+        self._reader = spawn(self._consume_events(), name="consume_events")
         if self.agent_id:
             register_runtime_manager(self.agent_id, self)
         return self.opened
@@ -307,9 +328,16 @@ class RuntimeManager:
             self._terminal[logical] = loop.create_future()
             try:
                 receipt = await self.driver.start_turn(input)
-            except BaseException:
-                await self._discard_failed_start_locked(logical, retire=True)
-                raise
+            except BaseException as exc:
+                errors: list[BaseException] = [exc]
+                await collect_cleanup_errors(
+                    self._discard_failed_start_locked(logical, retire=True),
+                    errors,
+                    timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
+                raise_collected_errors(
+                    "turn start retirement failed", errors
+                )
             if isinstance(receipt, UnsupportedCapability):
                 await self._discard_failed_start_locked(logical, retire=False)
                 return receipt
@@ -330,21 +358,18 @@ class RuntimeManager:
         self, logical: TurnRef, *, retire: bool
     ) -> None:
         # admission unknown -> retry must replay the durable payload
+        provider_turn_id = self.native_turn_id
         self._input_admitted = False
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._terminal.pop(logical, None)
         self._permission_refs.clear()
-        self._continuation_admissions.clear()
+        self._discard_pending_admissions("turn_abandoned", provider_turn_id)
         if not retire:
             return
-        try:
-            # Keep session: close prevents overlap; dead -> invalid_resume.
-            await self._retire_runtime_locked(preserve_session=True)
-        except Exception:
-            logger.exception("failed to retire runtime after turn start failure")
-            self.opened = None
+        # Keep session: close prevents overlap; dead -> invalid_resume.
+        await self._retire_runtime_locked(preserve_session=True)
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput) -> Any:
         async with self._command_lock:
@@ -369,10 +394,20 @@ class RuntimeManager:
                         "retryable": True,
                     },
                 )
-                try:
-                    await self._publish_terminal_locked(event, turn)
-                finally:
-                    await self._retire_runtime_locked(preserve_session=False)
+                errors: list[BaseException] = []
+                await collect_cleanup_errors(
+                    self._publish_terminal_locked(event, turn),
+                    errors,
+                    timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
+                await collect_cleanup_errors(
+                    self._retire_runtime_locked(preserve_session=False),
+                    errors,
+                    timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
+                raise_collected_errors(
+                    "ambiguous steer retirement failed", errors
+                )
             return replace(receipt, turn_ref=turn)
 
     async def cancel_turn(self, turn: TurnRef) -> Any:
@@ -416,10 +451,16 @@ class RuntimeManager:
                 )
             previous = self.native_session_id
             self._fail_compaction_locked("native session rollover")
-            await self._stop_reader()
-            await self.driver.close()
+            errors: list[BaseException] = []
+            await collect_cleanup_errors(
+                self._stop_reader(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
+            await collect_cleanup_errors(
+                self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
             self.opened = None
             self._clear_native_session()
+            raise_collected_errors("native session rollover failed", errors)
             opened = await self._open_locked(resume=False)
             return previous, opened.native_session_id
 
@@ -524,12 +565,17 @@ class RuntimeManager:
                     self.driver.cancel_turn(self._active_driver_turn_ref),
                     timeout=cancel_timeout,
                 )
+            except asyncio.CancelledError as exc:
+                errors: list[BaseException] = [exc]
             except Exception:
+                errors = []
                 logger.info(
                     "provider turn %s did not acknowledge timeout interrupt",
                     turn,
                     exc_info=True,
                 )
+            else:
+                errors = []
             event = HarnessEvent(
                 type=HarnessEventType.TURN_ABANDONED,
                 driver=self.driver_name,
@@ -543,10 +589,17 @@ class RuntimeManager:
                     "retryable": True,
                 },
             )
-            try:
-                await self._publish_terminal_locked(event, turn)
-            finally:
-                await self._retire_runtime_locked(preserve_session=False)
+            await collect_cleanup_errors(
+                self._publish_terminal_locked(event, turn),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+            await collect_cleanup_errors(
+                self._retire_runtime_locked(preserve_session=False),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+            raise_collected_errors("timed-out runtime retirement failed", errors)
             return event
 
     async def retire_runtime(self, *, preserve_session: bool) -> None:
@@ -562,12 +615,18 @@ class RuntimeManager:
         if self.active_turn_ref is not None:
             raise RuntimeStateError("cannot retire while a turn is active")
         self._fail_compaction_locked("runtime was retired")
-        await self._stop_reader()
-        await self.driver.close()
+        errors: list[BaseException] = []
+        await collect_cleanup_errors(
+            self._stop_reader(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+        )
+        await collect_cleanup_errors(
+            self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+        )
         self.opened = None
         if not preserve_session:
             self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
             self._clear_native_session()
+        raise_collected_errors("runtime retirement failed", errors)
 
     def events(self) -> AsyncIterator[HarnessEvent]:
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
@@ -582,15 +641,20 @@ class RuntimeManager:
             if self.agent_id:
                 unregister_runtime_manager(self.agent_id, self)
             self._fail_compaction_locked("runtime is closed")
-            await self._stop_reader()
-            await self.driver.close()
+            errors: list[BaseException] = []
+            await collect_cleanup_errors(
+                self._stop_reader(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
+            await collect_cleanup_errors(
+                self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
             self.opened = None
             autonomous = self._autonomous_turn
             if autonomous is not None:
                 # Refresh and ordinary shutdown reach here; without a terminal
                 # the daemon would hold that turn in_turn past the restart.
-                try:
-                    await self._publish_terminal_locked(
+                await collect_cleanup_errors(
+                    self._publish_terminal_locked(
                         HarnessEvent(
                             type=HarnessEventType.TURN_ABANDONED,
                             driver=self.driver_name,
@@ -605,12 +669,10 @@ class RuntimeManager:
                             },
                         ),
                         autonomous,
-                    )
-                except Exception:  # noqa: BLE001 - close must still finish
-                    logger.warning(
-                        "autonomous terminal failed during close",
-                        exc_info=True,
-                    )
+                    ),
+                    errors,
+                    timeout=CLEANUP_TIMEOUT_SECONDS,
+                )
             for future in tuple(self._terminal.values()):
                 if not future.done():
                     future.set_exception(RuntimeStateError("runtime is closed"))
@@ -621,6 +683,7 @@ class RuntimeManager:
             self._terminal.clear()
             for queue in tuple(self._subscribers):
                 queue.put_nowait(None)
+            raise_collected_errors("runtime manager close failed", errors)
 
     async def _stop_reader(self) -> None:
         if self._reader is not None:
@@ -639,6 +702,30 @@ class RuntimeManager:
                     "session.resumed",
                 }:
                     self.driver_name = native.driver or self.driver_name
+                    # A per-turn child can learn its durable provider session
+                    # only from the first accepted output frame.  Persist that
+                    # identity before projecting the session boundary.
+                    capabilities = self.current_capabilities()
+                    lifecycle = (
+                        getattr(
+                            capabilities.lifecycle,
+                            "value",
+                            capabilities.lifecycle,
+                        )
+                        if capabilities is not None
+                        else ""
+                    )
+                    if (
+                        event_type in {"session.opened", "session.resumed"}
+                        and lifecycle == "per_turn_child"
+                        and native.native_session_id
+                    ):
+                        self.native_session_id = native.native_session_id
+                        if self.opened is not None:
+                            self.opened = replace(
+                                self.opened,
+                                native_session_id=native.native_session_id,
+                            )
                     await self._publish_event(replace(
                         native,
                         session_ref=self.session_ref,
@@ -696,6 +783,13 @@ class RuntimeManager:
             # still publishes so subscribers and persistence see it.
             self._resolve_compaction_locked()
         if event.type in {
+            HarnessEventType.COMPACTION_FAILED,
+            "compaction.failed",
+        }:
+            self._fail_compaction_locked(
+                str(event.data.get("diagnostic") or "provider compaction failed")
+            )
+        if event.type in {
             HarnessEventType.RUNTIME_EXITED,
             "runtime.exited",
         }:
@@ -735,45 +829,59 @@ class RuntimeManager:
 
     async def _handle_runtime_exit_locked(self, event: HarnessEvent) -> None:
         self._fail_compaction_locked("runtime exited")
-        await self._publish_event(event)
-        active = self.active_turn_ref
-        unconfirmed = self._resume_unconfirmed
-        self._resume_unconfirmed = False
-        failed_native_session_id = self.native_session_id
-        if unconfirmed:
-            self._clear_native_session()
+        errors: list[BaseException] = []
         try:
-            if active is not None:
-                provider_error_code = str(event.data.get("error_code") or "")
-                if provider_error_code:
-                    failure_data: dict[str, Any] = {
-                        "outcome": "abandoned",
-                        "error_code": provider_error_code,
-                    }
-                else:
-                    failure_data = {
-                        "outcome": "abandoned",
-                        "error_code": (
-                            "resume_unconfirmed" if unconfirmed else "runtime_exited"
-                        ),
-                        "retryable": True,
-                    }
-                abandoned = HarnessEvent(
-                    type=HarnessEventType.TURN_ABANDONED,
-                    driver=self.driver_name,
-                    session_ref=self.session_ref,
-                    turn_ref=active,
-                    native_session_id=failed_native_session_id,
-                    native_turn_id=self.native_turn_id,
-                    occurred_at=event.occurred_at,
-                    data=failure_data,
-                )
-                await self._publish_terminal_locked(abandoned, active)
-        finally:
             try:
-                await self.driver.close()
-            finally:
-                self.opened = None
+                await self._publish_event(event)
+            except Exception as exc:
+                errors.append(exc)
+            active = self.active_turn_ref
+            unconfirmed = self._resume_unconfirmed
+            self._resume_unconfirmed = False
+            failed_native_session_id = self.native_session_id
+            if unconfirmed:
+                self._clear_native_session()
+            try:
+                if active is not None:
+                    provider_error_code = str(
+                        event.data.get("error_code") or ""
+                    )
+                    if provider_error_code:
+                        failure_data: dict[str, Any] = {
+                            "outcome": "abandoned",
+                            "error_code": provider_error_code,
+                        }
+                    else:
+                        failure_data = {
+                            "outcome": "abandoned",
+                            "error_code": (
+                                "resume_unconfirmed"
+                                if unconfirmed
+                                else "runtime_exited"
+                            ),
+                            "retryable": True,
+                        }
+                    abandoned = HarnessEvent(
+                        type=HarnessEventType.TURN_ABANDONED,
+                        driver=self.driver_name,
+                        session_ref=self.session_ref,
+                        turn_ref=active,
+                        native_session_id=failed_native_session_id,
+                        native_turn_id=self.native_turn_id,
+                        occurred_at=event.occurred_at,
+                        data=failure_data,
+                    )
+                    await self._publish_terminal_locked(abandoned, active)
+            except Exception as exc:
+                errors.append(exc)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            self.opened = None
+            await collect_cleanup_errors(
+                self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
+        raise_collected_errors("runtime exit handling failed", errors)
 
     def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
         """Track a provider turn the driver opened on its own.
@@ -822,13 +930,17 @@ class RuntimeManager:
         self._fail_compaction_locked("resume unconfirmed")
         terminal = replace(event, data={**event.data, "retryable": True})
         self._clear_native_session()
+        errors: list[BaseException] = []
         try:
             await self._publish_terminal_locked(terminal, logical_turn)
+        except BaseException as exc:
+            errors.append(exc)
         finally:
-            try:
-                await self.driver.close()
-            finally:
-                self.opened = None
+            self.opened = None
+            await collect_cleanup_errors(
+                self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
+        raise_collected_errors("invalid resume retirement failed", errors)
 
     async def _publish_event(self, event: HarnessEvent) -> None:
         if self.event_sink is not None:
@@ -879,33 +991,49 @@ class RuntimeManager:
     async def _fail_runtime_locked(self, reason: str) -> None:
         active = self.active_turn_ref
         self._fail_compaction_locked(reason)
-        try:
-            if active is not None:
-                abandoned = HarnessEvent(
-                    type=HarnessEventType.TURN_ABANDONED,
-                    driver=self.driver_name,
-                    session_ref=self.session_ref,
-                    turn_ref=active,
-                    native_session_id=self.native_session_id,
-                    native_turn_id=self.native_turn_id,
-                    data={
-                        "outcome": "abandoned",
-                        "error_code": reason,
-                        "retryable": True,
-                    },
-                )
-                try:
-                    await self._publish_terminal_locked(abandoned, active)
-                except Exception:
-                    logger.exception(
-                        "failed to persist terminal runtime event after %s",
+        errors: list[BaseException] = []
+        if active is not None:
+            abandoned = HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED,
+                driver=self.driver_name,
+                session_ref=self.session_ref,
+                turn_ref=active,
+                native_session_id=self.native_session_id,
+                native_turn_id=self.native_turn_id,
+                data={
+                    "outcome": "abandoned",
+                    "error_code": reason,
+                    "retryable": True,
+                },
+            )
+            await collect_cleanup_errors(
+                self._publish_terminal_locked(abandoned, active),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+            for error in errors:
+                if isinstance(error, Exception):
+                    logger.error(
+                        "failed to persist terminal runtime event after %s: %s",
                         reason,
+                        error,
                     )
-            await self.driver.close()
-        except Exception:
-            logger.exception("failed to close provider runtime after %s", reason)
-        finally:
-            self.opened = None
+        self.opened = None
+        cleanup_start = len(errors)
+        await collect_cleanup_errors(
+            self.driver.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+        )
+        for error in errors[cleanup_start:]:
+            if isinstance(error, Exception):
+                logger.error(
+                    "failed to close provider runtime after %s: %s",
+                    reason,
+                    error,
+                )
+        if any(
+            isinstance(error, asyncio.CancelledError) for error in errors
+        ):
+            raise_collected_errors("runtime failure cleanup cancelled", errors)
 
     def _complete_turn(self, event: HarnessEvent, turn: TurnRef) -> None:
         future = self._terminal.get(turn)
@@ -913,11 +1041,46 @@ class RuntimeManager:
             future.set_result(event)
         if self._active_driver_turn_ref is not None:
             self._turn_refs.pop(self._active_driver_turn_ref, None)
+        provider_turn_id = self.native_turn_id
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
         self._permission_refs.clear()
+        self._discard_pending_admissions("turn_completed", provider_turn_id)
+
+    def _discard_pending_admissions(
+        self, reason: str, provider_turn_id: str
+    ) -> None:
+        """Drop staged continuations at a turn boundary, audibly.
+
+        A continuation is retired here only when no tool result ever released
+        it.  On the ACP path that is the visible end of a lost post-commit
+        receipt: the argument-correlation fallback is unreachable (those facts
+        carry no ``arguments``), so nothing else can admit it, and the
+        mismatch warning below is never reached either.  Dropping silently
+        left the symptom -- a continuation that never fires -- with no trace
+        on the side that actually experiences it.
+
+        Deliberate cancellation (``register_continuation_callback(None)``)
+        clears the list directly and is NOT routed here: a signal that also
+        fires on the intended case stops being read.
+
+        ``provider_turn_id`` is passed in, not read off ``self``: every call
+        site resets ``native_turn_id`` as part of the same teardown, so
+        reading it here would have logged an empty field on every single
+        discard -- an attribution slot that looks populated and never is.
+        """
+        pending = len(self._continuation_admissions)
         self._continuation_admissions.clear()
+        if not pending:
+            return
+        logger.warning(
+            "puffo_admission_continuation_discarded "
+            "reason=%s count=%d provider_turn_id=%s",
+            reason,
+            pending,
+            provider_turn_id or "",
+        )
 
     def register_continuation(
         self,
@@ -958,6 +1121,33 @@ class RuntimeManager:
         ):
             return
         tool_name = str(fact.get("tool_name") or "")
+        tool_call_id = str(fact.get("tool_call_id") or "")
+        admission_binding = fact.get("admission_binding")
+        if fact.get("provider_context_committed") is True:
+            candidates = [
+                (index, admission)
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == event.native_turn_id
+                and admission.tool_names
+                and normalize_tool_name(tool_name) in admission.tool_names
+                and isinstance(admission_binding, str)
+                and admission.binding_for_tool_call(tool_call_id)
+                == admission_binding
+            ]
+            if not candidates:
+                return
+            index, admission = max(
+                candidates, key=lambda value: value[1].match_specificity
+            )
+            self._continuation_admissions.pop(index)
+            await admission.callback(ProviderAdmissionEvent(
+                planning_cycle_key=admission.planning_cycle_key,
+                provider_session_id=self.native_session_id,
+                provider_turn_id=event.native_turn_id,
+                tool_call_id=tool_call_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+            return
         arguments = fact.get("arguments")
         if not isinstance(arguments, dict):
             return
@@ -1041,6 +1231,7 @@ class RuntimeManagerAdapter(Adapter):
         spec_reloader: Callable[[str], Awaitable[RuntimeSpec]] | None = None,
         compaction_wait_seconds: float = COMPACTION_WAIT_SECONDS,
         post_close: Callable[[], Awaitable[None]] | None = None,
+        generation_sink: Callable[[str], None] | None = None,
     ):
         self.manager = manager
         self.spec_reloader = spec_reloader
@@ -1049,6 +1240,11 @@ class RuntimeManagerAdapter(Adapter):
         # (and its Driver) close. Used by the Docker Codex runtime to stop
         # the per-agent container once the exec transport has terminated.
         self.post_close = post_close
+        # Observes a freshly minted mcp generation between the spec
+        # reload and the reopen (the daemon pins it against registry
+        # trimming before the new subprocess can hello). Observation
+        # only; failures never reach the runtime.
+        self.generation_sink = generation_sink
         self.assistant_text_parts: list[str] = []
         self._latest_context_limits: tuple[int | None, int | None] = (
             None,
@@ -1349,28 +1545,61 @@ class RuntimeManagerAdapter(Adapter):
             await self.spec_reloader(new_system_prompt)
             if self.spec_reloader is not None else None
         )
+        if (
+            spec is not None
+            and spec.mcp_generation
+            and self.generation_sink is not None
+        ):
+            # Pin the minted generation BEFORE the reopen: the reopened
+            # subprocess hellos immediately, and until the caller's
+            # post-reload pin lands, registry trimming under zombie
+            # beacon pressure could evict that hello and fake a
+            # never-seen probe result.
+            try:
+                self.generation_sink(spec.mcp_generation)
+            except Exception:
+                logger.exception(
+                    "generation sink failed; reload continues"
+                )
         await self.manager.reload_resources(
             preserve_session=not with_session,
             spec=spec,
         )
 
     async def aclose(self) -> None:
-        try:
-            await self.manager.close()
-        finally:
-            if self.post_close is not None:
-                await self.post_close()
+        errors: list[BaseException] = []
+        await collect_cleanup_errors(
+            self.manager.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+        )
+        if self.post_close is not None:
+            await collect_cleanup_errors(
+                self.post_close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
+        raise_collected_errors("runtime adapter close failed", errors)
 
     def get_provider_session_id(self) -> str | None:
-        value = (
-            self.manager.opened.native_session_id
-            if self.manager.opened is not None
-            else self.manager.native_session_id
-        )
-        return value or None
+        return self.manager.native_session_id or None
 
     def inbox_notice_delivery_capability(self) -> str:
+        """Whether an inbox notice can reach a turn that is already running.
+
+        Two separate facts decide this, and conflating them is how a caller
+        ends up routing input on a promise the driver does not keep:
+
+        ``busy_delivery`` -- does the driver accept anything at all mid-turn.
+        ``steer``         -- if so, how immediately it lands.
+
+        A driver with no mid-turn path (``REJECT``) is ``next_turn`` no matter
+        what ``steer`` says. For both drivers shipping today the two agree, so
+        this returns exactly what it returned before.
+        """
         capabilities = self.manager.current_capabilities()
+        if capabilities is not None:
+            busy = getattr(
+                capabilities.busy_delivery, "value", capabilities.busy_delivery
+            )
+            if busy == "reject":
+                return "next_turn"
         steer = (
             capabilities.steer
             if capabilities is not None

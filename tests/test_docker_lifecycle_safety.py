@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from puffo_agent.agent.harness import docker_support
+from puffo_agent.agent.harness.runtime import docker_support
 
 
 def test_probe_result_is_fail_closed():

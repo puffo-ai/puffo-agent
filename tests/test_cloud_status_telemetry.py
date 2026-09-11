@@ -146,5 +146,6 @@ async def test_worker_registers_reconnect_status_callback():
                 "model": "gpt-5.4",
                 "inference_level": "",
             },
+            "health": "unknown",
         },
     )]

@@ -15,11 +15,11 @@ from puffo_agent.agent.message_store import (
     ReceiptDisposition,
 )
 from puffo_agent.agent.harness import UnsupportedDriver, build_driver
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     claude_capabilities,
 )
-from puffo_agent.agent.harness.codex_driver import (
+from puffo_agent.agent.harness.drivers.codex import (
     CODEX_CAPABILITIES,
     CodexAppServerDriver,
 )
@@ -39,7 +39,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
@@ -1084,7 +1084,7 @@ async def test_claude_driver_emits_compaction_boundary_and_clears_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_codex_driver_resumes_with_native_session_id_after_handshake():
+async def test_codex_driver_resumes_without_returning_full_turn_history():
     holder = {}
 
     def on_frame(frame):
@@ -1094,7 +1094,7 @@ async def test_codex_driver_resumes_with_native_session_id_after_handshake():
         elif frame.get("method") == "thread/resume":
             assert frame["params"] == {
                 "threadId": "native-thread",
-                "cwd": "/workspace",
+                "excludeTurns": True, "cwd": "/workspace",
                 "approvalPolicy": "never",
                 "sandbox": "danger-full-access",
                 "model": "gpt",
@@ -1415,7 +1415,7 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
     normalized executable prefix (the Windows wrapper block) followed by
     the untouched flags. On this host the real boundary passes the
     executable through, so the wiring + ordering both stay pinned."""
-    import puffo_agent.agent.harness.claude_code_driver as driver_mod
+    import puffo_agent.agent.harness.drivers.claude_code as driver_mod
 
     def make_factory(captured):
         def factory(args, _spec):
@@ -1706,15 +1706,10 @@ async def test_start_turn_write_failure_leaves_no_turn_or_request_pending(
 
 
 @pytest.mark.asyncio
-async def test_codex_child_environment_merges_over_process_environment(
+async def test_codex_child_environment_does_not_reintroduce_ambient_values(
     monkeypatch,
 ):
-    """``RuntimeSpec.environment`` is a delta, not the child's whole env.
-
-    ``ClaudeCodeCliDriver`` merges it over ``os.environ``; Codex replaced the
-    environment outright, so any spec carrying only overrides would launch
-    ``codex app-server`` without PATH or HOME.
-    """
+    """The preparer supplies a complete sanitized child environment."""
     holder = {}
 
     def on_frame(frame):
@@ -1736,12 +1731,18 @@ async def test_codex_child_environment_merges_over_process_environment(
     monkeypatch.setenv("PUFFO_HARNESS_MARKER", "inherited")
     driver = CodexAppServerDriver()
     await driver.open(
-        RuntimeSpec("/workspace", environment={"CODEX_HOME": "/tmp/codex"})
+        RuntimeSpec(
+            "/workspace",
+            environment={
+                "CODEX_HOME": "/tmp/codex",
+                "PATH": os.environ["PATH"],
+            },
+        )
     )
     await driver.close()
 
     assert captured["env"]["CODEX_HOME"] == "/tmp/codex"
-    assert captured["env"]["PUFFO_HARNESS_MARKER"] == "inherited"
+    assert "PUFFO_HARNESS_MARKER" not in captured["env"]
     assert captured["env"]["PATH"] == os.environ["PATH"]
 
 
@@ -1923,8 +1924,8 @@ async def _feed_projection_events(driver, events):
 
 
 def _build_projection_adapter(tmp_path, driver, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import (
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import (
         PreparedLocalRuntime,
         build_local_runtime_adapter,
     )

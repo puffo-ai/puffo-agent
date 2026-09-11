@@ -58,6 +58,7 @@ from .client_support import (
 )
 from .inbound_attachments import (
     downscale_oversized_image,
+    is_image_attachment,
     is_safe_path_component,
     normalize_saved_image,
 )
@@ -82,6 +83,7 @@ from .message_context import (
     maybe_redact_long_text,
 )
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
+from ..tasks import spawn
 
 KEYLESS_DM_REPLY_REASON = "handled keyless dm approval reply"
 KEYLESS_INVITATION_REPLY_REASON = "handled keyless invitation reply"
@@ -155,8 +157,9 @@ def _arm_keyless_invite_poller(client) -> None:
     task = getattr(client, "_keyless_invite_poll_task", None)
     if task is not None and not task.done():
         return
-    client._keyless_invite_poll_task = asyncio.create_task(
-        keyless_invite_poll_loop(client)
+    client._keyless_invite_poll_task = spawn(
+        keyless_invite_poll_loop(client),
+        name="keyless_invite_poll_loop",
     )
 
 
@@ -240,14 +243,14 @@ async def dispatch_bridge_frame(
         # pump is live — never from ``connect()`` or a connected callback.
         _track_bridge_task(
             client,
-            asyncio.create_task(resume_pending_approvals(client)),
+            spawn(resume_pending_approvals(client), name="resume_pending_approvals"),
         )
         # Seed the channel→space map for every channel we're already a
         # member of, so a proactive post to a pre-existing channel works
         # from boot (not only after the first inbound message there).
         # Scheduled async — awaiting send_list_spaces inline would deadlock
         # frames(), which must keep receiving to deliver the 'spaces' reply.
-        task = asyncio.create_task(client._refresh_bridge_spaces())
+        task = spawn(client._refresh_bridge_spaces(), name="client.refresh_bridge_spaces")
         client._ack_tasks.add(task)
         task.add_done_callback(client._ack_tasks.discard)
         # Keep draining pages on this connection. Awaiting a correlated
@@ -257,7 +260,7 @@ async def dispatch_bridge_frame(
         if more is True and isinstance(count, int) and not isinstance(count, bool):
             if count > 0:
                 client._bridge_pending_nonprogress = False
-                task = asyncio.create_task(client._bridge.send_fetch_pending())
+                task = spawn(client._bridge.send_fetch_pending(), name="bridge.send_fetch_pending")
                 client._ack_tasks.add(task)
                 task.add_done_callback(client._ack_tasks.discard)
             elif not client._bridge_pending_nonprogress:
@@ -280,7 +283,7 @@ async def dispatch_bridge_frame(
             "bridge: added to space %s — refreshing spaces",
             space_id or "<missing space_id>",
         )
-        task = asyncio.create_task(client._refresh_bridge_spaces(space_id))
+        task = spawn(client._refresh_bridge_spaces(space_id), name="client.refresh_bridge_spaces")
         client._ack_tasks.add(task)
         task.add_done_callback(client._ack_tasks.discard)
     elif kind == "error":
@@ -313,10 +316,10 @@ async def _bridge_runtime_command(client, frame: dict) -> Any:
     The claimed ``operator_slug`` is checked against this client's
     configured operator; an agent with no operator configured has nobody
     who could grant runtime permissions over this wire, so it matches no
-    claim. See ``harness.runtime_commands`` for why the comparison is the
+    claim. See ``harness.runtime.runtime_commands`` for why the comparison is the
     client's to make.
     """
-    from .harness.runtime_commands import execute_runtime_command
+    from .harness.runtime.runtime_commands import execute_runtime_command
 
     command = frame.get("command")
     if not isinstance(command, dict):
@@ -349,7 +352,10 @@ async def _handle_bridge_message_frame(client, frame: dict) -> None:
         if acknowledge:
             _track_bridge_task(
                 client,
-                asyncio.create_task(client._ack_bridge_envelope([payload.envelope_id])),
+                spawn(
+                    client._ack_bridge_envelope([payload.envelope_id]),
+                    name="client.ack_bridge_envelope",
+                ),
             )
     except Exception:  # noqa: BLE001 - poison frames must not stop delivery
         client._log.exception(
@@ -593,13 +599,14 @@ def _reschedule_sequence_less_control_reply(client, payload, stored) -> bool:
             return False
         _track_bridge_task(
             client,
-            asyncio.create_task(
+            spawn(
                 _finish_keyless_dm_operator_reply(
                     client,
                     thread_root_id=thread_root_id,
                     text=text,
                     envelope_id=payload.envelope_id,
-                )
+                ),
+                name="finish_keyless_dm_operator_reply",
             ),
         )
         return True
@@ -614,14 +621,15 @@ def _reschedule_sequence_less_control_reply(client, payload, stored) -> bool:
             return False
         _track_bridge_task(
             client,
-            asyncio.create_task(
+            spawn(
                 _finish_keyless_invitation_reply(
                     client,
                     flow,
                     thread_root_id=thread_root_id,
                     text=text,
                     envelope_id=payload.envelope_id,
-                )
+                ),
+                name="finish_keyless_invitation_reply",
             ),
         )
         return True
@@ -641,13 +649,14 @@ def _reschedule_keyless_gated_record(client, payload, stored) -> None:
         return
     _track_bridge_task(
         client,
-        asyncio.create_task(
+        spawn(
             record_gated_dm(
                 client,
                 envelope_id=payload.envelope_id,
                 sender_slug=payload.sender_slug,
                 server_seq=None,
-            )
+            ),
+            name="record_gated_dm",
         ),
     )
 
@@ -783,13 +792,14 @@ async def _keyless_operator_reply_gate(client, payload, row) -> GateVerdict | No
         return None
     _track_bridge_task(
         client,
-        asyncio.create_task(
+        spawn(
             _finish_keyless_dm_operator_reply(
                 client,
                 thread_root_id=thread_root_id,
                 text=text,
                 envelope_id=payload.envelope_id,
-            )
+            ),
+            name="finish_keyless_dm_operator_reply",
         ),
     )
     return GateVerdict(
@@ -855,14 +865,15 @@ async def _keyless_invitation_reply_gate(client, payload, row) -> GateVerdict | 
         return None
     _track_bridge_task(
         client,
-        asyncio.create_task(
+        spawn(
             _finish_keyless_invitation_reply(
                 client,
                 flow,
                 thread_root_id=thread_root_id,
                 text=text,
                 envelope_id=payload.envelope_id,
-            )
+            ),
+            name="finish_keyless_invitation_reply",
         ),
     )
     return GateVerdict(
@@ -932,13 +943,14 @@ async def _commit_bridge_verdict(
     ):
         _track_bridge_task(
             client,
-            asyncio.create_task(
+            spawn(
                 record_gated_dm(
                     client,
                     envelope_id=payload.envelope_id,
                     sender_slug=payload.sender_slug,
                     server_seq=server_seq,
-                )
+                ),
+                name="record_gated_dm",
             ),
         )
     runtime = getattr(client, "global_runtime", None)
@@ -1296,10 +1308,12 @@ async def _save_one_bridge_attachment(
     except OSError as exc:
         client._log.warning("bridge attachment save failed (%s): %s", target, exc)
         return None
-    normalized = await normalize_saved_image(
-        target=target,
-        image_edge_px=client._image_edge_px,
-        log=client._log,
-        scale_image=downscale_oversized_image,
-    )
+    normalized = target
+    if is_image_attachment(str(raw.get("mime_type") or ""), data):
+        normalized = await normalize_saved_image(
+            target=target,
+            image_edge_px=client._image_edge_px,
+            log=client._log,
+            scale_image=downscale_oversized_image,
+        )
     return (normalized, len(data)) if normalized is not None else None

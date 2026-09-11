@@ -27,6 +27,7 @@ from .message_store import (
     ReceiptDisposition,
     StoredMessage,
 )
+from ..tasks import spawn
 
 # Existing operators and tests subscribe to the runtime logger, not this
 # implementation module.
@@ -371,10 +372,10 @@ class InboxAdmissionMixin:
         if self._busy_notice_task is not None and not self._busy_notice_task.done():
             return
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._busy_notice_task = loop.create_task(
+        self._busy_notice_task = spawn(
             self._deliver_busy_notices(turn_id),
             name=f"inbox-notice-{turn_id}",
         )

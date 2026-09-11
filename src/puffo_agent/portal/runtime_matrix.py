@@ -5,7 +5,8 @@ both at agent-load time and at CLI flag-parse time. Some harnesses
 are bound to one provider (``claude-code`` → anthropic, ``gemini-cli``
 → google); ``hermes`` is multi-provider.
 
-Supported today: ``cli-local`` with ``claude-code`` or ``codex``,
+Supported today: ``cli-local`` with ``claude-code``, ``codex``, ``pi``,
+``opencode``, or ``acp``,
 ``cli-docker`` with ``claude-code`` or ``codex``, and ``ws-local``
 (external tool, no internal engine). ``hermes`` and ``gemini-cli``
 remain design-only — no runtime accepts them because their Driver and
@@ -56,12 +57,18 @@ HARNESS_CLAUDE_CODE = "claude-code"
 HARNESS_HERMES      = "hermes"
 HARNESS_GEMINI_CLI  = "gemini-cli"
 HARNESS_CODEX       = "codex"
+HARNESS_OPENCODE    = "opencode"
+HARNESS_ACP         = "acp"
+HARNESS_PI          = "pi"
 
 VALID_HARNESSES: frozenset[str] = frozenset({
     HARNESS_CLAUDE_CODE,
     HARNESS_HERMES,
     HARNESS_GEMINI_CLI,
     HARNESS_CODEX,
+    HARNESS_OPENCODE,
+    HARNESS_ACP,
+    HARNESS_PI,
 })
 
 
@@ -77,6 +84,9 @@ HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_HERMES:      frozenset({PROVIDER_ANTHROPIC, PROVIDER_OPENAI}),
     HARNESS_GEMINI_CLI:  frozenset({PROVIDER_GOOGLE}),
     HARNESS_CODEX:       frozenset({PROVIDER_OPENAI}),
+    HARNESS_OPENCODE:    VALID_PROVIDERS,
+    HARNESS_ACP:         VALID_PROVIDERS,
+    HARNESS_PI:          VALID_PROVIDERS,
 }
 
 
@@ -194,10 +204,14 @@ def validate_triple(
     if runtime == RUNTIME_CLI_LOCAL and harness not in {
         HARNESS_CLAUDE_CODE,
         HARNESS_CODEX,
+        HARNESS_OPENCODE,
+        HARNESS_ACP,
+        HARNESS_PI,
     }:
         return ValidationResult(False, (
             f"runtime {RUNTIME_CLI_LOCAL!r} supports only "
-            f"{HARNESS_CLAUDE_CODE!r} and {HARNESS_CODEX!r}; "
+            f"{HARNESS_CLAUDE_CODE!r}, {HARNESS_CODEX!r}, "
+            f"{HARNESS_OPENCODE!r}, {HARNESS_ACP!r}, and {HARNESS_PI!r}; "
             f"harness {harness!r} is not implemented by the Driver runtime"
         ))
 
