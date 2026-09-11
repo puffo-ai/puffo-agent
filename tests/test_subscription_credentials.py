@@ -171,3 +171,26 @@ def test_macos_refusal_beats_a_missing_credential(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(f"{_CREDS}.is_macos", lambda: True)
     with pytest.raises(SubscriptionUnsupported):
         resolve_subscription_credentials("claude-code", agent_home=tmp_path, token="")
+
+
+def test_subscription_agents_are_exempt_from_credential_refresh():
+    """A subscription agent has nothing to refresh: its credential is a
+    self-contained, year-long plan token supplied by the provisioner.
+
+    Regression for a real staging failure. `llm_base_url` is deliberately empty
+    for these agents, and the daemon's refresh gate keyed off *that* -- so the
+    agent fell through to the OAuth path, hunted for an operator credential view
+    that does not exist inside a sandbox, logged `credential view-sync
+    incomplete`, declared auth-failed and blocked the turn. The mode must decide,
+    not a side effect of which fields happen to be set."""
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.daemon import _is_subscription
+
+    sub = SimpleNamespace(runtime=SimpleNamespace(auth_mode=AUTH_MODE_SUBSCRIPTION))
+    gw = SimpleNamespace(runtime=SimpleNamespace(auth_mode=AUTH_MODE_API_GATEWAY))
+    assert _is_subscription(sub) is True
+    assert _is_subscription(gw) is False
+    # a runtime predating the field is not in subscription mode
+    assert _is_subscription(SimpleNamespace(runtime=SimpleNamespace())) is False
+    assert _is_subscription(SimpleNamespace()) is False
