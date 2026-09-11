@@ -190,9 +190,13 @@ def _bounded_result(result: dict) -> dict:
     # The server persists at most 16 KiB per command result. Stay below that
     # budget so a large inventory is partial rather than replaced by a marker.
     result["warnings"] = list(dict.fromkeys(result["warnings"]))
+    result["partial"] = bool(result["warnings"])
+    result["truncated"] = False
     for field in ("agents", "roots", "executables"):
         while len(json.dumps(result).encode()) > 12 * 1024 and result[field]:
             result[field].pop()
+            result["partial"] = True
+            result["truncated"] = True
             if "results_truncated" not in result["warnings"]:
                 result["warnings"].append("results_truncated")
     return result

@@ -95,3 +95,4 @@ def test_inventory_fits_server_result_budget():
     assert len(json.dumps(result).encode()) < 16 * 1024
     assert result["agents"]
     assert "results_truncated" in result["warnings"]
+    assert result["partial"] and result["truncated"]
