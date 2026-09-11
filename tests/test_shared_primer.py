@@ -69,7 +69,10 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         "visible acknowledgment", "For multi-step work",
         "report the outcome", "material ambiguity",
         "Agent messages may legitimately trigger further Agent work",
-        "choose one uncovered part that best fits your role",
+        "choose one unclaimed part that best fits your role",
+        "A cover is your explicit declaration",
+        "mark_covered",
+        "uncovered_redelivery=true",
         "A claim becomes visible only after it is successfully sent",
         "ordinary assistant text is not delivered",
         "message comes from an existing thread",
@@ -139,7 +142,10 @@ def test_inbox_turn_cue_is_short_and_reinforces_the_standing_default():
     assert "do not finish this turn from notice metadata alone" in cue.lower()
     assert "use `read_history` only if earlier context is needed" in cue.lower()
     assert "decide-response" not in cue
-    assert len(INBOX_TURN_CUE.encode()) < 360
+    assert "dispose of every human message" in cue.lower()
+    assert "`covers`" in cue
+    assert "`mark_covered`" in cue
+    assert len(INBOX_TURN_CUE.encode()) < 640
 
 
 def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():

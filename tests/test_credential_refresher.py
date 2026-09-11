@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
+
+import pytest
 
 
 from puffo_agent.portal import credential_refresh
@@ -269,6 +272,36 @@ def test_run_loop_wakes_early_on_refresh_request(tmp_path, monkeypatch):
     assert wake_latency < 1.0, f"wake_latency={wake_latency:.3f}s — event didn't short-circuit poll"
 
 
+@pytest.mark.asyncio
+async def test_tick_wait_failures_are_reported_once_each_with_tracebacks(
+    tmp_path, caplog,
+):
+    class BrokenEvent:
+        def __init__(self, message):
+            self._message = message
+
+        async def wait(self):
+            raise ValueError(self._message)
+
+    refresher = CredentialRefresher(host_home=tmp_path)
+    refresher._refresh_request = BrokenEvent("refresh wait failed")
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        await refresher._sleep_until_next_tick(BrokenEvent("stop wait failed"))
+        await asyncio.sleep(0)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert sorted(record.getMessage() for record in records) == [
+        "worker task died: refresh_request.wait",
+        "worker task died: stop_event.wait",
+    ]
+    assert all(record.exc_info is not None for record in records)
+    assert {str(record.exc_info[1]) for record in records} == {
+        "stop wait failed",
+        "refresh wait failed",
+    }
+
+
 # ── refresh-token flag round-trip (CLI ↔ daemon sentinel) ──────
 
 
@@ -311,15 +344,11 @@ def _make_agent_runtime(home_root: Path, agent_id: str) -> Path:
 
 def _make_refresher_with_agent(
     tmp_path: Path, monkeypatch, *, agent_id: str = "agent-puf265",
-    expires_in_seconds: int = 3600,
 ) -> tuple[CredentialRefresher, str]:
     from puffo_agent.portal.state import agent_home_dir
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    # PUF-349: 3600s is above REFRESH_SAFETY_MARGIN_SECONDS, so UNCHANGED
-    # reads as benign here. Tests that need UNCHANGED to count as trouble
-    # pass an expiry at or below the margin.
-    _write_creds(tmp_path / "host", expires_in_seconds=expires_in_seconds)
+    _write_creds(tmp_path / "host", expires_in_seconds=3600)
     _make_agent_runtime(tmp_path, agent_id)
 
     r = CredentialRefresher(host_home=tmp_path / "host")
@@ -329,28 +358,34 @@ def _make_refresher_with_agent(
 
 def test_propagate_outcome_refreshed_resets_counter(tmp_path, monkeypatch):
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._consecutive_failed = 1
+    r._consecutive_non_success = 1
     r._propagate_outcome(RefreshOutcome.REFRESHED)
-    assert r._consecutive_failed == 0
+    assert r._consecutive_non_success == 0
+
+
+def test_propagate_outcome_unchanged_increments_counter(tmp_path, monkeypatch):
+    r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    assert r._consecutive_non_success == 1
 
 
 def test_propagate_outcome_failed_increments_counter(tmp_path, monkeypatch):
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     r._propagate_outcome(RefreshOutcome.FAILED)
-    assert r._consecutive_failed == 1
+    assert r._consecutive_non_success == 1
 
 
 def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.state import RuntimeState
     import logging
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health != "refresh_broken"
     assert REFRESH_BROKEN_THRESHOLD == 2
     with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
-        r._propagate_outcome(RefreshOutcome.FAILED)
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "refresh_broken"
@@ -358,7 +393,7 @@ def test_refresh_broken_flips_after_threshold_consecutive(tmp_path, monkeypatch,
     assert "claude auth login" in rs.error
     # Outcome-class debug stays in the daemon log, not in runtime.error.
     assert any(
-        "flipping refresh_broken" in rec.getMessage() and "failed" in rec.getMessage()
+        "flipping refresh_broken" in rec.getMessage() and "unchanged" in rec.getMessage()
         for rec in caplog.records
     )
 
@@ -367,14 +402,14 @@ def test_refresh_broken_clears_on_next_refreshed(tmp_path, monkeypatch):
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.FAILED)
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
     assert RuntimeState.load(aid).health == "refresh_broken"
     r._propagate_outcome(RefreshOutcome.REFRESHED)
     rs = RuntimeState.load(aid)
     assert rs is not None
     assert rs.health == "ok"
     assert rs.error == ""
-    assert r._consecutive_failed == 0
+    assert r._consecutive_non_success == 0
 
 
 def test_refresh_broken_cleared_after_daemon_restart(tmp_path, monkeypatch):
@@ -384,7 +419,7 @@ def test_refresh_broken_cleared_after_daemon_restart(tmp_path, monkeypatch):
     rs.health = "refresh_broken"
     rs.error = "left over from previous daemon"
     rs.save(aid)
-    assert r._consecutive_failed == 0
+    assert r._consecutive_non_success == 0
     r._propagate_outcome(RefreshOutcome.REFRESHED)
     rs = RuntimeState.load(aid)
     assert rs.health == "ok"
@@ -426,6 +461,8 @@ def test_refresh_now_captures_outcome_instead_of_dropping(tmp_path, monkeypatch)
     captured: list[RefreshOutcome] = []
 
     class _FakeBackend:
+        refresh_lock_path = tmp_path / "fake-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -451,6 +488,8 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     captured: list[RefreshOutcome] = []
 
     class _ExplodingBackend:
+        refresh_lock_path = tmp_path / "exploding-refresh.lock"
+
         def expires_in_seconds(self):
             return 60
         async def refresh(self):
@@ -505,7 +544,7 @@ def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
     r.register_agent(agent_home_dir("agent-beta"))
 
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.FAILED)
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
 
     assert RuntimeState.load("agent-alpha").health == "refresh_broken"
     assert RuntimeState.load("agent-beta").health == "refresh_broken"
@@ -514,8 +553,8 @@ def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
 def test_refresh_broken_flip_is_idempotent_past_threshold(tmp_path, monkeypatch):
     from puffo_agent.portal.state import RuntimeState
     r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
-    r._propagate_outcome(RefreshOutcome.FAILED)
-    r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
     rs_after_flip = RuntimeState.load(aid)
     assert rs_after_flip.health == "refresh_broken"
     initial_error = rs_after_flip.error
@@ -523,7 +562,7 @@ def test_refresh_broken_flip_is_idempotent_past_threshold(tmp_path, monkeypatch)
     # already-refresh_broken agent's disk state must not be re-written
     # (avoids log spam + redundant disk writes once flipped).
     r._propagate_outcome(RefreshOutcome.FAILED)
-    r._propagate_outcome(RefreshOutcome.FAILED)
+    r._propagate_outcome(RefreshOutcome.UNCHANGED)
     r._propagate_outcome(RefreshOutcome.FAILED)
     rs_later = RuntimeState.load(aid)
     assert rs_later.health == "refresh_broken"
@@ -531,7 +570,7 @@ def test_refresh_broken_flip_is_idempotent_past_threshold(tmp_path, monkeypatch)
     # inner-loop guard `health == "refresh_broken": continue` blocked
     # the re-write.
     assert rs_later.error == initial_error
-    assert r._consecutive_failed == 5
+    assert r._consecutive_non_success == 5
 
 
 def test_refresh_broken_does_not_touch_unregistered_agents(tmp_path, monkeypatch):
@@ -547,7 +586,7 @@ def test_refresh_broken_does_not_touch_unregistered_agents(tmp_path, monkeypatch
     r.unregister_agent(agent_home_dir("agent-leaves"))
 
     for _ in range(REFRESH_BROKEN_THRESHOLD):
-        r._propagate_outcome(RefreshOutcome.FAILED)
+        r._propagate_outcome(RefreshOutcome.UNCHANGED)
 
     assert RuntimeState.load("agent-stays").health == "refresh_broken"
     assert RuntimeState.load("agent-leaves").health != "refresh_broken"
@@ -573,13 +612,7 @@ def test_refreshed_outcome_does_not_lift_unrelated_health_to_ok(
 def test_refresh_broken_streak_mixes_unchanged_and_failed(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.state import RuntimeState
     import logging
-    # PUF-349: the mixed streak only holds when UNCHANGED means trouble,
-    # i.e. the credential is at or below the safety margin and a refresh
-    # we needed didn't land. A fresh-token UNCHANGED no longer joins the
-    # streak — test_unchanged_with_fresh_token_does_not_flip pins that.
-    r, aid = _make_refresher_with_agent(
-        tmp_path, monkeypatch, expires_in_seconds=60,
-    )
+    r, aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     with caplog.at_level(logging.WARNING, logger="puffo_agent.portal.credential_refresh"):
         r._propagate_outcome(RefreshOutcome.UNCHANGED)
         r._propagate_outcome(RefreshOutcome.FAILED)
@@ -708,9 +741,9 @@ def test_filebackend_rate_limit_pattern_matches_in_stdout_too(tmp_path, monkeypa
 def test_propagate_outcome_rate_limited_counts_toward_streak(tmp_path, monkeypatch):
     r, _aid = _make_refresher_with_agent(tmp_path, monkeypatch)
     r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
-    assert r._consecutive_failed == 1
+    assert r._consecutive_non_success == 1
     r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
-    assert r._consecutive_failed >= REFRESH_BROKEN_THRESHOLD
+    assert r._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD
 
 
 def test_propagate_outcome_rate_limited_schedules_fast_retry(tmp_path, monkeypatch):
@@ -785,7 +818,7 @@ def test_propagate_outcome_rate_limited_does_not_crash_without_event_loop(
     r._propagate_outcome(RefreshOutcome.RATE_LIMITED)
     assert r._rate_limit_retry_task is None
     # Streak counter still advanced.
-    assert r._consecutive_failed == 1
+    assert r._consecutive_non_success == 1
 
 
 # ── model_not_found fallback latch ──────────────────────────────────────

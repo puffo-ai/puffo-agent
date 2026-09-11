@@ -387,7 +387,7 @@ def test_sync_host_mcp_empty_host_servers_is_noop(tmp_path):
 
 
 def test_sync_host_mcp_handles_empty_agent_file(tmp_path):
-    """``docker_cli.py`` touches ``.claude.json`` to a 0-byte file
+    """The Docker runtime touches ``.claude.json`` to a 0-byte file
     before ``docker run``. Merge must treat that as empty config."""
     host = tmp_path / "host"
     agent = tmp_path / "agent"

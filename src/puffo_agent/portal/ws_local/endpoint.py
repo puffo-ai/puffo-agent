@@ -26,6 +26,7 @@ from .bridge import WsLocalBridge
 from .protocol import Connect, Connected, Error, ProtocolError, decode_inbound, encode
 from .registry import SessionRegistry
 from .session import Transport, WsLocalSession
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +109,13 @@ async def _run_attached(
     async def on_message(root_id, batch, channel_meta):
         await bridge.dispatch(session, root_id, batch, channel_meta)
 
-    session_task = asyncio.ensure_future(session.run())
-    consumer_task = asyncio.ensure_future(start_consumer(authed, on_message))
+    # Cleanup below only records diagnostic DEBUG context.  Keep the central
+    # reporter as the single alertable, traceback-bearing failure record.
+    session_task = spawn(session.run(), name="session.run")
+    consumer_task = spawn(
+        start_consumer(authed, on_message),
+        name="start_consumer",
+    )
     try:
         await asyncio.wait(
             {session_task, consumer_task}, return_when=asyncio.FIRST_COMPLETED

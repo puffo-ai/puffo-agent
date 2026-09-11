@@ -205,7 +205,10 @@ async def test_assistant_output_is_not_persisted_but_terminal_is_kept(
     assert [value["type"] for value in values] == [
         "turn.started", "activity.updated", "turn.finished"
     ]
-    assert values[-1]["payload"] == {"outcome": "succeeded"}
+    assert values[-1]["payload"] == {
+        "outcome": "succeeded",
+        "tokens": {"input": 0, "output": 0},
+    }
     outbox.close()
 
 
@@ -218,6 +221,25 @@ def test_location_is_daemon_agent_state_beside_messages_not_workspace(tmp_path):
     assert workspace not in path.parents
     outbox = RuntimeEventOutbox(path)
     assert outbox.path == path
+    outbox.close()
+
+
+def test_native_session_harness_survives_unrelated_state_updates(tmp_path):
+    """Recovery bookkeeping must not erase the resume harness label."""
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    outbox.set_active_turn(
+        "turn-1",
+        session_ref="session-1",
+        native_session_id="native-1",
+        native_session_harness="opencode",
+    )
+    outbox.set_active_turn(
+        None,
+        session_ref="session-1",
+        native_session_id="native-1",
+    )
+
+    assert outbox.state()["native_session_harness"] == "opencode"
     outbox.close()
 
 
@@ -338,7 +360,8 @@ async def test_byte_bound_and_terminal_capacity_reservation(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sink_projects_metadata_lifecycle_without_assistant_output(tmp_path):
-    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    path = tmp_path / "runtime_events.db"
+    outbox = RuntimeEventOutbox(path)
     sink = RuntimeEventProjectingSink(
         outbox,
         RuntimeEventProjector(agent_id="agent", session_ref="session"),
@@ -358,12 +381,23 @@ async def test_sink_projects_metadata_lifecycle_without_assistant_output(tmp_pat
     await sink(native(
         "turn.assistant_completed", {"block_id": "result"}
     ))
-    await sink(native("turn.completed", {"outcome": "succeeded"}))
+    await sink(native("turn.completed", {
+        "outcome": "succeeded",
+        "input_tokens": 12,
+        "output_tokens": 3,
+        "context_tokens": 142_000,
+    }))
+    outbox.close()
+    outbox = RuntimeEventOutbox(path)
     values = [row.event for row in outbox.prefix()]
     assert [value["type"] for value in values] == [
         "turn.started", "activity.updated", "turn.finished",
     ]
-    assert values[-1]["payload"] == {"outcome": "succeeded"}
+    assert values[-1]["payload"] == {
+        "outcome": "succeeded",
+        "tokens": {"input": 12, "output": 3},
+        "current_context": 142_000,
+    }
     assert "abcdefghij" not in json.dumps(values)
     outbox.close()
 

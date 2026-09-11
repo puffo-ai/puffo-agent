@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from puffo_agent.agent.harness import runtime_commands
+from puffo_agent.agent.harness.runtime import runtime_commands
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
     HarnessEvent,
@@ -19,8 +19,8 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     TurnRef,
 )
-from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     register_runtime_manager,
     unregister_runtime_manager,

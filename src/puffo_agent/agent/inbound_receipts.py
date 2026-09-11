@@ -19,7 +19,11 @@ from .ingress_policy import (
     foreign_dm_gate,
     operator_control_gate,
 )
-from .message_context import MENTION_RE, maybe_redact_long_text
+from .message_context import (
+    MENTION_RE,
+    content_with_visibility,
+    maybe_redact_long_text,
+)
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
 
 if TYPE_CHECKING:
@@ -301,12 +305,14 @@ class InboundReceiptHandler:
             if payload.sender_slug == self.client.slug
             else payload.sender_slug
         ) if payload.envelope_kind == "dm" else ""
-        thread_root_id = await self.client._resolve_incoming_thread_root(
-            payload.thread_root_id,
-            payload.channel_id,
-            payload.space_id,
-            expected_envelope_kind=payload.envelope_kind,
-            expected_dm_peer=dm_peer,
+        thread_root_id, thread_root_unverified = (
+            await self.client._resolve_incoming_thread_root(
+                payload.thread_root_id,
+                payload.channel_id,
+                payload.space_id,
+                expected_envelope_kind=payload.envelope_kind,
+                expected_dm_peer=dm_peer,
+            )
         )
         reply_to_id = await self.client._validate_incoming_parent_id(
             payload.reply_to_id,
@@ -327,6 +333,7 @@ class InboundReceiptHandler:
             "sent_at": payload.sent_at,
             "thread_root_id": thread_root_id,
             "reply_to_id": reply_to_id,
+            "thread_root_unverified": thread_root_unverified,
             "is_encrypted": not is_plaintext,
         }
         return _ReceiptCommitter(
@@ -379,10 +386,16 @@ class InboundReceiptHandler:
             return None
         if payload.envelope_kind == "dm":
             await self.client._maybe_allowlist_outbound_dm(payload.recipient_slug)
+        replacement = self._echo_redaction(payload)
+        committer.stored_payload["content"] = content_with_visibility(
+            payload.content if replacement is None else replacement,
+            is_visible_to_human=payload.is_visible_to_human,
+        )
+        if replacement is not None:
+            committer.stored_payload["content_type"] = "text/plain"
         return await committer.commit(
             ReceiptDisposition.TERMINAL,
             "self echo",
-            content=self._echo_redaction(payload),
         )
 
     def _echo_redaction(self, payload: MessagePayload) -> str | None:
@@ -431,11 +444,13 @@ class InboundReceiptHandler:
             self.client._catchup_stale_ms,
             root_id or payload.envelope_id,
         )
-        self.client._report_stale_processed(payload.envelope_id)
-        return await committer.commit(
+        outcome = await committer.commit(
             ReceiptDisposition.TERMINAL,
             "stale catch-up",
         )
+        if outcome is TransportOutcome.ACK:
+            await self.client._report_stale_processed(payload.envelope_id)
+        return outcome
 
     @staticmethod
     def _raw_text(payload: MessagePayload) -> str:
@@ -476,7 +491,6 @@ class InboundReceiptHandler:
                 self.client,
                 committer.payload,
                 raw_text,
-                bool(committer.stored_payload.get("is_encrypted")),
             ),
         )
 
@@ -521,6 +535,10 @@ class InboundReceiptHandler:
             "channel_name": names["channel_name"],
             "space_name": names["space_name"],
         }
+        if raw_text != llm_text:
+            # Keep a durable source when the prompt view was bounded or
+            # normalized. Unchanged short strings need no duplicate copy.
+            content["original_content"] = payload.content
         # Only carried when authenticated facts actually classified the
         # sender; absent means projection falls back to ``unknown``.
         if names.get("sender_type"):

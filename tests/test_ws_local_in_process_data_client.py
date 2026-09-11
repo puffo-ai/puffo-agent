@@ -126,23 +126,7 @@ async def test_update_profile_cache_calls_worker_set_profile():
     worker.set_profile.assert_called_once_with("alice", "Alice", "https://x/a.png")
 
 
-def _stub_dm_crypto(monkeypatch, built):
-    """Neutralize envelope crypto so only the encrypt/plaintext choice shows."""
-    import puffo_agent.agent.outbound_messages as om
-
-    monkeypatch.setattr(om, "encrypt_message", lambda message, _k: (
-        built.__setitem__("encrypted", message) or {"envelope_id": "enc_1"}
-    ))
-    monkeypatch.setattr(om, "build_plaintext_message", lambda message, _k: (
-        built.__setitem__("plaintext", message) or {"envelope_id": "pt_1"}
-    ))
-    monkeypatch.setattr(
-        om.Ed25519KeyPair, "from_secret_bytes", staticmethod(lambda _b: MagicMock()),
-    )
-    monkeypatch.setattr(om, "decode_secret", lambda _v: b"")
-
-
-async def _daemon_dm_path(store, *, require_encryption):
+async def _daemon_dm_path():
     """Build one daemon-authored rootless DM and report its endpoint."""
     from puffo_agent.agent import outbound_messages
 
@@ -161,10 +145,7 @@ async def _daemon_dm_path(store, *, require_encryption):
         root_id="",
         is_visible_to_human=True,
         keystore=keystore,
-        store=store,
         fetch_devices=fetch_devices,
-        log=MagicMock(),
-        require_encryption=require_encryption,
     )
     return path
 
@@ -175,8 +156,8 @@ async def _dm_gate_prompt_send():
 
     sends = []
 
-    async def _send_dm(recipient, text, root_id, require_encryption=False):
-        sends.append((recipient, root_id, require_encryption))
+    async def _send_dm(recipient, text, root_id):
+        sends.append((recipient, root_id))
         return {"envelope_id": f"prompt_{len(sends)}"}
 
     gate_client = MagicMock()
@@ -189,52 +170,25 @@ async def _dm_gate_prompt_send():
         gate_client,
         sender_slug="stranger-1",
         text="confidential",
-        trigger_encrypted=True,
     )
     return sends[0]
 
 
 @pytest.mark.asyncio
-async def test_one_send_encryption_policy_across_both_authoring_lanes(
-    tmp_path, monkeypatch,
-):
-    """The ws-local coordinator lane and the daemon lane share one policy.
+async def test_daemon_authored_dms_always_use_the_e2ee_endpoint(monkeypatch):
+    """Every daemon-authored DM seals — there is no per-turn downgrade.
 
-    Without ``get_send_encryption`` on this shim, ``_send_encryption_required``
-    fell back to a blanket ``True`` while the out-of-process HTTP lane and
-    ``outbound_messages`` consulted ``send_mode`` — two lanes, two answers.
+    ``dm_gate``'s operator prompt embeds a decrypted stranger DM, so this
+    invariant is what keeps that quoted content off the wire in the clear.
     """
-    from puffo_agent.agent import send_mode
-    from puffo_agent.agent.message_store import MessageStore
+    import puffo_agent.agent.outbound_messages as om
 
-    store = MessageStore(tmp_path / "messages.db")
-    await store.open()
-    client = InProcessDataClient(store, MagicMock())
-    send_mode.clear_turn_bundle(["agent-0001"])
-    try:
-        # (a) The shim returns the send_mode decision, not a constant.
-        assert await client.get_send_encryption("agent-0001", None) is False
-        send_mode.note_turn_bundle(["agent-0001"], True)
-        assert await client.get_send_encryption("agent-0001", None) is True
-        assert await send_mode.encryption_required("agent-0001", store, None) is True
-
-        # (b) An encrypted trigger keeps a rootless daemon-authored DM E2EE —
-        # that is the envelope dm_gate's operator prompt is built from.
-        send_mode.clear_turn_bundle(["agent-0001"])
-        built: dict = {}
-        _stub_dm_crypto(monkeypatch, built)
-        assert await _daemon_dm_path(store, require_encryption=True) == "/messages"
-        assert "plaintext" not in built
-
-        # The untriggered default is unchanged: still policy-driven.
-        built.clear()
-        assert await _daemon_dm_path(store, require_encryption=False) == (
-            "/v2/messages/plaintext"
-        )
-
-        # (c) dm_gate supplies that trigger fact, so a prompt quoting a
-        # decrypted stranger DM never reaches the plaintext endpoint.
-        assert await _dm_gate_prompt_send() == ("operator-1", "", True)
-    finally:
-        send_mode.clear_turn_bundle(["agent-0001"])
-        await store.close()
+    monkeypatch.setattr(
+        om, "encrypt_message", lambda _message, _k: {"envelope_id": "enc_1"},
+    )
+    monkeypatch.setattr(
+        om.Ed25519KeyPair, "from_secret_bytes", staticmethod(lambda _b: MagicMock()),
+    )
+    monkeypatch.setattr(om, "decode_secret", lambda _v: b"")
+    assert await _daemon_dm_path() == "/messages"
+    assert await _dm_gate_prompt_send() == ("operator-1", "")

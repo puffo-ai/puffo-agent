@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 from dataclasses import FrozenInstanceError
@@ -218,6 +219,41 @@ async def test_coalescer_deadline_starts_at_notify_before_delayed_waiter():
 
 
 @pytest.mark.asyncio
+async def test_coalescer_sleep_failure_is_reported_once_with_traceback(caplog):
+    async def broken_sleep(_delay):
+        raise ValueError("coalescer sleep failed")
+
+    coalescer = InboxCoalescer(sleep=broken_sleep, monotonic=lambda: 20.0)
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        assert not await coalescer._sleep_or_pull(3.0)
+        await asyncio.sleep(0)
+
+    records = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(records) == 1
+    assert records[0].getMessage() == "worker task died: sleep"
+    assert records[0].exc_info is not None
+    assert isinstance(records[0].exc_info[1], ValueError)
+
+
+@pytest.mark.asyncio
+async def test_immediate_notifications_share_one_unconsumed_wake():
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    coalescer = InboxCoalescer(sleep=sleep, monotonic=lambda: 20.0)
+    coalescer.notify(delay_seconds=0)
+    coalescer.notify(delay_seconds=0)
+
+    await coalescer.wait_for_burst()
+
+    assert sleeps == [pytest.approx(0.0)]
+    assert not coalescer._deadlines
+
+
+@pytest.mark.asyncio
 async def test_coalescer_preserves_notification_for_next_expired_window():
     now = 30.0
     sleeps = []
@@ -307,7 +343,17 @@ async def test_notice_delivery_capability_matrix_is_turn_guarded():
     assert not await next_turn.offer(
         named_turn_id="active", active_turn_id="active", deliver=deliver
     )
-    assert delivered == ["delivered", "delivered"]
+
+    live_capability = NoticeDeliveryCapability.NEXT_TURN
+    dynamic = InboxNoticeDelivery(lambda: live_capability)
+    assert not await dynamic.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    live_capability = NoticeDeliveryCapability.GATED
+    assert await dynamic.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    assert delivered == ["delivered", "delivered", "delivered"]
 
 
 @pytest.mark.asyncio

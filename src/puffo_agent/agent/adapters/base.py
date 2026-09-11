@@ -218,6 +218,17 @@ class Adapter(ABC):
         self._context_admission_callback = callback
         self._context_admission_planning_cycle_key = planning_cycle_key
 
+    def register_autonomous_callback(self, callback) -> bool:
+        """Register a long-lived callback for provider turns the daemon did
+        not start (harness background-task wakeups).
+
+        Returns whether the adapter can report them at all. Adapters without
+        a live event stream answer ``False``: the daemon keeps its existing
+        behaviour instead of assuming turns will be bound.
+        """
+        del callback
+        return False
+
     # More explicit alias used by some integration call sites.
     register_provider_admission_callback = register_admission_callback
 

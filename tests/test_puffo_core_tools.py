@@ -332,10 +332,11 @@ async def test_hidden_schema_semantic_send_fields_only():
     expected = {
         "send_message": {
             "channel", "text", "root_id", "visibility_level", "send_anyway",
+            "covers",
         },
         "send_message_with_attachments": {
             "paths", "channel", "caption", "root_id",
-            "visibility_level", "send_anyway",
+            "visibility_level", "send_anyway", "covers",
         },
     }
     forbidden = {
@@ -481,7 +482,7 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
         "create_reminder", "list_reminders", "cancel_reminder", "replace_reminder",
     })
     assert set(tools["create_reminder"].inputSchema["properties"]) == {
-        "content", "target", "intended_at",
+        "content", "target", "intended_at", "covers",
     }
     assert set(tools["list_reminders"].inputSchema["properties"]) == {
         "state", "limit",
@@ -518,7 +519,7 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
     assert calls == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
+            "intended_at": "2026-08-02T12:00:00Z", "covers": None,
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
@@ -591,7 +592,7 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
     assert calls == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
+            "intended_at": "2026-08-02T12:00:00Z", "covers": None,
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
@@ -645,7 +646,12 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
     class Rpc:
         async def send_message(self, **body):
             bodies.append(body)
-            return {"state": "sent", "attempted": True, "seq": 3}
+            return {
+                "state": "sent",
+                "attempted": True,
+                "envelope_id": "msg_sent",
+                "seq": 3,
+            }
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
@@ -654,6 +660,8 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
         "send_message", {"channel": "ch_a", "text": "x", "send_anyway": True},
     )
     assert 'state="sent"' in result
+    assert 'message_id="msg_sent"' in result
+    assert "envelope_id=" not in result
     assert bodies == [{
         "channel": "ch_a",
         "root_id": "",
@@ -712,25 +720,41 @@ async def test_keyless_configured_rpc_failure_does_not_fall_back_to_http():
 
 
 @pytest.mark.asyncio
-async def test_send_message_plaintext_when_daemon_says_unencrypted():
+async def test_send_message_encrypts_when_daemon_says_unencrypted():
+    """Channel sends never downgrade to plaintext: even when the daemon-level
+    send-mode decision reports unencrypted (turn bundle cleared, e.g. a
+    turn-unbound background wakeup), the envelope still goes out E2EE."""
     cfg, http, ms = _setup()
+    recipient_kem = KemKeyPair.generate()
     await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [{"slug": "alice-0001", "role": "owner"}],
     }
+    http.responses["/certs/sync?slugs=alice-0001"] = {
+        "entries": [{
+            "seq": 1,
+            "kind": "device_cert",
+            "slug": "alice-0001",
+            "cert": {
+                "device_id": "dev_recipient_1",
+                "kem_public_key": base64url_encode(recipient_kem.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
 
-    async def _no_encrypt(slug, root):
-        return False
-
-    ms.get_send_encryption = _no_encrypt
     mcp = _build_tools(cfg)
-    with pytest.raises(RuntimeError, match="plaintext channel"):
-        await _call(
-            mcp,
-            "send_message",
-            {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
-        )
-    assert not any(m.startswith("POST") for m, _, _ in http.calls)
+    result = await _call(
+        mcp,
+        "send_message",
+        {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
+    )
+    assert "posted" in result
+    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
+    assert len(post_calls) == 1
+    envelope = post_calls[0][1]["envelope"]
+    assert envelope["type"] == "message_envelope"
+    assert "content_ciphertext" in envelope
 
 
 @pytest.mark.asyncio
@@ -925,7 +949,7 @@ async def test_send_message_agent_only_dm_stays_hidden_with_warning():
     so the agent can reconsider without being overridden."""
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
-    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = {
+    http.responses["/certs/sync?slugs=alice-0001"] = {
         "entries": [
             {
                 "seq": 1, "kind": "device_cert", "slug": "agent-0001",
@@ -1148,7 +1172,7 @@ async def test_send_message_dm():
     recipient_kem = KemKeyPair.generate()
     sender_kem = KemKeyPair.generate()
     # DM fans to recipient + sender's own devices via /certs/sync.
-    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = {
+    http.responses["/certs/sync?slugs=alice-0001"] = {
         "entries": [
             {
                 "seq": 1, "kind": "device_cert", "slug": "agent-0001",

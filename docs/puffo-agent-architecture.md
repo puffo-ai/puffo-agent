@@ -18,8 +18,8 @@ console entry point is `puffo_agent.portal.cli:main`.
 | --- | --- |
 | `portal/` | CLI, daemon, per-Agent worker lifecycle, config/state, machine control, loopback services, desktop UI, import/export. |
 | `agent/` | Transport facade, durable message/Inbox state, Global Inbox orchestration, model context, sends, reminders, memory, and Runtime events. |
-| `agent/harness/` | Provider-neutral Driver protocol, Runtime Manager, Codex app-server Driver, Claude stream-json Driver, local runtime preparation. |
-| `agent/adapters/` | Adapter facade and Docker Claude compatibility path. |
+| `agent/harness/` | Provider-neutral Driver protocol, Runtime Manager, Codex app-server Driver, Claude stream-json Driver, and local/Docker runtime preparation. |
+| `agent/adapters/` | Compatibility Adapter facade consumed by the common Inbox runtime. |
 | `crypto/` | Native signed HTTP, encrypted WS, identity keys, message envelopes, and attachment crypto. |
 | `mcp/` | Model-facing Puffo, Inbox/history, membership, memory, reminder, host, and file tools. |
 | `macos/` | Host credential integration. |
@@ -91,14 +91,17 @@ capability checks and terminal transitions.
 
 Current concrete engines:
 
-- `agent/harness/codex_driver.py`: Codex app-server.
-- `agent/harness/claude_code_driver.py`: Claude Code stream-json CLI.
-- `agent/adapters/docker_cli.py`: Docker Claude compatibility Adapter.
+- `agent/harness/drivers/codex.py`: Codex app-server.
+- `agent/harness/drivers/claude_code.py`: Claude Code stream-json CLI.
+- `agent/harness/runtime/docker_runtime.py`: per-Agent Docker placement and mounts for both Drivers.
+- `agent/harness/runtime/docker_support.py`: pinned image and bounded Docker lifecycle helpers.
 - `portal/ws_local/`: externally attached runtime.
 
-`agent/harness/local_runtime.py` resolves binaries, isolated homes, session
-fingerprints, managed config, and Driver construction. `portal/runtime_matrix.py`
-is the source of truth for supported runtime/provider/harness combinations.
+`agent/harness/runtime/local_runtime.py` resolves host binaries, isolated homes,
+durable native-session resume, managed config, and common Driver binding. Docker reuses
+the same Driver and Runtime Manager contracts through a `docker exec -i`
+process factory. `portal/runtime_matrix.py` is the source of truth for supported
+runtime/provider/harness combinations.
 
 ## MCP Subsystem
 

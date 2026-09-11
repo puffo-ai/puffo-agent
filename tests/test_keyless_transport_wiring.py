@@ -5,14 +5,14 @@ on its keyless / bridge path only when ``PUFFO_CORE_TRANSPORT == "bridge"``
 (``build_server`` does ``keyless=(transport == "bridge")``). That env var
 is produced by ``puffo_core_mcp_env`` and must be threaded from
 ``agent.yml``'s ``puffo_core.transport`` through both execution builders:
-``LocalRuntimePreparer`` for cli-local and ``worker.build_docker_adapter``
+``LocalRuntimePreparer`` for cli-local and ``DockerRuntimePreparer``
 for cli-docker.
 
 These tests pin both halves of the seam:
 
   * the env builder emits ``PUFFO_CORE_TRANSPORT`` for ``bridge`` only,
     and for no other transport value (so keyless stays False elsewhere);
-  * ``build_docker_adapter`` forwards ``pc.transport`` end-to-end, so a bridge
+  * ``build_docker_runtime`` forwards ``pc.transport`` end-to-end, so a bridge
     agent's adapter env carries the var while a native agent's does not
     (native stays byte-for-byte on the signed keystore path).
 """
@@ -33,7 +33,7 @@ from puffo_agent.portal.state import (
     PuffoCoreConfig,
     RuntimeConfig,
 )
-from puffo_agent.portal.worker import build_docker_adapter
+from puffo_agent.portal.worker import build_docker_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -107,11 +107,11 @@ def test_worker_forwards_bridge_transport(kind):
         puffo_core=_bridge_puffo_core(),
     )
     if kind == "cli-local":
-        from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+        from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         env = LocalRuntimePreparer(DaemonConfig(), cfg)._puffo_core_env
     else:
-        env = build_docker_adapter(DaemonConfig(), cfg).puffo_core_mcp_env
+        env = build_docker_runtime(DaemonConfig(), cfg)._container_puffo_mcp_env()
     assert env is not None
     assert env["PUFFO_CORE_TRANSPORT"] == "bridge"
 
@@ -124,10 +124,10 @@ def test_worker_native_agent_omits_transport(kind):
         puffo_core=_native_puffo_core(),
     )
     if kind == "cli-local":
-        from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+        from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         env = LocalRuntimePreparer(DaemonConfig(), cfg)._puffo_core_env
     else:
-        env = build_docker_adapter(DaemonConfig(), cfg).puffo_core_mcp_env
+        env = build_docker_runtime(DaemonConfig(), cfg)._container_puffo_mcp_env()
     assert env is not None
     assert "PUFFO_CORE_TRANSPORT" not in env

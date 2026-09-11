@@ -1232,7 +1232,7 @@ async def test_d_native_send_message_still_encrypts_and_posts(tmp_path, monkeypa
 
     ks = _native_keystore(tmp_path)
     http = FakeHttp()
-    http.responses["/certs/sync?slugs=bot-0001,alice-0001"] = {
+    http.responses["/certs/sync?slugs=alice-0001"] = {
         "entries": [{
             "seq": 1,
             "kind": "device_cert",
@@ -1643,7 +1643,7 @@ async def test_e_native_attachments_still_encrypt_and_signed_http(
     ks = _native_keystore(tmp_path)
     http = FakeHttp()
     http.responses["/blobs/upload"] = {"blob_id": "blob_native_att"}
-    http.responses["/certs/sync?slugs=bot-0001,alice-0001"] = {
+    http.responses["/certs/sync?slugs=alice-0001"] = {
         "entries": [{
             "seq": 1,
             "kind": "device_cert",

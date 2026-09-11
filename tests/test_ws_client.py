@@ -62,6 +62,41 @@ class TestHttpToWs:
         assert _http_to_ws("ws://localhost:3000") == "ws://localhost:3000"
 
 
+@pytest.mark.asyncio
+async def test_wss_connect_uses_remote_tls_context(monkeypatch):
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient("https://api.puffo.ai", ks, "alice-0001", FakeHttpClient())
+    tls_context = object()
+    captured = {}
+
+    class Connection:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    def connect(url, **kwargs):
+        captured.update(url=url, **kwargs)
+        return Connection()
+
+    async def handshake(_ws):
+        return "session"
+
+    async def noop():
+        return None
+
+    monkeypatch.setattr("puffo_agent.crypto.ws_client.create_remote_ssl_context", lambda: tls_context)
+    monkeypatch.setattr("puffo_agent.crypto.ws_client.websockets.connect", connect)
+    client._handshake = handshake
+    client._catchup = noop
+    client._listen_loop = noop
+
+    await client.connect_once()
+
+    assert captured == {"url": "wss://api.puffo.ai/subscribe", "ssl": tls_context}
+
+
 class FakeWsServer:
     """Minimal WS server for testing handshake and message flows."""
 
@@ -453,17 +488,22 @@ async def test_event_and_cert_handlers():
     server._push_after_connect = [
         {"type": "cert_update", "entry": {"seq": 5, "kind": "subkey_cert"}},
         {"type": "event", "scope": "sp_123", "event": {"action": "join"}},
+        {"type": "space_membership_changed", "space_id": "sp_123"},
     ]
     await server.start()
 
     cert_updates = []
     events = []
+    membership_changes = []
 
     async def on_cert(entry):
         cert_updates.append(entry)
 
     async def on_event(scope, event):
         events.append((scope, event))
+
+    async def on_membership_change(space_id):
+        membership_changes.append(space_id)
 
     http = FakeHttpClient()
     client = PuffoCoreWsClient(
@@ -473,6 +513,7 @@ async def test_event_and_cert_handlers():
     client.ws_url = f"ws://127.0.0.1:{server.port}"
     client.on_cert_update = on_cert
     client.on_event = on_event
+    client.on_space_membership_changed = on_membership_change
 
     task = asyncio.create_task(client.connect_once())
     await asyncio.sleep(0.5)
@@ -487,6 +528,7 @@ async def test_event_and_cert_handlers():
     assert len(events) == 1
     assert events[0][0] == "sp_123"
     assert events[0][1]["action"] == "join"
+    assert membership_changes == ["sp_123"]
     await server.stop()
 
 

@@ -319,7 +319,10 @@ async def test_invitation_lifecycle_reconciles_dedupes_and_stores_placeholder(
             _dm_frame(SELF, "echo of prompt", seq=1, envelope_id=prompt_env)
         )
         echo = await _await_envelope(client, prompt_env)
-        assert echo.content == INVITE_PROMPT_PLACEHOLDER
+        assert echo.content == {
+            "text": INVITE_PROMPT_PLACEHOLDER,
+            "is_visible_to_human": True,
+        }
 
         # An exact threaded operator reply is consumed to a terminal outcome.
         await bridge._out.put(

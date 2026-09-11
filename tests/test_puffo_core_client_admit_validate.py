@@ -19,18 +19,21 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.inbound_receipts import InboundReceiptHandler
+from puffo_agent.agent.client_support import DM_GATE_PROMPT_PLACEHOLDER
 from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.crypto.http_client import PuffoCoreHttpClient
 from puffo_agent.crypto.keystore import KeyStore
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
+from puffo_agent.mcp.core_post_tools import _get_post_segment
 
 
 def _now_ms() -> int:
@@ -303,12 +306,18 @@ class _ScriptedHttp:
     def __init__(self) -> None:
         self.keyless = False
         self.blocklist_reachable = False
+        self.allowlisted_slugs: list[str] = []
 
     async def get(self, path, *a, **k):
         if path in ("/allowlists", "/blocklists"):
             if not self.blocklist_reachable:
                 raise ConnectionError("simulated Puffo Server incident")
-            return {"entries": [], "blocks": []}
+            return {
+                "entries": [
+                    {"peer_slug": slug} for slug in self.allowlisted_slugs
+                ],
+                "blocks": [],
+            }
         return {}
 
     async def post(self, path, body=None, *a, **k):
@@ -422,9 +431,7 @@ def _attachment_content(text: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_native_ingress_withholds_uncleared_sender_content(
-    tmp_path, monkeypatch
-):
+async def test_native_ingress_withholds_uncleared_sender_content(tmp_path, monkeypatch):
     """The native gate decides before, and reveals nothing after.
 
     Four production failures, one boundary:
@@ -461,7 +468,6 @@ async def test_native_ingress_withholds_uncleared_sender_content(
         ),
     }
     handler = _handler(client, payloads)
-
     # ── cold-start blocklist: unreadable ⇒ hold, not admit ────────────
     outcome = await handler.handle(_delivery("env_stranger", STRANGER_SLUG, 1))
     assert outcome is TransportOutcome.HOLD
@@ -492,8 +498,8 @@ async def test_native_ingress_withholds_uncleared_sender_content(
     await handler.handle(_delivery("env_prompt", SELF_SLUG, 2))
 
     echo = await client.store.get_message_by_envelope("env_prompt")
-    assert echo is not None
-    assert marker not in str(echo.content)
+    assert echo is not None and marker not in str(echo.content)
+    assert echo.content == {"text": DM_GATE_PROMPT_PLACEHOLDER, "is_visible_to_human": True}
 
     operator_anchor = await client.store.store_local_event(
         {
@@ -521,6 +527,63 @@ async def test_native_ingress_withholds_uncleared_sender_content(
     assert outcome is TransportOutcome.ACK
     assert saved == ["env_friend"]
     assert (inbox_root / "env_friend").exists()
+    stored = await client.store.get_visible_message_by_envelope("env_friend")
+    assert stored is not None
+    assert "original_content" not in stored.content
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_native_long_message_keeps_segment_source_after_prompt_redaction(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    client = _native_client(tmp_path)
+    client._max_inline_chars = 100
+    client._segment_chars = 80
+    await client.store.open()
+    client.http.blocklist_reachable = True
+    # The server allowlist is authoritative once reachable: a refresh
+    # replaces the local set, so the friend must be allowlisted there
+    # (a bare local note_allowed used to pass only via the gate's since-
+    # removed fail-open prompt path).
+    client.http.allowlisted_slugs = [FRIEND_SLUG]
+    client._contacts.note_allowed(FRIEND_SLUG)
+
+    original = "0123456789" * 25
+    payloads = {
+        "env_long": _dm_payload(
+            FRIEND_SLUG,
+            original,
+            envelope_id="env_long",
+        ),
+    }
+    outcome = await _handler(client, payloads).handle(
+        _delivery("env_long", FRIEND_SLUG, 1)
+    )
+    assert outcome is TransportOutcome.ACK
+
+    stored = await client.store.get_visible_message_by_envelope("env_long")
+    assert stored is not None
+    assert "inbound message was too long" in stored.content["text"]
+    assert stored.content["original_content"] == original
+
+    class _StoreDataClient:
+        async def get_message_by_envelope(self, envelope_id):
+            return await client.store.get_visible_message_by_envelope(envelope_id)
+
+    segment = await _get_post_segment(
+        SimpleNamespace(
+            slug=SELF_SLUG,
+            agent_id=SELF_SLUG,
+            data_client=_StoreDataClient(),
+        ),
+        "env_long",
+        1,
+        80,
+    )
+    assert segment["segment"]["count"] == 4
+    assert segment["segment"]["text"] == original[80:160]
     await client.store.close()
 
 

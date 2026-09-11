@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional
 
 from ..crypto import ws_client as _ws_config
@@ -29,6 +28,7 @@ from ..limits import (
 from . import disk_cache as _disk_cache
 from . import inbound_attachments as _attachment_helpers
 from . import message_context as _message_context
+from ..tasks import spawn
 
 if TYPE_CHECKING:
     from .bridge_client import CloudBridgeClient
@@ -115,6 +115,7 @@ from .outbound_messages import (
     send_native_fallback_dm,
 )
 from .permission_prompt import format_permission_prompt
+from .processing_receipts import processing_run_id
 from .thread_context import (
     resolve_incoming_thread_root,
     validate_incoming_parent_id,
@@ -190,6 +191,9 @@ class PuffoCoreMessageClient:
                 bridge_client=bridge_client,
             )
         )
+        # Assignable post-construction (the Worker owns the health policy);
+        # picked up when ``run()`` builds the WS client.
+        self.transport_state_listener: Callable[[bool, int], None] | None = None
         bridge_connected = getattr(self._bridge, "add_connected_callback", None)
         if callable(bridge_connected):
             bridge_connected(self._notify_connected_callbacks)
@@ -220,40 +224,22 @@ class PuffoCoreMessageClient:
             now_ms = int(time.time() * 1000)
         return sent_at < now_ms - self._catchup_stale_ms
 
-    def _report_stale_processed(self, envelope_id: str) -> None:
-        """Batched best-effort processing report; never blocks catch-up."""
-        self._stale_report_buf.append(envelope_id)
-        if self._stale_flush_task is None or self._stale_flush_task.done():
-            self._stale_flush_task = asyncio.ensure_future(self._flush_stale_reports())
-
-    async def _flush_stale_reports(self) -> None:
-        await asyncio.sleep(1.0)  # coalesce the burst
-        # re-sweeps mid-flush arrivals
-        while self._stale_report_buf:
-            buf, self._stale_report_buf = self._stale_report_buf, []
-            await self._post_stale_runs(buf)
-
-    async def _post_stale_runs(self, buf: list[str]) -> None:
-        runs = [
-            {
-                "run_id": f"run_{uuid.uuid4().hex}",
-                "message_id": mid,
-                "succeeded": True,
-            }
-            for mid in buf
-        ]
-        for i in range(0, len(runs), 200):  # request-size cap
-            try:
-                await self.http.post(
-                    "/messages/processing/end:batch",
-                    {"runs": runs[i : i + 200]},
-                )
-            except Exception as exc:  # noqa: BLE001
-                self._log.debug(
-                    "stale-processed flush failed (%d runs): %s",
-                    len(runs[i : i + 200]),
-                    exc,
-                )
+    async def _report_stale_processed(self, envelope_id: str) -> None:
+        """Durably queue one catch-up receipt before transport ACK."""
+        dispatcher = self._processing_reports
+        if dispatcher is None:
+            return
+        await dispatcher.enqueue(
+            (
+                {
+                    "run_id": processing_run_id(
+                        f"stale-catchup:{self.slug}", envelope_id
+                    ),
+                    "message_id": envelope_id,
+                    "succeeded": True,
+                },
+            )
+        )
 
     async def listen(
         self,
@@ -287,7 +273,7 @@ class PuffoCoreMessageClient:
             read_plaintext=read_plaintext_message,
         )
 
-        invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
+        invite_poll_task = spawn(self._invite_poll_loop(), name="invite_poll_loop")
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
             keystore=self.keystore,
@@ -296,8 +282,18 @@ class PuffoCoreMessageClient:
         )
         self._ws.on_message = receipt_handler.handle
         self._ws.on_event = self._handle_event
+        self._ws.on_space_membership_changed = self._handle_space_membership_changed
+        self._ws.on_channel_update = self._handle_channel_update
         # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
+        # Worker-installed observer (see Worker._transport_state_listener):
+        # feeds reconnect-failure streaks into runtime.json health so a
+        # dead transport stops reporting "ok" (8/30 App Nap incident).
+        # getattr: legacy test seeds construct this client without
+        # __init__, same tolerance as the bridge callback above.
+        self._ws.on_transport_state = getattr(
+            self, "transport_state_listener", None
+        )
         await self.store.open()
         try:
             await self._ws.run()
@@ -401,6 +397,11 @@ class PuffoCoreMessageClient:
             return
         await self._handle_invite_cancellation_event(kind, payload)
 
+    async def _handle_space_membership_changed(self, space_id: str) -> None:
+        """Invalidate the roster projection without emitting a second event."""
+        if space_id:
+            self._space_members.pop(space_id, None)
+
     async def _prepare_membership_event(
         self,
         kind: str | None,
@@ -413,6 +414,7 @@ class PuffoCoreMessageClient:
             self._log.exception("mark_channel_space from %s failed", kind)
         if kind in (
             EventKind.ACCEPT_SPACE_INVITE,
+            EventKind.REDEEM_INVITE_CAPABILITY,
             EventKind.LEAVE_SPACE,
             EventKind.REMOVE_FROM_SPACE,
         ):
@@ -517,13 +519,15 @@ class PuffoCoreMessageClient:
         event: dict,
         payload: dict,
     ) -> bool:
-        if kind in (EventKind.LEAVE_CHANNEL, EventKind.REMOVE_FROM_CHANNEL):
+        if kind in (EventKind.LEAVE_CHANNEL, EventKind.REMOVE_FROM_CHANNEL,
+                    EventKind.ADD_TO_CHANNEL):
             await self._maybe_announce_membership_change(kind, event, payload)
             return True
         if kind in (
             EventKind.LEAVE_SPACE,
             EventKind.REMOVE_FROM_SPACE,
             EventKind.ACCEPT_SPACE_INVITE,
+            EventKind.REDEEM_INVITE_CAPABILITY,
         ):
             await self._maybe_announce_space_membership_change(kind, event, payload)
             return True
@@ -568,6 +572,7 @@ class PuffoCoreMessageClient:
             space_members=self._space_members,
             store=self.store,
             log=self._log,
+            channel_policies=self._channel_encrypted,
         )
 
     async def _evict_channel_caches(self, channel_id: str) -> None:
@@ -577,6 +582,7 @@ class PuffoCoreMessageClient:
             channel_names=self._channel_name_cache,
             store=self.store,
             log=self._log,
+            channel_policies=self._channel_encrypted,
         )
 
     async def _dm_operator_membership_change(self, text: str) -> None:
@@ -848,7 +854,7 @@ class PuffoCoreMessageClient:
         *,
         expected_envelope_kind: str = "",
         expected_dm_peer: str = "",
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], bool]:
         """Resolve an inbound reply reference to its canonical thread root."""
         return await resolve_incoming_thread_root(
             store=self.store,
@@ -861,24 +867,21 @@ class PuffoCoreMessageClient:
             expected_self_slug=getattr(self, "slug", ""),
         )
 
-    async def rewarm_channel_caches(self) -> None:
-        """On-miss re-warm; serialized + 5s-debounced (no stampede)."""
+    async def rewarm_channel_caches(self, *, force: bool = False) -> None:
+        """On-miss re-warm; serialized + 5s-debounced (no stampede).
+        ``force`` skips only the debounce (event-driven rechecks)."""
         async with self._rewarm_lock:
-            now = time.monotonic()
-            if now - self._last_rewarm < 5.0:
+            if not force and time.monotonic() - self._last_rewarm < 5.0:
                 return
             await self._warm_member_caches()
-            self._last_rewarm = now
+            self._last_rewarm = time.monotonic()
 
     async def _on_ws_connect(self) -> None:
         """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
-        self._warm_task = asyncio.ensure_future(
-            asyncio.gather(
-                self._warm_member_caches(),
-                # Allow/block hydration rides the same tick so a restart
-                # doesn't re-gate already-allowlisted senders.
-                self._contacts.refresh(),
-            )
+        self._warm_task = spawn(
+            # allow/block hydration same tick: restart must not re-gate
+            asyncio.gather(self._warm_member_caches(), self._contacts.refresh()),
+            name="warm_after_ws_connect",
         )
         await self._notify_connected_callbacks()
 
@@ -901,7 +904,73 @@ class PuffoCoreMessageClient:
             store=self.store,
             channel_spaces=self._channel_space,
             channel_names=self._channel_name_cache,
+            channel_policies=self._channel_encrypted,
         )
+
+    def channel_policy(self, channel_id: str) -> bool:
+        """is_encrypted for a channel; unknown fails safe to encrypted."""
+        if not channel_id:
+            return True
+        cached = self._channel_encrypted.get(channel_id)
+        if isinstance(cached, bool):
+            return cached
+        persisted = (disk_cache.load_channel(channel_id) or {}).get("is_encrypted")
+        return persisted is not False
+
+    async def ensure_channel_policy(self, channel_id: str, space_id: str = "") -> bool:
+        if channel_id in self._channel_encrypted:
+            return self._channel_encrypted[channel_id]
+        persisted = (disk_cache.load_channel(channel_id) or {}).get("is_encrypted")
+        if isinstance(persisted, bool):
+            self._channel_encrypted[channel_id] = persisted
+            return persisted
+        space = space_id or self._channel_space.get(channel_id) or ""
+        if space:
+            await self._warm_channels_for_space(space)
+        return self.channel_policy(channel_id)
+
+    async def refresh_channel_policy(self, channel_id: str) -> bool:
+        """Server re-read, bypassing caches (post-CHANNEL_FORMAT_MISMATCH)."""
+        space_id = self._channel_space.get(channel_id) or ""
+        if not space_id:
+            try:
+                space_id = await self.store.lookup_channel_space(channel_id) or ""
+            except Exception:
+                space_id = ""
+        if space_id:
+            await self._warm_channels_for_space(space_id)
+        return self.channel_policy(channel_id)
+
+    async def _handle_channel_update(self, update: dict) -> None:
+        channel_id = update.get("channel_id")
+        if not isinstance(channel_id, str) or not channel_id:
+            return
+        space_id = update.get("space_id")
+        if isinstance(space_id, str) and space_id:
+            self._channel_space[channel_id] = space_id
+        name = update.get("name")
+        if isinstance(name, str) and name.strip():
+            self._channel_name_cache[channel_id] = name.strip()
+        policy = update.get("is_encrypted")
+        if isinstance(policy, bool):
+            if self._channel_encrypted.get(channel_id) != policy:
+                logger.info(
+                    "channel %s policy -> %s",
+                    channel_id,
+                    "encrypted" if policy else "plaintext",
+                )
+            self._channel_encrypted[channel_id] = policy
+            cache_name = (
+                self._channel_name_cache.get(channel_id)
+                or (disk_cache.load_channel(channel_id) or {}).get("name")
+                or channel_id
+            )
+            disk_cache.persist_channel(
+                channel_id,
+                cache_name,
+                self._channel_space.get(channel_id) or "",
+                policy,
+            )
 
     async def _bulk_fetch_profiles(self, slugs: list[str]) -> None:
         await bulk_fetch_profiles(
@@ -1007,6 +1076,7 @@ class PuffoCoreMessageClient:
             inviter_by_event_id=getattr(self, "_inviter_by_invitation_event_id", {}),
             processed_event_ids=getattr(self, "_processed_membership_event_ids", set()),
             enqueue_message=self._enqueue_membership_system_message,
+            rewarm_channels=lambda: self.rewarm_channel_caches(force=True),
             log=self._log,
         )
 
@@ -1378,89 +1448,17 @@ class PuffoCoreMessageClient:
     _DM_NOTICE_INTERVAL_MS = 72 * 3600 * 1000
 
     async def _maybe_send_dm_notice(self, sender_slug: str) -> None:
-        """Operator FYI for every non-trusted sender (contacts included):
-        first DM immediately, then one per 72h; persisted."""
-        if not self.operator_slug:
-            return
-        try:
-            last = await self.store.get_dm_notice(sender_slug)
-        except Exception:
-            last = None
-        now_ms = int(time.time() * 1000)
-        if last is not None and now_ms - last < self._DM_NOTICE_INTERVAL_MS:
-            return
-        display = await self._fetch_display_name(sender_slug)
-        label = f"**{display}** ({sender_slug})" if display else f"@{sender_slug}"
-        try:
-            await self._send_dm(
-                self.operator_slug,
-                f"FYI, {label} is sending direct messages to me.",
-                root_id="",
-            )
-        except Exception as exc:
-            self._log.warning(
-                "dm_notice: failed to notify operator about %s: %s",
-                sender_slug,
-                exc,
-            )
-            return
-        try:
-            await self.store.set_dm_notice(sender_slug, now_ms)
-        except Exception as exc:
-            self._log.warning("dm_notice: failed to persist ts: %s", exc)
+        from . import dm_gate
+
+        await dm_gate.maybe_send_dm_notice(self, sender_slug)
 
     async def _maybe_allowlist_outbound_dm(self, recipient_slug: str) -> None:
-        """Agent DM'd a foreign peer first → allowlist them; best-effort."""
-        if not recipient_slug:
-            return
-        # Never allowlist a sender we're currently gating — the ack DM
-        # echoes back here and would pre-empt the operator's y/n.
-        if any(
-            m.get("sender_slug") == recipient_slug
-            for m in self._pending_dm_approvals.values()
-        ):
-            return
-        # Replying is not consent — only a genuinely agent-initiated
-        # first DM allowlists. A stored inbound DM means they wrote first.
-        try:
-            if await self.store.has_dm_from(recipient_slug):
-                return
-        except Exception:
-            return
-        # Trusted short-circuit before is_allowed can hit the network
-        # (the daemon DMs the operator constantly).
-        if not await self._is_foreign_dm_sender(recipient_slug):
-            return
-        if await self._contacts.is_allowed(recipient_slug):
-            return
-        try:
-            await self.http.post("/allowlists", {"slugs": [recipient_slug]})
-        except Exception as exc:
-            self._log.warning(
-                "dm_gate: outbound allowlist for %s failed: %s",
-                recipient_slug,
-                exc,
-            )
-            return
-        self._contacts.note_allowed(recipient_slug)
-        if not self.operator_slug:
-            return
-        display = await self._fetch_display_name(recipient_slug)
-        label = f"**{display}**(@{recipient_slug})" if display else f"@{recipient_slug}"
-        try:
-            await self._send_dm(
-                self.operator_slug,
-                f"Allowlisted {label} — I messaged them first, so their "
-                "replies won't need approval.",
-                root_id="",
-            )
-        except Exception:
-            self._log.exception(
-                "dm_gate: failed to notify operator of outbound allowlist",
-            )
+        from . import dm_gate
+
+        await dm_gate.maybe_allowlist_outbound_dm(self, recipient_slug)
 
     async def _maybe_gate_foreign_dm(
-        self, *, sender_slug: str, text: str, trigger_encrypted: bool = False
+        self, *, sender_slug: str, text: str
     ) -> bool:
         from . import dm_gate
 
@@ -1468,7 +1466,6 @@ class PuffoCoreMessageClient:
             self,
             sender_slug=sender_slug,
             text=text,
-            trigger_encrypted=trigger_encrypted,
         )
 
     async def _maybe_handle_dm_approval_reply(
@@ -1822,7 +1819,6 @@ class PuffoCoreMessageClient:
         recipient_slug: str,
         text: str,
         root_id: str,
-        require_encryption: bool = False,
     ) -> dict[str, Any] | None:
         return await send_direct_message(
             slug=self.slug,
@@ -1830,11 +1826,9 @@ class PuffoCoreMessageClient:
             text=text,
             root_id=root_id,
             keystore=self.keystore,
-            store=self.store,
             http=self.http,
             fetch_devices=self._fetch_device_keys,
             log=self._log,
-            require_encryption=require_encryption,
         )
 
     async def _fetch_device_keys(
@@ -1911,7 +1905,6 @@ class PuffoCoreMessageClient:
             text=text,
             root_id=root_id,
             keystore=self.keystore,
-            store=self.store,
             http=self.http,
             fetch_devices=self._fetch_device_keys,
             log=self._log,

@@ -2,9 +2,95 @@
 
 from __future__ import annotations
 
+import time
+
 from ..crypto.ws_client import TransportOutcome
 from .client_support import DM_GATE_SENDER_ACK
 from .permission_prompt import format_permission_prompt
+
+
+async def maybe_send_dm_notice(client, sender_slug: str) -> None:
+    """Operator FYI for every non-trusted sender (contacts included):
+    first DM immediately, then one per 72h; persisted."""
+    if not client.operator_slug:
+        return
+    try:
+        last = await client.store.get_dm_notice(sender_slug)
+    except Exception:
+        last = None
+    now_ms = int(time.time() * 1000)
+    if last is not None and now_ms - last < client._DM_NOTICE_INTERVAL_MS:
+        return
+    display = await client._fetch_display_name(sender_slug)
+    label = f"**{display}** ({sender_slug})" if display else f"@{sender_slug}"
+    try:
+        await client._send_dm(
+            client.operator_slug,
+            f"FYI, {label} is sending direct messages to me.",
+            root_id="",
+        )
+    except Exception as exc:
+        client._log.warning(
+            "dm_notice: failed to notify operator about %s: %s",
+            sender_slug,
+            exc,
+        )
+        return
+    try:
+        await client.store.set_dm_notice(sender_slug, now_ms)
+    except Exception as exc:
+        client._log.warning("dm_notice: failed to persist ts: %s", exc)
+
+
+async def maybe_allowlist_outbound_dm(client, recipient_slug: str) -> None:
+    """Agent DM'd a foreign peer first → allowlist them; best-effort."""
+    if not recipient_slug:
+        return
+    # Never allowlist a sender we're currently gating — the ack DM
+    # echoes back here and would pre-empt the operator's y/n.
+    if any(
+        m.get("sender_slug") == recipient_slug
+        for m in client._pending_dm_approvals.values()
+    ):
+        return
+    # Replying is not consent — only a genuinely agent-initiated
+    # first DM allowlists. A stored inbound DM means they wrote first.
+    try:
+        if await client.store.has_dm_from(recipient_slug):
+            return
+    except Exception:
+        return
+    # Trusted short-circuit before is_allowed can hit the network
+    # (the daemon DMs the operator constantly).
+    if not await client._is_foreign_dm_sender(recipient_slug):
+        return
+    if await client._contacts.is_allowed(recipient_slug):
+        return
+    try:
+        await client.http.post("/allowlists", {"slugs": [recipient_slug]})
+    except Exception as exc:
+        client._log.warning(
+            "dm_gate: outbound allowlist for %s failed: %s",
+            recipient_slug,
+            exc,
+        )
+        return
+    client._contacts.note_allowed(recipient_slug)
+    if not client.operator_slug:
+        return
+    display = await client._fetch_display_name(recipient_slug)
+    label = f"**{display}**(@{recipient_slug})" if display else f"@{recipient_slug}"
+    try:
+        await client._send_dm(
+            client.operator_slug,
+            f"Allowlisted {label} — I messaged them first, so their "
+            "replies won't need approval.",
+            root_id="",
+        )
+    except Exception:
+        client._log.exception(
+            "dm_gate: failed to notify operator of outbound allowlist",
+        )
 
 
 async def maybe_gate_foreign_dm(
@@ -12,16 +98,10 @@ async def maybe_gate_foreign_dm(
     *,
     sender_slug: str,
     text: str,
-    trigger_encrypted: bool = False,
 ) -> bool:
     """Prompt the operator for a held foreign DM. True = gated (caller
     skips the ack; the DM waits in /messages/pending). One prompt per
     sender — further DMs ride the same y/n.
-
-    ``trigger_encrypted`` is the inbound DM's own confidentiality. The
-    prompt embeds that decrypted text and is sent with ``root_id=""``,
-    so without it the send-mode policy would answer plaintext and
-    republish an E2EE stranger's message in the clear.
     """
     for entry in client._pending_dm_approvals.values():
         if entry.get("sender_slug") == sender_slug:
@@ -51,24 +131,28 @@ async def maybe_gate_foreign_dm(
             client.operator_slug,
             prompt,
             root_id="",
-            require_encryption=trigger_encrypted,
         )
     except Exception as exc:
-        client._log.warning(
+        # Approval is a control plane: a prompt that cannot reach the
+        # operator must not open the gate. No pending entry is recorded,
+        # so the sender's next DM retries the prompt.
+        client._log.error(
             "auto_accept_dm: failed to send approval prompt for %s: %s; "
-            "delivering DM without approval",
+            "holding the DM gated (fail-closed), prompt retries on their "
+            "next DM",
             sender_slug,
             exc,
         )
-        return False
+        return True
     prompt_env_id = envelope.get("envelope_id", "") if envelope else ""
     if not prompt_env_id:
-        client._log.warning(
+        client._log.error(
             "auto_accept_dm: approval prompt for %s got no envelope_id; "
-            "delivering DM without approval",
+            "holding the DM gated (fail-closed), prompt retries on their "
+            "next DM",
             sender_slug,
         )
-        return False
+        return True
     client._pending_dm_approvals[prompt_env_id] = {
         "sender_slug": sender_slug,
         "sender_display_name": sender_display,

@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 import pytest
 
 from puffo_agent.agent.adapters.base import Adapter, TurnContext, TurnResult
-from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
 from puffo_agent.agent.context_controller import (
     AdmissionCandidate,
     CompactionResult,
@@ -249,27 +248,3 @@ def test_provider_protocol_is_fakeable_without_adapter():
     provider = FakeProvider([snapshot()])
     result = asyncio.run(ContextController(provider).decide(candidate()))
     assert result.outcome is DecisionOutcome.ADMIT
-
-
-def test_docker_wrapper_delegates_context_contract():
-    class Harness:
-        def name(self):
-            return "claude-code"
-
-    class Session(FakeProvider):
-        def __init__(self):
-            super().__init__([snapshot(12)])
-            self.registered = None
-
-        def register_admission_callback(self, callback, planning_cycle_key=""):
-            self.registered = (callback, planning_cycle_key)
-
-    callback = lambda event: asyncio.sleep(0)
-    wrapper = DockerCLIAdapter.__new__(DockerCLIAdapter)
-    wrapper.harness = Harness()
-    wrapper._session = Session()
-    wrapper._one_shot_provider_session_id = None
-    assert asyncio.run(wrapper.get_context_snapshot()).used_tokens == 12
-    wrapper.register_admission_callback(callback, "wrapped-cycle")
-    assert wrapper._session.registered == (callback, "wrapped-cycle")
-    assert wrapper.get_provider_session_id() == "provider-session"

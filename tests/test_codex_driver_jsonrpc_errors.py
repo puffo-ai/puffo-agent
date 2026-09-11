@@ -4,15 +4,47 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 
 from puffo_agent.agent.core import AgentAPIError
-from puffo_agent.agent.harness.codex_driver import (
+from puffo_agent.agent.errors import ProviderFailureError
+from puffo_agent.agent.harness.drivers.codex import (
     CodexAppServerDriver,
     _classify_jsonrpc_error,
+    _selection_ack_warnings,
 )
-from puffo_agent.agent.harness.driver import PermissionDecision, PermissionRef
+from puffo_agent.agent.harness.driver import (
+    PermissionDecision,
+    PermissionRef,
+    RuntimeSpec,
+)
+
+
+def test_unlisted_model_and_level_are_explicitly_unvalidated_without_ack():
+    """A successful thread open must not imply its requested tier took effect."""
+    spec = RuntimeSpec(
+        "/workspace", model="gpt-6-astra", inference_level="high",
+    )
+
+    assert _selection_ack_warnings(spec, {"id": "thread-1"}) == (
+        "model_ack_unavailable",
+        "inference_level_ack_unavailable",
+    )
+
+
+def test_matching_harness_ack_validates_model_and_level():
+    """An exact app-server echo is positive evidence for the selected config."""
+    spec = RuntimeSpec(
+        "/workspace", model="gpt-6-astra", inference_level="high",
+    )
+
+    assert _selection_ack_warnings(spec, {
+        "id": "thread-1",
+        "model": "gpt-6-astra",
+        "reasoningEffort": "high",
+    }) == ()
 
 
 @pytest.mark.parametrize(
@@ -20,6 +52,11 @@ from puffo_agent.agent.harness.driver import PermissionDecision, PermissionRef
     [
         {"code": 401, "message": "access token has expired"},
         {"code": -32000, "message": "token_invalidated"},
+        {
+            "code": -32000,
+            "message": "stream error: unexpected status 401 Unauthorized",
+        },
+        {"code": -32000, "message": "Unauthorized: please run codex login"},
     ],
 )
 def test_jsonrpc_auth_errors_request_operator_reauthentication(error):
@@ -27,7 +64,7 @@ def test_jsonrpc_auth_errors_request_operator_reauthentication(error):
 
     assert isinstance(exc, AgentAPIError)
     assert exc.is_auth is True
-    assert "code=" in str(exc)
+    assert exc.error_code == "authentication"
 
 
 @pytest.mark.parametrize(
@@ -35,6 +72,11 @@ def test_jsonrpc_auth_errors_request_operator_reauthentication(error):
     [
         {"code": 429, "message": "rate limit exceeded"},
         {"code": -32000, "data": {"status": 503}, "message": "unavailable"},
+        {
+            "code": -32603,
+            "message": "stream error: unexpected status 503 Service Unavailable",
+        },
+        {"code": -32603, "message": "unexpected status 500 Internal Server Error"},
     ],
 )
 def test_jsonrpc_retryable_provider_errors_requeue(error):
@@ -42,22 +84,75 @@ def test_jsonrpc_retryable_provider_errors_requeue(error):
 
     assert isinstance(exc, AgentAPIError)
     assert exc.is_auth is False
-    assert "code=" in str(exc)
+    assert exc.error_code in {"rate_limit", "provider_unavailable"}
 
 
-def test_jsonrpc_protocol_error_keeps_safe_diagnostic_without_retry():
-    exc = _classify_jsonrpc_error(
-        {
-            "code": -32602,
-            "message": "invalid params authorization=Bearer sk_secret_token_123456789",
-        }
-    )
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (
+            {"code": -32000, "message": "model_not_found: gpt-future"},
+            "model_not_found",
+        ),
+        (
+            {
+                "code": 403,
+                "message": "Your account is not entitled to use model gpt-future",
+            },
+            "not_entitled",
+        ),
+    ],
+)
+def test_jsonrpc_model_selection_failures_keep_actionable_class(error, expected):
+    """A real model rejection must not collapse into generic provider failure."""
+    exc = _classify_jsonrpc_error(error)
 
-    assert type(exc) is RuntimeError
-    assert "code=-32602" in str(exc)
-    assert "invalid params" in str(exc)
-    assert "sk_secret_token_123456789" not in str(exc)
-    assert "[REDACTED]" in str(exc)
+    assert isinstance(exc, ProviderFailureError)
+    assert exc.error_code == expected
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "no rollout found for thread id 01a0356d-c424-7d00-0000-000000000000",
+        "Rollout not found for thread abc",
+        "thread not found: 01a0356d",
+    ],
+)
+def test_jsonrpc_missing_rollout_is_classified_as_invalid_resume(message):
+    exc = _classify_jsonrpc_error({"code": -32600, "message": message})
+
+    assert isinstance(exc, AgentAPIError)
+    assert exc.is_auth is False
+    assert exc.error_code == "invalid_resume"
+    # detail preserved for text-marker matching
+    assert message in str(exc)
+
+
+def test_jsonrpc_permission_and_quota_errors_do_not_enter_tight_retry():
+    for error in (
+        {"code": 403, "message": "permission denied"},
+        {"code": -32000, "message": "credit balance is too low"},
+        {"code": -32000, "message": "You have exceeded your quota"},
+    ):
+        exc = _classify_jsonrpc_error(error)
+        assert isinstance(exc, ProviderFailureError)
+        assert exc.error_code in {"permission_denied", "quota_exhausted"}
+
+
+def test_jsonrpc_protocol_error_keeps_safe_diagnostic_without_retry(caplog):
+    with caplog.at_level(logging.WARNING):
+        exc = _classify_jsonrpc_error(
+            {
+                "code": -32602,
+                "message": "invalid params authorization=Bearer sk_secret_token_123456789",
+            }
+        )
+
+    assert isinstance(exc, ProviderFailureError)
+    assert exc.error_code == "provider_error"
+    assert "sk_secret_token_123456789" not in caplog.text
+    assert "[REDACTED]" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -73,12 +168,13 @@ def test_jsonrpc_protocol_error_keeps_safe_diagnostic_without_retry():
          "plain-bearer-secret"),
     ],
 )
-def test_jsonrpc_diagnostics_redact_structured_credentials(message, secret):
-    exc = _classify_jsonrpc_error({"code": -32602, "message": message})
+def test_jsonrpc_diagnostics_redact_structured_credentials(message, secret, caplog):
+    with caplog.at_level(logging.WARNING):
+        exc = _classify_jsonrpc_error({"code": -32602, "message": message})
 
-    assert type(exc) is RuntimeError
-    assert secret not in str(exc)
-    assert "[REDACTED]" in str(exc)
+    assert isinstance(exc, ProviderFailureError)
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
 
 
 @pytest.mark.asyncio

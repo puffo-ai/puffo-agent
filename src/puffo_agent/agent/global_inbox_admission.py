@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping
 
 from ._logging import log_runtime_event
 from .context_controller import (
@@ -27,6 +27,7 @@ from .message_store import (
     ReceiptDisposition,
     StoredMessage,
 )
+from ..tasks import spawn
 
 # Existing operators and tests subscribe to the runtime logger, not this
 # implementation module.
@@ -61,19 +62,6 @@ class InboxAdmissionMixin:
     The runtime remains the only lifecycle and mutable-state owner. This trait
     exists solely to keep the compatibility facade readable and bounded.
     """
-
-    def _raise_send_mode_for(self, rows: Sequence[Any]) -> None:
-        """Raise the turn's E2EE obligation for a mid-turn admission.
-
-        The bundle flag was established from the planned batch. Admitting an
-        encrypted row afterwards extends that obligation to the rest of the
-        turn; a plaintext admission must never lower it.
-        """
-        if not any(getattr(row, "is_encrypted", False) for row in rows if row):
-            return
-        from . import send_mode
-
-        send_mode.raise_turn_bundle(list(self.send_mode_keys))
 
     def _validate_held_admission_turn(
         self,
@@ -181,7 +169,6 @@ class InboxAdmissionMixin:
             if row is not None and row.processing_state is ProcessingState.PENDING
         ]
         fired[0] = True
-        self._raise_send_mode_for(rows)
         try:
             if pending_ids:
                 await self.store.admit_messages(
@@ -385,10 +372,10 @@ class InboxAdmissionMixin:
         if self._busy_notice_task is not None and not self._busy_notice_task.done():
             return
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return
-        self._busy_notice_task = loop.create_task(
+        self._busy_notice_task = spawn(
             self._deliver_busy_notices(turn_id),
             name=f"inbox-notice-{turn_id}",
         )
@@ -632,7 +619,11 @@ class InboxAdmissionMixin:
                 latest_seq=through_seq,
                 state="no_active_turn",
             )
-            raise RuntimeError("no active provider turn for model-visible read")
+            raise RuntimeError(
+                "model-visible read is not bound to an admitted provider "
+                "turn (e.g. a background-task wakeup); reads become "
+                "available when a turn is next admitted"
+            )
         await self._add_visible_message_ids(
             visible_ids,
             space_id=space_id if has_boundary else None,
@@ -718,7 +709,6 @@ class InboxAdmissionMixin:
                     }
                 )
                 if admitted_rows:
-                    self._raise_send_mode_for(admitted_rows)
                     await self.store.admit_messages(
                         (row.envelope_id for row in admitted_rows),
                         turn_id=context.active_turn_id,
@@ -965,7 +955,6 @@ class InboxAdmissionMixin:
                 turn_id=turn_id,
                 provider_session_id=provider_session_id,
             )
-            self._raise_send_mode_for(projection.selected)
             self.active.message_ids[:] = list(run.message_ids)
             await self._add_visible_message_ids(list(ids))
             self.active.routes.extend(routes)
@@ -1026,7 +1015,11 @@ class InboxAdmissionMixin:
         requesting_provider_session_id = self.active.provider_session_id
         requesting_provider_turn_id = self.active.provider_turn_id
         if not requesting_turn_id:
-            raise RuntimeError("no active daemon turn for Inbox read")
+            raise RuntimeError(
+                "Inbox read is not bound to an admitted daemon turn (e.g. "
+                "a background-task wakeup); pending messages are delivered "
+                "when a turn is next admitted"
+            )
         page = await self.store.read_inbox_page(
             target=target, cursor=cursor, limit=limit
         )

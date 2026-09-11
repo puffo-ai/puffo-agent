@@ -9,6 +9,7 @@ Entry point: ``python -m puffo_agent.mcp.puffo_core_server``
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -57,13 +58,12 @@ def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
             f"harness={harness!r} not installed on host — the CLI "
             "binary is missing from PATH."
         )
-    from ..agent.model_catalog import provider_models
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if (model or "") not in supported:
-        raise RuntimeError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    from ..agent.model_catalog import validate_model_id
+
+    try:
+        validate_model_id(model or "")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
 
 
 def _validate_refresh_inference_level(harness: str, level: str) -> None:
@@ -205,18 +205,20 @@ def _register_skill_tools(mcp: FastMCP, workspace: str, harness: str) -> None:
         """Install a new skill at project scope."""
         _require_claude_code(harness, "install_skill")
         dst = _install_skill(Path(workspace), name, content)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
             f"installed skill {name!r} at project scope ({dst}). "
-            "Call refresh() so your next turn picks it up."
+            "Runtime refresh requested; your next turn will pick it up."
         )
     @mcp.tool()
     async def uninstall_skill(name: str) -> str:
         """Remove a skill you previously installed."""
         _require_claude_code(harness, "uninstall_skill")
         _uninstall_skill(Path(workspace), name)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
-            f"uninstalled skill {name!r}. Call refresh() so your next "
-            "turn stops seeing it."
+            f"uninstalled skill {name!r}. Runtime refresh requested; your "
+            "next turn will stop seeing it."
         )
     @mcp.tool()
     async def list_skills() -> str:
@@ -244,18 +246,20 @@ def _register_mcp_tools(mcp: FastMCP, workspace: str, runtime_kind: str, harness
             Path(workspace), name, command, args, env,
             check_host_local=check_host_local,
         )
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
             f"registered MCP server {name!r} at project scope ({path}). "
-            "Call refresh() so the claude subprocess respawns."
+            "Runtime refresh requested so the provider reloads it."
         )
     @mcp.tool()
     async def uninstall_mcp_server(name: str) -> str:
         """Remove an MCP server you previously registered."""
         _require_claude_code(harness, "uninstall_mcp_server")
         _uninstall_mcp_server(Path(workspace), name)
+        _touch_refresh_flag(Path(workspace), "refresh_agent")
         return (
-            f"removed MCP server {name!r}. Call refresh() so the claude "
-            "subprocess respawns without it."
+            f"removed MCP server {name!r}. Runtime refresh requested so the "
+            "provider reloads without it."
         )
     @mcp.tool()
     async def list_mcp_servers() -> str:
@@ -365,7 +369,12 @@ def build_server(
     # silencing the ``Unclosed client session`` gc warning.
     mcp = FastMCP(
         "puffo-core",
-        lifespan=make_lifespan(data, rpc_client, http),
+        lifespan=make_lifespan(
+            data,
+            rpc_client,
+            http,
+            startup=_make_hello_startup(rpc_client),
+        ),
     )
     register_core_tools(mcp, core_cfg)
     _register_local_tools(mcp, workspace, runtime_kind, harness)
@@ -381,6 +390,70 @@ def build_server(
     )
     register_memory_tools(mcp, mem_cfg)
     return mcp
+
+
+_HELLO_ATTEMPTS = 3
+_HELLO_RETRY_DELAY_SECONDS = 2.0
+_HELLO_BEACON_INTERVAL_SECONDS = 60.0
+
+
+def _make_hello_startup(rpc_client):
+    """Hello-beacon coroutine factory: one prompt startup burst, then a
+    steady re-hello every ``_HELLO_BEACON_INTERVAL_SECONDS``. The declared
+    interval travels in the payload, so the daemon-side probe reads
+    sustained silence from this subprocess as a wedged transport — not
+    just "never came up". ``None`` when the handshake is not applicable
+    (no RPC client wired, or the daemon predates ``PUFFO_MCP_GENERATION``)
+    so older daemons see zero new traffic."""
+    generation = os.environ.get("PUFFO_MCP_GENERATION", "")
+    if rpc_client is None or not generation:
+        return None
+
+    async def _try_hello() -> Exception | None:
+        try:
+            await rpc_client.hello(
+                generation,
+                beacon_interval=_HELLO_BEACON_INTERVAL_SECONDS,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            return exc
+
+    async def _beacon() -> None:
+        failing = False
+        for attempt in range(1, _HELLO_ATTEMPTS + 1):
+            exc = await _try_hello()
+            if exc is None:
+                break
+            if attempt == _HELLO_ATTEMPTS:
+                failing = True
+                # The daemon-side probe recycles on missing hellos;
+                # this line is the subprocess-side half of the story.
+                logger.warning(
+                    "mcp-hello failed after %d attempts "
+                    "(generation=%s): %s",
+                    attempt, generation, exc,
+                )
+            else:
+                await asyncio.sleep(_HELLO_RETRY_DELAY_SECONDS)
+        while True:
+            await asyncio.sleep(_HELLO_BEACON_INTERVAL_SECONDS)
+            exc = await _try_hello()
+            if exc is None:
+                if failing:
+                    logger.info(
+                        "mcp-hello beacon recovered (generation=%s)",
+                        generation,
+                    )
+                failing = False
+            elif not failing:
+                failing = True
+                logger.warning(
+                    "mcp-hello beacon failed (generation=%s): %s",
+                    generation, exc,
+                )
+
+    return _beacon
 
 
 def _cfg_from_env() -> dict[str, str]:

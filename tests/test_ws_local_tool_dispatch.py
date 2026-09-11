@@ -25,6 +25,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         # send
         "send_message",
         "send_message_with_attachments",
+        "mark_covered",
         # read / navigation
         "read_inbox",
         "read_history",
@@ -108,17 +109,19 @@ def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
             "target", "cursor", "before_message_id", "after_message_id",
             "limit",
         },
-        "create_reminder": {"content", "target", "intended_at"},
+        "create_reminder": {"content", "target", "intended_at", "covers"},
         "list_reminders": {"state", "limit"},
         "cancel_reminder": {"reminder_id"},
         "replace_reminder": {"reminder_id", "content", "target", "intended_at"},
         "send_message": {
             "channel", "text", "root_id", "visibility_level", "send_anyway",
+            "covers",
         },
         "send_message_with_attachments": {
             "paths", "channel", "caption", "root_id",
-            "visibility_level", "send_anyway",
+            "visibility_level", "send_anyway", "covers",
         },
+        "mark_covered": {"covers", "by_message_id", "note"},
     }
     forbidden = {
         "freshness", "freshness_mode", "mode", "context_baseline_seq",
@@ -217,7 +220,7 @@ async def test_ws_local_reminder_tools_use_the_live_runtime():
     assert calls == [
         ("create", {
             "content": "x", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
+            "intended_at": "2026-08-02T12:00:00Z", "covers": None,
         }),
         ("list", {"state": "scheduled", "limit": 7}),
         ("cancel", {"reminder_id": "r"}),

@@ -10,6 +10,7 @@ from typing import Awaitable, Callable, Iterable
 
 from .message_projection import canonical_target_parts
 from .message_store import StoredMessage
+from ..tasks import spawn
 
 MAX_MESSAGES = 50
 MAX_ESTIMATED_TOKENS = 32_000
@@ -32,9 +33,18 @@ class InboxNoticeDelivery:
 
     def __init__(
         self,
-        capability: NoticeDeliveryCapability | str = NoticeDeliveryCapability.NEXT_TURN,
+        capability: (
+            NoticeDeliveryCapability
+            | str
+            | Callable[[], NoticeDeliveryCapability | str]
+        ) = NoticeDeliveryCapability.NEXT_TURN,
     ) -> None:
-        self.capability = NoticeDeliveryCapability(capability)
+        self._capability = capability
+
+    @property
+    def capability(self) -> NoticeDeliveryCapability:
+        value = self._capability() if callable(self._capability) else self._capability
+        return NoticeDeliveryCapability(value)
 
     async def offer(
         self,
@@ -191,7 +201,7 @@ class InboxPlanner:
 
 
 class InboxCoalescer:
-    """Metadata-free, non-resetting fixed-window wake coalescer."""
+    """Metadata-free, non-resetting deadline wake coalescer."""
 
     def __init__(
         self,
@@ -214,7 +224,17 @@ class InboxCoalescer:
             0.0, delay_seconds
         )
         candidate = now + delay
-        if not self._deadlines or now >= self._deadlines[-1]:
+        if not self._deadlines:
+            self._deadlines.append(candidate)
+        elif delay == 0.0:
+            # One unconsumed immediate wake is enough: the next plan reads the
+            # durable pending set, including every receipt committed before it
+            # starts. A second zero-delay deadline would only create an empty
+            # follow-up planning cycle.
+            if candidate < self._deadlines[0]:
+                self._deadlines[0] = candidate
+                self._pulled.set()
+        elif now >= self._deadlines[-1]:
             self._deadlines.append(candidate)
         elif candidate < self._deadlines[0]:
             # A pending deadline may only move earlier, never later, so the
@@ -228,8 +248,8 @@ class InboxCoalescer:
 
     async def _sleep_or_pull(self, remaining: float) -> bool:
         """Sleep ``remaining``; report whether a pulled deadline cut it short."""
-        sleeper = asyncio.ensure_future(self._sleep(remaining))
-        pull = asyncio.ensure_future(self._pulled.wait())
+        sleeper = spawn(self._sleep(remaining), name="sleep")
+        pull = spawn(self._pulled.wait(), name="pulled.wait")
         try:
             done, _pending = await asyncio.wait(
                 {sleeper, pull}, return_when=asyncio.FIRST_COMPLETED,
@@ -238,10 +258,7 @@ class InboxCoalescer:
             for task in (sleeper, pull):
                 if not task.done():
                     task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
+            await asyncio.gather(sleeper, pull, return_exceptions=True)
         return sleeper not in done
 
     async def wait_for_burst(self) -> None:

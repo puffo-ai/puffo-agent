@@ -62,16 +62,21 @@ def test_now_ms_defaults_to_wall_clock():
 async def test_stale_receipt_is_reported_and_committed_terminal():
     from puffo_agent.agent.inbound_receipts import InboundReceiptHandler
     from puffo_agent.agent.message_store import ReceiptDisposition
+    from puffo_agent.crypto.ws_client import TransportOutcome
 
     client = _client(_48H_MS)
     client._log = logging.getLogger("staleness-test")
-    reported: list[str] = []
-    client._report_stale_processed = reported.append
-    commits: list[tuple] = []
+    trace: list[tuple[str, object]] = []
+    commit_outcome = TransportOutcome.ACK
+
+    async def _report(message_id):
+        trace.append(("report", message_id))
+
+    client._report_stale_processed = _report
 
     async def _commit(disposition, reason):
-        commits.append((disposition, reason))
-        return "ack"
+        trace.append(("commit", (disposition, reason)))
+        return commit_outcome
 
     committer = SimpleNamespace(
         payload=SimpleNamespace(
@@ -83,9 +88,16 @@ async def test_stale_receipt_is_reported_and_committed_terminal():
     handler = InboundReceiptHandler.__new__(InboundReceiptHandler)
     handler.client = client
 
-    assert await handler._stale_outcome(committer) == "ack"
-    assert reported == ["msg_old"]
-    assert commits == [(ReceiptDisposition.TERMINAL, "stale catch-up")]
+    assert await handler._stale_outcome(committer) is TransportOutcome.ACK
+    assert trace == [
+        ("commit", (ReceiptDisposition.TERMINAL, "stale catch-up")),
+        ("report", "msg_old"),
+    ]
+
+    trace.clear()
+    commit_outcome = TransportOutcome.HOLD
+    assert await handler._stale_outcome(committer) is TransportOutcome.HOLD
+    assert trace == [("commit", (ReceiptDisposition.TERMINAL, "stale catch-up"))]
 
 
 def _init_client(catchup_stale_hours: float) -> PuffoCoreMessageClient:
@@ -182,81 +194,3 @@ def test_worker_threads_catchup_stale_hours(monkeypatch, tmp_path):
 def test_worker_defaults_catchup_stale_hours_without_daemon_cfg(monkeypatch, tmp_path):
     captured = _build_via_worker(monkeypatch, tmp_path, None)
     assert captured.get("catchup_stale_hours") == DEFAULT_CATCHUP_STALE_HOURS
-
-
-class _StubHttp:
-    def __init__(self, fail: bool = False):
-        self.fail = fail
-        self.posts: list[tuple[str, dict]] = []
-
-    async def post(self, path, body):
-        if self.fail:
-            raise RuntimeError("server unreachable")
-        self.posts.append((path, body))
-        return {}
-
-
-def _report_client(fail: bool = False):
-    c = _client(_48H_MS)
-    c.http = _StubHttp(fail=fail)
-    c._log = logging.getLogger("staleness-test")
-    c._stale_report_buf = []
-    c._stale_flush_task = None
-    return c
-
-
-@pytest.mark.asyncio
-async def test_reports_batch_into_one_post():
-    """A catch-up burst must flush as ONE end:batch POST — the old
-    per-envelope await stretched catch-up past the WS keepalive window
-    and the backlog redelivered forever."""
-    c = _report_client()
-    for i in range(3):
-        c._report_stale_processed(f"msg_old_{i}")
-    await c._stale_flush_task
-    assert len(c.http.posts) == 1
-    path, body = c.http.posts[0]
-    assert path == "/messages/processing/end:batch"
-    assert [r["message_id"] for r in body["runs"]] == [
-        "msg_old_0", "msg_old_1", "msg_old_2",
-    ]
-    assert all(r["succeeded"] is True for r in body["runs"])
-    assert c._stale_report_buf == []
-
-
-@pytest.mark.asyncio
-async def test_reports_chunk_at_200():
-    c = _report_client()
-    for i in range(450):
-        c._report_stale_processed(f"msg_{i}")
-    await c._stale_flush_task
-    sizes = [len(b["runs"]) for _p, b in c.http.posts]
-    assert sizes == [200, 200, 50]
-
-
-@pytest.mark.asyncio
-async def test_report_during_flush_is_not_stranded():
-    c = _report_client()
-    orig_post = c.http.post
-    late: dict = {}
-
-    async def _post_and_inject(path, body):
-        # A new stale envelope lands while the first chunk POST is in
-        # flight — the flush loop must pick it up.
-        if "injected" not in late:
-            late["injected"] = True
-            c._report_stale_processed("msg_late")
-        return await orig_post(path, body)
-
-    c.http.post = _post_and_inject
-    c._report_stale_processed("msg_first")
-    await c._stale_flush_task
-    reported = [r["message_id"] for _p, b in c.http.posts for r in b["runs"]]
-    assert "msg_first" in reported and "msg_late" in reported
-
-
-@pytest.mark.asyncio
-async def test_report_flush_swallows_http_failure():
-    c = _report_client(fail=True)
-    c._report_stale_processed("msg_old_1")
-    await c._stale_flush_task  # must not raise

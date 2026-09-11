@@ -31,7 +31,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
@@ -508,7 +508,7 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     assert '[send_result context_version=1 state="held"' in held_result
     assert "synchronized=true" in held_result
     assert "latest_seq=7" in held_result
-    assert 'latest_envelope_id="held-peer"' in held_result
+    assert 'latest_message_id="held-peer"' in held_result
     assert '[window context_version=1 kind="held_basis"' in held_result
     assert '[window context_version=1 kind="held_new_context"' in held_result
     assert held_result.count("previous self contribution") == 1

@@ -587,7 +587,9 @@ async def test_gate_skips_when_operator_slug_missing(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_gate_delivers_ungated_when_prompt_send_fails(tmp_path):
+async def test_gate_holds_gated_when_prompt_send_fails(tmp_path):
+    """Approval is a control plane: an unreachable operator (e.g. zero
+    encryption devices → the DM send raises) must not open the gate."""
     isolated_home()
     from puffo_agent.portal.state import agent_dir
 
@@ -601,13 +603,14 @@ async def test_gate_delivers_ungated_when_prompt_send_fails(tmp_path):
     handled = await client._maybe_gate_foreign_dm(
         sender_slug="alice-1234", text="hi",
     )
-    # Prompt couldn't be sent → deliver ungated rather than swallow the DM.
-    assert handled is False
+    # Prompt couldn't be sent → hold the DM gated (fail-closed). No
+    # pending entry is recorded, so the next DM retries the prompt.
+    assert handled is True
     assert client._pending_dm_approvals == {}
 
 
 @pytest.mark.asyncio
-async def test_gate_delivers_ungated_when_prompt_has_no_envelope_id(tmp_path):
+async def test_gate_holds_gated_when_prompt_has_no_envelope_id(tmp_path):
     isolated_home()
     from puffo_agent.portal.state import agent_dir
 
@@ -621,7 +624,7 @@ async def test_gate_delivers_ungated_when_prompt_has_no_envelope_id(tmp_path):
     handled = await client._maybe_gate_foreign_dm(
         sender_slug="alice-1234", text="hi",
     )
-    assert handled is False
+    assert handled is True
     assert client._pending_dm_approvals == {}
 
 

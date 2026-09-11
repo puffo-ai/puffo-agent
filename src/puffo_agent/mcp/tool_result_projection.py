@@ -34,6 +34,8 @@ def _field(name: str, value: Any) -> str:
         return f"{name}={'true' if value else 'false'}"
     if isinstance(value, int) and not isinstance(value, bool):
         return f"{name}={value}"
+    if isinstance(value, (list, tuple)):
+        return f"{name}={_json(list(value))}"
     return f"{name}={_json(str(value))}"
 
 
@@ -163,16 +165,13 @@ def _send_result_header(
             result,
             (
                 "attempted",
-                "envelope_id",
                 "seq",
                 "replay",
                 "devices_queued",
                 "context_baseline_seq",
                 "seen_seq",
                 "latest_seq",
-                "latest_envelope_id",
                 "blocking_seq",
-                "blocking_envelope_id",
                 "blocking_sender_slug",
                 "latest_seq_before_send",
                 "mode",
@@ -181,9 +180,20 @@ def _send_result_header(
                 "recovery_more_pending",
                 "error_kind",
                 "status",
+                "covers_recorded",
+                "covers_unknown",
+                "covers_dropped",
             ),
         )
     )
+    for model_name, transport_name in (
+        ("message_id", "envelope_id"),
+        ("latest_message_id", "latest_envelope_id"),
+        ("blocking_message_id", "blocking_envelope_id"),
+    ):
+        value = result.get(transport_name)
+        if value not in (None, ""):
+            header_fields.append(_field(model_name, value))
     if reconsideration:
         header_fields.extend(
             _fields(

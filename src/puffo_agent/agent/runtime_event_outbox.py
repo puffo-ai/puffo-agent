@@ -71,7 +71,24 @@ def _metadata_only_event(value: Any) -> RuntimeEvent | None:
         if not isinstance(outcome, str) or outcome not in TURN_OUTCOMES:
             return None
         legacy_error = payload.get("error")
+        legacy_tokens = payload.get("tokens")
+        legacy_context = payload.get("current_context")
         payload = {"outcome": outcome}
+        if outcome == "succeeded" and (
+            isinstance(legacy_tokens, dict)
+            and set(legacy_tokens) == {"input", "output"}
+            and all(
+                type(value) is int and value >= 0
+                for value in legacy_tokens.values()
+            )
+        ):
+            payload["tokens"] = legacy_tokens
+        if (
+            outcome == "succeeded"
+            and type(legacy_context) is int
+            and legacy_context > 0
+        ):
+            payload["current_context"] = legacy_context
         if outcome == "failed" and isinstance(legacy_error, dict):
             payload["error"] = safe_error(
                 str(legacy_error.get("code") or "unknown"),
@@ -200,6 +217,9 @@ class RuntimeEventOutbox:
             """
         )
         self._migrate_metadata_only_rows(db)
+        # Session compatibility is decided by the provider's native resume
+        # contract. Remove the retired configuration-derived state key.
+        db.execute("DELETE FROM state WHERE key = 'session_fingerprint'")
         db.commit()
         return db
 
@@ -433,25 +453,25 @@ class RuntimeEventOutbox:
     def set_active_turn(
         self, turn_ref: str | None, *, session_ref: str = "",
         native_session_id: str = "",
-        session_fingerprint: str | None = None,
+        native_session_harness: str | None = None,
     ) -> None:
         self._call(
             lambda: self._set_active_turn(
                 turn_ref, session_ref, native_session_id,
-                session_fingerprint,
+                native_session_harness,
             )
         )
 
     async def aset_active_turn(
         self, turn_ref: str | None, *, session_ref: str = "",
         native_session_id: str = "",
-        session_fingerprint: str | None = None,
+        native_session_harness: str | None = None,
     ) -> None:
         """Commit the active turn without blocking the caller's event loop."""
         await self._acall(
             lambda: self._set_active_turn(
                 turn_ref, session_ref, native_session_id,
-                session_fingerprint,
+                native_session_harness,
             )
         )
 
@@ -460,15 +480,15 @@ class RuntimeEventOutbox:
         turn_ref: str | None,
         session_ref: str,
         native_session_id: str,
-        session_fingerprint: str | None,
+        native_session_harness: str | None,
     ) -> None:
         values = {
             "active_turn_ref": turn_ref or "",
             "session_ref": session_ref,
             "native_session_id": native_session_id,
         }
-        if session_fingerprint is not None:
-            values["session_fingerprint"] = session_fingerprint
+        if native_session_harness is not None:
+            values["native_session_harness"] = native_session_harness
         with self._db:
             for key, value in values.items():
                 self._db.execute(

@@ -62,6 +62,12 @@ def test_daemon_and_cli_import_without_pyside6(pyside6_blocked):
     assert hasattr(cli, "cmd_start")
 
 
+def test_cli_import_does_not_eagerly_import_daemon(pyside6_blocked):
+    importlib.import_module("puffo_agent.portal.cli")
+
+    assert "puffo_agent.portal.daemon" not in sys.modules
+
+
 def test_gui_command_without_extra_yields_actionable_hint(
     pyside6_blocked, capsys,
 ):

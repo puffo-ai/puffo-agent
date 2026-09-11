@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
-from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
 from puffo_agent.portal import cli, state
 from puffo_agent.portal.daemon import Daemon
 from puffo_agent.portal.state import (
@@ -15,7 +15,7 @@ from puffo_agent.portal.state import (
     RuntimeConfig,
     RuntimeState,
 )
-from puffo_agent.portal.worker import Worker, build_docker_adapter
+from puffo_agent.portal.worker import Worker, build_docker_runtime
 
 
 def _local_preparer(
@@ -27,7 +27,7 @@ def _local_preparer(
     runtime_key: str = "",
     base_url: str = "",
 ) -> LocalRuntimePreparer:
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
@@ -49,18 +49,19 @@ def _local_preparer(
     return LocalRuntimePreparer(daemon, config)
 
 
-def _docker_adapter(tmp_path: Path, *, api_key: str = "") -> DockerCLIAdapter:
-    return DockerCLIAdapter(
-        agent_id="docker-key-policy",
-        model="claude-sonnet-5",
-        image="puffo/agent-runtime:test",
-        workspace_dir=str(tmp_path / "workspace"),
-        claude_dir=str(tmp_path / "workspace" / ".claude"),
-        session_file=str(tmp_path / "session.json"),
-        agent_home_dir=str(tmp_path / "agent-home"),
-        shared_fs_dir=str(tmp_path / "shared"),
-        claude_api_key=api_key,
+def _docker_preparer(tmp_path: Path, *, api_key: str = ""):
+    daemon = DaemonConfig()
+    daemon.anthropic.api_key = api_key
+    daemon.anthropic.cli_use_api_key = bool(api_key)
+    config = AgentConfig(
+        id="docker-key-policy",
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="anthropic",
+            harness="claude-code",
+        ),
     )
+    return DockerRuntimePreparer(daemon, config)
 
 
 def test_daemon_anthropic_cli_api_key_opt_in_round_trips(tmp_path, monkeypatch):
@@ -169,21 +170,16 @@ def test_local_gateway_key_takes_precedence(tmp_path, monkeypatch):
 
 
 def test_docker_key_is_passed_by_name_not_argv_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
-    adapter = _docker_adapter(tmp_path, api_key="daemon-key")
-    adapter._prepare_mcp_args = lambda: []
+    preparer = _docker_preparer(tmp_path, api_key="daemon-key")
+    spec = preparer._prepare_claude_spec("prompt")
+    command, child_env = preparer._docker_exec_prefix(spec)
 
-    session = adapter._ensure_session()
-    command = session.build_command([], {})
-
-    assert session.env["ANTHROPIC_API_KEY"] == "daemon-key"
-    assert command[:5] == [
-        "docker",
-        "exec",
-        "-i",
-        "-e",
-        "ANTHROPIC_API_KEY",
-    ]
+    assert child_env["ANTHROPIC_API_KEY"] == "daemon-key"
+    assert command[:3] == ["docker", "exec", "-i"]
+    key_index = command.index("ANTHROPIC_API_KEY")
+    assert command[key_index - 1] == "-e"
     assert "daemon-key" not in command
 
 
@@ -201,9 +197,10 @@ def test_worker_applies_key_only_to_claude_docker(tmp_path, monkeypatch):
     daemon.anthropic.api_key = "daemon-key"
     daemon.anthropic.cli_use_api_key = True
 
-    adapter = build_docker_adapter(daemon, config)
+    preparer = build_docker_runtime(daemon, config)
+    spec = preparer._prepare_claude_spec("prompt")
 
-    assert adapter.claude_api_key == "daemon-key"
+    assert spec.environment["ANTHROPIC_API_KEY"] == "daemon-key"
 
 
 def test_daemon_skips_oauth_refresher_for_explicit_key(tmp_path, monkeypatch):
@@ -240,3 +237,28 @@ def test_successful_key_retry_clears_auth_failure(tmp_path, monkeypatch):
     assert worker.runtime.health == "ok"
     assert worker._api_key_auth_recovery_pending is False
     assert worker._auth_failed_notification_sent is False
+
+
+def test_local_gateway_caps_the_cli_retry_loop(tmp_path, monkeypatch):
+    """Behind a budgeted gateway a 429 is the cap, not load. The CLI retries
+    every 429 as transient; capping it keeps a cap hit to a handful of
+    requests instead of a storm the gateway bills against the same budget."""
+    preparer = _local_preparer(
+        tmp_path,
+        monkeypatch,
+        runtime_key="gateway-key",
+        base_url="https://gateway.example/v1",
+    )
+    spec = preparer._prepare_claude_spec("prompt")
+    assert spec.environment["CLAUDE_CODE_MAX_RETRIES"] == "2"
+
+
+def test_local_direct_provider_leaves_cli_retries_alone(tmp_path, monkeypatch):
+    preparer = _local_preparer(
+        tmp_path,
+        monkeypatch,
+        daemon_key="daemon-key",
+        key_enabled=True,
+    )
+    spec = preparer._prepare_claude_spec("prompt")
+    assert "CLAUDE_CODE_MAX_RETRIES" not in spec.environment

@@ -1,5 +1,13 @@
 # Agent Foundation 2.0 Stable Readiness
 
+## Stable Release Decision
+
+On 2026-08-23, the product owner explicitly authorized publication of
+`puffo-agent==2.0.0` from the hardened `2.0.0a25` source. The external evidence
+gaps retained below were accepted as post-release follow-up risks; they were not
+retroactively marked complete. This document remains the historical readiness
+backlog and evidence inventory rather than the current package status.
+
 This is the execution backlog for moving `puffo-agent==2.0.0a2` toward a
 stable `2.0.0` release. The release contract and acceptance cases remain in
 [`docs/RELEASE-CANDIDATE-2.0.0a2.md`](../../docs/RELEASE-CANDIDATE-2.0.0a2.md).

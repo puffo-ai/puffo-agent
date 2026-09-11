@@ -62,7 +62,7 @@ context, Driver, MCP, coordination, memory, and reminder contracts.
 | Transport facade | `agent/puffo_core_client.py` | Present one receive/send-support surface over native and keyless bridge strategies. |
 | Durable message state | `agent/message_store.py`, `agent/inbox_store.py`, `agent/reminder_store.py` | Persist accepted messages, processing state, frontiers, turn membership, notice state, and reminders. |
 | Provider boundary | `agent/global_inbox_runtime.py`, `agent/context_controller.py` | Serialize model turns, group pending targets, control context admission, steering, retries, and held recovery. |
-| Model runtime | `agent/harness/driver.py`, `agent/harness/runtime_manager.py` | Normalize sessions, turns, streamed events, cancellation, compaction, permissions, and shutdown. |
+| Model runtime | `agent/harness/driver.py`, `agent/harness/runtime/runtime_manager.py` | Normalize sessions, turns, streamed events, cancellation, compaction, permissions, and shutdown. |
 | Model tools | `mcp/` | Expose Inbox/history, sends, membership, files, memory, reminders, and host integration. |
 | Durable control planes | `agent/runtime_event_outbox.py`, `agent/reminder_sync.py` | Upload bounded Runtime events and synchronize encrypted Reminder state with the Server. |
 
@@ -70,7 +70,7 @@ context, Driver, MCP, coordination, memory, and reminder contracts.
 
 ```text
 prepare paths and managed prompt
-  -> prepare Driver or Docker compatibility adapter
+  -> prepare host-local or Docker Driver runtime
   -> construct PuffoAgent and transport client
   -> warm transport and runtime
   -> construct GlobalInboxRuntime + SendCoordinator
@@ -101,7 +101,7 @@ sequenceDiagram
     DB-->>T: durable receipt decision
     T-->>S: delivery ACK when the decision permits it
     DB->>I: notify pending work
-    I->>I: coalesce and group by space + channel/thread/DM target
+    I->>I: wake idle Agent now; coalesce active-turn deltas
     I->>DB: create daemon-owned active turn
     I->>L: metadata-only Inbox notice
     L->>M: read_inbox and optional read_history calls
@@ -146,9 +146,11 @@ Important boundaries:
 - One `GlobalInboxRuntime` owns one serial provider boundary per Agent. New
   arrivals can be steered only when the active Driver exposes a safe steering
   capability; otherwise they remain durable for the next turn.
-- The three-second window coalesces newly changed pending IDs. It is not a retry
-  interval for an unchanged unread set. A successful notice turn that performs
-  no Inbox read is a normal provider defer and does not immediately run again.
+- An idle Agent is notified immediately. During an active turn, a non-resetting
+  three-second window coalesces newly changed pending IDs before safe steering
+  or the next turn. It is not a retry interval for an unchanged unread set. A
+  successful notice turn that performs no Inbox read is a normal provider defer
+  and does not immediately run again.
 - Notice delivery records the exact pending IDs contributed to the current
   native provider session. Later arrivals produce a delta notice; a replacement
   session rediscovers the remaining pending set once. Provider failure or crash
@@ -211,19 +213,23 @@ failures. Provider-native diagnostics stay opaque and are not serialized.
 | --- | --- | --- |
 | `cli-local` | Codex | `CodexAppServerDriver` over `codex app-server`. |
 | `cli-local` | Claude Code | `ClaudeCodeCliDriver` over stream-json CLI. |
-| `cli-docker` | Claude Code only | Compatibility Adapter in a per-Agent container. |
+| `cli-docker` | Codex | `CodexAppServerDriver` over `docker exec -i codex app-server`. |
+| `cli-docker` | Claude Code | `ClaudeCodeCliDriver` over `docker exec -i claude` stream-json. |
 | `ws-local` | External Agent | Authenticated loopback attachment; no daemon-owned LLM. |
 
 `cli-sandbox` is reserved. Hermes and Gemini remain named design candidates but
 are rejected by the current runtime matrix.
 
 Codex accepts active-turn Inbox deltas through native `turn/steer`. Claude Code
-stream-json accepts another user frame, but even one written immediately after
-a tool result is queued as a separate Claude native turn; an arbitrary busy-time
-write can also interrupt the current request. Puffo therefore does not report
-that write as admission into the active logical turn. Its durable delta remains
-pending until the current terminal event, then starts as a separately tracked
-turn.
+exposes gated delivery only after `system/init` advertises the exact
+`msg_lifecycle_v1` protocol. Puffo then writes at most one additional stream-json
+user frame and considers it accepted only after the matching
+`command_lifecycle: queued` record. The active Puffo turn owns both native
+command UUIDs and emits one logical terminal event after every owned command is
+terminal. Without that capability, with an unknown lifecycle dialect, or when
+the queue acknowledgement is absent, the durable Inbox delta remains pending
+and is delivered by the next Puffo turn. Capability is read live because Claude
+does not publish it until the first input has started the native session.
 
 ## 6. Durable State
 
@@ -337,8 +343,7 @@ Three loopback services support local integration:
   the operator approval and allowlist/blocklist side effects for an untrusted
   inbound DM. With `auto_accept_dm=false`, that inbound DM remains gated.
 - Reactions are not a Puffo message feature in this release.
-- Docker Codex, Hermes, Gemini, and `cli-sandbox` are not supported runtime
-  combinations.
+- Hermes, Gemini, and `cli-sandbox` are not supported runtime combinations.
 - Sequence-less receipt handling remains as a compatibility/local-event lane;
   current Server bridge message frames carry an authoritative positive `seq`.
 
@@ -349,8 +354,8 @@ Use these entry points when tracing a change:
 | Concern | Start here |
 | --- | --- |
 | Daemon lifecycle | `portal/daemon.py`, `portal/worker_run.py` |
-| Runtime selection | `portal/runtime_matrix.py`, `agent/harness/local_runtime.py` |
-| Driver protocol | `agent/harness/driver.py`, `agent/harness/runtime_manager.py` |
+| Runtime selection | `portal/runtime_matrix.py`, `agent/harness/runtime/local_runtime.py` |
+| Driver protocol | `agent/harness/driver.py`, `agent/harness/runtime/runtime_manager.py` |
 | Native/bridge receive | `agent/puffo_core_client.py`, `agent/inbound_receipts.py`, `agent/bridge_transport.py` |
 | Durable Inbox | `agent/message_store.py`, `agent/inbox_store.py`, `agent/global_inbox_runtime.py` |
 | Context rendering | `agent/message_projection.py`, `mcp/tool_result_projection.py`, `agent/context_controller.py` |

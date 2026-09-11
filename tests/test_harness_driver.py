@@ -15,11 +15,11 @@ from puffo_agent.agent.message_store import (
     ReceiptDisposition,
 )
 from puffo_agent.agent.harness import UnsupportedDriver, build_driver
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     claude_capabilities,
 )
-from puffo_agent.agent.harness.codex_driver import (
+from puffo_agent.agent.harness.drivers.codex import (
     CODEX_CAPABILITIES,
     CodexAppServerDriver,
 )
@@ -39,7 +39,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
@@ -136,7 +136,6 @@ async def test_provider_events_project_valid_terminal(tmp_path, driver_name, sha
         assert not any(row["type"] == "output.updated" for row in rows)
     outbox.close()
 
-
 class _FakeStdin:
     def __init__(self, on_frame=None):
         self.writes: list[bytes] = []
@@ -213,6 +212,7 @@ def test_typed_refs_are_not_interchangeable():
 
 
 def test_codex_effective_capabilities():
+    assert CodexAppServerDriver().current_capabilities() == CODEX_CAPABILITIES
     assert CODEX_CAPABILITIES.session_resume is True
     assert CODEX_CAPABILITIES.inflight_turn_recovery is False
     assert CODEX_CAPABILITIES.steer == "current_turn"
@@ -670,7 +670,7 @@ def _metadata_driver(provider, provider_inputs):
         "type": "system", "subtype": "init",
         "session_id": "native-session", "slash_commands": [],
     })
-    return proc, ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=0.5)
+    return proc, ClaudeCodeCliDriver(lambda *_args: proc, input_ack_timeout=0.5)
 
 
 async def _metadata_store(tmp_path):
@@ -1071,7 +1071,7 @@ async def test_claude_driver_emits_compaction_boundary_and_clears_tool_calls():
         "type": "system", "subtype": "init",
         "session_id": "claude-1", "slash_commands": [],
     })
-    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc, input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     stream = driver.events()
     await driver.start_turn(TurnInput("hello"))
@@ -1084,7 +1084,7 @@ async def test_claude_driver_emits_compaction_boundary_and_clears_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_codex_driver_resumes_with_native_session_id_after_handshake():
+async def test_codex_driver_resumes_without_returning_full_turn_history():
     holder = {}
 
     def on_frame(frame):
@@ -1094,7 +1094,7 @@ async def test_codex_driver_resumes_with_native_session_id_after_handshake():
         elif frame.get("method") == "thread/resume":
             assert frame["params"] == {
                 "threadId": "native-thread",
-                "cwd": "/workspace",
+                "excludeTurns": True, "cwd": "/workspace",
                 "approvalPolicy": "never",
                 "sandbox": "danger-full-access",
                 "model": "gpt",
@@ -1248,7 +1248,7 @@ async def test_claude_driver_reopens_cleanly_after_closing_an_active_turn():
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     first = await driver.start_turn(TurnInput("first"))
     assert first.accepted
@@ -1320,7 +1320,7 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     opened = await driver.open(RuntimeSpec("/workspace"))
     assert "--replay-user-messages" in captured_args
     assert opened.capabilities.compact == "session_command"
@@ -1394,7 +1394,7 @@ async def test_claude_driver_accepts_init_after_first_stream_input():
         holder["proc"] = proc
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     opened = await driver.open(RuntimeSpec("/workspace"))
     session_id_index = captured.index("--session-id")
     assert captured[session_id_index + 1] == opened.native_session_id
@@ -1415,7 +1415,7 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
     normalized executable prefix (the Windows wrapper block) followed by
     the untouched flags. On this host the real boundary passes the
     executable through, so the wiring + ordering both stay pinned."""
-    import puffo_agent.agent.harness.claude_code_driver as driver_mod
+    import puffo_agent.agent.harness.drivers.claude_code as driver_mod
 
     def make_factory(captured):
         def factory(args, _spec):
@@ -1423,26 +1423,26 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
             proc = _FakeProcess()
             proc.feed({
                 "type": "system", "subtype": "init",
-                "session_id": f"claude-{len(captured)}", "slash_commands": [],
+                "session_id": f"claude-{len(captured)}", "slash_commands": ["/compact"],
             })
             return proc
         return factory
 
     posix = []
-    driver = ClaudeCodeCliDriver(make_factory(posix), replay_timeout=1)
-    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    driver = ClaudeCodeCliDriver(make_factory(posix), input_ack_timeout=1)
+    opened = await driver.open(RuntimeSpec("/workspace", executable="claude", launch_args=("--autocompact", "100000"), auto_compact_threshold_tokens=500000))
     await driver.close()
-    assert posix[:2] == ["claude", "-p"]
+    assert posix[:4] == ["claude", "--autocompact", "500000", "-p"] and opened.capabilities.compact == "session_command"
 
     monkeypatch.setattr(
         driver_mod, "normalize_launch_argv",
         lambda executable: ["cmd.exe", "/c", executable + ".cmd"],
     )
     windows = []
-    driver = ClaudeCodeCliDriver(make_factory(windows), replay_timeout=1)
-    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    driver = ClaudeCodeCliDriver(make_factory(windows), input_ack_timeout=1)
+    await driver.open(RuntimeSpec("/workspace", executable="claude", auto_compact_threshold_tokens=500000))
     await driver.close()
-    assert windows[:4] == ["cmd.exe", "/c", "claude.cmd", "-p"]
+    assert windows[:6] == ["cmd.exe", "/c", "claude.cmd", "--autocompact", "500000", "-p"]
 
 
 @pytest.mark.asyncio
@@ -1458,7 +1458,7 @@ async def test_claude_driver_resume_flag_maps_to_resumed_system_init():
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     opened = await driver.open(
         RuntimeSpec("/workspace"), SessionRef("native-claude-session")
     )
@@ -1483,7 +1483,7 @@ async def test_claude_driver_stdin_delivery_does_not_wait_for_replay():
         })
         return proc
 
-    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    driver = ClaudeCodeCliDriver(factory, input_ack_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     receipt = await driver.start_turn(TurnInput("accepted maybe"))
     assert receipt.accepted
@@ -1558,7 +1558,7 @@ def _two_block_claude_driver():
         "type": "system", "subtype": "init",
         "session_id": "claude-1", "slash_commands": [],
     })
-    return proc, ClaudeCodeCliDriver(lambda _args, _spec: proc, replay_timeout=1)
+    return proc, ClaudeCodeCliDriver(lambda _args, _spec: proc, input_ack_timeout=1)
 
 
 def _two_message_codex_driver():
@@ -1706,15 +1706,10 @@ async def test_start_turn_write_failure_leaves_no_turn_or_request_pending(
 
 
 @pytest.mark.asyncio
-async def test_codex_child_environment_merges_over_process_environment(
+async def test_codex_child_environment_does_not_reintroduce_ambient_values(
     monkeypatch,
 ):
-    """``RuntimeSpec.environment`` is a delta, not the child's whole env.
-
-    ``ClaudeCodeCliDriver`` merges it over ``os.environ``; Codex replaced the
-    environment outright, so any spec carrying only overrides would launch
-    ``codex app-server`` without PATH or HOME.
-    """
+    """The preparer supplies a complete sanitized child environment."""
     holder = {}
 
     def on_frame(frame):
@@ -1736,12 +1731,18 @@ async def test_codex_child_environment_merges_over_process_environment(
     monkeypatch.setenv("PUFFO_HARNESS_MARKER", "inherited")
     driver = CodexAppServerDriver()
     await driver.open(
-        RuntimeSpec("/workspace", environment={"CODEX_HOME": "/tmp/codex"})
+        RuntimeSpec(
+            "/workspace",
+            environment={
+                "CODEX_HOME": "/tmp/codex",
+                "PATH": os.environ["PATH"],
+            },
+        )
     )
     await driver.close()
 
     assert captured["env"]["CODEX_HOME"] == "/tmp/codex"
-    assert captured["env"]["PUFFO_HARNESS_MARKER"] == "inherited"
+    assert "PUFFO_HARNESS_MARKER" not in captured["env"]
     assert captured["env"]["PATH"] == os.environ["PATH"]
 
 
@@ -1781,7 +1782,7 @@ def _token_telemetry_driver(provider):
     holder["proc"] = proc
     return (
         proc,
-        ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=1),
+        ClaudeCodeCliDriver(lambda *_args: proc, input_ack_timeout=1),
         (40, 30, 84),
     )
 
@@ -1923,8 +1924,8 @@ async def _feed_projection_events(driver, events):
 
 
 def _build_projection_adapter(tmp_path, driver, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import (
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import (
         PreparedLocalRuntime,
         build_local_runtime_adapter,
     )
@@ -1939,7 +1940,6 @@ def _build_projection_adapter(tmp_path, driver, monkeypatch):
         migration_source="fresh",
         legacy_session_path=tmp_path / "legacy.json",
         preparer=_StubPreparer(),
-        session_fingerprint="fp",
     )
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db", max_rows=1)
     monkeypatch.setattr(local_runtime, "build_driver", lambda name: driver)

@@ -81,7 +81,7 @@ def test_optimistic_clear_then_re_set_on_next_401():
     runtime = _FakeRuntime(health="auth_failed")
     _call(runtime)
     assert runtime.health == "ok"
-    # Simulate worker's _handle_suppressed_reply re-flipping on next 401.
+    # Simulate the adapter auth path re-flipping on the next 401.
     runtime.health = "auth_failed"
     runtime.error = "fresh-401-after-refresh"
     _call(runtime)
@@ -203,12 +203,13 @@ async def test_refresh_now_fires_on_success(tmp_path, monkeypatch):
 
     monkeypatch.setattr(r.backend, "refresh", fake_refresh)
 
-    fired: list[str] = []
-    r.register_on_refresh_success(lambda: fired.append("ok"))
+    events: list[str] = []
+    monkeypatch.setattr(r, "_sync_views", lambda: events.append("views_synced"))
+    r.register_on_refresh_success(lambda: events.append("callback"))
 
     await r._refresh_now(expires_in=10, by_agent=True)
     assert refresh_called["n"] == 1
-    assert fired == ["ok"]
+    assert events == ["views_synced", "callback"]
 
 
 @pytest.mark.asyncio
@@ -299,17 +300,29 @@ async def test_external_rotation_loop_fires_on_detected_rotation(
     monkeypatch.setattr(_kc, "KEYCHAIN_POLL_INTERVAL_SECONDS", 0.01)
 
     poll_calls = {"n": 0}
+    revision = {"current": (1, 10)}
+    monkeypatch.setattr(
+        r.backend, "fingerprint", lambda: revision["current"],
+    )
+    r._detect_external_rotation()
 
     async def fake_poll() -> bool:
         poll_calls["n"] += 1
-        return poll_calls["n"] == 1
+        if poll_calls["n"] == 1:
+            revision["current"] = (2, 11)
+            return True
+        return False
 
     monkeypatch.setattr(
         r.backend, "poll_external_rotation", fake_poll, raising=False,
     )
     sync_calls = {"n": 0}
     monkeypatch.setattr(
-        r, "_sync_views", lambda: sync_calls.__setitem__("n", sync_calls["n"] + 1),
+        r,
+        "_sync_views",
+        lambda: (
+            sync_calls.__setitem__("n", sync_calls["n"] + 1) or True
+        ),
     )
 
     fired: list[str] = []

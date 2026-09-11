@@ -13,9 +13,10 @@ from unittest.mock import AsyncMock, Mock, patch
 class _Runtime:
     """Stand-in for RuntimeState — records save() calls instead of
     hitting disk."""
-    def __init__(self, health="ok", error=""):
+    def __init__(self, health="ok", error="", status="starting"):
         self.health = health
         self.error = error
+        self.status = status
         self.saved = []
 
     def save(self, agent_id):
@@ -32,13 +33,10 @@ def test_reassert_flips_ok_back_to_auth_failed():
     )
 
     assert rt.health == "auth_failed"
-    assert "Claude Code sign-in expired" in rt.error
-    assert "claude auth login" in rt.error
+    assert rt.error == "Provider authentication failed; sign in again and retry."
     assert rt.saved == [(
         "agent-a", "auth_failed",
-        "Claude Code sign-in expired. On the computer running "
-        "puffo-agent, open a terminal and run `claude auth "
-        "login`, then send this agent a message.",
+        "Provider authentication failed; sign in again and retry.",
     )]
 
 
@@ -139,13 +137,17 @@ def test_warm_done_only_flips_after_probe_completes():
         gate_task = asyncio.create_task(w._run_post_warm_gate("agent-a"))
         await started.wait()
         captured["mid_probe"] = w._warm_done.is_set()
+        captured["mid_probe_status"] = w.runtime.status
         release.set()
         await gate_task
         captured["post_gate"] = w._warm_done.is_set()
+        captured["post_gate_status"] = w.runtime.status
 
     asyncio.run(_run())
     assert captured["mid_probe"] is False
+    assert captured["mid_probe_status"] == "starting"
     assert captured["post_gate"] is True
+    assert captured["post_gate_status"] == "running"
 
 
 def test_warm_done_only_flips_after_reassert_when_probe_fails():
@@ -266,6 +268,7 @@ def test_prepared_runtime_retries_transient_warm_before_releasing_gate():
         outbox = Mock()
         outbox.state.return_value = {}
         prepared = Mock()
+        prepared.harness_name = "pi"
         worker = SimpleNamespace(
             _adapter=adapter,
             _run_post_warm_gate=AsyncMock(),
@@ -291,7 +294,7 @@ def test_prepared_runtime_retries_transient_warm_before_releasing_gate():
         None,
         session_ref="logical-session",
         native_session_id="native-session",
-        session_fingerprint=prepared.session_fingerprint,
+        native_session_harness="pi",
     )
     prepared.finalize_legacy_session_migration.assert_called_once_with()
     worker._run_post_warm_gate.assert_awaited_once_with("agent-a")

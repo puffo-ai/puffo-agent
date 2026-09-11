@@ -27,7 +27,7 @@ RUNTIME_EVENT_FIELDS = frozenset({
     "envelope_ids", "routes",
     "target", "server_seq", "message_id", "notice_generation",
     "send_attempt_id", "outcome", "remaining_count", "snapshot_generation",
-    "runtime_ref", "session_ref", "turn_ref", "permission_ref",
+    "runtime_ref", "session_ref", "turn_ref", "permission_ref", "run_id",
     "event_id", "event_type", "outbox_sequence", "retry_count",
     "capability", "capability_decision", "error_code", "error_type",
     "first_sequence", "last_sequence", "event_count",
@@ -65,6 +65,10 @@ RUNTIME_EVENT_NAMES = frozenset({
     "turn.requeued",
     "turn.failed",
     "turn.finalized",
+    "turn.autonomous_adoption",
+    "turn.autonomous_finalized",
+    "turn.uncovered_messages",
+    "turn.cover_reconciliation_failed",
     "runtime.command",
     "runtime.normalized_event",
     "runtime.projected",
@@ -75,6 +79,10 @@ RUNTIME_EVENT_NAMES = frozenset({
     "runtime.discarded",
     "runtime.capacity",
     "runtime.recovery",
+    "processing_report.acknowledged",
+    "processing_report.retry",
+    "processing_report.isolated",
+    "processing_report.discarded",
 })
 _OBSERVABILITY_WARNED: set[str] = set()
 _MAX_EVENT_ENVELOPE_IDS = 16

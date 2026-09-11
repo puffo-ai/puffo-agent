@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any, Mapping
 
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,20 @@ MENTION_RE = re.compile(
 )
 
 _LONG_MESSAGE_PREVIEW_CHARS = 240
+
+
+def content_with_visibility(
+    content: object,
+    *,
+    is_visible_to_human: bool,
+) -> dict[str, Any]:
+    """Preserve message content while attaching its authenticated visibility."""
+    if isinstance(content, Mapping):
+        projected = dict(content)
+    else:
+        projected = {"text": "" if content is None else str(content)}
+    projected["is_visible_to_human"] = bool(is_visible_to_human)
+    return projected
 
 
 def maybe_redact_long_text(

@@ -606,6 +606,7 @@ def test_process_refresh_flags_noop_when_no_flags(tmp_path):
         refresh_agent_flag=tmp_path / "refresh_agent.flag",
         refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
         refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=tmp_path / "refresh_provider_auth.flag",
     ))
     assert adapter.reload_calls == []
 
@@ -630,12 +631,108 @@ def test_process_refresh_flags_session_only(tmp_path, monkeypatch):
         refresh_agent_flag=tmp_path / "refresh_agent.flag",
         refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
         refresh_session_flag=session_flag,
+        refresh_provider_auth_flag=tmp_path / "refresh_provider_auth.flag",
     ))
     assert len(adapter.reload_calls) == 1
     prompt, with_session = adapter.reload_calls[0]
     assert prompt == "preserved"
     assert with_session is True
     assert not session_flag.exists()
+
+
+def test_process_refresh_flags_provider_auth_preserves_session(tmp_path):
+    """Credential replacement reopens the provider but keeps session identity."""
+    from puffo_agent.portal.worker import _process_refresh_flags
+    adapter = _FakeAdapter()
+    puffo = _FakePuffo(prompt="preserved")
+    provider_flag = tmp_path / "refresh_provider_auth.flag"
+    provider_flag.write_text("{}", encoding="utf-8")
+
+    _run(_process_refresh_flags(
+        agent_id="t",
+        harness_name="codex",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=puffo,
+        adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=provider_flag,
+    ))
+    assert adapter.reload_calls == [("preserved", False)]
+    assert not provider_flag.exists()
+
+
+def test_process_refresh_flags_honors_provider_reload_not_before(
+    tmp_path, monkeypatch,
+):
+    """Fleet credential fan-out waits for each persisted jitter deadline."""
+    from puffo_agent.portal import worker as worker_mod
+
+    adapter = _FakeAdapter()
+    provider_flag = tmp_path / "refresh_provider_auth.flag"
+    provider_flag.write_text(
+        '{"source":"credential_replaced","not_before_unix_ms":10500}',
+        encoding="utf-8",
+    )
+    now = {"value": 10.0}
+    monkeypatch.setattr(worker_mod.time, "time", lambda: now["value"])
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"),
+        workspace_path=str(tmp_path),
+        puffo=_FakePuffo(prompt="preserved"),
+        adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=provider_flag,
+    ))
+
+    assert adapter.reload_calls == []
+    assert provider_flag.exists()
+
+    now["value"] = 10.5
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t", harness_name="claude-code",
+        shared_path=tmp_path / "shared", profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"), workspace_path=str(tmp_path),
+        puffo=_FakePuffo(prompt="preserved"), adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=provider_flag,
+    ))
+    assert adapter.reload_calls == [("preserved", False)]
+    assert not provider_flag.exists()
+
+    # An explicit user/session refresh already spreads naturally and should
+    # not inherit the daemon's background credential jitter.
+    provider_flag.write_text(
+        '{"source":"credential_replaced","not_before_unix_ms":11000}',
+        encoding="utf-8",
+    )
+    now["value"] = 10.5
+    session_flag = tmp_path / "refresh_session.flag"
+    session_flag.write_text("{}", encoding="utf-8")
+    _run(worker_mod._process_refresh_flags(
+        agent_id="t", harness_name="claude-code",
+        shared_path=tmp_path / "shared", profile_path=str(tmp_path / "profile.md"),
+        memory_path=str(tmp_path / "memory"), workspace_path=str(tmp_path),
+        puffo=_FakePuffo(prompt="preserved"), adapter=adapter,
+        refresh_agent_flag=tmp_path / "refresh_agent.flag",
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=session_flag,
+        refresh_provider_auth_flag=provider_flag,
+    ))
+    assert adapter.reload_calls[-1] == ("preserved", True)
+    assert not provider_flag.exists()
 
 
 def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypatch):
@@ -661,9 +758,10 @@ def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypa
         refresh_agent_flag=agent_flag,
         refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
         refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=tmp_path / "refresh_provider_auth.flag",
     ))
     assert puffo.system_prompt == "new prompt"
-    assert adapter.reload_calls == [("new prompt", True)]
+    assert adapter.reload_calls == [("new prompt", False)]
     assert not agent_flag.exists()
 
 
@@ -695,6 +793,7 @@ def test_process_refresh_flags_keeps_authenticated_puffo_handle(
         refresh_agent_flag=agent_flag,
         refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
         refresh_session_flag=tmp_path / "refresh_session.flag",
+        refresh_provider_auth_flag=tmp_path / "refresh_provider_auth.flag",
         puffo_handle="bot-42-x9f2",
     ))
 

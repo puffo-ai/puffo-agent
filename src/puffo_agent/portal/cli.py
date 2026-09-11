@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from .cli_parser import build_parser as build_cli_parser
-from .daemon import run_daemon
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -42,6 +41,8 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_daemon_ready,
+    is_daemon_startup_stalled,
+    is_daemon_stop_stalled,
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
@@ -51,6 +52,7 @@ from .state import (
     refresh_runtime_flag_path,
     refresh_session_flag_path,
     shared_fs_dir,
+    stop_requested_for,
     write_refresh_token_request,
     write_stop_request,
 )
@@ -58,6 +60,7 @@ from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
+
 
 DEFAULT_PROFILE = """# Agent Profile
 
@@ -306,6 +309,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         from .background import spawn_background
 
         return spawn_background()
+    if getattr(args, "detach", False):
+        from .background import spawn_headless_background
+
+        return spawn_headless_background()
     if getattr(args, "ui", False):
         try:
             from .ui.launcher import launch
@@ -318,6 +325,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    from .daemon import run_daemon
+
     return asyncio.run(run_daemon())
 
 
@@ -373,6 +382,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Register / unregister / inspect after-login daemon autostart."""
+    from . import autostart
+
+    if args.autostart_cmd == "enable":
+        result = autostart.enable(linger=getattr(args, "linger", False))
+    elif args.autostart_cmd == "disable":
+        result = autostart.disable()
+    else:
+        state = autostart.status()
+        for line in state.lines:
+            print(line)
+        return 0
+    stream = sys.stdout if result.ok else sys.stderr
+    for line in result.lines:
+        print(line, file=stream)
+    return 0 if result.ok else 1
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     """Print installed version + install mode."""
     local = get_local_version()
@@ -413,13 +441,12 @@ def cmd_check_update(args: argparse.Namespace) -> int:
     print(f"latest:    {remote}")
     if is_outdated(local, remote):
         print()
-        print("an update is available. to upgrade:")
+        print("an update is available. to upgrade without leaving an old daemon:")
+        print("  puffo-agent stop")
         print(f"  {upgrade_command_for_install_mode()}")
+        print("  puffo-agent start --detach")
         if is_source_install():
             print("  (or re-run pip install against your local clone)")
-        print()
-        print("note: if the daemon is currently running, stop it first —")
-        print("on windows the puffo-agent.exe file is locked while in use.")
         return 0
     print()
     print("you're up to date.")
@@ -429,8 +456,19 @@ def cmd_check_update(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     pid = read_daemon_pid()
     alive = is_daemon_alive()
-    if alive and pid is not None:
+    ready = alive and pid is not None and is_daemon_ready(pid)
+    if alive and pid is not None and stop_requested_for(pid):
+        state = "stop stalled" if is_daemon_stop_stalled(pid) else "stopping"
+        print(f"daemon: {state} (pid={pid})")
+    elif ready:
         print(f"daemon: running (pid={pid})")
+    elif alive and pid is not None:
+        state = (
+            "stalled during startup"
+            if is_daemon_startup_stalled(pid)
+            else "starting"
+        )
+        print(f"daemon: {state} (pid={pid})")
     elif pid is not None:
         print(f"daemon: not running (stale pid file at {daemon_pid_path()}; pid={pid})")
     else:
@@ -481,10 +519,19 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     provider = args.provider or ""
     from .runtime_matrix import resolve_effective_harness, validate_triple
 
-    harness = resolve_effective_harness(runtime_kind, provider, "")
+    harness = getattr(args, "harness", None) or resolve_effective_harness(
+        runtime_kind, provider, ""
+    )
     validation = validate_triple(runtime_kind, provider, harness)
     if not validation.ok:
         print(f"error: {validation.error}", file=sys.stderr)
+        return 2
+    harness_command = list(getattr(args, "harness_command", None) or [])
+    if runtime_kind == "cli-local" and harness == "acp" and not harness_command:
+        print(
+            "error: --harness acp requires --harness-command EXECUTABLE [ARG ...]",
+            file=sys.stderr,
+        )
         return 2
     role = (args.role or "").strip()
     role_short_raw = getattr(args, "role_short", None)
@@ -523,6 +570,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             api_key=args.api_key or "",
             model=args.model or "",
             harness=harness,
+            harness_command=harness_command,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -606,14 +654,11 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
                 uptime = "—"
         # Surface non-ok health alongside lifecycle status so the
         # operator can see at a glance which agents need attention.
-        if rs is not None and rs.health in (
-            "in_progress",
-            "auth_failed",
-            "api_error_abandoned",
-            "refresh_broken",
-            "unhandled_error",
-            "codex_thread_wedged",
-        ):
+        # Stated as an exclusion, not a roster of the interesting values: a
+        # hand-maintained roster makes every health value added later
+        # invisible here by default, which is the one surface an operator
+        # reads first. Only "ok" and "unknown" carry no call to action.
+        if rs is not None and rs.health and rs.health not in ("ok", "unknown"):
             runtime = f"{runtime} [{rs.health}]"
         # Truncate display_name for table alignment.
         display = ac.display_name or aid
@@ -854,7 +899,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     values. With flags ⇒ update agent.yml, then sync to server."""
     import asyncio
 
-    from .profile_sync import sync_agent_profile
+    from .profile_sync import sync_agent_profile, write_refresh_agent_flag
 
     agent_id = args.id
     if not agent_yml_path(agent_id).exists():
@@ -918,6 +963,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
         patch["role_short"] = derived
 
     cfg.save()
+    write_refresh_agent_flag(cfg, reason="cli agent profile")
 
     try:
         asyncio.run(sync_agent_profile(cfg, patch))
@@ -1047,6 +1093,9 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
+    if args.harness_command is not None:
+        cfg.runtime.harness_command = list(args.harness_command)
+        touched = True
     status, level_touched, inference_level_cleared = _apply_cli_inference_level(
         cfg, args
     )
@@ -1061,6 +1110,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  provider:         {cfg.runtime.provider or '(default)'}")
         print(
             f"  harness:          {cfg.runtime.harness}  (cli-local / cli-docker only)"
+        )
+        print(
+            "  harness_command:  "
+            + (" ".join(cfg.runtime.harness_command) or "(default)")
         )
         print(f"  model:            {cfg.runtime.model or '(default)'}")
         print(
@@ -1082,6 +1135,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if not result.ok:
         print(f"error: {result.error}", file=sys.stderr)
         return 2
+    command_error = _harness_command_error(cfg.runtime)
+    if command_error:
+        print(f"error: {command_error}", file=sys.stderr)
+        return 2
 
     cfg.save()
     print(f"agent {agent_id!r} runtime updated:")
@@ -1095,6 +1152,19 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if is_daemon_alive():
         print("daemon will restart the worker on the next reconcile tick.")
     return 0
+
+
+def _harness_command_error(runtime: RuntimeConfig) -> str:
+    if (
+        runtime.kind == "cli-local"
+        and runtime.harness == "acp"
+        and not runtime.harness_command
+    ):
+        return (
+            "harness='acp' requires --harness-command "
+            "EXECUTABLE [ARG ...]"
+        )
+    return ""
 
 
 def cmd_agent_archive(args: argparse.Namespace) -> int:
@@ -1203,6 +1273,9 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    from .profile_sync import write_refresh_agent_flag
+
+    write_refresh_agent_flag(cfg, reason="cli profile editor")
     return 0
 
 
@@ -1223,17 +1296,41 @@ def cmd_link(args: argparse.Namespace) -> int:
     name = args.name or friendly_device_name()
     server_url = args.server_url or DEFAULT_SERVER_URL
     try:
-        return asyncio.run(
+        link_rc = asyncio.run(
             run_link(
                 server_url,
                 name,
                 open_browser=not args.not_open,
-                code=getattr(args, "code", None),
+                code=args.code,
             )
         )
     except KeyboardInterrupt:
         print("\nlink: cancelled.")
         return 1
+    if link_rc == 0 and not args.no_autostart:
+        _enable_autostart_after_link()
+    return link_rc
+
+
+def _enable_autostart_after_link() -> None:
+    from . import autostart
+
+    try:
+        result = autostart.enable()
+    except Exception as exc:  # noqa: BLE001
+        result = autostart.ActionResult(False, [str(exc)])
+    if result.ok:
+        print("link: autostart enabled.")
+        for line in result.lines:
+            print(line)
+        return
+    print("warning: link succeeded, but autostart could not be enabled.", file=sys.stderr)
+    for line in result.lines:
+        print(line, file=sys.stderr)
+    print(
+        "Run `puffo-agent autostart enable` manually to retry.",
+        file=sys.stderr,
+    )
 
 
 def cmd_unlink(args: argparse.Namespace) -> int:

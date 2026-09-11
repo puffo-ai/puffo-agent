@@ -55,9 +55,6 @@ async def coordinator_fixture(*, baseline=0, active=None):
         async def get_message_by_envelope(self, _envelope_id):
             raise DataNotFound("not found")
 
-        async def get_send_encryption(self, _slug, _root):
-            return True
-
     data = Data()
     device = KemKeyPair.generate()
     for channel in ("ch_a", "ch_b"):
@@ -817,7 +814,7 @@ async def test_native_held_response_rejects_adversarial_matrix_before_recording(
 async def test_dm_route_has_no_freshness():
     coordinator, _, http = await coordinator_fixture()
     device = KemKeyPair.generate()
-    http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+    http.responses["/certs/sync?slugs=alice-1"] = {
         "entries": [{
             "seq": 1, "kind": "device_cert",
             "cert": {
@@ -837,56 +834,29 @@ async def test_dm_route_has_no_freshness():
 
 
 @pytest.mark.asyncio
-async def test_plaintext_dm_route_has_no_freshness():
+async def test_dm_fails_when_recipient_has_no_devices():
+    """The sender's own devices must not mask an unreachable DM peer."""
     coordinator, _, http = await coordinator_fixture()
-
-    async def plaintext(_slug, _root):
-        return False
-
-    coordinator.data_client.get_send_encryption = plaintext
-    result = await coordinator.send(SemanticSendRequest(
-        destination="@alice-1", text="hi", visibility_level="human",
-    ))
-    assert result["state"] == "sent"
-    path, body = [(p, b) for m, p, b in http.calls if m == "POST"][-1]
-    assert path == "/v2/messages/plaintext"
-    assert "freshness" not in body
-
-
-@pytest.mark.asyncio
-async def test_plaintext_dm_policy_cannot_expose_attachment_keys(tmp_path):
-    """A DM attachment stays E2EE when text-only DMs permit plaintext."""
-    coordinator, _, http = await coordinator_fixture()
-    coordinator.workspace = str(tmp_path)
-    (tmp_path / "evidence.txt").write_text("proof", encoding="utf-8")
-
-    async def plaintext(_slug, _root):
-        return False
-
-    coordinator.data_client.get_send_encryption = plaintext
     device = KemKeyPair.generate()
-    http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+    http.responses["/certs/sync?slugs=alice-1"] = {
+        "entries": [], "has_more": False,
+    }
+    http.responses["/certs/sync?slugs=agent-0001"] = {
         "entries": [{
-            "seq": 1,
-            "kind": "device_cert",
+            "seq": 1, "kind": "device_cert",
             "cert": {
-                "device_id": "dev_dm_attachment",
+                "device_id": "dev_sender",
                 "kem_public_key": base64url_encode(device.public_key_bytes()),
             },
         }],
         "has_more": False,
     }
     result = await coordinator.send(SemanticSendRequest(
-        destination="@alice-1",
-        attachment_paths=("evidence.txt",),
-        caption="evidence",
+        destination="@alice-1", text="hi", visibility_level="human",
     ))
-    assert result["state"] == "sent", result
-    message_posts = [
-        path for method, path, _body in http.calls
-        if method == "POST" and path in {"/messages", "/v2/messages/plaintext"}
-    ]
-    assert message_posts == ["/messages"]
+    assert result["state"] == "failed"
+    assert "no encryption devices" in result["error"]
+    assert not [c for c in http.calls if c[0] == "POST" and c[1] == "/messages"]
 
 
 @pytest.mark.asyncio
@@ -902,7 +872,7 @@ async def test_channel_roster_path_encodes_model_selected_channel_segment():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["encrypted", "plaintext", "keyless"])
+@pytest.mark.parametrize("transport", ["encrypted", "keyless"])
 @pytest.mark.parametrize("include_metadata", [True, False])
 async def test_legacy_dm_transports_preserve_optional_metadata(
     transport, include_metadata, monkeypatch,
@@ -933,22 +903,17 @@ async def test_legacy_dm_transports_preserve_optional_metadata(
         )
     else:
         coordinator, _, http = await coordinator_fixture()
-        if transport == "plaintext":
-            async def plaintext(_slug, _root):
-                return False
-            coordinator.data_client.get_send_encryption = plaintext
-        else:
-            device = KemKeyPair.generate()
-            http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
-                "entries": [{
-                    "seq": 1, "kind": "device_cert",
-                    "cert": {
-                        "device_id": "metadata-device",
-                        "kem_public_key": base64url_encode(device.public_key_bytes()),
-                    },
-                }],
-                "has_more": False,
-            }
+        device = KemKeyPair.generate()
+        http.responses["/certs/sync?slugs=alice-1"] = {
+            "entries": [{
+                "seq": 1, "kind": "device_cert",
+                "cert": {
+                    "device_id": "metadata-device",
+                    "kem_public_key": base64url_encode(device.public_key_bytes()),
+                },
+            }],
+            "has_more": False,
+        }
 
         async def post(_path, _body):
             return metadata
@@ -973,18 +938,19 @@ async def test_legacy_dm_transports_preserve_optional_metadata(
 
 @pytest.mark.asyncio
 async def test_plaintext_channel_no_downgrade():
+    """A channel send never goes out as a plaintext envelope."""
     coordinator, _, http = await coordinator_fixture()
-
-    async def plaintext(_slug, _root):
-        return False
-
-    coordinator.data_client.get_send_encryption = plaintext
     result = await coordinator.send(SemanticSendRequest(
         destination="ch_a", text="must not downgrade",
     ))
-    assert result["state"] == "failed"
-    assert result["error_kind"] == "encryption_required"
-    assert not [call for call in http.calls if call[0].startswith("POST")]
+    assert result["state"] == "sent", result
+    posts = [
+        call for call in http.calls
+        if call[0] == "POST" and call[1] == CHANNEL_SEND_PATH
+    ]
+    assert posts
+    envelope = posts[-1][2]["envelope"]
+    assert envelope["type"] != "plaintext_message_envelope"
 
 
 @pytest.mark.asyncio

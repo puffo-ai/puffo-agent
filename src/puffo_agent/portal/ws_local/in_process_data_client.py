@@ -30,15 +30,6 @@ class InProcessDataClient:
     async def close(self) -> None:
         return None
 
-    async def get_send_encryption(
-        self, slug: str, thread_root_id: str | None,
-    ) -> bool:
-        from ...agent import send_mode
-
-        return await send_mode.encryption_required(
-            slug, self._store, thread_root_id,
-        )
-
     async def lookup_channel_space(self, channel_id: str) -> str | None:
         space_id = await self._store.lookup_channel_space(channel_id)
         if space_id is None and channel_id.startswith("ch_"):
@@ -112,24 +103,6 @@ class InProcessDataClient:
         # held for operator approval stays withheld, matching the HTTP
         # data service and the DM/thread reads.
         return await self._store.get_visible_message_by_envelope(envelope_id)
-
-    async def get_send_encryption(
-        self, slug: str, thread_root_id: str | None,
-    ) -> bool:
-        """Daemon-level send-mode decision, in-process.
-
-        Mirrors ``portal/data_service.py``'s HTTP endpoint so the ws-local
-        lane consults the same policy as the MCP subprocess lane. Without
-        this method ``_send_encryption_required`` fails safe to ``True``,
-        which turned every ws-local plaintext send into a hard failure.
-        """
-        from ...agent import send_mode
-
-        return bool(
-            await send_mode.encryption_required(
-                slug or "", self._store, thread_root_id or None,
-            )
-        )
 
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,

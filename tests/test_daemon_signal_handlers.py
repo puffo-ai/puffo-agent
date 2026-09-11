@@ -13,6 +13,7 @@ import asyncio
 import os
 import threading
 
+from puffo_agent.portal import daemon as daemon_mod
 from puffo_agent.portal.daemon import _install_posix_stop_handlers
 from puffo_agent.portal.ui import daemon_thread as daemon_thread_mod
 from puffo_agent.portal.ui.daemon_thread import DaemonThread
@@ -37,6 +38,19 @@ def test_posix_stop_handlers_skipped_off_main_thread():
     # No RuntimeError from set_wakeup_fd, and nothing installed off-thread.
     assert "error" not in out, out.get("error")
     assert out["installed"] is False
+
+
+def test_daemon_signal_stop_publishes_owned_sentinel(monkeypatch):
+    daemon = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    daemon._stop = asyncio.Event()
+    writes = []
+    monkeypatch.setattr(daemon_mod, "read_daemon_pid", lambda: os.getpid())
+    monkeypatch.setattr(daemon_mod, "write_stop_request", writes.append)
+
+    daemon.request_stop()
+
+    assert daemon._stop.is_set()
+    assert writes == [os.getpid()]
 
 
 def test_daemon_thread_runs_daemon_without_bridge_flag(monkeypatch):

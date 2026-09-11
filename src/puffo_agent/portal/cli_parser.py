@@ -47,8 +47,9 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
     start = sub.add_parser(
         "start",
         help=(
-            "Run the daemon (foreground by default; --background detaches "
-            "with a status-bar icon, --ui opens the desktop window)"
+            "Run the daemon (foreground by default; --detach runs headless "
+            "in the background, --background adds a status-bar icon, "
+            "and --ui opens the desktop window)"
         ),
     )
     start_mode = start.add_mutually_exclusive_group()
@@ -65,6 +66,11 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
             "icon; it survives the terminal closing. Quit from the icon or "
             "run `puffo-agent stop`."
         ),
+    )
+    start_mode.add_argument(
+        "--detach",
+        action="store_true",
+        help="Detach the headless daemon without requiring the desktop GUI extra.",
     )
     # Internal: the detached child that --background spawns to host the
     # tray. Hidden from --help.
@@ -96,6 +102,29 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
         "check-update",
         help="Compare installed version against latest GitHub release",
     ).set_defaults(func=handlers["cmd_check_update"])
+    autostart = sub.add_parser(
+        "autostart",
+        help="Start the daemon automatically after login (per-user)",
+    )
+    autostart_sub = autostart.add_subparsers(dest="autostart_cmd", required=True)
+    autostart_enable = autostart_sub.add_parser(
+        "enable", help="Register the daemon to start after login"
+    )
+    autostart_enable.add_argument(
+        "--linger",
+        action="store_true",
+        help=(
+            "Linux only: also try `loginctl enable-linger` so the daemon "
+            "starts at boot, before login (best-effort)"
+        ),
+    )
+    autostart_enable.set_defaults(func=handlers["cmd_autostart"])
+    autostart_sub.add_parser(
+        "disable", help="Remove the after-login start registration"
+    ).set_defaults(func=handlers["cmd_autostart"])
+    autostart_sub.add_parser(
+        "status", help="Show what is configured and what is currently loaded"
+    ).set_defaults(func=handlers["cmd_autostart"])
 
 
 def _add_agent_create_commands(sub, handlers: CommandHandlers):
@@ -147,8 +176,19 @@ def _add_agent_create(agent_sub, handlers: CommandHandlers) -> None:
     )
     create.add_argument(
         "--provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "google", "openai"],
         help="Model provider; selects the default harness",
+    )
+    create.add_argument(
+        "--harness",
+        choices=["acp", "claude-code", "codex", "opencode", "pi"],
+        help="Agent harness (defaults from provider)",
+    )
+    create.add_argument(
+        "--harness-command",
+        nargs="+",
+        metavar="ARGV",
+        help="cli-local ACP command argv, for example: opencode acp",
     )
     create.add_argument(
         "--api-key",
@@ -214,7 +254,7 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
     )
     runtime.add_argument(
         "--provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "google", "openai"],
         help=(
             "Model provider. anthropic (default) pairs with claude-code; "
             "openai pairs with codex on cli-local. Must match the selected "
@@ -256,18 +296,24 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
     )
     runtime.add_argument(
         "--harness",
-        choices=["claude-code", "codex"],
+        choices=["acp", "claude-code", "codex", "opencode", "pi"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
-            "runtime. cli-local supports 'claude-code' (anthropic) and "
-            "'codex' (openai); cli-docker supports 'claude-code' only. "
-            "cli-local uses long-lived Drivers; cli-docker uses its container "
-            "adapter with a persistent Claude session. 'codex' spawns "
-            "`codex app-server` as a long-lived JSON-RPC subprocess; auth via "
-            "runtime.api_key "
-            "or operator-side `codex login`. 'hermes' and 'gemini-cli' are "
+            "runtime. Claude Code pairs with Anthropic and Codex with OpenAI. "
+            "Both cli-local and cli-docker use the same long-lived Drivers; "
+            "cli-docker places the selected CLI in a per-Agent container. "
+            "Codex uses `codex app-server`; Claude Code uses stream-json; "
+            "Pi and OpenCode use their native JSON protocols. "
+            "Auth comes from runtime.api_key or the matching operator-side "
+            "CLI login. 'hermes' and 'gemini-cli' are "
             "design-only and rejected by config validation."
         ),
+    )
+    runtime.add_argument(
+        "--harness-command",
+        nargs="+",
+        metavar="ARGV",
+        help="cli-local harness command argv; required for generic ACP",
     )
     runtime.set_defaults(func=handlers["cmd_agent_runtime"])
 
@@ -472,6 +518,11 @@ def _add_machine_commands(sub, handlers: CommandHandlers) -> None:
         "--not-open",
         action="store_true",
         help="Don't auto-open the link page in your browser.",
+    )
+    machine_link.add_argument(
+        "--no-autostart",
+        action="store_true",
+        help="Do not register the daemon to start automatically after login.",
     )
     machine_link.set_defaults(func=handlers["cmd_link"])
 

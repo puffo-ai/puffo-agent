@@ -10,8 +10,10 @@ by mutating the filesystem — no IPC needed.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import random
 import shutil
 import signal
 import threading
@@ -36,8 +38,11 @@ from .data_service import (
 )
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
+from .control.usage_snapshot import set_live_workers
 from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
+    DAEMON_STARTUP_OBSERVATION_SECONDS,
+    DaemonStartupState,
     AgentConfig,
     DaemonConfig,
     agent_dir,
@@ -56,9 +61,12 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_daemon_ready,
+    is_daemon_startup_stalled,
     is_pid_alive,
+    PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS,
     read_daemon_pid,
     refresh_model_flag_path,
+    refresh_provider_auth_flag_path,
     refresh_runtime_flag_path,
     refresh_session_flag_path,
     refresh_token_request_path,
@@ -66,6 +74,7 @@ from .state import (
     shared_fs_dir,
     stop_request_path,
     stop_requested_for,
+    write_stop_request,
     write_daemon_pid,
     write_daemon_ready,
 )
@@ -74,8 +83,14 @@ from .workspace_layout import (
     prepare_workspace_shared_access,
 )
 from .worker import Worker
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_auth_reload_jitter_seconds() -> float:
+    """Spread fleet-wide provider reopen requests across a short window."""
+    return random.uniform(0.0, PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS)
 
 
 class _DaemonRuntime:
@@ -94,6 +109,8 @@ class Daemon:
     def __init__(self, daemon_cfg: DaemonConfig):
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
+        # snapshot drained flips must reach worker memory, not just disk
+        set_live_workers(lambda: self.workers)
         self._paused_reported: set[str] = set()
         # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
@@ -135,6 +152,7 @@ class Daemon:
         self,
         external_stop_requested: threading.Event | None = None,
     ) -> None:
+        startup_started = time.perf_counter()
         logger.info("puffo-agent portal starting; home=%s", home_dir())
         interval = max(0.5, self.daemon_cfg.reconcile_interval_seconds)
         pid = os.getpid()
@@ -146,6 +164,11 @@ class Daemon:
                 self._stop.set()
             else:
                 write_daemon_ready(pid)
+                logger.info(
+                    "startup: control plane ready; elapsed_ms=%d",
+                    int((time.perf_counter() - startup_started) * 1000),
+                )
+                await _prepare_workers_at_startup()
             await self._run_reconcile_loop(
                 pid,
                 interval,
@@ -156,16 +179,25 @@ class Daemon:
 
     async def _start_runtime(self, runtime: _DaemonRuntime) -> None:
         runtime.startup_tasks.append(
-            asyncio.ensure_future(_log_outdated_version_warning())
+            spawn(_log_outdated_version_warning(), name="log_outdated_version_warning")
         )
         from ..agent.model_catalog import prefetch as _prefetch_model_catalog
 
         _prefetch_model_catalog()
         runtime.startup_tasks.extend(
             (
-                asyncio.ensure_future(_sweep_archived_pending_revokes_at_startup()),
-                asyncio.ensure_future(_migrate_linked_agents_at_startup()),
-                asyncio.ensure_future(_full_sync_all_owned_agents_at_startup()),
+                spawn(
+                    _sweep_archived_pending_revokes_at_startup(),
+                    name="sweep_archived_pending_revokes_at_startup",
+                ),
+                spawn(
+                    _migrate_linked_agents_at_startup(),
+                    name="migrate_linked_agents_at_startup",
+                ),
+                spawn(
+                    _full_sync_all_owned_agents_at_startup(),
+                    name="full_sync_all_owned_agents_at_startup",
+                ),
             )
         )
         runtime.ws_local_runner = await start_ws_local_server(
@@ -185,17 +217,16 @@ class Daemon:
         )
         runtime.runtime_tasks.extend(
             (
-                asyncio.ensure_future(self.refresher.run_loop(self._stop)),
-                asyncio.ensure_future(self.codex_refresher.run_loop(self._stop)),
+                spawn(self.refresher.run_loop(self._stop), name="refresher.run_loop"),
+                spawn(self.codex_refresher.run_loop(self._stop), name="codex_refresher.run_loop"),
             )
         )
         from .control.client import ControlManager
 
         runtime.control_manager = ControlManager()
         runtime.runtime_tasks.append(
-            asyncio.ensure_future(runtime.control_manager.run())
+            spawn(runtime.control_manager.run(), name="control_manager.run")
         )
-        _respawn_codex_on_mcp_change_at_startup()
 
     def _stop_was_requested(
         self,
@@ -281,6 +312,13 @@ class Daemon:
 
     def request_stop(self) -> None:
         self._stop.set()
+        pid = os.getpid()
+        if read_daemon_pid() != pid:
+            return
+        try:
+            write_stop_request(pid)
+        except Exception:  # noqa: BLE001 - the in-process event still stops us
+            logger.exception("failed to persist signal stop request")
 
     def _load_agent_cfg_cached(self, agent_id: str) -> AgentConfig:
         """Reuses a cached parse when (mtime_ns, size) is unchanged.
@@ -346,7 +384,7 @@ class Daemon:
                     # the persisted session into Node's heap, so N
                     # parallel warms can OOM the host. Awaiting one at
                     # a time keeps peak RSS bounded.
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 elif (
                     worker.restart_required
                     or _worker_needs_restart(worker.agent_cfg, agent_cfg)
@@ -370,7 +408,7 @@ class Daemon:
                     self.workers[agent_id] = worker
                     self._register_with_refresher(agent_cfg, worker)
                     worker.start()
-                    await worker.wait_warm(timeout=self._warm_serialise_timeout)
+                    await self._observe_worker_start(agent_id, worker)
                 else:
                     worker.agent_cfg = agent_cfg
             elif desired_state == "paused":
@@ -388,6 +426,16 @@ class Daemon:
                         self._paused_reported.add(agent_id)
             else:
                 logger.warning("agent %s: unknown state %r", agent_id, desired_state)
+
+    async def _observe_worker_start(self, agent_id: str, worker: Worker) -> None:
+        if await worker.wait_warm(timeout=self._warm_serialise_timeout):
+            return
+        logger.warning(
+            "agent %s: worker did not reach running during the startup "
+            "observation window (status=%s)",
+            agent_id,
+            worker.runtime.status,
+        )
 
     async def _stop_removed_agents(self, on_disk: set[str]) -> None:
         for stale_id in list(self._agent_cfg_cache.keys() - on_disk):
@@ -427,13 +475,31 @@ class Daemon:
         except OSError as exc:
             logger.warning("agent %s: couldn't remove restart.flag: %s", agent_id, exc)
 
-    def _refresher_for(self, agent_cfg: AgentConfig) -> CredentialRefresher:
-        """Pick the right refresher for an agent's harness. Codex
-        agents only need their own auth.json refresh; claude-code +
-        every other harness routes through the Claude refresher."""
-        if (agent_cfg.runtime.harness or "claude-code") == "codex":
+    def _refresher_for(
+        self, agent_cfg: AgentConfig
+    ) -> CredentialRefresher | None:
+        """The refresher that actually owns this agent's credentials, or
+        ``None`` when no daemon refresher does.
+
+        Only the harnesses in ``_DAEMON_REFRESH_HARNESSES`` have a backend
+        here: claude-code via ``FileBackend``/``KeychainBackend``, codex via
+        ``CodexFileBackend``. Pi projects its own ``auth.json`` through
+        ``sync_host_pi_auth_view`` and OpenCode carries its own credentials;
+        neither has anything for a refresher to refresh.
+
+        This used to fall through to the Claude refresher for every
+        non-codex harness, which put Pi and OpenCode agents on a refresher
+        that could not help them and could block them: the pre-delivery
+        gate (``_ensure_fresh_for``) then failed on an expired *Claude*
+        token, so a Pi agent with a perfectly valid credential never
+        reached its own provider (#337).
+        """
+        harness = agent_cfg.runtime.harness or "claude-code"
+        if harness == "codex":
             return self.codex_refresher
-        return self.refresher
+        if harness == "claude-code":
+            return self.refresher
+        return None
 
     def _register_with_refresher(
         self,
@@ -451,11 +517,17 @@ class Daemon:
         ):
             return
         refresher = self._refresher_for(agent_cfg)
+        if refresher is None:
+            # No daemon refresher owns this harness's credentials. Registering
+            # anyway would subscribe the agent to another provider's failure
+            # fan-out (`_flip_refresh_broken` / `_flip_auth_failed`) and to an
+            # `on_refresh_success` that would clear its reds for an unrelated
+            # reason.
+            return
         refresher.register_agent(agent_home_dir(agent_cfg.id))
         agent_id = agent_cfg.id
 
         def on_refresh_success() -> None:
-            was_auth_failed = worker.runtime.health == "auth_failed"
             Worker._clear_auth_failed_if_recoverable(
                 worker.runtime,
                 agent_id,
@@ -464,25 +536,40 @@ class Daemon:
             # Re-arm the auth_failed DM dedup so a re-expiry this
             # session re-notifies the operator.
             worker._auth_failed_notification_sent = False
-            if was_auth_failed:
-                # The running adapter session still holds the stale
-                # credential; a restart re-links the fresh cred and
-                # redelivers the stalled batch (cursor wasn't advanced).
-                try:
-                    flag = restart_flag_path(agent_id)
-                    flag.parent.mkdir(parents=True, exist_ok=True)
-                    flag.write_text("")
-                    logger.info(
-                        "agent %s: credential recovered — requesting restart "
-                        "to pick up the new credential",
-                        agent_id,
-                    )
-                except OSError as exc:
-                    logger.warning(
-                        "agent %s: could not write restart flag: %s",
-                        agent_id,
-                        exc,
-                    )
+            # Long-lived Claude/Codex subprocesses may retain the credential
+            # they opened with. Reload only the provider runtime at the
+            # worker's next idle boundary; keep the bridge connection and
+            # Puffo logical session intact.
+            try:
+                flag = refresh_provider_auth_flag_path(
+                    agent_cfg.resolve_workspace_dir()
+                )
+                flag.parent.mkdir(parents=True, exist_ok=True)
+                jitter_seconds = _provider_auth_reload_jitter_seconds()
+                flag.write_text(
+                    json.dumps({
+                        "source": "credential_replaced",
+                        "jitter_seconds": jitter_seconds,
+                        "not_before_unix_ms": int(
+                            (time.time() + jitter_seconds) * 1000
+                        ),
+                    }),
+                    encoding="utf-8",
+                )
+                worker.notify_refresh()
+                logger.info(
+                    "agent %s: credential replaced — provider reload requested "
+                    "with %.3fs jitter",
+                    agent_id,
+                    jitter_seconds,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "agent %s: could not request provider credential reload: %s",
+                    agent_id,
+                    exc,
+                )
+                raise
 
         refresher.register_on_refresh_success(on_refresh_success)
         # Stash callback identity for _stop_worker's unregister.
@@ -491,7 +578,13 @@ class Daemon:
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
         if Daemon._uses_claude_api_key(self, agent_cfg):
             return None
-        return self._refresher_for(agent_cfg).notify_refresh_needed
+        refresher = self._refresher_for(agent_cfg)
+        # None for harnesses no refresher owns: there is nothing to wake, and
+        # waking the Claude refresher on a Pi 401 only re-probes an unrelated
+        # provider. The worker already null-checks this.
+        return (
+            refresher.notify_refresh_needed if refresher is not None else None
+        )
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
         # Gateway/VK mode (runtime.llm_base_url set): the LLM key is a static
@@ -505,7 +598,10 @@ class Daemon:
             or Daemon._uses_claude_api_key(self, agent_cfg)
         ):
             return None
-        return self._refresher_for(agent_cfg).ensure_fresh
+        refresher = self._refresher_for(agent_cfg)
+        # No owning refresher -> no pre-delivery gate. The worker already
+        # treats None as "skip the gate" (same path gateway/VK mode uses).
+        return refresher.ensure_fresh if refresher is not None else None
 
     def _uses_claude_api_key(self, agent_cfg: AgentConfig) -> bool:
         runtime = agent_cfg.runtime
@@ -935,13 +1031,26 @@ def _mcp_fingerprint_path() -> Path:
     return home_dir() / "mcp_tool_fingerprint"
 
 
+async def _prepare_workers_at_startup() -> None:
+    """Finish worker prerequisites without blocking control-plane readiness."""
+    started = time.perf_counter()
+    try:
+        await asyncio.to_thread(_respawn_codex_on_mcp_change_at_startup)
+    except Exception:  # noqa: BLE001 - preparation is best-effort
+        logger.exception("startup: worker preparation failed; continuing")
+    logger.info(
+        "startup: worker preparation complete; elapsed_ms=%d",
+        int((time.perf_counter() - started) * 1000),
+    )
+
+
 def _respawn_codex_on_mcp_change_at_startup() -> None:
     """Rotate Codex sessions when their cached MCP surface changed."""
     import json
 
-    from ..mcp.puffo_core_server import mcp_tool_fingerprint
-
     try:
+        from ..mcp.puffo_core_server import mcp_tool_fingerprint
+
         current = mcp_tool_fingerprint()
     except Exception as exc:  # noqa: BLE001 - startup remains best-effort
         logger.warning("startup: mcp fingerprint failed: %s", exc)
@@ -1067,7 +1176,8 @@ async def _log_outdated_version_warning() -> None:
         logger.warning(
             "puffo-agent %s is behind the latest release (%s). "
             "this daemon may be missing features or fixes documented "
-            "on github. to upgrade: %s",
+            "on github. stop this daemon, run `%s`, then restart it with "
+            "`puffo-agent start --detach`.",
             local,
             remote,
             upgrade_command_for_install_mode(),
@@ -1109,14 +1219,9 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     }[harness]
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
-    from ..agent.model_catalog import provider_models
+    from ..agent.model_catalog import validate_model_id
 
-    supported = [m.id for m in provider_models(harness) if m.id]
-    if model not in supported:
-        raise ValueError(
-            f"model={model!r} not supported by harness={harness!r}; "
-            f"supported: {supported}"
-        )
+    validate_model_id(model)
 
 
 def _validate_daemon_inference_level(harness: str, level: str) -> None:
@@ -1387,38 +1492,62 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def _wait_for_existing_daemon_ready(pid: int, timeout: float = 10.0) -> bool:
+async def _observe_existing_daemon_startup(
+    pid: int,
+    timeout: float = DAEMON_STARTUP_OBSERVATION_SECONDS,
+) -> DaemonStartupState:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    while loop.time() < deadline:
+    while True:
         if is_daemon_ready(pid):
-            return True
+            return DaemonStartupState.READY
         if not is_pid_alive(pid):
-            return False
-        await asyncio.sleep(0.1)
-    return is_daemon_ready(pid)
+            return DaemonStartupState.EXITED
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return DaemonStartupState.STARTING
+        await asyncio.sleep(min(0.1, remaining))
+
+
+async def _existing_daemon_start_result() -> int | None:
+    if not is_daemon_alive():
+        return None
+    pid = read_daemon_pid()
+    if pid is not None and is_daemon_startup_stalled(pid):
+        msg = f"puffo-agent daemon is alive but stalled during startup (pid={pid})"
+        logger.error(msg)
+        print(msg)
+        return 1
+    startup = (
+        await _observe_existing_daemon_startup(pid)
+        if pid is not None
+        else DaemonStartupState.EXITED
+    )
+    if startup is DaemonStartupState.READY:
+        msg = f"puffo-agent daemon already running (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
+    if startup is DaemonStartupState.STARTING:
+        msg = f"puffo-agent daemon already starting (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
+    msg = f"puffo-agent daemon exited before becoming ready (pid={pid})"
+    logger.error(msg)
+    print(msg)
+    return 1
 
 
 async def run_daemon(
     external_stop_requested: threading.Event | None = None,
 ) -> int:
-    # Single-daemon enforcement. ``start`` against an already-running
-    # daemon exits 0 (the user wanted a running daemon; one exists) —
-    # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
-    # we never spawn a second daemon. A different running version isn't
-    # discriminated here; ``stop && start`` is the version-swap path.
-    if is_daemon_alive():
-        pid = read_daemon_pid()
-        if pid is not None and await _wait_for_existing_daemon_ready(pid):
-            # print + log: background / tray runners may not surface INFO.
-            msg = f"puffo-agent daemon already running (pid={pid})"
-            logger.info(msg)
-            print(msg)
-            return 0
-        msg = f"puffo-agent daemon failed to become ready (pid={pid})"
-        logger.error(msg)
-        print(msg)
-        return 1
+    # Single-daemon enforcement. ``start`` against an already-running or
+    # recently-started daemon exits 0; a live process that stayed unready
+    # beyond the stall threshold returns 1 with diagnostics. We never spawn
+    # a second daemon. ``stop && start`` remains the version-swap path.
+    if (existing := await _existing_daemon_start_result()) is not None:
+        return existing
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)

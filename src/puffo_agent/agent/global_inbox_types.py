@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Sequence
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from .context_controller import AdmissionCandidate
 from .message_projection import canonical_target_parts, format_message_group
 from .message_store import MessageStore, StoredMessage
+from ..tasks import spawn
 
 OUTPUT_TOOL_RESERVE_TOKENS = 4_096
 CURRENT_TURN_VERSION = 2
@@ -24,7 +25,7 @@ async def await_listener_with_runtime(
     label: str,
 ) -> Any:
     """Stop a transport listener as soon as its Inbox consumer exits."""
-    listener_task = asyncio.ensure_future(listener)
+    listener_task = spawn(listener, name="listener")
     try:
         done, _pending = await asyncio.wait(
             {listener_task, runtime_task},
@@ -145,6 +146,30 @@ class ActiveExactUnion:
 class RuntimeHealth:
     state: str = "idle"
     diagnostic: str = ""
+
+
+ProcessOutcomeCallback = Callable[[str, str | None], None]
+
+
+class TurnStatusLifecycle(Protocol):
+    """Worker-owned mirror of one durable Global Inbox turn."""
+
+    async def on_notice_admitted(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None: ...
+
+    async def on_turn_active(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None: ...
+
+    async def on_turn_terminal(
+        self,
+        *,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None: ...
 
 
 @dataclass
@@ -280,3 +305,9 @@ class ActiveBoundaryAdapter:
             channel_id,
         ):
             self.active.through_by_channel[key] = seq
+
+
+def opt_str(value: object) -> str | None:
+    """Coerce to str and fold empty to None (NULL in the covers table)."""
+    text = str(value or "")
+    return text or None

@@ -23,6 +23,100 @@ def test_daemon_run_calls_model_catalog_prefetch_at_startup():
     assert "model_catalog" in source and "prefetch" in source
 
 
+@pytest.mark.asyncio
+async def test_daemon_ready_precedes_worker_preparation_and_reconcile(
+    monkeypatch,
+):
+    """A slow MCP scan must not hide a usable control plane, while workers
+    must not reconcile until the scan has prepared their sessions."""
+    events = []
+
+    async def start_runtime(_self, _runtime):
+        events.append("control-plane")
+
+    async def prepare_workers():
+        events.append("worker-preparation")
+
+    async def reconcile(_self, _pid, _interval, _external_stop):
+        events.append("reconcile")
+
+    async def shutdown(_self, _runtime, _pid):
+        events.append("shutdown")
+
+    daemon = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    daemon.daemon_cfg = DaemonConfig()
+    daemon._stop = asyncio.Event()
+    monkeypatch.setattr(daemon_mod.Daemon, "_start_runtime", start_runtime)
+    monkeypatch.setattr(daemon_mod.Daemon, "_run_reconcile_loop", reconcile)
+    monkeypatch.setattr(daemon_mod.Daemon, "_shutdown_runtime", shutdown)
+    monkeypatch.setattr(
+        daemon_mod.Daemon,
+        "_stop_was_requested",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        daemon_mod,
+        "_prepare_workers_at_startup",
+        prepare_workers,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon_mod,
+        "write_daemon_ready",
+        lambda _pid: events.append("ready"),
+    )
+
+    await daemon.run()
+
+    assert events == [
+        "control-plane",
+        "ready",
+        "worker-preparation",
+        "reconcile",
+        "shutdown",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_preparation_failure_is_best_effort(
+    monkeypatch, caplog,
+):
+    def fail_preparation():
+        raise RuntimeError("preparation failed")
+
+    monkeypatch.setattr(
+        daemon_mod,
+        "_respawn_codex_on_mcp_change_at_startup",
+        fail_preparation,
+    )
+
+    await daemon_mod._prepare_workers_at_startup()
+
+    assert "worker preparation failed; continuing" in caplog.text
+
+
+def test_capabilities_fetch_claude_catalog_after_late_login(monkeypatch):
+    from puffo_agent.agent import cli_bin, model_catalog
+    from puffo_agent.portal.control.client import build_capabilities
+
+    calls = []
+    monkeypatch.setattr(cli_bin, "resolve_claude_bin", lambda: "/bin/claude")
+    monkeypatch.setattr(cli_bin, "claude_has_credentials", lambda: True)
+    monkeypatch.setattr(cli_bin, "resolve_codex_bin", lambda: None)
+    monkeypatch.setattr(cli_bin, "resolve_opencode_bin", lambda: None)
+    monkeypatch.setattr(cli_bin, "resolve_pi_bin", lambda: None)
+    monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ("claude-code", "codex"))
+    monkeypatch.setattr(
+        model_catalog,
+        "provider_models",
+        lambda harness, *, fetch=False: calls.append((harness, fetch)) or [],
+    )
+
+    build_capabilities()
+
+    assert calls == [("claude-code", True), ("codex", False)]
+
+
 def test_run_daemon_short_circuit_does_not_prefetch(monkeypatch):
     """The already-running short-circuit lives in ``run_daemon``, not
     ``Daemon.run`` — so a second daemon getting refused mustn't fire a
@@ -37,8 +131,8 @@ def test_run_daemon_short_circuit_does_not_prefetch(monkeypatch):
     ), patch(
         "puffo_agent.portal.daemon.read_daemon_pid", return_value=4242,
     ), patch(
-        "puffo_agent.portal.daemon._wait_for_existing_daemon_ready",
-        return_value=True,
+        "puffo_agent.portal.daemon._observe_existing_daemon_startup",
+        return_value=state_mod.DaemonStartupState.READY,
     ):
         rc = asyncio.run(daemon_mod.run_daemon())
     assert rc == 0

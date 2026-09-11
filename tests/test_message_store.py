@@ -1123,9 +1123,10 @@ async def test_sequence_less_server_receipt_is_never_pending_work():
         """INSERT INTO messages
            (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
             recipient_slug, content_type, content, sent_at, received_at,
-            thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
+            thread_root_id, reply_to_id, thread_root_unverified,
+            is_encrypted, receipt_disposition,
             receipt_reason, processing_state)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         values + (
             ReceiptDisposition.ELIGIBLE.value,
             "malformed legacy data",

@@ -383,7 +383,7 @@ async def test_reminder_routes_are_strict_and_return_structured_objects(
     assert captured == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00.000Z",
+            "intended_at": "2026-08-02T12:00:00.000Z", "covers": [],
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
@@ -486,7 +486,7 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
     assert captured == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00.000Z",
+            "intended_at": "2026-08-02T12:00:00.000Z", "covers": [],
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
@@ -652,3 +652,30 @@ async def test_sync_dispatches_to_handler(app_client_factory, monkeypatch):
     body = await resp.json()
     assert body == {"message": "synced!"}
     assert captured["template_id"] == "gmail-read"
+
+
+@pytest.mark.asyncio
+async def test_covers_wrong_types_are_rejected_not_dropped(app_client_factory):
+    """Falsy wrong-typed covers must 400, not silently become []."""
+    client = await app_client_factory()
+    reminder_body = {
+        "content": "c", "target": "channel:sp:ch",
+        "intended_at": "2026-08-02T12:00:00.000Z",
+    }
+    for bad in (False, 0, "", {}, "x", True, ["ok", 3], [""]):
+        response = await client.post(
+            "/v1/rpc/agent_a/create-reminder",
+            json={**reminder_body, "covers": bad},
+        )
+        assert response.status == 400, f"covers={bad!r} accepted"
+        response = await client.post(
+            "/v1/rpc/agent_a/send-message",
+            json={"destination": "@peer", "text": "hi", "covers": bad},
+        )
+        assert response.status == 400, f"send covers={bad!r} accepted"
+    for bad in (False, 0, "", {}, [], [""]):
+        response = await client.post(
+            "/v1/rpc/agent_a/mark-covered",
+            json={"covers": bad},
+        )
+        assert response.status == 400, f"mark covers={bad!r} accepted"

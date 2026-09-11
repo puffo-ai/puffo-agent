@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import functools
 import json
 import time
 import uuid
@@ -13,17 +13,18 @@ from typing import Any, TYPE_CHECKING
 
 from . import worker as worker_module
 from .runtime_matrix import (
-    HARNESS_CODEX,
     RUNTIME_CLI_DOCKER,
     RUNTIME_CLI_LOCAL,
-    resolve_effective_harness,
-    resolve_effective_provider,
 )
 from .state import agent_dir, shared_fs_dir
 from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
+from ..agent.errors import ProviderFailureError
+from ..agent.processing_receipts import processing_run_id
+from ..agent._usage_markers import looks_like_budget_cap, parse_reset_epoch
+from ..tasks import spawn
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -47,12 +48,13 @@ class WorkerRunPaths:
     system_prompt: str
 
     @property
-    def refresh_flags(self) -> tuple[Path, Path, Path]:
+    def refresh_flags(self) -> tuple[Path, Path, Path, Path]:
         root = Path(self.workspace_path) / ".puffo-agent"
         return (
             root / "refresh_agent.flag",
             root / "refresh_host_sync.flag",
             root / "refresh_session.flag",
+            root / "refresh_provider_auth.flag",
         )
 
 
@@ -80,6 +82,12 @@ class WorkerRunServices:
 
 
 class _NoopStatusReporter:
+    async def begin_notice_turn(self, _mid):
+        return None
+
+    async def end_notice_turn(self, **_kwargs):
+        return None
+
     async def begin_turn(self, _mid, *, run_id=None):
         return None
 
@@ -92,6 +100,11 @@ class _NoopStatusReporter:
     async def report_error(self, _text):
         return None
 
+    def set_activity_overlay(self, _activity) -> bool:
+        # Sync like the real reporter's state-only setter; False means
+        # "nothing changed", so emit_activity never tries to push.
+        return False
+
     async def run_heartbeat_loop(self):
         return None
 
@@ -102,30 +115,41 @@ class _NoopStatusReporter:
 class GlobalInboxStatusLifecycle:
     """Mirror one durable Global Inbox turn into Server processing rows.
 
-    ``begin_turn`` fires once for the first admitted real message. Run ids are
+    Provider admission first emits a provisional busy status anchored to the
+    notice's first message without creating a processing row. ``begin_turn``
+    fires only when ``read_inbox`` admits the first real message. Run ids are
     derived from the durable turn and message identities, so crash recovery
-    reopens and settles the same Server row. Later active-union expansions do
-    not reopen rows. Terminal cleanup settles the exact active union in one
-    ``end_turn_batch`` with the same success/error result. State always resets
-    so the next turn cannot inherit runs.
+    reopens and settles the same Server row. Terminal cleanup settles either
+    the exact active union or the provisional status. State always resets so
+    the next turn cannot inherit runs.
     """
 
     def __init__(self, reporter) -> None:
         self._reporter = reporter
+        self._notice_began = False
         self._began = False
         self._turn_id: str | None = None
+
+    async def on_notice_admitted(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        if not message_ids:
+            return
+        self._claim_turn(turn_id)
+        if self._notice_began or self._began:
+            return
+        self._notice_began = True
+        await self._reporter.begin_notice_turn(message_ids[0])
 
     async def on_turn_active(
         self, *, turn_id: str, message_ids: tuple[str, ...]
     ) -> None:
         if not message_ids:
             return
+        self._claim_turn(turn_id)
         if self._began:
-            if self._turn_id != turn_id:
-                raise RuntimeError("status lifecycle already owns another turn")
             return
         self._began = True
-        self._turn_id = turn_id
         await self._reporter.begin_turn(
             message_ids[0],
             run_id=self._run_id(turn_id, message_ids[0]),
@@ -139,14 +163,24 @@ class GlobalInboxStatusLifecycle:
         succeeded: bool,
         error_text: str | None,
     ) -> None:
-        if self._began and self._turn_id != turn_id:
+        if (self._notice_began or self._began) and self._turn_id != turn_id:
             raise RuntimeError("status lifecycle terminal turn does not match")
         runs = self._build_runs(turn_id, message_ids, succeeded, error_text)
         try:
             if runs:
                 await self._reporter.end_turn_batch(runs)
+            elif self._notice_began:
+                await self._reporter.end_notice_turn(
+                    succeeded=succeeded,
+                    error_text=error_text,
+                )
         finally:
             self.reset()
+
+    def _claim_turn(self, turn_id: str) -> None:
+        if self._turn_id is not None and self._turn_id != turn_id:
+            raise RuntimeError("status lifecycle already owns another turn")
+        self._turn_id = turn_id
 
     def _build_runs(
         self,
@@ -168,13 +202,13 @@ class GlobalInboxStatusLifecycle:
         return runs
 
     def reset(self) -> None:
+        self._notice_began = False
         self._began = False
         self._turn_id = None
 
     @staticmethod
     def _run_id(turn_id: str, message_id: str) -> str:
-        identity = f"{turn_id}\0{message_id}".encode("utf-8")
-        return f"run_{hashlib.sha256(identity).hexdigest()[:32]}"
+        return processing_run_id(turn_id, message_id)
 
 
 class StandardWorkerRun:
@@ -187,7 +221,10 @@ class StandardWorkerRun:
         context = await self._initialize()
         if context is None or not await self._warm(context):
             return
-        asyncio.ensure_future(self._sync_profile_after_warm(context.paths.agent_id))
+        spawn(
+            self._sync_profile_after_warm(context.paths.agent_id),
+            name="sync_profile_after_warm",
+        )
         services = await self._start_services(context)
         try:
             await self._listen(context, services)
@@ -279,26 +316,20 @@ class StandardWorkerRun:
     ) -> tuple[Any, str, Any]:
         worker = self.worker
         kind = worker.agent_cfg.runtime.kind or RUNTIME_CLI_LOCAL
-        provider = resolve_effective_provider(
-            kind, worker.agent_cfg.runtime.provider
-        )
-        harness = resolve_effective_harness(
-            kind, provider, worker.agent_cfg.runtime.harness
-        )
-        if kind == RUNTIME_CLI_DOCKER and harness == HARNESS_CODEX:
+        if kind == RUNTIME_CLI_DOCKER:
             return await self._prepare_driver_runtime(
                 paths,
                 outbox_ref,
-                worker_module.build_docker_codex_runtime(
+                worker_module.build_docker_runtime(
                     worker.daemon_cfg, worker.agent_cfg
                 ),
             )
         if kind != RUNTIME_CLI_LOCAL:
-            worker._adapter = worker_module.build_docker_adapter(
-                worker.daemon_cfg, worker.agent_cfg
+            raise RuntimeError(
+                f"agent {worker.agent_cfg.id!r}: runtime kind {kind!r} "
+                "does not use the built-in Driver runtime"
             )
-            return None, "", None
-        from ..agent.harness.local_runtime import LocalRuntimePreparer
+        from ..agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         return await self._prepare_driver_runtime(
             paths,
@@ -312,10 +343,7 @@ class StandardWorkerRun:
         outbox_ref: list[Any],
         preparer: Any,
     ) -> tuple[Any, str, Any]:
-        """Prepare a Driver-backed runtime and bind it to the durable
-        outbox. Shared by host-local Claude/Codex and Docker Codex; the
-        Docker owner's exec transport and bounded container stop are wired
-        into the Driver here at the composition boundary."""
+        """Prepare a Driver-backed runtime and bind it to the durable outbox."""
         from ..agent.runtime_event_outbox import (
             RuntimeEventOutbox,
             runtime_event_outbox_path,
@@ -329,8 +357,8 @@ class StandardWorkerRun:
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
-            persisted_session_fingerprint=persisted.get(
-                "session_fingerprint", ""
+            persisted_native_session_harness=persisted.get(
+                "native_session_harness", ""
             ),
         )
         try:
@@ -351,60 +379,96 @@ class StandardWorkerRun:
         prepared: Any,
         persisted: dict[str, Any],
     ) -> tuple[Any, str, Any]:
-        """Bind the prepared runtime to the durable outbox and the Runtime
-        Manager, injecting the Docker Codex Driver transport at the
-        composition boundary."""
+        """Bind a prepared runtime to the durable outbox and Runtime Manager."""
         worker = self.worker
-        from ..agent.harness.codex_driver import CodexAppServerDriver
-        from ..agent.harness.docker_runtime import DockerCodexPreparer
-        from ..agent.harness.local_runtime import build_local_runtime_adapter
+        from ..agent.harness import build_driver
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+        from ..agent.harness.runtime.local_runtime import build_local_runtime_adapter
 
-        if prepared.discarded_persisted_session:
-            session_ref = f"session_{uuid.uuid4().hex}"
-            active_turn_ref = None
-        else:
-            session_ref = (
-                persisted.get("session_ref", "")
-                or f"session_{uuid.uuid4().hex}"
-            )
-            active_turn_ref = persisted.get("active_turn_ref") or None
+        session_ref = (
+            persisted.get("session_ref", "")
+            or f"session_{uuid.uuid4().hex}"
+        )
+        active_turn_ref = persisted.get("active_turn_ref") or None
         outbox.set_active_turn(
             active_turn_ref,
             session_ref=session_ref,
             native_session_id=prepared.native_session_id,
-            session_fingerprint=prepared.session_fingerprint,
+            native_session_harness=prepared.harness_name,
         )
         driver = None
         cleanup = None
-        if isinstance(preparer := prepared.preparer, DockerCodexPreparer):
-            driver = CodexAppServerDriver(
-                process_factory=preparer.process_factory
+        if isinstance(preparer := prepared.preparer, DockerRuntimePreparer):
+            driver = build_driver(
+                prepared.harness_name,
+                process_factory=preparer.process_factory,
             )
             cleanup = preparer.aclose
+        from . import rpc_service
+
+        agent_id = prepared.preparer.agent_id
+
+        def pin_generation(generation: str) -> None:
+            # Runs between the spec reload minting a fresh generation
+            # and the reopen: the pin must move before the new
+            # subprocess can hello, or zombie beacon pressure inside
+            # that window trims the hello and fakes never-seen.
+            rpc_service.pin_mcp_generation(agent_id, generation)
+
+        # Warm opens the driver before ``_start_services`` builds the
+        # reporter, and a session resume can compact right there — hold
+        # the latest label so the reporter starts from it instead of
+        # silently dropping the whole warm-phase window.
+        worker._pending_activity = None
+
+        async def emit_activity(activity: str | None) -> None:
+            # The overlay flips synchronously (event order preserved);
+            # the heartbeat push runs detached because this callback
+            # fires under the runtime command lock and a slow status
+            # POST must not extend the lock or stall event processing.
+            # The reporter serializes status writes and builds each body
+            # under its send lock, so a duplicate or delayed push still
+            # lands carrying the newest state.
+            reporter = getattr(worker, "_status_reporter", None)
+            if reporter is None:
+                worker._pending_activity = activity
+                return
+            if reporter.set_activity_overlay(activity):
+                spawn(
+                    reporter.report_current_status(),
+                    name="activity-heartbeat",
+                )
+
         worker._adapter = build_local_runtime_adapter(
             prepared,
             outbox=outbox,
             logical_session_ref=session_ref,
             driver=driver,
             cleanup=cleanup,
+            generation_sink=pin_generation,
+            activity_sink=emit_activity,
         )
+        # Pin the initial mcp generation at the mint, not at the first
+        # probe (same window as above, prepare-time edition).
+        if prepared.spec.mcp_generation:
+            pin_generation(prepared.spec.mcp_generation)
         return outbox, session_ref, prepared
 
     async def _abort_docker_preparation(self, preparer: Any) -> None:
-        """Stop the Docker Codex container after a partial Driver assembly.
+        """Stop a Docker container after a partial Driver assembly.
 
         Only the Docker owner starts a container inside ``prepare``; the
         host-local preparer has nothing to tear down.
         """
-        from ..agent.harness.docker_runtime import DockerCodexPreparer
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
 
-        if not isinstance(preparer, DockerCodexPreparer):
+        if not isinstance(preparer, DockerRuntimePreparer):
             return
         try:
             await preparer.aclose()
         except Exception:
             logger.exception(
-                "agent %s: failed to stop Docker Codex container after "
+                "agent %s: failed to stop Docker container after "
                 "preparation failure",
                 self.worker.agent_cfg.id,
             )
@@ -426,9 +490,7 @@ class StandardWorkerRun:
                 claude_dir=paths.claude_path,
                 agent_id=agent_id,
             )
-            client = worker_module._build_puffo_core_client(
-                worker.agent_cfg, agent_id, daemon_cfg=worker.daemon_cfg
-            )
+            client = worker._build_wired_client()
             worker._client = client
             return WorkerRunContext(
                 paths=paths,
@@ -448,7 +510,10 @@ class StandardWorkerRun:
         worker = self.worker
         logger.error("agent %s: failed to initialise: %s", agent_id, exc, exc_info=True)
         worker.runtime.status = "error"
-        worker.runtime.error = str(exc)
+        if isinstance(exc, ProviderFailureError) and exc.error_code == "extra_usage_required":
+            worker._enter_extra_usage_required(agent_id)
+        else:
+            worker.runtime.error = str(exc)
         worker.runtime.save(agent_id)
         worker._warm_done.set()
         if worker._adapter is not None:
@@ -487,8 +552,8 @@ class StandardWorkerRun:
                 persisted.get("active_turn_ref") or None,
                 session_ref=context.runtime_session_ref,
                 native_session_id=worker._adapter.get_provider_session_id() or "",
-                session_fingerprint=(
-                    context.prepared_local_runtime.session_fingerprint
+                native_session_harness=(
+                    context.prepared_local_runtime.harness_name
                 ),
             )
             context.prepared_local_runtime.finalize_legacy_session_migration()
@@ -501,7 +566,11 @@ class StandardWorkerRun:
     @staticmethod
     def _retryable_local_warm_error(exc: Exception) -> bool:
         if isinstance(exc, worker_module.AgentAPIError):
-            return not exc.is_auth
+            # drained: hold-no-retry, same as auth
+            return not exc.is_auth and not exc.is_drained
+        if isinstance(exc, ProviderFailureError):
+            # plan quota arrives here, not as AgentAPIError
+            return exc.error_code not in {"plan_drained", "extra_usage_required"}
         return not isinstance(
             exc,
             (
@@ -552,7 +621,10 @@ class StandardWorkerRun:
             exc_info=True,
         )
         worker.runtime.status = "error"
-        worker.runtime.error = str(exc)
+        if isinstance(exc, ProviderFailureError) and exc.error_code == "extra_usage_required":
+            worker._enter_extra_usage_required(agent_id)
+        else:
+            worker.runtime.error = str(exc)
         worker.runtime.save(agent_id)
         worker._warm_done.set()
         try:
@@ -594,10 +666,15 @@ class StandardWorkerRun:
         return RuntimeEventUploader(context.runtime_event_outbox, append_transport)
 
     async def _apply_refresh(self, context: WorkerRunContext) -> None:
-        refresh_agent, refresh_host, refresh_session = context.paths.refresh_flags
+        (
+            refresh_agent,
+            refresh_host,
+            refresh_session,
+            refresh_provider_auth,
+        ) = context.paths.refresh_flags
         paths = context.paths
         worker = self.worker
-        await worker_module._process_refresh_flags(
+        ok = await worker_module._process_refresh_flags(
             agent_id=paths.agent_id,
             harness_name=paths.effective_harness,
             shared_path=paths.shared_path,
@@ -614,6 +691,12 @@ class StandardWorkerRun:
             refresh_agent_flag=refresh_agent,
             refresh_host_sync_flag=refresh_host,
             refresh_session_flag=refresh_session,
+            refresh_provider_auth_flag=refresh_provider_auth,
+        )
+        worker._note_refresh_reload(
+            ok,
+            (refresh_agent, refresh_host, refresh_session, refresh_provider_auth),
+            paths.agent_id,
         )
 
     async def _execute_global_turn(self, context: WorkerRunContext, planned):
@@ -644,16 +727,12 @@ class StandardWorkerRun:
         worker = self.worker
         worker._turn_active = True
         try:
-            try:
-                reply = await context.puffo.handle_global_inbox_retry(planned)
-            finally:
-                worker._turn_active = False
-        except worker_module.AgentAPIError as exc:
-            if exc.is_auth:
-                worker._enter_auth_failed(context.paths.agent_id)
-            raise
-        else:
-            worker._resolve_health_after_success(context.paths.agent_id)
+            worker_module.Worker._flip_health_in_progress(
+                worker.runtime, context.paths.agent_id, logger
+            )
+            reply = await context.puffo.handle_global_inbox_retry(planned)
+        finally:
+            worker._turn_active = False
         if reply:
             logger.warning(
                 "agent %s: suppressed global retry plain output; outbound "
@@ -665,14 +744,7 @@ class StandardWorkerRun:
         worker = self.worker
 
         async def run_global_turn(planned):
-            try:
-                reply = await self._execute_global_turn(context, planned)
-            except worker_module.AgentAPIError as exc:
-                if exc.is_auth:
-                    worker._enter_auth_failed(context.paths.agent_id)
-                raise
-            else:
-                worker._resolve_health_after_success(context.paths.agent_id)
+            reply = await self._execute_global_turn(context, planned)
             worker.runtime.msg_count += 1
             worker.runtime.last_event_at = int(time.time())
             if reply:
@@ -688,7 +760,13 @@ class StandardWorkerRun:
         run_global_turn.handle_global_inbox_retry = retry_global_turn
         return run_global_turn
 
-    def _build_global_runtime(self, context: WorkerRunContext, *, status_lifecycle=None):
+    def _build_global_runtime(
+        self,
+        context: WorkerRunContext,
+        *,
+        status_lifecycle=None,
+        process_outcome=None,
+    ):
         from ..agent.channel_audience import read_channel_audience
         from ..agent.global_inbox_runtime import (
             ActiveBoundaryAdapter,
@@ -708,16 +786,25 @@ class StandardWorkerRun:
             run_turn=self._build_global_turn_handler(context),
             workspace=paths.workspace_path,
             held_catchup=client.recover_pending_delivery,
-            send_mode_keys=(paths.agent_id, client.slug),
+            identity_aliases=(paths.agent_id, client.slug),
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
             status_lifecycle=status_lifecycle,
+            process_outcome=process_outcome,
             channel_audience_loader=lambda space_id, channel_id: read_channel_audience(
                 space_id,
                 channel_id,
                 http=client.http,
                 log=logger,
             ),
+            covers_renotice_enabled=(
+                True if worker.daemon_cfg.covers_renotice else None
+            ),
+            # Plan quota can unpark after a snapshot; extra usage requires
+            # an operator restart (new runtime) or a successful model turn.
+            drained_check=lambda: worker.runtime.health in {
+                "drained", "extra_usage_required",
+            },
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -731,6 +818,7 @@ class StandardWorkerRun:
                 client.store, global_runtime.active
             ),
             held_recovery_source=global_runtime.held_recovery_source,
+            channel_policy_source=client,
         )
         global_runtime.coordinator = coordinator
         global_runtime.send_delegate = TrackingSendDelegate(
@@ -739,6 +827,10 @@ class StandardWorkerRun:
         client.global_runtime = global_runtime
         client.send_coordinator = coordinator
         client.send_delegate = global_runtime.send_delegate
+        # Harness background tasks wake the model after the daemon turn is
+        # finalized; adopting those runs keeps sends and Inbox reads on the
+        # normal lifecycle instead of leaving them unbound.
+        global_runtime.register_autonomous_adoption()
         return global_runtime
 
     async def _prepare_reminder_sync(self, context: WorkerRunContext, runtime):
@@ -753,6 +845,14 @@ class StandardWorkerRun:
         interval = max(1.0, worker.daemon_cfg.runtime_heartbeat_seconds)
         while not worker._stop.is_set():
             worker.runtime.save(agent_id)
+            try:
+                await worker.probe_mcp_transport(agent_id)
+            except Exception:  # noqa: BLE001
+                # The probe must never take the heartbeat down with it.
+                logger.warning(
+                    "agent %s: MCP transport probe raised", agent_id,
+                    exc_info=True,
+                )
             try:
                 await asyncio.wait_for(worker._stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
@@ -787,32 +887,93 @@ class StandardWorkerRun:
         if not hasattr(client, "http"):
             return _NoopStatusReporter()
         reporter = self.worker._build_status_reporter(client)
-        return reporter if reporter is not None else _NoopStatusReporter()
+        reporter = reporter if reporter is not None else _NoopStatusReporter()
+        # A warm-phase compaction fires before this reporter exists; the
+        # sink parked the latest label on the worker. Seed the overlay
+        # before the heartbeat loop starts so its immediate first beat
+        # carries it (no extra push needed).
+        pending = getattr(self.worker, "_pending_activity", None)
+        if pending is not None:
+            self.worker._pending_activity = None
+            reporter.set_activity_overlay(pending)
+        # The harness activity sink (``_bind_driver_runtime``) late-binds to
+        # this attribute; cleared in teardown so a stopped reporter is never
+        # driven by a still-draining event stream.
+        self.worker._status_reporter = reporter
+        return reporter
+
+    @staticmethod
+    def _settle_process_health(
+        worker: Worker, agent_id: str, outcome: str, error_text: str | None
+    ) -> None:
+        try:
+            if outcome == "succeeded":
+                worker._resolve_health_after_success(agent_id)
+            elif outcome == "no_progress":
+                worker._note_no_progress_turn(agent_id)
+            elif outcome == "cancelled":
+                # not recovery evidence: a live no-progress streak stays red
+                worker_module.Worker._reassert_no_progress_after_cancel(
+                    worker, agent_id
+                )
+            elif outcome == "auth_failed":
+                worker._enter_auth_failed(agent_id)
+            elif outcome == "drained":
+                worker._enter_drained(
+                    agent_id,
+                    parse_reset_epoch(error_text or ""),
+                    budget_cap=looks_like_budget_cap(error_text or ""),
+                )
+            elif outcome == "extra_usage_required":
+                worker._enter_extra_usage_required(agent_id)
+            elif outcome == "api_error_abandoned":
+                worker_module.Worker._mark_api_error_abandoned_if_in_progress(
+                    worker.runtime, agent_id, error_text, logger
+                )
+            elif outcome == "provider_failed":
+                worker_module.Worker._mark_provider_failure_if_in_progress(
+                    worker.runtime, agent_id, error_text, logger
+                )
+            else:
+                worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
+                    worker.runtime, agent_id, error_text, logger
+                )
+        except Exception:
+            logger.warning("process health settlement failed", exc_info=True)
 
     async def _start_services(self, context: WorkerRunContext) -> WorkerRunServices:
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
         reporter = self._build_reporter(context.client)
+
         global_runtime = self._build_global_runtime(
             context,
             status_lifecycle=GlobalInboxStatusLifecycle(reporter),
+            process_outcome=functools.partial(
+                self._settle_process_health, worker, context.paths.agent_id
+            ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
-        global_task = asyncio.ensure_future(global_runtime.run())
+        global_task = spawn(
+            global_runtime.run(),
+            name="global_runtime.run",
+        )
         reminder_task = None
         if reminder_sync is not None:
-            reminder_task = asyncio.ensure_future(
-                reminder_sync.run(request_snapshot_on_start=False)
+            reminder_task = spawn(
+                reminder_sync.run(request_snapshot_on_start=False),
+                name="reminder_sync.run",
             )
-        heartbeat_task = asyncio.ensure_future(self._heartbeat(context.paths.agent_id))
-        status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
-        watch_task = asyncio.ensure_future(
+        heartbeat_task = spawn(self._heartbeat(context.paths.agent_id), name="heartbeat")
+        status_task = spawn(reporter.run_heartbeat_loop(), name="reporter.run_heartbeat_loop")
+        watch_task = spawn(
             worker._refresh_watcher_loop(
                 context.paths.refresh_flags,
                 lambda: self._apply_refresh(context),
-            )
+            ),
+            name="worker.refresh_watcher_loop",
         )
-        upload_task = asyncio.ensure_future(self._upload_runtime_events(uploader))
+        upload_task = spawn(self._upload_runtime_events(uploader), name="upload_runtime_events")
         return WorkerRunServices(
             global_runtime=global_runtime,
             global_runtime_task=global_task,
@@ -906,6 +1067,7 @@ class StandardWorkerRun:
         except (asyncio.CancelledError, Exception):
             pass
         services.reporter.stop()
+        self.worker._status_reporter = None
         background_tasks = (
             services.heartbeat_task,
             services.status_task,

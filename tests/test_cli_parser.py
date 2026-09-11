@@ -9,6 +9,7 @@ def test_top_level_commands_remain_on_the_public_parser():
 
     assert set(command_action.choices) == {
         "agent",
+        "autostart",
         "check-update",
         "config",
         "machine",

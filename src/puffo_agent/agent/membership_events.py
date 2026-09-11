@@ -71,6 +71,7 @@ async def evict_space_caches(
     space_members: dict[str, dict[str, str]],
     store: Any,
     log: Log,
+    channel_policies: dict[str, bool] | None = None,
 ) -> None:
     if not space_id:
         return
@@ -79,6 +80,8 @@ async def evict_space_caches(
     ]:
         channel_spaces.pop(channel_id, None)
         channel_names.pop(channel_id, None)
+        if channel_policies is not None:
+            channel_policies.pop(channel_id, None)
     space_names.pop(space_id, None)
     space_members.pop(space_id, None)
     try:
@@ -98,11 +101,14 @@ async def evict_channel_caches(
     channel_names: dict[str, str],
     store: Any,
     log: Log,
+    channel_policies: dict[str, bool] | None = None,
 ) -> None:
     if not channel_id:
         return
     channel_spaces.pop(channel_id, None)
     channel_names.pop(channel_id, None)
+    if channel_policies is not None:
+        channel_policies.pop(channel_id, None)
     try:
         await store.unmark_channel_space(channel_id)
     except Exception:

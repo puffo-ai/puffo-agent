@@ -33,6 +33,18 @@ INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 # codex model_reasoning_effort values.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
+# Pi --thinking values.
+PI_INFERENCE_LEVELS = (
+    "off", "minimal", "low", "medium", "high", "xhigh", "max",
+)
+
+# OpenCode ``run --variant`` values that map to Puffo's shared reasoning
+# vocabulary. Individual models publish only the subset advertised by
+# ``opencode models --verbose``.
+OPENCODE_INFERENCE_LEVELS = (
+    "off", "minimal", "low", "medium", "high", "xhigh", "max",
+)
+
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:
     """Reasoning-effort values implemented by a specific harness."""
@@ -40,6 +52,10 @@ def supported_inference_levels(harness: str) -> tuple[str, ...]:
         return REASONING_EFFORTS
     if harness == "claude-code":
         return INFERENCE_LEVELS
+    if harness == "pi":
+        return PI_INFERENCE_LEVELS
+    if harness == "opencode":
+        return OPENCODE_INFERENCE_LEVELS
     return ()
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
@@ -48,6 +64,7 @@ _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 PUFFO_CORE_TOOL_NAMES = (
     "send_message",
     "send_message_with_attachments",
+    "mark_covered",
     "list_spaces",
     "list_channels_in_all_spaces",
     "list_channels_in_space",

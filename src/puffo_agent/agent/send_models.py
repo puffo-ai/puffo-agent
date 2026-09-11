@@ -19,6 +19,7 @@ class SemanticSendRequest:
     root_id: str = ""
     visibility_level: str = "default"
     send_anyway: bool = False
+    covers: tuple[str, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> SemanticSendRequest:
@@ -32,6 +33,7 @@ class SemanticSendRequest:
             "root_id",
             "visibility_level",
             "send_anyway",
+            "covers",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -42,6 +44,11 @@ class SemanticSendRequest:
             isinstance(item, str) for item in paths
         ):
             raise ValueError("attachment paths must be a list of strings")
+        covers = value.get("covers", ()) or ()
+        if not isinstance(covers, (list, tuple)) or not all(
+            isinstance(item, str) for item in covers
+        ):
+            raise ValueError("covers must be a list of message-id strings")
         return cls(
             destination=str(destination or ""),
             text=str(value.get("text") or ""),
@@ -50,6 +57,7 @@ class SemanticSendRequest:
             root_id=str(value.get("root_id") or ""),
             visibility_level=str(value.get("visibility_level") or "default"),
             send_anyway=value.get("send_anyway", False) is True,
+            covers=tuple(covers),
         )
 
     def to_rpc_dict(self) -> dict[str, Any]:
@@ -59,6 +67,8 @@ class SemanticSendRequest:
             "visibility_level": self.visibility_level,
             "send_anyway": self.send_anyway,
         }
+        if self.covers:
+            body["covers"] = list(self.covers)
         if self.attachment_paths:
             body["paths"] = list(self.attachment_paths)
             body["caption"] = self.caption
@@ -97,6 +107,8 @@ class SemanticSendRequest:
             arguments["visibility_level"] = self.visibility_level
         if self.send_anyway:
             arguments["send_anyway"] = True
+        if self.covers:
+            arguments["covers"] = list(self.covers)
         return arguments
 
 

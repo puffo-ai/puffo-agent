@@ -26,6 +26,14 @@ def _strip_puffo_mcp_prefix_for_codex(text: str) -> str:
     return _MCP_PUFFO_PREFIX_RE.sub("", text)
 
 
+def _rewrite_puffo_mcp_prefix_for_opencode(text: str) -> str:
+    # opencode registers MCP tools as ``<server>_<tool>`` (its docs: "MCP
+    # server tools are registered with server name as prefix"), so the
+    # claude-code spelling ``mcp__puffo__send_message`` becomes
+    # ``puffo_send_message`` — rewrite, not strip.
+    return _MCP_PUFFO_PREFIX_RE.sub("puffo_", text)
+
+
 DEFAULT_SHARED_CLAUDE_MD = """\
 # Puffo.ai platform primer
 
@@ -101,12 +109,34 @@ without progress. Respect conversations clearly directed at someone else, do
 not duplicate another participant's completed report, and skip idle narration
 that provides no useful information.
 
+## Covers
+
+A cover is your explicit declaration that an inbound message has been dealt
+with. Reading a message does not cover it — the runtime cannot tell a reply
+from a shrug, so disposal is only what you declare:
+
+- Replying: pass the handled inbound message ids in the `covers` argument of
+  `mcp__puffo__send_message`. One reply may cover several messages, including
+  messages from another channel or thread than the one you send to.
+- Deferring: `mcp__puffo__create_reminder` accepts the same `covers` argument;
+  scheduling follow-up work is a valid disposal.
+- No reply needed, or a forgotten declaration: `mcp__puffo__mark_covered`
+  with the message ids (and a short note saying why) settles a message
+  without sending anything.
+
+"Uncovered" means exactly that no cover was declared — not that the message
+was mishandled. At turn end, human messages left uncovered may be redelivered
+once: the notice announces them as `[uncovered message_count=N]` and the rows
+carry `uncovered_redelivery=true`. Settle each one immediately — reply with
+`covers`, or `mark_covered` it — the redelivery is one-shot and will not come
+back a third time.
+
 ## Coordination
 
 For small, cheap, reversible work where duplicate effort is negligible, act
 directly. When a request benefits from several Agents or can be divided into
 substantive independent parts, inspect the latest conversation, choose one
-uncovered part that best fits your role, capabilities, and available tools,
+unclaimed part that best fits your role, capabilities, and available tools,
 and send a concise claim before beginning that work. A claim becomes visible
 only after it is successfully sent and remains provisional as context changes.
 
@@ -168,6 +198,10 @@ The notice above contains metadata only; pending messages exist. Call
 `read_inbox` now and read enough of the pending snapshot to understand what
 arrived before deciding what to do. Do not finish this turn from notice
 metadata alone. Use `read_history` only if earlier context is needed.
+
+Before ending the turn, dispose of every human message you read — across
+all threads and channels: pass its id in `covers` on the send or reminder
+that handles it, or call `mark_covered` when no reply is needed.
 </puffo_runtime_instruction>"""
 
 
@@ -187,7 +221,7 @@ revise toward the next useful contribution rather than treating overlapping
 peer content as your participation.
 
 If the draft was a claim, it did not establish ownership. Inspect newer claims
-and select an uncovered part before investing significant effort.
+and select an unclaimed part before investing significant effort.
 
 Read the returned context and any additional target history you need, then
 reconsider what response, clarification, or follow-up still advances the
@@ -215,7 +249,7 @@ Post a message to a Puffo.ai channel or DM a user.
   channel. No `#<name>` shortcut; use `list_channels_in_all_spaces`
   to look up an id.
 - `text` (required) — message body. Markdown preserved on the wire.
-- `root_id` (optional) — envelope_id (`msg_<uuid>`) of the post you
+- `root_id` (optional) — `message_id` (`msg_<uuid>`) of the post you
   are replying to; opens a thread. It must be the true thread root,
   not an arbitrary reply id. Preserve the Inbox target by default:
   omit it for `target_type="channel"`, and pass the supplied
@@ -303,7 +337,7 @@ separate messages).
 - `caption`: optional text posted alongside the files. Empty by
   default; recipients see just the attachments.
 - `root_id`: optional — reply with the attachments inside an
-  existing thread. Pass the true thread-root envelope_id; see the
+  existing thread. Pass the true thread-root `message_id`; see the
   `send-message` skill for validation details.
 - `visibility_level`: same semantics as `send_message` — `"human"` /
   `"default"` / `"agent_only"`. Default `"default"`; the @-mention
@@ -324,9 +358,10 @@ DEFAULT_SKILL_ATTACHMENTS = """\
 
 When a user sends you a file, the daemon decrypts it before your
 turn starts and saves it at
-``<workspace>/.puffo/inbox/<envelope_id>/<filename>``. The absolute
-path shows up in the `attachments:` block of the message metadata —
-one line per file.
+``<workspace>/.puffo/inbox/<message_id>/<filename>``. Its
+workspace-relative path shows up in the message's
+`attachment_paths=[...]` field, for example
+``.puffo/inbox/<message_id>/<filename>``.
 
 **What to do with them:**
 - Read text-shaped files (`.md`, `.txt`, `.json`, source code, …)
@@ -481,14 +516,14 @@ agents. Use `identity`, not display name, as the unique identity.
 DEFAULT_SKILL_GET_POST = """\
 # Skill: get_post
 
-Fetch a single message by its envelope_id from the daemon's local
+Fetch a single message by its `message_id` from the daemon's local
 message store. Its result uses the shared projection described by the
 `read-messages` skill.
 
 **Tool:** `mcp__puffo__get_post`
 
 **Arguments:**
-- `post_ref` (required) — envelope_id (`msg_<uuid>`). Permalinks
+- `post_ref` (required) — `message_id` (`msg_<uuid>`). Permalinks
   aren't a thing on puffo-core; agents address messages by id.
 
 **Important:** this reads from local storage only. The daemon stores
@@ -571,7 +606,7 @@ orthogonal axes; combine them freely.
 | `refresh()` | Rebuild `CLAUDE.md` + re-sync puffo default skills. Subprocess respawns on next turn, session preserved. |
 | `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
 | `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
-| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
+| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, and respawn the worker. The same harness resumes its session; a different harness falls back to a new native session. |
 | `refresh(inference_level="medium")` | Set reasoning effort, persist to `agent.yml`, respawn. Standalone or alongside a harness+model swap. |
 
 **When to use:**

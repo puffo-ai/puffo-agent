@@ -134,6 +134,57 @@ def format_oauth_expired(agent_id: str, agent_display_name: str = "") -> str:
     )
 
 
+_HARNESS_LABELS = {
+    "pi": "Pi",
+    "opencode": "OpenCode",
+    "gemini": "Gemini",
+}
+
+
+def format_generic_oauth_expired(
+    agent_id: str, agent_display_name: str = "", harness: str = "",
+) -> str:
+    """Operator DM for a harness with no verified re-login command.
+
+    Deliberately names the harness but *not* a command. The Claude copy
+    used to be the fallback for every non-Codex harness, which told Pi
+    and OpenCode operators to run `claude auth login` for a CLI they may
+    not even have installed. Guessing a replacement is the same mistake:
+    `pi auth` exposes `print-api-key` / `print-bearer-token` / `check`
+    and no `login` at all, so a plausible-looking `pi auth login` would
+    be just as wrong. Naming the harness and leaving the how to the
+    operator is the honest form until a command is verified per harness.
+    """
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    name = _HARNESS_LABELS.get(harness, harness) or "provider"
+    return (
+        f"⚠️ {label} — my {name} sign-in was rejected, so I can't answer "
+        "you until it's renewed.\n"
+        "\n"
+        "**On the computer where puffo-agent is running:**\n"
+        f"1. Re-authenticate {name} the same way you first signed it in.\n"
+        "2. Come back here and send me a message — I'll pick up where I "
+        "left off.\n"
+        "\n"
+        f"(No command is given because {name} has no single verified "
+        "re-login command; running the wrong CLI's login would not fix "
+        "this agent.)\n"
+        "\n"
+        f"⚠️ {label} — 我的 {name} 登录被拒绝，需要重新授权后才能"
+        "继续回复。\n"
+        "\n"
+        "**在运行 puffo-agent 的电脑上：**\n"
+        f"1. 用你当初登录 {name} 的方式重新授权。\n"
+        "2. 回到这里发一条消息即可恢复。\n"
+        "\n"
+        f"（这里不给具体命令：{name} 没有单一且已核实的重新登录命令，"
+        "跑错 CLI 的登录并不能修好这只 Agent。）"
+    )
+
+
 def format_anthropic_api_key_rejected(
     agent_id: str, agent_display_name: str = "",
 ) -> str:
@@ -157,6 +208,72 @@ def format_anthropic_api_key_rejected(
         "`puffo-agent config --anthropic-api-key KEY`）。\n"
         "2. 保持 `anthropic.cli_use_api_key: true`。\n"
         "3. 重启 puffo-agent，然后再发一条消息。"
+    )
+
+
+def _resets_clause(resets_at: int | None) -> tuple[str, str]:
+    """``(en, zh)`` reset clause in host-local time, or empty pair."""
+    if not resets_at:
+        return "", ""
+    from datetime import datetime
+
+    try:
+        when = datetime.fromtimestamp(resets_at).strftime("%b %d, %H:%M")
+    except (OverflowError, OSError, TypeError, ValueError):
+        # unusable epoch: send the DM without a time
+        return "", ""
+    return f" It resets around **{when}**.", f"额度大约在 **{when}** 重置。"
+
+
+def format_drained(
+    agent_id: str,
+    agent_display_name: str = "",
+    *,
+    resets_at: int | None = None,
+    provider: str = "Claude Code",
+) -> str:
+    """Bilingual quota-exhausted operator DM. No re-auth step: re-login
+    cannot refill a spent quota."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name else f"`{agent_id}`"
+    )
+    en_reset, zh_reset = _resets_clause(resets_at)
+    return (
+        f"🪫 {label} — my {provider} usage limit is spent, so I can't "
+        f"answer you until it refills.{en_reset} I'm holding your "
+        "messages rather than retrying; nothing is lost.\n"
+        "\n"
+        "**Your options:**\n"
+        "1. Wait for the window to reset, then send me a message to get me going again.\n"
+        "2. Switch me to a smaller model (`/config`, or the model field on my agent card).\n"
+        "3. Add credits / raise the spend cap on the account this host is signed in with.\n"
+        "4. Upgrade the plan if you hit this often.\n"
+        "\n"
+        "**This is not a sign-in problem — re-running a login command won't help.**\n"
+        "\n"
+        f"🪫 {label} — 我的 {provider} 用量额度已经用完，要等额度恢复才能"
+        f"继续回复。{zh_reset}我会先把消息存住、不重试，不会丢。\n"
+        "\n"
+        "**你可以：**\n"
+        "1. 等窗口重置后再给我发条消息，我就会继续干活。\n"
+        "2. 把我换成更小的模型（`/config`，或 agent 卡片上的 model 字段）。\n"
+        "3. 给这台机器登录的账号加额度 / 提高消费上限。\n"
+        "4. 如果经常撞到，考虑升级套餐。\n"
+        "\n"
+        "**这不是登录问题 —— 重新跑登录命令没有用。**"
+    )
+
+
+def format_codex_drained(
+    agent_id: str,
+    agent_display_name: str = "",
+    *,
+    resets_at: int | None = None,
+) -> str:
+    """Codex sibling of :func:`format_drained`; provider name only."""
+    return format_drained(
+        agent_id, agent_display_name, resets_at=resets_at, provider="Codex",
     )
 
 
@@ -189,4 +306,34 @@ def format_codex_oauth_expired(
         "2. 运行：`codex login`\n"
         "3. 按浏览器提示用你的 Codex 账户登录。\n"
         "4. 登录完成后回到这里发一条消息即可恢复。"
+    )
+
+
+def format_budget_exceeded(agent_id: str, agent_display_name: str = "") -> str:
+    """Bilingual gateway-budget DM. Unlike a plan window there is nothing to
+    wait for: the cap is raised or the wallet is topped up, or it stays."""
+    label = (
+        f"**{agent_display_name}** (`{agent_id}`)"
+        if agent_display_name
+        else f"`{agent_id}`"
+    )
+    return (
+        f"🪫 {label} — the spending cap on the account behind my key is "
+        "exhausted, so the LLM gateway is refusing my requests. I'm holding "
+        "your messages and will re-check every 5–30 minutes; nothing is lost.\n"
+        "\n"
+        "**Your options:**\n"
+        "1. Top up the wallet or raise the cap for this account.\n"
+        "2. Switch me to a cheaper model (`/config`, or the model field on my agent card).\n"
+        "\n"
+        "**This is not a sign-in problem, and it will not reset on its own.**\n"
+        "\n"
+        f"🪫 {label} — 我这把密钥所属账户的消费上限已经用完，网关正在拒绝我的请求。"
+        "我会先把你的消息存住，每隔 5–30 分钟再试一次，不会丢。\n"
+        "\n"
+        "**你可以：**\n"
+        "1. 给这个账户充值，或提高消费上限。\n"
+        "2. 把我换成更便宜的模型（`/config`，或 agent 卡片上的 model 字段）。\n"
+        "\n"
+        "**这不是登录问题，也不会自己恢复。**"
     )

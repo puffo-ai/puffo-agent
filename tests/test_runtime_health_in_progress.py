@@ -8,9 +8,9 @@ Tests the two new static helpers on Worker:
   other state alone.
 
 Also covers the StatusReporter heartbeat shape extension (carries
-both per-turn ``status`` AND persistent ``health``) and the
-``cli.cmd_agent_list`` surfaced-health tuple includes
-``in_progress``.
+both per-turn ``status`` AND persistent ``health``). CLI surfacing of
+non-ok health moved to ``tests/test_no_progress_turn_guard.py`` — see the
+note further down.
 """
 
 from __future__ import annotations
@@ -192,6 +192,21 @@ def test_fallback_unhandled_error_default_error_when_caller_passes_none(
     assert rs.error  # populated even when caller had no error text
 
 
+def test_categorized_provider_failure_is_not_reported_as_unhandled(
+    tmp_path, monkeypatch,
+):
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+
+    Worker._mark_provider_failure_if_in_progress(
+        rs, agent_id, "provider usage limit reached", _LOG,
+    )
+
+    assert rs.health == "provider_error"
+    assert rs.error == "provider usage limit reached"
+
+
 # ── chain integration tests (PR #59 Blocker 1 + Blocker 2) ───────
 
 
@@ -221,11 +236,7 @@ def test_chain_agent_api_error_then_retry_success_resolves_to_ok(
     on_disk = RuntimeState.load(agent_id)
     assert on_disk is not None and on_disk.health == "in_progress"
 
-    # T2: consumer kicks the retry; it succeeds; on_turn_success
-    # fires the same helper pair the worker installed in this PR.
-    Worker._clear_api_error_abandoned_if_recoverable(
-        rs, agent_id, "root_x", _LOG,
-    )
+    # T2: consumer kicks the retry; process success resolves the health state.
     Worker._resolve_health_on_success(rs, agent_id, _LOG)
 
     assert rs.health == "ok"
@@ -333,24 +344,15 @@ async def test_heartbeat_provider_exception_does_not_break_heartbeat(monkeypatch
     assert body == {"status": "idle"}
 
 
-# ── CLI surfaced-health includes new values ──────────────────────
-
-
-def test_cli_surfaced_health_tuple_includes_new_values():
-    """Source-string check on cli.py's cmd_agent_list tuple (running
-    the CLI does heavy daemon init). Pins the new PUF-270 values."""
-    cli_path = (
-        Path(__file__).parent.parent
-        / "src" / "puffo_agent" / "portal" / "cli.py"
-    )
-    text = cli_path.read_text(encoding="utf-8")
-    for required in (
-        "in_progress",
-        "unhandled_error",
-        "auth_failed",
-        "api_error_abandoned",
-        "refresh_broken",
-    ):
-        assert f'"{required}"' in text, (
-            f"surfaced-health tuple missing {required!r}"
-        )
+# ── CLI surfaced-health ──────────────────────────────────────────
+#
+# The former ``test_cli_surfaced_health_tuple_includes_new_values`` grepped
+# cli.py for each health literal, because "running the CLI does heavy daemon
+# init". That rationale had expired: ``cmd_agent_list`` runs under three
+# monkeypatches. It also pinned the wrong thing — the *shape* of a
+# hand-maintained roster rather than the property that a non-ok health value
+# reaches the operator, so it went green on values nobody had added to the
+# roster. Replaced by the behavioural checks in
+# ``tests/test_no_progress_turn_guard.py`` (``..._is_visible_in_agent_list``,
+# ``test_every_non_ok_health_value_is_visible``), which drive the command and
+# read its output.

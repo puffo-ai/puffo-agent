@@ -1,10 +1,10 @@
 """One table-driven regression test for the worker Global Inbox status lifecycle.
 
-The durable Global Inbox turn — not WebSocket receipt — owns
-``StatusReporter.begin_turn`` / ``end_turn_batch``: exactly one begin on the
-first real admitted message, exactly one terminal batch over the exact active
-union, and no Server processing rows for synthetic ``intro-prompt-*``
-envelopes even though busy state is shown.
+The durable Global Inbox turn — not WebSocket receipt — owns status reporting:
+provider admission emits one provisional busy heartbeat, while ``read_inbox``
+owns ``StatusReporter.begin_turn`` and the first real processing row. Terminal
+cleanup settles the exact active union, and synthetic ``intro-prompt-*``
+envelopes show busy state without creating Server processing rows.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import asyncio
 import pytest
 
 from puffo_agent.agent.core import AgentAPIError
+from puffo_agent.agent.errors import ProviderFailureError
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.status_reporter import StatusReporter
 from puffo_agent.portal.worker_run import GlobalInboxStatusLifecycle
@@ -36,18 +37,22 @@ class _LifecycleRunner:
 
     async def __call__(self, planned):
         await self.adapter.admit()
+        if self.outcome == "no_read":
+            return None
         await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         if self.expand:
             await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         if self.outcome == "failure":
             raise self.error
         if self.outcome == "cancelled":
-            raise asyncio.CancelledError()
-        if self.outcome == "retry":
+            raise AgentAPIError("rate limit", is_auth=False)
+        if self.outcome in {"retry", "retry_exhausted"}:
             raise AgentAPIError("rate limit", is_auth=False)
         return None
 
     async def handle_global_inbox_retry(self, _planned):
+        if self.outcome == "retry_exhausted":
+            raise AgentAPIError("rate limit", is_auth=False)
         return None
 
 
@@ -55,8 +60,12 @@ _CASES = [
     {"id": "success_expanded", "outcome": "success", "expand": True},
     {"id": "success_then_second_turn", "outcome": "success", "expand": False, "second": True},
     {"id": "provider_failure", "outcome": "failure", "expand": False},
+    {"id": "quota_drained", "outcome": "failure", "expand": False,
+     "error_code": "plan_drained"},
     {"id": "cancelled", "outcome": "cancelled", "expand": False},
     {"id": "retry_same_turn", "outcome": "retry", "expand": False},
+    {"id": "retry_exhausted", "outcome": "retry_exhausted", "expand": False},
+    {"id": "success_without_read", "outcome": "no_read", "expand": False},
     {"id": "synthetic_intro", "outcome": "success", "expand": False, "synthetic": True},
 ]
 
@@ -83,19 +92,41 @@ def _assert_status_wire(case: dict, http, lifecycle) -> None:
     batch_runs = _batch_runs(http)
     turns = 2 if case.get("second") else 1
     # Clean per-turn state: a subsequent case/turn cannot inherit runs.
+    assert lifecycle._notice_began is False
     assert lifecycle._began is False
+    heartbeats = [
+        body for path, body in http.calls if path == "/agents/me/heartbeat"
+    ]
     if case.get("synthetic"):
-        heartbeats = [
-            body for path, body in http.calls if path == "/agents/me/heartbeat"
-        ]
         # Busy is shown for the synthetic turn, but no processing row reaches
-        # the wire for the synthetic id.
-        assert [body["status"] for body in heartbeats] == ["busy", "idle"]
-        assert "current_message_id" not in heartbeats[0]
+        # the wire for the synthetic id. Three beats pin the activity
+        # phases: "reading messages" while the notice is admitted, an
+        # immediate cleared beat when the intro turn starts composing
+        # (the reading phase is over and no /processing/start exists to
+        # clear it server-side), idle at terminal.
+        assert [
+            (body["status"], body.get("activity")) for body in heartbeats
+        ] == [
+            ("busy", "reading_messages"),
+            ("busy", None),
+            ("idle", None),
+        ]
+        assert all("current_message_id" not in body for body in heartbeats)
         assert begin_runs == {}
         assert batch_runs == []
         assert not any("/processing/" in path for path, _ in http.calls)
         return
+    if case["outcome"] == "no_read":
+        assert [body["status"] for body in heartbeats] == ["busy", "idle"]
+        assert heartbeats[0]["current_message_id"] == "m1"
+        assert begin_runs == {}
+        assert batch_runs == []
+        return
+    assert len(heartbeats) == turns
+    assert [body["status"] for body in heartbeats] == ["busy"] * turns
+    assert heartbeats[0]["current_message_id"] == "m1"
+    if case.get("second"):
+        assert heartbeats[1]["current_message_id"] == "m3"
     # Exactly one begin per logical turn, and one terminal batch per turn.
     assert len(begin_runs) == turns
     assert len(batch_runs) == turns
@@ -141,6 +172,7 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
     )
     store = await make_store(tmp_path)
     http = FakeHttp()
+    process_outcomes = []
     lifecycle = GlobalInboxStatusLifecycle(
         StatusReporter(http, heartbeat_interval_s=999)
     )
@@ -167,16 +199,27 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         adapter,
         expand=case["expand"],
         outcome=case["outcome"],
-        error=RuntimeError("provider exploded"),
+        error=ProviderFailureError(
+            "The selected provider model is unavailable.",
+            error_code=case.get("error_code", "provider_unavailable"),
+        ),
     )
+    async def retry_sleep(_delay):
+        if case["outcome"] == "cancelled":
+            raise asyncio.CancelledError()
+        await asyncio.sleep(0)
+
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
         run_turn=runner,
         workspace=tmp_path,
         status_lifecycle=lifecycle,
+        process_outcome=lambda outcome, error: process_outcomes.append(
+            (outcome, error)
+        ),
         max_api_retries=1,
-        retry_sleep=lambda _delay: asyncio.sleep(0),
+        retry_sleep=retry_sleep,
     )
     runner.runtime = runtime
 
@@ -189,6 +232,21 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         await receipt(store, "m3", 3)
         assert await runtime.process_once() is True
     _assert_status_wire(case, http, lifecycle)
+    expected_outcome = {
+        "failure": "provider_failed",
+        "cancelled": "cancelled",
+        "retry_exhausted": "api_error_abandoned",
+        # A turn that woke on an announced batch and read none of it no longer
+        # settles health as a success: the provider may simply have deferred,
+        # but a driver mis-reporting a failed turn produces the same shape, so
+        # the health lane holds instead of clearing to ``ok``. Message
+        # bookkeeping is unchanged — see ``_health_outcome_for_turn``.
+        "no_read": "no_progress",
+    }.get(case["outcome"], "succeeded")
+    if case.get("error_code") == "plan_drained":
+        # spent quota splits out of provider_failed: hold, don't retry
+        expected_outcome = "drained"
+    assert process_outcomes[0][0] == expected_outcome
     await store.close()
 
 
@@ -222,6 +280,7 @@ async def test_crash_recovery_reuses_and_settles_original_processing_run(tmp_pat
         async def handle_global_inbox_retry(self, _planned):
             return None
 
+    process_outcomes = []
     recovered = GlobalInboxRuntime(
         store=store,
         adapter=_ContinuationAdapter(),
@@ -230,9 +289,13 @@ async def test_crash_recovery_reuses_and_settles_original_processing_run(tmp_pat
         status_lifecycle=GlobalInboxStatusLifecycle(
             StatusReporter(http, heartbeat_interval_s=999)
         ),
+        process_outcome=lambda outcome, error: process_outcomes.append(
+            (outcome, error)
+        ),
     )
 
     assert await recovered.recover_current_turn() is True
+    assert process_outcomes == [("succeeded", None)]
     starts = [
         body
         for path, body in http.calls

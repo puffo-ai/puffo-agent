@@ -49,12 +49,6 @@ class _FakeDataClient:
         self.messages: dict[str, object] = {}
         self.exc: Exception | None = None
         self.calls: list[str] = []
-        # Existing tool tests exercise the E2EE branch; plaintext-branch
-        # tests flip this to False.
-        self.send_encryption = True
-
-    async def get_send_encryption(self, slug, thread_root_id):
-        return self.send_encryption
 
     def add(
         self,
@@ -84,6 +78,14 @@ class _FakeDataClient:
         if self.exc is not None:
             raise self.exc
         return self.messages.get(envelope_id)
+
+    async def get_thread_messages(self, root_id: str, limit: int = 50):
+        if self.exc is not None:
+            raise self.exc
+        return [
+            m for m in self.messages.values()
+            if m.envelope_id == root_id or m.thread_root_id == root_id
+        ][:limit]
 
 
 async def _resolve(dc, root_id, **kw):
@@ -136,6 +138,34 @@ async def test_outgoing_root_lookup_miss_wipes_to_none():
     resolved, note = await _resolve(dc, "msg_unknown")
     assert resolved is None
     assert "not in local cache" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_missing_but_claimed_is_kept():
+    dc = _FakeDataClient()
+    dc.add("msg_reply", thread_root_id="ghost-root", channel_id="ch_1")
+    resolved, note = await _resolve(dc, "ghost-root", channel_id="ch_1")
+    assert resolved == "ghost-root" and note == ""
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_missing_claimant_wrong_channel_rejects():
+    dc = _FakeDataClient()
+    dc.add("msg_reply", thread_root_id="ghost-root", channel_id="ch_OTHER")
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "ghost-root", channel_id="ch_1")
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_missing_but_claimed_dm_is_kept():
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_reply", thread_root_id="ghost-root",
+        envelope_kind="dm", sender_slug="peer-0001",
+        recipient_slug="agent-0001",
+    )
+    resolved, note = await _resolve(dc, "ghost-root", dm_peer="peer-0001")
+    assert resolved == "ghost-root" and note == ""
 
 
 @pytest.mark.asyncio
@@ -876,7 +906,7 @@ async def test_send_message_dm_rejects_channel_root():
     """DM sends scope-check too: a channel message as root rejects."""
     cfg, http, ms = _setup()
     _seed_recipient(http, "alice-0001")
-    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = (
+    http.responses["/certs/sync?slugs=alice-0001"] = (
         http.responses["/certs/sync?slugs=alice-0001"]
     )
     await ms.store({

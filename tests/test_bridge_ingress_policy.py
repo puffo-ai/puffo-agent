@@ -224,7 +224,10 @@ async def test_keyless_gated_dm_lifecycle_is_durable_and_prompt_echo_is_redacted
     await asyncio.gather(*tuple(client._ack_tasks))
     prompt_echo = await client.store.get_message_by_envelope(prompt_id)
     assert prompt_echo is not None
-    assert prompt_echo.content == DM_GATE_PROMPT_PLACEHOLDER
+    assert prompt_echo.content == {
+        "text": DM_GATE_PROMPT_PLACEHOLDER,
+        "is_visible_to_human": True,
+    }
     await client.store.close()
 
 

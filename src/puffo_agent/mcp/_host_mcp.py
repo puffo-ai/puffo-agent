@@ -46,6 +46,18 @@ class PuffoRpcClient:
             await self._session.close()
             self._session = None
 
+    async def hello(
+        self, generation: str, *, beacon_interval: float | None = None,
+    ) -> str:
+        """Hello beacon: prove this subprocess can reach the daemon's
+        RPC service, tagged with the mcp-config generation that spawned
+        it. ``beacon_interval`` declares the re-hello cadence so the
+        daemon may read sustained silence as a wedged transport."""
+        body: dict[str, Any] = {"generation": generation}
+        if beacon_interval is not None:
+            body["beacon_interval"] = beacon_interval
+        return await self._post("mcp-hello", body)
+
     async def _post(self, route: str, body: dict[str, Any]) -> str:
         """POST + return the ``message`` field. Raises on transport or non-2xx."""
         path = (
@@ -163,6 +175,7 @@ class PuffoRpcClient:
         root_id: str = "",
         visibility_level: str = "default",
         send_anyway: bool = False,
+        covers: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "channel": channel,
@@ -174,6 +187,8 @@ class PuffoRpcClient:
             body.update(paths=paths, caption=caption)
         else:
             body["text"] = text
+        if covers:
+            body["covers"] = covers
         return await self._post_structured("send-message", body)
 
     async def stage_model_visible_read(
@@ -267,7 +282,9 @@ class PuffoRpcClient:
             raise RuntimeError(f"rpc read-inbox transport error: {exc}") from exc
 
     @staticmethod
-    def _validate_reminder_object(data: dict[str, Any]) -> dict[str, Any]:
+    def _validate_reminder_object(
+        data: dict[str, Any], *, allow_covers: bool = False
+    ) -> dict[str, Any]:
         # During a rolling local upgrade, a new MCP subprocess can briefly
         # talk to an older daemon that still exposed this internal state.
         if data.get("state") == "claimed":
@@ -277,7 +294,17 @@ class PuffoRpcClient:
             "intended_at", "actual_fire_at", "created_at", "cancelled_at",
             "delivered_at",
         }
-        if set(data) != required or data.get("state") not in {
+        # Cover outcomes ride only on the create response; every other
+        # reminder surface keeps the strict exact-shape contract.
+        optional = {"covers_recorded", "covers_unknown"} if allow_covers else set()
+        covers_ok = all(
+            isinstance(data[key], list)
+            and all(isinstance(item, str) for item in data[key])
+            for key in optional & set(data)
+        )
+        if set(data) - optional != required or not covers_ok or data.get(
+            "state"
+        ) not in {
             "scheduled", "cancelled", "delivered",
         } or not all(
             isinstance(data.get(key), str)
@@ -290,12 +317,59 @@ class PuffoRpcClient:
         return data
 
     async def create_reminder(
-        self, *, content: str, target: str, intended_at: str,
+        self,
+        *,
+        content: str,
+        target: str,
+        intended_at: str,
+        covers: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        return self._validate_reminder_object(await self._post_object(
-            "create-reminder",
-            {"content": content, "target": target, "intended_at": intended_at},
-        ))
+        body: dict[str, Any] = {
+            "content": content, "target": target, "intended_at": intended_at,
+        }
+        if covers:
+            body["covers"] = covers
+        try:
+            data = await self._post_object("create-reminder", body)
+        except RuntimeError as exc:
+            # Rolling local upgrade: an older daemon rejects the covers key
+            # wholesale. The deferral matters more than the declaration, so
+            # retry without covers and report them as dropped.
+            if not covers or "accepts only" not in str(exc):
+                raise
+            data = await self._post_object(
+                "create-reminder",
+                {"content": content, "target": target, "intended_at": intended_at},
+            )
+            data = {**data, "covers_recorded": [], "covers_dropped": list(covers)}
+        dropped = data.pop("covers_dropped", None)
+        validated = self._validate_reminder_object(data, allow_covers=True)
+        if dropped is not None:
+            validated = {**validated, "covers_dropped": dropped}
+        return validated
+
+    async def mark_covered(
+        self,
+        *,
+        covers: list[str],
+        by_message_id: str = "",
+        note: str = "",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"covers": covers}
+        if by_message_id:
+            body["by_message_id"] = by_message_id
+        if note:
+            body["note"] = note
+        try:
+            return await self._post_object("mark-covered", body)
+        except RuntimeError as exc:
+            if "404" in str(exc) or "failed (404)" in str(exc):
+                raise RuntimeError(
+                    "mark_covered is not available on this daemon yet "
+                    "(rolling upgrade in progress); declare covers on the "
+                    "send or reminder instead"
+                ) from exc
+            raise
 
     async def list_reminders(
         self, *, state: str = "", limit: int = 50,

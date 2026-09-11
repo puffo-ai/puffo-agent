@@ -15,6 +15,7 @@ import pytest
 
 from puffo_agent.mcp.config import (
     INFERENCE_LEVELS,
+    OPENCODE_INFERENCE_LEVELS,
     REASONING_EFFORTS,
     write_codex_mcp_config,
 )
@@ -117,7 +118,7 @@ def test_legacy_yml_without_field_defaults_empty(tmp_path, monkeypatch):
 
 
 def _local_spec(tmp_path: Path, monkeypatch, level: str):
-    from puffo_agent.agent.harness import local_runtime
+    from puffo_agent.agent.harness.runtime import local_runtime
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
@@ -136,19 +137,22 @@ def _local_spec(tmp_path: Path, monkeypatch, level: str):
     return preparer._prepare_claude_spec("")
 
 
-def _docker_adapter(level: str):
-    from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
+def _docker_spec(tmp_path: Path, monkeypatch, level: str):
+    from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
-    a = DockerCLIAdapter.__new__(DockerCLIAdapter)
-    a.agent_id = "t-1"
-    a._docker_bin = "docker"
-    a.container_name = "puffo-t-1"
-    a.claude_api_key = ""
-    a.env_overrides = {}
-    a.auto_compact_threshold_pct = None
-    a.model = "claude-opus-4-8"
-    a.inference_level = level
-    return a
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    cfg = AgentConfig(
+        id="t-1",
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-opus-4-8",
+            inference_level=level,
+        ),
+    )
+    return DockerRuntimePreparer(DaemonConfig(), cfg)._prepare_claude_spec("")
 
 
 @pytest.mark.parametrize(
@@ -163,13 +167,14 @@ def test_local_claude_effort_args(tmp_path, monkeypatch, level, expected):
         assert args[args.index("--effort") + 1] == expected
 
 
-def test_docker_claude_argv_carries_effort():
-    cmd = _docker_adapter("high")._build_command([])
-    assert cmd[cmd.index("--effort") + 1] == "high"
+def test_docker_claude_argv_carries_effort(tmp_path, monkeypatch):
+    args = list(_docker_spec(tmp_path, monkeypatch, "high").launch_args)
+    assert args[args.index("--effort") + 1] == "high"
 
 
-def test_docker_claude_argv_skips_invalid():
-    assert "--effort" not in _docker_adapter("turbo")._build_command([])
+def test_docker_claude_argv_skips_invalid(tmp_path, monkeypatch):
+    args = _docker_spec(tmp_path, monkeypatch, "turbo").launch_args
+    assert "--effort" not in args
 
 
 # ─── inference_level via the self-serve refresh MCP ──────────
@@ -178,10 +183,12 @@ def test_docker_claude_argv_skips_invalid():
 from puffo_agent.mcp.config import supported_inference_levels  # noqa: E402
 from puffo_agent.mcp.puffo_core_server import (  # noqa: E402
     _validate_refresh_inference_level,
+    _validate_refresh_model,
 )
 from puffo_agent.portal.daemon import (  # noqa: E402
     _process_daemon_refresh_flags,
     _validate_daemon_inference_level,
+    _validate_daemon_refresh_model,
 )
 from puffo_agent.portal.state import refresh_model_flag_path  # noqa: E402
 
@@ -189,6 +196,10 @@ from puffo_agent.portal.state import refresh_model_flag_path  # noqa: E402
 def test_supported_levels_are_per_harness():
     assert supported_inference_levels("codex") == REASONING_EFFORTS
     assert supported_inference_levels("claude-code") == INFERENCE_LEVELS
+    assert supported_inference_levels("pi") == (
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    )
+    assert supported_inference_levels("opencode") == OPENCODE_INFERENCE_LEVELS
     # codex has minimal but not xhigh; claude-code the reverse.
     assert "xhigh" not in supported_inference_levels("codex")
     assert "minimal" not in supported_inference_levels("claude-code")
@@ -221,6 +232,45 @@ def test_daemon_validator_rejects_codex_xhigh():
     with pytest.raises(ValueError):
         _validate_daemon_inference_level("codex", "xhigh")
     _validate_daemon_inference_level("codex", "high")  # no raise
+
+
+@pytest.mark.parametrize(
+    "validator",
+    [_validate_refresh_model, _validate_daemon_refresh_model],
+)
+def test_refresh_model_catalog_is_advisory(monkeypatch, validator):
+    """A syntactically valid custom model must survive a catalog miss."""
+    from puffo_agent.agent import cli_bin, model_catalog
+
+    monkeypatch.setattr(cli_bin, "resolve_codex_bin", lambda: "/bin/codex")
+    monkeypatch.setattr(
+        model_catalog,
+        "provider_models",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("refresh validation must not consult discovery")
+        ),
+    )
+
+    validator("codex", "gpt-6-astra")
+
+
+@pytest.mark.parametrize(
+    "validator,error_type",
+    [
+        (_validate_refresh_model, RuntimeError),
+        (_validate_daemon_refresh_model, ValueError),
+    ],
+)
+@pytest.mark.parametrize("model", ["", "x" * 129, "bad\nmodel"])
+def test_refresh_model_keeps_syntax_gate(
+    monkeypatch, validator, error_type, model,
+):
+    """Removing catalog admission must not let malformed CLI arguments through."""
+    from puffo_agent.agent import cli_bin
+
+    monkeypatch.setattr(cli_bin, "resolve_codex_bin", lambda: "/bin/codex")
+    with pytest.raises(error_type):
+        validator("codex", model)
 
 
 def _codex_agent(tmp_path, monkeypatch, aid="codex-refresh", level=""):

@@ -193,11 +193,13 @@ async def _insert_new_receipt(
         """INSERT INTO messages
            (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
             recipient_slug, content_type, content, sent_at, received_at,
-            thread_root_id, reply_to_id, is_encrypted, server_seq,
+            thread_root_id, reply_to_id, thread_root_unverified,
+            is_encrypted, server_seq,
             receipt_disposition, receipt_reason, processing_state)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         values + (server_seq, disposition.value, reason, processing),
     )
+    await _settle_unverified_thread_claims(db, values)
     await store._advance_server_sequence_high_water(db, server_seq)
     if processing == ProcessingState.PENDING.value:
         await store._refresh_notice_state(db, activated_at=int(values[9]))
@@ -207,6 +209,74 @@ async def _insert_new_receipt(
         disposition,
         reason,
         store._receipt_ack(disposition),
+    )
+
+
+async def _settle_unverified_thread_claims(
+    db: aiosqlite.Connection,
+    values: tuple[Any, ...],
+) -> None:
+    """Run the deferred root check for replies that claimed this message.
+
+    A reply whose claimed thread root was not locally verifiable at receipt
+    time kept the claim with ``thread_root_unverified=1``. When the claimed
+    message finally arrives, apply the same ownership rules the live path
+    uses: a matching channel/space (or DM conversation) verifies the claim;
+    a mismatch (or the "root" being no root at all) wipes it.
+    """
+    envelope_id = values[0]
+    envelope_kind, channel_id, space_id = values[1], values[3], values[4]
+    sender_slug, recipient_slug = values[2], values[5]
+    own_root, own_root_unverified = values[10], values[12]
+    if envelope_kind == "channel" and not own_root:
+        await db.execute(
+            """UPDATE messages SET thread_root_unverified = 0
+               WHERE thread_root_unverified = 1 AND thread_root_id = ?
+                 AND channel_id = ?
+                 AND (space_id IS NULL OR ? IS NULL OR space_id = ?)""",
+            (envelope_id, channel_id, space_id, space_id),
+        )
+    elif envelope_kind == "channel" and own_root:
+        # The claimed "root" is itself a reply: re-root claimants to its
+        # own (already validated) root, inheriting its verification state.
+        await db.execute(
+            """UPDATE messages SET thread_root_id = ?, thread_root_unverified = ?
+               WHERE thread_root_unverified = 1 AND thread_root_id = ?
+                 AND channel_id = ?""",
+            (own_root, 1 if own_root_unverified else 0, envelope_id, channel_id),
+        )
+    elif envelope_kind == "dm" and not own_root:
+        # Same-conversation check mirrors validated_parent: both of the
+        # claimant's participants must appear among the root's participants.
+        await db.execute(
+            """UPDATE messages SET thread_root_unverified = 0
+               WHERE thread_root_unverified = 1 AND thread_root_id = ?
+                 AND envelope_kind = 'dm'
+                 AND sender_slug IN (?, ?) AND recipient_slug IN (?, ?)""",
+            (
+                envelope_id,
+                sender_slug, recipient_slug,
+                sender_slug, recipient_slug,
+            ),
+        )
+    elif envelope_kind == "dm" and own_root:
+        await db.execute(
+            """UPDATE messages SET thread_root_id = ?, thread_root_unverified = ?
+               WHERE thread_root_unverified = 1 AND thread_root_id = ?
+                 AND envelope_kind = 'dm'
+                 AND sender_slug IN (?, ?) AND recipient_slug IN (?, ?)""",
+            (
+                own_root, 1 if own_root_unverified else 0, envelope_id,
+                sender_slug, recipient_slug,
+                sender_slug, recipient_slug,
+            ),
+        )
+    # Any remaining claimants live in a different channel/space/DM or
+    # claimed a message of another kind: the deferred check failed, wipe.
+    await db.execute(
+        """UPDATE messages SET thread_root_id = NULL, thread_root_unverified = 0
+           WHERE thread_root_unverified = 1 AND thread_root_id = ?""",
+        (envelope_id,),
     )
 
 
@@ -265,9 +335,10 @@ async def store_local_receipt_unlocked(
             """INSERT INTO messages
                (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
                 recipient_slug, content_type, content, sent_at, received_at,
-                thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
+                thread_root_id, reply_to_id, thread_root_unverified,
+                is_encrypted, receipt_disposition,
                 receipt_reason, local_ordinal, after_server_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             values + (normalized.value, reason, ordinal, frontier),
         )
         await db.commit()

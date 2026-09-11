@@ -275,7 +275,7 @@ async def test_sync_copies_host_entry_to_agent(tmp_path):
         (ctx.agent_home / ".claude.json").read_text(encoding="utf-8"),
     )
     assert agent_data["mcpServers"]["gmail-read"] == entry
-    assert "refresh()" in msg
+    assert "provider reload" in msg
 
 
 # ── codex harness path ─────────────────────────────────────────────
@@ -394,8 +394,8 @@ async def test_sync_codex_validates_host_entry_present(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sync_codex_does_not_write_agent_file(tmp_path):
-    """Codex sync verifies host has the entry and points the agent
-    at refresh() — the worker's restart code does the re-merge.
+    """Codex sync verifies the host entry and leaves re-merging to the
+    provider reload requested by the MCP tool wrapper.
     Agent-side write would just get overwritten with the same
     content on the next restart, so we skip it."""
     ctx = _ctx(tmp_path, harness="codex")
@@ -408,7 +408,7 @@ async def test_sync_codex_does_not_write_agent_file(tmp_path):
 
     msg = await host_mcp_handler.sync(ctx, template_id="gmail-read")
 
-    assert "refresh()" in msg
+    assert "provider reload" in msg
     assert "re-merges" in msg
     # No file under agent_home/.codex was touched.
     assert not (ctx.agent_home / ".codex").exists()
@@ -484,3 +484,38 @@ async def test_sync_codex_reports_encrypted_oauth_is_not_portable(tmp_path):
     assert "OS-keyring-encrypted store" in msg
     assert "mcp_oauth_credentials_store" in msg
     assert not (ctx.agent_home / ".codex" / ".credentials.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_operator_dm_fails_when_operator_has_no_devices(tmp_path):
+    """The agent's own devices must not mask an operator with zero
+    encryption devices — same invariant as the coordinator and daemon
+    DM paths."""
+    device_key = "A" * 43  # base64url for 32 zero bytes
+
+    async def get(path):
+        if path.startswith("/certs/sync?slugs=op-test"):
+            return {"entries": [], "has_more": False}
+        if path.startswith("/certs/sync?slugs=bot-test"):
+            return {
+                "entries": [{
+                    "seq": 1,
+                    "kind": "device_cert",
+                    "cert": {
+                        "device_id": "dev_sender",
+                        "kem_public_key": device_key,
+                    },
+                }],
+                "has_more": False,
+            }
+        return {}
+
+    from puffo_agent.crypto.keystore import encode_secret
+
+    ctx = _ctx(tmp_path, http_get=get)
+    ctx.keystore.load_session.return_value.subkey_secret_key = encode_secret(
+        bytes(32)
+    )
+    with pytest.raises(RuntimeError, match="no recipient devices resolved"):
+        await host_mcp_handler._send_dm_to_operator(ctx, "hello operator")
+    assert ctx.http_client.post.await_count == 0

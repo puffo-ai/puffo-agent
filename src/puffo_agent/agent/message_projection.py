@@ -107,11 +107,20 @@ def target_label(
     channel_id = str(_value(message, "channel_id") or "")
     if not channel_id or str(_value(message, "envelope_kind", "")) == "dm":
         peer = _dm_peer(message, current_agent_aliases)
-        return (
+        header = (
             f"context context_version={CONTEXT_VERSION} "
             f"target_type=\"dm\" target_ref={_quoted(f'dm:{peer}')} "
             f"peer_identity={_quoted('@' + peer)}"
         )
+        # DM replies can already carry a thread_root_id (send_message's
+        # root_id validates against the DM's own history), but target_ref
+        # stays dm:<peer> -- DMs aren't independently routable per thread.
+        root_id = _effective_thread_root(
+            message, explicit_thread_root_id=thread_root_id,
+        )
+        if root_id:
+            header += f" thread_root_id={_quoted(root_id)}"
+        return header
     space_id = str(_value(message, "space_id") or "")
     effective_thread_root_id = _effective_thread_root(
         message, explicit_thread_root_id=thread_root_id,
@@ -172,6 +181,7 @@ def format_inbox_notice(
     targets: Sequence[Mapping[str, Any]],
     latest_seq: int | None,
     read_tool: str,
+    uncovered_message_count: int = 0,
 ) -> str:
     """Render a content-free notice in the shared conversation grammar."""
     fields = [
@@ -185,6 +195,11 @@ def format_inbox_notice(
         f"latest_seq={latest_seq if latest_seq is not None else 'null'}",
     ]
     lines = [f"[inbox {' '.join(fields)}]"]
+    if uncovered_message_count > 0:
+        lines.append(
+            f"[uncovered context_version={CONTEXT_VERSION} "
+            f"message_count={int(uncovered_message_count)}]"
+        )
     for row in targets:
         target_ref = str(row["target"])
         lines.append(f"## {target_label_from_ref(target_ref)}")
@@ -292,6 +307,8 @@ def sender_type(message: Any, *, current_agent_aliases: Sequence[str] = ()) -> s
     explicit = content.get("sender_type") or _value(message, "sender_type", "")
     if explicit in {"human", "agent", "system"}:
         return str(explicit)
+    if _normalized_slug(_value(message, "sender_slug")) == "system":
+        return "system"
     if (
         content.get("sender_is_agent")
         or content.get("sender_is_bot")
@@ -338,8 +355,25 @@ def _attachment_paths(message: Any) -> list[str]:
         "attachment_paths", _content(message).get("attachments"),
     )
     if isinstance(attachments, Sequence) and not isinstance(attachments, (str, bytes)):
-        return [str(path) for path in attachments if path not in (None, "")]
+        return [
+            model_attachment_path(path)
+            for path in attachments
+            if path not in (None, "")
+        ]
     return []
+
+
+def model_attachment_path(value: Any) -> str:
+    """Project a materialized Inbox file into the harness workspace."""
+    raw = str(value)
+    parts = raw.replace("\\", "/").split("/")
+    for index in range(len(parts) - 1):
+        if parts[index:index + 2] != [".puffo", "inbox"]:
+            continue
+        relative = parts[index:]
+        if ".." not in relative:
+            return "/".join(relative)
+    return raw
 
 
 def _mentions(message: Any) -> list[dict[str, Any]]:
@@ -479,6 +513,16 @@ def format_message_row(
         fields.append(f"mentions={_json(mentions)}")
     if reply_count is not None:
         fields.append(f"reply_count={reply_count}")
+    if bool(_value(message, "renotified", False)):
+        # The marker describes one live redelivery attempt, not permanent
+        # row history: once the row settles (PROCESSED), history reads must
+        # stop asking the model to settle it again.
+        state = _value(message, "processing_state", "")
+        state = getattr(state, "value", state)
+        if state in ("pending", "in_turn"):
+            fields.append("uncovered_redelivery=true")
+    if bool(_value(message, "thread_root_unverified", False)):
+        fields.append("thread_root_unverified=true")
     return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 

@@ -22,6 +22,7 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     # send
     "send_message",
     "send_message_with_attachments",
+    "mark_covered",
     # read / navigation
     "read_inbox",
     "read_history",

@@ -15,12 +15,10 @@ from typing import Any
 from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
-from ..agent import send_mode
 from ..agent.send_coordinator import SemanticSendRequest, failed_result
 from ..crypto.message import (
     EncryptInput,
     RecipientDevice,
-    build_plaintext_message,
     encrypt_message,
 )
 from ..crypto.primitives import Ed25519KeyPair
@@ -332,18 +330,22 @@ async def _send_dm_to_operator(
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(sess.subkey_secret_key)
     )
-    # Unthreaded DM — only the turn-bundle rule applies (no store here).
-    encrypt = await send_mode.encryption_required(ctx.slug, None, None)
-    devices: list[RecipientDevice] = []
-    if encrypt:
-        devices = await _fetch_device_keys(
-            ctx.http_client,
-            [ctx.slug, ctx.operator_slug],
+    # The operator is fetched alone so their reachability is checked on
+    # its own — the agent's own devices must not mask an operator with
+    # zero encryption devices.
+    operator_devices = await _fetch_device_keys(
+        ctx.http_client,
+        [ctx.operator_slug],
+    )
+    if not operator_devices:
+        raise RuntimeError(
+            f"no recipient devices resolved for @{ctx.operator_slug}"
         )
-        if not devices:
-            raise RuntimeError(
-                f"no recipient devices resolved for @{ctx.operator_slug}"
-            )
+    self_devices = await _fetch_device_keys(ctx.http_client, [ctx.slug])
+    merged: dict[str, RecipientDevice] = {}
+    for device in (*operator_devices, *self_devices):
+        merged.setdefault(device.device_id, device)
+    devices = list(merged.values())
     inp = EncryptInput(
         envelope_kind="dm",
         sender_slug=ctx.slug,
@@ -357,12 +359,8 @@ async def _send_dm_to_operator(
         content=text,
         recipients=devices,
     )
-    if encrypt:
-        envelope = encrypt_message(inp, signing_key)
-        await ctx.http_client.post("/messages", envelope)
-    else:
-        envelope = build_plaintext_message(inp, signing_key)
-        await ctx.http_client.post("/v2/messages/plaintext", envelope)
+    envelope = encrypt_message(inp, signing_key)
+    await ctx.http_client.post("/messages", envelope)
     return str(envelope.get("envelope_id") or "?")
 
 
@@ -554,9 +552,8 @@ async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
         )
         return (
             f"Verified host's ~/.codex/config.toml has {template_id!r}."
-            f"{oauth_note} Call refresh() - your codex worker re-merges the "
-            "host's mcp_servers into your own config on every restart, so "
-            "the new entry will be live immediately."
+            f"{oauth_note} Your codex worker re-merges the host's "
+            "mcp_servers into its own config on provider reload."
         )
 
     host_claude_json = ctx.host_home / ".claude.json"
@@ -580,8 +577,7 @@ async def sync(ctx: HostMcpContext, *, template_id: str) -> str:
     _atomic_write_claude_json(agent_claude_json, agent_data)
     return (
         f"Synced host's {template_id!r} entry into your "
-        f"~/.claude.json. Call refresh() so claude respawns and "
-        f"loads it."
+        f"~/.claude.json. It is ready for the next provider reload."
     )
 
 
@@ -623,6 +619,7 @@ async def send_message(
     root_id: str = "",
     visibility_level: str = "default",
     send_anyway: bool = False,
+    covers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Dispatch a semantic model send through the worker-owned coordinator."""
     coordinator = ctx.send_coordinator
@@ -639,6 +636,7 @@ async def send_message(
         root_id=str(root_id or ""),
         visibility_level=str(visibility_level or "default"),
         send_anyway=send_anyway is True,
+        covers=tuple(covers or ()),
     )
     result = await coordinator.send(request)
     if not isinstance(result, dict):
@@ -719,6 +717,7 @@ async def create_reminder(
     content: str,
     target: str,
     intended_at: str,
+    covers: list[str] | None = None,
 ) -> dict[str, object]:
     """Resolve reminder creation against the warm worker's one Inbox runtime."""
     runtime = getattr(ctx.message_client, "global_runtime", None)
@@ -728,6 +727,25 @@ async def create_reminder(
         content=content,
         target=target,
         intended_at=intended_at,
+        covers=covers,
+    )
+
+
+async def mark_covered(
+    ctx: HostMcpContext,
+    *,
+    covers: list[str],
+    by_message_id: str = "",
+    note: str = "",
+) -> dict[str, object]:
+    """Resolve standalone cover marking against the warm worker's runtime."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.mark_covered(
+        covers=covers,
+        by_message_id=by_message_id,
+        note=note,
     )
 
 

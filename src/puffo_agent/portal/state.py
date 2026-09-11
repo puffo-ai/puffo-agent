@@ -27,6 +27,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,21 @@ from ..limits import DEFAULT_CATCHUP_STALE_HOURS
 
 
 logger = logging.getLogger(__name__)
+
+
+DAEMON_STARTUP_OBSERVATION_SECONDS = 10.0
+# Slow startup remains non-fatal; this only marks an old unready process
+# as diagnosably stalled when a later command inspects it.
+DAEMON_STARTUP_STALLED_SECONDS = 300.0
+DAEMON_STOP_STALLED_SECONDS = 60.0
+
+
+class DaemonStartupState(Enum):
+    """What a bounded startup observation can prove about a daemon."""
+
+    READY = "ready"
+    STARTING = "starting"
+    EXITED = "exited"
 
 
 # Where daemon.yml, agents/, etc. live.
@@ -115,6 +131,8 @@ _sync_host_skills_dir = _host_assets._sync_host_skills_dir
 sync_host_skills = _host_assets.sync_host_skills
 sync_host_codex_skills = _host_assets.sync_host_codex_skills
 sync_host_gemini_skills = _host_assets.sync_host_gemini_skills
+select_pi_auth_home = _host_assets.select_pi_auth_home
+sync_host_pi_auth_view = _host_assets.sync_host_pi_auth_view
 _looks_host_local_command = _host_assets._looks_host_local_command
 _host_local_token = _host_assets._host_local_token
 filter_container_mcp_servers = _host_assets.filter_container_mcp_servers
@@ -214,9 +232,12 @@ def delete_flag_path(agent_id: str) -> Path:
     return agent_dir(agent_id) / ".puffo-agent" / "delete.flag"
 
 
-# Refresh flags — 5 axes touched by MCP refresh() / CLI / control-ws.
+# Refresh flags — user-facing refresh axes plus the daemon-owned provider-auth
+# reload signal.
 # All under ``<workspace>/.puffo-agent/`` so the location is reachable
 # from both the worker and the MCP subprocess in cli-docker.
+
+PROVIDER_AUTH_RELOAD_JITTER_MAX_SECONDS = 30.0
 
 
 def refresh_agent_flag_path(workspace: Path) -> Path:
@@ -229,6 +250,19 @@ def refresh_host_sync_flag_path(workspace: Path) -> Path:
 
 def refresh_session_flag_path(workspace: Path) -> Path:
     return workspace / ".puffo-agent" / "refresh_session.flag"
+
+
+def refresh_provider_auth_flag_path(workspace: Path) -> Path:
+    """Request an idle-boundary provider runtime reload after OAuth changes.
+
+    Unlike ``refresh_session.flag``, this preserves the Puffo logical session
+    and asks the harness to resume its native session with the replacement
+    credential. The runtime manager falls back to a fresh native session only
+    when that saved session is explicitly unavailable. Daemon-authored payloads
+    include ``not_before_unix_ms`` so simultaneous fleet reloads can be spread
+    across a bounded jitter window without losing the durable request.
+    """
+    return workspace / ".puffo-agent" / "refresh_provider_auth.flag"
 
 
 def refresh_model_flag_path(workspace: Path) -> Path:
@@ -326,6 +360,9 @@ class DaemonConfig:
     segment_chars: int = 2000
     # Catch-up older than this is stored but skips the LLM; <= 0 disables.
     catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
+    # Redeliver uncovered human messages once at turn end. Observation
+    # events fire regardless; this only gates the redelivery itself.
+    covers_renotice: bool = False
     ws_local_service: WsLocalServiceConfig = field(
         default_factory=WsLocalServiceConfig,
     )
@@ -361,6 +398,7 @@ class DaemonConfig:
             catchup_stale_hours=float(
                 raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
             ),
+            covers_renotice=raw.get("covers_renotice") is True,
         )
         p = raw.get("anthropic") or {}
         cfg.anthropic = AnthropicProviderConfig(
@@ -525,11 +563,15 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Agent engine (CLI kinds only). cli-local supports the long-lived
-    # ``claude-code`` and ``codex`` Drivers; cli-docker supports Claude Code.
+    # Agent engine (CLI kinds only). Both CLI runtimes support the long-lived
+    # ``claude-code`` and ``codex`` Drivers.
     # ``hermes`` and ``gemini-cli`` remain named design-only values so stale
     # configs receive an explicit migration diagnostic.
     harness: str = "claude-code"
+    # cli-local generic harness argv. Required for ``acp`` so any ACP v1
+    # agent can be selected without adding a provider-specific Driver. The
+    # first item is the executable and remaining items are literal arguments.
+    harness_command: list[str] = field(default_factory=list)
     # Retained only so older agent.yml files round-trip without losing data.
     # Driver runtimes use the wall-time limit below instead.
     max_turns: int = 10
@@ -745,6 +787,24 @@ def _load_runtime_config(
             kind, resolve_effective_provider(kind, provider), harness
         )
         _validate_inference_level(agent_id, inference, effective)
+    command = raw.get("harness_command") or []
+    if not isinstance(command, list) or not all(
+        isinstance(item, str) and item for item in command
+    ):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.harness_command must be a list "
+            "of non-empty strings"
+        )
+    if (
+        kind == RUNTIME_CLI_LOCAL
+        and harness == "acp"
+        and not command
+        and not allow_invalid_runtime
+    ):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.harness='acp' requires a "
+            "non-empty runtime.harness_command argv"
+        )
     return RuntimeConfig(
         kind=kind,
         provider=provider,
@@ -759,6 +819,7 @@ def _load_runtime_config(
         permission_mode=raw.get("permission_mode", "bypassPermissions"),
         sandbox=raw.get("sandbox", "danger-full-access"),
         harness=harness,
+        harness_command=list(command),
         max_turns=int(raw.get("max_turns", 10)),
         task_timeout_seconds=float(raw.get("task_timeout_seconds", 1800.0)),
     )
@@ -885,7 +946,7 @@ class RuntimeState:
     worker deadlocked).
     """
 
-    status: str = "stopped"  # running | paused | error | stopped
+    status: str = "stopped"  # starting | running | paused | error | stopped
     started_at: int = 0
     updated_at: int = 0
     msg_count: int = 0
@@ -899,18 +960,23 @@ class RuntimeState:
     #                           cleared a prior auth_failed
     #   "in_progress"         — turn mid-flight; overrides any sticky
     #                           red so the UI reads alive
-    #   "auth_failed"         — adapter saw 401 / authentication_error
-    #                           (set in worker._handle_suppressed_reply);
+    #   "auth_failed"         — adapter saw 401 / authentication_error;
     #                           cleared by the CredentialRefresher's
     #                           refresh-success callback (PUF-258 wired
     #                           the clear; PUF-221 owns the set lane)
-    #   "api_error_abandoned" — kick-retry exhausted, batch silently
-    #                           abandoned; cleared on next successful turn
-    #                           (PUF-255's on_turn_success lane)
+    #   "api_error_abandoned" — bounded provider retries exhausted and the
+    #                           durable turn was requeued; the next attempt
+    #                           transitions through in_progress and settles it
+    #   "provider_error"      — a categorized non-retryable provider failure;
+    #                           operator-safe detail is stored in ``error``
     #   "refresh_broken"      — daemon saw N consecutive non-success
     #                           refresh outcomes; cleared by next
-    #                           REFRESHED. Does not overwrite the two
-    #                           stronger downstream signals above.
+    #                           REFRESHED. Does not overwrite the stronger
+    #                           provider and authentication signals above.
+    #   "extra_usage_required" — extra usage refused; operator action + model success
+    #   "drained"             — plan quota spent; hold-no-retry until the
+    #                           usage window resets. Not a credential
+    #                           failure: re-login does not recover it
     #   "unhandled_error"     — non-AgentAPIError raised in the turn and
     #                           no category red was set; cleared by
     #                           next successful turn
@@ -921,8 +987,29 @@ class RuntimeState:
     #                           cleared on next successful turn. Does
     #                           NOT overwrite the stronger downstream
     #                           signals above.
+    #   "server_unreachable"  — N consecutive WS reconnect failures; the
+    #                           process is alive but the server has not
+    #                           been reachable for minutes. Cleared by the
+    #                           next successful reconnect. Only ever
+    #                           overwrites "ok" — the specific signals
+    #                           above stay authoritative
+    #   "mcp_unreachable"     — the puffo MCP subprocess never reached the
+    #                           loopback RPC service (mcp-hello handshake)
+    #                           after a runtime open AND one automatic
+    #                           recycle; tool calls are likely timing out.
+    #                           Set only from ok/unknown; cleared by the
+    #                           probe when a current-generation hello
+    #                           arrives.
+    #   "no_progress"         — N consecutive turns woke on an announced
+    #                           batch and consumed none of it. Driver-
+    #                           independent: it reads the runtime's own
+    #                           admission bookkeeping, so it still fires when
+    #                           a harness driver mis-reports a failed provider
+    #                           turn as a completed one. Cleared by the next
+    #                           turn that consumes its batch. Never overwrites
+    #                           the stronger signals above
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | drained | extra_usage_required | unhandled_error | codex_thread_wedged | server_unreachable | mcp_unreachable | no_progress | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:
@@ -978,6 +1065,62 @@ class RuntimeState:
             json.dump(asdict(self), f, indent=2)
         os.replace(tmp, path)
         _RUNTIME_LAST_SAVE[key] = (sig, self.updated_at)
+        self._notify_health_change(agent_id)
+
+    def _notify_health_change(self, agent_id: str) -> None:
+        """Fire the registered listener when ``health`` actually changed.
+
+        Every health writer already funnels through ``save``, so this is the
+        one place that cannot be forgotten — a per-writer notification is the
+        same "whoever remembers" shape that left the transport probe
+        unwired on three harness families.
+
+        Called only after ``os.replace`` succeeds, so a listener that reads
+        the runtime file sees the health it is being told about, and a save
+        that fails to land tells nobody. The throttled early return above
+        cannot skip a health change: ``health`` is part of the write
+        signature, so a change always misses the unchanged-signature branch.
+        """
+        listener = _RUNTIME_HEALTH_LISTENERS.get(agent_id)
+        previous = _RUNTIME_LAST_HEALTH.get(agent_id)
+        _RUNTIME_LAST_HEALTH[agent_id] = self.health
+        if listener is None or previous is None or previous == self.health:
+            return
+        try:
+            listener()
+        except Exception:  # noqa: BLE001
+            # Publishing is best-effort; the local write is authoritative and
+            # must complete even if nobody can be told about it.
+            logger.debug(
+                "runtime health listener for %s raised", agent_id, exc_info=True,
+            )
+
+
+# Fires when an agent's runtime health changes; the daemon registers the
+# status reporter here so a red reaches the server without waiting out the
+# heartbeat interval. The periodic heartbeat stays as the fallback.
+_RUNTIME_HEALTH_LISTENERS: dict[str, Any] = {}
+_RUNTIME_LAST_HEALTH: dict[str, str] = {}
+
+
+def set_runtime_health_listener(agent_id: str, listener: Any) -> None:
+    if listener is None:
+        _RUNTIME_HEALTH_LISTENERS.pop(agent_id, None)
+    else:
+        _RUNTIME_HEALTH_LISTENERS[agent_id] = listener
+
+
+def clear_runtime_health_listener(agent_id: str, listener: Any) -> None:
+    """Drop ``listener`` only while it is still the registered one.
+
+    A reporter's teardown can land after its successor has already claimed
+    the slot — a cancelled heartbeat loop runs its ``finally`` whenever the
+    event loop next gets to it. An unconditional pop would then silence a
+    live reporter, and health would quietly fall back to the periodic tick
+    with nothing to show that it had.
+    """
+    if _RUNTIME_HEALTH_LISTENERS.get(agent_id) is listener:
+        _RUNTIME_HEALTH_LISTENERS.pop(agent_id, None)
 
 
 # Keyed by resolved path so test tmp_path reuse doesn't collide.
@@ -1060,6 +1203,21 @@ def write_daemon_pid(pid: int) -> None:
     path = daemon_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(pid), encoding="utf-8")
+
+
+def is_daemon_startup_stalled(
+    pid: int,
+    *,
+    threshold: float = DAEMON_STARTUP_STALLED_SECONDS,
+) -> bool:
+    """Whether the current daemon has stayed alive but unready too long."""
+    if read_daemon_pid() != pid or is_daemon_ready(pid):
+        return False
+    try:
+        started_at = daemon_pid_path().stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - started_at >= threshold
 
 
 def read_daemon_ready_pid() -> int | None:
@@ -1172,6 +1330,21 @@ def stop_requested_for(pid: int) -> bool:
     request, which targets whichever daemon is running."""
     kind, target_pid = _classify_stop_request()
     return (kind == "pid" and target_pid == pid) or kind == "legacy"
+
+
+def is_daemon_stop_stalled(
+    pid: int,
+    *,
+    threshold: float = DAEMON_STOP_STALLED_SECONDS,
+) -> bool:
+    """Whether an owned stop request has waited too long for process exit."""
+    if not stop_requested_for(pid):
+        return False
+    try:
+        requested_at = stop_request_path().stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - requested_at >= threshold
 
 
 def write_stop_request(pid: int | None = None) -> None:

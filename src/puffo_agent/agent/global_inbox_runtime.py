@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from .channel_audience import (
     ChannelAudienceLoader,
@@ -30,6 +30,9 @@ from .context_controller import (
     ProviderAdmissionEvent,
     ToolResultAdmission,
 )
+from .errors import AgentAPIError
+from ._failure_outcomes import crash_resume_terminal, failure_outcome
+from ._usage_markers import looks_like_budget_cap
 from .inbox_scheduler import (
     COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
@@ -55,19 +58,21 @@ from .message_projection import (
 )
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
+from .provider_failures import operator_failure_text
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
-# A degrade is a transient provider incident, never a durable verdict about
-# pending Inbox work.  Recovery is a bounded backoff window the runtime re-arms
-# itself, so requeued rows stay retryable without depending on unrelated ingress.
-DEGRADED_RECOVERY_BASE_SECONDS = 5.0
-DEGRADED_RECOVERY_MAX_SECONDS = 300.0
+
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
+from .global_inbox_covers import CoversReconciliationMixin
+from .global_inbox_degraded import DegradedRecoveryMixin
+from .autonomous_turns import AutonomousTurnLifecycleMixin
 from .global_inbox_types import (
+    opt_str,
     ActiveBoundaryAdapter,
     ActiveExactUnion,
     BaselineAdapter,
@@ -77,8 +82,10 @@ from .global_inbox_types import (
     MessageRoute,
     OUTPUT_TOOL_RESERVE_TOKENS,
     PlannedTurn,
+    ProcessOutcomeCallback,
     RuntimeHealth,
     SendAttemptState,
+    TurnStatusLifecycle,
     await_listener_with_runtime,
     conservative_token_estimate,
     format_stored_message,
@@ -118,31 +125,12 @@ TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
 
 
-class TurnStatusLifecycle(Protocol):
-    """Optional worker-owned mirror of the active Global Inbox turn.
-
-    The runtime owns only the durable turn lifecycle; it notifies this
-    callback with immutable active-union snapshots so the worker can drive
-    Server processing-row status without moving status policy in here.
-    """
-
-    async def on_turn_active(
-        self, *, turn_id: str, message_ids: tuple[str, ...]
-    ) -> None:
-        """Report that the active union is (or has grown to) ``message_ids``."""
-
-    async def on_turn_terminal(
-        self,
-        *,
-        turn_id: str,
-        message_ids: tuple[str, ...],
-        succeeded: bool,
-        error_text: str | None,
-    ) -> None:
-        """Settle the exact active union in one terminal status batch."""
-
-
-class GlobalInboxRuntime(InboxAdmissionMixin):
+class GlobalInboxRuntime(
+    AutonomousTurnLifecycleMixin,
+    InboxAdmissionMixin,
+    CoversReconciliationMixin,
+    DegradedRecoveryMixin,
+):
     """One serial provider boundary over the durable global Inbox."""
 
     def __init__(
@@ -163,13 +151,16 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         max_api_retries: int = 2,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         held_catchup: Callable[[str], Awaitable[bool]] | None = None,
-        send_mode_keys: Sequence[str] = (),
+        identity_aliases: Sequence[str] = (),
         agent_id: str = "",
         notice_delivery: InboxNoticeDelivery | None = None,
         runtime_event_outbox: Any | None = None,
         reminder_scheduler: ReminderScheduler | None = None,
         status_lifecycle: TurnStatusLifecycle | None = None,
+        process_outcome: ProcessOutcomeCallback | None = None,
         channel_audience_loader: ChannelAudienceLoader | None = None,
+        covers_renotice_enabled: bool | None = None,
+        drained_check: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -183,6 +174,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.unfit_policy = unfit_policy or (lambda *_args, **_kwargs: True)
         self.coordinator = coordinator
         self.active = ActiveExactUnion()
+        self._initialize_autonomous_lifecycle()
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -198,28 +190,37 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         # turn owner and in-memory exact union, so they share one short lock.
         self._turn_state_lock = asyncio.Lock()
         self._stopping = False
-        self._degraded = False
-        self._degraded_until: float | None = None
-        self._degraded_attempts = 0
+        self._init_recovery_gates(drained_check)
+        self._mcp_silence_streak = 0
         self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
-        self.send_mode_keys = tuple(dict.fromkeys(key for key in send_mode_keys if key))
+        self.identity_aliases = tuple(dict.fromkeys(key for key in identity_aliases if key))
         self.agent_id = agent_id
-        # ``send_mode_keys`` is the existing runtime identity-alias set used
-        # by the send-mode guard (normally the configured agent id and the
-        # wire slug).  Inbox attribution is derived from the same identities;
-        # no durable or provider state is introduced.
+        # Uncovered-message redelivery is observed unconditionally but only
+        # acted on behind this flag, so test environments can lead adoption.
+        # daemon.yml (``covers_renotice``) is the operator surface; the
+        # environment variable remains as an override for tests.
+        if covers_renotice_enabled is None:
+            covers_renotice_enabled = (
+                os.environ.get("PUFFO_COVERS_RENOTICE", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+        self.covers_renotice_enabled = bool(covers_renotice_enabled)
+        # ``identity_aliases`` is the runtime identity-alias set (normally
+        # the configured agent id and the wire slug); inbox attribution is
+        # derived from these identities.
         self.formatter = self._format_for_provider
         capability = getattr(adapter, "inbox_notice_delivery_capability", None)
         self.notice_delivery = notice_delivery or InboxNoticeDelivery(
-            capability() if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
+            capability if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
         )
         self._busy_notice_task: asyncio.Task[None] | None = None
         self._busy_notice_dirty = False
         self._busy_notice_delay_seconds = COALESCE_SECONDS
         self.runtime_event_outbox = runtime_event_outbox
+        self.process_outcome = process_outcome
         self.reminder_scheduler = reminder_scheduler or ReminderScheduler(
             store=store,
             notify=self.notify,
@@ -234,7 +235,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
 
     def _current_agent_identity_aliases(self) -> tuple[str, ...]:
         """Return only runtime-owned identities usable for self attribution."""
-        values: list[str] = [self.agent_id, *self.send_mode_keys]
+        values: list[str] = [self.agent_id, *self.identity_aliases]
         for owner in (self.adapter, self.coordinator):
             for name in ("slug", "agent_id", "agent_slug", "self_slug"):
                 value = getattr(owner, name, "")
@@ -256,10 +257,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         return self.workspace / ".puffo-agent" / "current_turn.json"
 
     def notify(self) -> None:
-        self._degraded = False
-        self._degraded_until = None
-        self._degraded_attempts = 0
-        self.coalescer.notify()
+        self._clear_degraded_backoff()
+        delay = self._busy_notice_delay_seconds if self.active.turn_id else 0.0
+        self.coalescer.notify(delay_seconds=delay)
         self._schedule_busy_notice()
 
     async def create_reminder(
@@ -268,13 +268,62 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         content: str,
         target: str,
         intended_at: str,
+        covers: list[str] | None = None,
     ) -> dict[str, object]:
         """Create local reminder intent without introducing provider policy."""
-        return await self.reminder_scheduler.create_reminder(
+        result = await self.reminder_scheduler.create_reminder(
             content=content,
             target=target,
             intended_at=intended_at,
         )
+        if covers:
+            try:
+                outcome = await self.store.add_message_covers(
+                    covers,
+                    source="reminder",
+                    note=opt_str(result.get("reminder_id")),
+                    turn_id=opt_str(self.active.turn_id),
+                )
+            except Exception:
+                logger.exception("recording reminder covers failed")
+            else:
+                result["covers_recorded"] = list(outcome["recorded"])
+                if outcome["unknown"]:
+                    result["covers_unknown"] = list(outcome["unknown"])
+        return result
+
+    async def mark_covered(
+        self,
+        *,
+        covers: list[str],
+        by_message_id: str = "",
+        note: str = "",
+    ) -> dict[str, object]:
+        """Record standalone disposition claims for inbound messages.
+
+        The whole point of this call is precise marking, so unlike send and
+        reminder covers, unknown ids surface as an explicit error listing
+        exactly which ids failed (known ids are still recorded).
+        """
+        cleaned = [str(item) for item in covers if str(item or "").strip()]
+        if not cleaned:
+            raise ValueError("covers must be a non-empty list of message ids")
+        outcome = await self.store.add_message_covers(
+            cleaned,
+            source="mark",
+            by_envelope_id=opt_str(by_message_id),
+            note=opt_str(note),
+            turn_id=opt_str(self.active.turn_id),
+        )
+        result: dict[str, object] = {
+            "covers_recorded": list(outcome["recorded"]),
+            "covers_unknown": list(outcome["unknown"]),
+        }
+        if outcome["unknown"]:
+            result["error"] = (
+                "unknown message id(s): " + ", ".join(outcome["unknown"])
+            )
+        return result
 
     async def list_reminders(
         self,
@@ -343,31 +392,28 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
 
     async def run(self) -> None:
-        reminder_task = asyncio.create_task(self.reminder_scheduler.run())
+        reminder_task = spawn(
+            self.reminder_scheduler.run(),
+            name="reminder_scheduler.run",
+        )
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
+            await self._enable_autonomous_adoption()
             if self._defer_requeued_recovery:
                 # Consume the recovery wake without immediately feeding the same
                 # failed durable union through the initial-turn path.
                 await self.coalescer.wait_for_burst()
             elif await self.store.get_pending(limit=1):
-                notice = await self.store.get_notice_state()
                 if await self.store.get_notice_candidates(
                     self.adapter.get_provider_session_id()
                 ):
-                    remaining = (
-                        max(
-                            0.0,
-                            (notice.first_pending_deadline_ms - int(time.time() * 1000))
-                            / 1000,
-                        )
-                        if notice.first_pending_deadline_ms is not None
-                        else 0.0
-                    )
-                    self.coalescer.notify(delay_seconds=remaining)
+                    self.notify()
             while not self._stopping:
-                burst_task = asyncio.create_task(self.coalescer.wait_for_burst())
+                burst_task = spawn(
+                    self.coalescer.wait_for_burst(),
+                    name="coalescer.wait_for_burst",
+                )
                 done, _pending = await asyncio.wait(
                     {burst_task, reminder_task},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -375,10 +421,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 if reminder_task in done:
                     if not burst_task.done():
                         burst_task.cancel()
-                        try:
-                            await burst_task
-                        except asyncio.CancelledError:
-                            pass
+                    # Settle the sibling even when both tasks completed in the
+                    # same event-loop turn.  Otherwise a simultaneous burst
+                    # failure can escape inspection while the scheduler error
+                    # is propagated below.
+                    await asyncio.gather(burst_task, return_exceptions=True)
                     # A scheduler error is an owning-runtime error, never a
                     # silently disabled timer loop.
                     await reminder_task
@@ -562,6 +609,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             ),
             latest_seq=latest_seq,
             read_tool="read_inbox",
+            uncovered_message_count=(
+                await self.store.count_uncovered_pending()
+                if self.covers_renotice_enabled
+                else 0
+            ),
         )
         provider_input = (
             "<global_inbox_notice>\n"
@@ -846,6 +898,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             if self.coordinator is not None:
                 self.coordinator.provider_session_id = provider_session_id
             self._write_current_turn(planned)
+        await self._notify_status_notice_admitted(
+            tuple(planned.notice_message_ids)
+        )
         log_runtime_event(
             logger,
             "turn.admitted",
@@ -865,6 +920,28 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             message_count=len(self.active.message_ids),
             outcome="bound",
         )
+
+    async def _notify_status_notice_admitted(
+        self, message_ids: tuple[str, ...]
+    ) -> None:
+        """Expose provider admission without claiming Inbox rows were read."""
+        if (
+            self.status_lifecycle is None
+            or not self.active.turn_id
+            or not message_ids
+        ):
+            return
+        try:
+            await self.status_lifecycle.on_notice_admitted(
+                turn_id=self.active.turn_id,
+                message_ids=message_ids,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: status lifecycle notice notify failed",
+                self.agent_id,
+                exc_info=True,
+            )
 
     async def _notify_status_active(self) -> None:
         """Expose the exact active union to the worker's status lifecycle.
@@ -1037,37 +1114,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             except FileNotFoundError:
                 pass
 
-    def _degrade(self, diagnostic: str) -> None:
-        self.health = RuntimeHealth("degraded", diagnostic)
-        self._degraded = True
-        self._degraded_attempts += 1
-        backoff = min(
-            DEGRADED_RECOVERY_BASE_SECONDS * 2 ** (self._degraded_attempts - 1),
-            DEGRADED_RECOVERY_MAX_SECONDS,
-        )
-        self._degraded_until = time.monotonic() + backoff
-        # Arm the autonomous recovery wake through the existing coalescer only:
-        # no extra task, timer, or thread, so shutdown behaviour is unchanged.
-        self.coalescer.notify(delay_seconds=backoff)
-
-    def _try_degraded_recovery(self) -> bool:
-        """Return whether a degraded runtime may retry its durable work now."""
-        if not self._degraded:
-            return True
-        remaining = (
-            0.0
-            if self._degraded_until is None
-            else self._degraded_until - time.monotonic()
-        )
-        if remaining > 0:
-            # An earlier coalescer deadline may have fired ahead of the degrade
-            # wake and consumed it; re-arm so the window still ends in a retry.
-            self.coalescer.notify(delay_seconds=remaining)
-            return False
-        self._degraded = False
-        self._degraded_until = None
-        return True
-
     async def _resolve_context_plan(self, planned: PlannedTurn) -> PlannedTurn | None:
         rollover_seen = False
         for _ in range(self.max_context_decisions):
@@ -1156,11 +1202,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     await self._run_retry(await self._prepare_retry_attempt(planned))
                 return
             except Exception as exc:
-                from .core import AgentAPIError
-
                 can_retry = (
                     isinstance(exc, AgentAPIError)
                     and not exc.is_auth
+                    and not exc.is_drained
                     and self.active.turn_id == planned.turn_id
                     and retries < self.max_api_retries
                     and hasattr(self.run_turn, "handle_global_inbox_retry")
@@ -1203,57 +1248,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         return attempt
 
-    async def _mark_active_processed(
-        self,
-        planned: PlannedTurn,
-        process_started: float,
-    ) -> None:
-        # A processed turn ends the incident: consecutive-degrade backoff must
-        # not carry across unrelated later incidents.
-        self._degraded_attempts = 0
-        if self.active.message_ids:
-            await self.store.mark_processed(
-                tuple(self.active.message_ids),
-                turn_id=planned.turn_id,
-                provider_session_id=self.active.provider_session_id,
-            )
-            await self.store.release_notice_delivery(
-                self.active.provider_session_id,
-                tuple(self.active.notice_message_ids),
-            )
-        else:
-            # The provider received the notice but chose not to read Inbox.
-            # That is a normal deferred outcome, not a transport failure and
-            # therefore must not create another generation for the same set.
-            await self.store.finalize_empty_turn(turn_id=planned.turn_id)
-        for item_id in self.active.message_ids:
-            row = await self.store.get_message_by_envelope(item_id)
-            log_runtime_event(
-                logger,
-                "inbox.row_processed",
-                agent_id=self.agent_id,
-                turn_id=planned.turn_id,
-                provider_session_id=self.active.provider_session_id,
-                message_id=item_id,
-                server_seq=row.server_seq if row is not None else None,
-                outcome="processed",
-            )
-        log_runtime_event(
-            logger,
-            "turn.processed",
-            agent_id=self.agent_id,
-            turn_id=planned.turn_id,
-            provider_session_id=self.active.provider_session_id,
-            provider_turn_id=self.active.provider_turn_id,
-            envelope_id=(
-                self.active.message_ids[0]
-                if len(self.active.message_ids) == 1
-                else None
-            ),
-            state=ProcessingState.PROCESSED.value,
-            message_count=len(self.active.message_ids),
-            duration_ms=int((time.monotonic() - process_started) * 1000),
-        )
 
     async def _requeue_active_turn(
         self,
@@ -1303,9 +1297,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         return True
 
     def _finalize_process(self, planned: PlannedTurn, terminal: bool) -> None:
-        from . import send_mode
-
-        send_mode.clear_turn_bundle(list(self.send_mode_keys))
         self.adapter.register_admission_callback(None, "")
         was_active = self.active.turn_id == planned.turn_id
         if terminal:
@@ -1345,8 +1336,66 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         ):
             self.notify()
 
+    async def _handle_process_failure(
+        self, planned: PlannedTurn, process_started: float, exc: Exception
+    ) -> tuple[bool, str, str]:
+        process_outcome = failure_outcome(exc)
+        async with self._turn_state_lock:
+            terminal = await self._requeue_active_turn(
+                planned, process_started, "provider_error"
+            )
+        terminal_error = operator_failure_text(exc)
+        if process_outcome in {"drained", "extra_usage_required"}:
+            if process_outcome == "drained" and looks_like_budget_cap(terminal_error):
+                hold = self.next_budget_park_hold()
+                self._park_drained(
+                    hold_seconds=hold,
+                    diagnostic=(
+                        "gateway budget cap; holding "
+                        f"{int(hold)}s then probing once — {terminal_error[:160]}"
+                    ),
+                )
+            else:
+                self._park_drained(process_outcome)
+        else:
+            self._degrade(
+                "turn failed and was requeued"
+                if terminal
+                else "turn failed outside the active durable turn"
+            )
+        log_runtime_event(
+            logger,
+            "turn.failed",
+            level=logging.ERROR,
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            provider_session_id=self.active.provider_session_id,
+            provider_turn_id=self.active.provider_turn_id,
+            notice_generation=planned.notice_generation,
+            target_count=len(planned.targets),
+            error_category="provider_error",
+            error_type=type(exc).__name__,
+            error_code=getattr(exc, "error_code", None),
+            outcome="requeued" if terminal else "degraded",
+        )
+        return terminal, process_outcome, terminal_error
+
     async def process_once(self) -> bool:
+        if not self._drained_park_allows_processing():
+            return False
         if not self._try_degraded_recovery():
+            return False
+        if self._autonomous_settle_pending is not None:
+            # A terminal arrived but its durable settle failed. The manager has
+            # already released its side and the callback is spent, so this wake
+            # is the only thing left that can finish the turn.
+            if not await self.finish_autonomous_turn(
+                outcome=self._autonomous_settle_pending
+            ):
+                return False
+        await self._replay_deferred_autonomous_start()
+        if self._autonomous_turn_id:
+            # Queue while the provider is mid-run on its autonomous turn.
             return False
         async with self._boundary:
             process_started = time.monotonic()
@@ -1361,65 +1410,45 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
-            async with self._turn_state_lock:
-                await self._start_local_turn(planned)
+            if not await self._start_notice_unless_autonomous(planned):
+                return False
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,
             )
             self.health = RuntimeHealth("in_progress", "")
-            from . import send_mode
-
-            send_mode.note_turn_bundle(
-                list(self.send_mode_keys),
-                planned.requires_encryption
-                or any(item.is_encrypted for item in planned.items),
-            )
             terminal = False
             terminal_succeeded = False
+            process_outcome = "failed"
             terminal_error: str | None = None
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
+                    settled = self._health_outcome_for_turn(planned)
                     async with self._turn_state_lock:
                         await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
+                    process_outcome = settled
+                    if settled == "succeeded":
+                        self._clear_budget_park_backoff()
                 else:
-                    self._degrade("provider returned without correlated admission")
+                    terminal_error = "provider returned without correlated admission"
+                    self._degrade(terminal_error)
             except asyncio.CancelledError:
                 async with self._turn_state_lock:
                     await self._requeue_active_turn(
                         planned, process_started, "cancelled"
                     )
                 terminal = True
+                process_outcome = "cancelled"
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
-                async with self._turn_state_lock:
-                    terminal = await self._requeue_active_turn(
-                        planned, process_started, "provider_error"
+                terminal, process_outcome, terminal_error = (
+                    await self._handle_process_failure(
+                        planned, process_started, exc
                     )
-                terminal_error = f"{type(exc).__name__}: {exc}"
-                diagnostic = (
-                    "turn failed and was requeued"
-                    if terminal
-                    else "turn failed outside the active durable turn"
-                )
-                self._degrade(diagnostic)
-                log_runtime_event(
-                    logger,
-                    "turn.failed",
-                    level=logging.ERROR,
-                    agent_id=self.agent_id,
-                    turn_id=planned.turn_id,
-                    provider_session_id=self.active.provider_session_id,
-                    provider_turn_id=self.active.provider_turn_id,
-                    notice_generation=planned.notice_generation,
-                    target_count=len(planned.targets),
-                    error_category="provider_error",
-                    error_type=type(exc).__name__,
-                    outcome="requeued" if terminal else "degraded",
                 )
             finally:
                 await self._notify_status_terminal(
@@ -1427,7 +1456,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     succeeded=terminal_succeeded,
                     error_text=terminal_error,
                 )
+                if self.process_outcome is not None:
+                    self.process_outcome(process_outcome, terminal_error)
                 self._finalize_process(planned, terminal)
+                await self._replay_deferred_autonomous_start()
             await self._wake_remaining_pending()
             return True
 
@@ -1664,6 +1696,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 activated=activated,
             )
         self.health = RuntimeHealth(state, diagnostic)
+        if state in {"drained", "extra_usage_required"}:
+            # crash-resume drained: same park as the live path
+            self._parked_drained = True
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
         if activated:
             await self._notify_status_terminal(
@@ -1679,6 +1714,19 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 succeeded=succeeded,
                 error_text=None if succeeded else diagnostic,
             )
+        if activated and self.process_outcome is not None:
+            outcome = (
+                state
+                if state in {
+                    "auth_failed",
+                    "api_error_abandoned",
+                    "provider_failed",
+                    "drained",
+                    "extra_usage_required",
+                }
+                else "failed"
+            )
+            self.process_outcome(outcome, diagnostic)
         self._clear_terminal_turn()
         if requeued:
             self.notify()
@@ -1767,15 +1815,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 await self._run_retry(planned)
                 return None
             except Exception as exc:
-                from .core import AgentAPIError
-
-                if isinstance(exc, AgentAPIError) and exc.is_auth:
-                    return "crash resume auth failure", "auth_failed"
-                if not isinstance(exc, AgentAPIError):
-                    return (
-                        f"crash resume unsafe failure: {type(exc).__name__}",
-                        "degraded",
-                    )
+                terminal = crash_resume_terminal(exc)
+                if terminal is not None:
+                    return terminal
                 if retries >= self.max_api_retries:
                     return "crash resume retry budget exhausted", "api_error_abandoned"
                 retries += 1
@@ -1786,11 +1828,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         turn_id: str,
         recovery_started: float,
     ) -> bool:
-        await self.store.mark_processed(
-            tuple(self.active.message_ids),
-            turn_id=turn_id,
-            provider_session_id=self.active.provider_session_id,
-        )
+        await self._finalize_active_messages(turn_id)
         await self.store.release_notice_delivery(self.active.provider_session_id)
         log_runtime_event(
             logger,
@@ -1810,6 +1848,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             succeeded=True,
             error_text=None,
         )
+        if self.process_outcome is not None:
+            self.process_outcome("succeeded", None)
         self._clear_terminal_turn()
         return True
 
@@ -1841,6 +1881,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             succeeded=False,
             error_text="crash resume cancelled and requeued",
         )
+        if self.process_outcome is not None:
+            self.process_outcome("cancelled", "crash resume cancelled and requeued")
         self._clear_terminal_turn()
         self.notify()
 
@@ -1892,26 +1934,17 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 **unwind,
                 diagnostic="crash join identity, route, or target mismatch",
             )
+        # Same rule as the normal start path: a resumed crash join takes the
+        # session, so any adopted turn is closed exactly once first.
+        await self._release_autonomous_turn(reason="abandoned")
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
         await self._notify_status_active()
-        from . import send_mode
-
-        # A resumed turn establishes the same send-mode facts ``process_once``
-        # does; the module dict is process-local and therefore empty here.
-        send_mode.note_turn_bundle(
-            list(self.send_mode_keys),
-            planned.requires_encryption
-            or any(item.is_encrypted for item in planned.items),
+        return await self._resume_activated_turn(
+            planned=planned,
+            turn_id=turn_id,
+            recovery_started=recovery_started,
+            unwind=unwind,
         )
-        try:
-            return await self._resume_activated_turn(
-                planned=planned,
-                turn_id=turn_id,
-                recovery_started=recovery_started,
-                unwind=unwind,
-            )
-        finally:
-            send_mode.clear_turn_bundle(list(self.send_mode_keys))
 
     async def _resume_activated_turn(
         self,

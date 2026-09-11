@@ -489,8 +489,8 @@ def test_yaml_int_value_loads_as_string():
 
 
 def test_local_driver_applies_override_under_owned_environment(tmp_path, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
     from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
@@ -537,53 +537,45 @@ def test_junk_persisted_value_falls_back_to_default_band():
 
 
 def test_docker_session_receives_overrides(tmp_path, monkeypatch):
-    from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
+    from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
 
-    adapter = DockerCLIAdapter(
-        agent_id="ctx-bot",
-        model="claude-sonnet-5",
-        image="test",
-        workspace_dir=str(tmp_path / "workspace"),
-        claude_dir=str(tmp_path / "claude"),
-        session_file=str(tmp_path / "session.json"),
-        agent_home_dir=str(tmp_path / "home"),
-        shared_fs_dir=str(tmp_path / "shared"),
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    cfg = AgentConfig(
+        id="ctx-bot",
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-sonnet-5",
+        ),
         env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"},
-        auto_compact_threshold_pct=50,
     )
-    adapter._prepare_mcp_args = lambda: []
-    session = adapter._ensure_session()
     monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "500000")
     runtime = build_context_runtime(
-        model=adapter.model,
-        env_overrides=adapter.env_overrides,
+        model=cfg.runtime.model,
+        env_overrides=cfg.env_overrides,
         env={},
     )
     assert runtime["max_context"] == 1_000_000
-    command = session.build_command([], {})
-    assert command[:8] == [
-        "docker",
-        "exec",
-        "-i",
-        "-e",
-        "ANTHROPIC_API_KEY=",
-        "puffo-ctx-bot",
-        "claude",
-        "--dangerously-skip-permissions",
-    ]
-    compact_index = command.index("--autocompact")
-    assert command[compact_index : compact_index + 2] == [
+    args = list(
+        DockerRuntimePreparer(DaemonConfig(), cfg)
+        ._prepare_claude_spec("prompt")
+        .launch_args
+    )
+    compact_index = args.index("--autocompact")
+    assert args[compact_index : compact_index + 2] == [
         "--autocompact",
         "500000",
     ]
-    assert all("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in arg for arg in command)
+    assert all("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in arg for arg in args)
 
 
 @pytest.mark.asyncio
 async def test_remote_edit_reaches_docker_exec_command():
     from puffo_agent.portal.control.client import execute_command
     from puffo_agent.portal.state import DaemonConfig
-    from puffo_agent.portal.worker import build_docker_adapter
+    from puffo_agent.portal.worker import build_docker_runtime
 
     home = isolated_home()
     write_test_agent(home, "ctx-bot")
@@ -600,22 +592,20 @@ async def test_remote_edit_reaches_docker_exec_command():
     )
     assert result["ok"] is True
 
-    adapter = build_docker_adapter(DaemonConfig(), AgentConfig.load("ctx-bot"))
-    adapter._prepare_mcp_args = lambda: []
-    session = adapter._ensure_session()
-    command = session.build_command([], {})
-    compact_index = command.index("--autocompact")
-    assert command[compact_index : compact_index + 2] == [
+    preparer = build_docker_runtime(DaemonConfig(), AgentConfig.load("ctx-bot"))
+    args = list(preparer._prepare_claude_spec("prompt").launch_args)
+    compact_index = args.index("--autocompact")
+    assert args[compact_index : compact_index + 2] == [
         "--autocompact",
         "500000",
     ]
-    assert all("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in arg for arg in command)
+    assert all("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in arg for arg in args)
 
 
 @pytest.mark.asyncio
 async def test_local_codex_driver_receives_compact_pct(tmp_path, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import LocalRuntimePreparer
     from puffo_agent.portal.state import DaemonConfig
 
     home = isolated_home()

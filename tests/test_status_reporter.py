@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.status_reporter import StatusReporter
+from puffo_agent.agent.processing_receipts import ProcessingReportResult
 from puffo_agent.crypto.http_client import HttpError
 
 
@@ -281,6 +282,28 @@ async def test_end_turn_batch_failure_flips_status_to_error():
         "error_text": "claude rate limit",
     }
     assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_mixed_replay_batch_reasserts_current_terminal_status(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None
+    )
+
+    class MixedReplay:
+        def set_status_refresh(self, callback):
+            self.status_refresh = callback
+
+        async def enqueue(self, _runs, *, immediate=False):
+            assert immediate is True
+            return ProcessingReportResult("uploaded", count=2)
+
+    http = FakeHttp()
+    rep = StatusReporter(http, processing_reports=MixedReplay())
+
+    await rep.end_turn("msg_current", "run_current", succeeded=True)
+
+    assert http.calls == [("/agents/me/heartbeat", {"status": "idle"})]
 
 
 @pytest.mark.asyncio
@@ -575,12 +598,14 @@ class _CaptureSender:
         current_message_id=None,
         error_text=None,
         runtime=None,
+        health=None,
     ):
         self.calls.append({
             "status": status,
             "current_message_id": current_message_id,
             "error_text": error_text,
             "runtime": runtime,
+            "health": health,
         })
         if self._boom:
             raise RuntimeError("bridge ws closed")
@@ -600,6 +625,7 @@ async def test_keyless_begin_turn_emits_busy_over_bridge():
         "current_message_id": "msg_42",
         "error_text": None,
         "runtime": None,
+        "health": None,
     }]
     assert rep._current_status == "busy"
 
@@ -699,6 +725,7 @@ async def test_keyless_status_includes_runtime():
             "harness": "codex",
             "model": "gpt-5",
         },
+        "health": None,
     }]
 
 
@@ -731,3 +758,251 @@ async def test_keyless_emit_failure_is_swallowed():
     run_id = await rep.begin_turn("msg_1")
     assert run_id.startswith("run_")
     assert rep._current_status == "busy"
+
+
+# ── activity refinement (compacting / reading_messages) ──────────────
+
+
+@pytest.mark.asyncio
+async def test_notice_turn_reports_reading_messages_activity():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    await rep.begin_notice_turn("msg_1")
+
+    path, body = http.calls[-1]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "busy"
+    assert body["activity"] == "reading_messages"
+
+    # Admitting the real message ends the reading phase: the next
+    # heartbeat carries no activity.
+    await rep.begin_turn("msg_1")
+    await rep._send_heartbeat()
+    _, hb = http.calls[-1]
+    assert "activity" not in hb
+
+
+@pytest.mark.asyncio
+async def test_compaction_overlay_wins_and_restores():
+    """``set_activity_overlay`` is state-only (the harness event path
+    holds the runtime command lock, so the network push is the
+    caller's detached job); the returned flag drives exactly one push
+    per effective change."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("msg_1")
+
+    assert rep.set_activity_overlay("compacting") is True
+    await rep.report_current_status()
+    _, body = http.calls[-1]
+    assert body["activity"] == "compacting"
+
+    # Duplicate overlay is a no-op: no push requested.
+    assert rep.set_activity_overlay("compacting") is False
+
+    # Clearing the overlay restores the phase activity.
+    assert rep.set_activity_overlay(None) is True
+    await rep.report_current_status()
+    _, body = http.calls[-1]
+    assert body["activity"] == "reading_messages"
+
+
+def test_noop_reporter_matches_activity_overlay_contract():
+    """emit_activity calls ``set_activity_overlay`` synchronously and
+    pushes only on True. The no-op stub must satisfy the same contract
+    as the real reporter — an async stub returns a truthy coroutine,
+    which both leaks a "never awaited" warning and sends emit_activity
+    into a ``report_current_status`` the stub does not have."""
+    import inspect
+
+    from puffo_agent.portal.worker_run import _NoopStatusReporter
+
+    for cls in (StatusReporter, _NoopStatusReporter):
+        assert not inspect.iscoroutinefunction(cls.set_activity_overlay), cls
+    assert _NoopStatusReporter().set_activity_overlay("compacting") is False
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_carries_live_overlay_into_processing_start():
+    """/processing/start is retried legitimately and the server writes
+    the request's activity into agent_status: a live compaction overlay
+    must travel with the start, and an absent overlay must stay absent
+    so the finished reading phase is cleared server-side."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("msg_1")
+    rep.set_activity_overlay("compacting")
+
+    await rep.begin_turn("msg_1")
+    path, body = http.calls[-1]
+    assert path == "/messages/msg_1/processing/start"
+    assert body["activity"] == "compacting"
+
+    rep.set_activity_overlay(None)
+    await rep.begin_turn("msg_1")
+    _, body = http.calls[-1]
+    assert "activity" not in body
+
+
+@pytest.mark.asyncio
+async def test_notice_terminal_clears_activity():
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("msg_1")
+    rep.set_activity_overlay("compacting")
+
+    await rep.end_notice_turn(succeeded=True)
+
+    _, body = http.calls[-1]
+    assert body["status"] == "idle"
+    assert "activity" not in body
+
+
+@pytest.mark.asyncio
+async def test_intro_turn_clears_reading_activity_promptly():
+    """A local-only begin_turn (intro-prompt) skips /processing/start,
+    so only an immediate heartbeat can clear the reading label. The
+    status is already busy with no message id after the notice beat, so
+    the just-ended reading phase is the only thing distinguishing this
+    beat — dropping it kept the server on "reading messages" for the
+    whole intro composition."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    await rep.begin_notice_turn("intro-prompt-1")
+    assert http.calls[-1][1]["activity"] == "reading_messages"
+    http.calls.clear()
+
+    await rep.begin_turn("intro-prompt-1")
+
+    assert len(http.calls) == 1
+    path, body = http.calls[0]
+    assert path == "/agents/me/heartbeat"
+    assert body["status"] == "busy"
+    assert "activity" not in body
+
+
+class _GatedHttp(FakeHttp):
+    """Blocks the first POST on ``gate`` after recording it, so a test
+    can hold one status write on the wire and observe what the
+    reporter does with the next one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self._block_first = True
+
+    async def post(self, path: str, body: dict | None = None):
+        self.calls.append((path, body or {}))
+        if self._block_first:
+            self._block_first = False
+            self.entered.set()
+            await self.gate.wait()
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_turnless_compaction_reports_busy_then_restores_idle():
+    """A session-resume compaction during warm runs outside any turn:
+    the status dot must read Working while the label is live and
+    settle back to idle when it clears — no turn ever owns this
+    status transition."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+
+    assert rep.set_activity_overlay("compacting") is True
+    await rep.report_current_status()
+    _, body = http.calls[-1]
+    assert body["status"] == "busy"
+    assert body["activity"] == "compacting"
+    assert "current_message_id" not in body
+
+    assert rep.set_activity_overlay(None) is True
+    await rep.report_current_status()
+    _, body = http.calls[-1]
+    assert body["status"] == "idle"
+    assert "activity" not in body
+
+
+@pytest.mark.asyncio
+async def test_overlay_clear_does_not_steal_busy_from_a_turn():
+    """Once a turn owns the status, clearing the overlay must not
+    flip a mid-turn agent back to idle."""
+    http = FakeHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep.set_activity_overlay("compacting")  # turnless busy
+    await rep.begin_notice_turn("msg_1")  # the turn takes ownership
+
+    rep.set_activity_overlay(None)
+
+    assert rep._current_status == "busy"
+
+
+@pytest.mark.asyncio
+async def test_terminal_batch_upload_holds_the_send_lock():
+    """The dispatcher's immediate terminal upload is a status write
+    (the server flips agent_status on end:batch): it must queue
+    behind an in-flight beat. Without the lock the terminal batch
+    overtakes a slow busy/compacting beat, that stale beat lands
+    last, and a finished agent reads busy/compacting until the next
+    scheduled beat."""
+
+    class _Dispatcher:
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        def set_status_refresh(self, _cb) -> None:
+            return None
+
+        async def enqueue(self, runs, *, immediate=False):
+            self.entered.set()
+            return ProcessingReportResult("uploaded", len(runs))
+
+    http = _GatedHttp()
+    disp = _Dispatcher()
+    rep = StatusReporter(http, heartbeat_interval_s=999, processing_reports=disp)
+    rep.set_activity_overlay("compacting")
+    beat = asyncio.ensure_future(rep.report_current_status())
+    await asyncio.wait_for(http.entered.wait(), 1)
+
+    finish = asyncio.ensure_future(
+        rep.end_turn_batch([
+            {"run_id": "run_1", "message_id": "m1", "succeeded": True},
+        ])
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    # The terminal upload waits for the in-flight beat.
+    assert not disp.entered.is_set()
+
+    http.gate.set()
+    await asyncio.wait_for(asyncio.gather(beat, finish), 1)
+    assert disp.entered.is_set()
+    assert rep._current_status == "idle"
+    assert rep._effective_activity is None
+
+
+@pytest.mark.asyncio
+async def test_status_writes_are_serialized_and_carry_newest_state():
+    """Concurrent status writes must not reorder: the next body is
+    built only after the in-flight POST completes, so a label built
+    from older state can never land after a fresher one."""
+    http = _GatedHttp()
+    rep = StatusReporter(http, heartbeat_interval_s=999)
+    rep.set_activity_overlay("compacting")
+    first = asyncio.ensure_future(rep.report_current_status())
+    await asyncio.wait_for(http.entered.wait(), 1)
+
+    # The overlay clears while the first POST is still on the wire.
+    rep.set_activity_overlay(None)
+    second = asyncio.ensure_future(rep.report_current_status())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert len(http.calls) == 1  # nothing else posted while blocked
+
+    http.gate.set()
+    await asyncio.wait_for(asyncio.gather(first, second), 1)
+    assert len(http.calls) == 2
+    assert http.calls[0][1]["activity"] == "compacting"
+    assert "activity" not in http.calls[1][1]

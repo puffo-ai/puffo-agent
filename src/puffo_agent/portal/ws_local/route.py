@@ -31,6 +31,7 @@ from .protocol import Error, encode
 from .session import Transport, WsLocalSession
 from .tool_dispatch import build_dispatch as _build_dispatch
 from ..state import shared_fs_dir
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,11 @@ class _WsLocalContextAdapter:
     def register_admission_callback(self, callback, planning_cycle_key="") -> None:
         self._callback = callback
         self._planning_cycle_key = planning_cycle_key
+
+    def register_autonomous_callback(self, callback) -> bool:
+        """WS-local attachments do not expose autonomous provider turns."""
+        del callback
+        return False
 
     def register_continuation_callback(
         self,
@@ -325,7 +331,7 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         run_turn=run_turn,
         workspace=workspace,
         held_catchup=client.recover_pending_delivery,
-        send_mode_keys=(point.agent_id, client.slug),
+        identity_aliases=(point.agent_id, client.slug),
         agent_id=point.agent_id,
         channel_audience_loader=lambda space_id, channel_id: read_channel_audience(
             space_id,
@@ -344,9 +350,11 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         baseline_source=BaselineAdapter(client.store),
         active_turn_source=ActiveBoundaryAdapter(client.store, runtime.active),
         held_recovery_source=runtime.held_recovery_source,
+        channel_policy_source=client,
     )
     runtime.coordinator = coordinator
     runtime.send_delegate = TrackingSendDelegate(coordinator, runtime.attempts, runtime)
+    runtime.register_autonomous_adoption()
     return runtime
 
 
@@ -414,7 +422,7 @@ async def _start_ws_consumer(
 
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
     owned = connection.get("owned_runtime")
-    heartbeat = asyncio.ensure_future(point.reporter.run_heartbeat_loop())
+    heartbeat = spawn(point.reporter.run_heartbeat_loop(), name="reporter.run_heartbeat_loop")
     reminder_sync = None
     reminder_task = None
     runtime_task = None
@@ -423,10 +431,11 @@ async def _start_ws_consumer(
             # First statement of the scope whose ``finally`` unwinds it.
             _install_owned_runtime(client, owned)
             reminder_sync = await _prepare_owned_reminder_sync(point, client, owned)
-            reminder_task = asyncio.ensure_future(
-                reminder_sync.run(request_snapshot_on_start=False)
+            reminder_task = spawn(
+                reminder_sync.run(request_snapshot_on_start=False),
+                name="reminder_sync.run",
             )
-            runtime_task = asyncio.ensure_future(owned.run())
+            runtime_task = spawn(owned.run(), name="owned.run")
             await await_listener_with_runtime(
                 client.listen(on_message),
                 runtime_task,

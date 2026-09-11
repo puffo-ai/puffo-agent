@@ -22,6 +22,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .._proc import no_window_kwargs
 from .memory import (
     BRIEFING_DIR,
     IMPORTS_DIR,
@@ -115,6 +116,7 @@ def _run_git(
             text=True,
             timeout=_GIT_TIMEOUT,
             env=_scrubbed_env(),
+            **no_window_kwargs(),
         )
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
         logger.warning("memory git %s failed to run: %s", args[:1], exc)
