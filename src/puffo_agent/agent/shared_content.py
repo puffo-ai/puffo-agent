@@ -990,6 +990,108 @@ message: Alice can sanity-check our token-refresh discussion.
 # Each entry: skill id → (one-line description, body).
 # The description goes into the YAML frontmatter Claude Code reads
 # for skill discovery; the body is everything below the frontmatter.
+DEFAULT_SKILL_USE_PUFFO_NOTES = """\
+# Skill: use-puffo-notes
+
+Sticky-notes are lightweight status markers on a thread. Each note is
+a colored pill a human sees at a glance — a label (Waiting /
+Processing / Complete), a short message, and @mentions. A thread has
+one **active** note at a time: the newest wins, like stacking sticky-
+notes on top of each other.
+
+Use notes to make a thread's state legible without a human having to
+read it: "who is this blocked on?", "is anyone working on it?", "is
+it done?".
+
+**Tools:**
+- `mcp__puffo__get_channel_notes(channel, limit=20)` — the active note
+  of every thread in a channel (one per thread), newest-first. Your
+  channel-wide TODO scan.
+- `mcp__puffo__get_thread_notes(root_id, limit=20)` — a thread's note
+  history, newest-first. `limit=1` is the note currently in effect.
+- `mcp__puffo__add_note(root_id, preset, message="", mentions=[],
+  color="", label="")` — put a note on a thread. Posted as a reply in
+  that thread. Pass **either** a preset **or** a custom `color`+`label`
+  (they conflict); with neither, defaults to `waiting`.
+
+## The three presets
+
+A thread is work passing between people; the note tracks who holds
+the ball.
+
+- **waiting** (pink) — the ball is in someone else's court: you're
+  blocked on them, OR your part is done and you're handing off.
+  `mentions=[<slug>, ...]` = who acts next; `message` = what you
+  produced, what they need to know, and what you need them to do.
+  **This is the only preset that takes mentions.**
+- **processing** (yellow) — you hold the ball. Post it proactively so
+  everyone sees where things stand; `message` = a one-line "where I
+  am now". A self-report: the mention is you, and **passing
+  `mentions` is rejected**.
+- **complete** (green) — the WHOLE task is done, not just your part
+  (a finished part is a `waiting` handoff). Posted once, by whoever
+  finishes last; `message` = the wrap-up summary of the entire task.
+  A self-report: the mention is you, and **passing `mentions` is
+  rejected**.
+
+## When a note mentions you
+
+A `waiting` note mentioning you is a handoff: read its message, work
+out your part, and start. Post `processing` if you want the room to
+know you've picked it up.
+
+## Custom color
+
+For a status that doesn't fit a preset, skip `preset` and pass a
+custom `color` (hex, e.g. `#38bdf8`). A custom color **requires a
+`label`** (<=32 chars, e.g. "Blocked", "Review") and **must not** be
+combined with a preset. Custom notes take `mentions` freely, same as
+`waiting`. Presets cover the common cases — reach for custom only when
+none of Waiting / Processing / Complete fits.
+
+## Typical flow
+
+1. A human asks you to do something in a thread → drop a `processing`
+   note so they can see you picked it up:
+   `add_note(root_id=<the ask's root>, preset="processing",
+   message="on it — pulling the logs")`.
+2. You get blocked, or your part is done and someone else takes over
+   → flip to `waiting` and mention them: `add_note(root_id=...,
+   preset="waiting", message="build is green — needs your review to
+   ship", mentions=["alice-1a2b"])`.
+3. The whole ask is delivered → `add_note(root_id=...,
+   preset="complete", message="done — deployed to beta, PR #428")`.
+
+Each `add_note` supersedes the thread's previous note, so the pill a
+human sees always reflects the latest state. You don't delete old
+notes; you post a new one.
+
+## Reading notes
+
+- Landing in a busy channel? `get_channel_notes(channel=<ch_id>)`
+  first — the fastest way to see what's outstanding, and whether
+  anything is `Waiting` on **you**.
+- About to act on a thread? `get_thread_notes(root_id=<root>,
+  limit=1)` tells you the state someone already set, so you don't
+  double-work a thread that's already `Processing` or `Complete`.
+
+`root_id` is always a thread root envelope_id (`msg_<uuid>`) — the
+`thread_root_id` from a message's metadata, or the envelope_id of a
+top-level post. Channel ids are raw `ch_<uuid>` (no `#name`).
+
+**When to use:**
+- You're taking on, progressing, or finishing a piece of work a human
+  is tracking.
+- You need to hand a thread to a specific person and want it to show
+  up in their notes view.
+
+**When NOT to use:**
+- For actual conversation — a note is a status stamp, not a reply.
+  Use `send_message` to talk.
+- For agent-to-agent chatter no human is tracking.
+"""
+
+
 DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "send-message": (
         "Reply to a Puffo.ai channel or DM via the puffo MCP toolkit.",
@@ -1044,6 +1146,11 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "suggest-invite": (
         "Post an /invite card so a human can add a member to a channel.",
         DEFAULT_SKILL_SUGGEST_INVITE,
+    ),
+    "use-puffo-notes": (
+        "Read and post sticky-note status markers (Waiting / Processing "
+        "/ Complete) on Puffo threads.",
+        DEFAULT_SKILL_USE_PUFFO_NOTES,
     ),
 }
 
